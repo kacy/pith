@@ -152,6 +152,14 @@ mut ir_defer_nodes: List[Int] := []
 mut ir_defer_is_err: List[Int] := []
 mut ir_defer_scope_starts: List[Int] := []
 mut ir_defer_loop_base_stack: List[Int] := []
+# open owned loop iterables (a split result, a keys() list). a `for` loop
+# releases its iterable at the loop's normal end label, but an early exit
+# (`return`, `fail`, `!`) leaves the function without reaching that label, so
+# the release is skipped and the iterable leaks. these parallel stacks name the
+# iterable local and its rc kind for every loop currently open; the function
+# exit edges release them, and each loop pops its own entry once its body ends.
+mut ir_loop_iter_vars: List[String] := []
+mut ir_loop_iter_kinds: List[String] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
 mut ir_module_count := 0 # increments per emit_ir call for unique naming
 
@@ -715,8 +723,22 @@ fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
 # the function-level exit edges: pass is_error_exit true at the error edges
 # (fail / `!` / `?` / index-miss) so errdefers run, false at the success edges
 # (return, default return) so they are skipped.
+# release every still-open loop's owned iterable at a function exit edge. the
+# loop's own end label releases it on the normal path, but return/fail/`!` leave
+# the function before that label, so release here — innermost loop first — to
+# free what the end label would have. break/continue reach the end label and are
+# not function exits, so they never call this.
+fn ir_loop_iter_emit_releases():
+    mut i := ir_loop_iter_vars.len() - 1
+    while i >= 0:
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + ir_loop_iter_vars[i])
+        ir_rc_release_reg(r, ir_loop_iter_kinds[i])
+        i = i - 1
+
 fn ir_defer_emit_to_function_frame(is_error_exit: Bool):
     ir_defer_emit_through(0, is_error_exit)
+    ir_loop_iter_emit_releases()
 
 # close the innermost block scope. falling off the end of a block is a success
 # exit, so its plain defers run in LIFO order and its errdefers are skipped; if
@@ -4359,10 +4381,16 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_rc_kinds := ir_rc_local_kinds
     saved_tuple_tids := ir_tuple_local_tid
     saved_tuple_cascade := ir_tuple_cascade_names
+    # the lambda body is its own function frame; open loops in the enclosing
+    # function must not have their iterables released by a return inside it.
+    saved_loop_iter_vars := ir_loop_iter_vars
+    saved_loop_iter_kinds := ir_loop_iter_kinds
     ir_string_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
+    ir_loop_iter_vars = []
+    ir_loop_iter_kinds = []
     ir_reset_lambda_emit_state()
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
@@ -4375,6 +4403,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
     ir_tuple_cascade_names = saved_tuple_cascade
+    ir_loop_iter_vars = saved_loop_iter_vars
+    ir_loop_iter_kinds = saved_loop_iter_kinds
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -5647,7 +5677,18 @@ fn ir_emit_for_stmt(node: Node):
         ir_break_stack = ir_push_string(ir_break_stack, end_l)
         ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
         ir_defer_loop_enter()
+        # an early return/fail/`!` inside the body skips end_l's release below, so
+        # register this owned iterable for the exit edges to release. break and
+        # continue reach end_l, so they still release there — not here.
+        mut pushed_iter := false
+        if iter_release_kind.len() > 0:
+            ir_loop_iter_vars.push(ft)
+            ir_loop_iter_kinds.push(iter_release_kind)
+            pushed_iter = true
         ir_block(node.children[1])
+        if pushed_iter:
+            ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+            ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
         ir_defer_loop_exit()
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
@@ -6217,6 +6258,8 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_defer_is_err = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
+    ir_loop_iter_vars = []
+    ir_loop_iter_kinds = []
     ir_seed_global_types()
     ir_current_func_return_kind = ret_type
     ir_current_func_optional_inner_kind = ""

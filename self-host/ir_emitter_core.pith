@@ -5703,80 +5703,88 @@ fn ir_emit_for_stmt(node: Node):
         if next_name.len() > 0:
             ir_emit_for_iterator_stmt(node, names, next_name)
             return
-        iter_type := ir_infer_type(node.children[0])
-        mut iter_r := ir_expr(node.children[0])
-        item_kind := ir_for_iter_item_kind(iter_type)
-        # an owned iterable (a split result, a keys() list) dies when the
-        # loop ends; a converted iterable is always a fresh container
-        mut iter_release_kind := ""
-        if not ir_string_expr_is_borrowed(node.children[0]):
-            iter_release_kind = ir_rc_kind(iter_type)
-        conversion_call := ir_for_iter_conversion_call(iter_type)
-        if conversion_call.len() > 0:
-            converted_r := ir_reg()
-            ir_emit_call1(converted_r, conversion_call, ir_for_iter_conversion_return_kind(iter_type), iter_r)
-            if iter_release_kind.len() > 0:
-                ir_rc_release_reg(iter_r, iter_release_kind)
-            iter_r = converted_r
-            iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(iter_type))
-        fid := ir_for_count
-        ir_for_count = ir_for_count + 1
-        fi := "__for_idx_" + fid.to_string()
-        fl := "__for_len_" + fid.to_string()
-        ft := "__for_iter_" + fid.to_string()
-        len_r := ir_reg()
-        ir_emit_call1(len_r, ir_for_len_call_name(item_kind), "int", iter_r)
-        idx_r := ir_reg()
-        ir_emit("iconst " + idx_r.to_string() + " 0")
-        ir_emit("store " + fi + " " + idx_r.to_string())
-        ir_emit("store " + fl + " " + len_r.to_string())
-        ir_emit("store " + ft + " " + iter_r.to_string())
-        head_l := ir_label()
-        body_l := ir_label()
-        step_l := ir_label()
-        end_l := ir_label()
-        ir_emit_label(head_l)
-        ci := ir_reg()
-        ir_emit("load " + ci.to_string() + " " + fi)
-        cl := ir_reg()
-        ir_emit("load " + cl.to_string() + " " + fl)
-        cmp_r := ir_reg()
-        ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
-        ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
-        ir_emit_label(body_l)
-        ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
-        ir_break_stack = ir_push_string(ir_break_stack, end_l)
-        ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
-        ir_defer_loop_enter()
-        # an early return/fail/`!` inside the body skips end_l's release below, so
-        # register this owned iterable for the exit edges to release. break and
-        # continue reach end_l, so they still release there — not here.
-        mut pushed_iter := false
+        ir_emit_for_indexed_stmt(node, names)
+
+# `for x in list` and other index-addressable iterables (the fallback when the
+# element is neither a range nor an iterator-protocol struct). Converts to a
+# fresh container when the type needs it, then runs a counted loop over the
+# length using get-by-index. An owned iterable is released when the loop ends,
+# or at the function's exit edges if the body returns / fails early.
+fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
+    iter_type := ir_infer_type(node.children[0])
+    mut iter_r := ir_expr(node.children[0])
+    item_kind := ir_for_iter_item_kind(iter_type)
+    # an owned iterable (a split result, a keys() list) dies when the
+    # loop ends; a converted iterable is always a fresh container
+    mut iter_release_kind := ""
+    if not ir_string_expr_is_borrowed(node.children[0]):
+        iter_release_kind = ir_rc_kind(iter_type)
+    conversion_call := ir_for_iter_conversion_call(iter_type)
+    if conversion_call.len() > 0:
+        converted_r := ir_reg()
+        ir_emit_call1(converted_r, conversion_call, ir_for_iter_conversion_return_kind(iter_type), iter_r)
         if iter_release_kind.len() > 0:
-            ir_loop_iter_vars.push(ft)
-            ir_loop_iter_kinds.push(iter_release_kind)
-            pushed_iter = true
-        ir_block(node.children[1])
-        if pushed_iter:
-            ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
-            ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
-        ir_defer_loop_exit()
-        ir_break_stack.remove(ir_break_stack.len() - 1)
-        ir_continue_stack.remove(ir_continue_stack.len() - 1)
-        ir_emit_label(step_l)
-        idx3 := ir_reg()
-        ir_emit("load " + idx3.to_string() + " " + fi)
-        one_r := ir_reg()
-        ir_emit("iconst " + one_r.to_string() + " 1")
-        inc_r := ir_reg()
-        ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
-        ir_emit("store " + fi + " " + inc_r.to_string())
-        ir_emit("jmp " + head_l)
-        ir_emit_label(end_l)
-        if iter_release_kind.len() > 0:
-            fin_r := ir_reg()
-            ir_emit("load " + fin_r.to_string() + " " + ft)
-            ir_rc_release_reg(fin_r, iter_release_kind)
+            ir_rc_release_reg(iter_r, iter_release_kind)
+        iter_r = converted_r
+        iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(iter_type))
+    fid := ir_for_count
+    ir_for_count = ir_for_count + 1
+    fi := "__for_idx_" + fid.to_string()
+    fl := "__for_len_" + fid.to_string()
+    ft := "__for_iter_" + fid.to_string()
+    len_r := ir_reg()
+    ir_emit_call1(len_r, ir_for_len_call_name(item_kind), "int", iter_r)
+    idx_r := ir_reg()
+    ir_emit("iconst " + idx_r.to_string() + " 0")
+    ir_emit("store " + fi + " " + idx_r.to_string())
+    ir_emit("store " + fl + " " + len_r.to_string())
+    ir_emit("store " + ft + " " + iter_r.to_string())
+    head_l := ir_label()
+    body_l := ir_label()
+    step_l := ir_label()
+    end_l := ir_label()
+    ir_emit_label(head_l)
+    ci := ir_reg()
+    ir_emit("load " + ci.to_string() + " " + fi)
+    cl := ir_reg()
+    ir_emit("load " + cl.to_string() + " " + fl)
+    cmp_r := ir_reg()
+    ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
+    ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
+    ir_emit_label(body_l)
+    ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
+    ir_break_stack = ir_push_string(ir_break_stack, end_l)
+    ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
+    ir_defer_loop_enter()
+    # an early return/fail/`!` inside the body skips end_l's release below, so
+    # register this owned iterable for the exit edges to release. break and
+    # continue reach end_l, so they still release there — not here.
+    mut pushed_iter := false
+    if iter_release_kind.len() > 0:
+        ir_loop_iter_vars.push(ft)
+        ir_loop_iter_kinds.push(iter_release_kind)
+        pushed_iter = true
+    ir_block(node.children[1])
+    if pushed_iter:
+        ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+        ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
+    ir_defer_loop_exit()
+    ir_break_stack.remove(ir_break_stack.len() - 1)
+    ir_continue_stack.remove(ir_continue_stack.len() - 1)
+    ir_emit_label(step_l)
+    idx3 := ir_reg()
+    ir_emit("load " + idx3.to_string() + " " + fi)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    inc_r := ir_reg()
+    ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
+    ir_emit("store " + fi + " " + inc_r.to_string())
+    ir_emit("jmp " + head_l)
+    ir_emit_label(end_l)
+    if iter_release_kind.len() > 0:
+        fin_r := ir_reg()
+        ir_emit("load " + fin_r.to_string() + " " + ft)
+        ir_rc_release_reg(fin_r, iter_release_kind)
 
 # `for i in lo..hi` lowers to a counted loop over an Int counter, with no
 # intermediate list allocation. exclusive (`..`) stops at hi, inclusive

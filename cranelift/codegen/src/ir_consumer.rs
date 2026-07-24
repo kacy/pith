@@ -621,7 +621,12 @@ pub fn compile_from_ir(
             "func" if parts.len() >= 4 => {
                 let name = parts[1];
                 if !declared_funcs.contains_key(name) {
-                    let nparam: usize = parts[2].parse().unwrap_or(0);
+                    let nparam: usize = parts[2].parse().map_err(|_| {
+                        CompileError::ModuleError(format!(
+                            "IR consumer: invalid parameter count '{}' in function '{}'",
+                            parts[2], name
+                        ))
+                    })?;
                     let mut sig = codegen.module.make_signature();
                     for _ in 0..nparam {
                         sig.params.push(AbiParam::new(types::I64));
@@ -955,16 +960,7 @@ fn compile_ir_function(
         match parts[0] {
             "iconst" if parts.len() >= 3 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let s = parts[2];
-                let val: i64 = if s.starts_with("0x") || s.starts_with("0X") {
-                    i64::from_str_radix(&s[2..], 16).unwrap_or(0)
-                } else if s.starts_with("0b") || s.starts_with("0B") {
-                    i64::from_str_radix(&s[2..], 2).unwrap_or(0)
-                } else if s.starts_with("0o") || s.starts_with("0O") {
-                    i64::from_str_radix(&s[2..], 8).unwrap_or(0)
-                } else {
-                    s.parse().unwrap_or(0)
-                };
+                let val = parse_i64_operand(parts[2], "integer constant", line, func_name)?;
                 let v = builder.ins().iconst(types::I64, val);
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
@@ -976,7 +972,12 @@ fn compile_ir_function(
 
             "fconst" if parts.len() >= 3 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let fval: f64 = parts[2].parse().unwrap_or(0.0);
+                let fval: f64 = parts[2].parse().map_err(|_| {
+                    CompileError::ModuleError(format!(
+                        "IR consumer: invalid float constant '{}' in {}: {}",
+                        parts[2], func_name, line
+                    ))
+                })?;
                 let fv = builder.ins().f64const(fval);
                 let v =
                     builder
@@ -999,6 +1000,9 @@ fn compile_ir_function(
                     let v = builder.func.dfg.first_result(call);
                     regs.insert(reg, v);
                 } else {
+                    // a strref may name a string defined in another compilation
+                    // unit (docgen and other cross-module paths do this); it
+                    // resolves at link time, so a miss here is not malformed ir.
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
                 }
                 reg_source_vars.remove(&reg);
@@ -2011,6 +2015,32 @@ fn parse_reg(s: &str, instruction: &str, func_name: &str) -> Result<usize, Compi
     })
 }
 
+// An integer literal operand, with the 0x / 0b / 0o prefixes the emitter uses.
+// A token that does not parse is malformed IR, so this reports it rather than
+// coercing to 0 and miscompiling silently.
+fn parse_i64_operand(
+    s: &str,
+    what: &str,
+    instruction: &str,
+    func_name: &str,
+) -> Result<i64, CompileError> {
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16)
+    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        i64::from_str_radix(bin, 2)
+    } else if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        i64::from_str_radix(oct, 8)
+    } else {
+        s.parse::<i64>()
+    };
+    parsed.map_err(|_| {
+        CompileError::ModuleError(format!(
+            "IR consumer: invalid {} '{}' in {}: {}",
+            what, s, func_name, instruction
+        ))
+    })
+}
+
 fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     if let Some(name) = retkind.strip_prefix("struct:") {
         return Some(name);
@@ -2124,5 +2154,23 @@ mod tests {
     fn unknown_jump_label_returns_compile_error() {
         let err = compile_err_for_ir("func main 0 int\njmp missing_l\nendfunc\n");
         assert!(err.contains("unknown label 'missing_l'"));
+    }
+
+    #[test]
+    fn malformed_integer_constant_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst 1 notanumber\nendfunc\n");
+        assert!(err.contains("invalid integer constant 'notanumber'"));
+    }
+
+    #[test]
+    fn malformed_float_constant_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\nfconst 1 notafloat\nendfunc\n");
+        assert!(err.contains("invalid float constant 'notafloat'"));
+    }
+
+    #[test]
+    fn invalid_parameter_count_returns_compile_error() {
+        let err = compile_err_for_ir("func main x int\nendfunc\n");
+        assert!(err.contains("invalid parameter count 'x'"));
     }
 }

@@ -638,6 +638,14 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     # makes the binding retain again and leaks the payload.
     if node.kind == "catch_expr":
         return false
+    # awaiting a task transfers the result's count out to the single awaiter:
+    # the task's thread produced the value with count 1 and stored it raw in the
+    # result slot (no retain), and pith_await hands that count back. so the
+    # awaited value arrives owned, exactly like a fresh call result — treating it
+    # as borrowed would add a compensating retain and leak the payload by one.
+    # (scalar returns carry no count, so this classification is a no-op for them.)
+    if node.kind == "await":
+        return false
     # collection literals mint fresh containers, and collection-typed call
     # results arrive with a transferred count (user returns exclude the
     # local, runtime producers build new containers). variable, element,

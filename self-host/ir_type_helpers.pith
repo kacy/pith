@@ -235,31 +235,6 @@ pub fn ir_lookup_name_type_with_state(name: String, var_types: Map[String, Strin
         return "bool"
     return ""
 
-pub fn ir_builtin_result_retkind(name: String) -> String:
-    if name == "parse_int":
-        return "tuple"
-    if name == "file_open_read" or name == "file_open_write" or name == "file_open_append" or name == "byte_buffer_write" or name == "byte_buffer_write_string_utf8" or name == "byte_buffer_write_byte" or name == "file_write" or name == "file_write_bytes" or name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "tcp_write" or name == "tcp_write_bytes" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "process_write" or name == "process_write_bytes" or name == "crypto_x25519_keygen" or name == "crypto_p256_keygen":
-        return "result_int"
-    if name == "write_file" or name == "append_file" or name == "write_file_bytes" or name == "append_file_bytes":
-        return "result_bool"
-    if name == "parse_float":
-        return "float"
-    if name == "read_file" or name == "exec_output" or name == "dns_resolve" or name == "bytes_to_string_utf8" or name == "bytes_substring_utf8" or name == "file_read" or name == "tcp_read" or name == "process_read" or name == "process_read_err":
-        return "string"
-    if name == "read_file_bytes" or name == "b64_decode" or name == "from_hex" or name == "file_read_bytes" or name == "tcp_read_bytes" or name == "process_read_bytes" or name == "process_read_err_bytes" or name == "crypto_x25519_public_key" or name == "crypto_x25519_shared_secret" or name == "crypto_aes_128_gcm_seal" or name == "crypto_aes_128_gcm_open" or name == "crypto_chacha20_poly1305_seal" or name == "crypto_chacha20_poly1305_open" or name == "crypto_sign_rsa_pss_sha256_pkcs8":
-        return "bytes"
-    return ""
-
-pub fn ir_builtin_result_ok_kind(name: String) -> String:
-    legacy_kind := ir_builtin_result_retkind(name)
-    if legacy_kind == "result_int":
-        return "int"
-    if legacy_kind == "result_bool":
-        return "bool"
-    if name == "parse_int":
-        return "int"
-    return ""
-
 pub fn ir_known_scalar_return_type(fname: String) -> String:
     if ir_is_float_returning_func(fname):
         return "float"

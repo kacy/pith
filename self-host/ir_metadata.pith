@@ -11,6 +11,14 @@ BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contai
 VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release,store"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,list_join_int,read_file,env,chr"
 
+# fallible builtins, grouped by how the ir carries their result (see the result
+# encoding in docs/ir-contract.md). parse_int and parse_float keep their own
+# legacy retkinds and are handled directly in ir_builtin_result_retkind.
+RESULT_INT_FUNCS := "file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,crypto_p256_keygen"
+RESULT_BOOL_FUNCS := "write_file,append_file,write_file_bytes,append_file_bytes"
+RESULT_STRING_FUNCS := "read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err"
+RESULT_BYTES_FUNCS := "read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8"
+
 fn ir_csv_contains(csv: String, name: String) -> Bool:
     if name.len() == 0:
         return false
@@ -43,6 +51,34 @@ pub fn ir_is_list_string_returning_func(fname: String) -> Bool:
 
 pub fn ir_is_known_returning_func(fname: String) -> Bool:
     return ir_is_float_returning_func(fname) or ir_is_bool_returning_func(fname) or ir_is_int_returning_func(fname) or ir_is_string_returning_func(fname) or ir_is_bytes_returning_func(fname) or ir_is_list_returning_func(fname) or ir_is_list_string_returning_func(fname)
+
+# the ir retkind of a fallible builtin's result. the match order is preserved
+# from the original hand-written chain so every function's retkind is unchanged.
+pub fn ir_builtin_result_retkind(name: String) -> String:
+    if name == "parse_int":
+        return "tuple"
+    if ir_csv_contains(RESULT_INT_FUNCS, name):
+        return "result_int"
+    if ir_csv_contains(RESULT_BOOL_FUNCS, name):
+        return "result_bool"
+    if name == "parse_float":
+        return "float"
+    if ir_csv_contains(RESULT_STRING_FUNCS, name):
+        return "string"
+    if ir_csv_contains(RESULT_BYTES_FUNCS, name):
+        return "bytes"
+    return ""
+
+# the ok-value kind for a builtin whose result is carried as result_int/bool.
+pub fn ir_builtin_result_ok_kind(name: String) -> String:
+    legacy_kind := ir_builtin_result_retkind(name)
+    if legacy_kind == "result_int":
+        return "int"
+    if legacy_kind == "result_bool":
+        return "bool"
+    if name == "parse_int":
+        return "int"
+    return ""
 
 pub fn ir_is_bool_returning_method(meth: String) -> Bool:
     return ir_csv_contains(BOOL_RETURNING_METHODS, meth)

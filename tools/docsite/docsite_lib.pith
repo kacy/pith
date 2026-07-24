@@ -1,0 +1,268 @@
+# docsite_lib — turn the stdlib's source comments into a reference site.
+#
+# the extractor follows the same rules as `pith doc` (self-host/docgen.pith):
+# a module's first comment block is its header, and the comment lines directly
+# above a declaration are that declaration's documentation. it reads a little
+# more than the cli does — module constants, struct fields, enum variants, and
+# the methods inside `impl` blocks — because a browsable page has room for them
+# where a terminal listing does not.
+#
+# the renderer emits one self-contained html file: every module is a real
+# section in the document, so the page works with javascript disabled and
+# browser find still searches the whole stdlib. the script layers routing,
+# filtering, and the command palette on top of that markup.
+import std.algo as algo
+import std.fs as fs
+
+# a single documented declaration.
+#
+# `owner` is the receiving type for a method and empty otherwise. `via` names
+# the trait when the method came from a trait impl, which is what keeps an
+# inherent `read` distinct from the `read` that satisfies `Reader`.
+pub struct Item:
+    kind: String
+    name: String
+    signature: String
+    doc: String
+    owner: String
+    via: String
+    detail: List[String]
+
+# one module: its header comment plus everything declared in it.
+pub struct Module:
+    name: String
+    group: String
+    path: String
+    summary: String
+    overview: List[String]
+    items: List[Item]
+
+# --- text helpers ------------------------------------------------------
+
+fn indent_width(line: String) -> Int:
+    mut width := 0
+    while width < line.len():
+        character := line[width]
+        if character != " " and character != chr(9):
+            return width
+        width = width + 1
+    return width
+
+# strip a comment line's leading markers, leaving an empty string for a bare
+# "#" so blank lines inside a comment block survive as paragraph breaks.
+#
+# much of std marks doc comments with "##" the way rust uses "///", so the
+# whole run of hashes goes, not just the first.
+fn strip_comment_marker(line: String) -> String:
+    trimmed := line.trim()
+    mut i := 0
+    while i < trimmed.len() and trimmed[i] == "#":
+        i = i + 1
+    if i < trimmed.len() and trimmed[i] == " ":
+        i = i + 1
+    return trimmed.substring(i, trimmed.len())
+
+fn is_comment_line(line: String) -> Bool:
+    return line.trim().starts_with("#")
+
+# the header's first line reads "std.math — pure Pith math library". the
+# separator is either an em dash (three bytes in utf-8) or a plain hyphen.
+fn split_on_dash(text: String) -> (String, String):
+    em_dash := chr(226) + chr(128) + chr(148)
+    mut i := 0
+    while i < text.len():
+        if text[i] == " ":
+            if i + 5 <= text.len() and text.substring(i + 1, i + 4) == em_dash:
+                return (text.substring(0, i).trim(), text.substring(i + 5, text.len()).trim())
+            if i + 3 <= text.len() and text.substring(i, i + 3) == " - ":
+                return (text.substring(0, i).trim(), text.substring(i + 3, text.len()).trim())
+        i = i + 1
+    return (text.trim(), "")
+
+# --- declaration parsing -----------------------------------------------
+
+fn declaration_kind(trimmed: String) -> String:
+    if trimmed.starts_with("pub fn "):
+        return "fn"
+    if trimmed.starts_with("pub struct "):
+        return "struct"
+    if trimmed.starts_with("pub enum "):
+        return "enum"
+    if trimmed.starts_with("pub trait "):
+        return "trait"
+    return ""
+
+# a module constant is `pub NAME := value` — a pub line that is not one of the
+# keyword-introduced declarations.
+fn is_constant_declaration(trimmed: String) -> Bool:
+    if not trimmed.starts_with("pub "):
+        return false
+    if declaration_kind(trimmed) != "":
+        return false
+    return trimmed.contains(":=")
+
+fn name_after(trimmed: String, prefix: String) -> String:
+    rest := trimmed.substring(prefix.len(), trimmed.len())
+    mut end := 0
+    while end < rest.len():
+        character := rest[end]
+        if character == "(" or character == ":" or character == " " or character == "[":
+            return rest.substring(0, end)
+        end = end + 1
+    return rest
+
+fn declaration_name(trimmed: String, kind: String) -> String:
+    if kind == "fn":
+        return name_after(trimmed, "pub fn ")
+    if kind == "struct":
+        return name_after(trimmed, "pub struct ")
+    if kind == "enum":
+        return name_after(trimmed, "pub enum ")
+    if kind == "trait":
+        return name_after(trimmed, "pub trait ")
+    return ""
+
+fn constant_name(trimmed: String) -> String:
+    return name_after(trimmed, "pub ")
+
+# `impl Iterator for Range:` puts methods on Range to satisfy Iterator;
+# `impl ByteBuffer:` puts them on ByteBuffer directly. returns (type, trait),
+# with an empty trait for an inherent impl.
+fn impl_target(trimmed: String) -> (String, String):
+    mut body := trimmed.substring(5, trimmed.len())
+    if body.len() > 0 and body[body.len() - 1] == ":":
+        body = body.substring(0, body.len() - 1)
+    marker := body.index_of(" for ")
+    if marker > 0:
+        return (body.substring(marker + 5, body.len()).trim(), body.substring(0, marker).trim())
+    return (body.trim(), "")
+
+fn strip_trailing_colon(text: String) -> String:
+    trimmed := text.trim()
+    if trimmed.len() > 0 and trimmed[trimmed.len() - 1] == ":":
+        return trimmed.substring(0, trimmed.len() - 1)
+    return trimmed
+
+# --- extraction --------------------------------------------------------
+
+# collect the contiguous comment lines directly above `index`, oldest first.
+fn doc_above(lines: List[String], index: Int, floor: Int) -> String:
+    mut collected: List[String] := []
+    mut back := index - 1
+    while back >= floor:
+        if not is_comment_line(lines[back]):
+            break
+        collected.push(strip_comment_marker(lines[back]))
+        back = back - 1
+    if collected.len() == 0:
+        return ""
+    mut text := ""
+    mut i := collected.len() - 1
+    while i >= 0:
+        if text != "":
+            text = text + chr(10)
+        text = text + collected[i]
+        i = i - 1
+    return text.trim()
+
+# the indented body of a struct or enum: its fields or variants.
+fn indented_block(lines: List[String], start: Int) -> List[String]:
+    mut collected: List[String] := []
+    mut i := start
+    while i < lines.len():
+        line := lines[i]
+        if line.trim() == "" or indent_width(line) == 0:
+            break
+        entry := line.trim()
+        if not entry.starts_with("#"):
+            if entry.starts_with("pub "):
+                collected.push(entry.substring(4, entry.len()))
+            else:
+                collected.push(entry)
+        i = i + 1
+    return collected
+
+# read one module's documentation out of its source text.
+pub fn extract_module(source: String, module_name: String, rel_path: String) -> Module:
+    lines := source.split(chr(10))
+    mut summary := ""
+    mut overview: List[String] := []
+    mut cursor := 0
+
+    # the header is the leading comment block. it ends at the first blank line,
+    # which is also what separates it from the first declaration's own comment.
+    if lines.len() > 0 and is_comment_line(lines[0]):
+        first := strip_comment_marker(lines[0])
+        parts := split_on_dash(first)
+        summary = parts.1
+        cursor = 1
+        while cursor < lines.len() and is_comment_line(lines[cursor]):
+            overview.push(strip_comment_marker(lines[cursor]))
+            cursor = cursor + 1
+
+    header_end := cursor
+    mut items: List[Item] := []
+    mut current_type := ""
+    mut current_trait := ""
+
+    mut i := header_end
+    while i < lines.len():
+        line := lines[i]
+        trimmed := line.trim()
+        indent := indent_width(line)
+
+        if indent == 0 and trimmed != "" and not trimmed.starts_with("#"):
+            if trimmed.starts_with("impl "):
+                target := impl_target(trimmed)
+                current_type = target.0
+                current_trait = target.1
+            else:
+                current_type = ""
+                current_trait = ""
+
+        kind := declaration_kind(trimmed)
+        if indent == 0 and kind != "":
+            mut detail: List[String] := []
+            if kind == "struct" or kind == "enum":
+                detail = indented_block(lines, i + 1)
+            items.push(Item(kind, declaration_name(trimmed, kind), strip_trailing_colon(trimmed), doc_above(lines, i, header_end), "", "", detail))
+        elif indent == 0 and is_constant_declaration(trimmed):
+            items.push(Item("const", constant_name(trimmed), trimmed, doc_above(lines, i, header_end), "", "", []))
+        elif indent > 0 and current_type != "" and trimmed.starts_with("fn "):
+            signature := strip_trailing_colon(trimmed)
+            items.push(Item("method", name_after(trimmed, "fn "), signature, doc_above(lines, i, header_end), current_type, current_trait, []))
+
+        i = i + 1
+
+    group := module_group(module_name)
+    return Module(module_name, group, rel_path, summary, overview, items)
+
+fn module_group(module_name: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_name.len():
+        if module_name[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot <= 0:
+        return module_name
+    return module_name.substring(0, last_dot)
+
+# --- source discovery --------------------------------------------------
+
+fn path_to_module(rel_path: String) -> String:
+    mut name := rel_path
+    if name.ends_with(".pith"):
+        name = name.substring(0, name.len() - 5)
+    return name.replace("/", ".")
+
+# find every stdlib module under `root`, in a stable sorted order.
+pub fn load_modules(root: String) -> List[Module]!:
+    mut modules: List[Module] := []
+    for entry in fs.walk(root + "/std")!:
+        if entry.is_dir or not entry.name.ends_with(".pith"):
+            continue
+        rel := entry.path.substring(root.len() + 1, entry.path.len())
+        source := fs.read(entry.path)!
+        modules.push(extract_module(source, path_to_module(rel), rel))
+    return algo.sort_by_key(modules, fn(m: Module) => m.name)

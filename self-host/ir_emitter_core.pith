@@ -2528,18 +2528,28 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     left_r := ir_expr(node.children[0])
     right_r := ir_expr(node.children[1])
     r := ir_reg()
+    # Optional-typed `==` / `!=` compares by (is_some, value), not by pointer
+    # identity, and has several shapes; try it before the value operators.
+    opt_r := ir_emit_optional_binary_compare(node, r, left_r, right_r)
+    if opt_r >= 0:
+        return opt_r
+    return ir_emit_value_binary(node, r, left_r, right_r)
+
+# `==` / `!=` where at least one operand is an Optional. A raw pointer eq would
+# compare heap addresses, so compare by (is_some, value) instead. Covers a none
+# literal against an optional, `T? == T?`, and the two generic forms where the
+# operand's optional type is invisible to the checker — inside a generic impl
+# body (parameters suppressed at registration) or a generic specialization (the
+# tid is still the un-specialized marker). Returns -1 when neither operand is an
+# optional comparison, leaving the value-operator path to handle it.
+fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
-    left_type := ir_infer_type(node.children[0])
-    right_type := ir_infer_type(node.children[1])
     left_tid := c_get_expr_type(node.children[0])
     right_tid := c_get_expr_type(node.children[1])
     left_info := get_type_info(left_tid)
     right_info := get_type_info(right_tid)
     left_node := get_node(node.children[0])
     right_node := get_node(node.children[1])
-    is_str_op := left_type == "string" or right_type == "string"
-    is_bytes_op := left_type == "bytes" and right_type == "bytes"
-    is_float_op := left_type == "float" or right_type == "float"
     if op == "eq" or op == "neq":
         if left_node.kind == "none_lit" and right_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, right_r)
@@ -2588,6 +2598,19 @@ fn ir_emit_binary_expr(node: Node) -> Int:
             if gen_right_tid >= 0 and left_node.kind == "none_lit":
                 ir_emit_optional_none_compare(r, op, right_r)
                 return r
+    return 0 - 1
+
+# The scalar / string / bytes value operators: float arithmetic, string concat
+# and ordered comparison (which call the runtime rather than compare pointers),
+# enum structural equality, and the plain integer binops. Emits into r (already
+# allocated by the caller so register numbering is stable) and returns it.
+fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
+    op := node.value
+    left_type := ir_infer_type(node.children[0])
+    right_type := ir_infer_type(node.children[1])
+    is_str_op := left_type == "string" or right_type == "string"
+    is_bytes_op := left_type == "bytes" and right_type == "bytes"
+    is_float_op := left_type == "float" or right_type == "float"
     if is_float_op and ir_is_float_arithmetic(op):
         ir_emit_float_binary(r, op, left_r, right_r)
         return r

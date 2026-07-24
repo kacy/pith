@@ -29,6 +29,12 @@ pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: St
     mut emit_name := fname
     if not ir_is_declared_callable_with_state(fname, func_returns):
         emit_name = ir_runtime_call_name(fname)
+    # tcp_read is a 2-arg builtin backed by the 2-arg runtime symbol tcp_read2;
+    # the 1-arg tcp_read symbol is a separate legacy variant. resolve the
+    # overload by arity here so the ir names the runtime function directly,
+    # rather than leaving the consumer to rewrite it.
+    if fname == "tcp_read" and arg_count == 2:
+        emit_name = "tcp_read2"
     mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind_with_state(ret_type, type_aliases, struct_names) + " " + arg_count.to_string()
     if arg_text.len() > 0:
         call_line = call_line + arg_text

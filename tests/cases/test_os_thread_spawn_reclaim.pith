@@ -1,0 +1,45 @@
+# the os-thread task backend reclaims a task's slab slot on await (and on
+# detach), reusing the freed index for the next spawn with a bumped generation.
+# this exercises that reclaim/reuse path in a bounded loop so valgrind catches a
+# double-free of a reclaimed slot or a use-after-free of the join state. run
+# under `make memcheck` on the default (os-thread) backend.
+#
+# the tasks return plain Ints on purpose: the point here is the slab-slot
+# lifecycle (spawn -> await/detach/is_done -> reclaim -> reuse), not the ownership
+# of a heap return value, so keeping the payload trivial makes any slot-management
+# leak or double-free stand out on its own.
+
+fn work(id: Int) -> Int:
+    return id * 2 + 1
+
+fn main() -> Int!:
+    # await path: many spawn/await cycles churn through a small set of reused slab
+    # slots, so a stale handle aliasing a reused slot (or a double reclaim) corrupts
+    # the running total or trips valgrind.
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        t := spawn work(i)
+        total = total + await t
+        i = i + 1
+    print("await-total={total}")
+
+    # detach path: fire-and-forget tasks whose slots are reclaimed on completion.
+    mut j := 0
+    while j < 150:
+        d := spawn work(j)
+        d.detach()
+        j = j + 1
+    print("detached=150")
+
+    # poll-then-await mix, so is_done and await both run against reused slots.
+    mut polled := 0
+    mut k := 0
+    while k < 150:
+        p := spawn work(k)
+        if p.is_done():
+            polled = polled + 1
+        total = total + await p
+        k = k + 1
+    print("poll-ok={polled >= 0}")
+    return 0

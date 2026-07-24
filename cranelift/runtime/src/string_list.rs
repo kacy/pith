@@ -477,7 +477,10 @@ pub unsafe extern "C" fn pith_cstring_replace(
 
     let mut result: Vec<u8> = Vec::with_capacity(s_len);
     let mut i = 0;
-    while i <= s_len.saturating_sub(from_len) {
+    // `i + from_len <= s_len`, not `i <= s_len - from_len`: the saturating
+    // form yields 0 when the needle is longer than the haystack, which let
+    // the empty-haystack case slice past the end.
+    while i + from_len <= s_len {
         if &s_bytes[i..i + from_len] == from_bytes {
             result.extend_from_slice(to_bytes);
             i += from_len;

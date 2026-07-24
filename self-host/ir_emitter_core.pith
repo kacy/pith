@@ -3996,12 +3996,33 @@ fn ir_is_channel_send_name(emit_name: String) -> Bool:
 
 # --- method call dispatch ---
 fn ir_emit_method_call(idx: Int) -> Int:
-    node := get_node(idx)
-    # first child is object, then args. value is method_name (may have leading dot)
-    mname := ir_plain_method_name(node_value(idx))
+    # A method call is lowered by a handful of specialized emitters tried in
+    # order; each returns a register or -1 ("not my shape, keep looking"). The
+    # order matters — an earlier shape shadows the ones after it:
+    #   1. enum variant construction   Shape.Circle(2.5) / mod.Enum.Variant(..)
+    #   2. type-directed builtins       Int.to_string, Result.*, Optional.*
+    #   3. module-qualified call        mod.Struct(..) / mod.some_fn(..)
+    #   4. general dispatch             impl methods, closure-typed fields
+    variant_r := ir_emit_variant_ctor_method(idx)
+    if variant_r >= 0:
+        return variant_r
+    typed_r := ir_emit_typed_receiver_method(idx)
+    if typed_r >= 0:
+        return typed_r
+    alias_r := ir_emit_module_alias_method(idx)
+    if alias_r >= 0:
+        return alias_r
+    return ir_emit_general_method_call(idx)
 
-    # Shape.Circle(2.5) parses as a method call on the enum type name; it is
-    # really a variant construction
+# `Shape.Circle(2.5)` parses as a method call on the enum type name but is
+# really a variant construction. Handles both the local form and the
+# module-qualified `mod.Enum.Variant(...)` form. Returns -1 when the receiver
+# is not a (possibly aliased) boxed-enum name.
+fn ir_emit_variant_ctor_method(idx: Int) -> Int:
+    node := get_node(idx)
+    # first child is the receiver, then args; value is the method name (with a
+    # possible leading dot stripped by ir_plain_method_name).
+    mname := ir_plain_method_name(node_value(idx))
     if node.children.len() > 0:
         ctor_recv := get_node(node.children[0])
         if ctor_recv.kind == "ident" and ir_boxed_enums.contains_key(ctor_recv.value):
@@ -4018,7 +4039,16 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 qual_key := ctor_recv.value + "." + mname
                 if ir_struct_field_index_lookup.contains_key(qual_key):
                     return ir_emit_variant_construction(node, ctor_recv.value, qual_key)
+    return 0 - 1
 
+# Methods whose lowering is chosen by the receiver's static type rather than by
+# name resolution: unsigned `to_string`, the `Result` combinators, and the
+# `Optional` accessors. Also handles a bare `.value()` extract inside a
+# specialized generic impl body, where the receiver's optional type was
+# suppressed at registration. Returns -1 when none apply.
+fn ir_emit_typed_receiver_method(idx: Int) -> Int:
+    node := get_node(idx)
+    mname := ir_plain_method_name(node_value(idx))
     if node.children.len() > 0:
         recv_tid := c_get_expr_type(node.children[0])
         if recv_tid >= 0:
@@ -4084,7 +4114,14 @@ fn ir_emit_method_call(idx: Int) -> Int:
         r := ir_reg()
         ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 unknown value")
         return r
+    return 0 - 1
 
+# A module-qualified call, `mod.member(...)`, where `mod` is an import alias.
+# Resolves to the target name and emits it — as an inline struct construction
+# when the member is a struct type, otherwise as a plain (possibly generic)
+# static call. Returns -1 when the receiver is not a module alias.
+fn ir_emit_module_alias_method(idx: Int) -> Int:
+    node := get_node(idx)
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         mut call_name := alias_fname
@@ -4122,22 +4159,25 @@ fn ir_emit_method_call(idx: Int) -> Int:
         if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
             return ir_emit_wrapped_legacy_result(r, ret_type, call_name)
         return r
+    return 0 - 1
 
+# The general method dispatch: self-hosted list builtins, a call through a
+# closure-typed struct field, and finally an ordinary impl-method call with its
+# ARC bookkeeping (container-store retains, argument and receiver releases).
+fn ir_emit_general_method_call(idx: Int) -> Int:
+    node := get_node(idx)
+    mname := ir_plain_method_name(node_value(idx))
     obj_type := ir_method_receiver_type(node)
     self_hosted_list_r := ir_emit_self_hosted_list_method(idx, node, mname, obj_type)
     if self_hosted_list_r >= 0:
         return self_hosted_list_r
-    # `self.f(args)` inside a generic impl body where `f` is a closure-typed
-    # field: there's no method named `f` on the struct so dispatch would
-    # normally emit a literal `call f unknown ...`. instead, load the field
-    # into a named local and emit a `call result <tmp> ...` so the consumer's
-    # named-vars path routes through pith_closure_get_fn (the same pattern a
-    # local `f := fn(...) ...; f(x)` uses).
-    # `recv.f(args)` where `f` is a closure-typed field of recv's struct (and
-    # not a method of it): load the field and call it through the closure abi,
-    # the same as a local `f := ...; f(x)`. covers `self.f()` inside a generic
-    # impl and `h.f(x)` on any struct value. the checker only reaches emission
-    # for this shape when `f` is genuinely a fn-value field.
+    # `recv.f(args)` where `f` is a closure-typed field of recv's struct (not a
+    # method of it): there's no method named `f`, so a naive dispatch would emit
+    # a literal `call f unknown ...`. Instead load the field into a named local
+    # and call it through the closure abi — the same lowering a local
+    # `f := fn(...) ...; f(x)` gets, routing through pith_closure_get_fn. Covers
+    # `self.f()` inside a generic impl and `h.f(x)` on any struct value; the
+    # checker only reaches emission here when `f` is genuinely a fn-value field.
     cf_struct := ir_strip_type_args(obj_type)
     if cf_struct.len() > 0:
         field_key := cf_struct + "." + mname

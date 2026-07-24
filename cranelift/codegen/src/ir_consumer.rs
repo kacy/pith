@@ -1357,10 +1357,9 @@ fn compile_ir_function(
                         float_regs.remove(&reg);
                     }
                 } else {
-                    // tcp_read with 2 args → tcp_read2 (different runtime function)
-                    if fname == "tcp_read" && nargs == 2 {
-                        fname = "tcp_read2";
-                    }
+                    // the tcp_read/tcp_read2 arity overload is now resolved by the
+                    // emitter (ir_call_helpers.pith), so the ir names tcp_read2
+                    // directly and no rewrite is needed here.
                     // __list_get on a string → char_at (string indexing)
                     if (fname == "__list_get" || fname == "__index")
                         && nargs >= 1

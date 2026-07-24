@@ -293,78 +293,96 @@ fn ir_struct_fn_field_return_kind(struct_name: String, field_name: String) -> St
     return ""
 
 fn ir_expr_result_kind(idx: Int) -> String:
+    # prefer the kind the checker already recorded; otherwise recover it from
+    # the callee. calls and method calls each resolve their callee differently,
+    # so they get a helper apiece; anything else falls back to legacy inference.
     checked_kind := ir_checked_result_kind(idx)
     if checked_kind.len() > 0:
         return checked_kind
     node := get_node(idx)
     if node.kind == "call" and node.children.len() > 0:
-        # a call through a fn-value local (`f()` where `f := self.make`) carries
-        # its recorded closure return kind, so a `fn() -> T!` factory forwards
-        # its Result rather than getting re-wrapped.
-        fn_local := get_node(node.children[0])
-        if fn_local.kind == "ident" and ir_closure_return_kinds.contains_key(fn_local.value):
-            return ir_closure_return_kinds[fn_local.value]
-        mut callee := ir_resolve_static_callee(node.children[0])
-        if callee.name.len() > 0:
-            if ir_is_generic_function_name(callee.name):
-                mut explicit_generic_types: List[String] := []
-                callee_node := get_node(node.children[0])
-                if callee_node.kind == "index":
-                    explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
-                mut concrete_types := explicit_generic_types
-                if concrete_types.len() == 0:
-                    concrete_types = ir_infer_generic_concrete_types(callee.name, node)
-                mut generic_ret_type := ir_checked_type(idx)
-                if generic_ret_type.len() == 0:
-                    generic_ret_type = ir_infer_type(idx)
-                ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
-                callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
-            declared_kind := ir_declared_callable_ir_retkind(callee.name)
-            if declared_kind.len() > 0:
-                return declared_kind
-            builtin_kind := ir_builtin_result_retkind(callee.name)
-            if builtin_kind.len() > 0:
-                return builtin_kind
-        return ir_expr_legacy_result_kind(idx)
+        return ir_call_result_kind(idx, node)
     if node.kind == "method_call":
-        mut call_name := ir_resolve_module_alias_method_call_name(idx)
-        if call_name.len() > 0:
-            if ir_is_generic_function_name(call_name):
-                mut generic_ret_type := ir_checked_type(idx)
-                if generic_ret_type.len() == 0:
-                    generic_ret_type = ir_infer_type(idx)
-                call_name = ir_queue_generic_specialization(call_name, ir_infer_generic_concrete_types(call_name, node), generic_ret_type)
-            declared_kind := ir_declared_callable_ir_retkind(call_name)
-            if declared_kind.len() > 0:
-                return declared_kind
-            builtin_kind := ir_builtin_result_retkind(call_name)
-            if builtin_kind.len() > 0:
-                return builtin_kind
-            return ir_expr_legacy_result_kind(idx)
-        obj_type := ir_method_receiver_type(node)
-        method_name := ir_plain_method_name(node.value)
-        impl_name := ir_lookup_impl_method_name(obj_type, method_name)
-        if impl_name.len() > 0:
-            declared_kind := ir_declared_callable_ir_retkind(impl_name)
-            if declared_kind.len() > 0:
-                return declared_kind
-        # `self.make()` inside a generic impl where `make` is a closure field:
-        # no method of that name, so the result kind is the field's declared
-        # fn_type return kind. without this a `fn() -> T!` factory reads back as
-        # "unknown" and its Result gets wrapped in a second Result.
-        if impl_name.len() == 0 and ir_current_impl_type.len() > 0:
-            recv_node := get_node(node.children[0])
-            if recv_node.kind == "self":
-                field_kind := ir_struct_fn_field_return_kind(ir_strip_type_args(ir_current_impl_type), method_name)
-                if field_kind.len() > 0:
-                    return field_kind
-        emit_name := ir_method_emit_name(method_name, obj_type)
-        declared_kind := ir_declared_callable_ir_retkind(emit_name)
+        return ir_method_call_result_kind(idx, node)
+    return ir_expr_legacy_result_kind(idx)
+
+# The ir result kind (how a Result is carried in the abi) of a plain call.
+# A call through a fn-value local forwards that local's recorded closure return
+# kind; a generic callee is specialized first; then the callee's declared kind
+# wins over the builtin table, with legacy inference as the fallback.
+fn ir_call_result_kind(idx: Int, node: Node) -> String:
+    # a call through a fn-value local (`f()` where `f := self.make`) carries
+    # its recorded closure return kind, so a `fn() -> T!` factory forwards
+    # its Result rather than getting re-wrapped.
+    fn_local := get_node(node.children[0])
+    if fn_local.kind == "ident" and ir_closure_return_kinds.contains_key(fn_local.value):
+        return ir_closure_return_kinds[fn_local.value]
+    mut callee := ir_resolve_static_callee(node.children[0])
+    if callee.name.len() > 0:
+        if ir_is_generic_function_name(callee.name):
+            mut explicit_generic_types: List[String] := []
+            callee_node := get_node(node.children[0])
+            if callee_node.kind == "index":
+                explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
+            mut concrete_types := explicit_generic_types
+            if concrete_types.len() == 0:
+                concrete_types = ir_infer_generic_concrete_types(callee.name, node)
+            mut generic_ret_type := ir_checked_type(idx)
+            if generic_ret_type.len() == 0:
+                generic_ret_type = ir_infer_type(idx)
+            ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
+            callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
+        declared_kind := ir_declared_callable_ir_retkind(callee.name)
         if declared_kind.len() > 0:
             return declared_kind
-        builtin_kind := ir_builtin_result_retkind(emit_name)
+        builtin_kind := ir_builtin_result_retkind(callee.name)
         if builtin_kind.len() > 0:
             return builtin_kind
+    return ir_expr_legacy_result_kind(idx)
+
+# The ir result kind of a method call. A module-qualified call (`mod.fn(...)`)
+# resolves like a static call; otherwise dispatch to the impl method, then to a
+# `self.make()` closure field inside a generic impl, then the builtin table,
+# with legacy inference as the fallback.
+fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
+    mut call_name := ir_resolve_module_alias_method_call_name(idx)
+    if call_name.len() > 0:
+        if ir_is_generic_function_name(call_name):
+            mut generic_ret_type := ir_checked_type(idx)
+            if generic_ret_type.len() == 0:
+                generic_ret_type = ir_infer_type(idx)
+            call_name = ir_queue_generic_specialization(call_name, ir_infer_generic_concrete_types(call_name, node), generic_ret_type)
+        declared_kind := ir_declared_callable_ir_retkind(call_name)
+        if declared_kind.len() > 0:
+            return declared_kind
+        builtin_kind := ir_builtin_result_retkind(call_name)
+        if builtin_kind.len() > 0:
+            return builtin_kind
+        return ir_expr_legacy_result_kind(idx)
+    obj_type := ir_method_receiver_type(node)
+    method_name := ir_plain_method_name(node.value)
+    impl_name := ir_lookup_impl_method_name(obj_type, method_name)
+    if impl_name.len() > 0:
+        declared_kind := ir_declared_callable_ir_retkind(impl_name)
+        if declared_kind.len() > 0:
+            return declared_kind
+    # `self.make()` inside a generic impl where `make` is a closure field:
+    # no method of that name, so the result kind is the field's declared
+    # fn_type return kind. without this a `fn() -> T!` factory reads back as
+    # "unknown" and its Result gets wrapped in a second Result.
+    if impl_name.len() == 0 and ir_current_impl_type.len() > 0:
+        recv_node := get_node(node.children[0])
+        if recv_node.kind == "self":
+            field_kind := ir_struct_fn_field_return_kind(ir_strip_type_args(ir_current_impl_type), method_name)
+            if field_kind.len() > 0:
+                return field_kind
+    emit_name := ir_method_emit_name(method_name, obj_type)
+    declared_kind := ir_declared_callable_ir_retkind(emit_name)
+    if declared_kind.len() > 0:
+        return declared_kind
+    builtin_kind := ir_builtin_result_retkind(emit_name)
+    if builtin_kind.len() > 0:
+        return builtin_kind
     return ir_expr_legacy_result_kind(idx)
 
 fn ir_generic_result_ok_kind(name: String, concrete_types: List[String]) -> String:

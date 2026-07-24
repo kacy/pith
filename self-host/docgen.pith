@@ -101,15 +101,21 @@ fn d_escape_json_string(s: String) -> String:
             output = output + ch
     return output
 
-# strip the "# " prefix from a comment line.
+# strip a comment line's leading markers.
+#
+# much of std marks doc comments with "##" the way rust uses "///", so the whole
+# run of hashes goes, not just the first — otherwise the leftover marker is
+# printed as part of the documentation.
 fn strip_comment_markers(line: String) -> String:
     trimmed := d_trim_left(line)
-    if trimmed.len() >= 2:
-        if trimmed[0] == "#" and trimmed[1] == " ":
-            return trimmed.substring(2, trimmed.len())
-    if trimmed == "#":
-        return ""
-    return trimmed
+    mut i := 0
+    while i < trimmed.len():
+        if trimmed[i] != "#":
+            break
+        i = i + 1
+    if i < trimmed.len() and trimmed[i] == " ":
+        i = i + 1
+    return trimmed.substring(i, trimmed.len())
 
 fn source_lines(source: String) -> List[String]:
     mut lines: List[String] := []

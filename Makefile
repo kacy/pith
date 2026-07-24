@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-tests memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-tests docsite docsite-check memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -618,6 +618,28 @@ check-invalid-self-host-only:
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host invalid examples passed"
+
+# --- stdlib reference site ---
+# builds the doc extractor and renders docs/site/index.html from the
+# comments in std/. regenerate whenever a pub item's docs change.
+
+docsite:
+	@./target/release/pith build tools/docsite/docsite.pith > /dev/null
+	@./tools/docsite/docsite . docs/site
+
+# --- docsite golden check ---
+# runs the extractor over a fixture stdlib and diffs the markup. the fixture
+# ships its own minimal assets so the golden pins generated html rather than
+# the real stylesheet, which would churn on every design change.
+
+docsite-check:
+	@echo "--- docsite golden check ---"
+	@./target/release/pith build tools/docsite/docsite.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-docsite-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/docsite/docsite tools/docsite/sample "$$tmpdir" tools/docsite/sample/assets > /dev/null; \
+	diff -u tools/docsite/expected/index.html "$$tmpdir/index.html" && \
+	echo "docsite output matches golden files"
 
 # --- sitegen golden check ---
 # builds the dogfood site generator, runs it over the sample site, and

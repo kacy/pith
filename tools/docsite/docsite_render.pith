@@ -1,0 +1,428 @@
+# docsite_render — turn extracted modules into the reference page's markup.
+#
+# every module becomes a real <section> in the document rather than data for a
+# client-side renderer, so the page degrades to a plain long-form document when
+# scripting is off. the script only hides sections and searches them.
+import std.fs as fs
+from docsite_lib import Item, Module, load_modules
+
+# --- escaping ----------------------------------------------------------
+
+fn escape_html(text: String) -> String:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+fn escape_attribute(text: String) -> String:
+    return escape_html(text).replace(chr(34), "&quot;").replace(chr(10), " ")
+
+fn quoted(value: String) -> String:
+    return chr(34) + value + chr(34)
+
+# --- signature highlighting -------------------------------------------
+
+fn is_identifier_char(character: String) -> Bool:
+    code := ord(character)
+    if code >= 97 and code <= 122:
+        return true
+    if code >= 65 and code <= 90:
+        return true
+    if code >= 48 and code <= 57:
+        return true
+    return character == "_"
+
+fn is_upper(character: String) -> Bool:
+    code := ord(character)
+    return code >= 65 and code <= 90
+
+fn is_signature_keyword(word: String) -> Bool:
+    return word == "pub" or word == "fn" or word == "struct" or word == "enum" or word == "trait" or word == "impl" or word == "mut" or word == "for"
+
+fn introduces_a_name(word: String) -> Bool:
+    return word == "fn" or word == "struct" or word == "enum" or word == "trait"
+
+fn span(class_name: String, text: String) -> String:
+    return "<span class=" + quoted(class_name) + ">" + text + "</span>"
+
+fn next_visible_index(text: String, start: Int) -> Int:
+    mut i := start
+    while i < text.len():
+        if text[i] != " ":
+            return i
+        i = i + 1
+    return 0 - 1
+
+# `name := value` declares a constant; the name is what is being introduced.
+fn is_followed_by_assignment(text: String, start: Int) -> Bool:
+    at := next_visible_index(text, start)
+    if at < 0 or text[at] != ":":
+        return false
+    return at + 1 < text.len() and text[at + 1] == "="
+
+# `name: Type` annotates a parameter or field. a constant's `:=` is excluded,
+# so an assigned name does not read as a parameter.
+fn is_followed_by_annotation(text: String, start: Int) -> Bool:
+    at := next_visible_index(text, start)
+    if at < 0 or text[at] != ":":
+        return false
+    return at + 1 >= text.len() or text[at + 1] != "="
+
+# colour a declaration the way an editor would: keywords, the declared name,
+# parameter names, and types get a class each. punctuation is left bare and
+# picks up the muted colour `.sig` sets, which keeps the markup small — there
+# are a few thousand signatures on the page.
+pub fn highlight_signature(signature: String) -> String:
+    mut out := ""
+    mut previous_word := ""
+    mut i := 0
+    while i < signature.len():
+        character := signature[i]
+        if is_identifier_char(character):
+            start := i
+            while i < signature.len() and is_identifier_char(signature[i]):
+                i = i + 1
+            word := signature.substring(start, i)
+            if is_signature_keyword(word):
+                out = out + span("t-kw", word)
+            elif introduces_a_name(previous_word):
+                out = out + span("t-name", word)
+            elif is_followed_by_assignment(signature, i):
+                out = out + span("t-name", word)
+            elif is_followed_by_annotation(signature, i):
+                out = out + span("t-param", word)
+            elif is_upper(word[0]):
+                out = out + span("t-type", word)
+            else:
+                out = out + word
+            previous_word = word
+        elif character == "-" and i + 1 < signature.len() and signature[i + 1] == ">":
+            out = out + "&#8594;"
+            previous_word = ""
+            i = i + 2
+        elif character == "!":
+            out = out + span("t-bang", "!")
+            i = i + 1
+        else:
+            out = out + escape_html(character)
+            i = i + 1
+    return out
+
+# --- doc comment rendering ---------------------------------------------
+
+# render `code` spans inside a line of prose.
+fn render_inline(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        if text[i] == "`":
+            mut close := i + 1
+            while close < text.len() and text[close] != "`":
+                close = close + 1
+            if close < text.len():
+                out = out + "<code>" + escape_html(text.substring(i + 1, close)) + "</code>"
+                i = close + 1
+                continue
+        out = out + escape_html(text.substring(i, i + 1))
+        i = i + 1
+    return out
+
+fn leading_spaces(line: String) -> Int:
+    mut width := 0
+    while width < line.len() and line[width] == " ":
+        width = width + 1
+    return width
+
+# a doc comment is prose, except that indented lines are usage examples and
+# stay verbatim in a <pre>. blank lines separate paragraphs.
+#
+# a blank line inside an example is held back rather than closing the block:
+# most headers in std separate an import from the code that follows it, and
+# those belong in one listing. the held-back lines are only emitted if more
+# indented content follows, so a blank line that genuinely ends an example
+# does not leave a trailing gap.
+pub fn render_comment_block(lines: List[String]) -> String:
+    mut out := ""
+    mut paragraph := ""
+    mut code := ""
+    mut pending_blanks := 0
+
+    for line in lines:
+        blank := line.trim() == ""
+        indented := leading_spaces(line) >= 2 and not blank
+
+        if indented:
+            if paragraph != "":
+                out = out + "<p>" + render_inline(paragraph) + "</p>"
+                paragraph = ""
+            if code != "":
+                code = code + chr(10)
+            while pending_blanks > 0:
+                code = code + chr(10)
+                pending_blanks = pending_blanks - 1
+            code = code + escape_html(line.substring(2, line.len()))
+            continue
+
+        if blank:
+            if code != "":
+                pending_blanks = pending_blanks + 1
+                continue
+            if paragraph != "":
+                out = out + "<p>" + render_inline(paragraph) + "</p>"
+                paragraph = ""
+            continue
+
+        if code != "":
+            out = out + "<pre><code>" + code + "</code></pre>"
+            code = ""
+            pending_blanks = 0
+        if paragraph != "":
+            paragraph = paragraph + " "
+        paragraph = paragraph + line.trim()
+
+    if code != "":
+        out = out + "<pre><code>" + code + "</code></pre>"
+    if paragraph != "":
+        out = out + "<p>" + render_inline(paragraph) + "</p>"
+    return out
+
+fn render_doc(doc: String) -> String:
+    if doc.trim() == "":
+        return ""
+    return "<div class=" + quoted("doc") + ">" + render_comment_block(doc.split(chr(10))) + "</div>"
+
+fn first_line(text: String) -> String:
+    lines := text.split(chr(10))
+    if lines.len() == 0:
+        return ""
+    return lines[0]
+
+# --- items -------------------------------------------------------------
+
+# the trait belongs in a method's anchor: a type can carry both an inherent
+# `read` and the `read` that satisfies Reader, and they are different methods.
+fn item_id(module_name: String, item: Item) -> String:
+    if item.owner != "" and item.via != "":
+        return module_name + "." + item.owner + "." + item.via + "." + item.name
+    if item.owner != "":
+        return module_name + "." + item.owner + "." + item.name
+    return module_name + "." + item.name
+
+# the palette matches on the name and the first line of the doc comment. the
+# signature is left out on purpose: it repeats the name and would roughly
+# double the page's weight across a few thousand items.
+fn search_text(item: Item) -> String:
+    return (item.name + " " + first_line(item.doc)).to_lower()
+
+fn render_item(module_name: String, item: Item, css_class: String) -> String:
+    id := item_id(module_name, item)
+    mut out := "<article class=" + quoted(css_class) + " id=" + quoted(id)
+    out = out + " data-search=" + quoted(escape_attribute(search_text(item)))
+    out = out + " data-name=" + quoted(escape_attribute(item.name))
+    out = out + " data-kind=" + quoted(item.kind) + ">"
+    out = out + "<div class=" + quoted("item-head") + ">"
+    out = out + "<code class=" + quoted("sig") + ">" + highlight_signature(item.signature) + "</code>"
+    out = out + "<a class=" + quoted("anchor") + " href=" + quoted("#" + id) + " aria-label=" + quoted("Link to " + item.name) + ">#</a>"
+    out = out + "</div>"
+    out = out + render_doc(item.doc)
+    return out + "</article>"
+
+fn render_members(label: String, entries: List[String]) -> String:
+    if entries.len() == 0:
+        return ""
+    mut out := "<h3>" + label + "</h3><ul class=" + quoted("fields") + ">"
+    for entry in entries:
+        out = out + "<li>" + escape_html(entry) + "</li>"
+    return out + "</ul>"
+
+# a type renders as a card: its own declaration, then its fields or variants,
+# then its inherent methods, then one group per trait it implements.
+fn render_type_card(module: Module, type_item: Item) -> String:
+    module_name := module.name
+    mut out := "<div class=" + quoted("type-card") + " id=" + quoted(item_id(module_name, type_item) + ".type") + ">"
+    out = out + render_item(module_name, type_item, "item")
+
+    mut members := ""
+    if type_item.kind == "enum":
+        members = members + render_members("Variants", type_item.detail)
+    else:
+        members = members + render_members("Fields", type_item.detail)
+
+    inherent := methods_for(module, type_item.name, "")
+    if inherent.len() > 0:
+        members = members + "<h3>Methods</h3>"
+        for method in inherent:
+            members = members + render_item(module_name, method, "item")
+
+    for trait_name in traits_of(module, type_item.name):
+        members = members + "<h3>impl " + escape_html(trait_name) + "</h3>"
+        for method in methods_for(module, type_item.name, trait_name):
+            members = members + render_item(module_name, method, "item")
+
+    if members != "":
+        out = out + "<div class=" + quoted("members") + ">" + members + "</div>"
+    return out + "</div>"
+
+fn render_section(title: String, body: String) -> String:
+    if body == "":
+        return ""
+    return "<section class=" + quoted("section") + "><h2>" + title + "</h2><div class=" + quoted("section-rule") + "></div>" + body + "</section>"
+
+# --- modules ------------------------------------------------------------
+
+fn items_of_kind(module: Module, kind: String) -> List[Item]:
+    mut out: List[Item] := []
+    for item in module.items:
+        if item.kind == kind:
+            out.push(item)
+    return out
+
+fn is_type_kind(kind: String) -> Bool:
+    return kind == "struct" or kind == "enum" or kind == "trait"
+
+fn methods_for(module: Module, owner: String, via: String) -> List[Item]:
+    mut out: List[Item] := []
+    for item in module.items:
+        if item.kind == "method" and item.owner == owner and item.via == via:
+            out.push(item)
+    return out
+
+# the traits a type implements, in the order the impl blocks appear.
+fn traits_of(module: Module, owner: String) -> List[String]:
+    mut traits: List[String] := []
+    for item in module.items:
+        if item.kind != "method" or item.owner != owner or item.via == "":
+            continue
+        mut seen := false
+        for known in traits:
+            if known == item.via:
+                seen = true
+        if not seen:
+            traits.push(item.via)
+    return traits
+
+fn has_type_named(module: Module, name: String) -> Bool:
+    for item in module.items:
+        if is_type_kind(item.kind) and item.name == name:
+            return true
+    return false
+
+# methods can hang off a type that is not itself pub — a private handle with a
+# public api. group those under a heading of their own so nothing is dropped.
+fn unexported_method_owners(module: Module) -> List[String]:
+    mut owners: List[String] := []
+    for item in module.items:
+        if item.kind != "method" or has_type_named(module, item.owner):
+            continue
+        mut seen := false
+        for known in owners:
+            if known == item.owner:
+                seen = true
+        if not seen:
+            owners.push(item.owner)
+    return owners
+
+# render one module as a section: header comment, then constants, types, and
+# functions, in that order.
+pub fn render_module(module: Module) -> String:
+    mut out := "<section class=" + quoted("module") + " id=" + quoted(module.name)
+    out = out + " data-module=" + quoted(module.name) + ">"
+
+    out = out + "<header class=" + quoted("module-head") + ">"
+    out = out + "<div class=" + quoted("eyebrow") + ">module</div>"
+    out = out + "<h1>" + escape_html(module.name) + "</h1>"
+    if module.summary != "":
+        out = out + "<p class=" + quoted("module-summary") + ">" + render_inline(module.summary) + "</p>"
+    out = out + "<div class=" + quoted("module-meta") + ">"
+    out = out + "<span><code>" + escape_html(module.path) + "</code></span>"
+    out = out + "<span>" + module.items.len().to_string() + " documented items</span>"
+    out = out + "<span><code>import " + escape_html(module.name) + "</code></span>"
+    out = out + "</div>"
+    if module.overview.len() > 0:
+        out = out + "<div class=" + quoted("overview") + ">" + render_comment_block(module.overview) + "</div>"
+    out = out + "</header>"
+
+    mut constants := ""
+    for item in items_of_kind(module, "const"):
+        constants = constants + render_item(module.name, item, "item")
+    out = out + render_section("Constants", constants)
+
+    mut types := ""
+    for item in module.items:
+        if is_type_kind(item.kind):
+            types = types + render_type_card(module, item)
+    for owner in unexported_method_owners(module):
+        types = types + render_type_card(module, Item("struct", owner, "struct " + owner, "Methods on an internal type reached through this module's api.", "", "", []))
+    out = out + render_section("Types", types)
+
+    mut functions := ""
+    for item in items_of_kind(module, "fn"):
+        functions = functions + render_item(module.name, item, "item")
+    out = out + render_section("Functions", functions)
+
+    return out + "</section>"
+
+# --- navigation and landing --------------------------------------------
+
+# render the sidebar, one heading per namespace. modules arrive sorted, so a
+# change of group is the only signal needed to start a new list.
+pub fn render_nav(modules: List[Module]) -> String:
+    mut out := ""
+    mut current_group := ""
+    for module in modules:
+        if module.group != current_group:
+            if current_group != "":
+                out = out + "</ul></div>"
+            out = out + "<div class=" + quoted("nav-group") + "><h2>" + escape_html(module.group) + "</h2><ul>"
+            current_group = module.group
+        label := module.name.substring(module.group.len() + 1, module.name.len())
+        out = out + "<li><a href=" + quoted("#" + module.name) + " data-module=" + quoted(module.name) + ">" + escape_html(label) + "</a></li>"
+    if current_group != "":
+        out = out + "</ul></div>"
+    return out
+
+# render the landing view: what the stdlib covers, and a card per module.
+pub fn render_home(modules: List[Module], item_count: Int) -> String:
+    mut out := "<div id=" + quoted("home") + ">"
+    out = out + "<section class=" + quoted("hero") + ">"
+    out = out + "<div class=" + quoted("eyebrow") + ">standard library</div>"
+    out = out + "<h1>Everything pith ships with.</h1>"
+    out = out + "<p>Generated from the source comments, so the page and the code cannot drift. "
+    out = out + "Press <kbd>&#8984;K</kbd> to search every function, type, and constant.</p>"
+    out = out + "<div class=" + quoted("stats") + ">"
+    out = out + "<div class=" + quoted("stat") + "><div class=" + quoted("n") + ">" + modules.len().to_string() + "</div><div class=" + quoted("l") + ">modules</div></div>"
+    out = out + "<div class=" + quoted("stat") + "><div class=" + quoted("n") + ">" + item_count.to_string() + "</div><div class=" + quoted("l") + ">documented items</div></div>"
+    out = out + "</div></section>"
+
+    out = out + "<div class=" + quoted("card-grid") + ">"
+    for module in modules:
+        out = out + "<a class=" + quoted("card") + " href=" + quoted("#" + module.name) + ">"
+        out = out + "<div class=" + quoted("n") + ">" + escape_html(module.name) + "</div>"
+        out = out + "<div class=" + quoted("d") + ">" + escape_html(module.summary) + "</div></a>"
+    out = out + "</div></div>"
+    return out
+
+# --- build --------------------------------------------------------------
+
+fn fill(shell: String, marker: String, value: String) -> String:
+    return shell.replace("<!--docsite:" + marker + "-->", value)
+
+# build the reference site. returns the number of modules rendered.
+pub fn build_site(root: String, assets_dir: String, out_dir: String) -> Int!:
+    modules := load_modules(root)!
+    mut item_count := 0
+    for module in modules:
+        item_count = item_count + module.items.len()
+
+    mut body := ""
+    for module in modules:
+        body = body + render_module(module)
+
+    mut page := fs.read(assets_dir + "/shell.html")!
+    page = fill(page, "styles", fs.read(assets_dir + "/app.css")!)
+    page = fill(page, "script", fs.read(assets_dir + "/app.js")!)
+    page = fill(page, "nav", render_nav(modules))
+    page = fill(page, "home", render_home(modules, item_count))
+    page = fill(page, "modules", body)
+    page = fill(page, "version", modules.len().to_string() + " modules")
+
+    fs.make_dirs(out_dir)
+    fs.write(out_dir + "/index.html", page)!
+    return modules.len()

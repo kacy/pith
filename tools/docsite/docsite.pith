@@ -1,0 +1,27 @@
+# docsite — build the stdlib reference site from source comments.
+#
+#   pith build tools/docsite/docsite.pith
+#   ./tools/docsite/docsite . docs/site
+#   ./tools/docsite/docsite sample out sample/assets
+#
+# reads every module under <repo-root>/std, pulls out the documentation
+# `pith doc` prints, and writes one self-contained page to <out-dir>.
+#
+# the assets directory defaults to <repo-root>/tools/docsite/assets. the golden
+# check overrides it so the fixture pins the generated markup rather than the
+# stylesheet, which would otherwise churn on every design tweak.
+from docsite_render import build_site
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 3:
+        print("usage: docsite <repo-root> <out-dir> [assets-dir]")
+        return 1
+    root := argv[1]
+    out_dir := argv[2]
+    mut assets_dir := root + "/tools/docsite/assets"
+    if argv.len() >= 4:
+        assets_dir = argv[3]
+    count := build_site(root, assets_dir, out_dir)!
+    print("wrote {out_dir}/index.html from {count} modules")
+    return 0

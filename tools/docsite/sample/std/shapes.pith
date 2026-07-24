@@ -1,0 +1,58 @@
+# std.shapes — a fixture module covering the extractor's surface
+#
+# the header is prose, and an indented block inside it is a usage example
+# that must survive verbatim:
+#
+#   import std.shapes as shapes
+#
+#   fn main():
+#       print("{shapes.unit_square().area()}")
+#
+# a second paragraph, to pin the paragraph break.
+
+pub MAX_SIDES := 12
+pub ORIGIN_NAME := "origin"
+
+# a rectangle with a width and a height.
+pub struct Rect:
+    pub width: Int
+    pub height: Int
+
+impl Rect:
+    # the area enclosed by the rectangle.
+    fn area() -> Int:
+        return self.width * self.height
+
+    fn undocumented_helper() -> Int:
+        return 0
+
+impl Shape for Rect:
+    # the same name as an inherent method would be, but reached through Shape.
+    fn area() -> Int:
+        return self.width * self.height
+
+    fn name() -> String:
+        return "rect"
+
+# how a shape is drawn.
+pub enum Stroke:
+    Solid
+    Dashed
+    Dotted
+
+# a rectangle whose sides are both one.
+pub fn unit_square() -> Rect:
+    return Rect(1, 1)
+
+# clamp a side count into range, failing when the count is negative.
+pub fn clamp_sides(count: Int) -> Int!:
+    if count < 0:
+        fail "side count must be non-negative"
+    if count > MAX_SIDES:
+        return MAX_SIDES
+    return count
+
+impl Hidden:
+    # a method on a type this module never exports.
+    fn secret() -> Int:
+        return 1

@@ -996,7 +996,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_catch_heap_no_leak tests/cases/test_list_struct_no_leak \
 	tests/cases/test_optional_temp_release \
 	tests/cases/test_loop_iter_early_return \
-	tests/cases/test_result_ok_reclaim
+	tests/cases/test_result_ok_reclaim \
+	tests/cases/test_os_thread_spawn_reclaim
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

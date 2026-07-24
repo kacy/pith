@@ -1,0 +1,89 @@
+# awaiting a task transfers the result's refcount to the single awaiter, so the
+# await result is owned (like a fresh call result), not borrowed. this exercises
+# every syntactic shape an awaited heap value can take so valgrind catches both
+# a leak (missing release) and a double-free (an owned value released twice):
+#
+#   - bound:            s := await t                 (released at scope exit)
+#   - used in an expr:  (await t).len()              (temporary released after use)
+#   - passed to a call: consume(await t)             (owned arg, released after call)
+#   - returned:         return await t               (count transfers to caller)
+#   - scalar:           await (Task[Int])            (no count, must be untouched)
+#   - second await:     await the same handle twice  (safe after slot reclaim)
+#
+# run under `make memcheck` (os-thread) and with PITH_GREEN=1. the printed total
+# only flags a behavior regression; valgrind flags the memory bug.
+
+fn make_str(i: Int) -> String:
+    return "value-" + i.to_string() + "-payload"
+
+fn make_list(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn work(i: Int) -> Int:
+    return i * 2 + 1
+
+# consumes a string argument; the awaited value is passed straight in, so the
+# arg arrives owned and must be released after the call returns.
+fn consume(s: String) -> Int:
+    return s.len()
+
+# returns an awaited string directly: the transferred count flows out to the
+# caller unchanged (an owned return, not a re-retained borrow).
+fn forward(i: Int) -> String:
+    return await (spawn make_str(i))
+
+fn main() -> Int!:
+    mut total := 0
+
+    # bound: many spawn/await cycles reuse a small set of reclaimed slab slots.
+    mut i := 0
+    while i < 300:
+        s := await (spawn make_str(i))
+        total = total + s.len()
+        i = i + 1
+
+    # used directly in an expression, never named: an owned temporary.
+    mut j := 0
+    while j < 300:
+        total = total + (await (spawn make_str(j))).len()
+        j = j + 1
+
+    # passed as a call argument.
+    mut k := 0
+    while k < 300:
+        total = total + consume(await (spawn make_str(k)))
+        k = k + 1
+
+    # returned from a helper, then released by the caller.
+    mut m := 0
+    while m < 300:
+        r := forward(m)
+        total = total + r.len()
+        m = m + 1
+
+    # a list-returning task, bound.
+    mut n := 0
+    while n < 300:
+        xs := await (spawn make_list(n))
+        total = total + xs.len()
+        n = n + 1
+
+    # scalar await: no refcount, the classification must be a no-op here.
+    mut p := 0
+    while p < 300:
+        total = total + await (spawn work(p))
+        p = p + 1
+
+    # second await of the same handle: the slot is reclaimed on the first await,
+    # so the second must be safe (returns a default) and must not double-free.
+    mut q := 0
+    while q < 100:
+        t := spawn make_str(q)
+        first := await t
+        total = total + first.len()
+        second := await t
+        total = total + second.len()
+        q = q + 1
+
+    print("await-ownership total={total}")
+    return 0

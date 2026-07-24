@@ -311,20 +311,39 @@ purpose, and equally so for all four:
 
 | lang | ms | messages/sec | peak rss |
 |---|---:|---:|---:|
-| pith (os threads) | 622 | 1.6 m | 3.0 mb |
-| pith (`PITH_GREEN=1`) | 766 | 1.3 m | 2.8 mb |
-| go | 72 | 13.9 m | 2.0 mb |
-| rust | 74 | 13.5 m | 2.4 mb |
-| zig | 222 | 4.5 m | 2.7 mb |
+| pith (os threads) | 580 | 1.7 m | 3.0 mb |
+| pith (`PITH_GREEN=1`) | 782 | 1.3 m | 2.8 mb |
+| go | 69 | 14.5 m | 2.0 mb |
+| rust | 82 | 12.2 m | 2.3 mb |
+| zig | 201 | 5.0 m | 2.7 mb |
 
-the whole table was taken three times. pith, go, and rust repeat within
-a couple of percent (619-622, 71-72, 74-77); the green backend ranged
-766-833 and zig 222-278, so read those two as approximate.
+medians of the four run together; the green backend and zig are the
+noisier rows. the os-thread number came down from an earlier 622ms after
+a wake-strategy fix (below); the day-to-day drift between the two runs is
+a few percent (go moved 72→69 too), so the fix's real size is the
+controlled before/after, not the table delta.
 
-pith loses this one, and not narrowly. at 622ms it is about 8.6x go and
-8.4x rust, and 2.8x zig's hand-rolled queue. per message that is ~620ns
-for a send plus a receive where go spends ~72ns. this is
+pith loses this one, and not narrowly. at 580ms it is about 8.4x go and
+7x rust, and 2.9x zig's hand-rolled queue. per message that is ~580ns for
+a send plus a receive where go spends ~69ns. this is
 goroutines-and-channels territory and go wins it on merit.
+
+one round of this was recovered. the channel used to `notify_all` on
+every send and recv, unconditionally — waking all N waiters when one
+value can satisfy one of them, so N-1 wake and immediately re-block. a
+`perf` run had ~43% of the time in futex and context-switch machinery.
+giving each channel a sender condvar and a receiver condvar, waking only
+the opposite role, only `notify_one` on a buffered channel (a rendezvous
+still broadcasts), and skipping the wake entirely when nobody is parked,
+cut a controlled before/after by ~19% (659→535ms, same box, back to
+back). it does not change the order of the result — the remaining cost is
+the single hot channel's own mutex and condvar futex, and dropping the
+global handle-registry lock (the obvious next move) measured *2x worse*
+on one hot channel, because that lock was accidentally spreading futex
+contention across two futexes instead of one; concentrating it on the
+channel's own futex saturates the kernel's futex-hash spinlock. closing
+the gap needs a lower-contention channel core (a sharded or lock-free
+mpmc queue), not more lock removal.
 
 the green backend does not rescue it: at the default worker count it is
 *slower* than os threads. the shape is why — eight tasks that

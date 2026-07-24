@@ -23,11 +23,12 @@ reference cycles refcounting alone can't. json struct decode stays faster
 than go's reflection decode — a flat struct of required scalars decodes
 in a single pass, filled straight into the struct.
 
-the newest table, `bench/chan_fanout` (2026-07-23), is the one pith
-loses outright: pushing a million messages through a channel between
-eight tasks takes 622ms against go's 72ms. the batch benchmarks measure
-compute, and pith is competitive there; coordination is a different
-story and the number is below.
+the newest table, `bench/chan_fanout`, is the one pith loses outright:
+pushing a million messages through a channel between eight tasks takes
+~580ms against go's ~69ms (a channel wake fix on 2026-07-24 took the
+os-thread number down from 622; still ~8x go). the batch benchmarks
+measure compute, and pith is competitive there; coordination is a
+different story and the number is below.
 
 the comparators drift a few percent between days; within a table they
 are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
@@ -248,14 +249,15 @@ follow-up, and until then this bound is a green-only property.
 comparators: four producer tasks push one million messages through a
 bounded channel (capacity 256) and four consumer tasks drain them,
 folding each into an order-independent sum. all four languages print the
-same checksum. 2026-07-23, median of 9 on this 2-core box:
+same checksum. medians on this 2-core box (os-thread number is
+2026-07-24, after the wake fix below; the rest 2026-07-23):
 
 | | pith | pith green | go | rust | zig |
 |---|---:|---:|---:|---:|---:|
-| total | 622ms | 766ms | **72ms** | 74ms | 222ms |
-| peak rss | 3.0 mb | 2.8 mb | 2.0 mb | 2.4 mb | 2.7 mb |
+| total | 580ms | 782ms | **69ms** | 82ms | 201ms |
+| peak rss | 3.0 mb | 2.8 mb | 2.0 mb | 2.3 mb | 2.7 mb |
 
-pith is last here by a wide margin — 8.6x go, 8.4x rust, 2.8x zig's
+pith is last here by a wide margin — ~8x go, ~7x rust, ~3x zig's
 hand-written mutex/condvar queue — and the green backend at its default
 worker count makes it worse, not better. eight tasks that all block on
 one shared channel land on both workers, so each handoff wakes the peer
@@ -267,8 +269,21 @@ zig — zig takes twice pith's switches and still finishes 2.8x sooner, so
 the gap is the per-operation cost of pith's channel, not only the
 blocking. memory is the one column that holds: 4x the messages moves
 peak rss by under 100 kb everywhere, so nothing is retained per message.
-the table was taken three times; pith, go, and rust repeat within a
-couple of percent, green (766-833ms) and zig (222-278ms) drift more.
+
+one part of the per-op cost was recovered. `perf` put ~43% of the run in
+futex and context-switch machinery: the channel `notify_all`ed on every
+send and recv even when nobody waited, and woke all N waiters when one
+value can satisfy one, so N-1 re-blocked. splitting the channel's condvar
+by role, waking only the opposite role (`notify_one` on a buffered
+channel, broadcast only for an unbuffered rendezvous), and skipping the
+wake when no one is parked cut a controlled before/after ~19%
+(659→535ms). it does not change the order of the result. the obvious next
+move — dropping the per-op global handle-registry lock — measured *2x
+worse* on one hot channel: that lock had been spreading futex contention
+across two futexes, and removing it concentrates everything on the
+channel's own condvar futex, saturating the kernel's futex-hash spinlock.
+the real lever is a lower-contention channel core (sharded or lock-free
+mpmc), left as a follow-up.
 
 **result and optional locals** — a `T!` or `T?` bound to a name lowers to a
 three-slot heap value: a flag, the payload, and the error. releasing one

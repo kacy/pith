@@ -1,33 +1,12 @@
 //! IR Consumer — translates Pith text IR to Cranelift native code
 //!
-//! This module parses the simple text IR emitted by self-host/ir_emitter.pith
+//! This module parses the simple text IR emitted by self-host/ir_emitter_core.pith
 //! and translates it to Cranelift API calls. This is the Rust-side half of
 //! Stage 2: moving compilation logic from Rust to Pith.
 //!
-//! IR format reference:
-//!   string N "content"              — string data declaration
-//!   func NAME NPARAM RETTYPE        — function header
-//!   param NAME                      — function parameter
-//!   endfunc                         — end function
-//!   iconst REG VALUE                — integer constant
-//!   strref REG STRIDX              — reference to string data
-//!   call REG FNAME NARGS ARG...    — function call with return
-//!   callv FNAME NARGS ARG...       — void function call
-//!   add REG A B                    — integer addition
-//!   sub REG A B                    — integer subtraction
-//!   mul REG A B                    — integer multiplication
-//!   div REG A B                    — integer division
-//!   mod REG A B                    — integer modulo
-//!   eq REG A B                     — compare equal
-//!   neq REG A B                    — compare not equal
-//!   lt/gt/lte/gte REG A B          — comparisons
-//!   concat REG A B                 — string concatenation
-//!   store VARNAME REG              — store to variable
-//!   load REG VARNAME               — load from variable
-//!   ret REG                        — return value
-//!   brif COND THEN ELSE            — conditional branch
-//!   jmp LABEL                      — unconditional jump
-//!   label NAME                     — label definition
+//! The IR grammar, the type/retkind vocabulary, and the ABI conventions are
+//! specified in docs/ir-contract.md, which is authoritative. Update that file
+//! whenever the instruction set or the conventions in this consumer change.
 
 use crate::{CodeGen, CompileError};
 use cranelift::prelude::*;

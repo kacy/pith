@@ -25,6 +25,9 @@ fn main() -> Int!:
     print("done-after:{quick.is_done()}")
     print("await:{await quick}")
 
+    # detach is fire-and-forget: once the task finishes, its slot is reclaimed and
+    # the handle stops resolving, so is_done reports false (not "done"). both task
+    # backends agree on this — a detached handle is not a durable done-flag.
     detached := spawn slow_value(1, 3)
     detached.detach()
     time.delay(5)

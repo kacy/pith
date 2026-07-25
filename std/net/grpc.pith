@@ -45,9 +45,14 @@
 # pith closure cannot capture a fn-value, so the handler cannot be threaded in any
 # other way.
 #
-# deferred: streaming rpcs (client/server/bidi), message compression, deadlines
-# and metadata beyond the basics, grpc-message percent-decoding, and .proto code
-# generation.
+# serving a server-streaming rpc: serve_body/serve_body_tls take a BODY-level
+# dispatch — raw framed bytes in and out — so one dispatch can carry unary and
+# buffered streaming methods side by side (unframe_messages / frame_messages /
+# frame_one do the framing). the generated serve_<Service> uses this.
+#
+# deferred: incremental streaming serve (a buffered stream returns the whole
+# reply at once), serving client-streaming/bidi rpcs, message compression,
+# deadlines and metadata beyond the basics, and grpc-message percent-decoding.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2
@@ -937,3 +942,60 @@ pub fn serve(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcE
 pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
     grpc_dispatch_fn = dispatch
     return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_handler)!
+
+# --- body-level serving (streaming-capable dispatch) --------------------------
+#
+# serve() deframes one request message and frames one reply — the unary shape. a
+# streaming rpc is the same http/2 exchange with more frames in the body: a
+# server-streaming reply is N framed messages concatenated, a client-streaming
+# request likewise. so a dispatch that works on the RAW framed body can serve
+# every buffered shape; it deframes what it expects and frames what it returns
+# (unframe_messages / frame_messages below). the generated <Svc> router uses
+# this, deframing per method. buffered means the whole request and reply pass
+# through memory — the right tool for bounded streams, not endless ones.
+
+mut grpc_body_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
+
+fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch ""
+    result := grpc_body_dispatch_fn(path, req.body_bytes())
+    if result.is_err:
+        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
+    return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(result.ok).with_trailers(grpc_ok_trailers())
+
+# deframe every length-prefixed message in a request body. an empty body is a
+# valid empty stream (and, for unary, an all-default proto3 message).
+pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
+    mut out: List[Bytes] := []
+    d := new_deframer()
+    d.push(body)
+    while d.ready():
+        out.push(d.next()!)
+    return out
+
+# frame a sequence of messages into one response body: each message
+# length-prefixed, concatenated in order.
+pub fn frame_messages(messages: List[Bytes]) -> Bytes:
+    buf := bytes.buffer()
+    for message in messages:
+        framed := frame_message(message)
+        buf.write(framed) catch 0
+    out := buf.bytes()
+    buf.free()
+    return out
+
+# frame one message — the unary reply shape, public for body-level dispatches.
+pub fn frame_one(message: Bytes) -> Bytes:
+    return frame_message(message)
+
+# serve grpc over plaintext http/2 (h2c) with a body-level dispatch: `dispatch`
+# receives the raw framed request body and returns the raw framed response body,
+# so its methods can be unary or streaming (buffered). blocks.
+pub fn serve_body(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
+    grpc_body_dispatch_fn = dispatch
+    return h2server.listen_h2c(host, port, grpc_serve_body_handler)!
+
+# like serve_body, over http/2 with tls (alpn "h2").
+pub fn serve_body_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
+    grpc_body_dispatch_fn = dispatch
+    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_body_handler)!

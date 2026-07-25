@@ -1035,17 +1035,6 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
 # from other transport failures, so it must stay stable.
 pub REQUEST_DEADLINE_EXCEEDED := "http2: request deadline exceeded"
 
-# a one-event holder for the deadline-bounded receive below. select arms must
-# share one type, and a tuple carrying an optional trips the checker's arm
-# unification — so the received arm stashes the event here and both arms
-# reduce to a plain Int flag.
-struct EventSlot:
-    mut event: StreamEvent?
-
-fn stash_event(slot: EventSlot, received: StreamEvent?) -> Int:
-    slot.event = received
-    return 1
-
 # like assemble_response, but give up once the monotonic clock passes
 # `deadline_ms` (a time.mono_millis() timestamp). each wait for the next stream
 # event is bounded by the time remaining, so a server that answers slowly — or
@@ -1062,13 +1051,12 @@ fn assemble_response_until(inbox: Channel[StreamEvent], deadline_ms: Int) -> Res
         remaining := deadline_ms - time.mono_millis()
         if remaining <= 0:
             fail REQUEST_DEADLINE_EXCEEDED
-        slot := EventSlot(none)
         picked := select:
-            received := inbox.recv() => stash_event(slot, received)
-            timeout remaining => 0
-        if picked == 0:
+            received := inbox.recv() => (1, received)
+            timeout remaining => (0, none)
+        if picked.0 == 0:
             fail REQUEST_DEADLINE_EXCEEDED
-        opt := slot.event
+        opt := picked.1
         if opt == none:
             fail "http2: connection closed before the response completed"
         event := opt?

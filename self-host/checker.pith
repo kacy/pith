@@ -5128,7 +5128,15 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
 fn check_tuple_expression(node: Node, scope_id: Int) -> Int:
     mut elems: List[Int] := []
     for child in node.children:
-        elems.push(c_check_expr(child, scope_id))
+        cn := get_node(child)
+        if cn.kind == "none_lit":
+            # a bare none element can only be an optional. type it as an
+            # optional with a wildcard inner so structural comparison against a
+            # declared `T?` element succeeds, while a non-optional target still
+            # mismatches on kind.
+            elems.push(add_type_info(ti_optional(TID_ERR)))
+        else:
+            elems.push(c_check_expr(child, scope_id))
     return add_type_info(ti_tuple(elems))
 
 fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
@@ -5308,6 +5316,14 @@ fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
 
 fn types_structurally_equal(a: Int, b: Int) -> Bool:
     if a == b:
+        return true
+    # an error-typed side is a wildcard: either a subexpression whose error was
+    # already reported at its own site (comparing again only cascades noise), or
+    # the wildcard inner of an untargeted `none` element, which any concrete
+    # inner satisfies.
+    if is_error_type(a):
+        return true
+    if is_error_type(b):
         return true
     if a < 0:
         return false

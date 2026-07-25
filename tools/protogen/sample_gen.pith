@@ -120,6 +120,85 @@ pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
             r.skip(tag.wire)!
     return m
 
+# oneof design of Sticker. StickerDesignUnset means no member is set.
+pub enum StickerDesign:
+    StickerDesignUnset
+    Emoji(String)
+    Anchor(Point)
+    Tint(Int)
+
+# constructors for StickerDesign; call these from other modules rather than
+# constructing the variants directly.
+pub fn Sticker_design_unset() -> StickerDesign:
+    return StickerDesign.StickerDesignUnset
+pub fn Sticker_emoji(v: String) -> StickerDesign:
+    return StickerDesign.Emoji(v)
+pub fn Sticker_anchor(v: Point) -> StickerDesign:
+    return StickerDesign.Anchor(v)
+pub fn Sticker_tint(v: Int) -> StickerDesign:
+    return StickerDesign.Tint(v)
+
+# oneof backing of Sticker. StickerBackingUnset means no member is set.
+pub enum StickerBacking:
+    StickerBackingUnset
+    Reusable(Bool)
+    Stock(Int)
+
+# constructors for StickerBacking; call these from other modules rather than
+# constructing the variants directly.
+pub fn Sticker_backing_unset() -> StickerBacking:
+    return StickerBacking.StickerBackingUnset
+pub fn Sticker_reusable(v: Bool) -> StickerBacking:
+    return StickerBacking.Reusable(v)
+pub fn Sticker_stock(v: Int) -> StickerBacking:
+    return StickerBacking.Stock(v)
+
+# message Sticker
+pub struct Sticker:
+    pub name: String
+    pub design: StickerDesign
+    pub backing: StickerBacking
+
+# encode a Sticker to protobuf wire bytes.
+pub fn encode_Sticker(m: Sticker) -> Bytes:
+    w := writer()
+    if m.name != "":
+        w.write_string(1, m.name) catch false
+    match m.design:
+        StickerDesign.Emoji(v_emoji) => w.write_string(2, v_emoji) catch false
+        StickerDesign.Anchor(v_anchor) => w.write_message(3, encode_Point(v_anchor)) catch false
+        StickerDesign.Tint(v_tint) => w.write_enum(4, v_tint) catch false
+        StickerDesign.StickerDesignUnset => false
+    match m.backing:
+        StickerBacking.Reusable(v_reusable) => w.write_bool(5, v_reusable) catch false
+        StickerBacking.Stock(v_stock) => w.write_int32(6, v_stock) catch false
+        StickerBacking.StickerBackingUnset => false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Sticker from protobuf wire bytes.
+pub fn decode_Sticker(data: Bytes) -> Sticker!ProtoError:
+    m := Sticker(name: "", design: StickerDesign.StickerDesignUnset, backing: StickerBacking.StickerBackingUnset)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.name = r.read_string()!
+        elif tag.field == 2:
+            m.design = StickerDesign.Emoji(r.read_string()!)
+        elif tag.field == 3:
+            m.design = StickerDesign.Anchor(decode_Point(r.read_message()!)!)
+        elif tag.field == 4:
+            m.design = StickerDesign.Tint(r.read_enum()!)
+        elif tag.field == 5:
+            m.backing = StickerBacking.Reusable(r.read_bool()!)
+        elif tag.field == 6:
+            m.backing = StickerBacking.Stock(r.read_int64()!)
+        else:
+            r.skip(tag.wire)!
+    return m
+
 # a typed server-stream of Point messages from Geometry.Corners.
 pub struct GeometryCornersCall:
     pub inner: grpc.ServerStream

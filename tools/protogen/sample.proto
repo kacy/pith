@@ -31,6 +31,22 @@ message Shape {
   sint32 offset = 11;
 }
 
+// exercises oneof: each group becomes a payload enum plus constructor
+// functions (Sticker_emoji, Sticker_anchor, ...). string, message, and enum
+// members, and a second group in the same message.
+message Sticker {
+  string name = 1;
+  oneof design {
+    string emoji = 2;
+    Point anchor = 3;
+    Color tint = 4;
+  }
+  oneof backing {
+    bool reusable = 5;
+    int32 stock = 6;
+  }
+}
+
 // exercises all four rpc shapes: unary, server-streaming, client-streaming,
 // and bidirectional-streaming.
 service Geometry {

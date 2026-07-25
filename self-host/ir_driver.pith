@@ -134,6 +134,18 @@ fn rewrite_declared_function_ref(line: String, declared: DeclaredIrNames, prefix
     renamed := maybe_prefixed_init_name(name, init_prefix)
     return replace_token(line, name_start, name_end, prefixed_target_name(prefix, renamed))
 
+# a call's callee is usually a declared function, but it can also be a
+# module-global holding a fn-value, called by name. a function ref carries the
+# init-prefix rename; a global ref just takes the module prefix, matching the
+# global's own `global`/`store`/`load` lines. without the global fallback, a
+# global fn-value called from inside an imported module keeps its bare name and
+# the consumer — which looks up the prefixed global slot — can't resolve it.
+fn rewrite_call_callee(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String, callee_start: Int, callee_end: Int) -> String:
+    name := line.substring(callee_start, callee_end)
+    if declared.function_set.contains_key(name):
+        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
+    return rewrite_declared_global_ref(line, declared, prefix, callee_start, callee_end)
+
 fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String) -> String:
     first_end := next_space(line, 0)
     if first_end >= line.len():
@@ -170,7 +182,7 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
             return line
         callee_start := reg_end + 1
         callee_end := next_space(line, callee_start)
-        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
+        return rewrite_call_callee(line, declared, prefix, init_prefix, callee_start, callee_end)
 
     if op == "callv":
         callee_start := first_end + 1

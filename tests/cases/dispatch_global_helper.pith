@@ -1,0 +1,20 @@
+# a module-global fn-value that is called from within this (imported) module.
+# this is the shape grpc.serve relies on: a dispatch handler kept in a module
+# global because a pith closure cannot capture a fn-value. calling the global
+# from the root module always worked; calling it from here — an imported module —
+# used to emit an unresolved call, because the ir driver only module-prefixed a
+# call target that was a declared function, never a declared global.
+
+pub struct DispatchError:
+    pub message: String
+
+fn no_dispatch(x: Int) -> Int!DispatchError:
+    fail DispatchError("no dispatch registered")
+
+mut dispatch: fn(Int) -> Int!DispatchError := no_dispatch
+
+pub fn set_dispatch(f: fn(Int) -> Int!DispatchError):
+    dispatch = f
+
+pub fn invoke(x: Int) -> Int!DispatchError:
+    return dispatch(x)

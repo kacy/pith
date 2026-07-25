@@ -1,0 +1,22 @@
+import dispatch_global_helper as dh
+
+fn plus_one(x: Int) -> Int!dh.DispatchError:
+    return x + 1
+
+fn main() -> Int:
+    # before any dispatch is registered, the global holds its default handler.
+    before := dh.invoke(5)
+    if before.is_err:
+        print("before: err " + before.err.message)
+    else:
+        print("before: " + before.ok.to_string())
+
+    # register a real handler, then call again — same imported invoke(), now
+    # routing through the reassigned global.
+    dh.set_dispatch(plus_one)
+    after := dh.invoke(5)
+    if after.is_err:
+        print("after: err " + after.err.message)
+    else:
+        print("after: " + after.ok.to_string())
+    return 0

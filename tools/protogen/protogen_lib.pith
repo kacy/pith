@@ -12,11 +12,12 @@
 # supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
 # string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
 # plus named constants), singular message fields (as optionals), repeated
-# int-varint / enum / message / string / bytes fields, and grpc `service` stubs
-# for all four rpc shapes (unary, server-, client-, and bidi-streaming).
+# int-varint / enum / message / string / bytes fields, `oneof` groups (as a
+# payload enum per group), and grpc `service` stubs for all four rpc shapes
+# (unary, server-, client-, and bidi-streaming).
 #
-# deferred (a parse error names them): `oneof`, `map<>`, 32-bit `float`,
-# well-known types, proto2, and repeated sint/fixed/double.
+# deferred (a parse error names them): `map<>`, 32-bit `float`, well-known
+# types, proto2, and repeated sint/fixed/double.
 
 import std.bytes as bytes
 import std.strings as strings
@@ -97,11 +98,18 @@ pub struct Field:
     pub name: String
     pub number: Int
 
-# a message: its (simple) name and its fields. nested messages are lifted to
-# the top level.
+# a oneof group: its name and member fields. on the wire the members are
+# ordinary fields of the containing message; at most one is set.
+pub struct Oneof:
+    pub name: String
+    pub fields: List[Field]
+
+# a message: its (simple) name, its fields, and its oneof groups. nested
+# messages are lifted to the top level.
 pub struct Message:
     pub name: String
     pub fields: List[Field]
+    pub oneofs: List[Oneof]
 
 # one enum constant: its name and integer value.
 pub struct EnumValue:
@@ -285,6 +293,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
     name := p.advance()
     p.expect(chr(123))!
     fields: List[Field] := []
+    oneofs: List[Oneof] := []
     while not p.done() and p.peek() != chr(125):
         kw := p.peek()
         if kw == "message":
@@ -292,7 +301,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
         elif kw == "enum":
             enums.push(parse_enum(p)!)
         elif kw == "oneof":
-            fail parse_fail("'oneof' is not supported yet")
+            oneofs.push(parse_oneof(p)!)
         elif kw == "map":
             fail parse_fail("'map' fields are not supported yet")
         elif kw == "reserved":
@@ -305,8 +314,31 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
         else:
             fields.push(parse_field(p)!)
     p.expect(chr(125))!
-    messages.push(Message(name: name, fields: fields))
+    messages.push(Message(name: name, fields: fields, oneofs: oneofs))
     return true
+
+# parse `oneof name { <type> <name> = <number>; ... }`. proto3 forbids labels
+# on oneof members, so `repeated`/`optional` inside the group is a parse error.
+fn parse_oneof(p: Parser) -> Oneof!ParseError:
+    p.expect("oneof")!
+    name := p.advance()
+    p.expect(chr(123))!
+    fields: List[Field] := []
+    while not p.done() and p.peek() != chr(125):
+        kw := p.peek()
+        if kw == ";":
+            p.advance()
+        elif kw == "option":
+            p.advance()
+            while not p.done() and p.peek() != ";":
+                p.advance()
+            p.expect(";")!
+        elif kw == "repeated" or kw == "optional":
+            fail parse_fail("'{kw}' is not allowed inside a oneof")
+        else:
+            fields.push(parse_field(p)!)
+    p.expect(chr(125))!
+    return Oneof(name: name, fields: fields)
 
 # parse one field: `[repeated|optional] <type> <name> = <number> [options];`
 fn parse_field(p: Parser) -> Field!ParseError:
@@ -346,6 +378,17 @@ fn parse_enum(p: Parser) -> EnumDef!ParseError:
     return EnumDef(name: name, values: values)
 
 # --- type resolution --------------------------------------------------------
+
+# CamelCase a snake_case name: "paypal_email" -> "PaypalEmail".
+fn camel(name: String) -> String:
+    mut out := ""
+    for part in name.split("_"):
+        out = out + strings.capitalize(part)
+    return out
+
+# the pith enum generated for a oneof group: <Msg><OneofName>.
+fn oneof_enum_name(msg_name: String, o: Oneof) -> String:
+    return msg_name + camel(o.name)
 
 # the last dotted component of a (possibly package-qualified) type name.
 fn simple_name(ptype: String) -> String:
@@ -422,15 +465,23 @@ fn enum_names_of(pf: ProtoFile) -> List[String]:
         names.push(e.name)
     return names
 
-# the message types a message refers to through its fields (its dependencies).
+# the message types a message refers to through its fields and oneof members
+# (its dependencies).
 fn message_deps(m: Message, message_names: List[String]) -> List[String]:
     deps: List[String] := []
     for f in m.fields:
-        if is_message(f.ptype, message_names):
-            dep := simple_name(f.ptype)
-            if dep != m.name and not list_has(deps, dep):
-                deps.push(dep)
+        add_message_dep(deps, m.name, f, message_names)
+    for o in m.oneofs:
+        for f in o.fields:
+            add_message_dep(deps, m.name, f, message_names)
     return deps
+
+fn add_message_dep(deps: List[String], owner: String, f: Field, message_names: List[String]):
+    if not is_message(f.ptype, message_names):
+        return
+    dep := simple_name(f.ptype)
+    if dep != owner and not list_has(deps, dep):
+        deps.push(dep)
 
 # order messages so a referenced message is defined before the message that
 # uses it (pith does not resolve a struct field whose type appears later). a
@@ -602,6 +653,74 @@ fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: 
     out.push("            {fref} = r.{rmethod}()!")
     return out
 
+# the enum + constructor lines for one oneof group, emitted just before the
+# containing struct. constructors exist because cross-module enum-variant
+# construction has been buggy; std.sql's Value works around it the same way.
+fn oneof_type_lines(msg_name: String, o: Oneof, message_names: List[String], enum_names: List[String]) -> List[String]:
+    ename := oneof_enum_name(msg_name, o)
+    out: List[String] := []
+    out.push("# oneof {o.name} of {msg_name}. {ename}Unset means no member is set.")
+    out.push("pub enum {ename}:")
+    out.push("    {ename}Unset")
+    for f in o.fields:
+        variant := camel(f.name)
+        vt := scalar_pith_type(f.ptype, message_names, enum_names)
+        out.push("    {variant}({vt})")
+    out.push("")
+    out.push("# constructors for {ename}; call these from other modules rather than")
+    out.push("# constructing the variants directly.")
+    out.push("pub fn {msg_name}_{o.name}_unset() -> {ename}:")
+    out.push("    return {ename}.{ename}Unset")
+    for f in o.fields:
+        variant := camel(f.name)
+        vt := scalar_pith_type(f.ptype, message_names, enum_names)
+        out.push("pub fn {msg_name}_{f.name}(v: {vt}) -> {ename}:")
+        out.push("    return {ename}.{variant}(v)")
+    out.push("")
+    return out
+
+# the encode-body lines for one oneof group: match on the enum and write the
+# set member as a singular field of its type. a set member writes even at its
+# zero value (oneof presence); Unset writes nothing.
+fn encode_oneof(msg_name: String, o: Oneof, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+    ename := oneof_enum_name(msg_name, o)
+    out: List[String] := []
+    out.push("    match m.{o.name}:")
+    for f in o.fields:
+        variant := camel(f.name)
+        num := "{f.number}"
+        # each arm binds under its own name; reusing one name across arms of
+        # different payload types miscompiles today.
+        v := "v_{f.name}"
+        if is_message(f.ptype, message_names):
+            tn := simple_name(f.ptype)
+            out.push("        {ename}.{variant}({v}) => w.write_message({num}, encode_{tn}({v})) catch false")
+        else:
+            method := write_method(f.ptype, enum_names)
+            if method == "":
+                fail parse_fail("field type '{f.ptype}' is not supported yet")
+            out.push("        {ename}.{variant}({v}) => w.{method}({num}, {v}) catch false")
+    out.push("        {ename}.{ename}Unset => false")
+    return out
+
+# the decode arm for one oneof member: seeing its field number sets the group
+# to that variant, so the last member on the wire wins.
+fn decode_oneof_field(ename: String, oname: String, f: Field, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]:
+    out: List[String] := []
+    num := "{f.number}"
+    variant := camel(f.name)
+    mut keyword := "elif"
+    if first:
+        keyword = "if"
+    out.push("        {keyword} tag.field == {num}:")
+    if is_message(f.ptype, message_names):
+        tn := simple_name(f.ptype)
+        out.push("            m.{oname} = {ename}.{variant}(decode_{tn}(r.read_message()!)!)")
+    else:
+        rmethod := read_method(f.ptype, enum_names)
+        out.push("            m.{oname} = {ename}.{variant}(r.{rmethod}()!)")
+    return out
+
 # generate the full pith module for a parsed proto file.
 pub fn generate(pf: ProtoFile) -> String!ParseError:
     message_names := message_names_of(pf)
@@ -628,14 +747,25 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
 
     ordered := topo_sort(pf.messages, message_names)
     for m in ordered:
+        no_members := m.fields.len() == 0 and m.oneofs.len() == 0
+
+        # each oneof group gets its payload enum + constructors first, so the
+        # struct below can name them.
+        for o in m.oneofs:
+            for ln in oneof_type_lines(m.name, o, message_names, enum_names):
+                lines.push(ln)
+
         # struct
         lines.push("# message {m.name}")
         lines.push("pub struct {m.name}:")
-        if m.fields.len() == 0:
+        if no_members:
             lines.push("    pub _empty: Bool")
         for f in m.fields:
             ft := pith_type(f, message_names, enum_names)
             lines.push("    pub {f.name}: {ft}")
+        for o in m.oneofs:
+            ename := oneof_enum_name(m.name, o)
+            lines.push("    pub {o.name}: {ename}")
         lines.push("")
 
         # a default-valued constructor value, for decode to start from
@@ -643,8 +773,11 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         for f in m.fields:
             dv := default_value(f, message_names, enum_names)
             ctor_args.push("{f.name}: {dv}")
+        for o in m.oneofs:
+            ename := oneof_enum_name(m.name, o)
+            ctor_args.push("{o.name}: {ename}.{ename}Unset")
         mut ctor := strings.join_nonempty(ctor_args, ", ")
-        if m.fields.len() == 0:
+        if no_members:
             ctor = "_empty: false"
 
         # encode
@@ -653,6 +786,9 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         lines.push("    w := writer()")
         for f in m.fields:
             for ln in encode_field(f, message_names, enum_names)!:
+                lines.push(ln)
+        for o in m.oneofs:
+            for ln in encode_oneof(m.name, o, message_names, enum_names)!:
                 lines.push(ln)
         lines.push("    out := w.bytes()")
         lines.push("    w.free()")
@@ -666,7 +802,7 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         lines.push("    r := reader(data)")
         lines.push("    while not r.at_end():")
         lines.push("        tag := r.read_tag()!")
-        if m.fields.len() == 0:
+        if no_members:
             lines.push("        r.skip(tag.wire)!")
         else:
             mut first := true
@@ -674,6 +810,12 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
                 for ln in decode_field(f, first, message_names, enum_names)!:
                     lines.push(ln)
                 first = false
+            for o in m.oneofs:
+                ename := oneof_enum_name(m.name, o)
+                for f in o.fields:
+                    for ln in decode_oneof_field(ename, o.name, f, first, message_names, enum_names):
+                        lines.push(ln)
+                    first = false
             lines.push("        else:")
             lines.push("            r.skip(tag.wire)!")
         lines.push("    return m")

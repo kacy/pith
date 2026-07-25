@@ -25,7 +25,7 @@ test "a point encodes to the canonical wire bytes":
     assert_eq(encoding.to_hex(encode_Point(p)), "089601")
 
 test "a shape round-trips every field kind":
-    s := Shape(name: "sq", id: 42, filled: true, color: Color_RED, center: Point(x: 1, y: 2), vertices: [Point(x: 3, y: 4), Point(x: 5, y: 6)], tags: [10, 20, 30], labels: ["a", "b"], blob: bytes.from_string_utf8("xy"), area: 2.5, offset: 0 - 7)
+    s := Shape(name: "sq", id: 42, filled: true, color: Color_RED, center: Point(x: 1, y: 2), vertices: [Point(x: 3, y: 4), Point(x: 5, y: 6)], tags: [10, 20, 30], labels: ["a", "b"], blob: bytes.from_string_utf8("xy"), area: 2.5, offset: 0 - 7, weight: 1.5)
     back := decode_Shape(encode_Shape(s))!
     assert_eq(back.name, "sq")
     assert_eq(back.id, 42)
@@ -43,6 +43,7 @@ test "a shape round-trips every field kind":
     assert_eq(encoding.to_hex(back.blob), "7879")
     assert_eq(back.area, 2.5)
     assert_eq(back.offset, 0 - 7)
+    assert_eq(back.weight, 1.5)
 
 test "a string field is the canonical tag-length-utf8":
     s := empty_shape()
@@ -71,7 +72,21 @@ test "unset fields decode back to their defaults":
     assert(back.center == none)
 
 fn empty_shape() -> Shape:
-    return Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)
+    return Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0, weight: 0.0)
+
+test "a float field encodes the canonical fixed32 bytes":
+    # field 12, wire 5: 65, then 1.5 as little-endian f32 (0x3fc00000).
+    s := empty_shape()
+    s.weight = 1.5
+    assert_eq(encoding.to_hex(encode_Shape(s)), "650000c03f")
+
+test "a float field narrows to the nearest f32":
+    # 0.1 has no exact f32; the wire carries the nearest one, so decode gives
+    # the f32-rounded double, not 0.1 itself.
+    s := empty_shape()
+    s.weight = 0.1
+    back := decode_Shape(encode_Shape(s))!
+    assert_eq(back.weight, 0.10000000149011612)
 
 # --- oneof ------------------------------------------------------------------
 

@@ -14,7 +14,7 @@ pith build tools/protogen/protogen.pith
 
 - `message` with singular and repeated fields, nested messages, and `enum`
 - scalars: int32/int64/uint32/uint64, sint32/sint64, bool, string, bytes,
-  double, fixed32/fixed64, sfixed32/sfixed64
+  float, double, fixed32/fixed64, sfixed32/sfixed64
 - enums, as `Int` fields plus named `Enum_VALUE` constants
 - singular message fields, as pith optionals (`Sub?`)
 - repeated message / string / bytes / int-varint / enum fields
@@ -25,6 +25,11 @@ pith build tools/protogen/protogen.pith
 singular message fields have presence (optionals); other singular fields follow
 proto3 and skip their zero value on the wire. `decode_*` skips unknown fields, so
 it stays forward compatible.
+
+a `float` field becomes a pith `Float` (a 64-bit double). decode widens the
+32-bit wire value exactly; encode narrows to the nearest f32 with ties to
+even, the same rounding a c `(float)` cast does — so a value with no exact
+f32 form (0.1, say) round-trips to its f32-rounded double, not to itself.
 
 ## oneof
 
@@ -146,8 +151,8 @@ right for bounded streams, not endless or interactive ones.
 
 ## not yet supported
 
-a clear parse error names these: `bool`/`fixed` map keys, 32-bit `float`, the
-well-known types, proto2, and repeated `sint`/`fixed`/`double`.
+a clear error names these: `bool`/`fixed` map keys, the well-known types,
+proto2, and repeated `sint`/`fixed`/`float`/`double`.
 
 ## example
 

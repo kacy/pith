@@ -54,6 +54,7 @@ pub struct Shape:
     pub blob: Bytes
     pub area: Float
     pub offset: Int
+    pub weight: Float
 
 # encode a Shape to protobuf wire bytes.
 pub fn encode_Shape(m: Shape) -> Bytes:
@@ -66,8 +67,8 @@ pub fn encode_Shape(m: Shape) -> Bytes:
         w.write_bool(3, m.filled) catch false
     if m.color != 0:
         w.write_enum(4, m.color) catch false
-    if let sub = m.center:
-        w.write_message(5, encode_Point(sub)) catch false
+    if let sub_center = m.center:
+        w.write_message(5, encode_Point(sub_center)) catch false
     for item in m.vertices:
         w.write_message(6, encode_Point(item)) catch false
     if m.tags.len() > 0:
@@ -80,13 +81,15 @@ pub fn encode_Shape(m: Shape) -> Bytes:
         w.write_double(10, m.area) catch false
     if m.offset != 0:
         w.write_sint32(11, m.offset) catch false
+    if m.weight != 0.0:
+        w.write_float(12, m.weight) catch false
     out := w.bytes()
     w.free()
     return out
 
 # decode a Shape from protobuf wire bytes.
 pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
-    m := Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)
+    m := Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0, weight: 0.0)
     r := reader(data)
     while not r.at_end():
         tag := r.read_tag()!
@@ -116,6 +119,8 @@ pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
             m.area = r.read_double()!
         elif tag.field == 11:
             m.offset = r.read_sint64()!
+        elif tag.field == 12:
+            m.weight = r.read_float()!
         else:
             r.skip(tag.wire)!
     return m

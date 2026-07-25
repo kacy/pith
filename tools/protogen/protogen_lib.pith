@@ -10,15 +10,15 @@
 # out; the client and server encode and decode them for you.
 #
 # supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
-# string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
-# plus named constants), singular message fields (as optionals), repeated
-# int-varint / enum / message / string / bytes fields, `oneof` groups (as a
-# payload enum per group), `map<k, v>` fields (as pith Maps; string and
+# string/bytes/float/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int
+# fields plus named constants), singular message fields (as optionals),
+# repeated int-varint / enum / message / string / bytes fields, `oneof` groups
+# (as a payload enum per group), `map<k, v>` fields (as pith Maps; string and
 # integer keys), and grpc `service` stubs for all four rpc shapes (unary,
 # server-, client-, and bidi-streaming).
 #
-# deferred (a parse error names them): bool/fixed map keys, 32-bit `float`,
-# well-known types, proto2, and repeated sint/fixed/double.
+# deferred (a clear error names them): bool/fixed map keys, well-known types,
+# proto2, and repeated sint/fixed/float/double.
 
 import std.bytes as bytes
 import std.strings as strings
@@ -472,7 +472,7 @@ fn scalar_pith_type(ptype: String, message_names: List[String], enum_names: List
         return "Bytes"
     if ptype == "bool":
         return "Bool"
-    if ptype == "double":
+    if ptype == "double" or ptype == "float":
         return "Float"
     return "Int"
 
@@ -589,6 +589,8 @@ fn write_method(ptype: String, enum_names: List[String]) -> String:
         return "write_bytes"
     if ptype == "double":
         return "write_double"
+    if ptype == "float":
+        return "write_float"
     if ptype == "fixed32":
         return "write_fixed32"
     if ptype == "sfixed32":
@@ -615,6 +617,8 @@ fn read_method(ptype: String, enum_names: List[String]) -> String:
         return "read_bytes"
     if ptype == "double":
         return "read_double"
+    if ptype == "float":
+        return "read_float"
     if ptype == "fixed32":
         return "read_fixed32"
     if ptype == "sfixed32":
@@ -640,7 +644,7 @@ fn zero_guard(fieldname: String, ptype: String, enum_names: List[String]) -> Str
         return "if {fref} != \"\":"
     if ptype == "bytes":
         return "if {fref}.len() > 0:"
-    if ptype == "double":
+    if ptype == "double" or ptype == "float":
         return "if {fref} != 0.0:"
     return "if {fref} != 0:"
 
@@ -668,8 +672,11 @@ fn encode_field(f: Field, message_names: List[String], enum_names: List[String])
         return out
     if is_message(f.ptype, message_names):
         tn := simple_name(f.ptype)
-        out.push("    if let sub = {fref}:")
-        out.push("        w.write_message({num}, encode_{tn}(sub)) catch false")
+        # a per-field binding name, so two message fields of different types
+        # in one encoder never share a name.
+        sub := "sub_{f.name}"
+        out.push("    if let {sub} = {fref}:")
+        out.push("        w.write_message({num}, encode_{tn}({sub})) catch false")
         return out
     method := write_method(f.ptype, enum_names)
     if method == "":

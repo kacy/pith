@@ -1,0 +1,207 @@
+# generated from a .proto file by tools/protogen; do not edit by hand.
+# proto package: catalog
+
+from std.protobuf import ProtoError, writer, reader, WIRE_LEN
+import std.bytes as bytes
+import std.net.grpc as grpc
+
+# enum Category
+pub Category_CATEGORY_UNKNOWN := 0
+pub Category_ELECTRONICS := 1
+pub Category_BOOKS := 2
+pub Category_GROCERY := 3
+
+# message Product
+pub struct Product:
+    pub sku: String
+    pub name: String
+    pub price: Float
+    pub category: Int
+    pub tags: List[String]
+    pub in_stock: Bool
+
+# encode a Product to protobuf wire bytes.
+pub fn encode_Product(m: Product) -> Bytes:
+    w := writer()
+    if m.sku != "":
+        w.write_string(1, m.sku) catch false
+    if m.name != "":
+        w.write_string(2, m.name) catch false
+    if m.price != 0.0:
+        w.write_double(3, m.price) catch false
+    if m.category != 0:
+        w.write_enum(4, m.category) catch false
+    for item in m.tags:
+        w.write_string(5, item) catch false
+    if m.in_stock:
+        w.write_bool(6, m.in_stock) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Product from protobuf wire bytes.
+pub fn decode_Product(data: Bytes) -> Product!ProtoError:
+    m := Product(sku: "", name: "", price: 0.0, category: 0, tags: [], in_stock: false)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.sku = r.read_string()!
+        elif tag.field == 2:
+            m.name = r.read_string()!
+        elif tag.field == 3:
+            m.price = r.read_double()!
+        elif tag.field == 4:
+            m.category = r.read_enum()!
+        elif tag.field == 5:
+            m.tags.push(r.read_string()!)
+        elif tag.field == 6:
+            m.in_stock = r.read_bool()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message GetProductRequest
+pub struct GetProductRequest:
+    pub sku: String
+
+# encode a GetProductRequest to protobuf wire bytes.
+pub fn encode_GetProductRequest(m: GetProductRequest) -> Bytes:
+    w := writer()
+    if m.sku != "":
+        w.write_string(1, m.sku) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a GetProductRequest from protobuf wire bytes.
+pub fn decode_GetProductRequest(data: Bytes) -> GetProductRequest!ProtoError:
+    m := GetProductRequest(sku: "")
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.sku = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message SearchRequest
+pub struct SearchRequest:
+    pub query: String
+    pub max_results: Int
+
+# encode a SearchRequest to protobuf wire bytes.
+pub fn encode_SearchRequest(m: SearchRequest) -> Bytes:
+    w := writer()
+    if m.query != "":
+        w.write_string(1, m.query) catch false
+    if m.max_results != 0:
+        w.write_int32(2, m.max_results) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a SearchRequest from protobuf wire bytes.
+pub fn decode_SearchRequest(data: Bytes) -> SearchRequest!ProtoError:
+    m := SearchRequest(query: "", max_results: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.query = r.read_string()!
+        elif tag.field == 2:
+            m.max_results = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message SearchResponse
+pub struct SearchResponse:
+    pub products: List[Product]
+    pub total: Int
+
+# encode a SearchResponse to protobuf wire bytes.
+pub fn encode_SearchResponse(m: SearchResponse) -> Bytes:
+    w := writer()
+    for item in m.products:
+        w.write_message(1, encode_Product(item)) catch false
+    if m.total != 0:
+        w.write_int32(2, m.total) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a SearchResponse from protobuf wire bytes.
+pub fn decode_SearchResponse(data: Bytes) -> SearchResponse!ProtoError:
+    m := SearchResponse(products: [], total: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.products.push(decode_Product(r.read_message()!)!)
+        elif tag.field == 2:
+            m.total = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# a typed grpc client for the Catalog service.
+pub struct CatalogClient:
+    conn: grpc.Conn
+
+# wrap a grpc connection in a typed Catalog client.
+pub fn new_CatalogClient(conn: grpc.Conn) -> CatalogClient:
+    return CatalogClient(conn: conn)
+
+impl CatalogClient:
+    # unary rpc GetProduct.
+    pub fn GetProduct(req: GetProductRequest) -> Product!grpc.GrpcError:
+        raw := self.conn.unary("/catalog.Catalog/GetProduct", encode_GetProductRequest(req))!
+        decoded := decode_Product(raw)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Product failed")
+        return decoded.ok
+    # unary rpc Search.
+    pub fn Search(req: SearchRequest) -> SearchResponse!grpc.GrpcError:
+        raw := self.conn.unary("/catalog.Catalog/Search", encode_SearchRequest(req))!
+        decoded := decode_SearchResponse(raw)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode SearchResponse failed")
+        return decoded.ok
+
+# a server for the Catalog service. implement one handler per unary rpc
+# and hand them to serve_Catalog; the router decodes each request,
+# dispatches by method path, and encodes the reply. streaming rpcs are
+# client-only for now (grpc.serve is unary).
+fn _Catalog_GetProduct_unimpl(req: GetProductRequest) -> Product!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "GetProduct not implemented")
+mut _Catalog_GetProduct_fn: fn(GetProductRequest) -> Product!grpc.GrpcError := _Catalog_GetProduct_unimpl
+fn _Catalog_Search_unimpl(req: SearchRequest) -> SearchResponse!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Search not implemented")
+mut _Catalog_Search_fn: fn(SearchRequest) -> SearchResponse!grpc.GrpcError := _Catalog_Search_unimpl
+
+fn _Catalog_route(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path == "/catalog.Catalog/GetProduct":
+        decoded := decode_GetProductRequest(request)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode GetProductRequest failed")
+        return encode_Product(_Catalog_GetProduct_fn(decoded.ok)!)
+    if path == "/catalog.Catalog/Search":
+        decoded := decode_SearchRequest(request)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode SearchRequest failed")
+        return encode_SearchResponse(_Catalog_Search_fn(decoded.ok)!)
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+# serve Catalog over plaintext http/2 (h2c). pass one handler per unary rpc.
+pub fn serve_Catalog(host: String, port: Int, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
+    _Catalog_GetProduct_fn = GetProduct
+    _Catalog_Search_fn = Search
+    return grpc.serve(host, port, _Catalog_route)!
+
+# serve Catalog over http/2 with tls (alpn h2).
+pub fn serve_Catalog_tls(host: String, port: Int, cert: String, key: String, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
+    _Catalog_GetProduct_fn = GetProduct
+    _Catalog_Search_fn = Search
+    return grpc.serve_tls(host, port, cert, key, _Catalog_route)!

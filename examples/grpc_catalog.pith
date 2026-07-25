@@ -1,0 +1,75 @@
+# a grpc catalog service, server and client in one process. the messages, the
+# CatalogClient, and serve_Catalog all come from catalog_gen.pith, generated from
+# catalog.proto by tools/protogen. see docs/grpc.md for the walkthrough.
+#
+# you write two typed handlers and one serve call; the generated router decodes
+# each request, dispatches by method path, and encodes the reply. here the client
+# runs in the same process so the round trip is visible end to end.
+
+import catalog_gen as cat
+import std.net.grpc as grpc
+import std.time as time
+
+PORT := 50261
+
+# a tiny in-memory catalog, seeded once at startup (read-only, so no lock needed).
+mut store: Map[String, cat.Product] := {}
+
+fn seed():
+    store.insert("sku-1", cat.Product(sku: "sku-1", name: "usb-c cable", price: 9.99,
+        category: cat.Category_ELECTRONICS, tags: ["cable", "usb"], in_stock: true))
+    store.insert("sku-2", cat.Product(sku: "sku-2", name: "go programming language", price: 34.5,
+        category: cat.Category_BOOKS, tags: ["go", "book"], in_stock: true))
+    store.insert("sku-3", cat.Product(sku: "sku-3", name: "usb hub", price: 19.0,
+        category: cat.Category_ELECTRONICS, tags: ["usb", "hub"], in_stock: false))
+
+# --- the handlers: one per rpc, typed messages in and out ---
+
+fn get_product(req: cat.GetProductRequest) -> cat.Product!grpc.GrpcError:
+    if not store.contains_key(req.sku):
+        fail grpc.GrpcError(status: grpc.GRPC_NOT_FOUND, message: "no product " + req.sku)
+    return store[req.sku]
+
+fn search(req: cat.SearchRequest) -> cat.SearchResponse!grpc.GrpcError:
+    if req.query.len() == 0:
+        fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "query is required")
+    mut hits: List[cat.Product] := []
+    for sku in store.keys():
+        p := store[sku]
+        if p.name.contains(req.query):
+            hits.push(p)
+    return cat.SearchResponse(products: hits, total: hits.len())
+
+fn run_server():
+    cat.serve_Catalog("127.0.0.1", PORT, get_product, search) catch 0
+
+fn main():
+    seed()
+    spawn run_server()
+    time.delay(400)
+
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+    client := cat.new_CatalogClient(conn)
+
+    # a hit
+    hit := client.GetProduct(cat.GetProductRequest(sku: "sku-1"))
+    if hit.is_err:
+        print("GetProduct error " + hit.err.status.to_string())
+    else:
+        print("get sku-1 -> " + hit.ok.name + " $" + hit.ok.price.to_string())
+
+    # a miss comes back as NOT_FOUND (status 5)
+    miss := client.GetProduct(cat.GetProductRequest(sku: "sku-99"))
+    if miss.is_err:
+        print("get sku-99 -> status " + miss.err.status.to_string() + ": " + miss.err.message)
+
+    # a search
+    found := client.Search(cat.SearchRequest(query: "usb", max_results: 10))
+    if not found.is_err:
+        print("search 'usb' -> " + found.ok.total.to_string() + " results")
+
+    conn.close()

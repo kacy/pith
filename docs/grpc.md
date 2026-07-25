@@ -143,10 +143,12 @@ fn batch_add(reqs: List[cat.Product]) -> cat.SearchResponse!grpc.GrpcError:
 ```
 
 the generated router frames each element as one stream message; the client reads
-them back one at a time (or `collect()`s them). streams are *buffered* — a
-handler receives the complete request list and returns the complete reply list,
-so the whole stream passes through memory. that fits bounded streams (search
-results, batch writes, event replay), not endless ones.
+them back one at a time (or `collect()`s them). generated streams are *buffered*
+— a handler receives the complete request list and returns the complete reply
+list, so the whole stream passes through memory. that fits bounded streams
+(search results, batch writes, event replay), not endless ones. for interactive
+or endless streams, write the handler by hand against `grpc.serve_stream`
+instead, which serves incrementally (see "what isn't here yet").
 
 one thing to watch: the accept loop is concurrent, so if a handler *mutates*
 shared state (a seeded read-only store is fine), guard it with a `Mutex`.
@@ -200,11 +202,15 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 
 ## what isn't here yet
 
-- **streams are buffered.** every rpc shape is servable, but a streamed side
+- **generated streams are buffered.** a streamed side of a generated stub
   passes through memory whole: the handler gets the complete request `List` and
-  returns the complete reply `List`. there is no incremental send or receive, no
-  backpressure, and no interleaving on a bidi stream — so endless or
-  interactive streams are off the table until incremental serving lands.
+  returns the complete reply `List`, so no interleaving on a bidi stream. for
+  interactive or endless streams, drop down to `grpc.serve_stream`: a
+  hand-written dispatch gets a live `GrpcStream` and can `recv_message()` and
+  `send_message()` incrementally — reply to message 1 before the client sends
+  message 2 — ending with `finish_ok()` or `finish(status, message)`. protogen
+  doesn't generate streaming-shaped stubs yet, so serve_stream means routing
+  and encoding by hand.
 - **protogen doesn't cover** 32-bit `float` (use `double`), the well-known types
   (Timestamp, Any, …), or proto2. it stops with a clear error naming the
   feature. `oneof` (a payload enum per group) and `map<k,v>` (a pith `Map`,

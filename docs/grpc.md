@@ -143,12 +143,58 @@ fn batch_add(reqs: List[cat.Product]) -> cat.SearchResponse!grpc.GrpcError:
 ```
 
 the generated router frames each element as one stream message; the client reads
-them back one at a time (or `collect()`s them). generated streams are *buffered*
-— a handler receives the complete request list and returns the complete reply
-list, so the whole stream passes through memory. that fits bounded streams
-(search results, batch writes, event replay), not endless ones. for interactive
-or endless streams, write the handler by hand against `grpc.serve_stream`
-instead, which serves incrementally (see "what isn't here yet").
+them back one at a time (or `collect()`s them). generated streams under
+`serve_Catalog` are *buffered* — a handler receives the complete request list
+and returns the complete reply list, so the whole stream passes through memory.
+that fits bounded streams (search results, batch writes, event replay), not
+endless ones.
+
+### streaming, incrementally
+
+for interactive or endless streams, protogen also generates an incremental
+server: `serve_Catalog_streaming` (and `_tls`). one listener serves the whole
+service — unary handlers keep the `(Req) -> Resp` shape above, while each
+streaming rpc's handler works a typed `<Svc><Rpc>ServerCall` message by
+message. nothing is buffered end to end, so a bidi handler can answer message 1
+while the client is still composing message 2:
+
+```pith
+# rpc Tail(SearchRequest) returns (stream Product) — the handler gets the
+# decoded request plus a send-side call
+fn tail(req: cat.SearchRequest, call: cat.CatalogTailServerCall) -> Int!grpc.GrpcError:
+    for p in matching_products(req.query):
+        call.send(p)                     # framed and sent immediately
+    return 0                             # returning finishes with OK
+
+# rpc Import(stream Product) returns (SearchResponse) — the handler drives
+# recv itself; recv() decodes each message, done marks the half-close
+fn import_products(call: cat.CatalogImportServerCall) -> Int!grpc.GrpcError:
+    mut n := 0
+    while true:
+        got := call.recv()!
+        if got.done:
+            break
+        store.insert(got.message.sku, got.message)
+        n = n + 1
+    call.send(cat.SearchResponse(products: [], total: n))
+    return 0
+
+cat.serve_Catalog_streaming("0.0.0.0", 50051, get_product, search, tail, import_products)!
+```
+
+a bidi handler looks like the client-streaming one — `recv()` and `send()`
+interleave however the conversation needs. the call also carries `metadata()`,
+`deadline_ms()`, and `finish(status, message)` for ending with a non-OK status
+mid-stream; a handler that fails before sending anything becomes a compact
+trailers-only error response. a message that fails to decode surfaces from
+`recv()` as `INVALID_ARGUMENT`.
+
+pick the listener by the service's needs: `serve_Catalog` when every stream is
+bounded (the `List` shapes are the simplest to write), `serve_Catalog_streaming`
+when any rpc is interactive or long-lived. underneath both sit on
+`std.net.grpc`; `grpc.serve_stream` remains the low-level api when you want to
+route and encode by hand — `examples/grpc_chat.pith` does that, and
+`examples/grpc_reflect.pith` is the same idea through the generated stubs.
 
 one thing to watch: the accept loop is concurrent, so if a handler *mutates*
 shared state (a seeded read-only store is fine), guard it with a `Mutex`.
@@ -242,19 +288,14 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 
 ## what isn't here yet
 
-- **generated streams are buffered.** a streamed side of a generated stub
-  passes through memory whole: the handler gets the complete request `List` and
-  returns the complete reply `List`, so no interleaving on a bidi stream. for
-  interactive or endless streams, drop down to `grpc.serve_stream`: a
-  hand-written dispatch gets a live `GrpcStream` and can `recv_message()` and
-  `send_message()` incrementally — reply to message 1 before the client sends
-  message 2 — ending with `finish_ok()` or `finish(status, message)`. protogen
-  doesn't generate streaming-shaped stubs yet, so serve_stream means routing
-  and encoding by hand.
-- **protogen doesn't cover** 32-bit `float` (use `double`), the well-known types
-  (Timestamp, Any, …), or proto2. it stops with a clear error naming the
-  feature. `oneof` (a payload enum per group) and `map<k,v>` (a pith `Map`,
-  string or integer keys) are supported.
+- **generated streaming is server-side.** the generated *client* still collects
+  a response stream (`collect()`) or reaches through `.inner` for per-message
+  reads; a typed incremental client handle is not generated yet.
+- **protogen doesn't cover** proto2, `bool`/`fixed` map keys, repeated
+  `sint`/`fixed`/`float`/`double` fields, or the well-known types beyond
+  Timestamp, Duration, Empty, and the wrappers (no Any, Struct, FieldMask, …).
+  it stops with a clear error naming the feature. `oneof` (a payload enum per
+  group) and `map<k,v>` (a pith `Map`, string or integer keys) are supported.
 - **message compression and trailing metadata** are not supported; deadlines
   are enforced at the edges (client timeout, server expiry-on-arrival), not by
   cancelling a handler mid-flight.

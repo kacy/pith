@@ -4,10 +4,12 @@
 # scalar / message / enum fields, singular and repeated), and generates a pith
 # module: a struct per message plus `encode_<Msg>` / `decode_<Msg>` functions
 # that ride on std.protobuf's wire codec, and — for each `service` — a typed
-# `<Svc>Client` whose methods wrap std.net.grpc's unary and streaming calls plus,
-# for the unary rpcs, a `serve_<Svc>` server: you implement one handler per rpc
-# and it routes, decodes, dispatches, and encodes. messages are bytes in, bytes
-# out; the client and server encode and decode them for you.
+# `<Svc>Client` whose methods wrap std.net.grpc's unary and streaming calls,
+# plus two servers: a buffered `serve_<Svc>` (a streamed side becomes a List)
+# and an incremental `serve_<Svc>_streaming` (typed per-rpc stream handles over
+# grpc.serve_stream). you implement one handler per rpc and the generated
+# router decodes, dispatches, and encodes. messages are bytes in, bytes out;
+# the client and servers encode and decode them for you.
 #
 # supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
 # string/bytes/float/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int
@@ -1127,6 +1129,8 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
             lines.push(ln)
         for ln in gen_server_lines(svc, pf.package):
             lines.push(ln)
+        for ln in gen_streaming_server_lines(svc, pf.package):
+            lines.push(ln)
 
     return strings.join_lines(lines)
 
@@ -1353,3 +1357,160 @@ fn server_resp_type(rpc: Rpc) -> String:
     if rpc.server_streaming:
         return "List[{rpc.resp_type}]"
     return rpc.resp_type
+
+# whether either side of an rpc streams (so the streaming listener gives it a
+# typed ServerCall instead of the buffered unary shape).
+fn is_streaming(rpc: Rpc) -> Bool:
+    return rpc.client_streaming or rpc.server_streaming
+
+# the handler fn-type one rpc takes under serve_<Svc>_streaming: unary keeps the
+# buffered (Req) -> Resp shape; server-streaming gets the decoded request plus a
+# send-side ServerCall; client-streaming and bidi get just the ServerCall and
+# drive recv/send themselves.
+fn stream_handler_type(svc: Service, rpc: Rpc) -> String:
+    wrapper := "{svc.name}{rpc.name}ServerCall"
+    if rpc.client_streaming:
+        return "fn({wrapper}) -> Int!grpc.GrpcError"
+    if rpc.server_streaming:
+        return "fn({rpc.req_type}, {wrapper}) -> Int!grpc.GrpcError"
+    return "fn({rpc.req_type}) -> {rpc.resp_type}!grpc.GrpcError"
+
+# generate the incremental streaming server for one service: a typed
+# <Svc><Rpc>ServerCall per streaming rpc, handler slots for them, a stream-level
+# router, and serve_<Svc>_streaming/_tls over grpc.serve_stream. one listener
+# serves the whole service — unary rpcs reuse the buffered handler slots (the
+# router recvs the one request and sends the one reply), while a streaming rpc's
+# handler drives its ServerCall message by message, so nothing is buffered end
+# to end and interactive or endless streams work.
+fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
+    out: List[String] := []
+    q := chr(34)
+    mut svc_path := svc.name
+    if pkg != "":
+        svc_path = "{pkg}.{svc.name}"
+    if svc.rpcs.len() == 0:
+        return out
+
+    # the typed stream wrappers come before the handler slots that name them:
+    # pith resolves types in file order.
+    for rpc in svc.rpcs:
+        if not is_streaming(rpc):
+            continue
+        wrapper := "{svc.name}{rpc.name}ServerCall"
+        req := rpc.req_type
+        resp := rpc.resp_type
+        derr := "{q}grpc: decode {req} failed{q}"
+        if rpc.client_streaming:
+            out.push("# one received {svc.name}.{rpc.name} request message. done means the client")
+            out.push("# has finished sending (message is then an all-default {req}).")
+            out.push("pub struct {svc.name}{rpc.name}Recv:")
+            out.push("    pub done: Bool")
+            out.push("    pub message: {req}")
+            out.push("")
+        out.push("# a typed handle for one live {svc.name}.{rpc.name} rpc on the server.")
+        out.push("pub struct {wrapper}:")
+        out.push("    pub inner: grpc.GrpcStream")
+        out.push("")
+        out.push("impl {wrapper}:")
+        if rpc.client_streaming:
+            out.push("    # the next request message, decoded; blocks until it arrives.")
+            out.push("    pub fn recv() -> {svc.name}{rpc.name}Recv!grpc.GrpcError:")
+            out.push("        msg := self.inner.recv_message()!")
+            out.push("        decoded := decode_{req}(msg.message)")
+            out.push("        if decoded.is_err:")
+            out.push("            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: {derr})")
+            out.push("        return {svc.name}{rpc.name}Recv(done: msg.done, message: decoded.ok)")
+        out.push("    # frame and send one {resp} reply immediately.")
+        out.push("    pub fn send(reply: {resp}) -> Int:")
+        out.push("        return self.inner.send_message(encode_{resp}(reply))")
+        out.push("    # end the rpc with a status; returning from the handler without")
+        out.push("    # finishing ends it with OK.")
+        out.push("    pub fn finish(status: Int, message: String):")
+        out.push("        self.inner.finish(status, message)")
+        out.push("    # end the rpc with grpc-status 0 (OK).")
+        out.push("    pub fn finish_ok():")
+        out.push("        self.inner.finish_ok()")
+        out.push("    # this rpc's caller metadata, lowercase-keyed.")
+        out.push("    pub fn metadata() -> Map[String, String]:")
+        out.push("        return self.inner.metadata()")
+        out.push("    # the absolute deadline (a time.mono_millis() timestamp), 0 when none.")
+        out.push("    pub fn deadline_ms() -> Int:")
+        out.push("        return self.inner.deadline_ms()")
+        out.push("")
+
+    out.push("# handler slots for the streaming rpcs; the unary rpcs share the buffered")
+    out.push("# serve_{svc.name} slots above. module globals, because grpc's dispatch is")
+    out.push("# a bare fn-value that cannot capture.")
+    for rpc in svc.rpcs:
+        if not is_streaming(rpc):
+            continue
+        wrapper := "{svc.name}{rpc.name}ServerCall"
+        mut params := "call: {wrapper}"
+        if rpc.server_streaming and not rpc.client_streaming:
+            params = "req: {rpc.req_type}, call: {wrapper}"
+        out.push("fn _{svc.name}_{rpc.name}_stream_unimpl({params}) -> Int!grpc.GrpcError:")
+        out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}{rpc.name} not implemented{q})")
+        out.push("mut _{svc.name}_{rpc.name}_stream_fn: {stream_handler_type(svc, rpc)} := _{svc.name}_{rpc.name}_stream_unimpl")
+    out.push("")
+
+    out.push("# route one live rpc by its method path, driving the stream to completion.")
+    out.push("# a unary arm recvs the one request (requiring the client's half-close) and")
+    out.push("# sends the one reply; a streaming arm hands its typed ServerCall to the")
+    out.push("# installed handler. an error return becomes the grpc-status; a clean")
+    out.push("# return that never finished gets finish_ok from grpc.serve_stream.")
+    out.push("fn _{svc.name}_stream_route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:")
+    for rpc in svc.rpcs:
+        req := rpc.req_type
+        resp := rpc.resp_type
+        wrapper := "{svc.name}{rpc.name}ServerCall"
+        derr := "{q}grpc: decode {req} failed{q}"
+        out.push("    if path == {q}/{svc_path}/{rpc.name}{q}:")
+        if rpc.client_streaming:
+            out.push("        return _{svc.name}_{rpc.name}_stream_fn({wrapper}(inner: call))!")
+        else:
+            # exactly one request message; an empty (done) first read is an
+            # all-default request, matching the buffered router.
+            out.push("        first := call.recv_message()!")
+            out.push("        if not first.done:")
+            out.push("            second := call.recv_message()!")
+            out.push("            if not second.done:")
+            out.push("                fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: {q}expected one request message{q})")
+            out.push("        decoded := decode_{req}(first.message)")
+            out.push("        if decoded.is_err:")
+            out.push("            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: {derr})")
+            if rpc.server_streaming:
+                out.push("        return _{svc.name}_{rpc.name}_stream_fn(decoded.ok, {wrapper}(inner: call))!")
+            else:
+                out.push("        call.send_message(encode_{resp}(_{svc.name}_{rpc.name}_fn(decoded.ok)!))")
+                out.push("        return 0")
+    out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}no method {q} + path)")
+    out.push("")
+
+    mut params := ""
+    for rpc, i in svc.rpcs:
+        if i > 0:
+            params = params + ", "
+        params = params + "{rpc.name}: {stream_handler_type(svc, rpc)}"
+
+    out.push("# serve the whole {svc.name} service over one plaintext http/2 (h2c)")
+    out.push("# streaming listener. unary handlers keep the (Req) -> Resp shape; a")
+    out.push("# streaming rpc's handler drives its typed ServerCall incrementally.")
+    out.push("# blocks, accepting connections.")
+    out.push("pub fn serve_{svc.name}_streaming(host: String, port: Int, {params}) -> Int!:")
+    for rpc in svc.rpcs:
+        if is_streaming(rpc):
+            out.push("    _{svc.name}_{rpc.name}_stream_fn = {rpc.name}")
+        else:
+            out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
+    out.push("    return grpc.serve_stream(host, port, _{svc.name}_stream_route)!")
+    out.push("")
+    out.push("# like serve_{svc.name}_streaming, over http/2 with tls (alpn h2).")
+    out.push("pub fn serve_{svc.name}_streaming_tls(host: String, port: Int, cert: String, key: String, {params}) -> Int!:")
+    for rpc in svc.rpcs:
+        if is_streaming(rpc):
+            out.push("    _{svc.name}_{rpc.name}_stream_fn = {rpc.name}")
+        else:
+            out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
+    out.push("    return grpc.serve_stream_tls(host, port, cert, key, _{svc.name}_stream_route)!")
+    out.push("")
+    return out

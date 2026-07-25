@@ -22,7 +22,8 @@ pith build tools/protogen/protogen.pith
 - `map<k, v>` fields, as pith `Map`s (see below)
 - the common well-known types — Timestamp, Duration, Empty, and the
   wrappers (see below)
-- grpc `service` stubs — a typed client per service (see below)
+- grpc `service` stubs — a typed client and two servers (buffered and
+  streaming) per service (see below)
 
 a `float` field becomes a pith `Float` (a 64-bit double). decode widens the
 32-bit wire value exactly; encode narrows to the nearest f32 with ties to
@@ -186,7 +187,43 @@ serve_Foo_tls("0.0.0.0", 443, cert, key, bar, tail)!    # http/2 over tls
 
 streams are buffered end to end: a handler receives the complete request list
 and returns the complete reply list, so the whole stream passes through memory —
-right for bounded streams, not endless or interactive ones.
+right for bounded streams, not endless or interactive ones. those get the
+streaming server below.
+
+## streaming server
+
+`serve_Foo_streaming` (and `serve_Foo_streaming_tls`) serve every rpc on one
+incremental listener over `grpc.serve_stream`, so nothing is buffered end to
+end. unary handlers keep the `(Req) -> Resp!` shape above; each streaming rpc
+gets a typed `Foo<Rpc>ServerCall` and its handler drives the stream itself:
+
+- unary `rpc Bar(Req) returns (Resp)` → `fn(Req) -> Resp!` (same as buffered)
+- server-streaming `rpc Tail(Req) returns (stream Resp)` →
+  `fn(Req, FooTailServerCall) -> Int!` — the router decodes the one request;
+  the call sends
+- client-streaming `rpc Ingest(stream Req) returns (Resp)` →
+  `fn(FooIngestServerCall) -> Int!` — the handler recvs, then sends one reply
+- bidi → `fn(FooBidiServerCall) -> Int!` — recv and send interleave freely
+
+a `ServerCall` carries `send(reply: Resp) -> Int` (framed and sent
+immediately), `finish(status, message)` / `finish_ok()`, `metadata()`, and
+`deadline_ms()`. client-streaming and bidi calls add
+`recv() -> Foo<Rpc>Recv!` — a small struct with `done` (the client
+half-closed) and the decoded `message`; a message that fails to decode fails
+recv with `INVALID_ARGUMENT`.
+
+```
+fn tail(req: Req, call: FooTailServerCall) -> Int!grpc.GrpcError:
+    for r in produce(req):
+        call.send(r)
+    return 0            # returning without finishing ends the rpc with OK
+
+serve_Foo_streaming("0.0.0.0", 50051, bar, tail)!
+```
+
+failing the handler ends the rpc with that error's status (a compact
+trailers-only response when nothing was sent yet). `examples/grpc_reflect.pith`
+runs all four shapes through one streaming listener.
 
 ## not yet supported
 

@@ -193,6 +193,46 @@ conn := grpc.dial_with_config("catalog.internal", 443, cfg)!
 use `dial_with_config` when the server's cert is signed by a private ca; plain
 `grpc.dial` trusts the system roots.
 
+## deadlines and metadata
+
+a client attaches metadata — custom request headers, as a flat `[k1, v1, ...]`
+list — and a deadline to a unary call:
+
+```pith
+reply := conn.unary_with_headers("/pkg.Svc/Method", req, ["x-tenant", "acme"])!
+reply := conn.unary_with_deadline("/pkg.Svc/Method", req, 1500)!   # 1.5s
+reply := conn.unary_with_headers_and_deadline("/pkg.Svc/Method", req, md, 1500)!
+```
+
+a deadline does two things: the call sends the canonical `grpc-timeout` request
+header (`1500m`; whole seconds past eight digits of millis) so the server can
+stop working once the time is up, and the client itself gives up after the
+timeout, failing with `GRPC_DEADLINE_EXCEEDED`. the streaming openers have
+metadata variants too (`server_stream_with_headers`, `client_stream_with_headers`,
+`bidi_stream_with_headers`) but no deadline enforcement — cap a stream's
+lifetime yourself.
+
+on the server, a dispatch reads the calling request's context back:
+
+```pith
+fn dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    tenant := grpc.incoming_metadata()["x-tenant"]
+    remaining := grpc.incoming_deadline_ms() - time.mono_millis()  # 0 = none
+    ...
+```
+
+`incoming_metadata()` is the request's custom headers, lowercase-keyed, minus
+the transport and reserved `grpc-*` headers. `incoming_deadline_ms()` is the
+absolute deadline as a `time.mono_millis()` timestamp, `0` when the client sent
+none. a request whose deadline is already spent when it reaches the dispatch is
+answered `DEADLINE_EXCEEDED` without the handler running at all; past that
+point enforcement is the handler's job — check the deadline between steps of
+long work. on the `serve_stream` path the live `GrpcStream` carries the same
+context as `metadata()` and `deadline_ms()`.
+
+this is initial (request) metadata only. trailing metadata — custom trailers
+beyond `grpc-status`/`grpc-message` — is not supported in either direction.
+
 ## status codes
 
 the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
@@ -215,6 +255,8 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
   (Timestamp, Any, …), or proto2. it stops with a clear error naming the
   feature. `oneof` (a payload enum per group) and `map<k,v>` (a pith `Map`,
   string or integer keys) are supported.
-- **deadlines, metadata, and compression** are minimal.
+- **message compression and trailing metadata** are not supported; deadlines
+  are enforced at the edges (client timeout, server expiry-on-arrival), not by
+  cancelling a handler mid-flight.
 - **observability**: the client opens a trace span and records red metrics per
   call automatically; the server side is your code, so instrument it yourself.

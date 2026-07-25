@@ -1,0 +1,84 @@
+# an interactive grpc stream over grpc.serve_stream, server and client in one
+# process. the buffered server (grpc.serve / serve_body) collects a whole request
+# before the handler runs, so a bidi handler can never answer message 1 while the
+# client is deciding what message 2 should be. serve_stream hands the dispatch a
+# live GrpcStream instead: recv_message() yields each request message as it
+# arrives and send_message() replies immediately, so this client can hold a
+# turn-by-turn conversation — send, read the reply, then send again — over one
+# rpc. the messages are protobuf, field 1 a string in both directions.
+
+import std.net.grpc as grpc
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50253
+
+# read protobuf field 1 (a string) from a message, defaulting to "" if absent.
+fn read_text(message: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(message)
+    mut text := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            text = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return text
+
+# encode a single string into protobuf field 1 — the message shape both ways.
+fn message_of(text: String) -> Bytes:
+    w := protobuf.writer()
+    w.write_string(1, text) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# the service: /chat.Chat/Talk answers each message the moment it arrives.
+fn chat(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if path != "/chat.Chat/Talk":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    while true:
+        step := call.recv_message()!
+        if step.done:
+            break
+        text := read_text(step.message) catch "?"
+        call.send_message(message_of("you said: " + text))
+    call.finish_ok()
+    return 0
+
+fn run_server():
+    grpc.serve_stream("127.0.0.1", PORT, chat) catch 0
+
+# one conversational turn: send, then wait for the server's answer before the
+# caller composes the next message.
+fn turn(stream: grpc.BidiStream, text: String):
+    stream.send(message_of(text))
+    step := stream.recv()
+    if step.is_err:
+        print("chat error " + step.err.status.to_string())
+    elif step.ok.done:
+        print("server hung up")
+    else:
+        print(read_text(step.ok.message) catch "?")
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+    opened := conn.bidi_stream("/chat.Chat/Talk")
+    if opened.is_err:
+        print("open failed")
+        return
+    stream := opened.ok
+    turn(stream, "hello")
+    turn(stream, "still there?")
+    stream.close_send()
+    last := stream.recv()
+    if not last.is_err and last.ok.done:
+        print("conversation over")
+    conn.close()

@@ -495,7 +495,10 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     result
 }
 
-fn pith_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
+/// poll a single fd until it is ready, times out, or errors. the blocking wait
+/// every non-green caller uses, and the whole story on platforms without the
+/// epoll reactor (see `netpoll_fallback`).
+pub(crate) fn pith_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }

@@ -20,6 +20,14 @@ pub mod ffi_util;
 pub mod handle_registry;
 pub mod host_fs;
 pub mod json;
+// the netpoller is epoll-based, so it only builds on linux. everywhere else a
+// fallback with the same two entry points keeps `network` compiling — at the
+// cost of green tasks parking their worker on socket i/o. see
+// `netpoll_fallback` for what that means in practice.
+#[cfg(target_os = "linux")]
+pub mod netpoll;
+#[cfg(not(target_os = "linux"))]
+#[path = "netpoll_fallback.rs"]
 pub mod netpoll;
 pub mod network;
 pub mod perf;

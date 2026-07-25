@@ -4,8 +4,10 @@
 # scalar / message / enum fields, singular and repeated), and generates a pith
 # module: a struct per message plus `encode_<Msg>` / `decode_<Msg>` functions
 # that ride on std.protobuf's wire codec, and — for each `service` — a typed
-# `<Svc>Client` whose methods wrap std.net.grpc's unary and streaming calls.
-# messages are bytes in, bytes out; the service client encodes and decodes them.
+# `<Svc>Client` whose methods wrap std.net.grpc's unary and streaming calls plus,
+# for the unary rpcs, a `serve_<Svc>` server: you implement one handler per rpc
+# and it routes, decodes, dispatches, and encodes. messages are bytes in, bytes
+# out; the client and server encode and decode them for you.
 #
 # supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
 # string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
@@ -680,6 +682,8 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
     for svc in pf.services:
         for ln in gen_service_lines(svc, pf.package):
             lines.push(ln)
+        for ln in gen_server_lines(svc, pf.package):
+            lines.push(ln)
 
     return strings.join_lines(lines)
 
@@ -801,5 +805,69 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
             out.push("    pub fn {rpc.name}() -> {handle}!grpc.GrpcError:")
             out.push("        inner := self.conn.bidi_stream({path})!")
             out.push("        return {handle}(inner: inner)")
+    out.push("")
+    return out
+
+# generate server-side stubs for one service: a settable handler slot per unary
+# rpc, a router that decodes each request and dispatches by method path, and
+# serve_<Svc>/serve_<Svc>_tls that install the handlers and start grpc.serve. the
+# handlers live in module globals because grpc's dispatch is a bare fn-value that
+# cannot capture; a pith closure cannot either. streaming rpcs are skipped —
+# grpc.serve is unary today — so nothing is emitted for an all-streaming service.
+fn gen_server_lines(svc: Service, pkg: String) -> List[String]:
+    out: List[String] := []
+    q := chr(34)
+    mut svc_path := svc.name
+    if pkg != "":
+        svc_path = "{pkg}.{svc.name}"
+
+    unary: List[Rpc] := []
+    for rpc in svc.rpcs:
+        if not rpc.client_streaming and not rpc.server_streaming:
+            unary.push(rpc)
+    if unary.len() == 0:
+        return out
+
+    out.push("# a server for the {svc.name} service. implement one handler per unary rpc")
+    out.push("# and hand them to serve_{svc.name}; the router decodes each request,")
+    out.push("# dispatches by method path, and encodes the reply. streaming rpcs are")
+    out.push("# client-only for now (grpc.serve is unary).")
+    for rpc in unary:
+        req := rpc.req_type
+        resp := rpc.resp_type
+        out.push("fn _{svc.name}_{rpc.name}_unimpl(req: {req}) -> {resp}!grpc.GrpcError:")
+        out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}{rpc.name} not implemented{q})")
+        out.push("mut _{svc.name}_{rpc.name}_fn: fn({req}) -> {resp}!grpc.GrpcError := _{svc.name}_{rpc.name}_unimpl")
+    out.push("")
+
+    out.push("fn _{svc.name}_route(path: String, request: Bytes) -> Bytes!grpc.GrpcError:")
+    for rpc in unary:
+        req := rpc.req_type
+        resp := rpc.resp_type
+        out.push("    if path == {q}/{svc_path}/{rpc.name}{q}:")
+        out.push("        decoded := decode_{req}(request)")
+        out.push("        if decoded.is_err:")
+        out.push("            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: {q}grpc: decode {req} failed{q})")
+        out.push("        return encode_{resp}(_{svc.name}_{rpc.name}_fn(decoded.ok)!)")
+    out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}no method {q} + path)")
+    out.push("")
+
+    mut params := ""
+    for rpc, i in unary:
+        if i > 0:
+            params = params + ", "
+        params = params + "{rpc.name}: fn({rpc.req_type}) -> {rpc.resp_type}!grpc.GrpcError"
+
+    out.push("# serve {svc.name} over plaintext http/2 (h2c). pass one handler per unary rpc.")
+    out.push("pub fn serve_{svc.name}(host: String, port: Int, {params}) -> Int!:")
+    for rpc in unary:
+        out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
+    out.push("    return grpc.serve(host, port, _{svc.name}_route)!")
+    out.push("")
+    out.push("# serve {svc.name} over http/2 with tls (alpn h2).")
+    out.push("pub fn serve_{svc.name}_tls(host: String, port: Int, cert: String, key: String, {params}) -> Int!:")
+    for rpc in unary:
+        out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
+    out.push("    return grpc.serve_tls(host, port, cert, key, _{svc.name}_route)!")
     out.push("")
     return out

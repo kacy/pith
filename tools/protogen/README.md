@@ -50,10 +50,13 @@ the streaming handles wrap `std.net.grpc`'s `ServerStream` / `ClientStream` /
 protogen also generates a server: implement one handler per rpc and hand them to
 the generated `serve_Foo`. it routes each request by its method path, decodes it,
 calls your handler, and frames the reply (an unknown path or a decode failure
-comes back as the right grpc status). a unary rpc takes `(Req) ->
-Resp!grpc.GrpcError`; a server-streaming rpc takes a handler returning the whole
-reply as a list, `(Req) -> List[Resp]!grpc.GrpcError`, framed back as one
-buffered stream:
+comes back as the right grpc status). the handler's shape follows the rpc — a
+streamed side becomes a `List`:
+
+- unary `rpc Bar(Req) returns (Resp)` → `fn(Req) -> Resp!`
+- server-streaming `returns (stream Resp)` → `fn(Req) -> List[Resp]!`
+- client-streaming `(stream Req)` → `fn(List[Req]) -> Resp!`
+- bidi → `fn(List[Req]) -> List[Resp]!`
 
 ```
 fn bar(req: Req) -> Resp!grpc.GrpcError:
@@ -66,9 +69,9 @@ serve_Foo("0.0.0.0", 50051, bar, tail)!                 # plaintext http/2
 serve_Foo_tls("0.0.0.0", 443, cert, key, bar, tail)!    # http/2 over tls
 ```
 
-buffered means the whole reply passes through memory — right for bounded streams,
-not endless ones. client-streaming and bidi rpcs are client-only for now, so
-`serve_Foo` skips them and a service with only those gets no server.
+streams are buffered end to end: a handler receives the complete request list
+and returns the complete reply list, so the whole stream passes through memory —
+right for bounded streams, not endless or interactive ones.
 
 ## not yet supported
 

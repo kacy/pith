@@ -172,9 +172,9 @@ impl CatalogClient:
 
 # a server for the Catalog service. implement one handler per rpc and
 # hand them to serve_Catalog; the router deframes and decodes each
-# request, dispatches by method path, and frames the reply. a streaming
-# reply is buffered â the handler returns the whole List. client-streaming
-# and bidi rpcs are client-only for now.
+# request, dispatches by method path, and frames the reply. a streamed
+# request arrives as a List, and a streamed reply is returned as one â
+# buffered end to end, so bounded streams only.
 fn _Catalog_GetProduct_unimpl(req: GetProductRequest) -> Product!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "GetProduct not implemented")
 mut _Catalog_GetProduct_fn: fn(GetProductRequest) -> Product!grpc.GrpcError := _Catalog_GetProduct_unimpl

@@ -128,20 +128,25 @@ runtime. it takes a handler per rpc, in proto order. a request for an unknown
 method comes back as `UNIMPLEMENTED`, and a request that fails to decode comes
 back as `INVALID_ARGUMENT`. neither is code you write.
 
-a server-streaming rpc — `returns (stream X)` in the proto — gets a handler that
-returns the whole reply as a list:
+a streaming rpc changes the handler's shape, not its nature: a streamed side
+becomes a `List`. server-streaming returns one, client-streaming receives one,
+bidi does both:
 
 ```pith
 # rpc ListProducts(SearchRequest) returns (stream Product)
 fn list_products(req: cat.SearchRequest) -> List[cat.Product]!grpc.GrpcError:
     return matching_products(req.query)
+
+# rpc BatchAdd(stream Product) returns (SearchResponse)
+fn batch_add(reqs: List[cat.Product]) -> cat.SearchResponse!grpc.GrpcError:
+    ...
 ```
 
 the generated router frames each element as one stream message; the client reads
-them back one at a time (or `collect()`s them). the stream is *buffered* — the
-handler returns the complete list, so the whole reply passes through memory.
-that fits bounded streams (search results, batch reads, event replay), not
-endless ones.
+them back one at a time (or `collect()`s them). streams are *buffered* — a
+handler receives the complete request list and returns the complete reply list,
+so the whole stream passes through memory. that fits bounded streams (search
+results, batch writes, event replay), not endless ones.
 
 one thing to watch: the accept loop is concurrent, so if a handler *mutates*
 shared state (a seeded read-only store is fine), guard it with a `Mutex`.
@@ -195,13 +200,11 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 
 ## what isn't here yet
 
-- **server streams are buffered, and client-streaming isn't servable.** a
-  server-streaming handler returns its whole `List[Resp]` at once — there is no
-  incremental send, no backpressure, and an endless stream is off the table.
-  client-streaming and bidi rpcs can't be served at all yet (the *client* can
-  consume all four shapes against any grpc server). `serve_<Svc>` takes a handler
-  per unary and server-streaming rpc; a service with only client-streaming/bidi
-  rpcs gets no server.
+- **streams are buffered.** every rpc shape is servable, but a streamed side
+  passes through memory whole: the handler gets the complete request `List` and
+  returns the complete reply `List`. there is no incremental send or receive, no
+  backpressure, and no interleaving on a bidi stream — so endless or
+  interactive streams are off the table until incremental serving lands.
 - **protogen doesn't cover** `oneof`, `map<k,v>`, 32-bit `float` (use `double`),
   the well-known types (Timestamp, Any, …), or proto2. it stops with a clear
   error naming the feature.

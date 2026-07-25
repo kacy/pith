@@ -212,15 +212,21 @@ impl GeometryClient:
 
 # a server for the Geometry service. implement one handler per rpc and
 # hand them to serve_Geometry; the router deframes and decodes each
-# request, dispatches by method path, and frames the reply. a streaming
-# reply is buffered â the handler returns the whole List. client-streaming
-# and bidi rpcs are client-only for now.
+# request, dispatches by method path, and frames the reply. a streamed
+# request arrives as a List, and a streamed reply is returned as one â
+# buffered end to end, so bounded streams only.
 fn _Geometry_Describe_unimpl(req: Point) -> Shape!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Describe not implemented")
 mut _Geometry_Describe_fn: fn(Point) -> Shape!grpc.GrpcError := _Geometry_Describe_unimpl
 fn _Geometry_Corners_unimpl(req: Shape) -> List[Point]!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Corners not implemented")
 mut _Geometry_Corners_fn: fn(Shape) -> List[Point]!grpc.GrpcError := _Geometry_Corners_unimpl
+fn _Geometry_Assemble_unimpl(req: List[Point]) -> Shape!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Assemble not implemented")
+mut _Geometry_Assemble_fn: fn(List[Point]) -> Shape!grpc.GrpcError := _Geometry_Assemble_unimpl
+fn _Geometry_Reflect_unimpl(req: List[Point]) -> List[Point]!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Reflect not implemented")
+mut _Geometry_Reflect_fn: fn(List[Point]) -> List[Point]!grpc.GrpcError := _Geometry_Reflect_unimpl
 
 fn _Geometry_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
     if path == "/sample.Geometry/Describe":
@@ -249,16 +255,42 @@ fn _Geometry_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
         for reply in replies:
             framed.push(encode_Point(reply))
         return grpc.frame_messages(framed)
+    if path == "/sample.Geometry/Assemble":
+        msgs := grpc.unframe_messages(body)!
+        mut requests: List[Point] := []
+        for msg in msgs:
+            decoded := decode_Point(msg)
+            if decoded.is_err:
+                fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode Point failed")
+            requests.push(decoded.ok)
+        return grpc.frame_one(encode_Shape(_Geometry_Assemble_fn(requests)!))
+    if path == "/sample.Geometry/Reflect":
+        msgs := grpc.unframe_messages(body)!
+        mut requests: List[Point] := []
+        for msg in msgs:
+            decoded := decode_Point(msg)
+            if decoded.is_err:
+                fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode Point failed")
+            requests.push(decoded.ok)
+        replies := _Geometry_Reflect_fn(requests)!
+        mut framed: List[Bytes] := []
+        for reply in replies:
+            framed.push(encode_Point(reply))
+        return grpc.frame_messages(framed)
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
 
 # serve Geometry over plaintext http/2 (h2c). pass one handler per rpc.
-pub fn serve_Geometry(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError) -> Int!:
+pub fn serve_Geometry(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError) -> Int!:
     _Geometry_Describe_fn = Describe
     _Geometry_Corners_fn = Corners
+    _Geometry_Assemble_fn = Assemble
+    _Geometry_Reflect_fn = Reflect
     return grpc.serve_body(host, port, _Geometry_route)!
 
 # serve Geometry over http/2 with tls (alpn h2).
-pub fn serve_Geometry_tls(host: String, port: Int, cert: String, key: String, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError) -> Int!:
+pub fn serve_Geometry_tls(host: String, port: Int, cert: String, key: String, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError) -> Int!:
     _Geometry_Describe_fn = Describe
     _Geometry_Corners_fn = Corners
+    _Geometry_Assemble_fn = Assemble
+    _Geometry_Reflect_fn = Reflect
     return grpc.serve_body_tls(host, port, cert, key, _Geometry_route)!

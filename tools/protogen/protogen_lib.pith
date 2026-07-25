@@ -89,7 +89,7 @@ fn slice_text(data: Bytes, start: Int, end: Int) -> String:
 
 # one message field: its label ("repeated"/"optional"/""), proto type name,
 # pith field name, and wire field number.
-pub struct Field:
+pub struct ProtoField:
     pub label: String
     pub ptype: String
     pub name: String
@@ -99,7 +99,7 @@ pub struct Field:
 # the top level.
 pub struct Message:
     pub name: String
-    pub fields: List[Field]
+    pub fields: List[ProtoField]
 
 # one enum constant: its name and integer value.
 pub struct EnumValue:
@@ -282,7 +282,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
     p.expect("message")!
     name := p.advance()
     p.expect(chr(123))!
-    fields: List[Field] := []
+    fields: List[ProtoField] := []
     while not p.done() and p.peek() != chr(125):
         kw := p.peek()
         if kw == "message":
@@ -307,7 +307,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
     return true
 
 # parse one field: `[repeated|optional] <type> <name> = <number> [options];`
-fn parse_field(p: Parser) -> Field!ParseError:
+fn parse_field(p: Parser) -> ProtoField!ParseError:
     mut label := ""
     head := p.peek()
     if head == "repeated" or head == "optional":
@@ -318,7 +318,7 @@ fn parse_field(p: Parser) -> Field!ParseError:
     number := to_int(p.advance(), 0)
     p.skip_options()!
     p.expect(";")!
-    return Field(label: label, ptype: ptype, name: name, number: number)
+    return ProtoField(label: label, ptype: ptype, name: name, number: number)
 
 # parse `enum Name { NAME = n; ... }`.
 fn parse_enum(p: Parser) -> EnumDef!ParseError:
@@ -366,7 +366,7 @@ fn is_enum(ptype: String, enum_names: List[String]) -> Bool:
     return list_has(enum_names, simple_name(ptype))
 
 # the pith field type for a proto field.
-fn pith_type(f: Field, message_names: List[String], enum_names: List[String]) -> String:
+fn pith_type(f: ProtoField, message_names: List[String], enum_names: List[String]) -> String:
     base := scalar_pith_type(f.ptype, message_names, enum_names)
     if f.label == "repeated":
         return "List[{base}]"
@@ -390,7 +390,7 @@ fn scalar_pith_type(ptype: String, message_names: List[String], enum_names: List
     return "Int"
 
 # the zero/default value literal for a pith field type, for the constructor.
-fn default_value(f: Field, message_names: List[String], enum_names: List[String]) -> String:
+fn default_value(f: ProtoField, message_names: List[String], enum_names: List[String]) -> String:
     if f.label == "repeated":
         return "[]"
     if is_message(f.ptype, message_names):
@@ -532,7 +532,7 @@ fn zero_guard(fieldname: String, ptype: String, enum_names: List[String]) -> Str
     return "if {fref} != 0:"
 
 # the encode-body lines for one field (already indented four spaces).
-fn encode_field(f: Field, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+fn encode_field(f: ProtoField, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
     out: List[String] := []
     num := "{f.number}"
     fref := "m.{f.name}"
@@ -567,7 +567,7 @@ fn encode_field(f: Field, message_names: List[String], enum_names: List[String])
     return out
 
 # the decode arm for one field. `first` picks `if` vs `elif` for the dispatch.
-fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+fn decode_field(f: ProtoField, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
     out: List[String] := []
     num := "{f.number}"
     fref := "m.{f.name}"

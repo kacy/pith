@@ -2,6 +2,13 @@ syntax = "proto3";
 
 package sample;
 
+// the supported well-known-type imports; each type used below is synthesized
+// into the generated module as a plain message (Timestamp, Int32Value, ...).
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/wrappers.proto";
+
 // a color, generated as named Int constants (Color_RED, ...).
 enum Color {
   UNKNOWN = 0;
@@ -29,6 +36,16 @@ message Shape {
   bytes blob = 9;
   double area = 10;
   sint32 offset = 11;
+  float weight = 12;
+}
+
+// exercises the well-known types as fields: Timestamp and Duration, plus a
+// wrapper (Int32Value) as the optional-int pattern.
+message Event {
+  string name = 1;
+  google.protobuf.Timestamp at = 2;
+  google.protobuf.Duration elapsed = 3;
+  google.protobuf.Int32Value priority = 4;
 }
 
 // exercises oneof: each group becomes a payload enum plus constructor
@@ -68,4 +85,5 @@ service Geometry {
   rpc Corners(Shape) returns (stream Point);
   rpc Assemble(stream Point) returns (Shape);
   rpc Reflect(stream Point) returns (stream Point);
+  rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
 }

@@ -3,6 +3,7 @@
 from sample_gen import Point, Shape, encode_Shape, decode_Shape
 from sample_gen import Sticker, encode_Sticker, decode_Sticker, Sticker_anchor, Sticker_stock
 from sample_gen import Inventory, Bin, encode_Inventory, decode_Inventory
+from sample_gen import Event, encode_Event, decode_Event, Timestamp, Duration, Int32Value
 import std.bytes as bytes
 
 fn main():
@@ -14,5 +15,7 @@ fn main():
         stback := decode_Sticker(encode_Sticker(st)) catch st
         inv := Inventory(counts: {"a": 1, "b": 2}, bins: {"north": Bin(size: 9)}, names: {7: "seven"})
         invback := decode_Inventory(encode_Inventory(inv)) catch inv
-        i = i + back.id - 41 + stback.name.len() - 3 + invback.counts.len() - 2
+        ev := Event(name: "tick", at: Timestamp(seconds: 1721800000, nanos: 500), elapsed: Duration(seconds: 3, nanos: 0), priority: Int32Value(value: 7))
+        evback := decode_Event(encode_Event(ev)) catch ev
+        i = i + back.id - 41 + stback.name.len() - 3 + invback.counts.len() - 2 + evback.name.len() - 4
     print("ran encode/decode 200 times")

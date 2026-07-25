@@ -20,16 +20,18 @@ pith build tools/protogen/protogen.pith
 - repeated message / string / bytes / int-varint / enum fields
 - `oneof` groups, as a payload enum per group (see below)
 - `map<k, v>` fields, as pith `Map`s (see below)
+- the common well-known types — Timestamp, Duration, Empty, and the
+  wrappers (see below)
 - grpc `service` stubs — a typed client per service (see below)
-
-singular message fields have presence (optionals); other singular fields follow
-proto3 and skip their zero value on the wire. `decode_*` skips unknown fields, so
-it stays forward compatible.
 
 a `float` field becomes a pith `Float` (a 64-bit double). decode widens the
 32-bit wire value exactly; encode narrows to the nearest f32 with ties to
 even, the same rounding a c `(float)` cast does — so a value with no exact
 f32 form (0.1, say) round-trips to its f32-rounded double, not to itself.
+
+singular message fields have presence (optionals); other singular fields follow
+proto3 and skip their zero value on the wire. `decode_*` skips unknown fields, so
+it stays forward compatible.
 
 ## oneof
 
@@ -100,6 +102,43 @@ or zero value) and merges duplicates last-one-wins.
 forbids anyway. map iteration order is not fixed, so two encodes of the same
 multi-entry map may order entries differently (both decode the same).
 
+## well-known types
+
+importing a supported google/protobuf file enables its types, and each type
+the file actually uses is synthesized into the generated module as a plain
+message — a struct plus `encode_`/`decode_` functions, named by its simple
+name (`Timestamp`, `Duration`, `Empty`, `Int32Value`, ...). nothing is
+generated for an imported type that is never used. supported:
+
+- `google/protobuf/timestamp.proto` — `Timestamp` (seconds, nanos)
+- `google/protobuf/duration.proto` — `Duration` (seconds, nanos)
+- `google/protobuf/empty.proto` — `Empty`
+- `google/protobuf/wrappers.proto` — `DoubleValue`, `FloatValue`,
+  `Int64Value`, `UInt64Value`, `Int32Value`, `UInt32Value`, `BoolValue`,
+  `StringValue`, `BytesValue` (each a single `value` field)
+
+refer to them by their qualified names (`google.protobuf.Timestamp`); as
+message fields they generate as optionals, so a wrapper like
+`google.protobuf.Int32Value` gives the usual optional-int presence pattern:
+
+```proto
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+message Event {
+  string name = 1;
+  google.protobuf.Timestamp at = 2;       // -> pub at: Timestamp?
+  google.protobuf.Int32Value priority = 3; // -> pub priority: Int32Value?
+}
+```
+
+declaring your own message (or enum) with one of these names while also
+importing it is an error — the two would be indistinguishable in the
+generated module. any other google/protobuf import (`any.proto`,
+`struct.proto`, `field_mask.proto`, ...) is a clear error naming the file;
+imports of your own files are ignored, since protogen generates from a
+single file.
+
 ## services
 
 each `service Foo { ... }` becomes a `FooClient` wrapping a `grpc.Conn`, with a
@@ -151,8 +190,9 @@ right for bounded streams, not endless or interactive ones.
 
 ## not yet supported
 
-a clear error names these: `bool`/`fixed` map keys, the well-known types,
-proto2, and repeated `sint`/`fixed`/`float`/`double`.
+a clear error names these: `bool`/`fixed` map keys, proto2, repeated
+`sint`/`fixed`/`float`/`double`, and the well-known types beyond the list
+above (`Any`, `Struct`/`Value`/`ListValue`, `FieldMask`, ...).
 
 ## example
 

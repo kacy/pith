@@ -229,6 +229,151 @@ pub fn decode_Bin(data: Bytes) -> Bin!ProtoError:
             r.skip(tag.wire)!
     return m
 
+# message Timestamp (synthesized well-known type google.protobuf.Timestamp)
+pub struct Timestamp:
+    pub seconds: Int
+    pub nanos: Int
+
+# encode a Timestamp to protobuf wire bytes.
+pub fn encode_Timestamp(m: Timestamp) -> Bytes:
+    w := writer()
+    if m.seconds != 0:
+        w.write_int32(1, m.seconds) catch false
+    if m.nanos != 0:
+        w.write_int32(2, m.nanos) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Timestamp from protobuf wire bytes.
+pub fn decode_Timestamp(data: Bytes) -> Timestamp!ProtoError:
+    m := Timestamp(seconds: 0, nanos: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.seconds = r.read_int64()!
+        elif tag.field == 2:
+            m.nanos = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Duration (synthesized well-known type google.protobuf.Duration)
+pub struct Duration:
+    pub seconds: Int
+    pub nanos: Int
+
+# encode a Duration to protobuf wire bytes.
+pub fn encode_Duration(m: Duration) -> Bytes:
+    w := writer()
+    if m.seconds != 0:
+        w.write_int32(1, m.seconds) catch false
+    if m.nanos != 0:
+        w.write_int32(2, m.nanos) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Duration from protobuf wire bytes.
+pub fn decode_Duration(data: Bytes) -> Duration!ProtoError:
+    m := Duration(seconds: 0, nanos: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.seconds = r.read_int64()!
+        elif tag.field == 2:
+            m.nanos = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Int32Value (synthesized well-known type google.protobuf.Int32Value)
+pub struct Int32Value:
+    pub value: Int
+
+# encode a Int32Value to protobuf wire bytes.
+pub fn encode_Int32Value(m: Int32Value) -> Bytes:
+    w := writer()
+    if m.value != 0:
+        w.write_int32(1, m.value) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Int32Value from protobuf wire bytes.
+pub fn decode_Int32Value(data: Bytes) -> Int32Value!ProtoError:
+    m := Int32Value(value: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.value = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Empty (synthesized well-known type google.protobuf.Empty)
+pub struct Empty:
+    pub _empty: Bool
+
+# encode a Empty to protobuf wire bytes.
+pub fn encode_Empty(m: Empty) -> Bytes:
+    w := writer()
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Empty from protobuf wire bytes.
+pub fn decode_Empty(data: Bytes) -> Empty!ProtoError:
+    m := Empty(_empty: false)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        r.skip(tag.wire)!
+    return m
+
+# message Event
+pub struct Event:
+    pub name: String
+    pub at: Timestamp?
+    pub elapsed: Duration?
+    pub priority: Int32Value?
+
+# encode a Event to protobuf wire bytes.
+pub fn encode_Event(m: Event) -> Bytes:
+    w := writer()
+    if m.name != "":
+        w.write_string(1, m.name) catch false
+    if let sub_at = m.at:
+        w.write_message(2, encode_Timestamp(sub_at)) catch false
+    if let sub_elapsed = m.elapsed:
+        w.write_message(3, encode_Duration(sub_elapsed)) catch false
+    if let sub_priority = m.priority:
+        w.write_message(4, encode_Int32Value(sub_priority)) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Event from protobuf wire bytes.
+pub fn decode_Event(data: Bytes) -> Event!ProtoError:
+    m := Event(name: "", at: none, elapsed: none, priority: none)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.name = r.read_string()!
+        elif tag.field == 2:
+            m.at = decode_Timestamp(r.read_message()!)!
+        elif tag.field == 3:
+            m.elapsed = decode_Duration(r.read_message()!)!
+        elif tag.field == 4:
+            m.priority = decode_Int32Value(r.read_message()!)!
+        else:
+            r.skip(tag.wire)!
+    return m
+
 # message Inventory
 pub struct Inventory:
     pub counts: Map[String, Int]
@@ -398,6 +543,13 @@ impl GeometryClient:
     pub fn Reflect() -> GeometryReflectCall!grpc.GrpcError:
         inner := self.conn.bidi_stream("/sample.Geometry/Reflect")!
         return GeometryReflectCall(inner: inner)
+    # unary rpc Ping.
+    pub fn Ping(req: Empty) -> Empty!grpc.GrpcError:
+        raw := self.conn.unary("/sample.Geometry/Ping", encode_Empty(req))!
+        decoded := decode_Empty(raw)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Empty failed")
+        return decoded.ok
 
 # a server for the Geometry service. implement one handler per rpc and
 # hand them to serve_Geometry; the router deframes and decodes each
@@ -416,6 +568,9 @@ mut _Geometry_Assemble_fn: fn(List[Point]) -> Shape!grpc.GrpcError := _Geometry_
 fn _Geometry_Reflect_unimpl(req: List[Point]) -> List[Point]!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Reflect not implemented")
 mut _Geometry_Reflect_fn: fn(List[Point]) -> List[Point]!grpc.GrpcError := _Geometry_Reflect_unimpl
+fn _Geometry_Ping_unimpl(req: Empty) -> Empty!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Ping not implemented")
+mut _Geometry_Ping_fn: fn(Empty) -> Empty!grpc.GrpcError := _Geometry_Ping_unimpl
 
 fn _Geometry_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
     if path == "/sample.Geometry/Describe":
@@ -466,20 +621,33 @@ fn _Geometry_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
         for reply in replies:
             framed.push(encode_Point(reply))
         return grpc.frame_messages(framed)
+    if path == "/sample.Geometry/Ping":
+        msgs := grpc.unframe_messages(body)!
+        if msgs.len() > 1:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "expected one request message")
+        mut request := bytes.empty()
+        if msgs.len() == 1:
+            request = msgs[0]
+        decoded := decode_Empty(request)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode Empty failed")
+        return grpc.frame_one(encode_Empty(_Geometry_Ping_fn(decoded.ok)!))
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
 
 # serve Geometry over plaintext http/2 (h2c). pass one handler per rpc.
-pub fn serve_Geometry(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError) -> Int!:
+pub fn serve_Geometry(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError, Ping: fn(Empty) -> Empty!grpc.GrpcError) -> Int!:
     _Geometry_Describe_fn = Describe
     _Geometry_Corners_fn = Corners
     _Geometry_Assemble_fn = Assemble
     _Geometry_Reflect_fn = Reflect
+    _Geometry_Ping_fn = Ping
     return grpc.serve_body(host, port, _Geometry_route)!
 
 # serve Geometry over http/2 with tls (alpn h2).
-pub fn serve_Geometry_tls(host: String, port: Int, cert: String, key: String, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError) -> Int!:
+pub fn serve_Geometry_tls(host: String, port: Int, cert: String, key: String, Describe: fn(Point) -> Shape!grpc.GrpcError, Corners: fn(Shape) -> List[Point]!grpc.GrpcError, Assemble: fn(List[Point]) -> Shape!grpc.GrpcError, Reflect: fn(List[Point]) -> List[Point]!grpc.GrpcError, Ping: fn(Empty) -> Empty!grpc.GrpcError) -> Int!:
     _Geometry_Describe_fn = Describe
     _Geometry_Corners_fn = Corners
     _Geometry_Assemble_fn = Assemble
     _Geometry_Reflect_fn = Reflect
+    _Geometry_Ping_fn = Ping
     return grpc.serve_body_tls(host, port, cert, key, _Geometry_route)!

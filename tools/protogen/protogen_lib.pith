@@ -14,11 +14,15 @@
 # fields plus named constants), singular message fields (as optionals),
 # repeated int-varint / enum / message / string / bytes fields, `oneof` groups
 # (as a payload enum per group), `map<k, v>` fields (as pith Maps; string and
-# integer keys), and grpc `service` stubs for all four rpc shapes (unary,
-# server-, client-, and bidi-streaming).
+# integer keys), grpc `service` stubs for all four rpc shapes (unary,
+# server-, client-, and bidi-streaming), and the common well-known types
+# (Timestamp, Duration, Empty, and the wrappers), synthesized into the
+# generated module as plain messages when their google/protobuf file is
+# imported and the type is used.
 #
-# deferred (a clear error names them): bool/fixed map keys, well-known types,
-# proto2, and repeated sint/fixed/float/double.
+# deferred (a clear error names them): bool/fixed map keys, proto2, repeated
+# sint/fixed/float/double, and the other well-known types (Any, Struct,
+# FieldMask, ...).
 
 import std.bytes as bytes
 import std.strings as strings
@@ -145,12 +149,15 @@ pub struct Service:
     pub name: String
     pub rpcs: List[Rpc]
 
-# a parsed proto file.
+# a parsed proto file. `wkts` holds the simple names of the well-known types
+# whose google/protobuf imports appeared ("Timestamp", "Int32Value", ...); the
+# generator synthesizes the ones the file actually uses.
 pub struct ProtoFile:
     pub package: String
     pub messages: List[Message]
     pub enums: List[EnumDef]
     pub services: List[Service]
+    pub wkts: List[String]
 
 # raised on unsupported or malformed proto input.
 pub struct ParseError:
@@ -217,6 +224,7 @@ pub fn parse(src: String) -> ProtoFile!ParseError:
     messages: List[Message] := []
     enums: List[EnumDef] := []
     services: List[Service] := []
+    wkts: List[String] := []
     while not p.done():
         kw := p.peek()
         if kw == "syntax":
@@ -228,7 +236,14 @@ pub fn parse(src: String) -> ProtoFile!ParseError:
             p.advance()
             package = p.advance()
             p.expect(";")!
-        elif kw == "import" or kw == "option":
+        elif kw == "import":
+            p.advance()
+            if p.peek() == "public" or p.peek() == "weak":
+                p.advance()
+            path := p.advance()
+            p.expect(";")!
+            record_import(wkts, path)!
+        elif kw == "option":
             # skip to the terminating semicolon
             p.advance()
             while not p.done() and p.peek() != ";":
@@ -244,7 +259,84 @@ pub fn parse(src: String) -> ProtoFile!ParseError:
             p.advance()
         else:
             fail parse_fail("unexpected token '{kw}' at top level")
-    return ProtoFile(package: package, messages: messages, enums: enums, services: services)
+    # a user type with a well-known type's name would be indistinguishable
+    # from the imported one, so that combination is an error.
+    for m in messages:
+        if list_has(wkts, m.name):
+            fail parse_fail("message '{m.name}' collides with the imported well-known type google.protobuf.{m.name}")
+    for e in enums:
+        if list_has(wkts, e.name):
+            fail parse_fail("enum '{e.name}' collides with the imported well-known type google.protobuf.{e.name}")
+    return ProtoFile(package: package, messages: messages, enums: enums, services: services, wkts: wkts)
+
+# --- well-known types -------------------------------------------------------
+
+# the well-known types protogen can synthesize. each generates as a plain
+# message named by its simple name (Timestamp, Duration, Empty, Int32Value,
+# ...), with the fields proto defines for it.
+fn wkt_all_names() -> List[String]:
+    return ["Timestamp", "Duration", "Empty", "DoubleValue", "FloatValue", "Int64Value", "UInt64Value", "Int32Value", "UInt32Value", "BoolValue", "StringValue", "BytesValue"]
+
+# the google/protobuf file that declares a supported well-known type, or ""
+# if the name is not one protogen knows.
+fn wkt_import_path(name: String) -> String:
+    if name == "Timestamp":
+        return "google/protobuf/timestamp.proto"
+    if name == "Duration":
+        return "google/protobuf/duration.proto"
+    if name == "Empty":
+        return "google/protobuf/empty.proto"
+    if list_has(wkt_all_names(), name):
+        return "google/protobuf/wrappers.proto"
+    return ""
+
+# note an `import` statement. a supported google/protobuf import enables its
+# well-known types; an unsupported one (any.proto, struct.proto, ...) is an
+# error; any other import names another user file, which protogen — a
+# single-file generator — ignores.
+fn record_import(wkts: List[String], path: String) -> Bool!ParseError:
+    if not path.starts_with("google/protobuf/"):
+        return true
+    mut matched := false
+    for name in wkt_all_names():
+        if wkt_import_path(name) == path:
+            matched = true
+            if not list_has(wkts, name):
+                wkts.push(name)
+    if not matched:
+        fail parse_fail("import '{path}' is not supported (the supported well-known types are timestamp, duration, empty, and wrappers)")
+    return true
+
+# the synthesized definition of one well-known type, as an ordinary Message.
+fn wkt_message(name: String) -> Message:
+    fields: List[Field] := []
+    if name == "Timestamp" or name == "Duration":
+        fields.push(Field(label: "", ptype: "int64", name: "seconds", number: 1))
+        fields.push(Field(label: "", ptype: "int32", name: "nanos", number: 2))
+    elif name != "Empty":
+        # every wrapper is a single `value = 1` field of its scalar type
+        fields.push(Field(label: "", ptype: wkt_wrapper_scalar(name), name: "value", number: 1))
+    return Message(name: name, fields: fields, oneofs: [], maps: [])
+
+# the scalar proto type a wrapper well-known type carries.
+fn wkt_wrapper_scalar(name: String) -> String:
+    if name == "DoubleValue":
+        return "double"
+    if name == "FloatValue":
+        return "float"
+    if name == "Int64Value":
+        return "int64"
+    if name == "UInt64Value":
+        return "uint64"
+    if name == "Int32Value":
+        return "int32"
+    if name == "UInt32Value":
+        return "uint32"
+    if name == "BoolValue":
+        return "bool"
+    if name == "StringValue":
+        return "string"
+    return "bytes"
 
 # parse `service Name { rpc Method([stream] Req) returns ([stream] Resp); ... }`.
 fn parse_service(p: Parser) -> Service!ParseError:
@@ -511,11 +603,49 @@ fn default_value(f: Field, message_names: List[String], enum_names: List[String]
 
 # --- code generation --------------------------------------------------------
 
-fn message_names_of(pf: ProtoFile) -> List[String]:
+fn message_names_of(messages: List[Message]) -> List[String]:
     names: List[String] := []
-    for m in pf.messages:
+    for m in messages:
         names.push(m.name)
     return names
+
+# check one type reference against the well-known types: a google.protobuf
+# name must be a supported wkt with its import present, and a supported use
+# is collected into `used` (once). any other type passes through untouched.
+fn check_wkt_use(ptype: String, enabled: List[String], used: List[String]) -> Bool!ParseError:
+    if not ptype.starts_with("google.protobuf."):
+        return true
+    name := simple_name(ptype)
+    path := wkt_import_path(name)
+    if path == "":
+        fail parse_fail("well-known type '{ptype}' is not supported")
+    if not list_has(enabled, name):
+        fail parse_fail("'{ptype}' is used but '{path}' is not imported")
+    if not list_has(used, name):
+        used.push(name)
+    return true
+
+# the well-known types the file actually uses, validating every reference.
+# fields, oneof members, and map values still carry the qualified name; rpc
+# request/response types were reduced to simple names by the parser, so they
+# match by name against the imported set (a collision with a user message is
+# already ruled out at parse time).
+fn used_wkts(pf: ProtoFile, declared: List[String]) -> List[String]!ParseError:
+    used: List[String] := []
+    for m in pf.messages:
+        for f in m.fields:
+            check_wkt_use(f.ptype, pf.wkts, used)!
+        for o in m.oneofs:
+            for f in o.fields:
+                check_wkt_use(f.ptype, pf.wkts, used)!
+        for mf in m.maps:
+            check_wkt_use(mf.value_type, pf.wkts, used)!
+    for svc in pf.services:
+        for rpc in svc.rpcs:
+            for tn in [rpc.req_type, rpc.resp_type]:
+                if list_has(pf.wkts, tn) and not list_has(declared, tn) and not list_has(used, tn):
+                    used.push(tn)
+    return used
 
 fn enum_names_of(pf: ProtoFile) -> List[String]:
     names: List[String] := []
@@ -868,7 +998,15 @@ fn decode_oneof_field(ename: String, oname: String, f: Field, first: Bool, messa
 
 # generate the full pith module for a parsed proto file.
 pub fn generate(pf: ProtoFile) -> String!ParseError:
-    message_names := message_names_of(pf)
+    # the used well-known types join the user's messages as synthesized
+    # definitions and generate like any other message.
+    wkt_used := used_wkts(pf, message_names_of(pf.messages))!
+    all_messages: List[Message] := []
+    for m in pf.messages:
+        all_messages.push(m)
+    for wkt_name in wkt_used:
+        all_messages.push(wkt_message(wkt_name))
+    message_names := message_names_of(all_messages)
     enum_names := enum_names_of(pf)
     lines: List[String] := []
     lines.push("# generated from a .proto file by tools/protogen; do not edit by hand.")
@@ -893,7 +1031,7 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
     # "{}" as literal text: an empty map literal for constructor defaults.
     empty_map := chr(123) + chr(125)
 
-    ordered := topo_sort(pf.messages, message_names)
+    ordered := topo_sort(all_messages, message_names)
     for m in ordered:
         no_members := m.fields.len() == 0 and m.oneofs.len() == 0 and m.maps.len() == 0
 
@@ -904,7 +1042,10 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
                 lines.push(ln)
 
         # struct
-        lines.push("# message {m.name}")
+        if list_has(wkt_used, m.name):
+            lines.push("# message {m.name} (synthesized well-known type google.protobuf.{m.name})")
+        else:
+            lines.push("# message {m.name}")
         lines.push("pub struct {m.name}:")
         if no_members:
             lines.push("    pub _empty: Bool")

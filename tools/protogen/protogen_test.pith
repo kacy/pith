@@ -6,6 +6,8 @@ from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, d
 from sample_gen import Sticker, encode_Sticker, decode_Sticker, StickerDesign, StickerBacking
 from sample_gen import Sticker_emoji, Sticker_anchor, Sticker_tint, Sticker_design_unset, Sticker_reusable, Sticker_stock, Sticker_backing_unset
 from sample_gen import Inventory, Bin, encode_Inventory, decode_Inventory
+from sample_gen import Event, encode_Event, decode_Event, Timestamp, Duration, Int32Value
+from sample_gen import encode_Timestamp, decode_Timestamp, Empty, encode_Empty, decode_Empty
 from protogen_lib import parse, generate
 from std.protobuf import writer
 import std.bytes as bytes
@@ -256,6 +258,99 @@ fn has(text: String, needle: String) -> Bool:
 fn proto_message(body: String) -> String:
     return "message M " + chr(123) + " " + body + " " + chr(125)
 
+# an `import "<path>";` line, quotes via chr for the same reason.
+fn proto_import(path: String) -> String:
+    return "import " + chr(34) + path + chr(34) + "; "
+
+# --- well-known types -------------------------------------------------------
+
+fn empty_event() -> Event:
+    return Event(name: "", at: none, elapsed: none, priority: none)
+
+test "a timestamp field round-trips":
+    e := empty_event()
+    e.at = Timestamp(seconds: 1721800000, nanos: 500)
+    back := decode_Event(encode_Event(e))!
+    if let at = back.at:
+        assert_eq(at.seconds, 1721800000)
+        assert_eq(at.nanos, 500)
+    else:
+        assert(false)
+
+test "a timestamp encodes its canonical bytes":
+    # seconds = 1 (08 01), nanos = 2 (10 02), both plain varints.
+    assert_eq(encoding.to_hex(encode_Timestamp(Timestamp(seconds: 1, nanos: 2))), "08011002")
+    back := decode_Timestamp(encoding.from_hex("08011002") catch bytes.empty())!
+    assert_eq(back.seconds, 1)
+    assert_eq(back.nanos, 2)
+
+test "a negative duration round-trips":
+    e := empty_event()
+    e.elapsed = Duration(seconds: 0 - 3, nanos: 0 - 500000000)
+    back := decode_Event(encode_Event(e))!
+    if let d = back.elapsed:
+        assert_eq(d.seconds, 0 - 3)
+        assert_eq(d.nanos, 0 - 500000000)
+    else:
+        assert(false)
+
+test "a wrapper field gives the optional-int pattern":
+    # unset means none; set-to-zero still writes the (empty) message, so
+    # presence survives the round-trip.
+    unset := decode_Event(encode_Event(empty_event()))!
+    assert(unset.priority == none)
+    e := empty_event()
+    e.priority = Int32Value(value: 0)
+    # field 4, wire 2, a zero-length payload.
+    assert_eq(encoding.to_hex(encode_Event(e)), "2200")
+    back := decode_Event(encode_Event(e))!
+    if let p = back.priority:
+        assert_eq(p.value, 0)
+    else:
+        assert(false)
+
+test "empty encodes to nothing and decodes from anything":
+    assert_eq(encoding.to_hex(encode_Empty(Empty(_empty: false))), "")
+    decode_Empty(bytes.empty())!
+    # unknown fields are skipped, per proto3
+    decode_Empty(encoding.from_hex("089601") catch bytes.empty())!
+
+test "declaring a message named like an imported wkt is an error":
+    src := proto_import("google/protobuf/timestamp.proto") + "message Timestamp " + chr(123) + chr(125)
+    bad := parse(src)
+    assert(bad.is_err)
+    assert(has(bad.err.message, "collides"))
+    assert(has(bad.err.message, "google.protobuf.Timestamp"))
+
+test "an unsupported google import is an error naming the file":
+    bad := parse(proto_import("google/protobuf/any.proto"))
+    assert(bad.is_err)
+    assert(has(bad.err.message, "google/protobuf/any.proto"))
+    bad2 := parse(proto_import("google/protobuf/struct.proto"))
+    assert(bad2.is_err)
+
+test "using a wkt without its import is an error":
+    parsed := parse(proto_message("google.protobuf.Timestamp t = 1;"))
+    assert(not parsed.is_err)
+    gen := generate(parsed.ok)
+    assert(gen.is_err)
+    assert(has(gen.err.message, "google/protobuf/timestamp.proto"))
+
+test "an unsupported wkt reference is an error":
+    parsed := parse(proto_message("google.protobuf.Any a = 1;"))
+    assert(not parsed.is_err)
+    gen := generate(parsed.ok)
+    assert(gen.is_err)
+    assert(has(gen.err.message, "not supported"))
+
+test "an imported but unused wkt is not synthesized":
+    src := proto_import("google/protobuf/duration.proto") + proto_message("int32 x = 1;")
+    parsed := parse(src)
+    assert(not parsed.is_err)
+    gen := generate(parsed.ok)
+    assert(not gen.is_err)
+    assert(not has(gen.ok, "struct Duration"))
+
 test "a bool or fixed map key is a parse error":
     bad := parse(proto_message("map<bool, int32> x = 1;"))
     assert(bad.is_err)
@@ -305,3 +400,7 @@ test "the geometry service generates typed client stubs":
     assert(has(out, "pub struct GeometryReflectCall:"))
     assert(has(out, "self.conn.bidi_stream("))
     assert(has(out, "pub fn send(req: Point) -> Int:"))
+
+    # a unary rpc on the synthesized Empty wkt, client and server side
+    assert(has(out, "pub fn Ping(req: Empty) -> Empty!grpc.GrpcError:"))
+    assert(has(out, "/sample.Geometry/Ping"))

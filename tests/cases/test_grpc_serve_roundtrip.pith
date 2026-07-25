@@ -1,0 +1,64 @@
+# end-to-end grpc: pith's grpc.serve_tls accepts a unary call from pith's own grpc
+# client over tls with alpn "h2", routes it by :path to a dispatch handler, and
+# returns a protobuf reply with the grpc-status trailer. this exercises the whole
+# serve path — the module-global dispatch handler, the http/2 server, deframing
+# the request, framing the reply, and the trailer — against the real client.
+
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50077
+
+# read protobuf field 1 (a string) from a message.
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+# the service handler: greet the caller by the name in field 1.
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/echo.Echo/Ping":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_field1(request) catch ""
+    w := protobuf.writer()
+    w.write_string(1, "echo:" + name) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run_server():
+    grpc.serve_tls("127.0.0.1", PORT, "tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key", echo_dispatch) catch 0
+
+fn client_call() -> String:
+    cfg_r := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")
+    if cfg_r.is_err:
+        return "TLS_CFG_ERR"
+    cfg := cfg_r.ok.with_alpn(["h2"])
+    conn_r := grpc.dial_with_config("localhost", PORT, cfg)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    w := protobuf.writer()
+    w.write_string(1, "hello") catch false
+    reply_r := conn.unary("/echo.Echo/Ping", w.bytes())
+    w.free()
+    if reply_r.is_err:
+        conn.close()
+        return "UNARY_ERR"
+    got := read_field1(reply_r.ok) catch "?"
+    conn.close()
+    return got
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    print(client_call())

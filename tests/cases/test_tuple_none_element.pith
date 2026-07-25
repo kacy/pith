@@ -1,0 +1,39 @@
+# a bare `none` inside a tuple literal is an optional element: it types as an
+# optional with a wildcard inner and emits the canonical optional none, so
+# `(0, none)` satisfies a declared (Int, T?) in return position and in select
+# arms (the natural deadline-select shape), and the element reads back as none
+# through the optional machinery. a none against a non-optional element is
+# still rejected — the wildcard lives inside the optional, not at the element.
+
+import std.concurrent
+
+fn timed_out() -> (Int, Int?):
+    return (0, none)
+
+fn got() -> (Int, Int?):
+    x: Int? := 42
+    return (7, x)
+
+fn pick(ready: Bool) -> (Int, Int?):
+    ch := Channel[Int](1)
+    if ready:
+        ch.send(9)
+        return select:
+            v := ch.recv() => (1, v)
+            timeout 40 => (0, none)
+    return select:
+        v := ch.recv() => (1, v)
+        timeout 40 => (0, none)
+
+fn show(pair: (Int, Int?), label: String):
+    v := pair.1
+    if v == none:
+        print(label + " flag=" + pair.0.to_string() + " none")
+    else:
+        print(label + " flag=" + pair.0.to_string() + " some")
+
+fn main():
+    show(timed_out(), "ret")
+    show(got(), "wrapped")
+    show(pick(true), "recv")
+    show(pick(false), "timeout")

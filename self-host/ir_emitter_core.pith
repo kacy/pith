@@ -3498,7 +3498,14 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
     mut elem_regs: List[Int] := []
     mut elem_nodes: List[Int] := []
     for child in node.children:
-        elem_regs.push(ir_expr(child))
+        cn := get_node(child)
+        if cn.kind == "none_lit":
+            # a none element can only be an optional; build the canonical
+            # optional none rather than a bare zero, so element reads go
+            # through the optional machinery.
+            elem_regs.push(ir_emit_optional_none_value())
+        else:
+            elem_regs.push(ir_expr(child))
         elem_nodes.push(child)
     r := ir_reg()
     nf := ir_reg()

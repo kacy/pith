@@ -122,18 +122,32 @@ impl Conn:
     # grpc-status, a malformed response, or a transport error.
     pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
         no_metadata: List[String] := []
-        return self.unary_with_headers(full_method, request, no_metadata)!
+        return self.unary_with_headers_and_deadline(full_method, request, no_metadata, 0)!
 
     # like unary, but also sends `extra_headers` — a flat [k1, v1, k2, v2, ...]
     # list — as grpc metadata: custom http/2 request headers layered on top of the
     # standard grpc set. this is how a caller passes auth/tenant credentials (e.g.
     # an api key) to a collector. an empty list behaves exactly like unary.
     pub fn unary_with_headers(full_method: String, request: Bytes, extra_headers: List[String]) -> Bytes!GrpcError:
+        return self.unary_with_headers_and_deadline(full_method, request, extra_headers, 0)!
+
+    # like unary, but with a deadline: the call sends a grpc-timeout header so
+    # the server can stop working once the time is up, and the client itself
+    # gives up after `timeout_ms` milliseconds, failing with
+    # GRPC_DEADLINE_EXCEEDED. a timeout of zero (or less) means no deadline.
+    pub fn unary_with_deadline(full_method: String, request: Bytes, timeout_ms: Int) -> Bytes!GrpcError:
+        no_metadata: List[String] := []
+        return self.unary_with_headers_and_deadline(full_method, request, no_metadata, timeout_ms)!
+
+    # the full unary form: metadata and a deadline together. the other unary
+    # methods are shorthands for this one.
+    pub fn unary_with_headers_and_deadline(full_method: String, request: Bytes, extra_headers: List[String], timeout_ms: Int) -> Bytes!GrpcError:
         if not trace.is_active():
             framed := frame_message(request)
-            resp := self.client.request("POST", self.authority, full_method, with_metadata(grpc_headers(), extra_headers), framed)
+            fields := with_timeout_header(with_metadata(grpc_headers(), extra_headers), timeout_ms)
+            resp := self.client.request_with_timeout("POST", self.authority, full_method, fields, framed, timeout_ms)
             if resp.is_err:
-                fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
+                fail transport_error(resp.err)
             return handle_response(resp.ok)!
         # observability on: a CLIENT span, a traceparent injected into the request
         # headers, and RED metrics — all invisible to the caller.
@@ -141,10 +155,12 @@ impl Conn:
         span.set_attr("rpc.system", "grpc").set_attr("rpc.method", full_method)
         framed := frame_message(request)
         started := time.mono_nanos()
-        resp := self.client.request("POST", self.authority, full_method, with_metadata(headers_with_traceparent(span.context()), extra_headers), framed)
+        fields := with_timeout_header(with_metadata(headers_with_traceparent(span.context()), extra_headers), timeout_ms)
+        resp := self.client.request_with_timeout("POST", self.authority, full_method, fields, framed, timeout_ms)
         if resp.is_err:
-            finish_client_span(span, full_method, GRPC_UNAVAILABLE, started)
-            fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
+            err := transport_error(resp.err)
+            finish_client_span(span, full_method, err.status, started)
+            fail err
         result := handle_response(resp.ok)
         mut status := GRPC_OK
         if result.is_err:
@@ -217,6 +233,73 @@ fn with_metadata(base: List[hpack.HeaderField], extra: List[String]) -> List[hpa
         fields.push(hpack.header_field(extra[i], extra[i + 1]))
         i = i + 2
     return fields
+
+# `fields` plus a grpc-timeout header carrying `timeout_ms` in the canonical
+# wire form. zero (or less) means no deadline and returns `fields` unchanged;
+# otherwise a fresh list is built so a shared base list is never mutated.
+fn with_timeout_header(fields: List[hpack.HeaderField], timeout_ms: Int) -> List[hpack.HeaderField]:
+    if timeout_ms <= 0:
+        return fields
+    mut out: List[hpack.HeaderField] := []
+    for f in fields:
+        out.push(f)
+    out.push(hpack.header_field("grpc-timeout", format_grpc_timeout(timeout_ms)))
+    return out
+
+# a grpc-timeout value may carry at most eight digits, in any of six units.
+GRPC_TIMEOUT_MAX_VALUE := 99999999
+
+# format a timeout for the grpc-timeout request header: a value of one to eight
+# digits followed by a unit. milliseconds ("m") cover everything realistic; a
+# timeout too large for eight digits of millis falls back to whole seconds
+# ("S"), clamped at the eight-digit ceiling (~3 years).
+pub fn format_grpc_timeout(timeout_ms: Int) -> String:
+    if timeout_ms <= GRPC_TIMEOUT_MAX_VALUE:
+        return "{timeout_ms}m"
+    mut secs := timeout_ms / 1000
+    if secs > GRPC_TIMEOUT_MAX_VALUE:
+        secs = GRPC_TIMEOUT_MAX_VALUE
+    return "{secs}S"
+
+# parse a grpc-timeout header value into milliseconds: one to eight digits and
+# a unit — H hours, M minutes, S seconds, m millis, u micros, n nanos. sub-
+# millisecond values round down, so "1u" is 0 ms (a deadline already due).
+# anything malformed is none — the caller treats the request as having no
+# deadline rather than inventing one.
+pub fn parse_grpc_timeout(text: String) -> Int?:
+    if text.len() < 2 or text.len() > 9:
+        return none
+    raw := bytes.from_string_utf8(text)
+    mut value := 0
+    mut i := 0
+    while i < raw.len() - 1:
+        c := raw[i]
+        if c < 48 or c > 57:
+            return none
+        value = (value * 10) + (c - 48)
+        i = i + 1
+    unit := raw[raw.len() - 1]
+    if unit == 72: # 'H'
+        return value * 3600000
+    if unit == 77: # 'M'
+        return value * 60000
+    if unit == 83: # 'S'
+        return value * 1000
+    if unit == 109: # 'm'
+        return value
+    if unit == 117: # 'u'
+        return value / 1000
+    if unit == 110: # 'n'
+        return value / 1000000
+    return none
+
+# map a transport-level failure to the grpc error a caller sees: the http/2
+# client's deadline error becomes GRPC_DEADLINE_EXCEEDED, anything else is
+# GRPC_UNAVAILABLE.
+fn transport_error(detail: String) -> GrpcError:
+    if detail == http2.REQUEST_DEADLINE_EXCEEDED:
+        return GrpcError(GRPC_DEADLINE_EXCEEDED, "grpc: deadline exceeded")
+    return GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {detail}")
 
 # the standard grpc headers plus a W3C traceparent for `ctx`, so the server joins
 # this trace. builds a fresh list rather than pushing onto the shared cached one.
@@ -501,7 +584,13 @@ impl Conn:
     # returned ServerStream to pull response messages until it reports done; a
     # non-OK grpc-status surfaces as a GrpcError from recv().
     pub fn server_stream(full_method: String, request: Bytes) -> ServerStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
+        no_metadata: List[String] := []
+        return self.server_stream_with_headers(full_method, request, no_metadata)!
+
+    # like server_stream, but also sends `extra_headers` — a flat [k1, v1, ...]
+    # list — as grpc metadata, the same shape unary_with_headers takes.
+    pub fn server_stream_with_headers(full_method: String, request: Bytes, extra_headers: List[String]) -> ServerStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         stream := opened.ok
@@ -580,7 +669,12 @@ impl Conn:
     # one response. `full_method` is "/package.Service/Method". send() each
     # request, close_send() to finish, then recv_response().
     pub fn client_stream(full_method: String) -> ClientStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
+        no_metadata: List[String] := []
+        return self.client_stream_with_headers(full_method, no_metadata)!
+
+    # like client_stream, but also sends `extra_headers` as grpc metadata.
+    pub fn client_stream_with_headers(full_method: String, extra_headers: List[String]) -> ClientStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         return ClientStream(opened.ok, new_stream_reader())
@@ -590,7 +684,12 @@ impl Conn:
     # drive the request stream, recv() drains the response stream — the two can run
     # in separate tasks.
     pub fn bidi_stream(full_method: String) -> BidiStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
+        no_metadata: List[String] := []
+        return self.bidi_stream_with_headers(full_method, no_metadata)!
+
+    # like bidi_stream, but also sends `extra_headers` as grpc metadata.
+    pub fn bidi_stream_with_headers(full_method: String, extra_headers: List[String]) -> BidiStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         return BidiStream(opened.ok, new_stream_reader())
@@ -619,6 +718,44 @@ test "with_metadata returns the base list unchanged when there is no metadata":
 test "with_metadata ignores a trailing key that has no value":
     fields := with_metadata(grpc_headers(), ["x-only-key"])
     assert_eq(fields.len(), grpc_headers().len())
+
+test "with_timeout_header appends grpc-timeout and leaves the base list alone":
+    fields := with_timeout_header(grpc_headers(), 1500)
+    assert_eq(fields.len(), grpc_headers().len() + 1)
+    assert_eq(find_header(fields, "grpc-timeout"), "1500m")
+    # the shared cached header list was copied, not mutated.
+    assert(not has_header(grpc_headers(), "grpc-timeout"))
+
+test "with_timeout_header without a deadline returns the base list unchanged":
+    assert_eq(with_timeout_header(grpc_headers(), 0).len(), grpc_headers().len())
+
+test "format_grpc_timeout uses millis up to eight digits then whole seconds":
+    assert_eq(format_grpc_timeout(1500), "1500m")
+    assert_eq(format_grpc_timeout(99999999), "99999999m")
+    # nine digits of millis no longer fit; fall back to seconds.
+    assert_eq(format_grpc_timeout(100000000), "100000S")
+    # a value too large even in seconds clamps at the eight-digit ceiling.
+    assert_eq(format_grpc_timeout(999999999999999), "99999999S")
+
+test "parse_grpc_timeout reads every unit into milliseconds":
+    assert_eq(parse_grpc_timeout("1H")?, 3600000)
+    assert_eq(parse_grpc_timeout("2M")?, 120000)
+    assert_eq(parse_grpc_timeout("3S")?, 3000)
+    assert_eq(parse_grpc_timeout("1500m")?, 1500)
+    assert_eq(parse_grpc_timeout("2000u")?, 2)
+    assert_eq(parse_grpc_timeout("5000000n")?, 5)
+    # sub-millisecond values round down: due immediately.
+    assert_eq(parse_grpc_timeout("1u")?, 0)
+    assert_eq(parse_grpc_timeout("999999n")?, 0)
+
+test "parse_grpc_timeout rejects garbage":
+    assert(parse_grpc_timeout("") == none)
+    assert(parse_grpc_timeout("m") == none)
+    assert(parse_grpc_timeout("15x") == none)
+    assert(parse_grpc_timeout("15") == none)
+    assert(parse_grpc_timeout("1a4m") == none)
+    # nine digits exceed the eight-digit cap.
+    assert(parse_grpc_timeout("123456789m") == none)
 
 test "a message frames with a zero flag and a big-endian length":
     framed := frame_message(encoding.from_hex("089601")!)

@@ -37,6 +37,9 @@
 #   grpc.serve("0.0.0.0", 50051, greeter)!               # plaintext http/2
 #   grpc.serve_tls("0.0.0.0", 443, cert, key, greeter)!  # http/2 over tls
 #
+# dial a plaintext server with dial_h2c (no tls); dial a tls server with dial or
+# dial_with_config.
+#
 # the handler lives in a module global, so there is one grpc server per process —
 # the usual shape, one service binary per endpoint. that is a deliberate limit: a
 # pith closure cannot capture a fn-value, so the handler cannot be threaded in any
@@ -153,6 +156,13 @@ pub fn dial(host: String, port: Int) -> Conn!:
 # like dial.
 pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
     client := http2.open_with_config(host, port, config)!
+    return Conn(client: client, authority: host)
+
+# dial a grpc server over plaintext http/2 (h2c) — no tls. matches a server
+# started with grpc.serve. use this for local or trusted-network endpoints; for
+# anything public, dial over tls. otherwise like dial.
+pub fn dial_h2c(host: String, port: Int) -> Conn!:
+    client := http2.open_h2c(host, port)!
     return Conn(client: client, authority: host)
 
 # make a one-shot unary call: dial host:port, run the method, and close. this is

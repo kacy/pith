@@ -4606,8 +4606,12 @@ fn check_select_expression(node: Node, scope_id: Int) -> Int:
             result_type = arm_type
         elif is_error_type(arm_type) == false:
             if arm_type != result_type:
-                if arm_type != TID_VOID and result_type != TID_VOID:
-                    report_error("E225", "select arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
+                # composite types (tuples, optionals) are allocated fresh per
+                # resolution, so two arms with the same shape can carry
+                # different ids — compare structure before reporting.
+                if types_structurally_equal(arm_type, result_type) == false:
+                    if arm_type != TID_VOID and result_type != TID_VOID:
+                        report_error("E225", "select arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
     return result_type
 
 fn check_select_arm(arm: Node, scope_id: Int) -> Int:
@@ -4709,7 +4713,10 @@ fn check_if_expression(node: Node, scope_id: Int) -> Int:
                     result_type = etype
                 elif is_error_type(etype) == false:
                     if etype != result_type:
-                        report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
+                        # same-shape composites can carry different ids; see
+                        # the select-arm check above.
+                        if types_structurally_equal(etype, result_type) == false:
+                            report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
         else:
             # else branch
             etype := c_check_expr(child, scope_id)
@@ -4717,7 +4724,8 @@ fn check_if_expression(node: Node, scope_id: Int) -> Int:
                 result_type = etype
             elif is_error_type(etype) == false:
                 if etype != result_type:
-                    report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
+                    if types_structurally_equal(etype, result_type) == false:
+                        report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
     return result_type
 
 # ---------------------------------------------------------------
@@ -4762,7 +4770,10 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
                 if arm_type != result_type:
                     if arm_type != TID_VOID:
                         if result_type != TID_VOID:
-                            report_error("E225", "match arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
+                            # same-shape composites can carry different ids;
+                            # see the select-arm check above.
+                            if types_structurally_equal(arm_type, result_type) == false:
+                                report_error("E225", "match arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
     # exhaustiveness checking
     check_match_exhaustiveness(subject_type, arm_values, node_idx)
     return result_type

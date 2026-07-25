@@ -1,0 +1,32 @@
+# select and match arms whose values are structurally identical composites
+# (tuples carrying optionals) built through independently-resolved types used
+# to fail E225 "different types: tuple vs tuple": composite types are allocated
+# fresh per resolution, so equal shapes carry different ids. arm unification
+# now compares structure. (a bare `none` inside a composite literal is still
+# untargeted and rejected — that is a separate, tracked gap.)
+
+import std.concurrent
+
+fn got_value(v: Int?) -> (Int, Int?):
+    return (1, v)
+
+fn timed_out(v: Int?) -> (Int, Int?):
+    return (0, v)
+
+fn pick_select() -> Int:
+    ch := Channel[Int](1)
+    ch.send(5)
+    got := select:
+        v := ch.recv() => got_value(v)
+        timeout 50 => timed_out(none)
+    return got.0
+
+fn pick_match(n: Int) -> Int:
+    got := match n:
+        0 => timed_out(none)
+        _ => got_value(none)
+    return got.0
+
+fn main():
+    print(pick_select().to_string())
+    print(pick_match(3).to_string())

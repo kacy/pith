@@ -31,6 +31,7 @@ import std.binary as binary
 import std.encoding as encoding
 import std.net.url as url
 import std.net.tls as tls
+import std.time as time
 
 # --- settings identifiers (RFC 9113 §6.5.2) ---
 
@@ -1029,6 +1030,64 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
         if event.end:
             return Response(status, headers, trailers, body.bytes())
 
+# the error a deadline-bounded request fails with when its time runs out. a
+# caller (std.net.grpc) compares against this exact string to tell a deadline
+# from other transport failures, so it must stay stable.
+pub REQUEST_DEADLINE_EXCEEDED := "http2: request deadline exceeded"
+
+# a one-event holder for the deadline-bounded receive below. select arms must
+# share one type, and a tuple carrying an optional trips the checker's arm
+# unification — so the received arm stashes the event here and both arms
+# reduce to a plain Int flag.
+struct EventSlot:
+    mut event: StreamEvent?
+
+fn stash_event(slot: EventSlot, received: StreamEvent?) -> Int:
+    slot.event = received
+    return 1
+
+# like assemble_response, but give up once the monotonic clock passes
+# `deadline_ms` (a time.mono_millis() timestamp). each wait for the next stream
+# event is bounded by the time remaining, so a server that answers slowly — or
+# never — fails the request with REQUEST_DEADLINE_EXCEEDED instead of blocking
+# forever. the caller owns cleaning up the abandoned stream (reset + forget).
+fn assemble_response_until(inbox: Channel[StreamEvent], deadline_ms: Int) -> Response!:
+    body := bytes.buffer()
+    defer body.free()
+    mut status := 0
+    mut headers: List[hpack.HeaderField] := []
+    mut trailers: List[hpack.HeaderField] := []
+    mut got_headers := false
+    while true:
+        remaining := deadline_ms - time.mono_millis()
+        if remaining <= 0:
+            fail REQUEST_DEADLINE_EXCEEDED
+        slot := EventSlot(none)
+        picked := select:
+            received := inbox.recv() => stash_event(slot, received)
+            timeout remaining => 0
+        if picked == 0:
+            fail REQUEST_DEADLINE_EXCEEDED
+        opt := slot.event
+        if opt == none:
+            fail "http2: connection closed before the response completed"
+        event := opt?
+        if event.kind == STREAM_UNARY:
+            return Response(status_from(event.headers), event.headers, event.trailers, event.data)
+        if event.kind == STREAM_RESET:
+            fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
+        if event.kind == STREAM_HEADERS:
+            if not got_headers:
+                headers = event.headers
+                status = status_from(event.headers)
+                got_headers = true
+            else:
+                trailers = event.headers
+        elif event.kind == STREAM_DATA:
+            body.write(event.data)!
+        if event.end:
+            return Response(status, headers, trailers, body.bytes())
+
 # apply the peer's SETTINGS (RFC 9113 §6.5.2). the header-table-size bounds our
 # hpack encoder so the indices we emit stay valid for the peer's decoder; the
 # frame size and header-list size shape and gate what we send; the initial
@@ -1460,6 +1519,59 @@ impl Client:
         for f in extra:
             fields.push(f)
         return self.do_request(fields, body)!
+
+    # like request, but fail with REQUEST_DEADLINE_EXCEEDED once `timeout_ms`
+    # milliseconds pass without a complete response. a timeout of zero (or less)
+    # means no deadline — identical to request, including its inline fast path.
+    # a deadline-bounded call always rides the threaded pipeline: the inline path
+    # reads the socket synchronously and cannot be interrupted, while the
+    # pipeline delivers events over a channel this can wait on with a bound. on
+    # timeout the stream is reset (CANCEL) and forgotten, so the connection
+    # stays usable for later requests.
+    pub fn request_with_timeout(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes, timeout_ms: Int) -> Response!:
+        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
+        for f in extra:
+            fields.push(f)
+        if timeout_ms <= 0:
+            return self.do_request(fields, body)!
+        self.ensure_threaded()
+        return self.threaded_request_until(fields, body, time.mono_millis() + timeout_ms)!
+
+    # threaded_request with a deadline: the same open/send/assemble shape, but
+    # the response wait is bounded by `deadline_ms`. on failure (timeout
+    # included) the stream is closed — reset on the wire and dropped from the
+    # table — which also wakes a body sender still blocked on flow control.
+    fn threaded_request_until(fields: List[hpack.HeaderField], body: Bytes, deadline_ms: Int) -> Response!:
+        has_body := body.len() > 0
+        stream := self.open_stream_with_fields(fields, not has_body, true)!
+        stream_id := stream.id
+        if has_body and body.len() > self.peer_max_frame_size:
+            # a large body may block on flow-control credit, so send it on a
+            # task while this call drains the response inbox (see
+            # threaded_request). bind self to a local: a spawn thunk cannot
+            # load `self` directly.
+            me := self
+            sender := spawn send_stream_data(me, stream_id, body, true)
+            attempt := assemble_response_until(stream.inbox, deadline_ms)
+            if attempt.is_err:
+                # closing the stream resets it and closes its credit channel,
+                # unblocking the sender so the await below cannot hang.
+                stream.close()
+                await sender
+                fail attempt.err
+            await sender
+            self.forget(stream_id)
+            return attempt.ok
+        if has_body:
+            # a single-frame body drains immediately — the common grpc unary
+            # case — so it is sent right here, no task needed.
+            send_stream_data(self, stream_id, body, true)
+        attempt := assemble_response_until(stream.inbox, deadline_ms)
+        if attempt.is_err:
+            stream.close()
+            fail attempt.err
+        self.forget(stream_id)
+        return attempt.ok
 
     # GET a path on the given authority over this client.
     pub fn get(authority: String, path: String) -> Response!:
@@ -2071,3 +2183,28 @@ test "the first concurrency promotes the client and leaves the send window whole
     client.ensure_threaded()
     assert_eq(client.mode, MODE_THREADED)
     client.close()
+
+test "assemble_response_until returns a response that arrives in time":
+    inbox := Channel[StreamEvent](4)
+    inbox.send(headers_event([hpack.header_field(":status", "200")], false))
+    inbox.send(data_event(bytes.from_string_utf8("ok"), true))
+    resp := assemble_response_until(inbox, time.mono_millis() + 2000)!
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body.to_string_utf8()!, "ok")
+
+test "assemble_response_until fails once the deadline passes on a silent stream":
+    inbox := Channel[StreamEvent](4)
+    started := time.mono_millis()
+    result := assemble_response_until(inbox, started + 30)
+    assert(result.is_err)
+    assert_eq(result.err, REQUEST_DEADLINE_EXCEEDED)
+    # the wait was bounded: it actually waited rather than failing on arrival.
+    # the timeout may wake a hair before the deadline on a coarse timer, so the
+    # bound is deliberately loose — the immediate-failure case is the test below.
+    assert(time.mono_millis() - started >= 20)
+
+test "assemble_response_until fails immediately on an already-past deadline":
+    inbox := Channel[StreamEvent](4)
+    result := assemble_response_until(inbox, time.mono_millis() - 1)
+    assert(result.is_err)
+    assert_eq(result.err, REQUEST_DEADLINE_EXCEEDED)

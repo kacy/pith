@@ -1,19 +1,17 @@
-# defining a grpc service in pith: a dispatch handler that routes by method path,
-# decodes a protobuf request, and returns a protobuf reply (or a GrpcError).
+# a grpc service over plaintext http/2 (h2c), server and client in one process.
 #
-# to serve it over the network, hand the same handler to grpc.serve:
-#
-#     grpc.serve("0.0.0.0", 50051, greeter)              # plaintext http/2
-#     grpc.serve_tls("0.0.0.0", 443, cert, key, greeter) # http/2 over tls
-#
-# grpc.serve routes every request by its /package.Service/Method path to this one
-# handler and sends the reply back with the grpc-status trailer. here we drive the
-# handler directly so the example is self-contained: two calls, a known method and
-# an unknown one, exactly as the server would invoke it per request.
+# the server routes each call by its /package.Service/Method path to one dispatch
+# handler and sends the reply back with the grpc-status trailer. the client dials
+# with grpc.dial_h2c (no tls) and makes two unary calls over the one connection: a
+# known method and an unknown one, which comes back as GRPC_UNIMPLEMENTED. the
+# messages are protobuf — field 1 is a string in both directions.
 
 import std.net.grpc as grpc
 import std.protobuf as protobuf
 import std.bytes as bytes
+import std.time as time
+
+PORT := 50251
 
 # read protobuf field 1 (a string) from a message, defaulting to "" if absent.
 fn read_name(message: Bytes) -> String!protobuf.ProtoError:
@@ -43,13 +41,25 @@ fn greeter(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
     name := read_name(request) catch "world"
     return message_of("hello, " + name)
 
-fn call(path: String, name: String):
-    reply := greeter(path, message_of(name))
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, greeter) catch 0
+
+# call `path` over `conn` and print the reply, or the grpc-status on failure.
+fn call(conn: grpc.Conn, path: String, name: String):
+    reply := conn.unary(path, message_of(name))
     if reply.is_err:
         print(path + " -> error " + reply.err.status.to_string() + ": " + reply.err.message)
     else:
         print(path + " -> " + (read_name(reply.ok) catch "?"))
 
 fn main():
-    call("/greeter.Greeter/SayHello", "pith")
-    call("/greeter.Greeter/Unknown", "pith")
+    spawn run_server()
+    time.delay(400)
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+    call(conn, "/greeter.Greeter/SayHello", "pith")
+    call(conn, "/greeter.Greeter/Unknown", "pith")
+    conn.close()

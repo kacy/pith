@@ -499,6 +499,14 @@ fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
         fields.push(hpack.header_field("set-cookie", cookie))
     return fields
 
+# flatten a response's trailers into hpack header fields for the trailing HEADERS
+# block. empty when the response has no trailers (the common case).
+fn response_trailer_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
+    mut fields: List[hpack.HeaderField] := []
+    for key in response.trailers:
+        fields.push(hpack.header_field(key.to_lower(), response.trailers[key]))
+    return fields
+
 # encode and send a response's HEADERS on `stream_id`: one HEADERS frame carrying
 # the hpack block of `fields`, with END_HEADERS set. `end_stream` half-closes on
 # the HEADERS frame, which is what a bodiless response wants; a response with a
@@ -718,14 +726,23 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
     fields := response_fields(response)
     body := response.body
     has_body := body.len() > 0
-    # queue the HEADERS first: END_STREAM rides on them only when there is no body.
-    server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, fields, not has_body))
+    # trailers (a header block after the body) end the stream; grpc carries its
+    # grpc-status here. flattened in the handler task, same as the headers.
+    trailer_fields := response_trailer_fields(response)
+    has_trailers := trailer_fields.len() > 0
+    # queue the HEADERS first: END_STREAM rides on them only when nothing follows.
+    server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, fields, not has_body and not has_trailers))
     if has_body:
         # stream the body as flow-controlled DATA frames on this handler task, so a
         # response larger than the client's window is chunked and paused on the
         # window without ever blocking the writer. the DATA frames queue after the
-        # HEADERS above (same task, one FIFO channel), so ordering holds.
-        send_stream_data(server, stream_id, body, true)
+        # HEADERS above (same task, one FIFO channel), so ordering holds. END_STREAM
+        # rides on the last DATA frame only when no trailers follow.
+        send_stream_data(server, stream_id, body, not has_trailers)
+    if has_trailers:
+        # a second HEADERS block after the body is the trailers; it always ends
+        # the stream. queued after the DATA on the same FIFO, so ordering holds.
+        server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, trailer_fields, true))
     server.forget(stream_id)
 
 # --- the reader task ---

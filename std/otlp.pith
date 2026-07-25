@@ -1145,17 +1145,17 @@ test "prepare_body gzips only when the target enables compression":
 test "retry_delay prefers a larger Retry-After over the backoff":
     empty_headers: Map[String, String] := {}
     # no Retry-After header: fall back to the exponential backoff.
-    without := http.HttpResponse(503, "", empty_headers, bytes.empty(), [])
+    without := http.HttpResponse(503, "", empty_headers, bytes.empty(), [], {})
     assert_eq(retry_delay_ms(without, 0), backoff_ms(0))
 
     # a Retry-After larger than the backoff wins (5s vs the 1s base backoff).
     big_headers: Map[String, String] := {"Retry-After": "5"}
-    bigger := http.HttpResponse(503, "", big_headers, bytes.empty(), [])
+    bigger := http.HttpResponse(503, "", big_headers, bytes.empty(), [], {})
     assert_eq(retry_delay_ms(bigger, 0), 5000)
 
     # a Retry-After smaller than the backoff is ignored in favor of the backoff.
     small_headers: Map[String, String] := {"Retry-After": "1"}
-    smaller := http.HttpResponse(503, "", small_headers, bytes.empty(), [])
+    smaller := http.HttpResponse(503, "", small_headers, bytes.empty(), [], {})
     assert_eq(retry_delay_ms(smaller, 3), backoff_ms(3))
 
 test "grpc_method_for maps each signal path to its Export method":

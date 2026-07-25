@@ -1,4 +1,4 @@
-# std.net.grpc — a minimal unary grpc client over pith's native http/2.
+# std.net.grpc — a minimal unary grpc client and server over pith's native http/2.
 #
 # grpc is http/2 with a fixed message framing and a status carried in the
 # trailers. a unary call POSTs to /<package>.<Service>/<Method> with
@@ -25,12 +25,31 @@
 #   reply := ch.unary("/grpcbin.GRPCBin/DummyUnary", request)!
 #   ch.close()
 #
+# to serve, write a dispatch handler — (path, request bytes) -> reply bytes, or a
+# GrpcError — and hand it to serve() or serve_tls(). the server routes each call
+# by its /<package>.<Service>/<Method> path to the handler and sends the reply
+# back with the grpc-status trailer:
+#
+#   fn greeter(path, request) -> Bytes!grpc.GrpcError:
+#       name := read_name(request) catch "world"
+#       return encode_reply("hello, " + name)
+#
+#   grpc.serve("0.0.0.0", 50051, greeter)!               # plaintext http/2
+#   grpc.serve_tls("0.0.0.0", 443, cert, key, greeter)!  # http/2 over tls
+#
+# the handler lives in a module global, so there is one grpc server per process —
+# the usual shape, one service binary per endpoint. that is a deliberate limit: a
+# pith closure cannot capture a fn-value, so the handler cannot be threaded in any
+# other way.
+#
 # deferred: streaming rpcs (client/server/bidi), message compression, deadlines
 # and metadata beyond the basics, grpc-message percent-decoding, and .proto code
 # generation.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2
+import std.net.http2.server as h2server
+import std.net.http as http
 import std.protobuf as protobuf
 import std.bytes as bytes
 import std.bits as bits
@@ -841,3 +860,70 @@ pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config
         conns.push(dial_with_config(host, port, config)!)
         i = i + 1
     return PoolConn(conns: conns, next: 0, pick: Mutex())
+
+# --- server ---
+#
+# serving grpc reuses the http/2 server: a grpc call is an http/2 POST to
+# /pkg.Service/Method carrying a length-prefixed message, answered with a
+# length-prefixed reply and a grpc-status trailer. serve() wraps the http/2
+# server with a handler that deframes the request, dispatches by path, frames
+# the reply, and sets the trailer.
+#
+# the dispatch fn lives in a module global because a pith closure cannot capture
+# a fn-value, so there is one grpc server per process — the common case, one
+# service binary per endpoint. a generated <Service>Server provides the dispatch
+# (routing each path to a typed handler); a hand-written server can match paths
+# itself.
+
+GRPC_CONTENT_TYPE := "application/grpc"
+
+mut grpc_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
+
+fn grpc_no_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
+    fail GrpcError(GRPC_UNIMPLEMENTED, "no grpc dispatch registered")
+
+fn grpc_ok_trailers() -> Map[String, String]:
+    mut t: Map[String, String] := {}
+    t.insert("grpc-status", GRPC_OK.to_string())
+    return t
+
+fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
+    mut t: Map[String, String] := {}
+    t.insert("grpc-status", status.to_string())
+    if message.len() > 0:
+        t.insert("grpc-message", message)
+    return t
+
+# extract the single request message from a unary request body (one
+# length-prefixed frame). an all-default proto3 message can arrive as an empty
+# body, which decodes to a default message.
+fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
+    d := new_deframer()
+    d.push(body)
+    if not d.ready():
+        return bytes.empty()
+    return d.next()!
+
+# the http/2 handler that turns one unary grpc request into one grpc response.
+fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch ""
+    request := grpc_unframe_unary(req.body_bytes())
+    if request.is_err:
+        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_INTERNAL, "malformed request frame"))
+    result := grpc_dispatch_fn(path, request.ok)
+    if result.is_err:
+        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
+    framed := frame_message(result.ok)
+    return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(framed).with_trailers(grpc_ok_trailers())
+
+# serve grpc over plaintext http/2 (h2c). blocks, accepting connections. the
+# `dispatch` maps a full method path (/pkg.Service/Method) and the request
+# message bytes to the response message bytes, or a GrpcError.
+pub fn serve(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
+    grpc_dispatch_fn = dispatch
+    return h2server.listen_h2c(host, port, grpc_serve_handler)!
+
+# serve grpc over http/2 with tls (alpn "h2").
+pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
+    grpc_dispatch_fn = dispatch
+    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_handler)!

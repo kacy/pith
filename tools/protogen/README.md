@@ -19,6 +19,7 @@ pith build tools/protogen/protogen.pith
 - singular message fields, as pith optionals (`Sub?`)
 - repeated message / string / bytes / int-varint / enum fields
 - `oneof` groups, as a payload enum per group (see below)
+- `map<k, v>` fields, as pith `Map`s (see below)
 - grpc `service` stubs — a typed client per service (see below)
 
 singular message fields have presence (optionals); other singular fields follow
@@ -60,6 +61,39 @@ constructors sidestep it (std.sql's `Value` does the same). reading is a plain
 a set member always writes, even at its zero value; `Unset` writes nothing. on
 decode the members are ordinary fields of the message, and the last one seen
 wins, per proto3.
+
+## maps
+
+a `map<k, v>` field becomes a pith `Map`. string keys stay `String`; the
+integer key types (`int32`/`int64`/`uint32`/`uint64`/`sint32`/`sint64`) become
+`Int`. values can be any supported scalar, string, bytes, enum (as `Int`), or
+message type:
+
+```proto
+message Inventory {
+  map<string, int32> counts = 1;
+  map<string, Bin> bins = 2;
+  map<int64, string> names = 3;
+}
+```
+
+```
+pub struct Inventory:
+    pub counts: Map[String, Int]
+    pub bins: Map[String, Bin]
+    pub names: Map[Int, String]
+```
+
+on the wire each entry is a little message (key = 1, value = 2) written
+length-delimited on the map's field number, per proto3. an empty map writes
+nothing. the encoder always writes both key and value, even at their zero
+values; the decoder accepts entries that omit either (they mean the zero key
+or zero value) and merges duplicates last-one-wins.
+
+`bool` and `fixed*`/`sfixed*` keys are a parse error — a pith `Map` keys by
+`String` or `Int` only. so is a map value that is itself a map, which proto3
+forbids anyway. map iteration order is not fixed, so two encodes of the same
+multi-entry map may order entries differently (both decode the same).
 
 ## services
 
@@ -112,8 +146,8 @@ right for bounded streams, not endless or interactive ones.
 
 ## not yet supported
 
-a clear parse error names these: `map<>`, 32-bit `float`, the well-known types,
-proto2, and repeated `sint`/`fixed`/`double`.
+a clear parse error names these: `bool`/`fixed` map keys, 32-bit `float`, the
+well-known types, proto2, and repeated `sint`/`fixed`/`double`.
 
 ## example
 

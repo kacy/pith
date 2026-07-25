@@ -199,6 +199,111 @@ pub fn decode_Sticker(data: Bytes) -> Sticker!ProtoError:
             r.skip(tag.wire)!
     return m
 
+# message Bin
+pub struct Bin:
+    pub size: Int
+
+# encode a Bin to protobuf wire bytes.
+pub fn encode_Bin(m: Bin) -> Bytes:
+    w := writer()
+    if m.size != 0:
+        w.write_int32(1, m.size) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Bin from protobuf wire bytes.
+pub fn decode_Bin(data: Bytes) -> Bin!ProtoError:
+    m := Bin(size: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.size = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Inventory
+pub struct Inventory:
+    pub counts: Map[String, Int]
+    pub bins: Map[String, Bin]
+    pub names: Map[Int, String]
+
+# encode a Inventory to protobuf wire bytes.
+pub fn encode_Inventory(m: Inventory) -> Bytes:
+    w := writer()
+    for k_counts in m.counts.keys():
+        ew_counts := writer()
+        ew_counts.write_string(1, k_counts) catch false
+        ew_counts.write_int32(2, m.counts[k_counts]) catch false
+        w.write_message(1, ew_counts.bytes()) catch false
+        ew_counts.free()
+    for k_bins in m.bins.keys():
+        ew_bins := writer()
+        ew_bins.write_string(1, k_bins) catch false
+        ew_bins.write_message(2, encode_Bin(m.bins[k_bins])) catch false
+        w.write_message(2, ew_bins.bytes()) catch false
+        ew_bins.free()
+    for k_names in m.names.keys():
+        ew_names := writer()
+        ew_names.write_int32(1, k_names) catch false
+        ew_names.write_string(2, m.names[k_names]) catch false
+        w.write_message(3, ew_names.bytes()) catch false
+        ew_names.free()
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Inventory from protobuf wire bytes.
+pub fn decode_Inventory(data: Bytes) -> Inventory!ProtoError:
+    m := Inventory(counts: {}, bins: {}, names: {})
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            er_counts := reader(r.read_message()!)
+            mut mk_counts := ""
+            mut mv_counts := 0
+            while not er_counts.at_end():
+                et_counts := er_counts.read_tag()!
+                if et_counts.field == 1:
+                    mk_counts = er_counts.read_string()!
+                elif et_counts.field == 2:
+                    mv_counts = er_counts.read_int64()!
+                else:
+                    er_counts.skip(et_counts.wire)!
+            m.counts.insert(mk_counts, mv_counts)
+        elif tag.field == 2:
+            er_bins := reader(r.read_message()!)
+            mut mk_bins := ""
+            mut mv_bins := decode_Bin(bytes.empty())!
+            while not er_bins.at_end():
+                et_bins := er_bins.read_tag()!
+                if et_bins.field == 1:
+                    mk_bins = er_bins.read_string()!
+                elif et_bins.field == 2:
+                    mv_bins = decode_Bin(er_bins.read_message()!)!
+                else:
+                    er_bins.skip(et_bins.wire)!
+            m.bins.insert(mk_bins, mv_bins)
+        elif tag.field == 3:
+            er_names := reader(r.read_message()!)
+            mut mk_names := 0
+            mut mv_names := ""
+            while not er_names.at_end():
+                et_names := er_names.read_tag()!
+                if et_names.field == 1:
+                    mk_names = er_names.read_int64()!
+                elif et_names.field == 2:
+                    mv_names = er_names.read_string()!
+                else:
+                    er_names.skip(et_names.wire)!
+            m.names.insert(mk_names, mv_names)
+        else:
+            r.skip(tag.wire)!
+    return m
+
 # a typed server-stream of Point messages from Geometry.Corners.
 pub struct GeometryCornersCall:
     pub inner: grpc.ServerStream

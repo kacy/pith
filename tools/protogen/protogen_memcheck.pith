@@ -2,6 +2,7 @@
 # under valgrind. it should allocate and free cleanly, like std.protobuf.
 from sample_gen import Point, Shape, encode_Shape, decode_Shape
 from sample_gen import Sticker, encode_Sticker, decode_Sticker, Sticker_anchor, Sticker_stock
+from sample_gen import Inventory, Bin, encode_Inventory, decode_Inventory
 import std.bytes as bytes
 
 fn main():
@@ -11,5 +12,7 @@ fn main():
         back := decode_Shape(encode_Shape(s)) catch s
         st := Sticker(name: "dot", design: Sticker_anchor(Point(x: 7, y: 8)), backing: Sticker_stock(3))
         stback := decode_Sticker(encode_Sticker(st)) catch st
-        i = i + back.id - 41 + stback.name.len() - 3
+        inv := Inventory(counts: {"a": 1, "b": 2}, bins: {"north": Bin(size: 9)}, names: {7: "seven"})
+        invback := decode_Inventory(encode_Inventory(inv)) catch inv
+        i = i + back.id - 41 + stback.name.len() - 3 + invback.counts.len() - 2
     print("ran encode/decode 200 times")

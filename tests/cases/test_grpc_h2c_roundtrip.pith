@@ -1,0 +1,57 @@
+# end-to-end grpc over plaintext http/2 (h2c): grpc.serve accepts a unary call
+# from pith's own grpc client dialed with grpc.dial_h2c (no tls), routes it by
+# :path, and returns a protobuf reply with the grpc-status trailer. this covers
+# the h2c client transport — the plaintext socket path through the http/2
+# connection — against the real server.
+
+import std.net.grpc as grpc
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50319
+
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/echo.Echo/Ping":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_field1(request) catch ""
+    w := protobuf.writer()
+    w.write_string(1, "echo:" + name) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, echo_dispatch) catch 0
+
+fn client_call() -> String:
+    conn_r := grpc.dial_h2c("127.0.0.1", PORT)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    w := protobuf.writer()
+    w.write_string(1, "hello") catch false
+    reply_r := conn.unary("/echo.Echo/Ping", w.bytes())
+    w.free()
+    if reply_r.is_err:
+        conn.close()
+        return "UNARY_ERR"
+    got := read_field1(reply_r.ok) catch "?"
+    conn.close()
+    return got
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    print(client_call())

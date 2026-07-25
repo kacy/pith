@@ -80,11 +80,12 @@ pub struct Response:
 
 # --- connection ---
 
-# a synchronous http/2 connection over one transport. `tls_handle` addresses
-# the tls session when `live`; when not live the connection reads from a
-# preloaded `buf` and records writes in `sent`, which the tests drive. `buf`
-# and `pos` are the receive buffer coalescing partial socket reads (frames can
-# span reads), and the encoder/decoder carry the two hpack dynamic tables.
+# a synchronous http/2 connection over one transport. the handle addresses the
+# tls session over tls, or the raw socket fd when `plaintext` (h2c); `live` marks
+# it connected either way. when not live the connection reads from a preloaded
+# `buf` and records writes in `sent`, which the tests drive. `buf` and `pos` are
+# the receive buffer coalescing partial socket reads (frames can span reads), and
+# the encoder/decoder carry the two hpack dynamic tables.
 pub struct Connection:
     mut tls_handle: Int
     mut live: Bool
@@ -94,15 +95,22 @@ pub struct Connection:
     mut decoder: hpack.Decoder
     mut next_stream_id: Int
     mut sent: Bytes
+    # true for an h2c (plaintext) connection: the handle is a raw socket fd and
+    # transport i/o goes through tcp rather than the tls session.
+    mut plaintext: Bool
 
 # build a live connection over an established tls session handle.
 fn new_live_connection(handle: Int) -> Connection:
-    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty())
+    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false)
+
+# build a live h2c (plaintext) connection over an open socket fd.
+fn new_h2c_connection(fd: Int) -> Connection:
+    return Connection(fd, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), true)
 
 # build an offline connection that reads `data` as if it arrived from a peer.
 # used by the tests to drive the read loop over a constructed frame stream.
 fn connection_from_frames(data: Bytes) -> Connection:
-    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty())
+    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false)
 
 # the SETTINGS frame the client opens with: no server push, the default window,
 # and the default max frame size (so a peer must not send larger frames).
@@ -118,10 +126,19 @@ fn status_from(headers: List[hpack.HeaderField]) -> Int:
     return 0
 
 impl Connection:
-    # read one transport chunk: the tls session when live, otherwise nothing
-    # (the offline buffer is exhausted, which reads as end-of-stream).
+    # the request :scheme pseudo-header: "http" for an h2c connection, "https"
+    # over tls.
+    fn scheme() -> String:
+        if self.plaintext:
+            return "http"
+        return "https"
+
+    # read one transport chunk: the socket when live (tcp for h2c, the tls session
+    # otherwise), or nothing when offline (the buffer is exhausted, read as eof).
     fn recv_chunk() -> Bytes!:
         if self.live:
+            if self.plaintext:
+                return tcp_read_bytes(self.tls_handle, 16384)!
             return tls.conn_from_handle(self.tls_handle).read_bytes(16384)!
         return bytes.empty()
 
@@ -154,9 +171,12 @@ impl Connection:
         self.pos = self.pos + total
         return frames.read_frame(binary.reader(full), frames.DEFAULT_MAX_FRAME_SIZE)!
 
-    # write raw bytes to the transport, or record them when offline.
+    # write raw bytes to the transport (tcp for h2c, the tls session otherwise),
+    # or record them when offline.
     fn send(data: Bytes) -> Int!:
         if self.live:
+            if self.plaintext:
+                return tcp_write_bytes(self.tls_handle, data)!
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
         self.sent = bytes.concat(self.sent, data)
         return data.len()
@@ -269,7 +289,7 @@ impl Connection:
     fn request_get(authority: String, path: String) -> Response!:
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
-        request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", self.scheme()), hpack.header_field(":authority", authority)]
         block := self.encoder.encode(request)
         self.send_frame(frames.headers_frame(stream_id, block, true, true))!
         return self.read_response(stream_id)!
@@ -277,7 +297,10 @@ impl Connection:
     # close the underlying transport.
     pub fn close():
         if self.live:
-            tls.conn_from_handle(self.tls_handle).close()
+            if self.plaintext:
+                tcp_close(self.tls_handle)
+            else:
+                tls.conn_from_handle(self.tls_handle).close()
 
 # open a connection to `host`:`port` using the caller's tls `config` and run the
 # handshake. the config must offer alpn "h2"; use this to trust a private ca or
@@ -296,6 +319,15 @@ pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Conne
 # roots, and run the handshake. fails if the peer does not negotiate http/2.
 pub fn connect(host: String, port: Int) -> Connection!:
     return connect_with_config(host, port, tls.client_config()!.with_alpn(["h2"]))!
+
+# open an h2c (plaintext, prior-knowledge) connection to `host`:`port` and run the
+# handshake. no tls, no alpn — the client assumes the peer speaks http/2 and opens
+# with the preface, per RFC 9113 §3.3. for a server reached over tls, use connect.
+pub fn connect_h2c(host: String, port: Int) -> Connection!:
+    fd := tcp_connect(host, port)!
+    conn := new_h2c_connection(fd)
+    conn.handshake()!
+    return conn
 
 # the parts of an https url a request needs: where to connect and what to ask
 # for. `authority` is the value of the :authority pseudo-header (host, plus the
@@ -620,6 +652,13 @@ fn client_from_connection(conn: Connection) -> Client:
 # the reader/writer pipeline once concurrency appears. call close() when done.
 pub fn open(host: String, port: Int) -> Client!:
     conn := connect(host, port)!
+    return client_from_connection(conn)
+
+# open a multiplexed h2c (plaintext, prior-knowledge) client to host:port. like
+# open, but no tls — for a server that speaks http/2 in the clear. call close()
+# when done.
+pub fn open_h2c(host: String, port: Int) -> Client!:
+    conn := connect_h2c(host, port)!
     return client_from_connection(conn)
 
 # open a multiplexed client using the caller's tls `config` (which must offer
@@ -1254,7 +1293,7 @@ impl Client:
     # server-streaming request has no body); false to keep sending DATA with
     # Stream.send. safe to call from many tasks concurrently.
     pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
-        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
         for f in extra:
             fields.push(f)
         # a stream is long-lived and its events flow through the reader, so it can
@@ -1417,14 +1456,14 @@ impl Client:
     # point for non-GET verbs and request bodies — a grpc unary call is a POST
     # whose body is a length-prefixed protobuf message.
     pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
-        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
         for f in extra:
             fields.push(f)
         return self.do_request(fields, body)!
 
     # GET a path on the given authority over this client.
     pub fn get(authority: String, path: String) -> Response!:
-        fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
         return self.do_request(fields, bytes.empty())!
 
     # stop the client and close the connection. call it when no request is in

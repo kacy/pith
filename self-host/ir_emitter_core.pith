@@ -3027,7 +3027,7 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
         if i == 0:
             continue
         arg_nodes.push(child)
-    return ir_emit_struct_positional_init(expr_info.name, arg_nodes)
+    return ir_emit_struct_positional_init(expr_info.name, arg_nodes, expr_tid)
 
 # substitute a base field type name that is a bare generic param (I, T, U) with
 # the instance's concrete type name; anything else passes through unchanged.
@@ -4181,7 +4181,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
                     if ci == 0:
                         continue
                     ctor_args.push(child)
-                return ir_emit_struct_positional_init(call_name, ctor_args)
+                return ir_emit_struct_positional_init(call_name, ctor_args, alias_expr_tid)
         if ir_is_generic_function_name(call_name):
             mut generic_ret_type := ir_checked_type(idx)
             if generic_ret_type.len() == 0:
@@ -4624,17 +4624,51 @@ fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
             return true
     return false
 
+# Field metadata for a struct construction, resolved by the checker's type id
+# when it typed the expression. Two modules can each declare a struct with the
+# same name; the name-keyed registry (and the global type table it consults)
+# then collapse them, so a field given by name matches the wrong struct's
+# layout and silently stores its default. The construction's checked tid names
+# the exact struct, so we read its ordered fields directly — the same
+# authoritative path field reads already use (ir_try_checked_field_read). We
+# fall back to the name-keyed registry when the checker never assigned a plain
+# struct tid (tuples and some emit-only constructions).
+fn ir_ctor_field_count(sname: String, tid: Int) -> Int:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            return info.fields.len()
+    return ir_struct_field_count(sname)
+
+fn ir_ctor_field_name_at(sname: String, tid: Int, field_index: Int) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct" and field_index >= 0 and field_index < info.fields.len():
+            return info.fields[field_index]
+    return ir_struct_field_name_at(sname, field_index)
+
+fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return ir_type_from_tid(info.field_types[i])
+    return ir_struct_field_type_name(sname, field_name)
+
 # Emit a struct built with named fields (`Point(x: 3, y: 4)`). Fields can be
 # given in any order and any defaulted field may be omitted, so we walk the
 # struct's declaration order and pull each field's value by name, falling back
 # to its default. The checker has already validated names and required fields.
-fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
-    total_fields := ir_struct_field_count(sname)
+# `tid` is the construction's checked type id (or -1), used to resolve the field
+# layout unambiguously across same-named structs.
+fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> Int:
+    total_fields := ir_ctor_field_count(sname, tid)
     mut field_regs: List[Int] := []
     mut field_idx := 0
     while field_idx < total_fields:
-        field_name := ir_struct_field_name_at(sname, field_idx)
-        field_type := ir_struct_field_type_name(sname, field_name)
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
+        field_type := ir_ctor_field_type_name(sname, tid, field_name)
         mut value_node := 0 - 1
         for an_idx in arg_nodes:
             an := get_node(an_idx)
@@ -4675,21 +4709,22 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
     ir_emit_attach_dtor(r, sname)
     return r
 
-fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
+fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int) -> Int:
     if ir_struct_args_have_names(arg_nodes):
-        return ir_emit_struct_named_init(sname, arg_nodes)
+        return ir_emit_struct_named_init(sname, arg_nodes, tid)
     mut field_regs: List[Int] := []
     mut field_idx := 0
     while field_idx < arg_nodes.len():
         child := arg_nodes[field_idx]
         cn := get_node(child)
-        ftype := ir_struct_field_type_name(sname, ir_struct_field_name_at(sname, field_idx))
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
+        ftype := ir_ctor_field_type_name(sname, tid, field_name)
         mut value_idx := child
         if cn.kind == "field_init" and cn.children.len() > 0:
             value_idx = cn.children[0]
         elif cn.kind == "arg" and cn.children.len() > 0:
             value_idx = cn.children[0]
-        if ir_struct_field_is_weak(sname, ir_struct_field_name_at(sname, field_idx)):
+        if ir_struct_field_is_weak(sname, field_name):
             field_regs.push(ir_emit_weak_payload(value_idx))
             field_idx = field_idx + 1
             continue
@@ -4700,12 +4735,12 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
             ir_rc_retain_reg(fr, pos_field_kind)
         field_regs.push(fr)
         field_idx = field_idx + 1
-    total_fields := ir_struct_field_count(sname)
+    total_fields := ir_ctor_field_count(sname, tid)
     while field_idx < total_fields:
-        field_name := ir_struct_field_name_at(sname, field_idx)
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         default_idx := ir_struct_field_default_node(sname, field_name)
         if default_idx >= 0:
-            field_regs.push(ir_emit_value_for_target(default_idx, ir_struct_field_type_name(sname, field_name)))
+            field_regs.push(ir_emit_value_for_target(default_idx, ir_ctor_field_type_name(sname, tid, field_name)))
         else:
             field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -4719,8 +4754,8 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
     ir_emit_attach_dtor(r, sname)
     return r
 
-fn ir_emit_struct_init(node: Node) -> Int:
-    return ir_emit_struct_positional_init(node.value, node.children)
+fn ir_emit_struct_init(idx: Int, node: Node) -> Int:
+    return ir_emit_struct_positional_init(node.value, node.children, c_get_expr_type(idx))
 
 fn ir_emit_spawn_expr(node: Node) -> Int:
     if node.children.len() > 0:
@@ -5148,7 +5183,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_tuple_literal(node)
 
     if kind == "struct_init":
-        return ir_emit_struct_init(node)
+        return ir_emit_struct_init(idx, node)
 
     if kind == "field_access":
         return ir_emit_field_access_expr(idx, node)

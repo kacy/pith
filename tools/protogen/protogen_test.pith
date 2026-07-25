@@ -404,3 +404,43 @@ test "the geometry service generates typed client stubs":
     # a unary rpc on the synthesized Empty wkt, client and server side
     assert(has(out, "pub fn Ping(req: Empty) -> Empty!grpc.GrpcError:"))
     assert(has(out, "/sample.Geometry/Ping"))
+
+# the streaming server: serve_Geometry_streaming serves every rpc on one
+# grpc.serve_stream listener. each streaming rpc gets a typed ServerCall whose
+# recv decodes and whose send encodes; unary rpcs reuse the buffered handler
+# slots. (the generated code itself is compiled by the sample_gen import above,
+# which type-checks it against std.net.grpc.)
+test "the geometry service generates streaming server stubs":
+    read := fs.read("tools/protogen/sample.proto")
+    assert(not read.is_err)
+    parsed := parse(read.ok)
+    assert(not parsed.is_err)
+    gen := generate(parsed.ok)
+    assert(not gen.is_err)
+    out := gen.ok
+
+    # server-streaming: the handler gets the decoded request plus a send-side
+    # call, so no Recv struct is generated for it
+    assert(has(out, "pub struct GeometryCornersServerCall:"))
+    assert(has(out, "Corners: fn(Shape, GeometryCornersServerCall) -> Int!grpc.GrpcError"))
+    assert(not has(out, "GeometryCornersRecv"))
+
+    # client-streaming: the handler drives recv (typed, decoded) and sends the
+    # single reply
+    assert(has(out, "pub struct GeometryAssembleRecv:"))
+    assert(has(out, "pub fn recv() -> GeometryAssembleRecv!grpc.GrpcError:"))
+    assert(has(out, "pub fn send(reply: Shape) -> Int:"))
+    assert(has(out, "Assemble: fn(GeometryAssembleServerCall) -> Int!grpc.GrpcError"))
+
+    # bidi: recv and send both flow through the typed call
+    assert(has(out, "pub fn recv() -> GeometryReflectRecv!grpc.GrpcError:"))
+    assert(has(out, "Reflect: fn(GeometryReflectServerCall) -> Int!grpc.GrpcError"))
+
+    # a decode failure inside recv comes back as INVALID_ARGUMENT
+    assert(has(out, "grpc.GRPC_INVALID_ARGUMENT"))
+
+    # unary rpcs ride the same listener with their buffered handler shape
+    assert(has(out, "pub fn serve_Geometry_streaming(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError"))
+    assert(has(out, "_Geometry_Describe_fn = Describe"))
+    assert(has(out, "grpc.serve_stream(host, port, _Geometry_stream_route)"))
+    assert(has(out, "grpc.serve_stream_tls(host, port, cert, key, _Geometry_stream_route)"))

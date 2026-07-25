@@ -6,7 +6,12 @@ from types import ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, g
 # unnamed composites bare ("List", "fn"), which once merged
 # List[List[Int]] and List[List[String]] into one interned id when two
 # modules built them in the wrong order — so the key spells nested
-# structure out fully.
+# structure out fully. the same hazard applies to a named leaf: two modules
+# can each declare a struct (or enum) called "Field", so keying by the bare
+# name alone merged List[log.Field] and List[protogen.Field] into one id. the
+# type id is unique per declaration, so a struct/enum leaf carries it in the
+# key; primitives keep their plain name (their names are already unique, and
+# lookups like "List[String]" rely on it).
 fn intern_key_name(tid: Int) -> String:
     info := get_type_info(tid)
     if info.kind == "list":
@@ -37,6 +42,9 @@ fn intern_key_name(tid: Int) -> String:
                 out = out + ","
             out = out + intern_key_name(pt)
         return out + ")->" + intern_key_name(info.return_type)
+    if info.kind == "struct" or info.kind == "enum":
+        # two modules can declare a same-named struct/enum; the id disambiguates.
+        return info.name + "#" + tid.to_string()
     return get_type_name(tid)
 
 fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:

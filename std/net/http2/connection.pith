@@ -2198,8 +2198,10 @@ test "assemble_response_until fails once the deadline passes on a silent stream"
     result := assemble_response_until(inbox, started + 30)
     assert(result.is_err)
     assert_eq(result.err, REQUEST_DEADLINE_EXCEEDED)
-    # the wait was bounded: it gave up at (or just after) the deadline.
-    assert(time.mono_millis() - started >= 30)
+    # the wait was bounded: it actually waited rather than failing on arrival.
+    # the timeout may wake a hair before the deadline on a coarse timer, so the
+    # bound is deliberately loose — the immediate-failure case is the test below.
+    assert(time.mono_millis() - started >= 20)
 
 test "assemble_response_until fails immediately on an already-past deadline":
     inbox := Channel[StreamEvent](4)

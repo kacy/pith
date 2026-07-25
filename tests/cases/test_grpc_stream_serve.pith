@@ -1,7 +1,8 @@
-# end-to-end buffered server-streaming over grpc.serve_body: the dispatch returns
-# several framed messages in one body and the real grpc client reads them back
-# with server_stream + collect_server_stream. also covers a unary reply through
-# the same body-level path, since serve_body carries both shapes.
+# end-to-end buffered streaming over grpc.serve_body, in both directions: the
+# dispatch returns several framed messages in one body (read back with
+# server_stream + collect_server_stream), and receives several framed messages
+# in one request body (sent with client_stream send/close_send). a unary reply
+# rides the same body-level path, since serve_body carries every shape.
 
 import std.net.grpc as grpc
 import std.bytes as bytes
@@ -25,6 +26,14 @@ fn route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
             out.push(bytes.concat(msgs[0], bytes.from_string_utf8("-" + i.to_string())))
             i = i + 1
         return grpc.frame_messages(out)
+    if path == "/t.Svc/Join":
+        # client-streaming: concatenate every request message into one reply
+        joined := bytes.buffer()
+        for m in msgs:
+            joined.write(m) catch 0
+        out := joined.bytes()
+        joined.free()
+        return grpc.frame_one(out)
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
 
 fn run_server():
@@ -57,4 +66,19 @@ fn main():
         for f in frames.ok:
             joined = joined + (f.to_string_utf8() catch "?") + " "
         print("stream: " + frames.ok.len().to_string() + " [" + joined.trim() + "]")
+
+    # buffered client-streaming: three sends land as three framed messages
+    cs := conn.client_stream("/t.Svc/Join")
+    if cs.is_err:
+        print("client stream open err")
+        return
+    cs.ok.send(bytes.from_string_utf8("a"))
+    cs.ok.send(bytes.from_string_utf8("b"))
+    cs.ok.send(bytes.from_string_utf8("c"))
+    cs.ok.close_send()
+    reply2 := cs.ok.recv_response()
+    if reply2.is_err:
+        print("join err " + reply2.err.status.to_string())
+    else:
+        print("join: " + (reply2.ok.to_string_utf8() catch "?"))
     conn.close()

@@ -45,14 +45,16 @@
 # pith closure cannot capture a fn-value, so the handler cannot be threaded in any
 # other way.
 #
-# serving a server-streaming rpc: serve_body/serve_body_tls take a BODY-level
-# dispatch — raw framed bytes in and out — so one dispatch can carry unary and
-# buffered streaming methods side by side (unframe_messages / frame_messages /
-# frame_one do the framing). the generated serve_<Service> uses this.
+# serving a streaming rpc: serve_body/serve_body_tls take a BODY-level dispatch
+# — raw framed bytes in and out — so one dispatch can carry unary and buffered
+# streaming methods side by side, in either direction (unframe_messages /
+# frame_messages / frame_one do the framing). the generated serve_<Service> uses
+# this for all four rpc shapes.
 #
-# deferred: incremental streaming serve (a buffered stream returns the whole
-# reply at once), serving client-streaming/bidi rpcs, message compression,
-# deadlines and metadata beyond the basics, and grpc-message percent-decoding.
+# deferred: incremental streaming serve (a buffered stream passes the whole
+# request and reply through memory, with no interleaving on bidi), message
+# compression, deadlines and metadata beyond the basics, and grpc-message
+# percent-decoding.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2

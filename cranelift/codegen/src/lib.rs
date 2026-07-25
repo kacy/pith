@@ -83,6 +83,15 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    // macos links everything position-independent and its ld rejects text
+    // relocations outright, so absolute addressing in the text section — what
+    // cranelift emits by default — fails to link. the gnu toolchain accepts
+    // both, so we only pay the pic addressing cost where it is required.
+    if cfg!(target_os = "macos") {
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    }
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;

@@ -1,0 +1,60 @@
+# end-to-end buffered server-streaming over grpc.serve_body: the dispatch returns
+# several framed messages in one body and the real grpc client reads them back
+# with server_stream + collect_server_stream. also covers a unary reply through
+# the same body-level path, since serve_body carries both shapes.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50323
+
+fn route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
+    msgs := grpc.unframe_messages(body)!
+    if path == "/t.Svc/Echo":
+        if msgs.len() != 1:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "want one message")
+        return grpc.frame_one(msgs[0])
+    if path == "/t.Svc/Count":
+        # stream back n copies of the request payload, numbered
+        if msgs.len() != 1:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "want one message")
+        mut out: List[Bytes] := []
+        mut i := 0
+        while i < 3:
+            out.push(bytes.concat(msgs[0], bytes.from_string_utf8("-" + i.to_string())))
+            i = i + 1
+        return grpc.frame_messages(out)
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+fn run_server():
+    grpc.serve_body("127.0.0.1", PORT, route) catch 0
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+
+    # unary through the body-level path
+    reply := conn.unary("/t.Svc/Echo", bytes.from_string_utf8("ping"))
+    if not reply.is_err:
+        print("echo: " + (reply.ok.to_string_utf8() catch "?"))
+
+    # buffered server-streaming: three messages in one response body
+    stream := conn.server_stream("/t.Svc/Count", bytes.from_string_utf8("m"))
+    if stream.is_err:
+        print("stream open err")
+        return
+    frames := grpc.collect_server_stream(stream.ok)
+    if frames.is_err:
+        print("stream err " + frames.err.status.to_string())
+    else:
+        mut joined := ""
+        for f in frames.ok:
+            joined = joined + (f.to_string_utf8() catch "?") + " "
+        print("stream: " + frames.ok.len().to_string() + " [" + joined.trim() + "]")
+    conn.close()

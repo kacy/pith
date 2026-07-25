@@ -1,0 +1,90 @@
+# drives the h2c server with a handler that attaches response trailers, then
+# reads the wire back with a prior-knowledge client: the server must send the
+# body as DATA (no END_STREAM) followed by a second HEADERS block carrying the
+# trailers and ending the stream. this is the framing grpc's grpc-status rides
+# on. one hpack decoder spans both header blocks, as a real client's would.
+
+import std.net.http2.server as server
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.net.http as http
+import std.bytes as bytes
+import std.binary as binary
+import std.encoding as encoding
+
+fn handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    mut trailers: Map[String, String] := {}
+    trailers.insert("x-checksum", "ok")
+    return http.text(200, "hi").with_trailers(trailers)
+
+fn serve_once(listener: Int):
+    client_fd := tcp_accept(listener) catch 0
+    if client_fd != 0:
+        server.serve_h2c_connection(client_fd, handler)
+
+fn send_request(fd: Int):
+    preface := encoding.from_hex("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a") catch bytes.empty()
+    tcp_write_bytes(fd, preface) catch 0
+    settings := frames.frame_bytes(frames.settings_frame([]) catch frames.settings_ack_frame()) catch bytes.empty()
+    tcp_write_bytes(fd, settings) catch 0
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    block := encoder.encode([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/hi"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "localhost")])
+    headers := frames.frame_bytes(frames.headers_frame(1, block, true, true)) catch bytes.empty()
+    tcp_write_bytes(fd, headers) catch 0
+
+# read frames until stream 1 ends, printing each HEADERS block's :status (or
+# trailer fields) and any DATA body. one decoder spans both header blocks.
+fn read_response(fd: Int):
+    decoder := hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE)
+    mut buf := bytes.empty()
+    mut pos := 0
+    mut rounds := 0
+    while rounds < 200:
+        rounds = rounds + 1
+        while buf.len() - pos < 9:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                return
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        length := binary.read_u24_be_at(buf, pos).unwrap_or(0)
+        total := 9 + length
+        while buf.len() - pos < total:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                return
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        full := buf.slice(pos, pos + total)
+        pos = pos + total
+        frame := frames.read_frame(binary.reader(full), frames.MAX_ALLOWED_FRAME_SIZE) catch frames.settings_ack_frame()
+        if frame.header.frame_type == frames.FRAME_HEADERS:
+            hf_r := frames.parse_headers(frame)
+            if hf_r.is_err:
+                return
+            hf := hf_r.ok
+            fields_r := decoder.decode(hf.block_fragment)
+            if not fields_r.is_err:
+                for field in fields_r.ok:
+                    print(field.name + ": " + field.value)
+            if hf.end_stream:
+                return
+        if frame.header.frame_type == frames.FRAME_DATA:
+            df_r := frames.parse_data(frame)
+            if df_r.is_err:
+                return
+            df := df_r.ok
+            print("body: " + (df.data.to_string_utf8() catch "?"))
+            if df.end_stream:
+                return
+
+fn main():
+    port := 17423
+    listener := tcp_listen("127.0.0.1", port) catch 0
+    task := spawn serve_once(listener)
+    fd := tcp_connect("127.0.0.1", port) catch 0
+    send_request(fd)
+    read_response(fd)
+    tcp_close(fd)
+    await task
+    tcp_close(listener)

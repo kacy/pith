@@ -94,6 +94,9 @@ pub struct HttpResponse:
     pub headers: Map[String, String]
     pub body: Bytes
     pub set_cookie_headers: List[String]
+    # http/2 response trailers (a header block sent after the body). empty for
+    # ordinary responses; grpc carries its grpc-status/grpc-message here.
+    pub trailers: Map[String, String]
 
 # response metadata returned when a body is streamed into a writer.
 pub struct StreamedHttpResponse:
@@ -1260,7 +1263,7 @@ fn response_from_head_and_body(head: Bytes, body: Bytes) -> HttpResponse!:
     headers := response_headers_map(head)
     content_type := header_lookup(headers, "Content-Type")
     set_cookie_headers := response_set_cookie_headers(head)
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
+    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers, {})
 
 fn streamed_response_from_head(head: Bytes, body_size: Int) -> StreamedHttpResponse!:
     status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
@@ -1512,7 +1515,7 @@ fn ct_header(ct: String) -> String:
 # starts building an http response.
 pub fn response(status: Int) -> HttpResponse:
     mut headers: Map[String, String] := {}
-    return HttpResponse(status, "", headers, bytes.empty(), [])
+    return HttpResponse(status, "", headers, bytes.empty(), [], {})
 
 # builds a plain text response.
 pub fn text(status: Int, body_text: String) -> HttpResponse:
@@ -1601,14 +1604,14 @@ impl Cookie:
 impl HttpResponse:
     fn header(name: String, value: String) -> HttpResponse:
         if header_key_matches(name, "Content-Type"):
-            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers))
-        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers))
+            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
 
     fn with_body_text(text: String) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text), copy_string_list(self.set_cookie_headers))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text), copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
 
     fn with_body_bytes(data: Bytes) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data, copy_string_list(self.set_cookie_headers))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
 
     fn with_json(handle: Int) -> HttpResponse:
         body_bytes := json_mod.encode_bytes(handle)
@@ -1637,7 +1640,12 @@ impl HttpResponse:
     fn set_cookie(item: Cookie) -> HttpResponse:
         mut next := copy_string_list(self.set_cookie_headers)
         next.push(serialize_cookie(item))
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, next)
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, next, copy_headers_map(self.trailers))
+
+    # sets the http/2 response trailers (replacing any existing). grpc uses this
+    # to carry grpc-status/grpc-message after the body.
+    fn with_trailers(t: Map[String, String]) -> HttpResponse:
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(t))
 
     fn clear_cookie(name: String) -> HttpResponse:
         return self.set_cookie(expired_cookie(name))
@@ -2174,7 +2182,7 @@ pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     mut body := raw.slice(body_start, raw.len())
     if uses_chunked_transfer_encoding(head):
         body = decode_chunked_body(body)!
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
+    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers, {})
 
 # parses a raw http response string into a structured response.
 pub fn parse_response(raw: String) -> HttpResponse!:
@@ -2608,7 +2616,7 @@ fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedByt
             resp = send_request_plain_into_with_redirects(current, writer)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
-        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers)))!
+        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
         redirects_left = redirects_left - 1
         current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
 
@@ -2620,14 +2628,14 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
             resp := send_request_tls_into_with_redirects(current, current.host, tls_config, writer)!
             if redirects_left <= 0 or not redirect_status(resp.status):
                 return resp
-            current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers)))!
+            current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
             redirects_left = redirects_left - 1
             current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
             continue
         resp := send_request_plain_into_with_redirects(current, writer)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
-        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers)))!
+        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
         redirects_left = redirects_left - 1
         current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
 

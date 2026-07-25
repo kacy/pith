@@ -198,3 +198,37 @@ test "testing helpers inspect files and temp dirs":
     assert(ok)
     assert(pass_count == 1)
     assert(fail_count == 0)
+
+# a payload enum for the compiler regression test below. the two payload
+# variants deliberately carry different heap types so the test can reuse
+# one binding name across arms.
+enum MatchProbe:
+    Unset
+    Word(String)
+    Nums(List[Int])
+
+# regression: a match with payload bindings written directly in a test
+# body used to miscompile ("unknown load source") because test functions
+# skipped the locals prologue ordinary functions get. the arms also reuse
+# the binding name `v` with different payload types, which used to trip a
+# second miscompile in any function body.
+test "match payload bindings work directly in a test body":
+    reset_counts()
+    silence_output()
+
+    w := MatchProbe.Word("star")
+    got := match w:
+        MatchProbe.Word(v) => v
+        MatchProbe.Nums(v) => v.len().to_string()
+        _ => ""
+    assert_eq(got, "star")
+
+    n := MatchProbe.Nums([1, 2, 3])
+    count := match n:
+        MatchProbe.Word(v) => v
+        MatchProbe.Nums(v) => v.len().to_string()
+        _ => ""
+    assert_eq(count, "3")
+
+    assert(pass_count == 2)
+    assert(fail_count == 0)

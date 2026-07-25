@@ -825,8 +825,10 @@ fn encode_oneof(msg_name: String, o: Oneof, message_names: List[String], enum_na
     for f in o.fields:
         variant := camel(f.name)
         num := "{f.number}"
-        # each arm binds under its own name; reusing one name across arms of
-        # different payload types miscompiles today.
+        # each arm binds under its own name. reusing one name across arms of
+        # different payload types now compiles, but the compiler drops such a
+        # mixed-kind name from the exit cleanup, leaking the payload on every
+        # call; per-arm names stay tracked and leak-free.
         v := "v_{f.name}"
         if is_message(f.ptype, message_names):
             tn := simple_name(f.ptype)

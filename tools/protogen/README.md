@@ -45,6 +45,26 @@ resp := client.Bar(Req(...))!
 the streaming handles wrap `std.net.grpc`'s `ServerStream` / `ClientStream` /
 `BidiStream`; reach through `.inner` for incremental, non-collecting access.
 
+## server
+
+for the unary rpcs of a service, protogen also generates a server: implement one
+handler per rpc — `(Req) -> Resp!grpc.GrpcError` — and hand them to the generated
+`serve_Foo`. it routes each request by its method path, decodes it, calls your
+handler, and encodes the reply (an unknown path or a decode failure comes back as
+the right grpc status):
+
+```
+fn bar(req: Req) -> Resp!grpc.GrpcError:
+    return Resp(...)
+
+serve_Foo("0.0.0.0", 50051, bar)!                 # plaintext http/2
+serve_Foo_tls("0.0.0.0", 443, cert, key, bar)!    # http/2 over tls
+```
+
+streaming rpcs are client-only for now — `grpc.serve` is unary — so `serve_Foo`
+takes a handler only for each unary rpc, and an all-streaming service gets no
+server.
+
 ## not yet supported
 
 a clear parse error names these: `oneof`, `map<>`, 32-bit `float`, the well-known

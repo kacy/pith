@@ -209,3 +209,29 @@ impl GeometryClient:
     pub fn Reflect() -> GeometryReflectCall!grpc.GrpcError:
         inner := self.conn.bidi_stream("/sample.Geometry/Reflect")!
         return GeometryReflectCall(inner: inner)
+
+# a server for the Geometry service. implement one handler per unary rpc
+# and hand them to serve_Geometry; the router decodes each request,
+# dispatches by method path, and encodes the reply. streaming rpcs are
+# client-only for now (grpc.serve is unary).
+fn _Geometry_Describe_unimpl(req: Point) -> Shape!grpc.GrpcError:
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Describe not implemented")
+mut _Geometry_Describe_fn: fn(Point) -> Shape!grpc.GrpcError := _Geometry_Describe_unimpl
+
+fn _Geometry_route(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path == "/sample.Geometry/Describe":
+        decoded := decode_Point(request)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode Point failed")
+        return encode_Shape(_Geometry_Describe_fn(decoded.ok)!)
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+# serve Geometry over plaintext http/2 (h2c). pass one handler per unary rpc.
+pub fn serve_Geometry(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError) -> Int!:
+    _Geometry_Describe_fn = Describe
+    return grpc.serve(host, port, _Geometry_route)!
+
+# serve Geometry over http/2 with tls (alpn h2).
+pub fn serve_Geometry_tls(host: String, port: Int, cert: String, key: String, Describe: fn(Point) -> Shape!grpc.GrpcError) -> Int!:
+    _Geometry_Describe_fn = Describe
+    return grpc.serve_tls(host, port, cert, key, _Geometry_route)!

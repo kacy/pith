@@ -170,10 +170,11 @@ impl CatalogClient:
             fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode SearchResponse failed")
         return decoded.ok
 
-# a server for the Catalog service. implement one handler per unary rpc
-# and hand them to serve_Catalog; the router decodes each request,
-# dispatches by method path, and encodes the reply. streaming rpcs are
-# client-only for now (grpc.serve is unary).
+# a server for the Catalog service. implement one handler per rpc and
+# hand them to serve_Catalog; the router deframes and decodes each
+# request, dispatches by method path, and frames the reply. a streaming
+# reply is buffered â the handler returns the whole List. client-streaming
+# and bidi rpcs are client-only for now.
 fn _Catalog_GetProduct_unimpl(req: GetProductRequest) -> Product!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "GetProduct not implemented")
 mut _Catalog_GetProduct_fn: fn(GetProductRequest) -> Product!grpc.GrpcError := _Catalog_GetProduct_unimpl
@@ -181,27 +182,39 @@ fn _Catalog_Search_unimpl(req: SearchRequest) -> SearchResponse!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Search not implemented")
 mut _Catalog_Search_fn: fn(SearchRequest) -> SearchResponse!grpc.GrpcError := _Catalog_Search_unimpl
 
-fn _Catalog_route(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+fn _Catalog_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
     if path == "/catalog.Catalog/GetProduct":
+        msgs := grpc.unframe_messages(body)!
+        if msgs.len() > 1:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "expected one request message")
+        mut request := bytes.empty()
+        if msgs.len() == 1:
+            request = msgs[0]
         decoded := decode_GetProductRequest(request)
         if decoded.is_err:
             fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode GetProductRequest failed")
-        return encode_Product(_Catalog_GetProduct_fn(decoded.ok)!)
+        return grpc.frame_one(encode_Product(_Catalog_GetProduct_fn(decoded.ok)!))
     if path == "/catalog.Catalog/Search":
+        msgs := grpc.unframe_messages(body)!
+        if msgs.len() > 1:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "expected one request message")
+        mut request := bytes.empty()
+        if msgs.len() == 1:
+            request = msgs[0]
         decoded := decode_SearchRequest(request)
         if decoded.is_err:
             fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode SearchRequest failed")
-        return encode_SearchResponse(_Catalog_Search_fn(decoded.ok)!)
+        return grpc.frame_one(encode_SearchResponse(_Catalog_Search_fn(decoded.ok)!))
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
 
-# serve Catalog over plaintext http/2 (h2c). pass one handler per unary rpc.
+# serve Catalog over plaintext http/2 (h2c). pass one handler per rpc.
 pub fn serve_Catalog(host: String, port: Int, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
     _Catalog_GetProduct_fn = GetProduct
     _Catalog_Search_fn = Search
-    return grpc.serve(host, port, _Catalog_route)!
+    return grpc.serve_body(host, port, _Catalog_route)!
 
 # serve Catalog over http/2 with tls (alpn h2).
 pub fn serve_Catalog_tls(host: String, port: Int, cert: String, key: String, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
     _Catalog_GetProduct_fn = GetProduct
     _Catalog_Search_fn = Search
-    return grpc.serve_tls(host, port, cert, key, _Catalog_route)!
+    return grpc.serve_body_tls(host, port, cert, key, _Catalog_route)!

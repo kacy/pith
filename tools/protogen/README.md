@@ -47,23 +47,28 @@ the streaming handles wrap `std.net.grpc`'s `ServerStream` / `ClientStream` /
 
 ## server
 
-for the unary rpcs of a service, protogen also generates a server: implement one
-handler per rpc — `(Req) -> Resp!grpc.GrpcError` — and hand them to the generated
-`serve_Foo`. it routes each request by its method path, decodes it, calls your
-handler, and encodes the reply (an unknown path or a decode failure comes back as
-the right grpc status):
+protogen also generates a server: implement one handler per rpc and hand them to
+the generated `serve_Foo`. it routes each request by its method path, decodes it,
+calls your handler, and frames the reply (an unknown path or a decode failure
+comes back as the right grpc status). a unary rpc takes `(Req) ->
+Resp!grpc.GrpcError`; a server-streaming rpc takes a handler returning the whole
+reply as a list, `(Req) -> List[Resp]!grpc.GrpcError`, framed back as one
+buffered stream:
 
 ```
 fn bar(req: Req) -> Resp!grpc.GrpcError:
     return Resp(...)
 
-serve_Foo("0.0.0.0", 50051, bar)!                 # plaintext http/2
-serve_Foo_tls("0.0.0.0", 443, cert, key, bar)!    # http/2 over tls
+fn tail(req: Req) -> List[Resp]!grpc.GrpcError:    # rpc Tail(Req) returns (stream Resp)
+    return [...]
+
+serve_Foo("0.0.0.0", 50051, bar, tail)!                 # plaintext http/2
+serve_Foo_tls("0.0.0.0", 443, cert, key, bar, tail)!    # http/2 over tls
 ```
 
-streaming rpcs are client-only for now — `grpc.serve` is unary — so `serve_Foo`
-takes a handler only for each unary rpc, and an all-streaming service gets no
-server.
+buffered means the whole reply passes through memory — right for bounded streams,
+not endless ones. client-streaming and bidi rpcs are client-only for now, so
+`serve_Foo` skips them and a service with only those gets no server.
 
 ## not yet supported
 

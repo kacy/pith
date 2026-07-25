@@ -13,11 +13,12 @@
 # string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
 # plus named constants), singular message fields (as optionals), repeated
 # int-varint / enum / message / string / bytes fields, `oneof` groups (as a
-# payload enum per group), and grpc `service` stubs for all four rpc shapes
-# (unary, server-, client-, and bidi-streaming).
+# payload enum per group), `map<k, v>` fields (as pith Maps; string and
+# integer keys), and grpc `service` stubs for all four rpc shapes (unary,
+# server-, client-, and bidi-streaming).
 #
-# deferred (a parse error names them): `map<>`, 32-bit `float`, well-known
-# types, proto2, and repeated sint/fixed/double.
+# deferred (a parse error names them): bool/fixed map keys, 32-bit `float`,
+# well-known types, proto2, and repeated sint/fixed/double.
 
 import std.bytes as bytes
 import std.strings as strings
@@ -104,12 +105,21 @@ pub struct Oneof:
     pub name: String
     pub fields: List[Field]
 
-# a message: its (simple) name, its fields, and its oneof groups. nested
-# messages are lifted to the top level.
+# a map field: its key/value proto types, pith field name, and wire field
+# number. on the wire it is a repeated entry message with key = 1, value = 2.
+pub struct MapField:
+    pub key_type: String
+    pub value_type: String
+    pub name: String
+    pub number: Int
+
+# a message: its (simple) name, its fields, its oneof groups, and its map
+# fields. nested messages are lifted to the top level.
 pub struct Message:
     pub name: String
     pub fields: List[Field]
     pub oneofs: List[Oneof]
+    pub maps: List[MapField]
 
 # one enum constant: its name and integer value.
 pub struct EnumValue:
@@ -294,6 +304,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
     p.expect(chr(123))!
     fields: List[Field] := []
     oneofs: List[Oneof] := []
+    maps: List[MapField] := []
     while not p.done() and p.peek() != chr(125):
         kw := p.peek()
         if kw == "message":
@@ -303,7 +314,7 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
         elif kw == "oneof":
             oneofs.push(parse_oneof(p)!)
         elif kw == "map":
-            fail parse_fail("'map' fields are not supported yet")
+            maps.push(parse_map_field(p)!)
         elif kw == "reserved":
             p.advance()
             while not p.done() and p.peek() != ";":
@@ -314,8 +325,35 @@ fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bo
         else:
             fields.push(parse_field(p)!)
     p.expect(chr(125))!
-    messages.push(Message(name: name, fields: fields, oneofs: oneofs))
+    messages.push(Message(name: name, fields: fields, oneofs: oneofs, maps: maps))
     return true
+
+# the map key types pith can carry: string keys stay String, integer keys
+# become Int. proto3 also allows bool and fixed keys, but a pith Map keys by
+# String or Int only, so those are a parse error.
+fn is_map_key(ptype: String) -> Bool:
+    if ptype == "string":
+        return true
+    return ptype == "int32" or ptype == "int64" or ptype == "uint32" or ptype == "uint64" or ptype == "sint32" or ptype == "sint64"
+
+# parse `map<ktype, vtype> name = number [options];`.
+fn parse_map_field(p: Parser) -> MapField!ParseError:
+    p.expect("map")!
+    p.expect("<")!
+    ktype := p.advance()
+    if not is_map_key(ktype):
+        fail parse_fail("map key type '{ktype}' is not supported (use string or an integer type)")
+    p.expect(",")!
+    vtype := p.advance()
+    if vtype == "map":
+        fail parse_fail("a map value cannot be another map")
+    p.expect(">")!
+    name := p.advance()
+    p.expect("=")!
+    number := to_int(p.advance(), 0)
+    p.skip_options()!
+    p.expect(";")!
+    return MapField(key_type: ktype, value_type: vtype, name: name, number: number)
 
 # parse `oneof name { <type> <name> = <number>; ... }`. proto3 forbids labels
 # on oneof members, so `repeated`/`optional` inside the group is a parse error.
@@ -347,6 +385,10 @@ fn parse_field(p: Parser) -> Field!ParseError:
     if head == "repeated" or head == "optional":
         label = p.advance()
     ptype := p.advance()
+    if ptype == "map":
+        # a plain map field is handled before we get here, so this is a
+        # labeled map or a map inside a oneof — both forbidden by proto3.
+        fail parse_fail("'map' is not allowed here")
     name := p.advance()
     p.expect("=")!
     number := to_int(p.advance(), 0)
@@ -434,13 +476,21 @@ fn scalar_pith_type(ptype: String, message_names: List[String], enum_names: List
         return "Float"
     return "Int"
 
-# the zero/default value literal for a pith field type, for the constructor.
-fn default_value(f: Field, message_names: List[String], enum_names: List[String]) -> String:
-    if f.label == "repeated":
-        return "[]"
-    if is_message(f.ptype, message_names):
-        return "none"
-    t := scalar_pith_type(f.ptype, message_names, enum_names)
+# the pith key type for a map field: string keys stay String, integer keys
+# become Int (the parser already rejected anything else).
+fn map_key_pith_type(key_type: String) -> String:
+    if key_type == "string":
+        return "String"
+    return "Int"
+
+# the pith field type for a map field.
+fn map_pith_type(mf: MapField, message_names: List[String], enum_names: List[String]) -> String:
+    k := map_key_pith_type(mf.key_type)
+    v := scalar_pith_type(mf.value_type, message_names, enum_names)
+    return "Map[{k}, {v}]"
+
+# the zero literal for a scalar pith type.
+fn scalar_zero(t: String) -> String:
     if t == "String":
         return "\"\""
     if t == "Bytes":
@@ -450,6 +500,14 @@ fn default_value(f: Field, message_names: List[String], enum_names: List[String]
     if t == "Float":
         return "0.0"
     return "0"
+
+# the zero/default value literal for a pith field type, for the constructor.
+fn default_value(f: Field, message_names: List[String], enum_names: List[String]) -> String:
+    if f.label == "repeated":
+        return "[]"
+    if is_message(f.ptype, message_names):
+        return "none"
+    return scalar_zero(scalar_pith_type(f.ptype, message_names, enum_names))
 
 # --- code generation --------------------------------------------------------
 
@@ -465,21 +523,23 @@ fn enum_names_of(pf: ProtoFile) -> List[String]:
         names.push(e.name)
     return names
 
-# the message types a message refers to through its fields and oneof members
-# (its dependencies).
+# the message types a message refers to through its fields, oneof members,
+# and map values (its dependencies).
 fn message_deps(m: Message, message_names: List[String]) -> List[String]:
     deps: List[String] := []
     for f in m.fields:
-        add_message_dep(deps, m.name, f, message_names)
+        add_message_dep(deps, m.name, f.ptype, message_names)
     for o in m.oneofs:
         for f in o.fields:
-            add_message_dep(deps, m.name, f, message_names)
+            add_message_dep(deps, m.name, f.ptype, message_names)
+    for mf in m.maps:
+        add_message_dep(deps, m.name, mf.value_type, message_names)
     return deps
 
-fn add_message_dep(deps: List[String], owner: String, f: Field, message_names: List[String]):
-    if not is_message(f.ptype, message_names):
+fn add_message_dep(deps: List[String], owner: String, ptype: String, message_names: List[String]):
+    if not is_message(ptype, message_names):
         return
-    dep := simple_name(f.ptype)
+    dep := simple_name(ptype)
     if dep != owner and not list_has(deps, dep):
         deps.push(dep)
 
@@ -653,6 +713,82 @@ fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: 
     out.push("            {fref} = r.{rmethod}()!")
     return out
 
+# the encode-body lines for one map field: each entry is a little message
+# (key = 1, value = 2) written length-delimited on the map's field number.
+# key and value always write, even at their zero values, so every entry on
+# the wire names both. an empty map writes nothing.
+fn encode_map(mf: MapField, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+    out: List[String] := []
+    num := "{mf.number}"
+    fref := "m.{mf.name}"
+    # per-field binding names, so two map fields in one message never share a
+    # name across loops of different types.
+    k := "k_{mf.name}"
+    ew := "ew_{mf.name}"
+    kmethod := write_method(mf.key_type, enum_names)
+    out.push("    for {k} in {fref}.keys():")
+    out.push("        {ew} := writer()")
+    out.push("        {ew}.{kmethod}(1, {k}) catch false")
+    if is_message(mf.value_type, message_names):
+        tn := simple_name(mf.value_type)
+        out.push("        {ew}.write_message(2, encode_{tn}({fref}[{k}])) catch false")
+    else:
+        vmethod := write_method(mf.value_type, enum_names)
+        if vmethod == "":
+            fail parse_fail("map value type '{mf.value_type}' is not supported yet")
+        out.push("        {ew}.{vmethod}(2, {fref}[{k}]) catch false")
+    out.push("        w.write_message({num}, {ew}.bytes()) catch false")
+    out.push("        {ew}.free()")
+    return out
+
+# the value a decoded map entry starts from: proto3 lets an entry omit its
+# value, which then means the zero value. a message value decodes from no
+# bytes, which is exactly its all-defaults form.
+fn map_value_zero(vtype: String, message_names: List[String], enum_names: List[String]) -> String:
+    if is_message(vtype, message_names):
+        tn := simple_name(vtype)
+        return "decode_{tn}(bytes.empty())!"
+    return scalar_zero(scalar_pith_type(vtype, message_names, enum_names))
+
+# the decode arm for one map field: read the entry message, parse key (1) and
+# value (2) starting from their zero values (proto3 lets either be omitted),
+# and insert. insert overwrites, so a duplicate key is last-one-wins.
+fn decode_map_field(mf: MapField, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]:
+    out: List[String] := []
+    num := "{mf.number}"
+    mut keyword := "elif"
+    if first:
+        keyword = "if"
+    # per-field binding names, same reason as in encode_map.
+    er := "er_{mf.name}"
+    et := "et_{mf.name}"
+    mk := "mk_{mf.name}"
+    mv := "mv_{mf.name}"
+    mut key_zero := "0"
+    if mf.key_type == "string":
+        key_zero = "\"\""
+    kread := read_method(mf.key_type, enum_names)
+    value_zero := map_value_zero(mf.value_type, message_names, enum_names)
+    out.push("        {keyword} tag.field == {num}:")
+    out.push("            {er} := reader(r.read_message()!)")
+    out.push("            mut {mk} := {key_zero}")
+    out.push("            mut {mv} := {value_zero}")
+    out.push("            while not {er}.at_end():")
+    out.push("                {et} := {er}.read_tag()!")
+    out.push("                if {et}.field == 1:")
+    out.push("                    {mk} = {er}.{kread}()!")
+    out.push("                elif {et}.field == 2:")
+    if is_message(mf.value_type, message_names):
+        tn := simple_name(mf.value_type)
+        out.push("                    {mv} = decode_{tn}({er}.read_message()!)!")
+    else:
+        vread := read_method(mf.value_type, enum_names)
+        out.push("                    {mv} = {er}.{vread}()!")
+    out.push("                else:")
+    out.push("                    {er}.skip({et}.wire)!")
+    out.push("            m.{mf.name}.insert({mk}, {mv})")
+    return out
+
 # the enum + constructor lines for one oneof group, emitted just before the
 # containing struct. constructors exist because cross-module enum-variant
 # construction has been buggy; std.sql's Value works around it the same way.
@@ -745,9 +881,12 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
             lines.push("pub {cname} := {cval}")
         lines.push("")
 
+    # "{}" as literal text: an empty map literal for constructor defaults.
+    empty_map := chr(123) + chr(125)
+
     ordered := topo_sort(pf.messages, message_names)
     for m in ordered:
-        no_members := m.fields.len() == 0 and m.oneofs.len() == 0
+        no_members := m.fields.len() == 0 and m.oneofs.len() == 0 and m.maps.len() == 0
 
         # each oneof group gets its payload enum + constructors first, so the
         # struct below can name them.
@@ -763,6 +902,9 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         for f in m.fields:
             ft := pith_type(f, message_names, enum_names)
             lines.push("    pub {f.name}: {ft}")
+        for mf in m.maps:
+            mt := map_pith_type(mf, message_names, enum_names)
+            lines.push("    pub {mf.name}: {mt}")
         for o in m.oneofs:
             ename := oneof_enum_name(m.name, o)
             lines.push("    pub {o.name}: {ename}")
@@ -773,6 +915,8 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         for f in m.fields:
             dv := default_value(f, message_names, enum_names)
             ctor_args.push("{f.name}: {dv}")
+        for mf in m.maps:
+            ctor_args.push("{mf.name}: {empty_map}")
         for o in m.oneofs:
             ename := oneof_enum_name(m.name, o)
             ctor_args.push("{o.name}: {ename}.{ename}Unset")
@@ -786,6 +930,9 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         lines.push("    w := writer()")
         for f in m.fields:
             for ln in encode_field(f, message_names, enum_names)!:
+                lines.push(ln)
+        for mf in m.maps:
+            for ln in encode_map(mf, message_names, enum_names)!:
                 lines.push(ln)
         for o in m.oneofs:
             for ln in encode_oneof(m.name, o, message_names, enum_names)!:
@@ -808,6 +955,10 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
             mut first := true
             for f in m.fields:
                 for ln in decode_field(f, first, message_names, enum_names)!:
+                    lines.push(ln)
+                first = false
+            for mf in m.maps:
+                for ln in decode_map_field(mf, first, message_names, enum_names):
                     lines.push(ln)
                 first = false
             for o in m.oneofs:

@@ -5,6 +5,7 @@
 from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, decode_Shape, Color_RED, Color_GREEN
 from sample_gen import Sticker, encode_Sticker, decode_Sticker, StickerDesign, StickerBacking
 from sample_gen import Sticker_emoji, Sticker_anchor, Sticker_tint, Sticker_design_unset, Sticker_reusable, Sticker_stock, Sticker_backing_unset
+from sample_gen import Inventory, Bin, encode_Inventory, decode_Inventory
 from protogen_lib import parse, generate
 from std.protobuf import writer
 import std.bytes as bytes
@@ -144,8 +145,116 @@ test "the last oneof member on the wire wins":
     back := decode_Sticker(raw)!
     assert_eq(show_design(back.design), "anchor:5,6")
 
+# --- maps -------------------------------------------------------------------
+
+fn empty_inventory() -> Inventory:
+    return Inventory(counts: {}, bins: {}, names: {})
+
+test "an empty map encodes nothing":
+    assert_eq(encoding.to_hex(encode_Inventory(empty_inventory())), "")
+    back := decode_Inventory(encode_Inventory(empty_inventory()))!
+    assert_eq(back.counts.len(), 0)
+    assert_eq(back.bins.len(), 0)
+    assert_eq(back.names.len(), 0)
+
+test "a single map entry encodes the canonical entry message":
+    # field 1, wire 2, a 5-byte entry: key "a" (0a 01 61), value 5 (10 05).
+    inv := empty_inventory()
+    inv.counts.insert("a", 5)
+    assert_eq(encoding.to_hex(encode_Inventory(inv)), "0a050a01611005")
+
+test "a string-keyed map round-trips multiple entries":
+    inv := empty_inventory()
+    inv.counts.insert("apples", 3)
+    inv.counts.insert("pears", 0)
+    inv.counts.insert("plums", 12)
+    # map iteration order is not fixed, so assert on the decoded contents,
+    # not the exact bytes.
+    back := decode_Inventory(encode_Inventory(inv))!
+    assert_eq(back.counts.len(), 3)
+    assert_eq(back.counts["apples"], 3)
+    assert_eq(back.counts["pears"], 0)
+    assert_eq(back.counts["plums"], 12)
+
+test "a message-valued map round-trips":
+    inv := empty_inventory()
+    inv.bins.insert("north", Bin(size: 9))
+    inv.bins.insert("south", Bin(size: 0))
+    back := decode_Inventory(encode_Inventory(inv))!
+    assert_eq(back.bins.len(), 2)
+    assert_eq(back.bins["north"].size, 9)
+    assert_eq(back.bins["south"].size, 0)
+
+test "an int-keyed map round-trips":
+    inv := empty_inventory()
+    inv.names.insert(7, "seven")
+    inv.names.insert(1000, "grand")
+    back := decode_Inventory(encode_Inventory(inv))!
+    assert_eq(back.names.len(), 2)
+    assert_eq(back.names[7], "seven")
+    assert_eq(back.names[1000], "grand")
+
+test "a duplicate map key takes the last value":
+    # hand-craft two entries for the same key on field 1; proto3 merges map
+    # entries with last-one-wins.
+    entry1 := writer()
+    entry1.write_string(1, "k")!
+    entry1.write_int32(2, 1)!
+    entry2 := writer()
+    entry2.write_string(1, "k")!
+    entry2.write_int32(2, 2)!
+    w := writer()
+    w.write_message(1, entry1.bytes())!
+    w.write_message(1, entry2.bytes())!
+    raw := w.bytes()
+    entry1.free()
+    entry2.free()
+    w.free()
+    back := decode_Inventory(raw)!
+    assert_eq(back.counts.len(), 1)
+    assert_eq(back.counts["k"], 2)
+
+test "a map entry may omit its key or its value":
+    # an entry with only a value means the zero key; an entry with only a
+    # key means the zero value.
+    only_value := writer()
+    only_value.write_int32(2, 9)!
+    only_key := writer()
+    only_key.write_string(1, "bare")!
+    w := writer()
+    w.write_message(1, only_value.bytes())!
+    w.write_message(1, only_key.bytes())!
+    raw := w.bytes()
+    only_value.free()
+    only_key.free()
+    w.free()
+    back := decode_Inventory(raw)!
+    assert_eq(back.counts.len(), 2)
+    assert_eq(back.counts[""], 9)
+    assert_eq(back.counts["bare"], 0)
+
 fn has(text: String, needle: String) -> Bool:
     return strings.find_all(text, needle).len() > 0
+
+# wrap a field declaration in `message M { ... }` for parse-error tests.
+# (chr because a brace in a string literal would read as interpolation.)
+fn proto_message(body: String) -> String:
+    return "message M " + chr(123) + " " + body + " " + chr(125)
+
+test "a bool or fixed map key is a parse error":
+    bad := parse(proto_message("map<bool, int32> x = 1;"))
+    assert(bad.is_err)
+    assert(has(bad.err.message, "map key type 'bool'"))
+    bad2 := parse(proto_message("map<fixed32, int32> x = 1;"))
+    assert(bad2.is_err)
+    assert(has(bad2.err.message, "map key type 'fixed32'"))
+
+test "a labeled map or a map-valued map is a parse error":
+    bad := parse(proto_message("repeated map<string, int32> x = 1;"))
+    assert(bad.is_err)
+    bad2 := parse(proto_message("map<string, map<string, int32>> x = 1;"))
+    assert(bad2.is_err)
+    assert(has(bad2.err.message, "cannot be another map"))
 
 # the service in sample.proto exercises all four rpc shapes; assert the
 # generator emits a typed client with the right method signatures and paths.

@@ -1,0 +1,50 @@
+# regression: match arms over a payload enum may reuse one binding name
+# across arms with different payload types (a string vs a struct here).
+# the emitter used to key per-arm binding state by plain name, so one
+# arm's release-of-previous-value loaded a name the ir never declared
+# ("unknown load source 'v'").
+from std.protobuf import ProtoError, writer, Writer
+
+struct P:
+    x: Int
+
+enum E:
+    Unset
+    S(String)
+    M(P)
+
+fn enc_p(p: P) -> Bytes:
+    w := writer()
+    w.write_int32(1, p.x) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn encoded_len(e: E) -> Int:
+    w := writer()
+    match e:
+        E.S(v) => w.write_string(2, v) catch false
+        E.M(v) => w.write_message(3, enc_p(v)) catch false
+        _ => false
+    data := w.bytes()
+    w.free()
+    return data.len()
+
+fn main():
+    # both arms run, so both bindings of the shared name are exercised
+    print(encoded_len(E.S("hello")).to_string())
+    print(encoded_len(E.M(P(x: 5))).to_string())
+    # rebinding the shared name repeatedly in one frame, alternating the
+    # payload type, must not misfire a release of the previous value
+    mut items: List[E] := []
+    mut i := 0
+    while i < 2:
+        items.push(E.S("a" + i.to_string()))
+        items.push(E.M(P(x: i)))
+        i = i + 1
+    for e in items:
+        msg := match e:
+            E.S(v) => "s:" + v
+            E.M(v) => "m:" + v.x.to_string()
+            _ => "none"
+        print(msg)

@@ -124,6 +124,15 @@ pub fn ir_label() -> String:
 # per-function state the lowering families read constantly.
 pub mut ir_var_types: Map[String, String] := {}
 
+# rc-typed names bound with conflicting rc kinds in sibling branches or match
+# arms (e.g. `E.S(v)` binding a string and `E.M(v)` binding a struct). the
+# prologue prepass drops these from the exit cleanup — releasing with either
+# kind could fire the wrong runtime release — and records them here so the
+# match emitter also skips the release-of-previous-value for them. lives in
+# ir_builder (not ir_emitter_core) so ir_match_emit can read it without a
+# module cycle, same as ir_var_regs/ir_var_types.
+pub mut ir_untracked_rc_binds: List[String] := []
+
 ## the current function's variable registers.
 pub mut ir_var_regs: Map[String, Int] := {}
 

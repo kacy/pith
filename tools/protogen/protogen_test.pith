@@ -2,8 +2,11 @@
 # round-trips exercise every field kind; the hex assertions check the generated
 # encoder emits the canonical protobuf wire bytes, byte for byte.
 
-from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, decode_Shape, Color_RED
+from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, decode_Shape, Color_RED, Color_GREEN
+from sample_gen import Sticker, encode_Sticker, decode_Sticker, StickerDesign, StickerBacking
+from sample_gen import Sticker_emoji, Sticker_anchor, Sticker_tint, Sticker_design_unset, Sticker_reusable, Sticker_stock, Sticker_backing_unset
 from protogen_lib import parse, generate
+from std.protobuf import writer
 import std.bytes as bytes
 import std.encoding as encoding
 import std.fs as fs
@@ -68,6 +71,78 @@ test "unset fields decode back to their defaults":
 
 fn empty_shape() -> Shape:
     return Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)
+
+# --- oneof ------------------------------------------------------------------
+
+fn empty_sticker() -> Sticker:
+    return Sticker(name: "", design: Sticker_design_unset(), backing: Sticker_backing_unset())
+
+# render each oneof for assertions: the set variant and its payload. these
+# also exercise matching the generated enums from another module. (they are
+# plain fns because a match binding inside a test block miscompiles today.)
+fn show_design(d: StickerDesign) -> String:
+    return match d:
+        StickerDesign.Emoji(e) => "emoji:{e}"
+        StickerDesign.Anchor(p) => "anchor:{p.x},{p.y}"
+        StickerDesign.Tint(c) => "tint:{c}"
+        StickerDesign.StickerDesignUnset => "unset"
+
+fn show_backing(b: StickerBacking) -> String:
+    return match b:
+        StickerBacking.Reusable(r) => "reusable:{r}"
+        StickerBacking.Stock(n) => "stock:{n}"
+        StickerBacking.StickerBackingUnset => "unset"
+
+test "a oneof string member round-trips":
+    s := empty_sticker()
+    s.design = Sticker_emoji("star")
+    back := decode_Sticker(encode_Sticker(s))!
+    assert_eq(show_design(back.design), "emoji:star")
+
+test "a oneof message member round-trips":
+    s := empty_sticker()
+    s.design = Sticker_anchor(Point(x: 3, y: 9))
+    back := decode_Sticker(encode_Sticker(s))!
+    assert_eq(show_design(back.design), "anchor:3,9")
+
+test "a oneof enum member round-trips":
+    s := empty_sticker()
+    s.design = Sticker_tint(Color_GREEN)
+    back := decode_Sticker(encode_Sticker(s))!
+    assert_eq(show_design(back.design), "tint:{Color_GREEN}")
+
+test "an unset oneof encodes nothing and decodes back to unset":
+    assert_eq(encoding.to_hex(encode_Sticker(empty_sticker())), "")
+    back := decode_Sticker(encode_Sticker(empty_sticker()))!
+    assert_eq(show_design(back.design), "unset")
+    assert_eq(show_backing(back.backing), "unset")
+
+test "a set oneof member writes even at its zero value":
+    # oneof presence: bool false still goes on the wire (field 5, varint 0).
+    s := empty_sticker()
+    s.backing = Sticker_reusable(false)
+    assert_eq(encoding.to_hex(encode_Sticker(s)), "2800")
+    back := decode_Sticker(encode_Sticker(s))!
+    assert_eq(show_backing(back.backing), "reusable:false")
+
+test "two oneof groups in one message stay independent":
+    s := empty_sticker()
+    s.design = Sticker_emoji("dot")
+    s.backing = Sticker_stock(7)
+    back := decode_Sticker(encode_Sticker(s))!
+    assert_eq(show_design(back.design), "emoji:dot")
+    assert_eq(show_backing(back.backing), "stock:7")
+
+test "the last oneof member on the wire wins":
+    # hand-craft bytes carrying two members of the same group: emoji (field 2)
+    # then anchor (field 3). proto3 says the later one wins.
+    w := writer()
+    w.write_string(2, "old")!
+    w.write_message(3, encode_Point(Point(x: 5, y: 6)))!
+    raw := w.bytes()
+    w.free()
+    back := decode_Sticker(raw)!
+    assert_eq(show_design(back.design), "anchor:5,6")
 
 fn has(text: String, needle: String) -> Bool:
     return strings.find_all(text, needle).len() > 0

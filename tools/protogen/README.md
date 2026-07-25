@@ -18,11 +18,48 @@ pith build tools/protogen/protogen.pith
 - enums, as `Int` fields plus named `Enum_VALUE` constants
 - singular message fields, as pith optionals (`Sub?`)
 - repeated message / string / bytes / int-varint / enum fields
+- `oneof` groups, as a payload enum per group (see below)
 - grpc `service` stubs — a typed client per service (see below)
 
 singular message fields have presence (optionals); other singular fields follow
 proto3 and skip their zero value on the wire. `decode_*` skips unknown fields, so
 it stays forward compatible.
+
+## oneof
+
+each `oneof` group becomes a pith enum with one variant per member plus an
+`Unset` variant, and the containing struct holds the enum:
+
+```proto
+message Payment {
+  string id = 1;
+  oneof method {
+    string paypal_email = 2;
+    CardDetails card = 3;
+  }
+}
+```
+
+```
+pub enum PaymentMethod:
+    PaymentMethodUnset
+    PaypalEmail(String)
+    Card(CardDetails)
+
+pub struct Payment:
+    pub id: String
+    pub method: PaymentMethod
+```
+
+build a value with the generated constructor functions — `Payment_paypal_email("a@b")`,
+`Payment_card(CardDetails(...))`, `Payment_method_unset()` — rather than naming
+the variants directly; cross-module enum-variant construction is shaky, and the
+constructors sidestep it (std.sql's `Value` does the same). reading is a plain
+`match` on the field, which works fine across modules.
+
+a set member always writes, even at its zero value; `Unset` writes nothing. on
+decode the members are ordinary fields of the message, and the last one seen
+wins, per proto3.
 
 ## services
 
@@ -75,8 +112,8 @@ right for bounded streams, not endless or interactive ones.
 
 ## not yet supported
 
-a clear parse error names these: `oneof`, `map<>`, 32-bit `float`, the well-known
-types, proto2, and repeated `sint`/`fixed`/`double`.
+a clear parse error names these: `map<>`, 32-bit `float`, the well-known types,
+proto2, and repeated `sint`/`fixed`/`double`.
 
 ## example
 

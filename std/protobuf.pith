@@ -24,9 +24,10 @@
 #
 # proto3 semantics: default values (0, "", empty) are normally not written, and
 # a decoder reads tags until the buffer is exhausted, dispatching on the field
-# number and skipping any field it does not recognize. deferred for later: maps,
-# oneof, the well-known types, 32-bit floats, and groups (the removed wire types
-# 3 and 4).
+# number and skipping any field it does not recognize. deferred for later:
+# groups (the removed wire types 3 and 4). maps, oneof, and the well-known
+# types are schema-level shapes built from these primitives; tools/protogen
+# generates them.
 
 import std.bytes as bytes
 import std.bits as bits
@@ -157,6 +158,13 @@ impl Writer:
     # write a double field (64-bit ieee754, little-endian).
     pub fn write_double(field: Int, value: Float) -> Bool!ProtoError:
         return self.write_fixed64(field, float_to_bits(value))
+
+    # write a float field (32-bit ieee754, little-endian). pith's Float is a
+    # 64-bit double, so the value narrows to the nearest f32 first (ties to
+    # even), the same rounding a c `(float)` cast does.
+    pub fn write_float(field: Int, value: Float) -> Bool!ProtoError:
+        self.write_tag(field, WIRE_I32)!
+        return self.put_fixed32(float32_bits(value))
 
     fn put_fixed32(value: Int) -> Bool!ProtoError:
         self.put(bits.band(value, 255))!
@@ -322,6 +330,10 @@ impl Reader:
     pub fn read_double() -> Float!ProtoError:
         return float_from_bits(self.read_fixed64()!)
 
+    # read a float field (32-bit ieee754), widened losslessly to a Float.
+    pub fn read_float() -> Float!ProtoError:
+        return float32_from_bits(self.read_fixed32()!)
+
     # read a length-delimited field's raw bytes.
     pub fn read_bytes() -> Bytes!ProtoError:
         length := self.read_varint()!
@@ -365,6 +377,83 @@ impl Reader:
             self.read_raw(4)!
             return true
         fail proto_fail("unknown wire type")
+
+# --- 32-bit floats ----------------------------------------------------------
+#
+# pith's Float is a 64-bit double, but a proto `float` field carries ieee754
+# binary32 bits on the wire. these helpers move between the two bit patterns
+# by hand: widening an f32 to an f64 is exact, and narrowing rounds to the
+# nearest f32 with ties to even, exactly like a c `(float)` cast.
+
+# the ieee754 binary32 bit pattern nearest to `value`.
+fn float32_bits(value: Float) -> Int:
+    b := float_to_bits(value)
+    sign := bits.shl(bits.shr(b, 63), 31)
+    exp := bits.band(bits.shr(b, 52), 0x7ff)
+    frac := bits.band(b, 0xfffffffffffff)
+    if exp == 0x7ff:
+        # infinity (frac == 0) or nan. a nan keeps its top mantissa bits and
+        # is forced quiet, so the payload can never read back as an infinity.
+        if frac == 0:
+            return bits.bor(sign, 0x7f800000)
+        return bits.bor(sign, bits.bor(0x7fc00000, bits.shr(frac, 29)))
+    mut e := exp - 1023
+    if e > 127:
+        # too large for any finite f32
+        return bits.bor(sign, 0x7f800000)
+    if e >= 0 - 126:
+        # a normal f32 candidate: round the 52-bit mantissa down to 23 bits.
+        keep := bits.shr(frac, 29)
+        dropped := bits.band(frac, 0x1fffffff)
+        mut mant := keep
+        if dropped > 0x10000000 or (dropped == 0x10000000 and bits.band(keep, 1) == 1):
+            mant = keep + 1
+        if mant == 0x800000:
+            # the mantissa carried out; bump the exponent instead
+            mant = 0
+            e = e + 1
+            if e > 127:
+                return bits.bor(sign, 0x7f800000)
+        return bits.bor(sign, bits.bor(bits.shl(e + 127, 23), mant))
+    # below the normal f32 range: round the full 53-bit significand onto the
+    # subnormal grid (multiples of 2^-149) by shifting `shift` bits off it.
+    shift := (0 - e) - 97
+    if shift > 60:
+        # far below even the subnormal range; rounds to a signed zero
+        return sign
+    sig := bits.bor(bits.shl(1, 52), frac)
+    low := bits.shr(sig, shift)
+    rest := bits.band(sig, bits.shl(1, shift) - 1)
+    half := bits.shl(1, shift - 1)
+    mut sub := low
+    if rest > half or (rest == half and bits.band(low, 1) == 1):
+        sub = low + 1
+    # if the rounding carried up to 2^23 this is exactly the smallest normal
+    # f32, whose bit pattern (exponent field 1, mantissa 0) this bor produces.
+    return bits.bor(sign, sub)
+
+# the Float (a 64-bit double) an ieee754 binary32 bit pattern denotes. every
+# f32 value fits an f64 exactly, so nothing is lost.
+fn float32_from_bits(b: Int) -> Float:
+    sign := bits.shl(bits.band(bits.shr(b, 31), 1), 63)
+    exp := bits.band(bits.shr(b, 23), 255)
+    frac := bits.band(b, 0x7fffff)
+    if exp == 255:
+        # infinity or nan: an all-ones f64 exponent, mantissa carried across
+        return float_from_bits(bits.bor(sign, bits.bor(bits.shl(0x7ff, 52), bits.shl(frac, 29))))
+    if exp == 0:
+        if frac == 0:
+            return float_from_bits(sign)
+        # an f32 subnormal is a normal f64: normalize the mantissa by hand,
+        # walking the leading 1 up to the implicit position.
+        mut f := frac
+        mut e := 0 - 126
+        while bits.band(f, 0x800000) == 0:
+            f = bits.shl(f, 1)
+            e = e - 1
+        f = bits.band(f, 0x7fffff)
+        return float_from_bits(bits.bor(sign, bits.bor(bits.shl(e + 1023, 52), bits.shl(f, 29))))
+    return float_from_bits(bits.bor(sign, bits.bor(bits.shl((exp - 127) + 1023, 52), bits.shl(frac, 29))))
 
 # --- zigzag -----------------------------------------------------------------
 
@@ -485,6 +574,53 @@ test "double round-trips through fixed64":
     r.read_tag()!
     assert_eq(r.read_double()!, 3.14159)
     w.free()
+
+# encode a float field and read it straight back, for the float tests below.
+fn float_wire_round_trip(value: Float) -> Float!ProtoError:
+    w := writer()
+    w.write_float(1, value)!
+    r := reader(w.bytes())
+    r.read_tag()!
+    result := r.read_float()!
+    w.free()
+    return result
+
+test "float encodes the canonical fixed32 bytes":
+    # field 1, wire 5: 0d, then 1.5 as little-endian f32 (0x3fc00000).
+    w := writer()
+    w.write_float(1, 1.5)!
+    assert_eq(encoding.to_hex(w.bytes()), "0d0000c03f")
+    w.free()
+
+test "float round-trips values an f32 holds exactly":
+    for value in [0.0, 1.5, 0.0 - 0.25, 2.0, 123456.0]:
+        assert_eq(float_wire_round_trip(value)!, value)
+
+test "float narrows to the nearest f32 on encode":
+    # 0.1 has no exact f32, so the wire carries the nearest one and decode
+    # widens it back exactly: the f32-rounded double, not 0.1 itself.
+    assert_eq(float_wire_round_trip(0.1)!, 0.10000000149011612)
+
+test "float narrowing rounds ties to even":
+    # 1 + 2^-24 sits halfway between 1.0 and the next f32; the even mantissa
+    # (1.0) wins. 1 + 3 * 2^-24 sits halfway one step up; there the even
+    # mantissa is the larger neighbour (1 + 2^-22).
+    assert_eq(float_wire_round_trip(float_from_bits(0x3ff0000010000000))!, 1.0)
+    assert_eq(float_wire_round_trip(float_from_bits(0x3ff0000030000000))!, float_from_bits(0x3ff0000040000000))
+
+test "float keeps large magnitudes and subnormals":
+    # 3.4e38 is near the top of the f32 range; it narrows to a nearby f32.
+    assert_eq(float_wire_round_trip(3.4e38)!, float_from_bits(0x47eff933c0000000))
+    # 2^-149 is the smallest positive f32 subnormal, and round-trips exactly.
+    tiny := float_from_bits(0x36a0000000000000)
+    assert_eq(float_wire_round_trip(tiny)!, tiny)
+    assert_eq(float_wire_round_trip(0.0 - tiny)!, 0.0 - tiny)
+
+test "a float beyond the f32 range becomes infinity":
+    inf := float_from_bits(0x7ff0000000000000)
+    assert_eq(float_wire_round_trip(1.0e39)!, inf)
+    assert_eq(float_wire_round_trip(0.0 - 1.0e39)!, 0.0 - inf)
+    assert_eq(float_wire_round_trip(inf)!, inf)
 
 test "skip steps over an unknown field of each wire type":
     w := writer()

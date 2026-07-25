@@ -5,6 +5,27 @@
 use crate::CompileError;
 use std::process::Command;
 
+/// Linker arguments that differ between the GNU toolchain and Apple's ld. Both
+/// lists express the same two intentions:
+///
+/// - Drop runtime code the program never references — a hello world pulls in
+///   `print` but not the crypto/net/json it doesn't call. Runtime functions the
+///   compiler emits are referenced by name, so anything a program actually uses
+///   stays live; only genuinely dead sections go.
+/// - Strip symbols from the release binary. This is the bulk of the size — an
+///   unstripped hello world is ~4x its stripped self.
+#[cfg(target_os = "macos")]
+const PLATFORM_LINK_ARGS: &[&str] = &[
+    // Apple's ld spells --gc-sections as -dead_strip, has no libdl (dlopen
+    // lives in libSystem), and rejects -s as obsolete. -x is its closest
+    // equivalent: drop local symbols, keep the ones dyld needs.
+    "-Wl,-dead_strip",
+    "-Wl,-x",
+];
+
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_LINK_ARGS: &[&str] = &["-ldl", "-Wl,--gc-sections", "-s"];
+
 /// Link object files with runtime to create executable
 pub fn link_executable(
     obj_file: &str,
@@ -19,16 +40,8 @@ pub fn link_executable(
         .arg(obj_file)
         .arg(runtime_lib)
         .arg("-lpthread") // Required by our runtime
-        .arg("-ldl") // Required by our runtime
         .arg("-lm") // Math library
-        // Drop runtime code the program never references — a hello world pulls
-        // in `print` but not the crypto/net/json it doesn't call. Runtime
-        // functions the compiler emits are referenced by name, so anything a
-        // program actually uses stays live; only genuinely dead sections go.
-        .arg("-Wl,--gc-sections")
-        // Strip symbols and debug info from the release binary. This is the
-        // bulk of the size — an unstripped hello world is ~4x its stripped self.
-        .arg("-s");
+        .args(PLATFORM_LINK_ARGS);
 
     let output_result = cmd
         .output()

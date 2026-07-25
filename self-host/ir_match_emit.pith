@@ -9,7 +9,7 @@
 from ast import Node, get_node
 from checker import c_get_expr_type
 from types import get_type_info
-from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs, ir_var_types, ir_current_func_return_kind
+from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs, ir_var_types, ir_current_func_return_kind, ir_untracked_rc_binds
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field
@@ -318,13 +318,22 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                 ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
                 rc_kind := ir_rc_kind(kind)
                 if rc_kind.len() > 0:
-                    # release whatever the binding held before (it is zero on
-                    # first reach and a stale payload when an arm rebinds the
-                    # name in a loop), then retain the new one so it owns its
-                    # count, mirroring the reassign dance for ordinary locals.
-                    old_r := ir_reg()
-                    ir_emit("load " + old_r.to_string() + " " + sub.value)
-                    ir_rc_release_reg(old_r, rc_kind)
+                    if not ir_untracked_rc_binds.contains(sub.value):
+                        # release whatever the binding held before (it is zero
+                        # on first reach and a stale payload when an arm rebinds
+                        # the name in a loop), then retain the new one so it
+                        # owns its count, mirroring the reassign dance for
+                        # ordinary locals.
+                        old_r := ir_reg()
+                        ir_emit("load " + old_r.to_string() + " " + sub.value)
+                        ir_rc_release_reg(old_r, rc_kind)
+                    # an untracked name (sibling arms bind it with different rc
+                    # kinds) gets no prologue zero-store, so loading it here
+                    # would reference an undeclared name — and the previous
+                    # value's kind is unknowable anyway, so any release could
+                    # be the wrong one. skip the release (a bounded leak) but
+                    # still retain: the binding must own its count or it would
+                    # dangle once the enum box is released at scope exit.
                     ir_rc_retain_reg(slot_r, rc_kind)
                 ir_var_regs.insert(sub.value, slot_r)
                 if kind != "unknown":

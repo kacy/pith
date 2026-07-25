@@ -54,7 +54,7 @@ from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emi
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
-from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
@@ -1198,6 +1198,11 @@ fn ir_emit_string_prologue(body_idx: Int):
             pi = pi + 1
         ir_string_locals = kept
         ir_rc_local_kinds = kept_kinds
+        # publish the poisoned names so the match emitter skips the
+        # release-of-previous-value for their bindings; the untracked name is
+        # never zero-stored here, so that release would load a name the ir
+        # has not declared yet (and could fire the wrong-kind release later).
+        ir_untracked_rc_binds = poisoned
     # with the final tracked set known, decide which tuple locals may cascade
     # their payload at cleanup (all uses provably safe); the rest stay shell-only
     ir_tuple_cascade_scan(body_idx)
@@ -6383,6 +6388,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_map_value_types = {}
     ir_string_locals = []
     ir_rc_local_kinds = []
+    ir_untracked_rc_binds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
     # defers are function-scoped: start each function with empty scope stacks
@@ -6425,6 +6431,11 @@ fn ir_emit_test_func(idx: Int, ordinal: Int):
     ir_prepare_func_emission("int")
     ir_emit_func_header("__test_" + ordinal.to_string(), 0, "int")
     ir_emitting_test_func = true
+    # a test body is an ordinary function body: without the prologue its
+    # locals are never collected or zero-stored, so a match payload binding
+    # (which releases the binding's previous value) would load a name the ir
+    # has not declared. mirrors ir_func.
+    ir_emit_string_prologue(body_idx)
     ir_finish_func_emission(body_idx)
     ir_emitting_test_func = false
 

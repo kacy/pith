@@ -1,0 +1,55 @@
+# defining a grpc service in pith: a dispatch handler that routes by method path,
+# decodes a protobuf request, and returns a protobuf reply (or a GrpcError).
+#
+# to serve it over the network, hand the same handler to grpc.serve:
+#
+#     grpc.serve("0.0.0.0", 50051, greeter)              # plaintext http/2
+#     grpc.serve_tls("0.0.0.0", 443, cert, key, greeter) # http/2 over tls
+#
+# grpc.serve routes every request by its /package.Service/Method path to this one
+# handler and sends the reply back with the grpc-status trailer. here we drive the
+# handler directly so the example is self-contained: two calls, a known method and
+# an unknown one, exactly as the server would invoke it per request.
+
+import std.net.grpc as grpc
+import std.protobuf as protobuf
+import std.bytes as bytes
+
+# read protobuf field 1 (a string) from a message, defaulting to "" if absent.
+fn read_name(message: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(message)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+# encode a single string into protobuf field 1 — the request and reply shape.
+fn message_of(text: String) -> Bytes:
+    w := protobuf.writer()
+    w.write_string(1, text) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# the service: one method, /greeter.Greeter/SayHello, greeting the caller by name.
+# an unknown path fails with GRPC_UNIMPLEMENTED, the standard grpc response.
+fn greeter(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/greeter.Greeter/SayHello":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_name(request) catch "world"
+    return message_of("hello, " + name)
+
+fn call(path: String, name: String):
+    reply := greeter(path, message_of(name))
+    if reply.is_err:
+        print(path + " -> error " + reply.err.status.to_string() + ": " + reply.err.message)
+    else:
+        print(path + " -> " + (read_name(reply.ok) catch "?"))
+
+fn main():
+    call("/greeter.Greeter/SayHello", "pith")
+    call("/greeter.Greeter/Unknown", "pith")

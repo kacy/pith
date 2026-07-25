@@ -37,6 +37,12 @@
 # bodies and full send/receive flow control are implemented and tested; the
 # request-size limits below bound how much one connection can make the server
 # buffer.
+#
+# besides the buffered handler above there is a streaming path
+# (listen_h2c_streaming / listen_h2_tls_streaming): the handler receives a live
+# ServerStream and reads body chunks with recv_event() while sending response
+# headers, DATA, and trailers incrementally — so it can answer before the
+# request has finished arriving. see "the streaming handler surface" below.
 
 # the codec modules are imported before std.net.http on purpose, for the same
 # loader-ordering reason documented in std.net.http2.connection: importing frames
@@ -311,6 +317,9 @@ fn server_settings_frame() -> frames.Frame!:
 struct Server:
     conn: ServerConn
     handler: fn(http.HttpRequestBytes) -> http.HttpResponse
+    # true when this server hands streams to the streaming handler (see
+    # ServerStream below) instead of buffering whole requests for `handler`.
+    streaming: Bool
     outbound: Channel[Outbound]
     mu: Mutex
     streams: Map[Int, Channel[StreamEvent]]
@@ -440,6 +449,89 @@ impl Server:
         self.credit = empty_credit
         self.active = []
         self.mu.unlock()
+
+# --- the streaming handler surface ---
+#
+# the buffered path above collects a whole request before the handler runs and
+# sends a whole response after it returns. a streaming handler instead runs while
+# the request is still arriving: it reads body chunks off the stream's inbox one
+# at a time and sends response headers, DATA, and trailers incrementally, so it
+# can answer message 1 before the client has sent message 2 (what an interactive
+# grpc bidi stream needs). the machinery is the same — the per-stream inbox the
+# reader already feeds, and the same outbound queue and flow-control gating the
+# buffered path sends through — only the buffering in the middle is gone.
+
+# one live request stream, handed to a streaming handler. the request HEAD
+# (method, path, headers) is already parsed into `request`; the body arrives
+# through recv_event(). the send side mirrors the buffered response path: headers
+# first, then flow-controlled DATA, then trailers (or END_STREAM on the last
+# DATA). the handler must end the stream one way or the other before returning,
+# or the client is left waiting.
+pub struct ServerStream:
+    server: Server
+    pub id: Int
+    inbox: Channel[StreamEvent]
+    # the request head, parsed from the HEADERS block: path, query, headers — the
+    # same HttpRequestBytes a buffered handler sees, with an empty body (the body
+    # is read incrementally with recv_event()).
+    pub request: http.HttpRequestBytes
+    # true once the request side has finished: END_STREAM seen, the stream was
+    # reset, or the connection closed. recv_event() keeps the flag current.
+    mut done: Bool
+
+impl ServerStream:
+    # the next request event: a DATA chunk (its `end` flag marks the last one), a
+    # HEADERS event (request trailers, rare), or a RESET if the client abandoned
+    # the stream. once the request side has finished, every further call returns
+    # an empty end-of-stream DATA event, so a loop that reads until `end` or a
+    # reset never hangs on a finished request. a closed connection reads as a
+    # reset with CANCEL, so handlers treat the two the same way: stop.
+    pub fn recv_event() -> StreamEvent:
+        if self.done:
+            return data_event(bytes.empty(), true)
+        opt := self.inbox.recv()
+        if opt == none:
+            self.done = true
+            return reset_event(frames.ERROR_CANCEL)
+        event := opt.unwrap_or(reset_event(frames.ERROR_CANCEL))
+        if event.is_reset() or event.end:
+            self.done = true
+        return event
+
+    # queue the response HEADERS. `end_stream` true is a headers-only response;
+    # false leaves the stream open for send() and send_trailers(). call once,
+    # before any send(). the Outbound is built inline at the send site (a
+    # by-value struct moved into a constructor inside a helper loses its heap
+    # fields), same as the buffered path.
+    pub fn send_headers(fields: List[hpack.HeaderField], end_stream: Bool):
+        self.server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), self.id, fields, end_stream))
+
+    # send a chunk of response body as flow-controlled DATA, blocking while the
+    # client's send windows are exhausted until a WINDOW_UPDATE grows them.
+    # `end_stream` ends the response on the final frame (use send_trailers
+    # instead when trailers follow). returns the bytes sent; a short count means
+    # the connection dropped.
+    pub fn send_data(data: Bytes, end_stream: Bool) -> Int:
+        return send_stream_data(self.server, self.id, data, end_stream)
+
+    # queue the response trailers — a trailing HEADERS block, which always ends
+    # the stream. grpc carries its grpc-status here.
+    pub fn send_trailers(fields: List[hpack.HeaderField]):
+        self.server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), self.id, fields, true))
+
+# the process-wide streaming handler, set by listen_h2c_streaming /
+# listen_h2_tls_streaming. a module global for the same reason grpc's dispatch
+# is one: a pith closure cannot capture a fn-value, and a Server field of type
+# fn(ServerStream) would make Server and ServerStream mutually recursive, which
+# the type system resolves in file order and so cannot express. the cost is one
+# streaming handler per process — the same shape grpc already documents.
+mut stream_handler_fn: fn(ServerStream) -> Int := stream_handler_unset
+
+# the default streaming handler: refuse the stream, so a misconfigured server
+# fails loudly instead of leaving clients waiting on a stream nobody serves.
+fn stream_handler_unset(stream: ServerStream) -> Int:
+    stream.server.reset(stream.id, frames.ERROR_REFUSED_STREAM)
+    return 0
 
 # --- the request bridge ---
 
@@ -707,7 +799,12 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
 # handler, and submit the response to the writer. an assemble failure (the client
 # reset the stream, or it dropped) just drops the stream; the handler runs on its
 # own task so a slow or failing request never blocks the reader or another stream.
+# a streaming server hands the stream to the streaming handler instead of
+# buffering (handle_streaming_stream); the buffered path below is unchanged.
 fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
+    if server.streaming:
+        handle_streaming_stream(server, stream_id, inbox)
+        return
     result := assemble_request(inbox)
     if result.is_err:
         # a body that outgrew the size cap gets an explicit stream reset so the
@@ -743,6 +840,31 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
         # a second HEADERS block after the body is the trailers; it always ends
         # the stream. queued after the DATA on the same FIFO, so ordering holds.
         server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, trailer_fields, true))
+    server.forget(stream_id)
+
+# run one stream on the streaming path: read the request HEADERS off the inbox,
+# parse the head, and hand the live stream to the streaming handler. the handler
+# reads the body with recv_event() and sends the response incrementally while the
+# request may still be arriving. when it returns, the stream is forgotten —
+# whatever it did or did not send. a reset (or a dropped connection) before the
+# headers just drops the stream, mirroring the buffered path's assemble failure.
+fn handle_streaming_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
+    opt := inbox.recv()
+    if opt == none:
+        server.forget(stream_id)
+        return
+    first := opt.unwrap_or(reset_event(frames.ERROR_CANCEL))
+    if not first.is_headers():
+        server.forget(stream_id)
+        return
+    head := build_request(first.headers, bytes.empty())
+    if head.is_err:
+        server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
+        return
+    # END_STREAM on the request HEADERS means there is no body: the stream starts
+    # out done and the handler's first recv_event() reports end-of-request.
+    stream := ServerStream(server, stream_id, inbox, head.ok, first.end)
+    stream_handler_fn(stream)
     server.forget(stream_id)
 
 # --- the reader task ---
@@ -954,6 +1076,11 @@ pub fn serve_h2c_connection(fd: Int, handler: fn(http.HttpRequestBytes) -> http.
 # spawns the writer, and runs the reader loop on the calling task; when the reader
 # returns it waits for the writer to flush and stop.
 fn serve_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Bool!:
+    return run_connection(conn, handler, false)!
+
+# serve_connection with the streaming switch explicit: `streaming` true routes
+# every stream to the process-wide streaming handler instead of `handler`.
+fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Bool!:
     conn.read_preface()!
     conn.send_frame(server_settings_frame()!)!
     outbound := Channel[Outbound](OUTBOUND_CAP)
@@ -965,7 +1092,7 @@ fn serve_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http
     credit: Map[Int, Channel[Int]] := {}
     # the send side starts at http/2's defaults; the client's SETTINGS (its first
     # frame) revises the initial window and max frame size before any stream opens.
-    server := Server(conn, handler, outbound, Mutex(), streams, ids, 0, closed, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
+    server := Server(conn, handler, streaming, outbound, Mutex(), streams, ids, 0, closed, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
     run_reader(server)
     await writer
     return true
@@ -1010,6 +1137,56 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
         spawn serve_h2_tls_connection(client, handler)
     return 0
 
+# --- streaming entry points ---
+#
+# the streaming twins of the buffered entry points above. the handler receives a
+# live ServerStream per request instead of a buffered HttpRequestBytes; it is
+# stored in the process-wide slot (see stream_handler_fn), so one process runs
+# one streaming handler. the buffered listen paths are untouched.
+
+# the buffered-handler slot of a streaming server. never called — handle_stream
+# routes to the streaming path first — but the Server struct still carries one.
+fn streaming_unused_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.response(500)
+
+# serve one accepted h2c connection on the streaming path. mirrors
+# serve_h2c_connection; the handler comes from the process-wide slot.
+pub fn serve_h2c_streaming_connection(fd: Int):
+    conn := new_live_server_conn(fd)
+    run_connection(conn, streaming_unused_handler, true) catch false
+    conn.close()
+
+# bind host:port for cleartext h2c and serve forever, handing each request
+# stream to `handler` while it is still arriving. mirrors listen_h2c.
+pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -> Int) -> Int!:
+    stream_handler_fn = handler
+    fd := tcp_listen(host, port)!
+    while true:
+        client := tcp_accept(fd)!
+        spawn serve_h2c_streaming_connection(client)
+    return 0
+
+# serve one accepted tls connection on the streaming path. mirrors
+# serve_h2_tls_connection, including the alpn "h2" check.
+pub fn serve_h2_tls_streaming_connection(tls_conn: tls.Conn):
+    if tls_conn.negotiated_protocol() != "h2":
+        tls_conn.close()
+        return
+    conn := new_tls_server_conn(tls_conn.handle)
+    run_connection(conn, streaming_unused_handler, true) catch false
+    conn.close()
+
+# bind host:port for http/2 over tls and serve forever on the streaming path.
+# mirrors listen_h2_tls.
+pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: String, handler: fn(ServerStream) -> Int) -> Int!:
+    stream_handler_fn = handler
+    config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen(host, port, config)!
+    while true:
+        client := tls.accept(listener)!
+        spawn serve_h2_tls_streaming_connection(client)
+    return 0
+
 # --- offline frame tests ---
 #
 # these drive the server's pieces over an offline ServerConn (no socket): the
@@ -1035,7 +1212,7 @@ fn test_server(conn: ServerConn) -> Server:
     ids: List[Int] := []
     send_windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
-    return Server(conn, ok_handler, Channel[Outbound](OUTBOUND_CAP), Mutex(), streams, ids, 0, AtomicInt(0), DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
+    return Server(conn, ok_handler, false, Channel[Outbound](OUTBOUND_CAP), Mutex(), streams, ids, 0, AtomicInt(0), DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
 
 # the ":status" of a decoded response header list, or 0 when absent.
 fn find_status(fields: List[hpack.HeaderField]) -> Int:
@@ -1331,3 +1508,111 @@ test "a client SETTINGS_INITIAL_WINDOW_SIZE resizes the server's open send windo
     # the open stream shrinks by the delta: 65535 + (1000 - 65535) = 1000.
     assert_eq(server.send_windows[1], 1000)
     assert_eq(server.peer_max_frame_size, 32768)
+
+# --- streaming-path tests ---
+
+# a ServerStream over an offline test server: stream id 1, the given inbox, a
+# minimal POST head, and the body not yet finished.
+fn test_stream(server: Server, inbox: Channel[StreamEvent]) -> ServerStream!:
+    fields := [hpack.header_field(":method", "POST"), hpack.header_field(":path", "/s")]
+    return ServerStream(server, 1, inbox, build_request(fields, bytes.empty())!, false)
+
+test "a streaming ServerStream reads body chunks then reports a sticky end":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    inbox := Channel[StreamEvent](4)
+    inbox.send(data_event(bytes.from_string_utf8("hi"), false))
+    inbox.send(data_event(bytes.empty(), true))
+    stream := test_stream(server, inbox)!
+    first := stream.recv_event()
+    assert(first.is_data())
+    assert_eq(first.data.to_string_utf8()!, "hi")
+    assert(not first.end)
+    second := stream.recv_event()
+    assert(second.end)
+    # the request has finished: recv keeps reporting end without blocking.
+    third := stream.recv_event()
+    assert(third.is_data())
+    assert(third.end)
+
+test "a streaming ServerStream reads a reset and a closed inbox as resets":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    inbox := Channel[StreamEvent](2)
+    inbox.send(reset_event(frames.ERROR_STREAM_CLOSED))
+    stream := test_stream(server, inbox)!
+    ev := stream.recv_event()
+    assert(ev.is_reset())
+    assert_eq(ev.error_code, frames.ERROR_STREAM_CLOSED)
+    # a closed inbox (the connection went away) reads as a CANCEL reset.
+    closed_inbox := Channel[StreamEvent](2)
+    closed_inbox.close()
+    other := test_stream(server, closed_inbox)!
+    ev2 := other.recv_event()
+    assert(ev2.is_reset())
+    assert_eq(ev2.error_code, frames.ERROR_CANCEL)
+
+test "a streaming ServerStream sends headers, data, and trailers in order":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    arm_send_stream(server, 1, 100, 100, 100)
+    inbox := Channel[StreamEvent](2)
+    stream := test_stream(server, inbox)!
+    stream.send_headers([hpack.header_field(":status", "200")], false)
+    stream.send_data(bytes.from_string_utf8("payload"), false)
+    stream.send_trailers([hpack.header_field("grpc-status", "0")])
+    # the response HEADERS first, leaving the stream open.
+    hopt := server.outbound.try_recv()
+    assert(hopt != none)
+    head := hopt.unwrap_or(raw_item(bytes.empty()))
+    assert_eq(head.kind, OUT_RESPONSE)
+    assert(not head.end_stream)
+    assert(has_field(head.fields, ":status", "200"))
+    # then the flow-controlled DATA.
+    df := next_data_frame(server.outbound)!
+    assert_eq(df.data.to_string_utf8()!, "payload")
+    assert(not df.end_stream)
+    # then the trailers, which end the stream.
+    topt := server.outbound.try_recv()
+    assert(topt != none)
+    tail := topt.unwrap_or(raw_item(bytes.empty()))
+    assert_eq(tail.kind, OUT_RESPONSE)
+    assert(tail.end_stream)
+    assert(has_field(tail.fields, "grpc-status", "0"))
+
+# the streaming handler the offline handle_streaming_stream test registers: send
+# a 200 head, echo each body chunk as it arrives, then trail out.
+fn echo_stream_handler(stream: ServerStream) -> Int:
+    stream.send_headers([hpack.header_field(":status", "200")], false)
+    while true:
+        ev := stream.recv_event()
+        if ev.is_reset():
+            return 0
+        if ev.is_data() and ev.data.len() > 0:
+            stream.send_data(ev.data, false)
+        if ev.end:
+            break
+    stream.send_trailers([hpack.header_field("x-done", "1")])
+    return 0
+
+test "handle_streaming_stream parses the head and drives the streaming handler":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    stream_handler_fn = echo_stream_handler
+    inbox := Channel[StreamEvent](8)
+    server.register(1, inbox)
+    fields := [hpack.header_field(":method", "POST"), hpack.header_field(":path", "/echo")]
+    inbox.send(headers_event(fields, false))
+    inbox.send(data_event(bytes.from_string_utf8("ping"), true))
+    handle_streaming_stream(server, 1, inbox)
+    # the handler's output, in order: HEADERS, the echoed DATA, the trailers.
+    hopt := server.outbound.try_recv()
+    assert(hopt != none)
+    head := hopt.unwrap_or(raw_item(bytes.empty()))
+    assert_eq(head.kind, OUT_RESPONSE)
+    assert(has_field(head.fields, ":status", "200"))
+    df := next_data_frame(server.outbound)!
+    assert_eq(df.data.to_string_utf8()!, "ping")
+    topt := server.outbound.try_recv()
+    assert(topt != none)
+    tail := topt.unwrap_or(raw_item(bytes.empty()))
+    assert(tail.end_stream)
+    assert(has_field(tail.fields, "x-done", "1"))
+    # the stream was forgotten when the handler returned.
+    assert_eq(server.active_count(), 0)

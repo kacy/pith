@@ -1,0 +1,96 @@
+# incremental streaming over grpc.serve_stream, the interleaving buffered serve
+# cannot do. the chat rpc echoes each message the moment it arrives, and the
+# client waits for each echo BEFORE sending the next message — no half-close
+# first. if the server buffered the request, the first recv here would deadlock:
+# that hang is exactly what this test exists to catch. the feed rpc then proves
+# multi-message incremental send on a server-streaming shape, read back one
+# recv() at a time rather than collected.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50331
+
+fn route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if path == "/t.Svc/Chat":
+        # bidi echo: reply to each request message before the next one exists.
+        while true:
+            step := call.recv_message()!
+            if step.done:
+                break
+            call.send_message(bytes.concat(bytes.from_string_utf8("echo:"), step.message))
+        call.finish_ok()
+        return 0
+    if path == "/t.Svc/Feed":
+        # server-streaming: one request in, three incremental messages out.
+        step := call.recv_message()!
+        if step.done:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "want one message")
+        mut i := 0
+        while i < 3:
+            call.send_message(bytes.concat(step.message, bytes.from_string_utf8("-" + i.to_string())))
+            i = i + 1
+        call.finish_ok()
+        return 0
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+fn run_server():
+    grpc.serve_stream("127.0.0.1", PORT, route) catch 0
+
+# send one chat message and wait for its echo — the next send happens only after
+# this returns, so a pass proves the server answered mid-request-stream.
+fn chat_round(bs: grpc.BidiStream, text: String) -> Bool:
+    bs.send(bytes.from_string_utf8(text))
+    step := bs.recv()
+    if step.is_err:
+        print("chat err " + step.err.status.to_string())
+        return false
+    if step.ok.done:
+        print("chat ended early")
+        return false
+    print("chat: " + (step.ok.message.to_string_utf8() catch "?"))
+    return true
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+
+    # the interleaving proof: send, wait for the echo, only then send the next.
+    opened := conn.bidi_stream("/t.Svc/Chat")
+    if opened.is_err:
+        print("chat open err")
+        return
+    bs := opened.ok
+    if not chat_round(bs, "a"):
+        return
+    if not chat_round(bs, "b"):
+        return
+    if not chat_round(bs, "c"):
+        return
+    bs.close_send()
+    last := bs.recv()
+    if not last.is_err and last.ok.done:
+        print("chat done")
+
+    # server-streaming, read incrementally (recv per message, not collect).
+    stream := conn.server_stream("/t.Svc/Feed", bytes.from_string_utf8("m"))
+    if stream.is_err:
+        print("feed open err")
+        return
+    ss := stream.ok
+    while true:
+        step := ss.recv()
+        if step.is_err:
+            print("feed err " + step.err.status.to_string())
+            break
+        if step.ok.done:
+            print("feed done")
+            break
+        print("feed: " + (step.ok.message.to_string_utf8() catch "?"))
+    conn.close()

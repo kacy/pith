@@ -49,12 +49,18 @@
 # — raw framed bytes in and out — so one dispatch can carry unary and buffered
 # streaming methods side by side, in either direction (unframe_messages /
 # frame_messages / frame_one do the framing). the generated serve_<Service> uses
-# this for all four rpc shapes.
+# this for all four rpc shapes. buffered means the whole request and reply pass
+# through memory — right for bounded streams, wrong for interactive or endless
+# ones.
 #
-# deferred: incremental streaming serve (a buffered stream passes the whole
-# request and reply through memory, with no interleaving on bidi), message
-# compression, deadlines and metadata beyond the basics, and grpc-message
-# percent-decoding.
+# for those, serve_stream/serve_stream_tls take a STREAM-level dispatch: the
+# handler receives a live GrpcStream and can recv_message() and send_message()
+# incrementally — reply to message 1 before the client sends message 2. see the
+# streaming server section below. the generated stubs stay on the buffered path;
+# serve_stream is the hand-written escape hatch.
+#
+# deferred: message compression, deadlines and metadata beyond the basics, and
+# grpc-message percent-decoding.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2
@@ -1001,3 +1007,135 @@ pub fn serve_body(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!
 pub fn serve_body_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
     grpc_body_dispatch_fn = dispatch
     return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_body_handler)!
+
+# --- streaming serving (incremental) ------------------------------------------
+#
+# the buffered paths above hold the whole request until the client half-closes,
+# which makes an interactive stream impossible: the handler cannot answer message
+# 1 while the client waits to send message 2. serve_stream instead hands the
+# dispatch a live GrpcStream riding the h2 server's streaming path: recv_message
+# deframes request messages as their DATA arrives, send_message frames and sends
+# a reply immediately, and finish carries the grpc-status out in the trailers.
+# any mix of the four rpc shapes works — a unary handler just recvs once and
+# sends once. generated stubs do not use this path; it is the hand-written
+# escape hatch for interactive and long-lived streams.
+
+# a grpc rpc in progress on the server, handed to a serve_stream dispatch.
+# receive with recv_message() until it reports done; send with send_message();
+# end with finish_ok() or finish(). the response headers (":status 200",
+# content-type application/grpc) go out lazily with the first send_message — so
+# a handler that fails before sending anything still gets the compact
+# trailers-only error response from finish().
+pub struct GrpcStream:
+    stream: h2server.ServerStream
+    mut deframer: Deframer
+    mut request_done: Bool
+    mut sent_headers: Bool
+    mut finished: Bool
+
+# the response headers of a streaming grpc reply.
+fn grpc_response_fields() -> List[hpack.HeaderField]:
+    return [hpack.header_field(":status", "200"), hpack.header_field("content-type", GRPC_CONTENT_TYPE)]
+
+# the grpc-status (and grpc-message, when non-empty) trailer fields.
+fn grpc_status_fields(status: Int, message: String) -> List[hpack.HeaderField]:
+    mut fields: List[hpack.HeaderField] := [hpack.header_field("grpc-status", status.to_string())]
+    if message.len() > 0:
+        fields.push(hpack.header_field("grpc-message", message))
+    return fields
+
+impl GrpcStream:
+    # the full method path of this rpc, "/package.Service/Method".
+    pub fn full_method() -> String:
+        return self.stream.request.path() catch ""
+
+    # the parsed request head (headers, metadata) — the body is not in it; read
+    # messages with recv_message().
+    pub fn request_head() -> http.HttpRequestBytes:
+        return self.stream.request
+
+    # pull the next request message: a StreamMessage with `done` false and the
+    # message bytes, or `done` true once the client has finished sending. blocks
+    # until a whole message has arrived. fails with GRPC_CANCELLED if the client
+    # reset the stream (or the connection dropped) — the handler should stop.
+    pub fn recv_message() -> StreamMessage!GrpcError:
+        while true:
+            if self.deframer.ready():
+                return StreamMessage(false, self.deframer.next()!)
+            if self.request_done:
+                return StreamMessage(true, bytes.empty())
+            ev := self.stream.recv_event()
+            if ev.is_reset():
+                self.request_done = true
+                fail GrpcError(GRPC_CANCELLED, "grpc: stream reset by the client")
+            if ev.is_data():
+                if ev.data.len() > 0:
+                    self.deframer.push(ev.data)
+            # a HEADERS event after the body began is request trailers; grpc
+            # requests carry nothing there, so only its end flag matters.
+            if ev.end:
+                self.request_done = true
+        return StreamMessage(true, bytes.empty())
+
+    # frame and send one response message, immediately — the client can read it
+    # while this rpc's request stream is still open. the response headers go out
+    # before the first message. returns the bytes queued for the wire.
+    pub fn send_message(message: Bytes) -> Int:
+        if not self.sent_headers:
+            self.sent_headers = true
+            self.stream.send_headers(grpc_response_fields(), false)
+        return self.stream.send_data(frame_message(message), false)
+
+    # end the rpc with `status` (and an optional message) in the trailers. after
+    # a send_message this is the trailing HEADERS block; before any send it is a
+    # trailers-only response, the compact error shape grpc clients expect.
+    pub fn finish(status: Int, message: String):
+        if self.finished:
+            return
+        self.finished = true
+        if self.sent_headers:
+            self.stream.send_trailers(grpc_status_fields(status, message))
+            return
+        self.sent_headers = true
+        mut fields := grpc_response_fields()
+        for f in grpc_status_fields(status, message):
+            fields.push(f)
+        self.stream.send_headers(fields, true)
+
+    # end the rpc with grpc-status 0 (OK).
+    pub fn finish_ok():
+        self.finish(GRPC_OK, "")
+
+# the stream dispatch lives in a module global for the same reason the unary
+# dispatch does: a pith closure cannot capture a fn-value, so there is one
+# streaming grpc server per process.
+mut grpc_stream_dispatch_fn: fn(String, GrpcStream) -> Int!GrpcError := grpc_no_stream_dispatch
+
+fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:
+    fail GrpcError(GRPC_UNIMPLEMENTED, "no grpc stream dispatch registered")
+
+# the h2-level streaming handler: wrap the stream, dispatch by path, and make
+# sure the rpc is finished when the dispatch returns — a forgotten finish would
+# leave the client waiting forever. an error return becomes the grpc-status (a
+# trailers-only response when nothing was sent yet); a clean return that never
+# called finish gets finish_ok.
+fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
+    call := GrpcStream(stream, new_deframer(), false, false, false)
+    result := grpc_stream_dispatch_fn(call.full_method(), call)
+    if result.is_err:
+        call.finish(result.err.status, result.err.message)
+    else:
+        call.finish_ok()
+    return 0
+
+# serve grpc over plaintext http/2 (h2c) with a stream-level dispatch: `dispatch`
+# receives the full method path and a live GrpcStream, and drives the rpc
+# incrementally. blocks, accepting connections.
+pub fn serve_stream(host: String, port: Int, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
+    grpc_stream_dispatch_fn = dispatch
+    return h2server.listen_h2c_streaming(host, port, grpc_serve_stream_handler)!
+
+# like serve_stream, over http/2 with tls (alpn "h2").
+pub fn serve_stream_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
+    grpc_stream_dispatch_fn = dispatch
+    return h2server.listen_h2_tls_streaming(host, port, cert, key, grpc_serve_stream_handler)!

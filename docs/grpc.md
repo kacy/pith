@@ -205,9 +205,10 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
   returns the complete reply `List`. there is no incremental send or receive, no
   backpressure, and no interleaving on a bidi stream — so endless or
   interactive streams are off the table until incremental serving lands.
-- **protogen doesn't cover** `oneof`, `map<k,v>`, 32-bit `float` (use `double`),
-  the well-known types (Timestamp, Any, …), or proto2. it stops with a clear
-  error naming the feature.
+- **protogen doesn't cover** 32-bit `float` (use `double`), the well-known types
+  (Timestamp, Any, …), or proto2. it stops with a clear error naming the
+  feature. `oneof` (a payload enum per group) and `map<k,v>` (a pith `Map`,
+  string or integer keys) are supported.
 - **deadlines, metadata, and compression** are minimal.
 - **observability**: the client opens a trace span and records red metrics per
   call automatically; the server side is your code, so instrument it yourself.

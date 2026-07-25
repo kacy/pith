@@ -59,8 +59,15 @@
 # streaming server section below. the generated stubs stay on the buffered path;
 # serve_stream is the hand-written escape hatch.
 #
-# deferred: message compression, deadlines and metadata beyond the basics, and
-# grpc-message percent-decoding.
+# deadlines and metadata: a client attaches metadata (unary_with_headers, the
+# *_with_headers stream openers) and a deadline (unary_with_deadline) to a call;
+# a server dispatch reads them back with incoming_metadata() and
+# incoming_deadline_ms(), and a request whose deadline is already spent on
+# arrival is answered DEADLINE_EXCEEDED without running the handler. initial
+# (request) metadata only — trailing metadata is not supported.
+#
+# deferred: message compression, trailing metadata, mid-handler deadline
+# cancellation, and grpc-message percent-decoding.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2
@@ -1037,6 +1044,82 @@ pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config
 
 GRPC_CONTENT_TYPE := "application/grpc"
 
+# --- request context: metadata and deadline ---
+#
+# a dispatch handler is a module-global fn-value, so per-request data cannot be
+# threaded through its signature without breaking every server and generated
+# stub already written against it. instead each serve handler stashes the
+# request's metadata and deadline in threadlocal slots just before invoking the
+# dispatch, and the dispatch reads them back with incoming_metadata() /
+# incoming_deadline_ms(). threadlocal storage is per-task under the green
+# runtime and per-os-thread otherwise (where every task is its own thread), and
+# each request runs handler-plus-dispatch on its own task, so concurrent
+# requests never see each other's context.
+
+threadlocal mut current_metadata: Map[String, String] := {}
+threadlocal mut current_deadline: Int := 0
+
+# the metadata of the request currently being dispatched: its custom request
+# headers, lowercase-keyed, minus the transport headers (host, content-type,
+# te, user-agent) and the reserved grpc-* set. valid inside a dispatch handler;
+# empty outside one.
+pub fn incoming_metadata() -> Map[String, String]:
+    return current_metadata
+
+# the absolute deadline of the request currently being dispatched, as a
+# time.mono_millis() timestamp — compare against time.mono_millis() for the
+# time remaining. 0 when the client sent no grpc-timeout (or none parsed).
+pub fn incoming_deadline_ms() -> Int:
+    return current_deadline
+
+# whether `name` (already lowercase) is a header the transport or grpc itself
+# owns, and so never surfaces as caller metadata.
+fn is_reserved_metadata_key(name: String) -> Bool:
+    if name.starts_with("grpc-"):
+        return true
+    return name == "host" or name == "content-type" or name == "te" or name == "user-agent"
+
+# the caller metadata carried in a request's headers.
+fn request_metadata(req: http.HttpRequestBytes) -> Map[String, String]:
+    mut out: Map[String, String] := {}
+    for key in req.header_map:
+        name := key.to_lower()
+        if not is_reserved_metadata_key(name):
+            out.insert(name, req.header_map[key])
+    return out
+
+# the request's grpc-timeout in milliseconds, or none when the header is
+# absent or malformed (a malformed value reads as no deadline — the safe
+# direction, since inventing one would fail valid requests).
+fn request_timeout_ms(req: http.HttpRequestBytes) -> Int?:
+    text := req.header_or("grpc-timeout", "")
+    if text == "":
+        return none
+    return parse_grpc_timeout(text)
+
+# stash the request context for the dispatch about to run. returns true when
+# the request's deadline had already expired on arrival, in which case the
+# caller answers DEADLINE_EXCEEDED without invoking the handler at all.
+# expiry is judged from the parsed timeout itself, not the stored timestamp:
+# time.mono_millis() reads 0 in the process's first millisecond, and a
+# timestamp of 0 must keep meaning "no deadline".
+fn begin_request_context(req: http.HttpRequestBytes) -> Bool:
+    current_metadata = request_metadata(req)
+    current_deadline = 0
+    parsed_timeout := request_timeout_ms(req)
+    if parsed_timeout == none:
+        return false
+    remaining := parsed_timeout.unwrap_or(0)
+    current_deadline = time.mono_millis() + remaining
+    return remaining <= 0
+
+# the message sent when a request arrives with its deadline already spent.
+EXPIRED_ON_ARRIVAL := "grpc: deadline expired before the handler ran"
+
+# the trailers-only DEADLINE_EXCEEDED response for the buffered serve paths.
+fn expired_response() -> http.HttpResponse:
+    return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL))
+
 mut grpc_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
 
 fn grpc_no_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
@@ -1067,6 +1150,8 @@ fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
 # the http/2 handler that turns one unary grpc request into one grpc response.
 fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
     path := req.path() catch ""
+    if begin_request_context(req):
+        return expired_response()
     request := grpc_unframe_unary(req.body_bytes())
     if request.is_err:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_INTERNAL, "malformed request frame"))
@@ -1103,6 +1188,8 @@ mut grpc_body_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispa
 
 fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
     path := req.path() catch ""
+    if begin_request_context(req):
+        return expired_response()
     result := grpc_body_dispatch_fn(path, req.body_bytes())
     if result.is_err:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
@@ -1166,6 +1253,9 @@ pub fn serve_body_tls(host: String, port: Int, cert: String, key: String, dispat
 pub struct GrpcStream:
     stream: h2server.ServerStream
     mut deframer: Deframer
+    # the absolute request deadline (a time.mono_millis() timestamp, 0 = none),
+    # anchored when the request arrived rather than when the handler asks.
+    deadline: Int
     mut request_done: Bool
     mut sent_headers: Bool
     mut finished: Bool
@@ -1190,6 +1280,16 @@ impl GrpcStream:
     # messages with recv_message().
     pub fn request_head() -> http.HttpRequestBytes:
         return self.stream.request
+
+    # this rpc's caller metadata: custom request headers, lowercase-keyed, minus
+    # the transport and reserved grpc-* headers.
+    pub fn metadata() -> Map[String, String]:
+        return request_metadata(self.stream.request)
+
+    # this rpc's absolute deadline as a time.mono_millis() timestamp, or 0 when
+    # the client sent no grpc-timeout.
+    pub fn deadline_ms() -> Int:
+        return self.deadline
 
     # pull the next request message: a StreamMessage with `done` false and the
     # message bytes, or `done` true once the client has finished sending. blocks
@@ -1257,7 +1357,11 @@ fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:
 # trailers-only response when nothing was sent yet); a clean return that never
 # called finish gets finish_ok.
 fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
-    call := GrpcStream(stream, new_deframer(), false, false, false)
+    expired := begin_request_context(stream.request)
+    call := GrpcStream(stream, new_deframer(), current_deadline, false, false, false)
+    if expired:
+        call.finish(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL)
+        return 0
     result := grpc_stream_dispatch_fn(call.full_method(), call)
     if result.is_err:
         call.finish(result.err.status, result.err.message)
@@ -1276,3 +1380,44 @@ pub fn serve_stream(host: String, port: Int, dispatch: fn(String, GrpcStream) ->
 pub fn serve_stream_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
     grpc_stream_dispatch_fn = dispatch
     return h2server.listen_h2_tls_streaming(host, port, cert, key, grpc_serve_stream_handler)!
+
+# --- server request context --------------------------------------------------
+
+# build a parsed request head like the h2 server hands the serve handlers, for
+# driving the request-context helpers without a live connection.
+fn context_test_request(timeout_value: String) -> http.HttpRequestBytes!:
+    mut head := "POST /test.Svc/Method HTTP/1.1\r\nhost: example\r\ncontent-type: application/grpc\r\nte: trailers\r\nuser-agent: test-client\r\ngrpc-encoding: identity\r\nx-tenant: acme\r\nx-request-id: r1\r\n"
+    if timeout_value != "":
+        head = head + "grpc-timeout: " + timeout_value + "\r\n"
+    head = head + "\r\n"
+    return http.build_http_request(bytes.from_string_utf8(head), bytes.empty())!
+
+test "request_metadata keeps caller headers and drops transport ones":
+    md := request_metadata(context_test_request("")!)
+    assert_eq(md["x-tenant"], "acme")
+    assert_eq(md["x-request-id"], "r1")
+    assert(not md.contains_key("host"))
+    assert(not md.contains_key("content-type"))
+    assert(not md.contains_key("te"))
+    assert(not md.contains_key("user-agent"))
+    assert(not md.contains_key("grpc-encoding"))
+
+test "begin_request_context anchors the deadline on the monotonic clock":
+    assert(not begin_request_context(context_test_request("60S")!))
+    deadline := incoming_deadline_ms()
+    now := time.mono_millis()
+    assert(deadline > now)
+    assert(deadline <= now + 60000)
+
+test "begin_request_context stashes the context and spots a spent deadline":
+    # a healthy deadline: context is visible and the request is not expired.
+    assert(not begin_request_context(context_test_request("60S")!))
+    assert_eq(incoming_metadata()["x-tenant"], "acme")
+    assert(incoming_deadline_ms() > 0)
+    # one microsecond rounds down to zero millis: expired on arrival.
+    assert(begin_request_context(context_test_request("1u")!))
+    # no timeout header (or a malformed one): no deadline at all.
+    assert(not begin_request_context(context_test_request("")!))
+    assert_eq(incoming_deadline_ms(), 0)
+    assert(not begin_request_context(context_test_request("abc")!))
+    assert_eq(incoming_deadline_ms(), 0)

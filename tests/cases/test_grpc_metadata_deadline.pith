@@ -1,0 +1,135 @@
+# grpc metadata and deadlines end to end, over one in-process h2c server:
+#
+#   1. a unary call with metadata and a deadline — the dispatch reads both back
+#      through incoming_metadata() / incoming_deadline_ms().
+#   2. a request that arrives with its deadline already spent (grpc-timeout: 1u,
+#      one microsecond) is answered DEADLINE_EXCEEDED without the handler
+#      running — the handler would set a module-global flag, and a follow-up
+#      rpc confirms the flag stayed unset.
+#   3. two overlapping requests each see their own metadata: the request
+#      context lives in threadlocal slots, which are per-task, so a slow
+#      handler must echo the tag of its own request, never its neighbor's.
+#   4. a client-side deadline: the client gives up on a slow handler after
+#      100ms with DEADLINE_EXCEEDED, enforced locally without server help.
+
+import std.net.grpc as grpc
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50413
+
+# set by the /test.Ctx/Blocked handler — which must never run.
+mut blocked_handler_ran := false
+
+fn reply_text(text: String) -> Bytes!grpc.GrpcError:
+    w := protobuf.writer()
+    w.write_string(1, text) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# read protobuf field 1 (a string) from a message.
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut text := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            text = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return text
+
+fn metadata_value(name: String) -> String:
+    md := grpc.incoming_metadata()
+    if md.contains_key(name):
+        return md[name]
+    return "-"
+
+fn dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path == "/test.Ctx/Echo":
+        # report the metadata plus whether the deadline landed in a sane window.
+        mut deadline := "none"
+        remaining := grpc.incoming_deadline_ms() - time.mono_millis()
+        if grpc.incoming_deadline_ms() > 0 and remaining > 0 and remaining <= 5000:
+            deadline = "bounded"
+        return reply_text(metadata_value("x-tenant") + "|" + deadline)!
+    if path == "/test.Ctx/Blocked":
+        blocked_handler_ran = true
+        return reply_text("should-not-run")!
+    if path == "/test.Ctx/Slow":
+        # hold this request's context across a delay while another request
+        # runs, then echo the tag: proof the contexts stay separate.
+        tag := metadata_value("x-tag")
+        time.delay(300)
+        return reply_text(tag)!
+    if path == "/test.Ctx/Check":
+        if blocked_handler_ran:
+            return reply_text("ran")!
+        return reply_text("not-run")!
+    fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, dispatch) catch 0
+
+# call /test.Ctx/Slow on its own connection and return the echoed tag.
+fn slow_probe(tag: String) -> String:
+    conn_r := grpc.dial_h2c("127.0.0.1", PORT)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    reply := conn.unary_with_headers("/test.Ctx/Slow", bytes.empty(), ["x-tag", tag])
+    conn.close()
+    if reply.is_err:
+        return "RPC_ERR"
+    return read_field1(reply.ok) catch "?"
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    conn_r := grpc.dial_h2c("127.0.0.1", PORT)
+    if conn_r.is_err:
+        print("DIAL_ERR")
+        return
+    conn := conn_r.ok
+
+    # 1. metadata and deadline both reach the dispatch.
+    echo := conn.unary_with_headers_and_deadline("/test.Ctx/Echo", bytes.empty(), ["x-tenant", "acme"], 2000)
+    if echo.is_err:
+        print("echo:ERR")
+    else:
+        print("echo:" + (read_field1(echo.ok) catch "?"))
+
+    # 2. a deadline spent on arrival: one microsecond rounds down to zero
+    # millis, so the server answers before the handler runs.
+    blocked := conn.unary_with_headers("/test.Ctx/Blocked", bytes.empty(), ["grpc-timeout", "1u"])
+    if blocked.is_err:
+        print("blocked:" + grpc.status_name(blocked.err.status))
+    else:
+        print("blocked:NO_ERR")
+
+    # ...and the handler really never ran.
+    check := conn.unary("/test.Ctx/Check", bytes.empty())
+    if check.is_err:
+        print("check:ERR")
+    else:
+        print("check:" + (read_field1(check.ok) catch "?"))
+
+    # 3. two overlapping requests keep their own metadata.
+    probe := spawn slow_probe("one")
+    time.delay(50)
+    second := slow_probe("two")
+    first := await probe
+    if first == "one" and second == "two":
+        print("isolation:ok")
+    else:
+        print("isolation:" + first + "/" + second)
+
+    # 4. the client enforces its own deadline against a slow handler.
+    late := conn.unary_with_deadline("/test.Ctx/Slow", bytes.empty(), 100)
+    if late.is_err:
+        print("client:" + grpc.status_name(late.err.status))
+    else:
+        print("client:NO_ERR")
+    conn.close()

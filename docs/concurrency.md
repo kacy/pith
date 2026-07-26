@@ -209,8 +209,23 @@ short jobs over channels, or a network client whose reader, writer, and
 worker tasks trade a request back and forth per call. on that last shape the
 green backend cut internal context switches from about five per grpc call to
 well under one and raised throughput on a two-core box (see the grpc section
-of `docs/performance.md`). it does the least for tasks that are already
-cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
+of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
+trading a million messages through one bounded channel — it runs 2.6x faster
+than the os-thread backend and ahead of rust and zig, at 2.3x go (~46ms
+against go's ~75 when pinned to one worker; see `bench/README.md`). it does
+the least for tasks that are already cpu-bound and rarely wait — those never
+hit the handoffs green makes cheap.
+
+the machinery behind that: coroutine stacks are pooled and reused rather
+than mapped and unmapped per task, so a fan-out of short tasks costs
+allocations, not TLB shootdowns; each task's scheduling state lives in one
+atomic word, so waking a task or resuming it never takes the scheduler's
+slab lock; and a channel wake only signals a condvar when an os-thread
+waiter is actually parked in it, because green waiters suspend their
+coroutine instead and rust's condvar pays a futex syscall per notify
+regardless of waiters. `PITH_GREEN_STATS=1` prints the wake breakdown,
+contended-lock counts, and hot-path counters at exit if you want to see
+where a workload's handoffs actually go.
 
 it also keeps memory flat under fan-out. when a task finishes, the green
 backend reclaims its slot and releases the closure it was spawned with, so a
@@ -243,4 +258,7 @@ it is off by default and still experimental. the known rough edges:
   `PITH_GREEN_WORKERS=1` the whole pipeline shares one worker with no cross-thread
   wakes at all, which is often the fastest setting for a single connection even
   though it uses one core; more workers only pay off when the work genuinely
-  spreads across connections or cores
+  spreads across connections or cores. on the channel fan-out benchmark this is
+  the difference between ~46ms pinned and ~130-170ms when the pipeline splits
+  across two workers — placement is the biggest remaining cost on coordinated
+  shapes, and today it falls where first-resume luck puts it

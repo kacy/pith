@@ -531,6 +531,12 @@ struct Task {
     /// (see `enqueue_preempted`) so it yields to all other ready work, whereas a
     /// woken task goes onto the higher-priority `pinned` queue to resume promptly.
     preempt_pending: bool,
+    /// a value handed to this task by the waker (see `wake_with`): a channel
+    /// send that wakes a parked receiver dequeues on its behalf and leaves the
+    /// value here, so the receiver resumes with its result in hand instead of
+    /// re-locking and re-trying. taken (and cleared) by `take_handoff` as the
+    /// first thing the resumed block site does.
+    handoff: Option<i64>,
     /// set by `green_detach` when a task is detached while still running: no one
     /// will ever await it, so `finish_task` reclaims its slab slot the moment it
     /// completes rather than leaking it for the life of the process. an awaited
@@ -708,6 +714,50 @@ pub(crate) fn wake(id: TaskId) {
         Some(w) => enqueue_woken(w, id),
         None => enqueue_fresh(id),
     }
+}
+
+/// wake a parked green task and, if it is truly parked, run `fetch` and hand it
+/// the result: a channel send that wakes a parked receiver dequeues on the
+/// receiver's behalf, so the receiver resumes with the value in hand instead of
+/// re-locking the channel and re-trying the ring — go-style direct handoff, but
+/// keeping the ring as the ordering source so fifo holds. `fetch` runs under
+/// the slab lock only after the task is claimed (state was `Parked`), which is
+/// what makes handing over safe: a task that is still `Running` might complete
+/// its own attempt, so it gets a plain wake and the value stays in the ring.
+/// a `fetch` that comes back empty (a racing consumer drained the ring) still
+/// wakes the task valueless — it re-checks and re-parks, the usual tolerance.
+pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
+    let owner = {
+        let mut slab = lock_slab();
+        let Some(task) = slab.get_mut(id) else {
+            return;
+        };
+        match task.state {
+            RunState::Parked => {
+                task.handoff = fetch();
+                task.state = RunState::Ready;
+                task.owner
+            }
+            RunState::Running => {
+                task.wake_pending = true;
+                return;
+            }
+            RunState::Ready | RunState::Done => return,
+        }
+    };
+    match owner {
+        Some(w) => enqueue_woken(w, id),
+        None => enqueue_fresh(id),
+    }
+}
+
+/// take (and clear) the value a waker handed to the current task, if any. the
+/// first thing a resumed channel block site checks.
+pub(crate) fn take_handoff() -> Option<i64> {
+    let id = current_task()?;
+    let mut slab = lock_slab();
+    let task = slab.get_mut(id)?;
+    task.handoff.take()
 }
 
 /// the `tls` map of the green task currently running on this thread, or `None`
@@ -894,11 +944,23 @@ fn enqueue_fresh(id: TaskId) {
 /// ran it (see the pinning note). the pinned queue is not stolen from.
 fn enqueue_woken(owner: usize, id: TaskId) {
     let sched = scheduler();
-    sched.workers[owner]
-        .pinned
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push_back(id);
+    {
+        let mut pinned = sched.workers[owner]
+            .pinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // wake affinity: when the waker is the owner worker itself, the woken
+        // task is usually the other half of a handoff the current task just
+        // completed — run it next (front of the queue) while its data is hot,
+        // instead of behind every earlier wake. cross-worker wakes keep fifo
+        // order; starvation is bounded by preemption (an overrunning task is
+        // parked onto the lowest-priority deferred queue regardless).
+        if CURRENT_WORKER.with(|c| c.get()) == Some(owner) {
+            pinned.push_front(id);
+        } else {
+            pinned.push_back(id);
+        }
+    }
     // a pinned task can only ever run on its owner, and only the owner drains its
     // pinned queue — so nudge *only* the owner. if the owner is busy the notify is
     // a cheap no-op (no waiter), and it never wakes an idle peer that has nothing
@@ -1453,6 +1515,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             yielder_ptr: YielderPtr(ptr::null()),
             wake_pending: false,
             preempt_pending: false,
+            handoff: None,
             reclaim_on_done: false,
             join,
             // fresh, empty thread-local storage: this task starts with no
@@ -1673,6 +1736,7 @@ mod tests {
                 yielder_ptr: YielderPtr(ptr::null()),
                 wake_pending: false,
                 preempt_pending: false,
+                handoff: None,
                 reclaim_on_done: false,
                 join,
                 tls: Box::new(HashMap::new()),
@@ -1732,6 +1796,7 @@ mod tests {
             yielder_ptr: YielderPtr(ptr::null()),
             wake_pending: false,
             preempt_pending: false,
+            handoff: None,
             reclaim_on_done: false,
             join,
             tls: Box::new(HashMap::new()),
@@ -1829,6 +1894,7 @@ mod tests {
             yielder_ptr: YielderPtr(ptr::null()),
             wake_pending: false,
             preempt_pending: false,
+            handoff: None,
             reclaim_on_done: false,
             join: fresh_join(),
             tls: Box::new(HashMap::new()),

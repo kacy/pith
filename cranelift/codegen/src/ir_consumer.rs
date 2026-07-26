@@ -502,54 +502,61 @@ pub fn compile_from_ir(
                 } else {
                     rest
                 };
-                let mut content = String::new();
+                // accumulated as bytes, not chars: `byte as char` maps a byte
+                // to the code point of the same value, so the two bytes of a
+                // utf8 character each got re-encoded and "café" came out as
+                // "cafÃ©". the escapes below are all ascii, and `raw` is valid
+                // utf8, so the assembled bytes are too.
+                let mut content: Vec<u8> = Vec::new();
                 let bytes = raw.as_bytes();
                 let mut j = 0;
                 while j < bytes.len() {
                     if bytes[j] == b'{' && j + 1 < bytes.len() && bytes[j + 1] == b'{' {
                         // `{{` is an escaped literal brace
-                        content.push('{');
+                        content.push(b'{');
                         j += 2;
                     } else if bytes[j] == b'}' && j + 1 < bytes.len() && bytes[j + 1] == b'}' {
                         // `}}` is an escaped literal brace
-                        content.push('}');
+                        content.push(b'}');
                         j += 2;
                     } else if bytes[j] == b'\\' && j + 1 < bytes.len() {
                         match bytes[j + 1] {
                             b'n' => {
-                                content.push('\n');
+                                content.push(b'\n');
                                 j += 2;
                             }
                             b't' => {
-                                content.push('\t');
+                                content.push(b'\t');
                                 j += 2;
                             }
                             b'\\' => {
-                                content.push('\\');
+                                content.push(b'\\');
                                 j += 2;
                             }
                             b'"' => {
-                                content.push('"');
+                                content.push(b'"');
                                 j += 2;
                             }
                             b'r' => {
-                                content.push('\r');
+                                content.push(b'\r');
                                 j += 2;
                             }
                             b'0' => {
-                                content.push('\0');
+                                content.push(b'\0');
                                 j += 2;
                             }
                             _ => {
-                                content.push(bytes[j] as char);
+                                content.push(bytes[j]);
                                 j += 1;
                             }
                         }
                     } else {
-                        content.push(bytes[j] as char);
+                        content.push(bytes[j]);
                         j += 1;
                     }
                 }
+                let content = String::from_utf8(content)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 string_data.push((idx, content));
             }
             "struct" if parts.len() >= 2 => {

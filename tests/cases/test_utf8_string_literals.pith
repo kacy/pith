@@ -1,0 +1,37 @@
+# a non-ascii string literal has to survive the trip from source to binary.
+#
+# the ir consumer assembled string data with `byte as char`, which maps a byte
+# to the code point of the same value and then re-encodes it as utf8. so the two
+# bytes of "é" each got expanded and "café" came out of the compiler as
+# "cafÃ©" — five source bytes became seven. every non-ascii literal in the
+# language was wrong, quietly: it printed as mojibake, compared unequal to
+# itself read from a file, and reported the wrong length.
+
+import std.bytes as bytes
+
+fn main():
+    accented := "café"
+    print("text:" + accented)
+    print("len:" + accented.len().to_string())
+
+    # the bytes are the real utf8 encoding: 63 61 66 c3 a9
+    print("first:" + accented[0])
+    print("lead:" + ord(accented[3]).to_string())
+    print("cont:" + ord(accented[4]).to_string())
+
+    # two-byte, three-byte, and four-byte characters all round-trip
+    print("cjk:" + "你好" + " len:" + "你好".len().to_string())
+    print("emoji:" + "🌍" + " len:" + "🌍".len().to_string())
+
+    # and they survive interpolation, concatenation, and comparison
+    print("interp:{accented} {accented.len()}")
+    print("concat:" + accented + "/" + "naïve")
+    print("eq:" + (accented == "café").to_string())
+
+    # a literal converted to Bytes and back is unchanged
+    raw := bytes.from_string_utf8(accented)
+    print("bytes-len:" + raw.len().to_string())
+    print("roundtrip:" + (bytes.to_string_utf8(raw) catch "<invalid>"))
+
+    # escapes still work alongside the wider characters
+    print("escaped:" + "tab\tand\\slash in café")

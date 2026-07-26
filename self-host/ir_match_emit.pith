@@ -356,6 +356,42 @@ pub fn ir_emit_match_arm_body(body_idx: Int, result_temp: String, emit_expr: fn(
     ir_emit("store " + result_temp + " " + val_r.to_string())
     ir_last_was_ret = false
 
+## lower an if used as an expression: evaluate the first branch whose condition
+## holds into a shared temp, so the whole chain produces one value — the same
+## temp-store shape ir_emit_match_expr uses. children are
+## [condition, then_expr, elif_branch(cond, expr)..., else_expr].
+pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
+    result_temp := ir_new_temp_name("ifexpr")
+    end_l := ir_label()
+    cond_r := emit_expr(node.children[0])
+    then_l := ir_label()
+    mut next_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + then_l + " " + next_l)
+    ir_emit_label(then_l)
+    then_r := emit_expr(node.children[1])
+    ir_emit("store " + result_temp + " " + then_r.to_string())
+    ir_emit("jmp " + end_l)
+    ir_emit_label(next_l)
+    mut i := 2
+    while i < node.children.len() - 1:
+        branch := get_node(node.children[i])
+        branch_cond_r := emit_expr(branch.children[0])
+        body_l := ir_label()
+        after_l := ir_label()
+        ir_emit("brif " + branch_cond_r.to_string() + " " + body_l + " " + after_l)
+        ir_emit_label(body_l)
+        branch_r := emit_expr(branch.children[1])
+        ir_emit("store " + result_temp + " " + branch_r.to_string())
+        ir_emit("jmp " + end_l)
+        ir_emit_label(after_l)
+        i = i + 1
+    else_r := emit_expr(node.children[node.children.len() - 1])
+    ir_emit("store " + result_temp + " " + else_r.to_string())
+    ir_emit_label(end_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + result_temp)
+    return r
+
 ## lower a match used as an expression.
 pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int) -> Int:
     subj_r := emit_expr(node.children[0])

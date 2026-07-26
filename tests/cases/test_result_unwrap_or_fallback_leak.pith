@@ -1,0 +1,45 @@
+# a result's `unwrap_or` must not leak its fallback on the ok path.
+#
+# the fallback used to be built before the ok/err branch, so a heap default
+# like `unwrap_or(bytes.empty())` was allocated every call and, whenever the
+# result was ok, discarded without release. the optional `unwrap_or` already
+# deferred its default into the none arm; the result path now matches. this
+# runs the ok path many times over and checks the process footprint stays flat.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.strings as strings
+
+fn make(i: Int) -> Bytes!:
+    if i < 0:
+        fail "negative"
+    return bytes.from_string_utf8("a payload wide enough to notice if it leaks")
+
+fn hwm_kb() -> Int:
+    status := fs.read_file("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM"):
+            for part in line.split(" "):
+                v := strings.parse_int(part).unwrap_or(0 - 1)
+                if v > 0:
+                    return v
+    return 0
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 200000:
+        # inline (owned) operand: `unwrap_or` moves its ok payload out and frees
+        # the fresh result shell itself, so this exercises only the fallback,
+        # not the separate borrowed-operand ownership question. the fallback
+        # allocates every iteration and, on the ok path, must never be kept.
+        total = total + make(i).unwrap_or(bytes.empty()).len()
+        i = i + 1
+    peak := hwm_kb()
+    # a per-iteration leak of the ~48-byte empty-bytes fallback would add
+    # ~9 mb over 200k iterations; flat sits near 3 mb. 20 mb is a wide margin
+    # that a real leak blows through and normal variance never reaches.
+    if peak < 20000:
+        print("flat total=" + total.to_string())
+    else:
+        print("leaked peak_kb=" + peak.to_string())

@@ -1032,6 +1032,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_channel_fanout_ownership \
 	tests/cases/test_empty_list_field_ownership \
 	tests/cases/test_list_bytes_ownership \
+	tests/cases/test_result_unwrap_or_fallback_leak \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_lazy_adapter_pipeline tests/cases/test_named_local_adapter_chain \

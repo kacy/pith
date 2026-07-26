@@ -1292,6 +1292,13 @@ fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(result.ok).with_trailers(grpc_ok_trailers())
 
+# the most messages a buffered request stream will hold. a 10 MiB body of
+# five-byte empty frames is two million messages, and each one costs a list slot
+# and a Bytes header on top of its payload — a request that is small on the wire
+# turning into hundreds of megabytes of handler input. 64k is far more than a
+# buffered rpc has any reason to send; a client with more should stream.
+pub MAX_STREAM_MESSAGES := 65536
+
 # deframe every length-prefixed message in a request body. an empty body is a
 # valid empty stream (and, for unary, an all-default proto3 message).
 pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
@@ -1299,6 +1306,8 @@ pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
     d := new_deframer()
     d.push(body)
     while d.ready():
+        if out.len() >= MAX_STREAM_MESSAGES:
+            fail GrpcError(GRPC_RESOURCE_EXHAUSTED, "grpc: request stream carries more than {MAX_STREAM_MESSAGES} messages")
         out.push(d.next()!)
     if d.remaining() > 0:
         # leftover bytes that never completed a frame: the body was truncated or

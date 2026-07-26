@@ -1,0 +1,64 @@
+# the accept loop takes a concurrency permit per connection and releases it when
+# the connection ends. this drives more connections through it, one after
+# another, than a single permit would allow — if a permit is ever dropped on the
+# floor the loop stops accepting and this test stops printing rather than
+# printing a wrong answer.
+#
+# it also opens several at once, so the release path is exercised from
+# overlapping connections and not just sequential ones.
+
+import std.net.grpc as grpc
+import std.net.http2.connection as http2
+import std.net.http2.hpack as hpack
+import std.bytes as bytes
+import std.encoding as encoding
+import std.time as time
+
+PORT := 50637
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    return request
+
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, echo_dispatch) catch 0
+
+# one full connection: dial, make a call, hang up. returns 1 when the reply came
+# back intact.
+fn one_call(tag: String) -> Int:
+    opened := http2.open_h2c("127.0.0.1", PORT)
+    if opened.is_err:
+        return 0
+    client := opened.ok
+    fields := [hpack.header_field("content-type", "application/grpc"), hpack.header_field("te", "trailers")]
+    body := grpc.frame_messages([bytes.from_string_utf8(tag)])
+    resp := client.request("POST", "localhost", "/t.Svc/Echo", fields, body)
+    mut ok := 0
+    if not resp.is_err:
+        messages := grpc.unframe_messages(resp.ok.body) catch []
+        if messages.len() == 1 and bytes.to_string_utf8(messages[0]) catch "" == tag:
+            ok = 1
+    client.close()
+    return ok
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+
+    # sequential connections: every one has to get its permit back
+    mut sequential := 0
+    mut i := 0
+    while i < 12:
+        sequential = sequential + one_call("seq-" + i.to_string())
+        i = i + 1
+    print("sequential:" + sequential.to_string())
+
+    # overlapping connections
+    a := spawn one_call("par-a")
+    b := spawn one_call("par-b")
+    c := spawn one_call("par-c")
+    d := spawn one_call("par-d")
+    parallel := (await a) + (await b) + (await c) + (await d)
+    print("parallel:" + parallel.to_string())
+
+    # and the loop still accepts afterwards
+    print("after:" + one_call("after").to_string())

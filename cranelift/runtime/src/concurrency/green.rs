@@ -90,7 +90,7 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 
@@ -668,6 +668,15 @@ struct Worker {
     /// lost-wakeup window exactly as the old single spot did.
     park_lock: Mutex<()>,
     park_cv: Condvar,
+    /// whether this worker is currently inside `park`'s condvar wait. set under
+    /// `park_lock` before the wait and cleared after, so `wake_worker` can skip
+    /// the lock-and-notify entirely when the target is busy running tasks — the
+    /// common case on a hot pipeline, where the old unconditional lock acquire
+    /// per wake was measurable contention. the Dekker pairing is in `park`:
+    /// it publishes the flag before its final work re-check, and enqueuers
+    /// publish their work before reading the flag, so at least one side always
+    /// sees the other; the wait-timeout backstops anything subtler.
+    parked: AtomicBool,
     /// the slab id (`id + 1`, 0 = none) of the task this worker is currently
     /// resuming. written right before `resume` and cleared right after, so the
     /// monitor thread can spot a task that has been on-CPU too long. the monitor
@@ -898,6 +907,7 @@ fn scheduler() -> &'static Scheduler {
                 deferred: Mutex::new(VecDeque::new()),
                 park_lock: Mutex::new(()),
                 park_cv: Condvar::new(),
+                parked: AtomicBool::new(false),
                 running_task: AtomicUsize::new(0),
                 running_since: AtomicU64::new(0),
             })
@@ -1082,6 +1092,13 @@ fn enqueue_preempted(owner: usize, id: TaskId) {
 /// residual window). a `notify_one` on a worker that is not parked is a no-op.
 fn wake_worker(index: usize) {
     let worker = &scheduler().workers[index];
+    // fast path: a worker that is running (or spinning) needs no futex — it
+    // re-runs find_work on its own. `parked` is published under `park_lock`
+    // before park's final work re-check, and our caller enqueued before this
+    // load, so a worker mid-park either sees the task or is visible here.
+    if !worker.parked.load(AtomicOrdering::SeqCst) {
+        return;
+    }
     let _g = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
     worker.park_cv.notify_one();
 }
@@ -1236,8 +1253,15 @@ fn steal_start(n: usize) -> usize {
 fn park(index: usize) {
     let worker = &scheduler().workers[index];
     let guard = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
+    // publish the flag BEFORE the final work re-check. an enqueuer publishes
+    // its work before reading the flag (wake_worker's fast path), so either it
+    // sees us parked and pays the notify, or our re-check below sees its task
+    // and we never sleep. flipping this order would let both sides miss each
+    // other and cost a full park timeout per task.
+    worker.parked.store(true, AtomicOrdering::SeqCst);
     // one last check under the lock: if work appeared, don't sleep.
     if has_any_work(index) {
+        worker.parked.store(false, AtomicOrdering::SeqCst);
         return;
     }
     // profiling: mark ourselves parked so a concurrent wake can be attributed as
@@ -1245,7 +1269,12 @@ fn park(index: usize) {
     if stats_on() {
         PARKED_WORKERS.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    let _ = worker.park_cv.wait_timeout(guard, Duration::from_millis(1));
+    let (guard, _) = worker
+        .park_cv
+        .wait_timeout(guard, Duration::from_millis(1))
+        .unwrap_or_else(|p| p.into_inner());
+    worker.parked.store(false, AtomicOrdering::SeqCst);
+    drop(guard);
     if stats_on() {
         PARKED_WORKERS.fetch_sub(1, AtomicOrdering::Relaxed);
     }

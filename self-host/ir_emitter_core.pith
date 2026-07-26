@@ -3706,9 +3706,38 @@ fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
         return cn.children[0]
     return child
 
-fn ir_emit_result_unwrap_or(node: Node) -> Int:
+# how `!`, `catch`, and `unwrap_or` should treat the shell of their result
+# or optional operand:
+#   "owned"    — a fresh shell this extraction is the sole owner of: a call
+#                or method-call result (results and optionals always arrive
+#                owned from a call; user returns retain borrowed payloads on
+#                the way out, runtime producers mint new tuples), or an
+#                awaited task's value.
+#   "borrowed" — a shell some other owner will release: a parameter or a
+#                named local (an ident), a struct field, a container
+#                element. the extraction must not free the shell, and must
+#                not hand out the shell's payload count as if it owned it —
+#                the owner releases the shell at its own scope exit, so
+#                either mistake is a double-free.
+#   "opaque"   — anything else (a match or if expression value, ...): kept
+#                on the historical owned-style treatment, which can leak a
+#                shell but predates this classification.
+# parens are transparent. mirrors ir_optional_subject_is_owned, which makes
+# the same call-vs-borrow split for optional subjects.
+fn ir_extraction_operand_class(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "grouped" and node.children.len() > 0:
+        return ir_extraction_operand_class(node.children[0])
+    if node.kind == "call" or node.kind == "method_call" or node.kind == "await":
+        return "owned"
+    if node.kind == "ident" or node.kind == "field_access" or node.kind == "index":
+        return "borrowed"
+    return "opaque"
+
+fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     recv_tid := c_get_expr_type(node.children[0])
+    operand_class := ir_extraction_operand_class(node.children[0])
     cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
     temp_name := ir_new_temp_name("unwrap_or")
     arg_idx := ir_method_call_arg_expr(node, 0)
@@ -3718,7 +3747,19 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
     ir_emit_label(ok_l)
     ok_value_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    if operand_class == "borrowed":
+        # the operand's owner keeps the shell and its payload count.
+        # consumers treat a heap-kind unwrap_or value as owned (see the
+        # method_call cases in ir_string_expr_is_borrowed), so hand them
+        # their own count instead of the one the shell holds; a string
+        # payload stays classified borrowed and keeps the retain-at-escape
+        # convention, exactly like a `.ok` read.
+        if not ir_string_expr_is_borrowed(idx):
+            ir_rc_retain_reg(ok_value_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
+    else:
+        # a fresh shell: the extracted payload carries the count out, and
+        # the destructor-less tuple frees as just its three slots.
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
@@ -3727,8 +3768,9 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     # (`r.unwrap_or(bytes.empty())`) every ok iteration. this mirrors the
     # optional unwrap_or, which already defers its default into the none arm.
     fallback_r := ir_expr(arg_idx)
-    ir_emit_release_result_error(recv_r, recv_tid)
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    if operand_class != "borrowed":
+        ir_emit_release_result_error(recv_r, recv_tid)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("store " + temp_name + " " + fallback_r.to_string())
     ir_emit_label(merge_l)
     r := ir_reg()
@@ -4135,7 +4177,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                     return out_r
             if recv_info.kind == "result":
                 if mname == "unwrap_or":
-                    return ir_emit_result_unwrap_or(node)
+                    return ir_emit_result_unwrap_or(idx, node)
                 if mname == "or_else":
                     return ir_emit_result_or_else(idx, node)
                 if mname == "to_string":
@@ -4163,9 +4205,15 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
                 ir_emit_label(some_l)
                 inner_r := ir_optional_value_field(obj_r, recv_tid)
-                # the result escapes to the caller, so a heap inner must be
-                # retained out of the shell before the shell is freed below.
-                if owns_subject and inner_kind.len() > 0:
+                # a borrowed subject moves its inner out without a retain: the
+                # subject's own cleanup is shell-only, so the single count the
+                # shell holds transfers to the extracted value and is released
+                # once, at that value's scope. only an owned (fresh) subject,
+                # whose shell is freed just below, needs a retain first so the
+                # inner survives the free. (extracting the same borrowed local
+                # twice is a separate, rarer bug tracked on its own — a retain
+                # here to cover it leaked the far more common single case.)
+                if inner_kind.len() > 0 and owns_subject:
                     ir_rc_retain_reg(inner_r, inner_kind)
                 ir_emit("store " + tmp + " " + inner_r.to_string())
                 ir_emit("jmp " + end_l)
@@ -4813,6 +4861,8 @@ fn ir_emit_try_expr(node: Node) -> Int:
         result_kind := ir_expr_result_kind(node.children[0])
         val_r := ir_expr(node.children[0])
         if result_kind == "tuple":
+            operand_class := ir_extraction_operand_class(node.children[0])
+            operand_tid := c_get_expr_type(node.children[0])
             cond_r := ir_emit_result_flag_field(val_r, "is_ok")
             ok_l := ir_label()
             err_l := ir_label()
@@ -4820,15 +4870,35 @@ fn ir_emit_try_expr(node: Node) -> Int:
             ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
             ir_emit_label(ok_l)
             decoded_r := ir_emit_result_ok_field_for_expr(val_r, node.children[0])
-            # the extracted payload carries the count; the tuple shell has
-            # no destructor, so this frees only the three-slot allocation.
-            # the error path returns the same tuple upward instead — its
-            # consumer releases it there.
-            ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+            if operand_class != "borrowed":
+                # a fresh shell: the extracted payload carries the count; the
+                # tuple shell has no destructor, so this frees only the
+                # three-slot allocation. the error path returns the same
+                # tuple upward instead — its consumer releases it there.
+                ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+            # a borrowed operand (a parameter, a live named local) keeps its
+            # shell and its payload count with its owner. the unwrapped value
+            # stays a borrow — a `!` over a non-call operand is classified
+            # borrowed, so bindings and returns retain at the escape site,
+            # the same as a `.ok` read.
             ir_emit("jmp " + merge_l)
             ir_emit_label(err_l)
             if ir_emit_tests and ir_emitting_test_func:
                 ir_test_assert_fail_return()
+            elif operand_class == "borrowed":
+                # propagate a FRESH error tuple: returning the borrowed
+                # tuple itself would hand the operand's shell to a second
+                # owner, and its owner still releases it here. the error
+                # value gets its own count for the new tuple; the reads
+                # happen before cleanup can release a named operand's shell.
+                err_kind := ir_rc_kind(ir_result_field_kind(operand_tid, "err"))
+                err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
+                if err_kind.len() > 0:
+                    ir_rc_retain_reg(err_r, err_kind)
+                fresh_err_r := ir_emit_err_result_tuple(err_r)
+                ir_defer_emit_to_function_frame(true)
+                ir_emit_string_cleanup("")
+                ir_emit("ret " + fresh_err_r.to_string())
             else:
                 # propagating the error out early skips the normal return,
                 # so release the function's owned locals here too; the error
@@ -5145,6 +5215,7 @@ fn ir_emit_discard_result(result_r: Int, result_tid: Int):
 fn ir_emit_catch_expr(node: Node) -> Int:
     result_r := ir_expr(node.children[0])
     result_tid := c_get_expr_type(node.children[0])
+    operand_class := ir_extraction_operand_class(node.children[0])
     cond_r := ir_emit_result_flag_field(result_r, "is_ok")
     temp_name := ir_new_temp_name("catch")
     ok_l := ir_label()
@@ -5153,13 +5224,24 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
     ir_emit_label(ok_l)
     ok_value_r := ir_emit_result_value_field(result_r, result_tid, "ok")
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+    if operand_class == "borrowed":
+        # the operand's owner keeps the shell and its payload count. a catch
+        # value always arrives owned at its consumer (see the catch_expr case
+        # in ir_string_expr_is_borrowed), so give it a count of its own —
+        # handing out the shell's count, or freeing the shell here, would
+        # double-free once the owner cleans up.
+        ir_rc_retain_reg(ok_value_r, ir_rc_kind(ir_result_field_kind(result_tid, "ok")))
+    else:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
-    # the error is being thrown away for the fallback value; drop it first
-    ir_emit_release_result_error(result_r, result_tid)
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+    # the error is being thrown away for the fallback value; drop it first —
+    # unless the operand is a borrow, in which case both the error and the
+    # shell stay with their owner
+    if operand_class != "borrowed":
+        ir_emit_release_result_error(result_r, result_tid)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     # both arms must hand back an OWNED value: the ok arm transferred the
     # result payload out of the destructor-less tuple shell, so a borrowed
     # fallback needs its own count. the whole catch is classified owned

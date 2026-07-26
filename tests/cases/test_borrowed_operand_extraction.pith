@@ -1,0 +1,90 @@
+# `!`, `catch`, and `unwrap_or` on a BORROWED result/optional operand — a
+# parameter or a named local — must leave the operand's shell and payload
+# count with their owner. each of them used to shell-release the operand
+# unconditionally (and `!` returned the borrowed tuple itself on the error
+# path), so the owner's own cleanup freed the same block a second time.
+#
+# valgrind-gated in MEMCHECK_CASES with the struct freelist disabled: the
+# freelist recycles the freed block in place, so the printed total comes out
+# right even when the extraction reads and frees memory it does not own —
+# only valgrind catches the use-after-free.
+
+struct Bag:
+    data: String
+
+fn make(i: Int) -> Bag!:
+    if i < 0:
+        fail "neg-" + i.to_string()
+    return Bag("payload-" + i.to_string())
+
+fn find(i: Int) -> Bag?:
+    if i % 3 == 0:
+        return none
+    return Bag("maybe-" + i.to_string())
+
+# `!` on a T! parameter: the ok path unwraps a borrow; the error path must
+# propagate a fresh error tuple, not the caller's own shell
+fn bang_param(r: Bag!) -> Int!:
+    b := r!
+    return b.data.len()
+
+fn catch_param(r: Bag!) -> Int:
+    b := r catch Bag("fb")
+    return b.data.len()
+
+fn unwrap_param(r: Bag!) -> Int:
+    return r.unwrap_or(Bag("fb")).data.len()
+
+# a named result local as the operand, extracted more than once: no
+# extraction may free the shell the local's cleanup will free, nor read a
+# payload another extraction already moved
+fn named_local(i: Int) -> Int:
+    x := make(i)
+    a := x catch Bag("fb")
+    b := x.unwrap_or(Bag("fb"))
+    return a.data.len() + b.data.len()
+
+fn bang_local(i: Int) -> Int!:
+    x := make(i)
+    b := x!
+    return b.data.len()
+
+# a borrowed optional subject (a parameter): single extraction, the common
+# shape. (extracting the same optional local twice is a separate, rarer
+# pre-existing bug, not covered here.)
+fn opt_param(o: Bag?) -> Int:
+    return o.unwrap_or(Bag("fb")).data.len()
+
+# owned inline operands are the control: they keep the move-the-payload-out
+# and free-the-fresh-shell behavior, on the ok and the error path
+fn inline_owned(i: Int) -> Int:
+    a := make(i) catch Bag("fb")
+    n := a.data.len() + make(i).unwrap_or(Bag("fb")).data.len()
+    e := make(0 - i - 1) catch Bag("fb")
+    return n + e.data.len() + make(0 - i - 1).unwrap_or(Bag("fb")).data.len()
+
+fn main() -> Int:
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        rp := make(i)
+        total = total + (bang_param(rp) catch 0)
+        re := make(0 - 1)
+        total = total + (bang_param(re) catch 7)
+        cp := make(i)
+        total = total + catch_param(cp)
+        ce := make(0 - 1)
+        total = total + catch_param(ce)
+        up := make(i)
+        total = total + unwrap_param(up)
+        ue := make(0 - 1)
+        total = total + unwrap_param(ue)
+        total = total + named_local(i)
+        total = total + (bang_local(i) catch 0)
+        total = total + (bang_local(0 - 1) catch 7)
+        op := find(i)
+        total = total + opt_param(op)
+        total = total + inline_owned(i)
+        i = i + 1
+    print("total " + total.to_string())
+    return 0

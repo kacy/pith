@@ -1,0 +1,21 @@
+# an if-expression produces a value: the first branch whose condition holds
+# stores into a shared temp, mirroring how a match expression lowers. this used
+# to fall through the emitter's dispatch and silently produce zero — composite
+# values (tuples carrying optionals) trapped at runtime with no error.
+
+fn got_value(v: Int?) -> (Int, Int?):
+    return (1, v)
+
+fn timed_out(v: Int?) -> (Int, Int?):
+    return (0, v)
+
+fn grade(n: Int) -> String:
+    return if n >= 90: "a" elif n >= 80: "b" elif n >= 70: "c" else: "f"
+
+fn main():
+    got := if true: got_value(none) else: timed_out(none)
+    print("then flag " + got.0.to_string())
+    other := if false: got_value(none) else: timed_out(none)
+    print("else flag " + other.0.to_string())
+    print(grade(95) + grade(85) + grade(72) + grade(10))
+    print((if 1 < 2: 10 else: 20).to_string())

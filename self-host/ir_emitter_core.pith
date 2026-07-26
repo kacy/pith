@@ -47,7 +47,7 @@ from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_dec
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
-from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
+from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
@@ -5170,6 +5170,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
             ir_emit_match_return(idx, node, ir_expr, ir_block)
             return ir_emit_zero_value()
         return ir_emit_match_expr(idx, node, ir_expr, ir_block)
+    if kind == "if_expr":
+        return ir_emit_if_expr(node, ir_expr)
     if kind == "method_call":
         return ir_emit_method_call(idx)
 

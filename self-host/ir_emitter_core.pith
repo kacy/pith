@@ -3712,7 +3712,6 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
     temp_name := ir_new_temp_name("unwrap_or")
     arg_idx := ir_method_call_arg_expr(node, 0)
-    fallback_r := ir_expr(arg_idx)
     ok_l := ir_label()
     fallback_l := ir_label()
     merge_l := ir_label()
@@ -3723,6 +3722,11 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
+    # build the fallback INSIDE the error arm: on the ok path it is never
+    # needed, and evaluating it eagerly before the branch leaked a heap default
+    # (`r.unwrap_or(bytes.empty())`) every ok iteration. this mirrors the
+    # optional unwrap_or, which already defers its default into the none arm.
+    fallback_r := ir_expr(arg_idx)
     ir_emit_release_result_error(recv_r, recv_tid)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("store " + temp_name + " " + fallback_r.to_string())

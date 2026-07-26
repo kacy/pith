@@ -297,6 +297,7 @@ too low.
 | --- | --- | --- |
 | `grpc.MAX_MESSAGE_BYTES` | 4 MiB | `RESOURCE_EXHAUSTED`, refused as soon as the frame header is read |
 | `grpc.MAX_STREAM_MESSAGES` | 65536 | `RESOURCE_EXHAUSTED` on a buffered request stream |
+| `protobuf.MAX_NESTING_DEPTH` | 100 | the decode fails; a self-referential message cannot recurse without bound |
 | `http.MAX_REQUEST_BODY` | 10 MiB | the stream is reset |
 | concurrent streams per connection | 100 | `REFUSED_STREAM` |
 | concurrent connections per listener | 512 | the accept loop waits for one to end |

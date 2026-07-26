@@ -42,6 +42,13 @@ pub WIRE_LEN := 2
 # wire type 5: 32-bit fixed (fixed32, sfixed32, float).
 pub WIRE_I32 := 5
 
+# how deeply one message may nest another before a decoder gives up. a schema
+# whose message refers to itself decodes by recursing once per level, and the
+# wire format lets a sender nest as deeply as it likes for two bytes per level —
+# so a body of a couple of hundred kilobytes can drive a decoder thousands of
+# frames deep and exhaust the stack. 100 is protobuf's own default limit.
+pub MAX_NESTING_DEPTH := 100
+
 # raised when a buffer ends mid-field or a value is malformed.
 pub struct ProtoError:
     pub message: String
@@ -53,6 +60,12 @@ pub struct Tag:
 
 fn proto_fail(message: String) -> ProtoError:
     return ProtoError(message)
+
+# the error a generated decoder raises when a message nests past
+# MAX_NESTING_DEPTH. it lives here rather than in the generated code so every
+# decoder reports the limit the same way.
+pub fn nesting_error() -> ProtoError:
+    return ProtoError("message nesting exceeds {MAX_NESTING_DEPTH} levels")
 
 # --- writer -----------------------------------------------------------------
 

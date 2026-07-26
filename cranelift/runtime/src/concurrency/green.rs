@@ -53,10 +53,20 @@
 //! ## synchronization model
 //!
 //! - the task slab (a generational slotmap, see `Slab`) is shared across workers
-//!   under one mutex. we never hold that lock while *running* a coroutine — running pith
-//!   code can spawn more tasks, which needs the same lock. so a worker *takes*
-//!   the coroutine out of the slab, drops the lock, resumes it, then re-locks to
-//!   record the result. see `run_task`.
+//!   under one mutex, and holds each task's *cold* bookkeeping: the join arc,
+//!   the closure handle, the tls map's owning `Box`, and the reclamation state.
+//!   the slab lock is taken a handful of times per task *lifetime* (spawn,
+//!   finish, reclaim), never per resume.
+//! - everything the hot wake/resume cycle touches — a task's run state,
+//!   wake/preempt flags, owner pin, coroutine, yielder, and handoff — lives in
+//!   a lock-free side arena of per-task sync blocks (see `SyncArena`). a wake
+//!   is the hottest thing the scheduler does (two per channel message at
+//!   saturation), and routing it through the slab mutex made every waker and
+//!   every resume serialize on one global lock. the arena's chunks never move,
+//!   so `wake` finds a task's state by index math and flips it with a CAS; the
+//!   state word doubles as a claim ticket that hands the block's cells (the
+//!   coroutine among them) from waker to worker without a lock — see the claim
+//!   protocol on `SyncBlock`.
 //! - each worker owns three run queues: a `local` queue of fresh, stealable
 //!   tasks; a `pinned` queue of woken started tasks that only the owner drains;
 //!   and a `deferred` queue of *preempted* started tasks (P5), also owner-only but
@@ -87,10 +97,12 @@
 
 use crate::handle_registry::{self, HandleKind};
 use corosensei::{Coroutine, CoroutineResult, Yielder};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 
@@ -222,21 +234,18 @@ pub extern "C" fn pith_green_maybe_yield() {
 
     // gate 3: we are overrunning. flag ourselves for re-enqueue *before* parking,
     // so run_task's yield path re-enqueues us instead of leaving us parked with no
-    // block site to wake us. we use a distinct `preempt_pending` flag (not the
-    // channel/await `wake_pending`) so run_task routes us onto our owner's
-    // lowest-priority `deferred` queue: a preempted compute task must yield to
-    // every other ready task on the worker, or it would simply be re-selected and
-    // keep monopolizing the worker (`pinned`/woken work is served first). nothing
-    // else writes this flag and preemption registers no waiter, so there is no
+    // block site to wake us. the distinct preempt flag (not the channel/await
+    // wake-pending flag) makes run_task route us onto our owner's lowest-priority
+    // `deferred` queue: a preempted compute task must yield to every other ready
+    // task on the worker, or it would simply be re-selected and keep monopolizing
+    // the worker (`pinned`/woken work is served first). we are the running task,
+    // so our word is `Running` and a fetch_or cannot race the yield arm (which
+    // only runs after we suspend); preemption registers no waiter, so there is no
     // wake/park race to close here.
-    {
-        let mut slab = lock_slab();
-        if let Some(task) = slab.get_mut(id) {
-            task.preempt_pending = true;
-        } else {
-            return;
-        }
-    }
+    let Some(block) = sync_block(id) else {
+        return;
+    };
+    block.word.fetch_or(S_PREEMPT_PENDING, AtomicOrdering::AcqRel);
     park_current();
 }
 
@@ -275,6 +284,245 @@ fn split_handle(handle: i64) -> Option<(TaskId, u32)> {
         return None;
     }
     Some(((low - 1) as TaskId, (bits >> 32) as u32 & GEN_MASK))
+}
+
+// ---------------------------------------------------------------------------
+// per-task scheduling word (the lock-free wake path)
+//
+// a task's run state used to live in its slab entry, which meant every wake —
+// the hottest operation in a channel pipeline, two per message at saturation —
+// took the slab mutex just to flip Parked -> Ready and read the owner. the
+// state now lives in a side arena of per-task sync blocks reachable without
+// any lock: fixed-size chunks that never move (the slab's entries Vec moves
+// when it grows, which is exactly why this state cannot be a pointer into it),
+// found by index math from the task id.
+//
+// the whole scheduling state packs into one AtomicU64 so every transition is a
+// single CAS and all the pieces travel together:
+//
+//   bits 0..2   run state: Ready / Running / Parked / Done
+//   bit  2      wake_pending: a wake landed while the task was still Running
+//   bit  3      preempt_pending: the task overran its quantum (see P5)
+//   bits 32..   owner worker + 1 (0 = not yet pinned)
+//
+// the transitions mirror the old mutex-guarded state machine exactly:
+//
+//   wake         Parked -> Ready (claim + enqueue) | Running -> set wake_pending
+//                | Ready / Done -> no-op
+//   run_task     Ready -> Running (claim; pins the owner on first resume)
+//   yield arm    Running -> Ready (a pending flag was set; re-enqueue)
+//                | Running -> Parked (the block site owns the wake)
+//   finish_task  -> Done (plain store; every later wake is a no-op)
+//
+// slot reuse and stale wakes: a reclaimed task's slot (and so its sync block)
+// is reused by a later spawn, and a wake against a stale id must stay
+// harmless. it is, by the same argument the slab path relied on: between
+// reclaim and re-init the word reads Done (no-op), and after re-init it reads
+// Ready (no-op). a stale wake that catches the reused slot's new task
+// genuinely Parked wakes it spuriously — it re-checks its block condition and
+// re-parks, the tolerance every block site already has. in practice stale
+// wakes do not occur: a parked task's id lives in exactly one waiter list, and
+// every list removes the id at wake time.
+// ---------------------------------------------------------------------------
+
+/// run states of the scheduling word (bits 0..2).
+///
+/// - `S_READY`: sitting in a run queue with its coroutine present.
+/// - `S_RUNNING`: coroutine taken out and being resumed on some worker.
+/// - `S_PARKED`: suspended on a blocking op; coroutine back in the slab, the
+///   task in no queue, and the block site it parked on owns re-enqueueing it.
+/// - `S_DONE`: coroutine returned (or the slot holds no task at all — a fresh
+///   arena chunk reads `Done` so a wake against a never-used index no-ops).
+const S_STATE_MASK: u64 = 0b11;
+const S_READY: u64 = 0;
+const S_RUNNING: u64 = 1;
+const S_PARKED: u64 = 2;
+const S_DONE: u64 = 3;
+/// a wake landed while the task was still `Running` (mid-suspend, before the
+/// yield arm recorded it as `Parked`): the yield arm re-enqueues instead of
+/// parking, closing the wake/park race so a wake in that window is never lost.
+const S_WAKE_PENDING: u64 = 1 << 2;
+/// set by `pith_green_maybe_yield` right before it parks a task that overran
+/// its quantum: the yield arm routes it onto the owner's lowest-priority
+/// `deferred` queue instead of the prompt `pinned` queue.
+const S_PREEMPT_PENDING: u64 = 1 << 3;
+const S_OWNER_SHIFT: u32 = 32;
+const S_OWNER_MASK: u64 = !0u64 << S_OWNER_SHIFT;
+
+/// the owner worker packed in a scheduling word, if the task has been pinned.
+fn word_owner(word: u64) -> Option<usize> {
+    match word >> S_OWNER_SHIFT {
+        0 => None,
+        w => Some(w as usize - 1),
+    }
+}
+
+/// the owner bits for a worker index (stored as `worker + 1`, 0 = unpinned).
+fn owner_bits(worker: usize) -> u64 {
+    ((worker as u64) + 1) << S_OWNER_SHIFT
+}
+
+/// one task's lock-free scheduling state: the word above plus the cells the
+/// hot resume path needs. cache-line aligned so two tasks' wake CASes never
+/// false-share a line.
+///
+/// ## the claim protocol (what makes the cells safe without a lock)
+///
+/// the word is a claim ticket. exactly one thread holds the claim at a time:
+///
+/// - the spawn path initializes the cells *before* the word first reads
+///   `Ready` and before the task is enqueued anywhere.
+/// - a worker that wins the `Ready -> Running` CAS owns the cells for the
+///   whole resume: it takes the coroutine out, and (on a yield) writes it back
+///   before the `Running -> Parked/Ready` CAS republishes the task.
+/// - a waker that wins the `Parked -> Ready` CAS owns the cells until its
+///   enqueue makes the task claimable again — that is the window `wake_with`
+///   uses to deposit a handoff value.
+///
+/// every hand-over goes through a CAS on `word` (release on publish, acquire
+/// on claim), so the cell writes of the previous holder are visible to the
+/// next; the run-queue mutex between an enqueue and the owner's dequeue adds
+/// its own ordering on top. this is exactly the exclusion the slab mutex used
+/// to provide, minus the lock.
+#[repr(align(64))]
+struct SyncBlock {
+    word: AtomicU64,
+    /// the task's coroutine, present exactly while the word reads `Ready` or
+    /// `Parked`; taken out by the claiming worker for the duration of a
+    /// resume, gone for good once the task is `Done`.
+    coro: UnsafeCell<Option<SendCoroutine>>,
+    /// raw pointer to the coroutine's `Yielder`, captured on the body's first
+    /// run (see `green_spawn`) and re-installed before every later resume.
+    /// null until the body has run once; only ever dereferenced on the owner
+    /// worker while this task is the one running.
+    yielder: UnsafeCell<*const TaskYielder>,
+    /// raw pointer to this task's boxed `threadlocal` map (owned by the slab
+    /// entry — see the `tls` field doc on `Task` for why the `Box` indirection
+    /// makes the pointer stable). cached here so a resume does not need the
+    /// slab lock to find it.
+    tls: UnsafeCell<*mut HashMap<i64, i64>>,
+    /// a value handed to this task by its waker (see `wake_with`): written by
+    /// the waker right after it claims the task (the Parked -> Ready CAS),
+    /// taken by the task itself once it resumes.
+    handoff: UnsafeCell<Option<i64>>,
+}
+
+// SAFETY: `word` is an atomic; the cells are guarded by the claim protocol
+// documented on the type (a single holder at a time, hand-overs ordered by
+// the word's CAS pairs and the run-queue mutex). the coroutine cell only ever
+// crosses threads under the pinning discipline `SendCoroutine` documents.
+unsafe impl Sync for SyncBlock {}
+
+impl SyncBlock {
+    /// an inert block: `Done` reads as "no task here", so a wake against an
+    /// index whose slot has never held a task is a no-op.
+    fn new() -> SyncBlock {
+        SyncBlock {
+            word: AtomicU64::new(S_DONE),
+            coro: UnsafeCell::new(None),
+            yielder: UnsafeCell::new(ptr::null()),
+            tls: UnsafeCell::new(ptr::null_mut()),
+            handoff: UnsafeCell::new(None),
+        }
+    }
+
+    /// arm this slot for a freshly spawned task: install its coroutine and tls
+    /// pointer, clear the leftovers, and only then let the word read `Ready`
+    /// (unpinned, no pending flags). called from the spawn path before the
+    /// task is enqueued, so nothing observes the block mid-reset — the old
+    /// task was `Done` and reclaimed, and wakes against either state no-op.
+    fn reset(&self, coro: SendCoroutine, tls: *mut HashMap<i64, i64>) {
+        // SAFETY: no other thread touches this block between the old task's
+        // reclamation and the new task's enqueue (which happens after this).
+        unsafe {
+            *self.coro.get() = Some(coro);
+            *self.yielder.get() = ptr::null();
+            *self.tls.get() = tls;
+            *self.handoff.get() = None;
+        }
+        self.word.store(S_READY, AtomicOrdering::Release);
+    }
+}
+
+/// arena geometry: chunks of `ARENA_CHUNK` blocks hang off a fixed spine of
+/// `ARENA_SPINE` chunk pointers. chunks are allocated on demand and never
+/// freed or moved — the property that lets `wake` reach a block with index
+/// math and no lock. the spine bounds the live task count at 2M; every live
+/// green task also owns a 1 MiB coroutine stack, so real programs exhaust
+/// address space long before this bound, and hitting it is a loud panic
+/// rather than a silent corruption.
+const ARENA_CHUNK: usize = 256;
+const ARENA_SPINE: usize = 8192;
+
+/// the side arena of per-task sync blocks, indexed by slab task id.
+struct SyncArena {
+    /// chunk pointers, null until a task id in that chunk's range first exists.
+    spine: Box<[AtomicPtr<SyncBlock>]>,
+}
+
+impl SyncArena {
+    fn new() -> SyncArena {
+        SyncArena {
+            spine: (0..ARENA_SPINE)
+                .map(|_| AtomicPtr::new(ptr::null_mut()))
+                .collect(),
+        }
+    }
+
+    /// the sync block for `id`, or `None` when no task with that index has
+    /// ever existed. a garbage id — e.g. the reactor probing an id far beyond
+    /// any real task — must read as "no task", never allocate.
+    fn get(&self, id: TaskId) -> Option<&SyncBlock> {
+        let chunk = self.spine.get(id / ARENA_CHUNK)?.load(AtomicOrdering::Acquire);
+        if chunk.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null chunk pointer is an immortal allocation of
+        // ARENA_CHUNK blocks (see `ensure`), and the offset is in range.
+        Some(unsafe { &*chunk.add(id % ARENA_CHUNK) })
+    }
+
+    /// the sync block for `id`, allocating its chunk on first use. spawn-path
+    /// only; the hot paths use `get`.
+    fn ensure(&self, id: TaskId) -> &SyncBlock {
+        let slot = self
+            .spine
+            .get(id / ARENA_CHUNK)
+            .unwrap_or_else(|| panic!("green task index {id} exceeds the sync arena bound"));
+        let mut chunk = slot.load(AtomicOrdering::Acquire);
+        if chunk.is_null() {
+            let fresh: Box<[SyncBlock]> = (0..ARENA_CHUNK).map(|_| SyncBlock::new()).collect();
+            let fresh = Box::into_raw(fresh) as *mut SyncBlock;
+            match slot.compare_exchange(
+                ptr::null_mut(),
+                fresh,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                // installed: the chunk is now immortal (never freed or moved).
+                Ok(_) => chunk = fresh,
+                // a racing spawner installed the chunk first; free ours.
+                Err(existing) => {
+                    // SAFETY: `fresh` came from Box::into_raw above and was
+                    // never shared.
+                    unsafe {
+                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                            fresh,
+                            ARENA_CHUNK,
+                        )));
+                    }
+                    chunk = existing;
+                }
+            }
+        }
+        // SAFETY: as in `get`.
+        unsafe { &*chunk.add(id % ARENA_CHUNK) }
+    }
+}
+
+/// the sync block for `id`, or `None` for an index that has never held a task.
+fn sync_block(id: TaskId) -> Option<&'static SyncBlock> {
+    scheduler().sync.get(id)
 }
 
 /// one slab entry: a task plus the generation stamp that makes its handle
@@ -324,9 +572,7 @@ impl Slab {
         }
     }
 
-    // used by the debug-only stealable assertion and the tests; a pure release
-    // build has neither, so allow it to look unused there.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn get(&self, id: TaskId) -> Option<&Task> {
         self.entries.get(id).and_then(|slot| slot.task.as_ref())
     }
@@ -358,7 +604,7 @@ impl Slab {
         if slot.generation != expected_gen {
             return false;
         }
-        let done = matches!(slot.task.as_ref(), Some(t) if t.state == RunState::Done);
+        let done = matches!(slot.task.as_ref(), Some(t) if t.done);
         if !done {
             return false;
         }
@@ -374,7 +620,7 @@ impl Slab {
     fn reclaim_if_detached(&mut self, id: TaskId) -> Option<i64> {
         let slot = self.entries.get_mut(id)?;
         let task = slot.task.as_ref()?;
-        if !(task.reclaim_on_done && task.state == RunState::Done) {
+        if !(task.reclaim_on_done && task.done) {
             return None;
         }
         let handle = make_handle(id, slot.generation);
@@ -394,7 +640,7 @@ impl Slab {
             return None;
         }
         let task = slot.task.as_mut()?;
-        if task.state == RunState::Done {
+        if task.done {
             let handle = make_handle(id, slot.generation);
             slot.task = None;
             slot.generation = slot.generation.wrapping_add(1) & GEN_MASK;
@@ -451,22 +697,6 @@ fn recycle_stack(coro: SendCoroutine) {
     }
 }
 
-/// run state of a slab task.
-///
-/// - `Ready`: sitting in a run queue with its coroutine present, waiting to run.
-/// - `Running`: coroutine taken out and being resumed on some worker.
-/// - `Parked`: suspended on a blocking op (a channel, a P2b primitive, or an
-///   await); coroutine is back in the slab, the task is in no queue, and the
-///   block site it parked on owns re-enqueueing it (see the park/wake protocol).
-/// - `Done`: coroutine returned; result recorded.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RunState {
-    Ready,
-    Running,
-    Parked,
-    Done,
-}
-
 /// the coroutine type every task runs: no input/yield, returns the pith result
 /// as an `i64`.
 type TaskCoroutine = Coroutine<(), (), i64>;
@@ -505,18 +735,6 @@ struct SendCoroutine(TaskCoroutine);
 // thread boundary again.
 unsafe impl Send for SendCoroutine {}
 
-/// a task's yielder pointer, stored in the slab (which is shared across
-/// workers). the raw pointer would make `Task` `!Send`; this newtype carries it
-/// with a documented `Send`. the value is only ever *dereferenced* on the task's
-/// owner worker (via `park_current`), never off-thread — the same pinning
-/// invariant that keeps `SendCoroutine` sound — so moving the address between
-/// threads is harmless.
-struct YielderPtr(*const TaskYielder);
-
-// SAFETY: the pointer is only dereferenced on the owner worker while the task is
-// the one running; sending the address itself between threads reads nothing.
-unsafe impl Send for YielderPtr {}
-
 /// join channel between a task and whoever awaits it: the done flag plus the
 /// result, guarded so an awaiting thread can block on the condvar until the
 /// worker records completion. one allocation per task, shared via `Arc`.
@@ -541,45 +759,24 @@ struct Join {
     condvar_waiters: u32,
 }
 
+/// a task's cold, slab-resident bookkeeping. everything the hot wake/resume
+/// cycle touches — the run state, owner pin, coroutine, yielder, handoff, and
+/// the cached tls pointer — lives in the task's `SyncBlock` instead, reachable
+/// without the slab lock; what remains here is spawn/finish/reclaim state that
+/// is only read a handful of times per task lifetime.
 struct Task {
-    /// the running coroutine. taken out (`None`) while a worker resumes it, put
-    /// back if it parks, dropped when it returns.
-    coro: Option<SendCoroutine>,
     /// the pith closure this task runs. the coroutine already closed over it to
     /// call it; we keep the handle so `finish_task` can release the closure's one
     /// owning reference once the body returns (see there).
     closure_handle: i64,
-    state: RunState,
+    /// set by `finish_task` once the coroutine has returned. the slab's
+    /// reclamation gates (`reclaim`, `detach`, `reclaim_if_detached`) key off
+    /// this rather than the lock-free scheduling word, so the slab stays a
+    /// self-contained structure. it mirrors the word's `Done` state and is
+    /// written under the slab lock before the join's `done` flag is published,
+    /// so any awaiter that saw `join.done` sees this too.
+    done: bool,
     result: i64,
-    /// the worker that first resumed this task, `None` until then. once set the
-    /// task is pinned: it is never stolen and every wake re-enqueues it here (see
-    /// the pinning note in the module doc). this is what keeps a suspended
-    /// coroutine from ever resuming on a different OS thread.
-    owner: Option<usize>,
-    /// raw pointer to this coroutine's `Yielder`, captured the first time the
-    /// body runs (the body writes it into `CURRENT_YIELDER`, which `run_task`
-    /// reads back). re-installed before every later resume so a task parked deep
-    /// in pith code can find its yielder via `park_current`. null until the body
-    /// has run once; only ever dereferenced on the owner worker while this task
-    /// is the one running.
-    yielder_ptr: YielderPtr,
-    /// set by `wake` when a wake arrives while the task is still `Running` (i.e.
-    /// mid-suspend, before `run_task` has recorded it as `Parked`). the park path
-    /// in `run_task` checks this and re-enqueues instead of parking, closing the
-    /// wake/park race so a wake in that window is never lost.
-    wake_pending: bool,
-    /// set by `pith_green_maybe_yield` right before it parks a task that has
-    /// overrun its quantum. distinct from `wake_pending`: `run_task`'s yield path
-    /// routes a preempted task onto its owner's lowest-priority `deferred` queue
-    /// (see `enqueue_preempted`) so it yields to all other ready work, whereas a
-    /// woken task goes onto the higher-priority `pinned` queue to resume promptly.
-    preempt_pending: bool,
-    /// a value handed to this task by the waker (see `wake_with`): a channel
-    /// send that wakes a parked receiver dequeues on its behalf and leaves the
-    /// value here, so the receiver resumes with its result in hand instead of
-    /// re-locking and re-trying. taken (and cleared) by `take_handoff` as the
-    /// first thing the resumed block site does.
-    handoff: Option<i64>,
     /// set by `green_detach` when a task is detached while still running: no one
     /// will ever await it, so `finish_task` reclaims its slab slot the moment it
     /// completes rather than leaking it for the life of the process. an awaited
@@ -694,6 +891,9 @@ struct Worker {
 /// and the injector for off-worker spawns.
 struct Scheduler {
     slab: Mutex<Slab>,
+    /// the lock-free per-task scheduling words, indexed by slab task id (see
+    /// the scheduling-word section).
+    sync: SyncArena,
     workers: Vec<Worker>,
     injector: Mutex<VecDeque<TaskId>>,
 }
@@ -761,32 +961,48 @@ pub(crate) fn park_current() {
 
 /// wake a parked green task: move it back onto its owner worker's queue so it
 /// resumes and re-checks the channel condition it blocked on. called by
-/// `channel.rs` from a send/recv/close while holding the channel lock, so it may
-/// nest the slab and queue locks under the channel lock (see the lock-order note
-/// in the module doc). safe to call for a task in any state — it acts only when
-/// the task is actually parked, and defers via `wake_pending` if the task is
-/// still mid-suspend, so a wake is never lost and never double-enqueued.
+/// `channel.rs` from a send/recv/close while holding the channel lock; it takes
+/// no scheduler lock itself beyond the owner's queue mutex (the state flip is a
+/// CAS on the task's scheduling word), so the nesting stays block-site -> queue.
+/// safe to call for a task in any state — it acts only when the task is actually
+/// parked, and defers via the wake-pending flag if the task is still mid-suspend,
+/// so a wake is never lost and never double-enqueued.
 pub(crate) fn wake(id: TaskId) {
-    let owner = {
-        let mut slab = lock_slab();
-        let Some(task) = slab.get_mut(id) else {
-            return;
-        };
-        match task.state {
-            // parked and put back: flip to Ready and re-enqueue below.
-            RunState::Parked => {
-                task.state = RunState::Ready;
-                task.owner
+    let Some(block) = sync_block(id) else {
+        return;
+    };
+    let mut word = block.word.load(AtomicOrdering::Acquire);
+    let owner = loop {
+        match word & S_STATE_MASK {
+            // parked with its coroutine put back: claim it and re-enqueue below.
+            S_PARKED => {
+                let next = (word & S_OWNER_MASK) | S_READY;
+                match block.word.compare_exchange_weak(
+                    word,
+                    next,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => break word_owner(word),
+                    Err(current) => word = current,
+                }
             }
             // still resuming/suspending: it has not yet recorded itself as
-            // Parked, so remember the wake; the park path in `run_task` will see
-            // this flag and re-enqueue instead of parking.
-            RunState::Running => {
-                task.wake_pending = true;
-                return;
+            // Parked, so set the pending flag; the yield arm in `run_task` will
+            // see it and re-enqueue instead of parking.
+            S_RUNNING => {
+                match block.word.compare_exchange_weak(
+                    word,
+                    word | S_WAKE_PENDING,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(current) => word = current,
+                }
             }
             // already queued to re-check, or finished: nothing to do.
-            RunState::Ready | RunState::Done => return,
+            _ => return,
         }
     };
     // profiling: categorize this wake by where the waker sits relative to the
@@ -802,8 +1018,8 @@ pub(crate) fn wake(id: TaskId) {
         };
     }
 
-    // enqueue outside the slab lock. a parked task always ran, so `owner` is set;
-    // fall back to the injector only defensively.
+    // a parked task always ran, so `owner` is set; fall back to the injector
+    // only defensively.
     match owner {
         Some(w) => enqueue_woken(w, id),
         None => enqueue_fresh(id),
@@ -814,31 +1030,52 @@ pub(crate) fn wake(id: TaskId) {
 /// the result: a channel send that wakes a parked receiver dequeues on the
 /// receiver's behalf, so the receiver resumes with the value in hand instead of
 /// re-locking the channel and re-trying the ring — go-style direct handoff, but
-/// keeping the ring as the ordering source so fifo holds. `fetch` runs under
-/// the slab lock only after the task is claimed (state was `Parked`), which is
-/// what makes handing over safe: a task that is still `Running` might complete
-/// its own attempt, so it gets a plain wake and the value stays in the ring.
-/// a `fetch` that comes back empty (a racing consumer drained the ring) still
-/// wakes the task valueless — it re-checks and re-parks, the usual tolerance.
+/// keeping the ring as the ordering source so fifo holds. `fetch` runs only
+/// after the task is claimed (the Parked -> Ready CAS), which is what makes
+/// handing over safe: a task that is still `Running` might complete its own
+/// attempt, so it gets a plain pending-flag wake and the value stays in the
+/// ring. a `fetch` that comes back empty (a racing consumer drained the ring)
+/// still wakes the task valueless — it re-checks and re-parks, the usual
+/// tolerance.
 pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
-    let owner = {
-        let mut slab = lock_slab();
-        let Some(task) = slab.get_mut(id) else {
-            return;
-        };
-        match task.state {
-            RunState::Parked => {
-                task.handoff = fetch();
-                task.state = RunState::Ready;
-                task.owner
+    let Some(block) = sync_block(id) else {
+        return;
+    };
+    let mut word = block.word.load(AtomicOrdering::Acquire);
+    let owner = loop {
+        match word & S_STATE_MASK {
+            S_PARKED => {
+                let next = (word & S_OWNER_MASK) | S_READY;
+                match block.word.compare_exchange_weak(
+                    word,
+                    next,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => break word_owner(word),
+                    Err(current) => word = current,
+                }
             }
-            RunState::Running => {
-                task.wake_pending = true;
-                return;
+            S_RUNNING => {
+                match block.word.compare_exchange_weak(
+                    word,
+                    word | S_WAKE_PENDING,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(current) => word = current,
+                }
             }
-            RunState::Ready | RunState::Done => return,
+            _ => return,
         }
     };
+    // the claim above made this thread the only one touching the handoff cell
+    // until the task is enqueued (below) and resumed: a Parked task is in no
+    // queue, and every other waker now reads Ready and no-ops. see the field
+    // doc on `SyncBlock::handoff` for the publication argument.
+    // SAFETY: exclusive by the claim, as documented on the field.
+    unsafe { *block.handoff.get() = fetch() };
     match owner {
         Some(w) => enqueue_woken(w, id),
         None => enqueue_fresh(id),
@@ -849,9 +1086,11 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
 /// first thing a resumed channel block site checks.
 pub(crate) fn take_handoff() -> Option<i64> {
     let id = current_task()?;
-    let mut slab = lock_slab();
-    let task = slab.get_mut(id)?;
-    task.handoff.take()
+    let block = sync_block(id)?;
+    // SAFETY: only the running task itself reads its handoff cell, and a
+    // claiming waker only writes it while the task is Parked — disjoint by the
+    // state machine (see `SyncBlock::handoff`).
+    unsafe { (*block.handoff.get()).take() }
 }
 
 /// the `tls` map of the green task currently running on this thread, or `None`
@@ -948,6 +1187,7 @@ fn scheduler() -> &'static Scheduler {
             .collect();
         Scheduler {
             slab: Mutex::new(Slab::new()),
+            sync: SyncArena::new(),
             workers,
             injector: Mutex::new(VecDeque::new()),
         }
@@ -1176,19 +1416,16 @@ fn note_notify() {
 /// either were false here we would be about to run — possibly on a different
 /// worker than last time — a coroutine that may carry live pith stack, the
 /// unsound case the manual `Send` forbids. cheap, and compiled out in release.
-///
-/// the slab lock is taken with no queue lock held (the caller pops into a local
-/// first), so this never nests queue-inside-slab.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
-    let slab = lock_slab();
-    if let Some(task) = slab.get(id) {
+    if let Some(block) = sync_block(id) {
+        let word = block.word.load(AtomicOrdering::Acquire);
         debug_assert!(
-            task.owner.is_none(),
+            word_owner(word).is_none(),
             "stole/ran-fresh a task already pinned to a worker (id {id})"
         );
         debug_assert!(
-            task.state == RunState::Ready,
+            word & S_STATE_MASK == S_READY,
             "a stealable task must be Ready, never mid-run (id {id})"
         );
     }
@@ -1400,10 +1637,19 @@ enum Requeue {
 /// lock, a fresh `green_await` sees it and returns without registering, so no
 /// waiter can be added after we take the list: draining here loses none.
 fn finish_task(id: TaskId, result: i64) {
+    // retire the scheduling word first: from here on every wake reads Done and
+    // no-ops, and no flag a racing wake set survives (a finishing task can
+    // never need re-enqueueing). a plain store is enough — the task is Running
+    // and only its own worker finishes it; a concurrent flag-CAS either lands
+    // before this store (and is overwritten) or after (fails, reloads, sees
+    // Done, no-ops).
+    if let Some(block) = sync_block(id) {
+        block.word.store(S_DONE, AtomicOrdering::Release);
+    }
     let (join, closure_handle) = {
         let mut slab = lock_slab();
         if let Some(task) = slab.get_mut(id) {
-            task.state = RunState::Done;
+            task.done = true;
             task.result = result;
             (task.join.clone(), task.closure_handle)
         } else {
@@ -1455,32 +1701,51 @@ fn finish_task(id: TaskId, result: i64) {
 /// code, which may itself spawn), resumed, then either dropped (returned) or put
 /// back (parked).
 fn run_task(id: TaskId) {
-    // take the coroutine out under the lock, mark it running, pin it to this
-    // worker on first resume, and grab a raw pointer to this task's boxed
-    // thread-local map plus its stored yielder pointer. all captured here, while
-    // we still hold the lock, from a stable view of the slab; the `Box` the tls
-    // pointer points into does not move even if the slab reallocates later (see
-    // the `tls` field doc).
-    let (mut coro, tls_ptr, yielder_ptr) = {
-        let mut slab = lock_slab();
-        match slab.get_mut(id) {
-            Some(task) if task.state == RunState::Ready => {
-                task.state = RunState::Running;
-                // pin on first resume: whoever runs it first owns it forever.
-                if task.owner.is_none() {
-                    task.owner = CURRENT_WORKER.with(|c| c.get());
-                }
-                let tls_ptr: *mut HashMap<i64, i64> = &mut *task.tls;
-                let yielder_ptr = task.yielder_ptr.0;
-                match task.coro.take() {
-                    Some(c) => (c, tls_ptr, yielder_ptr),
-                    // a Ready task with no coroutine should be impossible; skip
-                    // defensively rather than panic on a corrupt slot.
-                    None => return,
-                }
+    // claim the task on its scheduling word: Ready -> Running, pinning it to
+    // this worker on first resume (whoever runs it first owns it forever, and
+    // the owner rides in the word so a waker can read it lock-free). finding
+    // it not Ready — someone else already claimed a double-enqueued id, or it
+    // is gone — means nothing to do, the same tolerance the old slab-guarded
+    // state check had.
+    let Some(block) = sync_block(id) else {
+        return;
+    };
+    let mut word = block.word.load(AtomicOrdering::Acquire);
+    loop {
+        if word & S_STATE_MASK != S_READY {
+            return;
+        }
+        let mut next = (word & S_OWNER_MASK) | S_RUNNING;
+        if next & S_OWNER_MASK == 0 {
+            if let Some(w) = CURRENT_WORKER.with(|c| c.get()) {
+                next |= owner_bits(w);
             }
-            // already running/parked/done/absent: nothing to do.
-            _ => return,
+        }
+        match block.word.compare_exchange_weak(
+            word,
+            next,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => word = current,
+        }
+    }
+
+    // the claim above hands this worker the block's cells (see the claim
+    // protocol on `SyncBlock`): take the coroutine out and read the yielder
+    // and tls pointers, no lock needed. the tls pointer targets the `Box`
+    // owned by the slab entry, which does not move even if the slab
+    // reallocates (see the `tls` field doc).
+    //
+    // SAFETY: exclusive by the Ready -> Running claim; the previous holder's
+    // writes are visible through the word's CAS pairing.
+    let (mut coro, tls_ptr, yielder_ptr) = unsafe {
+        match (*block.coro.get()).take() {
+            Some(c) => (c, *block.tls.get(), *block.yielder.get()),
+            // a claimed task with no coroutine should be impossible; skip
+            // defensively rather than panic on a corrupt slot.
+            None => return,
         }
     };
 
@@ -1574,36 +1839,52 @@ fn run_task(id: TaskId) {
         }
         Ok(CoroutineResult::Yield(())) => {
             // the task suspended: either it parked on a blocking op (a channel, a
-            // P2b primitive, or an await), or it was preempted at a safe-point. put
-            // the coroutine back and record where its yielder lives, then decide how
-            // to re-enqueue:
-            //   - `preempt_pending`: overran its quantum -> `deferred` (lowest
+            // P2b primitive, or an await), or it was preempted at a safe-point.
+            //
+            // put the coroutine back (and record where its yielder lives)
+            // BEFORE the word transition below makes the task claimable: once
+            // the word reads Parked a waker may re-enqueue the task, and its
+            // next resume — always on this same worker, by pinning — must find
+            // the coroutine present. the transition CAS releases these writes
+            // to the next claimant (see the claim protocol on `SyncBlock`).
+            //
+            // SAFETY: we still hold the claim from Ready -> Running.
+            unsafe {
+                *block.coro.get() = Some(coro);
+                *block.yielder.get() = new_yielder;
+            }
+            // then decide how to re-enqueue on the scheduling word:
+            //   - the preempt flag: overran its quantum -> `deferred` (lowest
             //     priority), so it yields to every other ready task on the worker.
-            //   - `wake_pending`: a block-site wake landed while we were still
+            //   - the wake flag: a block-site wake landed while we were still
             //     Running (the wake/park race) -> `pinned`, resume promptly.
             //   - neither: a plain block -> Parked; the block site re-enqueues us.
-            let requeue = {
-                let mut slab = lock_slab();
-                if let Some(task) = slab.get_mut(id) {
-                    task.coro = Some(coro);
-                    task.yielder_ptr = YielderPtr(new_yielder);
-                    if task.preempt_pending {
-                        task.preempt_pending = false;
-                        task.state = RunState::Ready;
-                        Requeue::Preempted(task.owner)
-                    } else if task.wake_pending {
-                        task.wake_pending = false;
-                        task.state = RunState::Ready;
-                        Requeue::Woken(task.owner)
-                    } else {
-                        task.state = RunState::Parked;
-                        Requeue::None
-                    }
+            // a wake can land between the load and the CAS — the retry sees its
+            // flag, so it is never lost.
+            let mut word = block.word.load(AtomicOrdering::Acquire);
+            let requeue = loop {
+                debug_assert_eq!(
+                    word & S_STATE_MASK,
+                    S_RUNNING,
+                    "a yielded task must still be Running (id {id})"
+                );
+                let (next, requeue) = if word & S_PREEMPT_PENDING != 0 {
+                    ((word & S_OWNER_MASK) | S_READY, Requeue::Preempted(word_owner(word)))
+                } else if word & S_WAKE_PENDING != 0 {
+                    ((word & S_OWNER_MASK) | S_READY, Requeue::Woken(word_owner(word)))
                 } else {
-                    return;
+                    ((word & S_OWNER_MASK) | S_PARKED, Requeue::None)
+                };
+                match block.word.compare_exchange_weak(
+                    word,
+                    next,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => break requeue,
+                    Err(current) => word = current,
                 }
             };
-            // enqueue outside the slab lock to keep the slab -> queue order clean.
             match requeue {
                 Requeue::Woken(Some(w)) => enqueue_woken(w, id),
                 Requeue::Preempted(Some(w)) => enqueue_preempted(w, id),
@@ -1671,22 +1952,29 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
 
     let (id, generation) = {
         let mut slab = lock_slab();
-        slab.insert(Task {
-            coro: Some(SendCoroutine(coro)),
+        let (id, generation) = slab.insert(Task {
             closure_handle,
-            state: RunState::Ready,
+            done: false,
             result: 0,
-            owner: None,
-            yielder_ptr: YielderPtr(ptr::null()),
-            wake_pending: false,
-            preempt_pending: false,
-            handoff: None,
             reclaim_on_done: false,
             join,
             // fresh, empty thread-local storage: this task starts with no
             // threadlocal slots materialized, exactly like a brand-new OS thread.
             tls: Box::new(HashMap::new()),
-        })
+        });
+        // arm this slot's sync block — coroutine in, word to Ready — before the
+        // enqueue below makes the task findable. the tls pointer is taken after
+        // the insert so it targets the Box at its final home. inside the slab
+        // lock only because insert is; the reset itself needs no lock.
+        let tls_ptr: *mut HashMap<i64, i64> = slab
+            .get_mut(id)
+            .map(|task| &mut *task.tls as *mut _)
+            .expect("freshly inserted task");
+        scheduler()
+            .sync
+            .ensure(id)
+            .reset(SendCoroutine(coro), tls_ptr);
+        (id, generation)
     };
 
     let task_handle = make_handle(id, generation);
@@ -1889,46 +2177,19 @@ mod tests {
             },
         );
 
-        let join = Arc::new((
-            Mutex::new(Join {
-                done: false,
-                result: 0,
-                green_waiters: Vec::new(),
-                condvar_waiters: 0,
-            }),
-            Condvar::new(),
-        ));
-        let id = {
-            let mut slab = lock_slab();
-            slab.insert(Task {
-                coro: Some(SendCoroutine(coro)),
-                closure_handle: 0,
-                state: RunState::Ready,
-                result: 0,
-                owner: None,
-                yielder_ptr: YielderPtr(ptr::null()),
-                wake_pending: false,
-                preempt_pending: false,
-                handoff: None,
-                reclaim_on_done: false,
-                join,
-                tls: Box::new(HashMap::new()),
-            })
-            .0
-        };
+        let id = push_ready_task(coro, fresh_join());
 
         // force the flag on so the safe-point takes its slow path.
         PITH_PREEMPT_REQUESTED.store(1, AtomicOrdering::Relaxed);
 
         // first resume: the body overruns and parks at the safe-point. run_task's
-        // yield path must see preempt_pending and re-enqueue onto owner 0's
+        // yield path must see the preempt flag and re-enqueue onto owner 0's
         // lowest-priority deferred queue.
         run_task(id);
         {
-            let slab = lock_slab();
-            let task = slab.get(id).unwrap();
-            assert_eq!(task.owner, Some(0), "task should pin to worker 0");
-            assert!(task.state == RunState::Ready, "should be re-enqueued, not parked");
+            let word = sync_block(id).unwrap().word.load(AtomicOrdering::Acquire);
+            assert_eq!(word_owner(word), Some(0), "task should pin to worker 0");
+            assert_eq!(word & S_STATE_MASK, S_READY, "should be re-enqueued, not parked");
         }
         {
             let mut deferred = scheduler().workers[0]
@@ -1947,7 +2208,7 @@ mod tests {
         {
             let slab = lock_slab();
             let task = slab.get(id).unwrap();
-            assert!(task.state == RunState::Done);
+            assert!(task.done);
             assert_eq!(task.result, 99);
         }
 
@@ -1960,21 +2221,23 @@ mod tests {
     // slab-push boilerplate.
     fn push_ready_task(coro: TaskCoroutine, join: Arc<(Mutex<Join>, Condvar)>) -> TaskId {
         let mut slab = lock_slab();
-        slab.insert(Task {
-            coro: Some(SendCoroutine(coro)),
+        let (id, _generation) = slab.insert(Task {
             closure_handle: 0,
-            state: RunState::Ready,
+            done: false,
             result: 0,
-            owner: None,
-            yielder_ptr: YielderPtr(ptr::null()),
-            wake_pending: false,
-            preempt_pending: false,
-            handoff: None,
             reclaim_on_done: false,
             join,
             tls: Box::new(HashMap::new()),
-        })
-        .0
+        });
+        // mirror green_spawn: arm the sync block (coroutine in, word Ready)
+        // before run_task can claim the task.
+        let tls_ptr: *mut HashMap<i64, i64> =
+            &mut *slab.get_mut(id).expect("freshly inserted task").tls;
+        scheduler()
+            .sync
+            .ensure(id)
+            .reset(SendCoroutine(coro), tls_ptr);
+        id
     }
 
     fn fresh_join() -> Arc<(Mutex<Join>, Condvar)> {
@@ -2020,9 +2283,19 @@ mod tests {
         {
             let slab = lock_slab();
             let task = slab.get(id).unwrap();
-            assert!(task.state == RunState::Done, "panicked task must be Done");
-            assert!(task.coro.is_none(), "dead coroutine must not be put back");
+            assert!(task.done, "panicked task must be Done");
         }
+        let block = sync_block(id).unwrap();
+        assert_eq!(
+            block.word.load(AtomicOrdering::Acquire) & S_STATE_MASK,
+            S_DONE,
+            "the scheduling word must retire so late wakes no-op"
+        );
+        // SAFETY: the task is Done, so nothing else touches its cells.
+        assert!(
+            unsafe { (*block.coro.get()).is_none() },
+            "dead coroutine must not be put back"
+        );
         // an awaiter sees done=true, so it unblocks with a defined (zero) result
         // rather than hanging forever.
         {
@@ -2045,30 +2318,22 @@ mod tests {
         {
             let slab = lock_slab();
             let task = slab.get(id2).unwrap();
-            assert!(task.state == RunState::Done);
+            assert!(task.done);
             assert_eq!(task.result, 7, "worker still runs tasks after a panic");
         }
 
         CURRENT_WORKER.with(|c| c.set(None));
     }
 
-    // a minimal task with a trivial coroutine, for the slab-logic tests below.
-    // reclamation never touches the coroutine, so its body is irrelevant.
-    fn dummy_task(state: RunState) -> Task {
-        let coro = TaskCoroutine::with_stack(
-            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
-            move |_y: &TaskYielder, _in: ()| -> i64 { 0 },
-        );
+    // a minimal task for the slab-logic tests below. these tests use their own
+    // local `Slab`, so they never touch the global arena — the slab's
+    // reclamation gates key off the task's `done` flag alone, and a task's
+    // coroutine lives in its sync block, not the slab.
+    fn dummy_task(done: bool) -> Task {
         Task {
-            coro: Some(SendCoroutine(coro)),
             closure_handle: 0,
-            state,
+            done,
             result: 0,
-            owner: None,
-            yielder_ptr: YielderPtr(ptr::null()),
-            wake_pending: false,
-            preempt_pending: false,
-            handoff: None,
             reclaim_on_done: false,
             join: fresh_join(),
             tls: Box::new(HashMap::new()),
@@ -2101,18 +2366,18 @@ mod tests {
     #[test]
     fn slab_reclaim_reuses_slot_with_bumped_generation() {
         let mut slab = Slab::new();
-        let (id, gen) = slab.insert(dummy_task(RunState::Ready));
+        let (id, gen) = slab.insert(dummy_task(false));
         assert_eq!((id, gen), (0, 0));
         assert!(slab.get_checked(id, gen).is_some());
 
         // a task that is not Done is never reclaimed.
         assert!(!slab.reclaim(id, gen));
 
-        slab.get_mut(id).unwrap().state = RunState::Done;
+        slab.get_mut(id).unwrap().done = true;
         assert!(slab.reclaim(id, gen));
         assert!(slab.get_checked(id, gen).is_none(), "stale handle must not resolve");
 
-        let (id2, gen2) = slab.insert(dummy_task(RunState::Ready));
+        let (id2, gen2) = slab.insert(dummy_task(false));
         assert_eq!(id2, id, "freed index is reused");
         assert_ne!(gen2, gen, "generation bumped");
 
@@ -2124,7 +2389,7 @@ mod tests {
     #[test]
     fn slab_reclaim_wrong_generation_is_noop() {
         let mut slab = Slab::new();
-        let (id, gen) = slab.insert(dummy_task(RunState::Done));
+        let (id, gen) = slab.insert(dummy_task(true));
         assert!(!slab.reclaim(id, gen.wrapping_add(1)));
         assert!(slab.get_checked(id, gen).is_some(), "slot survives a mismatched reclaim");
     }
@@ -2133,12 +2398,12 @@ mod tests {
     #[test]
     fn slab_detach_running_task_reclaims_on_finish() {
         let mut slab = Slab::new();
-        let (id, gen) = slab.insert(dummy_task(RunState::Running));
+        let (id, gen) = slab.insert(dummy_task(false));
         assert_eq!(slab.detach(id, gen), None);
         assert!(slab.reclaim_if_detached(id).is_none(), "not done yet");
         assert!(slab.get_checked(id, gen).is_some());
 
-        slab.get_mut(id).unwrap().state = RunState::Done;
+        slab.get_mut(id).unwrap().done = true;
         assert_eq!(slab.reclaim_if_detached(id), Some(make_handle(id, gen)));
         assert!(slab.get_checked(id, gen).is_none());
     }
@@ -2147,7 +2412,7 @@ mod tests {
     #[test]
     fn slab_detach_done_task_reclaims_immediately() {
         let mut slab = Slab::new();
-        let (id, gen) = slab.insert(dummy_task(RunState::Done));
+        let (id, gen) = slab.insert(dummy_task(true));
         assert_eq!(slab.detach(id, gen), Some(make_handle(id, gen)));
         assert!(slab.get_checked(id, gen).is_none());
         // a second detach on the stale handle is a no-op.
@@ -2159,7 +2424,102 @@ mod tests {
     #[test]
     fn slab_undetached_done_task_survives_finish_reclaim() {
         let mut slab = Slab::new();
-        let (id, _gen) = slab.insert(dummy_task(RunState::Done));
+        let (id, _gen) = slab.insert(dummy_task(true));
         assert!(slab.reclaim_if_detached(id).is_none());
+    }
+
+    // the scheduling-word owner packing: 0 means unpinned, worker indices
+    // round-trip through the owner bits, and the owner bits never collide with
+    // the state or flag bits.
+    #[test]
+    fn scheduling_word_owner_round_trips() {
+        assert_eq!(word_owner(S_READY), None);
+        assert_eq!(word_owner(S_PARKED | owner_bits(0)), Some(0));
+        assert_eq!(word_owner(S_RUNNING | S_WAKE_PENDING | owner_bits(7)), Some(7));
+        assert_eq!(
+            owner_bits(3) & (S_STATE_MASK | S_WAKE_PENDING | S_PREEMPT_PENDING),
+            0
+        );
+    }
+
+    // a wake against an id no task has ever had must be a harmless no-op — the
+    // reactor can probe ids far beyond any real task (see netpoll.rs).
+    #[test]
+    fn wake_on_never_used_id_is_noop() {
+        wake(ARENA_CHUNK * ARENA_SPINE + 5); // beyond the spine entirely
+        wake(ARENA_CHUNK * (ARENA_SPINE - 1)); // in range, chunk never allocated
+    }
+
+    // the full park -> wake -> resume cycle on the lock-free scheduling word: a
+    // task that parks with no pending flag reads Parked and sits in no queue;
+    // wake() claims it (Parked -> Ready) and enqueues it on its owner's pinned
+    // queue exactly once; a second wake while Ready is a no-op; the resumed
+    // task runs to completion and retires to Done.
+    #[test]
+    fn parked_task_wakes_once_onto_owner_pinned_queue() {
+        let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        CURRENT_WORKER.with(|c| c.set(Some(0)));
+        // start from an empty pinned queue so the assertions below see only
+        // this test's enqueues.
+        while scheduler().workers[0]
+            .pinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+            .is_some()
+        {}
+
+        let coro = TaskCoroutine::with_stack(
+            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+            move |yielder: &TaskYielder, _input: ()| -> i64 {
+                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                park_current();
+                21
+            },
+        );
+        let id = push_ready_task(coro, fresh_join());
+
+        // first resume: the body parks with no pending flag.
+        run_task(id);
+        let block = sync_block(id).unwrap();
+        assert_eq!(
+            block.word.load(AtomicOrdering::Acquire) & S_STATE_MASK,
+            S_PARKED
+        );
+        assert!(scheduler().workers[0]
+            .pinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty());
+
+        // wake claims Parked -> Ready and enqueues on the owner's pinned queue.
+        wake(id);
+        let word = block.word.load(AtomicOrdering::Acquire);
+        assert_eq!(word & S_STATE_MASK, S_READY);
+        assert_eq!(word_owner(word), Some(0), "task stays pinned to its owner");
+        // a second wake while Ready must not enqueue again.
+        wake(id);
+        {
+            let mut pinned = scheduler().workers[0]
+                .pinned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(pinned.pop(), Some(id));
+            assert!(pinned.is_empty(), "a Ready task must not be double-enqueued");
+        }
+
+        run_task(id);
+        {
+            let slab = lock_slab();
+            let task = slab.get(id).unwrap();
+            assert!(task.done);
+            assert_eq!(task.result, 21);
+        }
+        assert_eq!(
+            block.word.load(AtomicOrdering::Acquire) & S_STATE_MASK,
+            S_DONE
+        );
+
+        CURRENT_WORKER.with(|c| c.set(None));
     }
 }

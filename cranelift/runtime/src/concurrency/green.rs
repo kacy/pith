@@ -128,6 +128,7 @@ extern "C" fn dump_stats() {
         "[green-stats] wakes: same-worker={same} cross-worker={cross} reactor={reactor} \
          | futex-wakes={futex} absorbed={absorbed}"
     );
+    dump_contention();
 }
 
 // ---------------------------------------------------------------------------
@@ -872,11 +873,44 @@ pub(crate) fn current_task_tls() -> Option<*mut HashMap<i64, i64>> {
     }
 }
 
+// contended-acquire and hot-path counters for the same `PITH_GREEN_STATS`
+// lens as the wake breakdown above. a `try_lock` miss is one contended
+// acquire; the channel-wake and park counters size the hot paths those locks
+// sit on. these are what attributed the fanout benchmark's cost to the wake
+// *chain* (about two million channel wake slow-paths per run, each walking
+// channel -> slab -> queue) rather than to any single contended lock — the
+// per-worker queues measured two orders of magnitude quieter than the slab.
+static C_SLAB: AtomicU64 = AtomicU64::new(0);
+pub static C_PINNED: AtomicU64 = AtomicU64::new(0);
+pub static C_CH_WAKE: AtomicU64 = AtomicU64::new(0);
+static C_PARKS: AtomicU64 = AtomicU64::new(0);
+
 fn lock_slab() -> MutexGuard<'static, Slab> {
-    scheduler()
-        .slab
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    let m = &scheduler().slab;
+    if let Ok(g) = m.try_lock() {
+        return g;
+    }
+    if stats_on() {
+        C_SLAB.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn dump_contention() {
+    eprintln!(
+        "[green-stats] contended: slab={} pinned={} | channel-wakes={} worker-parks={}",
+        C_SLAB.load(AtomicOrdering::Relaxed),
+        C_PINNED.load(AtomicOrdering::Relaxed),
+        C_CH_WAKE.load(AtomicOrdering::Relaxed),
+        C_PARKS.load(AtomicOrdering::Relaxed)
+    );
+}
+
+/// count one channel wake slow-path (stats-gated; see the counter block above).
+pub fn note_channel_wake() {
+    if stats_on() {
+        C_CH_WAKE.fetch_add(1, AtomicOrdering::Relaxed);
+    }
 }
 
 fn lock_join(lock: &Mutex<Join>) -> MutexGuard<'_, Join> {
@@ -1039,10 +1073,16 @@ fn enqueue_fresh(id: TaskId) {
 fn enqueue_woken(owner: usize, id: TaskId) {
     let sched = scheduler();
     {
-        let mut pinned = sched.workers[owner]
-            .pinned
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let m = &sched.workers[owner].pinned;
+        let mut pinned = match m.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                if stats_on() {
+                    C_PINNED.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                m.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        };
         // wake affinity: when the waker is the owner worker itself, the woken
         // task is usually the other half of a handoff the current task just
         // completed — ask to run it next, while its data is hot, instead of
@@ -1268,6 +1308,9 @@ fn park(index: usize) {
     // a real futex wake vs one absorbed by a busy pool.
     if stats_on() {
         PARKED_WORKERS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    if stats_on() {
+        C_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
     }
     let (guard, _) = worker
         .park_cv

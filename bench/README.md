@@ -307,75 +307,69 @@ zig build-exe -O ReleaseFast -femit-bin=bench/chan_fanout_zig bench/chan_fanout.
 
 one million messages, median of 9 trials on this 2-core machine, run
 with nothing else on it. eight tasks on two cores is oversubscribed on
-purpose, and equally so for all four:
+purpose, and equally so for all four (measured 2026-07-26, after the
+green wake-path work described below):
 
 | lang | ms | messages/sec | peak rss |
 |---|---:|---:|---:|
-| pith (os threads) | 580 | 1.7 m | 3.0 mb |
-| pith (`PITH_GREEN=1`) | 782 | 1.3 m | 2.8 mb |
-| go | 69 | 14.5 m | 2.0 mb |
-| rust | 82 | 12.2 m | 2.3 mb |
-| zig | 201 | 5.0 m | 2.7 mb |
+| pith (os threads) | 438 | 2.3 m | 3.0 mb |
+| pith (`PITH_GREEN=1`) | 171 | 5.8 m | 3.0 mb |
+| go | 75 | 13.3 m | 2.0 mb |
+| rust | 135 | 7.4 m | 2.4 mb |
+| zig | 135 | 7.4 m | 2.7 mb |
 
-medians of the four run together; the green backend and zig are the
-noisier rows. the os-thread number came down from an earlier 622ms after
-a wake-strategy fix (below); the day-to-day drift between the two runs is
-a few percent (go moved 72→69 too), so the fix's real size is the
-controlled before/after, not the table delta.
+for most of this benchmark's life pith lost it outright — 580ms os-thread
+and 782ms green against go's ~70, roughly 8x behind. two fixes on
+2026-07-26 changed that. the first was found with `perf`: rust's standard
+condvar is futex-based and pays a `futex(FUTEX_WAKE)` syscall on every
+notify *even when nobody is waiting*, and the channel notified its
+condvar on every wake. green waiters never condvar-wait (they suspend
+their coroutine instead), so on an all-green channel that was two
+pointless syscalls per message — about 70% of the run. the channel now
+counts its os-thread waiters per role, under the same lock the parker and
+waker already hold, and only signals when one is actually parked. the
+second moved each task's scheduling state (run state, wake flags, owner)
+into one atomic word in a chunked side arena, so a wake and a resume no
+longer touch the scheduler's slab lock at all.
 
-pith loses this one, and not narrowly. at 580ms it is about 8.4x go and
-7x rust, and 2.9x zig's hand-rolled queue. per message that is ~580ns for
-a send plus a receive where go spends ~69ns. this is
-goroutines-and-channels territory and go wins it on merit.
+with those in, the green backend finally does what it is for: 171ms is
+2.6x faster than pith's own os threads and ahead of rust and zig, at
+2.3x go. the remaining gap to go is placement — eight tasks that all
+block on one channel land on both workers, and a cross-worker handoff
+still wakes the peer. `PITH_GREEN_WORKERS=1` pins the pipeline to one
+worker and gives ~46ms, faster than go on this box. locality is the
+whole story of the difference, and the knob is green-only, so it is not
+in the table. the green median above mixes both
+placement modes (~60ms when the pinning falls same-worker, ~130-170 when
+it splits), which is also why green is the noisier row.
 
-one round of this was recovered. the channel used to `notify_all` on
-every send and recv, unconditionally — waking all N waiters when one
-value can satisfy one of them, so N-1 wake and immediately re-block. a
-`perf` run had ~43% of the time in futex and context-switch machinery.
-giving each channel a sender condvar and a receiver condvar, waking only
-the opposite role, only `notify_one` on a buffered channel (a rendezvous
-still broadcasts), and skipping the wake entirely when nobody is parked,
-cut a controlled before/after by ~19% (659→535ms, same box, back to
-back). it does not change the order of the result — the remaining cost is
-the single hot channel's own mutex and condvar futex, and dropping the
-global handle-registry lock (the obvious next move) measured *2x worse*
-on one hot channel, because that lock was accidentally spreading futex
-contention across two futexes instead of one; concentrating it on the
-channel's own futex saturates the kernel's futex-hash spinlock. closing
-the gap needs a lower-contention channel core (a sharded or lock-free
-mpmc queue), not more lock removal.
+the os-thread improvement (580→438) is older and separate: the channel
+core moved to a lock-free mpmc ring earlier the same day, after two
+prior rounds — splitting the condvar by role (~19%) and one failed
+attempt (dropping the handle-registry lock measured 2x worse by
+concentrating futex contention). os threads still condvar-wait, so the
+notify-skip buys them little; the ring is what moved their number.
 
-the green backend does not rescue it: at the default worker count it is
-*slower* than os threads. the shape is why — eight tasks that
-mostly block on one shared channel spread across two workers, so the
-handoffs cross workers and wake the peer instead of staying in
-userspace. pinning it with `PITH_GREEN_WORKERS=1` gives 578ms, the best
-pith number here, which matches what the green docs say about locality.
-that is a tuning knob the other three do not have, so it is not in the
-table.
-
-context switches over the same run (`perf stat -e context-switches`) say
-the kernel is not the whole story:
+context switches over the same run (`perf stat -e context-switches`):
 
 | | pith | pith green | go | rust | zig |
 |---|---:|---:|---:|---:|---:|
-| context switches | 17.4k | 30.9k | 204 | 5.7k | 32.8k |
+| context switches | 5.0k | 2.5k | 258 | 4.8k | 60k |
 
-zig takes twice pith's context switches and still finishes 2.8x sooner,
-so the cost is in pith's per-operation channel work, not only in the
-blocking. go's 204 is its scheduler keeping the handoff in userspace,
-which is exactly the thing the green backend is meant to do and does not
-yet do well at this shape.
+green used to take 30.9k switches here; it now takes fewer than rust's
+std threads, which is the userspace-handoff behavior it was built for.
+go's 258 remains the mark: its scheduler almost never touches the
+kernel on this shape.
 
-memory is the one column where pith is fine. everything holds flat: 4x
-the messages moves peak rss by under 100 kb in every implementation, so
-nothing is retained per message on any of them. pith's 3.0 mb against
-go's 2.0 mb is runtime baseline, not growth.
+memory is the one column where pith was always fine. everything holds
+flat: 4x the messages moves peak rss by under 100 kb in every
+implementation, so nothing is retained per message on any of them.
+pith's 3.0 mb against go's 2.0 mb is runtime baseline, not growth.
 
-zig's timing is by far the noisiest of the four, 104-371ms across nine
-runs — probably the plain `signal` on a shared condvar, which wakes
-whichever consumer the kernel feels like. the median is stable enough to
-compare, but read any single zig run with suspicion.
+zig's timing is by far the noisiest of the four — probably the plain
+`signal` on a shared condvar, which wakes whichever consumer the kernel
+feels like. the median is stable enough to compare, but read any single
+zig run with suspicion.
 
 ## std pipeline benchmark
 

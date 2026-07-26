@@ -23,12 +23,14 @@ reference cycles refcounting alone can't. json struct decode stays faster
 than go's reflection decode — a flat struct of required scalars decodes
 in a single pass, filled straight into the struct.
 
-the newest table, `bench/chan_fanout`, is the one pith loses outright:
-pushing a million messages through a channel between eight tasks takes
-~580ms against go's ~69ms (a channel wake fix on 2026-07-24 took the
-os-thread number down from 622; still ~8x go). the batch benchmarks
-measure compute, and pith is competitive there; coordination is a
-different story and the number is below.
+`bench/chan_fanout`, the coordination benchmark, was the one pith lost
+outright — ~580ms against go's ~69 for a million messages between eight
+tasks. the green wake-path work on 2026-07-26 (details below) brought
+the green backend to 171ms, ahead of rust and zig and 2.3x go, with
+~46ms — faster than go on this box — when the pipeline is pinned to one
+worker. the batch benchmarks measure compute and pith is competitive
+there; coordination is now a genuine strength of the green backend
+rather than the standing embarrassment it was.
 
 the comparators drift a few percent between days; within a table they
 are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
@@ -249,41 +251,48 @@ follow-up, and until then this bound is a green-only property.
 comparators: four producer tasks push one million messages through a
 bounded channel (capacity 256) and four consumer tasks drain them,
 folding each into an order-independent sum. all four languages print the
-same checksum. medians on this 2-core box (os-thread number is
-2026-07-24, after the wake fix below; the rest 2026-07-23):
+same checksum. medians of 9 on this 2-core box, 2026-07-26:
 
 | | pith | pith green | go | rust | zig |
 |---|---:|---:|---:|---:|---:|
-| total | 580ms | 782ms | **69ms** | 82ms | 201ms |
-| peak rss | 3.0 mb | 2.8 mb | 2.0 mb | 2.3 mb | 2.7 mb |
+| total | 438ms | 171ms | **75ms** | 135ms | 135ms |
+| peak rss | 3.0 mb | 3.0 mb | 2.0 mb | 2.4 mb | 2.7 mb |
 
-pith is last here by a wide margin — ~8x go, ~7x rust, ~3x zig's
-hand-written mutex/condvar queue — and the green backend at its default
-worker count makes it worse, not better. eight tasks that all block on
-one shared channel land on both workers, so each handoff wakes the peer
-instead of staying in userspace; `PITH_GREEN_WORKERS=1` pins them
-together and gives 578ms, the best pith number of the set, which is the
-locality effect described in docs/concurrency.md. context switches over
-the run are 17.4k os-thread, 30.9k green, 204 for go, 5.7k rust, 32.8k
-zig — zig takes twice pith's switches and still finishes 2.8x sooner, so
-the gap is the per-operation cost of pith's channel, not only the
-blocking. memory is the one column that holds: 4x the messages moves
-peak rss by under 100 kb everywhere, so nothing is retained per message.
+this table used to read 580 / 782 / 69 / 82 / 201 — pith last by ~8x,
+with the green backend slower than os threads on the shape it was built
+for. the story of closing it is worth keeping because each step was
+measured and two plausible steps failed.
 
-one part of the per-op cost was recovered. `perf` put ~43% of the run in
-futex and context-switch machinery: the channel `notify_all`ed on every
-send and recv even when nobody waited, and woke all N waiters when one
-value can satisfy one, so N-1 re-blocked. splitting the channel's condvar
-by role, waking only the opposite role (`notify_one` on a buffered
-channel, broadcast only for an unbuffered rendezvous), and skipping the
-wake when no one is parked cut a controlled before/after ~19%
-(659→535ms). it does not change the order of the result. the obvious next
-move — dropping the per-op global handle-registry lock — measured *2x
-worse* on one hot channel: that lock had been spreading futex contention
-across two futexes, and removing it concentrates everything on the
-channel's own condvar futex, saturating the kernel's futex-hash spinlock.
-the real lever is a lower-contention channel core (sharded or lock-free
-mpmc), left as a follow-up.
+first, the history: splitting the channel's condvar by role and waking
+only the opposite role recovered ~19% in 2026-07; dropping the global
+handle-registry lock measured *2x worse* (it had been accidentally
+spreading futex contention across two futexes); the lock-free mpmc ring
+(2026-07-26) fixed the queueing but not the elapsed time; and the two
+"obvious" scheduler fixes — spin-before-park and lock-free run queues —
+were prototyped or measured out: spinning was flat at three budgets on
+two cores, and per-worker queue contention measured two orders of
+magnitude below the slab lock's, so those queues were never the problem.
+
+what actually closed it, found by counters rather than intuition: at one
+worker — zero lock contention, one park, eight futex wakes — the run
+still made ~2 million channel wake slow-paths. rust's std condvar is
+futex-based and pays a `futex(FUTEX_WAKE)` syscall on every notify even
+with zero waiters, and the channel notified on every wake; green waiters
+suspend coroutines and never condvar-wait, so every message bought two
+syscalls that woke nobody. counting os-thread waiters per role under the
+channel lock and signalling only when one is parked removed ~70% of the
+run. moving each task's scheduling state into one atomic word in a
+chunked side arena then took the slab lock off the wake and resume paths
+entirely (contended slab acquires on the wake path: 133 → 0), worth a
+further ~12% on the cross-worker mode.
+
+what remains is placement: the green median mixes ~60ms runs (the
+pipeline happened to pin to one worker) with ~130-170ms runs (it split),
+and `PITH_GREEN_WORKERS=1` gives ~46ms — faster than go here. making the
+scheduler colocate tasks that talk to each other, instead of leaving it
+to luck, is the open lever. context switches tell the same story: green
+went from 30.9k to 2.5k on this run — fewer than rust's std threads —
+against go's 258.
 
 **result and optional locals** — a `T!` or `T?` bound to a name lowers to a
 three-slot heap value: a flag, the payload, and the error. releasing one

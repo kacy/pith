@@ -975,13 +975,35 @@ green-starvation: build
 		exit 1; \
 	fi
 
+# --- green-thread wake affinity fairness ---
+# waking a task onto the worker that woke it is a big win for a ping-pong pair,
+# but the affinity slot holds exactly one task: a second same-worker wake
+# displaces the first to the back of the fifo. without that displacement a hot
+# pair keeps re-claiming the slot and any task queued behind it never runs, so at
+# a single worker this hangs instead of printing. preemption cannot rescue it —
+# each half of the pair re-parks long before it overruns its quantum.
+green-pinned-fairness: build
+	@echo "--- green-thread wake affinity fairness (byte-identical off vs on, 1 and default workers) ---"
+	@off=$$(./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
+	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
+	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
+	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
+		echo "ok   identical output at 1 and default workers: $$(echo $$on1)"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread:        $$off"; \
+		echo "  green 1 worker:   $$on1"; \
+		echo "  green default:    $$onN"; \
+		exit 1; \
+	fi
+
 # --- green-thread test suite ---
 # the deterministic, bounded green-thread tests, gathered so ci can run them as
 # one step. each compares the default os-thread backend against PITH_GREEN=1 and
 # must match byte-for-byte. green-echo is intentionally left out: it binds a
 # fixed loopback port and races a sleep to let the server start, which is too
 # flaky for a shared runner.
-green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation
+green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness
 	@echo "all green-thread tests passed"
 
 # --- memcheck ---

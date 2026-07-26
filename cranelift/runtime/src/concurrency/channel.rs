@@ -265,11 +265,29 @@ struct ChannelInner {
 
 type PithChannelHandle = Arc<ChannelInner>;
 
+/// "PCHA": the magic word at the front of every channel allocation. a channel
+/// handle is validated by alignment + this tag rather than the global handle
+/// registry — the registry's mutex was two global lock round trips per message
+/// (send + recv), the hottest shared line left once the ring made the channel
+/// itself lock-free. channels are never freed, so the tag never needs scrubbing;
+/// garbage handles fail the alignment or magic check and read as invalid.
+const CHANNEL_MAGIC: u32 = 0x50434841;
+
+/// a channel allocation: the magic tag, then the shared handle.
+struct TaggedChannel {
+    magic: u32,
+    channel: PithChannelHandle,
+}
+
 unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a PithChannelHandle> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Channel) {
+    let ptr = handle as *const TaggedChannel;
+    if !handle_registry::plausibly_aligned::<TaggedChannel>(ptr as *const ()) {
         return None;
     }
-    Some(&*(handle as *const PithChannelHandle))
+    if (*ptr).magic != CHANNEL_MAGIC {
+        return None;
+    }
+    Some(&(*ptr).channel)
 }
 
 fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
@@ -420,8 +438,10 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         senders: Condvar::new(),
         receivers: Condvar::new(),
     });
-    let ptr = Box::into_raw(Box::new(channel));
-    handle_registry::register(ptr as *const (), HandleKind::Channel);
+    let ptr = Box::into_raw(Box::new(TaggedChannel {
+        magic: CHANNEL_MAGIC,
+        channel,
+    }));
     ptr as i64
 }
 
@@ -430,7 +450,13 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
 /// before the gate load, pairing with the fence a parking waiter issues between
 /// its gate increment and its ring re-try — so either we see its increment here,
 /// or its re-try sees our value (never both misses; see `buffered_send`).
-fn wake_parked(inner: &ChannelInner, role: Role) {
+///
+/// a parked green *receiver* gets a direct handoff: one is popped and the ring
+/// dequeued on its behalf under the claim (see `green::wake_with`), so it
+/// resumes with the value in hand instead of re-locking and re-trying. dequeuing
+/// through the ring — never bypassing it — is what keeps fifo order. everything
+/// else (os-thread waiters, green senders) gets the plain wake-and-re-check.
+fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
     std::sync::atomic::fence(Ordering::SeqCst);
     let gate = match role {
         Role::Receiver => &inner.parked_receivers,
@@ -440,6 +466,17 @@ fn wake_parked(inner: &ChannelInner, role: Role) {
         return;
     }
     let mut state = lock_state(&inner.state);
+    if role == Role::Receiver {
+        if let Some(id) = state.green_receivers.pop() {
+            green::wake_with(id, || ring.try_dequeue());
+            drop(state);
+            // the handoff dequeue freed a slot, so a parked sender may now have
+            // room. gated like every wake, and the sender path never hands off,
+            // so this cannot recurse.
+            wake_parked(inner, ring, Role::Sender);
+            return;
+        }
+    }
     let cvar = match role {
         Role::Receiver => &inner.receivers,
         Role::Sender => &inner.senders,
@@ -476,7 +513,7 @@ unsafe fn buffered_send(inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
             return 0;
         }
         if ring.try_enqueue(value, capacity) {
-            wake_parked(inner, Role::Receiver);
+            wake_parked(inner, ring, Role::Receiver);
             return 1;
         }
         if spins > 0 {
@@ -495,7 +532,7 @@ unsafe fn buffered_send(inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
         if ring.try_enqueue(value, capacity) {
             inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
             drop(state);
-            wake_parked(inner, Role::Receiver);
+            wake_parked(inner, ring, Role::Receiver);
             return 1;
         }
         state = block_on_channel(inner, state, green_task, Role::Sender);
@@ -512,7 +549,7 @@ unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
         if let Some(value) = ring.try_dequeue() {
-            wake_parked(inner, Role::Sender);
+            wake_parked(inner, ring, Role::Sender);
             return optional_tuple(true, value);
         }
         if spins > 0 {
@@ -523,7 +560,7 @@ unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
         if inner.closed_flag.load(Ordering::SeqCst) {
             // one more look: a value enqueued just before close must be drained.
             if let Some(value) = ring.try_dequeue() {
-                wake_parked(inner, Role::Sender);
+                wake_parked(inner, ring, Role::Sender);
                 return optional_tuple(true, value);
             }
             return optional_tuple(false, 0);
@@ -534,7 +571,7 @@ unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
         if let Some(value) = ring.try_dequeue() {
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
             drop(state);
-            wake_parked(inner, Role::Sender);
+            wake_parked(inner, ring, Role::Sender);
             return optional_tuple(true, value);
         }
         if inner.closed_flag.load(Ordering::SeqCst) {
@@ -544,6 +581,14 @@ unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
         state = block_on_channel(inner, state, green_task, Role::Receiver);
         drop(state);
         inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
+        // a green task may have been handed its value by the waker (see
+        // wake_parked): the send dequeued on our behalf, so take it and skip the
+        // re-try entirely.
+        if green_task.is_some() {
+            if let Some(value) = green::take_handoff() {
+                return optional_tuple(true, value);
+            }
+        }
     }
 }
 
@@ -608,7 +653,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         }
         let capacity = { lock_state(&inner.state).capacity };
         if ring.try_enqueue(value, capacity) {
-            wake_parked(inner, Role::Receiver);
+            wake_parked(inner, ring, Role::Receiver);
             return 1;
         }
         return 0;
@@ -669,7 +714,7 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
     let inner = &**channel;
     if let Some(ring) = &inner.ring {
         if let Some(value) = ring.try_dequeue() {
-            wake_parked(inner, Role::Sender);
+            wake_parked(inner, ring, Role::Sender);
             return optional_tuple(true, value);
         }
         return optional_tuple(false, 0);

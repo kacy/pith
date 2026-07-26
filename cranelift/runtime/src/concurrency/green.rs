@@ -413,6 +413,43 @@ impl Slab {
 /// loudly rather than corrupting memory. sizing per-task stacks is a later knob.
 const STACK_SIZE: usize = 1024 * 1024;
 
+/// finished coroutines donate their stacks here and green_spawn reuses them.
+/// a fresh stack is an mmap + a guard-page mprotect, and freeing one is an
+/// munmap that costs a TLB shootdown across every core — per task, that made
+/// spawn dominated by the kernel's address-space bookkeeping (a 20k spawn/join
+/// probe spent 22k page faults where go spends 1.7k). reuse skips all of it,
+/// and the already-faulted pages come back warm.
+///
+/// the pool is capped so a burst cannot hoard address space forever: beyond
+/// STACK_POOL_MAX a returned stack just drops (one munmap, as before). stacks
+/// keep whatever pages the previous task dirtied — same-process memory, and the
+/// coroutine's setup overwrites what it uses, so stale bytes are inert.
+const STACK_POOL_MAX: usize = 64;
+static STACK_POOL: Mutex<Vec<corosensei::stack::DefaultStack>> = Mutex::new(Vec::new());
+
+/// a pooled stack if one is free, otherwise a fresh allocation.
+fn take_stack() -> corosensei::stack::DefaultStack {
+    if let Some(stack) = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+        return stack;
+    }
+    corosensei::stack::DefaultStack::new(STACK_SIZE).expect("allocate coroutine stack")
+}
+
+/// recycle a finished coroutine's stack. `into_stack` requires the coroutine to
+/// be complete, which both a clean return and an unwound panic guarantee; the
+/// defensive `done()` check keeps a hypothetical incomplete coroutine on the
+/// old drop path instead of aborting.
+fn recycle_stack(coro: SendCoroutine) {
+    if !coro.0.done() {
+        return;
+    }
+    let stack = coro.0.into_stack();
+    let mut pool = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    if pool.len() < STACK_POOL_MAX {
+        pool.push(stack);
+    }
+}
+
 /// run state of a slab task.
 ///
 /// - `Ready`: sitting in a run queue with its coroutine present, waiting to run.
@@ -1438,8 +1475,9 @@ fn run_task(id: TaskId) {
     match outcome {
         Ok(CoroutineResult::Return(result)) => {
             // clean return: record the result, flip done, wake awaiters of both
-            // kinds, and drop the coroutine (and its stack) by not putting it
-            // back. see `finish_task` for the join-lock / wake ordering.
+            // kinds, and hand the stack back to the pool. see `finish_task` for
+            // the join-lock / wake ordering.
+            recycle_stack(coro);
             finish_task(id, result);
         }
         Err(_panic) => {
@@ -1450,7 +1488,9 @@ fn run_task(id: TaskId) {
             // do not hang. mark the task done with a zero result (a failed task
             // reports 0, matching the os-thread path when a closure lookup fails)
             // and wake every awaiter so they unblock with a defined outcome. the
-            // worker itself is unharmed and goes on to run the next task.
+            // worker itself is unharmed and goes on to run the next task. the
+            // unwound coroutine is complete, so its stack is reusable too.
+            recycle_stack(coro);
             finish_task(id, 0);
         }
         Ok(CoroutineResult::Yield(())) => {
@@ -1524,7 +1564,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     // own stack instead of a fresh OS-thread stack; the pith code is identical,
     // so refcount retain/release stays balanced across the boundary.
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("allocate coroutine stack"),
+        take_stack(),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             // publish this coroutine's yielder so pith code running on its stack
             // can suspend the task (via park_current). this runs once, on the

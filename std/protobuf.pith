@@ -243,20 +243,33 @@ impl Reader:
     fn read_raw(count: Int) -> Bytes!ProtoError:
         if count < 0:
             fail proto_fail("negative length")
-        if self.pos + count > self.data.len():
+        # compare against what is LEFT rather than summing: a length near the
+        # 64-bit ceiling makes `pos + count` wrap negative, which passes a
+        # `pos + count > len` test and then walks the cursor off the buffer.
+        # the subtraction cannot overflow — pos is never past len.
+        if count > self.data.len() - self.pos:
             fail proto_fail("unexpected end of buffer")
         out := self.data.slice(self.pos, self.pos + count)
         self.pos = self.pos + count
         return out
 
-    # read a base-128 varint.
+    # read a base-128 varint. a 64-bit value is at most ten bytes; a payload
+    # that runs past bit 63 is rejected rather than silently truncated. callers
+    # that use the result as a length re-check it against the buffer, since a
+    # negative int64 is a legitimate varint but never a legitimate size.
     pub fn read_varint() -> Int!ProtoError:
         mut result := 0
         mut shift := 0
         mut count := 0
         while count < 10:
             b := self.read_byte()!
-            result = bits.bor(result, bits.shl(bits.band(b, 127), shift))
+            chunk := bits.band(b, 127)
+            # the tenth byte carries only bit 63, so a payload above bit 0 there
+            # is a value wider than 64 bits, not a large negative. (a negative
+            # int64 is legitimately ten bytes, ending in 0x01.)
+            if shift == 63 and chunk > 1:
+                fail proto_fail("varint out of range")
+            result = bits.bor(result, bits.shl(chunk, shift))
             count = count + 1
             if bits.band(b, 128) == 0:
                 return result
@@ -682,3 +695,39 @@ test "a mixed message decodes field by field":
     assert(seen_bool)
     assert_eq(seen_nested, 42)
     w.free()
+
+test "a length that overruns the buffer is rejected, not wrapped":
+    # field 1, wire type 2, length 0x7fffffffffffffff. summing pos + count wraps
+    # negative, which used to pass the bounds check and walk the cursor off the
+    # buffer — the process exited on the next read.
+    evil := encoding.from_hex("0affffffffffffffff7f") catch bytes.empty()
+    r := reader(evil)
+    tag := r.read_tag()
+    assert(not tag.is_err)
+    assert(r.skip(tag.ok.wire).is_err)
+
+test "a varint whose payload runs past 63 bits is rejected":
+    # ten 0xff bytes: every continuation set, payload far past the signed range.
+    huge := encoding.from_hex("ffffffffffffffffff7f") catch bytes.empty()
+    r := reader(huge)
+    assert(r.read_varint().is_err)
+
+test "a truncated length-delimited field is rejected":
+    # declares five bytes, supplies two.
+    short := encoding.from_hex("0a056869") catch bytes.empty()
+    r := reader(short)
+    tag := r.read_tag()
+    assert(not tag.is_err)
+    assert(r.read_bytes().is_err)
+
+test "the largest in-range varint still round-trips":
+    w := writer()
+    w.write_int64(1, 4611686018427387903) catch false
+    data := w.bytes()
+    w.free()
+    r := reader(data)
+    tag := r.read_tag()
+    assert(not tag.is_err)
+    got := r.read_varint()
+    assert(not got.is_err)
+    assert_eq(got.ok, 4611686018427387903)

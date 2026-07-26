@@ -469,6 +469,12 @@ impl Deframer:
         length := read_u32(self.buf, self.pos + 1)
         return avail >= 5 + length
 
+    # bytes buffered but not yet consumed. after draining every ready() message,
+    # a non-zero remainder is a partial frame — the sender either truncated the
+    # body or framed it wrong, which callers reject rather than silently drop.
+    pub fn remaining() -> Int:
+        return self.buf.len() - self.pos
+
     # take the next complete message and advance past it. precondition: ready().
     # fails if the message is flagged compressed, which this client does not read.
     pub fn next() -> Bytes!GrpcError:
@@ -1141,11 +1147,22 @@ fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
 # length-prefixed frame). an all-default proto3 message can arrive as an empty
 # body, which decodes to a default message.
 fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
+    # an all-default proto3 message encodes to no bytes, and a peer may send it
+    # as an empty body: that is the one case where "nothing" is a valid message.
+    if body.len() == 0:
+        return bytes.empty()
     d := new_deframer()
     d.push(body)
     if not d.ready():
-        return bytes.empty()
-    return d.next()!
+        # a body that is not a complete frame is malformed — truncated, or a
+        # length prefix that overruns what was sent. answering OK with an empty
+        # message would let corrupt input look like a successful default-valued
+        # call, so reject it.
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: truncated request message frame")
+    msg := d.next()!
+    if d.remaining() > 0:
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: unary request carried more than one message")
+    return msg
 
 # the http/2 handler that turns one unary grpc request into one grpc response.
 fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
@@ -1154,7 +1171,11 @@ fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
         return expired_response()
     request := grpc_unframe_unary(req.body_bytes())
     if request.is_err:
-        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_INTERNAL, "malformed request frame"))
+        # report the framing error's own status: a malformed frame is the
+        # caller's fault (INVALID_ARGUMENT), not a server fault, and a
+        # compressed message is UNIMPLEMENTED. reporting INTERNAL for all of
+        # them told a client to retry a request that will never succeed.
+        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(request.err.status, request.err.message))
     result := grpc_dispatch_fn(path, request.ok)
     if result.is_err:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
@@ -1203,6 +1224,11 @@ pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
     d.push(body)
     while d.ready():
         out.push(d.next()!)
+    if d.remaining() > 0:
+        # leftover bytes that never completed a frame: the body was truncated or
+        # mis-framed. dropping them silently would hand the handler a short
+        # stream and report success.
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: truncated request message frame")
     return out
 
 # frame a sequence of messages into one response body: each message

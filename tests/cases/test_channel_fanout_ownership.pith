@@ -1,0 +1,43 @@
+# multi-producer/multi-consumer fanout over one bounded channel: exercises the
+# lock-free ring, blocking on full/empty, the park/wake gates, the green direct
+# handoff, and close-then-drain. run under valgrind by `make memcheck`, where
+# thread serialization perturbs the timing that a lost wake or a torn ring slot
+# would depend on — a regression shows up as a wrong checksum or a hang, not a
+# quiet corruption. the checksum is the exact sum of every value sent.
+fn producer(jobs: Channel[Int], id: Int, per: Int) -> Int:
+    mut i := 0
+    while i < per:
+        jobs.send(id * 1000 + i)
+        i = i + 1
+    return per
+
+fn consumer(jobs: Channel[Int], done: Channel[Int]) -> Int:
+    mut n := 0
+    mut sum := 0
+    while true:
+        v := jobs.recv()
+        if v == none:
+            break
+        n = n + 1
+        sum = sum + v.unwrap_or(0)
+    done.send(sum)
+    return n
+
+fn main():
+    jobs := Channel[Int](7)
+    done := Channel[Int](4)
+    p1 := spawn producer(jobs, 1, 250)
+    p2 := spawn producer(jobs, 2, 250)
+    c1 := spawn consumer(jobs, done)
+    c2 := spawn consumer(jobs, done)
+    await p1
+    await p2
+    jobs.close()
+    await c1
+    await c2
+    mut total := 0
+    mut k := 0
+    while k < 2:
+        total = total + done.recv().unwrap_or(0)
+        k = k + 1
+    print("total:" + total.to_string())

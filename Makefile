@@ -1019,14 +1019,7 @@ green-tests: green-smoke green-threadlocal green-pingpong green-producer-consume
 # a case that legitimately differs under green (nondeterministic scheduling
 # order that its expected output happens to encode) belongs in
 # GREEN_CORPUS_EXCLUDE with a reason, not in a loosened compare.
-# test_process_ctx: under a single green worker (PITH_GREEN_WORKERS=1), a
-# deadline-limited read_exact on a subprocess pipe reports the read failed but
-# classifies the error as unexpected-eof rather than deadline-exceeded — its
-# spawned read-worker returns empty on would-block instead of yielding until
-# data or the deadline. correct at the default worker count and os-thread; a
-# narrow single-worker green bug tracked separately. (see the read_exact ctx
-# path in std/io.pith.)
-GREEN_CORPUS_EXCLUDE := test_process_ctx
+GREEN_CORPUS_EXCLUDE :=
 GREEN_CORPUS_EXPECTED := $(filter-out $(addprefix tests/expected/,$(addsuffix .txt,$(GREEN_CORPUS_EXCLUDE))),$(REGRESSION_EXPECTED))
 
 verify-green-corpus: build verify-green-corpus-only

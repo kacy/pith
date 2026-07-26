@@ -1,0 +1,13 @@
+# a module's private helper is not callable from another module. std.net.grpc
+# declares `frame_message` with a bare `fn`, so only grpc itself may call it —
+# the public entry point is `frame_messages`. this used to compile: the lookup
+# fell through to a bare-name match in the shared table and handed back a value
+# the caller could not use.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+
+fn main() -> Int!:
+    framed := grpc.frame_message(bytes.from_string_utf8("hi"))
+    print(framed.len().to_string())
+    return 0

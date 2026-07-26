@@ -560,3 +560,19 @@ warning[E305]: indentation depth 5 exceeds maximum of 4
   12 |                     if x > 0:
                             ^^
 ```
+
+### E251 — function is not public in that module
+
+a module function declared with a bare `fn` belongs to the module that declared
+it; only a `pub fn` can be called through an import. the two live in one shared
+name table, so before this check the lookup for `mod.helper` would fall through
+to a bare-name match and return something the caller had no business holding.
+
+mark the function `pub` if it is meant to be part of the module's surface, or
+call the public entry point that wraps it.
+
+```
+error[E251]: 'frame_message' is not public in module 'grpc'
+ 11 |     framed := grpc.frame_message(bytes.from_string_utf8("hi"))
+                                                                    ^
+```

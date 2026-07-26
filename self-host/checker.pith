@@ -53,6 +53,11 @@ fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
 pub mut current_scope := -1
 pub mut method_type_map: Map[String, Int] := {}
 pub mut method_visibility_map: Map[String, Bool] := {}
+# whether each module function was declared `pub`, keyed by its module-qualified
+# symbol. a call through a module alias consults this so a module's private
+# helpers stay private; without it every function in the shared name table was
+# reachable from anywhere.
+pub mut function_visibility_map: Map[String, Bool] := {}
 mut struct_field_default_nodes: Map[String, Int] := {}
 # legacy map kept for probes; generic declaration lookup uses flat lists
 pub mut generic_declaration_map: Map[String, Int] := {}
@@ -107,6 +112,7 @@ pub fn initialize_checker(file_path: String):
     checker_reset_diagnostics(file_path)
     method_type_map = {}
     method_visibility_map = {}
+    function_visibility_map = {}
     checker_methods_reset()
     struct_field_default_nodes = {}
     generic_declaration_map = {}
@@ -517,7 +523,7 @@ fn register_declaration(node_idx: Int, is_pub: Bool):
         register_declaration(node.children[0], is_pub)
         return
     if node.kind == "fn_decl":
-        register_function_declaration(node_idx, node)
+        register_function_declaration(node_idx, node, is_pub)
     elif node.kind == "struct_decl":
         register_struct_declaration(node_idx, node)
     elif node.kind == "enum_decl":
@@ -539,8 +545,23 @@ fn register_declaration(node_idx: Int, is_pub: Bool):
 # pass 1 — function declarations
 # ---------------------------------------------------------------
 
-fn register_function_declaration(node_idx: Int, node: Node):
+# whether `name` may be called from outside `module_path`. a name the checker
+# never saw declared there is left alone: single-file mode registers nothing,
+# and the builtin std modules that get symbol-prefixed rather than
+# module-qualified are not in the table either. only a function it positively
+# knows is private is refused.
+fn module_function_is_visible(module_path: String, name: String) -> Bool:
+    if module_path == current_checker_module_path:
+        return true
+    key := module_generic_target_name(module_path, name)
+    if not function_visibility_map.contains_key(key):
+        return true
+    return function_visibility_map[key]
+
+fn register_function_declaration(node_idx: Int, node: Node, is_pub: Bool):
     name := node.value
+    if current_checker_module_path.len() > 0:
+        function_visibility_map.insert(module_generic_target_name(current_checker_module_path, name), is_pub)
     if declaration_has_generic_params(node):
         register_generic_declaration(name, node_idx)
         return
@@ -3670,6 +3691,13 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             if has_generic_declaration(method_name):
                 if get_node(get_generic_declaration_index(method_name)).kind == "struct_decl":
                     return check_generic_struct_constructor(method_name, arg_indices, scope_id)
+            # a function the aliased module declared without `pub` belongs to
+            # that module. the lookups below end in a bare-name fallback into
+            # the shared table, which used to reach a private helper and return
+            # a value the caller could not use.
+            if not module_function_is_visible(module_path, method_name):
+                report_error("E251", "'" + method_name + "' is not public in module '" + recv_name + "'")
+                return TID_ERR
             qualified_name := module_import_target_name(module_path, method_name)
             module_name := module_generic_target_name(module_path, method_name)
             mut callee_type := lookup_binding(scope_id, module_name)
@@ -4366,6 +4394,13 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
             module_path := module_aliases[obj_name]
             qualified_name := module_import_target_name(module_path, field_name)
             module_name := module_generic_target_name(module_path, field_name)
+            # a function the target module declared without `pub` is its own
+            # business. the lookups below end in a bare-name fallback into the
+            # shared table, which used to reach a private helper and hand back
+            # a value the caller could not use.
+            if not module_function_is_visible(module_path, field_name):
+                report_error("E251", "'" + field_name + "' is not public in module '" + obj_name + "'")
+                return TID_ERR
             mut func_tid := lookup_binding(scope_id, module_name)
             if func_tid >= 0:
                 return func_tid

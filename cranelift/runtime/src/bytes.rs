@@ -134,11 +134,12 @@ pub unsafe extern "C" fn pith_bytes_substring_utf8(handle: i64, start: i64, end:
         return std::ptr::null_mut();
     };
     let len = bytes.data.len() as i64;
-    let mut start_idx = start.max(0).min(len);
-    let mut end_idx = end.max(0).min(len);
-    if end_idx < start_idx {
-        std::mem::swap(&mut start_idx, &mut end_idx);
-    }
+    // an inverted range is empty, not reversed: clamping `end` up to `start`
+    // matches pith_cstring_substring and pith_list_slice. swapping the two
+    // instead would hand back bytes the caller never asked for, which for a
+    // parser walking a buffer is wrong data rather than no data.
+    let start_idx = start.max(0).min(len);
+    let end_idx = end.max(start_idx).min(len);
     let slice = &bytes.data[start_idx as usize..end_idx as usize];
     if std::str::from_utf8(slice).is_err() {
         return std::ptr::null_mut();
@@ -202,11 +203,9 @@ pub unsafe extern "C" fn pith_bytes_slice(handle: i64, start: i64, end: i64) -> 
         return 0;
     };
     let len = bytes.data.len() as i64;
-    let mut start_idx = start.max(0).min(len);
-    let mut end_idx = end.max(0).min(len);
-    if end_idx < start_idx {
-        std::mem::swap(&mut start_idx, &mut end_idx);
-    }
+    // see the note in pith_bytes_substring_utf8: an inverted range is empty.
+    let start_idx = start.max(0).min(len);
+    let end_idx = end.max(start_idx).min(len);
     pith_bytes_from_vec(bytes.data[start_idx as usize..end_idx as usize].to_vec())
 }
 
@@ -451,6 +450,31 @@ mod tests {
             assert_eq!(pith_bytes_get(12345, 0), 0);
             assert_eq!(pith_bytes_slice(12345, 0, 1), 0);
             assert!(pith_bytes_to_string_utf8(12345).is_null());
+        }
+    }
+
+    // an inverted or negative range yields nothing. this used to swap the two
+    // ends, so slice(1, -5) on b"abc" came back as b"a" — a caller walking a
+    // buffer got bytes it never asked for instead of an empty result.
+    #[test]
+    fn inverted_byte_ranges_are_empty() {
+        unsafe {
+            let b = pith_bytes_from_vec(b"abcdef".to_vec());
+
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, 1, -5)), 0);
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, 4, 2)), 0);
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, -3, -1)), 0);
+
+            // the ordinary cases are untouched
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, 1, 4)), 3);
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, 0, 99)), 6);
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, -2, 3)), 3);
+            assert_eq!(pith_bytes_len(pith_bytes_slice(b, 2, 2)), 0);
+
+            // and the utf8 shortcut agrees with the slice
+            let s = pith_bytes_substring_utf8(b, 4, 2);
+            assert!(!s.is_null());
+            assert_eq!(*s, 0, "an inverted range decodes to the empty string");
         }
     }
 

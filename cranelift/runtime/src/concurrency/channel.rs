@@ -57,11 +57,161 @@
 
 use crate::concurrency::green;
 use crate::handle_registry::{self, HandleKind};
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 static SELECT_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+/// one slot of the lock-free buffered queue. `sequence` is the vyukov ticket:
+/// a slot is free for the enqueuer holding position `pos` when its sequence is
+/// exactly `pos`, and holds a value for the dequeuer at `pos` when its sequence
+/// is `pos + 1`. after a dequeue the slot's sequence advances by the ring size,
+/// handing it to the enqueuer one lap later. the sequence's release store is
+/// what publishes the value in `cell`.
+struct Slot {
+    sequence: AtomicUsize,
+    cell: UnsafeCell<i64>,
+}
+
+/// the lock-free core of a buffered channel: a fixed ring of slots with two
+/// monotonically increasing positions. `try_enqueue`/`try_dequeue` are the
+/// classic vyukov bounded mpmc — pure cas, no lock — and they alone carry the
+/// throughput path. blocking, waking, green-task parking, and close all stay on
+/// the channel mutex, which an op only touches when the ring is actually full
+/// or empty (or when a gate says someone is parked).
+/// a cache-line padded atomic position. senders hammer `enqueue_pos` and
+/// receivers `dequeue_pos`; on one line they false-share and every CAS bounces
+/// the line between roles.
+#[repr(align(64))]
+struct PaddedPos(AtomicUsize);
+
+struct Ring {
+    buffer: Box<[Slot]>,
+    mask: usize,
+    /// true when the requested capacity is a power of two, i.e. the ring size
+    /// equals the capacity exactly: fullness is then fully encoded in the slot
+    /// sequences and `try_enqueue` never needs to read `dequeue_pos` — which
+    /// keeps senders off the receivers' cache line entirely.
+    exact: bool,
+    enqueue_pos: PaddedPos,
+    dequeue_pos: PaddedPos,
+}
+
+unsafe impl Send for Ring {}
+unsafe impl Sync for Ring {}
+
+impl Ring {
+    /// ring size = capacity rounded up to a power of two, so the position wraps
+    /// with a mask. the extra slots beyond the requested capacity are kept out
+    /// of service by `try_enqueue`'s explicit capacity check, so `len()` and
+    /// blocking behavior honor the exact capacity the program asked for.
+    ///
+    /// the minimum size is 2: with a single slot, the sequence after an enqueue
+    /// at position p (p + 1) equals the *next* enqueue position, so a full slot
+    /// is indistinguishable from a free one and gets overwritten. two slots
+    /// restore the invariant; a capacity-1 channel then runs with `exact` off
+    /// and the explicit check enforcing its bound.
+    fn new(capacity: usize) -> Ring {
+        let size = capacity.next_power_of_two().max(2);
+        let buffer: Vec<Slot> = (0..size)
+            .map(|i| Slot {
+                sequence: AtomicUsize::new(i),
+                cell: UnsafeCell::new(0),
+            })
+            .collect();
+        Ring {
+            buffer: buffer.into_boxed_slice(),
+            mask: size - 1,
+            exact: capacity == size,
+            enqueue_pos: PaddedPos(AtomicUsize::new(0)),
+            dequeue_pos: PaddedPos(AtomicUsize::new(0)),
+        }
+    }
+
+    /// how many values are in the ring right now. approximate under concurrency
+    /// (positions move independently), exact when the channel is quiescent.
+    fn len(&self) -> usize {
+        let enq = self.enqueue_pos.0.load(Ordering::Acquire);
+        let deq = self.dequeue_pos.0.load(Ordering::Acquire);
+        enq.saturating_sub(deq)
+    }
+
+    /// lock-free enqueue: false when the channel is at capacity.
+    fn try_enqueue(&self, value: i64, capacity: usize) -> bool {
+        let mut pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+        loop {
+            // a non-power-of-two capacity leaves spare ring slots, so fullness
+            // is not encoded in the slot sequences alone: enforce it here. when
+            // the capacity is exact this check (and its read of the receivers'
+            // cache line) disappears.
+            if !self.exact
+                && pos.saturating_sub(self.dequeue_pos.0.load(Ordering::Acquire)) >= capacity
+            {
+                return false;
+            }
+            let slot = &self.buffer[pos & self.mask];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            if seq == pos {
+                // slot free for this position: claim it by advancing enqueue_pos.
+                match self.enqueue_pos.0.compare_exchange_weak(
+                    pos,
+                    pos + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        unsafe { *slot.cell.get() = value };
+                        // release-publish the value to the dequeuer at this pos.
+                        slot.sequence.store(pos + 1, Ordering::Release);
+                        return true;
+                    }
+                    Err(actual) => pos = actual,
+                }
+            } else if seq < pos {
+                // the slot still holds a value from the previous lap: full.
+                return false;
+            } else {
+                // another enqueuer already claimed this position; catch up.
+                pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// lock-free dequeue: None when the channel is empty.
+    fn try_dequeue(&self) -> Option<i64> {
+        let mut pos = self.dequeue_pos.0.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.buffer[pos & self.mask];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            if seq == pos + 1 {
+                // slot holds the value for this position: claim it.
+                match self.dequeue_pos.0.compare_exchange_weak(
+                    pos,
+                    pos + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let value = unsafe { *slot.cell.get() };
+                        // hand the slot to the enqueuer one lap later.
+                        slot.sequence
+                            .store(pos + self.mask + 1, Ordering::Release);
+                        return Some(value);
+                    }
+                    Err(actual) => pos = actual,
+                }
+            } else if seq <= pos {
+                // the slot is still awaiting its enqueuer: empty.
+                return None;
+            } else {
+                // another dequeuer already claimed this position; catch up.
+                pos = self.dequeue_pos.0.load(Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 struct ChannelState {
     queue: VecDeque<i64>,
@@ -93,10 +243,21 @@ enum Role {
     Receiver,
 }
 
-/// the channel behind a handle: the guarded state plus one condvar per role.
-/// os-thread senders park on `senders`, receivers on `receivers`, so a wake can
-/// target one role without disturbing the other (see the role-split note above).
+/// the channel behind a handle. a **buffered** channel carries its values in
+/// the lock-free `ring`; the mutex/condvars exist only for parking and waking,
+/// which an op touches only when the ring is full/empty or a `parked_*` gate
+/// says someone is waiting. an **unbuffered** channel (`ring` is None) is the
+/// original mutex rendezvous, untouched. `closed_flag` mirrors `state.closed`
+/// so the lock-free path can observe close without the lock. `parked_senders`/
+/// `parked_receivers` count every parked waiter of a role — os-thread and green
+/// alike — and are maintained under the mutex but read without it (the wake
+/// gate); the seq-cst fences in the fast paths close the park/wake race (see
+/// `buffered_send`).
 struct ChannelInner {
+    ring: Option<Ring>,
+    closed_flag: AtomicBool,
+    parked_senders: AtomicUsize,
+    parked_receivers: AtomicUsize,
     state: Mutex<ChannelState>,
     senders: Condvar,
     receivers: Condvar,
@@ -251,6 +412,10 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         green_senders: Vec::new(),
     };
     let channel = Arc::new(ChannelInner {
+        ring: if cap > 0 { Some(Ring::new(cap)) } else { None },
+        closed_flag: AtomicBool::new(false),
+        parked_senders: AtomicUsize::new(0),
+        parked_receivers: AtomicUsize::new(0),
         state: Mutex::new(state),
         senders: Condvar::new(),
         receivers: Condvar::new(),
@@ -260,12 +425,139 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
     ptr as i64
 }
 
+/// after a successful ring op, wake one parked waiter of the opposite `role` if
+/// the gate says any exist. the seq-cst fence orders our ring release-store
+/// before the gate load, pairing with the fence a parking waiter issues between
+/// its gate increment and its ring re-try — so either we see its increment here,
+/// or its re-try sees our value (never both misses; see `buffered_send`).
+fn wake_parked(inner: &ChannelInner, role: Role) {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let gate = match role {
+        Role::Receiver => &inner.parked_receivers,
+        Role::Sender => &inner.parked_senders,
+    };
+    if gate.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut state = lock_state(&inner.state);
+    let cvar = match role {
+        Role::Receiver => &inner.receivers,
+        Role::Sender => &inner.senders,
+    };
+    cvar.notify_one();
+    wake_green(&mut state, role);
+}
+
+/// the buffered send: lock-free enqueue on the fast path; park under the mutex
+/// only when the ring is full.
+///
+/// ## the park/wake race
+/// a sender can find the ring full, then a receiver dequeues and checks the gate
+/// before the sender registers — a lost wake, and a hang. it is closed the
+/// standard way: the parker increments its gate (under the mutex), issues a
+/// seq-cst fence, and *re-tries the ring op* before waiting; the waker issues a
+/// seq-cst fence between its ring op and its gate load. in the fence order,
+/// whichever fence comes second sees the other side's write — the waker sees the
+/// incremented gate (and notifies under the mutex, which the parker holds until
+/// it actually waits), or the parker's re-try sees the freed slot.
+/// how many failed ring attempts an os-thread caller burns before parking. a
+/// paired producer/consumer usually frees a slot within a few hundred cycles,
+/// and a park/unpark round trip through the kernel costs microseconds — a short
+/// spin converts most would-parks into immediate retries. green tasks never
+/// spin: their park is a userspace suspend, already cheap.
+const SPIN_TRIES: usize = 64;
+
+unsafe fn buffered_send(inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
+    let capacity = { lock_state(&inner.state).capacity };
+    let green_task = green::current_task();
+    let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
+    loop {
+        if inner.closed_flag.load(Ordering::SeqCst) {
+            return 0;
+        }
+        if ring.try_enqueue(value, capacity) {
+            wake_parked(inner, Role::Receiver);
+            return 1;
+        }
+        if spins > 0 {
+            spins -= 1;
+            std::hint::spin_loop();
+            continue;
+        }
+        // ring full: fall to the slow path and park as a sender.
+        let mut state = lock_state(&inner.state);
+        inner.parked_senders.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if inner.closed_flag.load(Ordering::SeqCst) {
+            inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
+            return 0;
+        }
+        if ring.try_enqueue(value, capacity) {
+            inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
+            drop(state);
+            wake_parked(inner, Role::Receiver);
+            return 1;
+        }
+        state = block_on_channel(inner, state, green_task, Role::Sender);
+        drop(state);
+        inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
+/// path; park under the mutex only when the ring is empty. a closed channel
+/// still drains — the dequeue try comes before the closed check.
+unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
+    let green_task = green::current_task();
+    let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
+    loop {
+        if let Some(value) = ring.try_dequeue() {
+            wake_parked(inner, Role::Sender);
+            return optional_tuple(true, value);
+        }
+        if spins > 0 {
+            spins -= 1;
+            std::hint::spin_loop();
+            continue;
+        }
+        if inner.closed_flag.load(Ordering::SeqCst) {
+            // one more look: a value enqueued just before close must be drained.
+            if let Some(value) = ring.try_dequeue() {
+                wake_parked(inner, Role::Sender);
+                return optional_tuple(true, value);
+            }
+            return optional_tuple(false, 0);
+        }
+        let mut state = lock_state(&inner.state);
+        inner.parked_receivers.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some(value) = ring.try_dequeue() {
+            inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
+            drop(state);
+            wake_parked(inner, Role::Sender);
+            return optional_tuple(true, value);
+        }
+        if inner.closed_flag.load(Ordering::SeqCst) {
+            inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
+            return optional_tuple(false, 0);
+        }
+        state = block_on_channel(inner, state, green_task, Role::Receiver);
+        drop(state);
+        inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     let Some(channel) = channel_ref(handle) else {
         return 0;
     };
     let inner = &**channel;
+    // a buffered channel's values live in the lock-free ring; the mutex is only
+    // the parking lot. the unbuffered rendezvous below is untouched.
+    if let Some(ring) = &inner.ring {
+        return buffered_send(inner, ring, value);
+    }
     // is this send running inside a green task? if so it yields on a would-block
     // instead of parking the worker; if not (main thread / os-thread backend) it
     // condvar-waits exactly as before. computed once — the running task does not
@@ -300,19 +592,8 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
         return 0;
     }
 
-    while !state.closed && state.queue.len() >= state.capacity {
-        state.sender_waiting += 1;
-        state = block_on_channel(inner, state, green_task, Role::Sender);
-        state.sender_waiting -= 1;
-    }
-
-    if state.closed {
-        return 0;
-    }
-
-    state.queue.push_back(value);
-    wake_receivers(inner, &mut state);
-    1
+    // buffered sends never reach here: they took the ring path above.
+    0
 }
 
 #[no_mangle]
@@ -321,27 +602,29 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         return 0;
     };
     let inner = &**channel;
+    if let Some(ring) = &inner.ring {
+        if inner.closed_flag.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let capacity = { lock_state(&inner.state).capacity };
+        if ring.try_enqueue(value, capacity) {
+            wake_parked(inner, Role::Receiver);
+            return 1;
+        }
+        return 0;
+    }
     let mut state = lock_state(&inner.state);
 
     if state.closed {
         return 0;
     }
 
-    if state.capacity == 0 {
-        if state.receiver_waiting == 0 || state.pending_value.is_some() {
-            return 0;
-        }
-        state.pending_value = Some(value);
-        wake_receivers(inner, &mut state);
-        1
-    } else {
-        if state.queue.len() >= state.capacity {
-            return 0;
-        }
-        state.queue.push_back(value);
-        wake_receivers(inner, &mut state);
-        1
+    if state.receiver_waiting == 0 || state.pending_value.is_some() {
+        return 0;
     }
+    state.pending_value = Some(value);
+    wake_receivers(inner, &mut state);
+    1
 }
 
 #[no_mangle]
@@ -350,23 +633,18 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
         return optional_tuple(false, 0);
     };
     let inner = &**channel;
+    if let Some(ring) = &inner.ring {
+        return buffered_recv(inner, ring);
+    }
     let green_task = green::current_task();
     let mut state = lock_state(&inner.state);
 
     loop {
-        if let Some(value) = state.queue.pop_front() {
-            // took a queued value: a blocked sender may now have room.
+        if let Some(value) = state.pending_value.take() {
+            // completed a rendezvous: wake the sender waiting for its value
+            // to be taken.
             wake_senders(inner, &mut state);
             return optional_tuple(true, value);
-        }
-
-        if state.capacity == 0 {
-            if let Some(value) = state.pending_value.take() {
-                // completed a rendezvous: wake the sender waiting for its value
-                // to be taken.
-                wake_senders(inner, &mut state);
-                return optional_tuple(true, value);
-            }
         }
 
         if state.closed {
@@ -389,17 +667,17 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
         return optional_tuple(false, 0);
     };
     let inner = &**channel;
-    let mut state = lock_state(&inner.state);
-
-    if let Some(value) = state.queue.pop_front() {
-        wake_senders(inner, &mut state);
-        return optional_tuple(true, value);
-    }
-    if state.capacity == 0 {
-        if let Some(value) = state.pending_value.take() {
-            wake_senders(inner, &mut state);
+    if let Some(ring) = &inner.ring {
+        if let Some(value) = ring.try_dequeue() {
+            wake_parked(inner, Role::Sender);
             return optional_tuple(true, value);
         }
+        return optional_tuple(false, 0);
+    }
+    let mut state = lock_state(&inner.state);
+    if let Some(value) = state.pending_value.take() {
+        wake_senders(inner, &mut state);
+        return optional_tuple(true, value);
     }
     optional_tuple(false, 0)
 }
@@ -415,6 +693,9 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
         return 0;
     }
     state.closed = true;
+    // publish close to the lock-free path before the wakes below, so a woken
+    // buffered waiter's re-check observes it.
+    inner.closed_flag.store(true, Ordering::SeqCst);
     state.pending_value = None;
     // wake every parked caller of both roles so they resume and observe `closed` —
     // the one notify that legitimately targets both sides. notify_all rather than
@@ -431,6 +712,9 @@ pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
     let Some(channel) = channel_ref(handle) else {
         return 0;
     };
+    if let Some(ring) = &channel.ring {
+        return ring.len() as i64;
+    }
     let state = lock_state(&channel.state);
     state.queue.len() as i64
 }
@@ -511,6 +795,67 @@ mod tests {
                 h.join().unwrap();
             }
             assert_eq!(total, n * (n + 1) / 2);
+        }
+    }
+
+    // capacity 1 is the vyukov edge: a single-slot ring cannot distinguish full
+    // from free (the sequence after an enqueue equals the next enqueue
+    // position), so the ring holds two slots with the explicit capacity check
+    // enforcing the bound of one. the second try_send must refuse.
+    #[test]
+    fn buffered_capacity_one_refuses_second_send() {
+        unsafe {
+            let ch = pith_channel_new(1);
+            assert_eq!(pith_channel_try_send(ch, 4), 1);
+            assert_eq!(pith_channel_try_send(ch, 5), 0, "capacity 1 is full");
+            assert_eq!(pith_channel_len(ch), 1);
+            let t = pith_channel_try_recv(ch) as *const i64;
+            assert_eq!((*t, *t.add(1)), (1, 4));
+            assert_eq!(pith_channel_try_send(ch, 6), 1, "room again after recv");
+        }
+    }
+
+    // a non-power-of-two capacity leaves spare ring slots, so fullness is
+    // enforced by the explicit capacity check rather than the slot sequences:
+    // try_send must refuse the (cap+1)th value, len must report the exact
+    // capacity, and draining must return every value in order.
+    #[test]
+    fn buffered_ring_honors_non_power_of_two_capacity() {
+        unsafe {
+            let ch = pith_channel_new(3);
+            assert_eq!(pith_channel_cap(ch), 3);
+            for v in 1..=3 {
+                assert_eq!(pith_channel_try_send(ch, v), 1);
+            }
+            assert_eq!(pith_channel_try_send(ch, 99), 0, "over capacity");
+            assert_eq!(pith_channel_len(ch), 3);
+            for v in 1..=3 {
+                let t = pith_channel_try_recv(ch) as *const i64;
+                assert_eq!(*t, 1);
+                assert_eq!(*t.add(1), v);
+            }
+            let t = pith_channel_try_recv(ch) as *const i64;
+            assert_eq!(*t, 0, "drained");
+        }
+    }
+
+    // values enqueued before close must still drain; recvs after the drain see
+    // the empty optional, and sends after close are refused.
+    #[test]
+    fn buffered_close_drains_then_reports_closed() {
+        unsafe {
+            let ch = pith_channel_new(4);
+            assert_eq!(pith_channel_send(ch, 41), 1);
+            assert_eq!(pith_channel_send(ch, 42), 1);
+            pith_channel_close(ch);
+            assert_eq!(pith_channel_send(ch, 43), 0, "send after close");
+            let a = pith_channel_recv(ch) as *const i64;
+            assert_eq!((*a, *a.add(1)), (1, 41));
+            let b = pith_channel_recv(ch) as *const i64;
+            assert_eq!((*b, *b.add(1)), (1, 42));
+            let c = pith_channel_recv(ch) as *const i64;
+            assert_eq!(*c, 0, "closed and drained");
+            assert_eq!(pith_channel_is_closed(ch), 1);
         }
     }
 

@@ -1,0 +1,44 @@
+# an empty list literal in a struct constructor takes the field's element type.
+#
+# `Box([])` has nothing to infer an element type from, so the checker typed it
+# as an error and the emitter built the untagged container it uses for
+# List[Int] — one that stores a handle without taking a reference to it. the
+# elements pushed in later were owned by nobody, so the emitter compensated with
+# a retain at every push site, and that retain was never balanced: the list held
+# one count too many for its whole life.
+#
+# the field's declared type now reaches the literal, so the constructor builds a
+# list that owns its elements and the push needs no compensation. this checks
+# both halves: the elements survive, and pushing in a loop does not grow.
+
+import std.bytes as bytes
+
+struct Box:
+    mut items: List[Bytes]
+    mut names: List[String]
+
+fn fill(box: Box):
+    payload := bytes.from_string_utf8("kept")
+    box.items.push(payload)
+
+fn main():
+    # the element outlives the scope that created it
+    box := Box([], [])
+    fill(box)
+    print("kept:" + (bytes.to_string_utf8(box.items[0]) catch "<freed>"))
+
+    # a named-field constructor takes the same path
+    named := Box(items: [], names: [])
+    named.names.push("hello")
+    named.items.push(bytes.from_string_utf8("world"))
+    print("named:" + named.names[0] + "/" + (bytes.to_string_utf8(named.items[0]) catch "<freed>"))
+
+    # and pushing through a struct field in a loop stays flat. a per-push leak
+    # of a 4KB payload over 20000 rounds would be ~80MB; this holds steady
+    # because each Box releases its elements when it dies.
+    mut i := 0
+    while i < 20000:
+        b := Box([], [])
+        b.items.push(bytes.from_string_utf8("0123456789012345678901234567890123456789"))
+        i = i + 1
+    print("rounds:" + i.to_string())

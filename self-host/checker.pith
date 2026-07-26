@@ -1421,6 +1421,19 @@ fn struct_min_required_fields(struct_name: String, info: TypeInfo) -> Int:
 # lose the optional; the emitter wraps elements from the container's
 # recorded type, so recording the right type on every nested literal is
 # what makes deep literals build correct values.
+# give an empty (or otherwise untyped) collection literal the type it is being
+# stored into. an empty literal has nothing to infer an element type from, so it
+# checks as an error and the emitter falls back to an untagged container — one
+# that does not retain what gets pushed into it. an annotated binding already
+# did this; a struct field is the other place a literal has a declared type
+# waiting for it.
+fn propagate_empty_collection_literal(value_idx: Int, expected_tid: Int):
+    if expected_tid < 0:
+        return
+    node := get_node(value_idx)
+    if node.kind == "list" or node.kind == "map" or node.kind == "set":
+        propagate_expected_collection_type(value_idx, expected_tid)
+
 fn propagate_expected_collection_type(literal_idx: Int, expected_tid: Int):
     if expected_tid < 0:
         return
@@ -2845,6 +2858,8 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
         if provided.contains_key(fld):
             expr := provided[fld]
             arg_type := c_check_expr(expr, scope_id)
+            if is_error_type(arg_type):
+                propagate_empty_collection_literal(expr, info.field_types[idx])
             if is_error_type(arg_type) == false:
                 expected := info.field_types[idx]
                 if value_matches_optional_target(expr, arg_type, expected) == false:
@@ -2874,6 +2889,13 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
             if arg_node.children.len() > 0:
                 arg_expr_idx = arg_node.children[0]
         arg_type := c_check_expr(arg_expr_idx, scope_id)
+        # an empty collection literal types as an error on its own; against a
+        # field it takes the field's type, and the cache entry is what tells the
+        # emitter which container to build. without it `S([])` produced an
+        # untagged list that never owned what was later pushed into it.
+        if is_error_type(arg_type):
+            if idx < info.field_types.len():
+                propagate_empty_collection_literal(arg_expr_idx, info.field_types[idx])
         if is_error_type(arg_type) == false:
             if idx < info.field_types.len():
                 expected := info.field_types[idx]

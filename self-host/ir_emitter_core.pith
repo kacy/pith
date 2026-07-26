@@ -1914,6 +1914,17 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
                 ir_rc_retain_reg(value_r, payload_kind)
             return ir_emit_optional_owned_some(value_r, payload_kind)
         return ir_emit_optional_some_value(value_r)
+    # an empty list whose element type the checker worked out goes through the
+    # literal emitter, which picks the container from that element type. the
+    # shortcut below only knows the coarse target kind ("list", "list_string"),
+    # so it would build an untagged list for a List[Bytes] or List[SomeStruct]
+    # field — one that never takes a reference to what is pushed into it.
+    # ir_checked_type is empty when the checker has no type for the literal,
+    # which is exactly when the shortcut is still the only thing that knows what
+    # to build.
+    if vn.kind == "list" and vn.children.len() == 0:
+        if ir_checked_type(val_idx).starts_with("list"):
+            return ir_expr(val_idx)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), target_type)
     if empty_init_call.len() > 0:
         r := ir_reg()
@@ -3363,6 +3374,10 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
     return set_r
 
+# the container stores that land in a list rather than a map or a set.
+fn ir_is_list_store_name(emit_name: String) -> Bool:
+    return emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push" or emit_name == "set" or emit_name == "pith_list_set_value"
+
 fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     if elem_kind == "string":
         return "__list_new_str"
@@ -4308,7 +4323,13 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 mut compensate := false
                 if ir_is_channel_send_name(emit_name):
                     compensate = store_kind.len() > 0
-                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes" or store_kind == "struct":
+                elif store_kind == "bytes":
+                    # a List[Bytes] is tagged wherever the checker knows the
+                    # element type — including an empty literal in a struct
+                    # constructor — so the runtime push already retains and a
+                    # count here would only leak.
+                    compensate = not ir_is_list_store_name(emit_name)
+                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "struct":
                     compensate = true
                 if compensate and ir_string_expr_is_borrowed(value_expr):
                     ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)

@@ -86,6 +86,11 @@ struct TaskState {
 struct TaskShared {
     done: bool,
     result: i64,
+    /// awaiters currently blocked in `cvar.wait`. completion only signals the
+    /// condvar when this is non-zero — a detached or not-yet-awaited task then
+    /// skips the notify entirely, and a later awaiter sees `done` before it
+    /// ever waits.
+    waiters: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +273,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         Mutex::new(TaskShared {
             done: false,
             result: 0,
+            waiters: 0,
         }),
         Condvar::new(),
     ));
@@ -306,7 +312,9 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
             let mut state = lock_shared(lock);
             state.done = true;
             state.result = result;
-            cvar.notify_all();
+            if state.waiters > 0 {
+                cvar.notify_all();
+            }
         }
         // then run the slab-side completion, the os-thread analogue of green's
         // `finish_task` reclaim: reclaim our slot now if we were detached, else
@@ -370,7 +378,9 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
         let (lock, cvar) = &*shared;
         let mut state = lock_shared(lock);
         while !state.done {
+            state.waiters += 1;
             state = wait_shared(cvar, state);
+            state.waiters -= 1;
         }
         state.result
     };
@@ -455,6 +465,7 @@ mod tests {
                 Mutex::new(TaskShared {
                     done: finished,
                     result: 0,
+                    waiters: 0,
                 }),
                 Condvar::new(),
             )),

@@ -413,6 +413,43 @@ impl Slab {
 /// loudly rather than corrupting memory. sizing per-task stacks is a later knob.
 const STACK_SIZE: usize = 1024 * 1024;
 
+/// finished coroutines donate their stacks here and green_spawn reuses them.
+/// a fresh stack is an mmap + a guard-page mprotect, and freeing one is an
+/// munmap that costs a TLB shootdown across every core — per task, that made
+/// spawn dominated by the kernel's address-space bookkeeping (a 20k spawn/join
+/// probe spent 22k page faults where go spends 1.7k). reuse skips all of it,
+/// and the already-faulted pages come back warm.
+///
+/// the pool is capped so a burst cannot hoard address space forever: beyond
+/// STACK_POOL_MAX a returned stack just drops (one munmap, as before). stacks
+/// keep whatever pages the previous task dirtied — same-process memory, and the
+/// coroutine's setup overwrites what it uses, so stale bytes are inert.
+const STACK_POOL_MAX: usize = 64;
+static STACK_POOL: Mutex<Vec<corosensei::stack::DefaultStack>> = Mutex::new(Vec::new());
+
+/// a pooled stack if one is free, otherwise a fresh allocation.
+fn take_stack() -> corosensei::stack::DefaultStack {
+    if let Some(stack) = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+        return stack;
+    }
+    corosensei::stack::DefaultStack::new(STACK_SIZE).expect("allocate coroutine stack")
+}
+
+/// recycle a finished coroutine's stack. `into_stack` requires the coroutine to
+/// be complete, which both a clean return and an unwound panic guarantee; the
+/// defensive `done()` check keeps a hypothetical incomplete coroutine on the
+/// old drop path instead of aborting.
+fn recycle_stack(coro: SendCoroutine) {
+    if !coro.0.done() {
+        return;
+    }
+    let stack = coro.0.into_stack();
+    let mut pool = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    if pool.len() < STACK_POOL_MAX {
+        pool.push(stack);
+    }
+}
+
 /// run state of a slab task.
 ///
 /// - `Ready`: sitting in a run queue with its coroutine present, waiting to run.
@@ -496,6 +533,11 @@ struct Join {
     done: bool,
     result: i64,
     green_waiters: Vec<TaskId>,
+    /// os-thread awaiters currently blocked in `cvar.wait`. completion only
+    /// signals the condvar when this is non-zero: the overwhelmingly common
+    /// detached-or-not-yet-awaited case then skips the notify call entirely, and
+    /// a later awaiter sees `done` before it ever waits.
+    condvar_waiters: u32,
 }
 
 struct Task {
@@ -1317,7 +1359,9 @@ fn finish_task(id: TaskId, result: i64) {
         let mut j = lock_join(lock);
         j.done = true;
         j.result = result;
-        cvar.notify_all();
+        if j.condvar_waiters > 0 {
+            cvar.notify_all();
+        }
         std::mem::take(&mut j.green_waiters)
     };
     for waiter in green_waiters {
@@ -1438,8 +1482,9 @@ fn run_task(id: TaskId) {
     match outcome {
         Ok(CoroutineResult::Return(result)) => {
             // clean return: record the result, flip done, wake awaiters of both
-            // kinds, and drop the coroutine (and its stack) by not putting it
-            // back. see `finish_task` for the join-lock / wake ordering.
+            // kinds, and hand the stack back to the pool. see `finish_task` for
+            // the join-lock / wake ordering.
+            recycle_stack(coro);
             finish_task(id, result);
         }
         Err(_panic) => {
@@ -1450,7 +1495,9 @@ fn run_task(id: TaskId) {
             // do not hang. mark the task done with a zero result (a failed task
             // reports 0, matching the os-thread path when a closure lookup fails)
             // and wake every awaiter so they unblock with a defined outcome. the
-            // worker itself is unharmed and goes on to run the next task.
+            // worker itself is unharmed and goes on to run the next task. the
+            // unwound coroutine is complete, so its stack is reusable too.
+            recycle_stack(coro);
             finish_task(id, 0);
         }
         Ok(CoroutineResult::Yield(())) => {
@@ -1514,6 +1561,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             done: false,
             result: 0,
             green_waiters: Vec::new(),
+            condvar_waiters: 0,
         }),
         Condvar::new(),
     ));
@@ -1524,7 +1572,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     // own stack instead of a fresh OS-thread stack; the pith code is identical,
     // so refcount retain/release stays balanced across the boundary.
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("allocate coroutine stack"),
+        take_stack(),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             // publish this coroutine's yielder so pith code running on its stack
             // can suspend the task (via park_current). this runs once, on the
@@ -1614,8 +1662,15 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
     let mut j = lock_join(lock);
     while !j.done {
         match green_task {
-            // os-thread awaiter: condvar-wait, unchanged from the P1a path.
-            None => j = cvar.wait(j).unwrap_or_else(|p| p.into_inner()),
+            // os-thread awaiter: condvar-wait. the waiter count brackets the
+            // wait so completion knows a notify is worth making; it is
+            // maintained under the join lock, so the count and the wait are one
+            // atomic step from the completer's point of view.
+            None => {
+                j.condvar_waiters += 1;
+                j = cvar.wait(j).unwrap_or_else(|p| p.into_inner());
+                j.condvar_waiters -= 1;
+            }
             // green awaiter: register under the join lock, release it, and suspend
             // the coroutine. re-lock and re-check `done` on resume — a completing
             // task drains the list, so we are woken exactly when `done` is set.
@@ -1767,6 +1822,7 @@ mod tests {
                 done: false,
                 result: 0,
                 green_waiters: Vec::new(),
+                condvar_waiters: 0,
             }),
             Condvar::new(),
         ));
@@ -1855,6 +1911,7 @@ mod tests {
                 done: false,
                 result: 0,
                 green_waiters: Vec::new(),
+                condvar_waiters: 0,
             }),
             Condvar::new(),
         ))

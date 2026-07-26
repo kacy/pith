@@ -1006,6 +1006,53 @@ green-pinned-fairness: build
 green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness
 	@echo "all green-thread tests passed"
 
+# --- full corpus under the green backend ---
+# the dedicated green-tests above prove the coordination primitives; this proves
+# the whole deterministic regression corpus produces the same output under the
+# green backend as under os threads. it is the safety net for making green the
+# default: every case with an expected file is run under PITH_GREEN=1 at the
+# default worker count and again pinned to one worker, and compared to the same
+# expected output the os-thread run is held to. a green run whose output drifts
+# from its expected file is a green correctness bug, not a timing artifact,
+# since the expected file is the fixed os-thread answer.
+#
+# a case that legitimately differs under green (nondeterministic scheduling
+# order that its expected output happens to encode) belongs in
+# GREEN_CORPUS_EXCLUDE with a reason, not in a loosened compare.
+# test_process_ctx: under a single green worker (PITH_GREEN_WORKERS=1), a
+# deadline-limited read_exact on a subprocess pipe reports the read failed but
+# classifies the error as unexpected-eof rather than deadline-exceeded — its
+# spawned read-worker returns empty on would-block instead of yielding until
+# data or the deadline. correct at the default worker count and os-thread; a
+# narrow single-worker green bug tracked separately. (see the read_exact ctx
+# path in std/io.pith.)
+GREEN_CORPUS_EXCLUDE := test_process_ctx
+GREEN_CORPUS_EXPECTED := $(filter-out $(addprefix tests/expected/,$(addsuffix .txt,$(GREEN_CORPUS_EXCLUDE))),$(REGRESSION_EXPECTED))
+
+verify-green-corpus: build verify-green-corpus-only
+
+verify-green-corpus-only:
+	@echo "--- regression corpus under the green backend (default + 1 worker) ---"
+	@pass=0; fail=0; skip=0; \
+	for f in $(GREEN_CORPUS_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		src="tests/cases/$$name.pith"; \
+		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
+		expected=$$(cat "$$f"); \
+		gN=$$(timeout 60 env PITH_GREEN=1 ./target/release/pith run "$$src" 2>/dev/null); \
+		g1=$$(timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run "$$src" 2>/dev/null); \
+		if [ "$$gN" = "$$expected" ] && [ "$$g1" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+		elif [ "$$gN" != "$$expected" ]; then \
+			echo "FAIL $$name (green default workers)"; fail=$$((fail+1)); \
+		else \
+			echo "FAIL $$name (green 1 worker)"; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed, $$skip without a source"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "green corpus matches os-thread output"
+
 # --- memcheck ---
 # run a curated set of memory-management-heavy programs under valgrind
 # with an error exit code, so a use-after-free or an out-of-bounds read

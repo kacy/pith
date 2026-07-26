@@ -1,7 +1,7 @@
 # generated from a .proto file by tools/protogen; do not edit by hand.
 # proto package: sample
 
-from std.protobuf import ProtoError, writer, reader, WIRE_LEN
+from std.protobuf import ProtoError, writer, reader, WIRE_LEN, MAX_NESTING_DEPTH, nesting_error
 import std.bytes as bytes
 import std.net.grpc as grpc
 
@@ -29,6 +29,12 @@ pub fn encode_Point(m: Point) -> Bytes:
 
 # decode a Point from protobuf wire bytes.
 pub fn decode_Point(data: Bytes) -> Point!ProtoError:
+    return decode_Point_at(data, 0)!
+
+# decode a Point nested `depth` messages deep.
+fn decode_Point_at(data: Bytes, depth: Int) -> Point!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Point(x: 0, y: 0)
     r := reader(data)
     while not r.at_end():
@@ -89,6 +95,12 @@ pub fn encode_Shape(m: Shape) -> Bytes:
 
 # decode a Shape from protobuf wire bytes.
 pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
+    return decode_Shape_at(data, 0)!
+
+# decode a Shape nested `depth` messages deep.
+fn decode_Shape_at(data: Bytes, depth: Int) -> Shape!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0, weight: 0.0)
     r := reader(data)
     while not r.at_end():
@@ -102,9 +114,9 @@ pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
         elif tag.field == 4:
             m.color = r.read_enum()!
         elif tag.field == 5:
-            m.center = decode_Point(r.read_message()!)!
+            m.center = decode_Point_at(r.read_message()!, depth + 1)!
         elif tag.field == 6:
-            m.vertices.push(decode_Point(r.read_message()!)!)
+            m.vertices.push(decode_Point_at(r.read_message()!, depth + 1)!)
         elif tag.field == 7:
             if tag.wire == WIRE_LEN:
                 for v in r.read_packed_varints()!:
@@ -184,6 +196,12 @@ pub fn encode_Sticker(m: Sticker) -> Bytes:
 
 # decode a Sticker from protobuf wire bytes.
 pub fn decode_Sticker(data: Bytes) -> Sticker!ProtoError:
+    return decode_Sticker_at(data, 0)!
+
+# decode a Sticker nested `depth` messages deep.
+fn decode_Sticker_at(data: Bytes, depth: Int) -> Sticker!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Sticker(name: "", design: StickerDesign.StickerDesignUnset, backing: StickerBacking.StickerBackingUnset)
     r := reader(data)
     while not r.at_end():
@@ -193,7 +211,7 @@ pub fn decode_Sticker(data: Bytes) -> Sticker!ProtoError:
         elif tag.field == 2:
             m.design = StickerDesign.Emoji(r.read_string()!)
         elif tag.field == 3:
-            m.design = StickerDesign.Anchor(decode_Point(r.read_message()!)!)
+            m.design = StickerDesign.Anchor(decode_Point_at(r.read_message()!, depth + 1)!)
         elif tag.field == 4:
             m.design = StickerDesign.Tint(r.read_enum()!)
         elif tag.field == 5:
@@ -219,12 +237,54 @@ pub fn encode_Bin(m: Bin) -> Bytes:
 
 # decode a Bin from protobuf wire bytes.
 pub fn decode_Bin(data: Bytes) -> Bin!ProtoError:
+    return decode_Bin_at(data, 0)!
+
+# decode a Bin nested `depth` messages deep.
+fn decode_Bin_at(data: Bytes, depth: Int) -> Bin!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Bin(size: 0)
     r := reader(data)
     while not r.at_end():
         tag := r.read_tag()!
         if tag.field == 1:
             m.size = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Node
+pub struct Node:
+    pub label: String
+    pub child: Node?
+
+# encode a Node to protobuf wire bytes.
+pub fn encode_Node(m: Node) -> Bytes:
+    w := writer()
+    if m.label != "":
+        w.write_string(1, m.label) catch false
+    if let sub_child = m.child:
+        w.write_message(2, encode_Node(sub_child)) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Node from protobuf wire bytes.
+pub fn decode_Node(data: Bytes) -> Node!ProtoError:
+    return decode_Node_at(data, 0)!
+
+# decode a Node nested `depth` messages deep.
+fn decode_Node_at(data: Bytes, depth: Int) -> Node!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
+    m := Node(label: "", child: none)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.label = r.read_string()!
+        elif tag.field == 2:
+            m.child = decode_Node_at(r.read_message()!, depth + 1)!
         else:
             r.skip(tag.wire)!
     return m
@@ -247,6 +307,12 @@ pub fn encode_Timestamp(m: Timestamp) -> Bytes:
 
 # decode a Timestamp from protobuf wire bytes.
 pub fn decode_Timestamp(data: Bytes) -> Timestamp!ProtoError:
+    return decode_Timestamp_at(data, 0)!
+
+# decode a Timestamp nested `depth` messages deep.
+fn decode_Timestamp_at(data: Bytes, depth: Int) -> Timestamp!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Timestamp(seconds: 0, nanos: 0)
     r := reader(data)
     while not r.at_end():
@@ -277,6 +343,12 @@ pub fn encode_Duration(m: Duration) -> Bytes:
 
 # decode a Duration from protobuf wire bytes.
 pub fn decode_Duration(data: Bytes) -> Duration!ProtoError:
+    return decode_Duration_at(data, 0)!
+
+# decode a Duration nested `depth` messages deep.
+fn decode_Duration_at(data: Bytes, depth: Int) -> Duration!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Duration(seconds: 0, nanos: 0)
     r := reader(data)
     while not r.at_end():
@@ -304,6 +376,12 @@ pub fn encode_Int32Value(m: Int32Value) -> Bytes:
 
 # decode a Int32Value from protobuf wire bytes.
 pub fn decode_Int32Value(data: Bytes) -> Int32Value!ProtoError:
+    return decode_Int32Value_at(data, 0)!
+
+# decode a Int32Value nested `depth` messages deep.
+fn decode_Int32Value_at(data: Bytes, depth: Int) -> Int32Value!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Int32Value(value: 0)
     r := reader(data)
     while not r.at_end():
@@ -327,6 +405,12 @@ pub fn encode_Empty(m: Empty) -> Bytes:
 
 # decode a Empty from protobuf wire bytes.
 pub fn decode_Empty(data: Bytes) -> Empty!ProtoError:
+    return decode_Empty_at(data, 0)!
+
+# decode a Empty nested `depth` messages deep.
+fn decode_Empty_at(data: Bytes, depth: Int) -> Empty!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Empty(_empty: false)
     r := reader(data)
     while not r.at_end():
@@ -358,6 +442,12 @@ pub fn encode_Event(m: Event) -> Bytes:
 
 # decode a Event from protobuf wire bytes.
 pub fn decode_Event(data: Bytes) -> Event!ProtoError:
+    return decode_Event_at(data, 0)!
+
+# decode a Event nested `depth` messages deep.
+fn decode_Event_at(data: Bytes, depth: Int) -> Event!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Event(name: "", at: none, elapsed: none, priority: none)
     r := reader(data)
     while not r.at_end():
@@ -365,11 +455,11 @@ pub fn decode_Event(data: Bytes) -> Event!ProtoError:
         if tag.field == 1:
             m.name = r.read_string()!
         elif tag.field == 2:
-            m.at = decode_Timestamp(r.read_message()!)!
+            m.at = decode_Timestamp_at(r.read_message()!, depth + 1)!
         elif tag.field == 3:
-            m.elapsed = decode_Duration(r.read_message()!)!
+            m.elapsed = decode_Duration_at(r.read_message()!, depth + 1)!
         elif tag.field == 4:
-            m.priority = decode_Int32Value(r.read_message()!)!
+            m.priority = decode_Int32Value_at(r.read_message()!, depth + 1)!
         else:
             r.skip(tag.wire)!
     return m
@@ -407,6 +497,12 @@ pub fn encode_Inventory(m: Inventory) -> Bytes:
 
 # decode a Inventory from protobuf wire bytes.
 pub fn decode_Inventory(data: Bytes) -> Inventory!ProtoError:
+    return decode_Inventory_at(data, 0)!
+
+# decode a Inventory nested `depth` messages deep.
+fn decode_Inventory_at(data: Bytes, depth: Int) -> Inventory!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Inventory(counts: {}, bins: {}, names: {})
     r := reader(data)
     while not r.at_end():
@@ -427,13 +523,13 @@ pub fn decode_Inventory(data: Bytes) -> Inventory!ProtoError:
         elif tag.field == 2:
             er_bins := reader(r.read_message()!)
             mut mk_bins := ""
-            mut mv_bins := decode_Bin(bytes.empty())!
+            mut mv_bins := decode_Bin_at(bytes.empty(), depth + 1)!
             while not er_bins.at_end():
                 et_bins := er_bins.read_tag()!
                 if et_bins.field == 1:
                     mk_bins = er_bins.read_string()!
                 elif et_bins.field == 2:
-                    mv_bins = decode_Bin(er_bins.read_message()!)!
+                    mv_bins = decode_Bin_at(er_bins.read_message()!, depth + 1)!
                 else:
                     er_bins.skip(et_bins.wire)!
             m.bins.insert(mk_bins, mv_bins)

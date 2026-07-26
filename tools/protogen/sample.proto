@@ -78,6 +78,14 @@ message Bin {
   int32 size = 1;
 }
 
+// a self-referential message. the decoder for one of these recurses per level
+// of nesting, and a sender pays about two bytes a level, so it is the shape
+// that needs the depth ceiling.
+message Node {
+  string label = 1;
+  Node child = 2;
+}
+
 // exercises all four rpc shapes: unary, server-streaming, client-streaming,
 // and bidirectional-streaming.
 service Geometry {

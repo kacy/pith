@@ -6,10 +6,12 @@ from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, d
 from sample_gen import Sticker, encode_Sticker, decode_Sticker, StickerDesign, StickerBacking
 from sample_gen import Sticker_emoji, Sticker_anchor, Sticker_tint, Sticker_design_unset, Sticker_reusable, Sticker_stock, Sticker_backing_unset
 from sample_gen import Inventory, Bin, encode_Inventory, decode_Inventory
+from sample_gen import Node, encode_Node, decode_Node
 from sample_gen import Event, encode_Event, decode_Event, Timestamp, Duration, Int32Value
 from sample_gen import encode_Timestamp, decode_Timestamp, Empty, encode_Empty, decode_Empty
 from protogen_lib import parse, generate
-from std.protobuf import writer
+from std.protobuf import writer, MAX_NESTING_DEPTH
+import std.bits as bits
 import std.bytes as bytes
 import std.encoding as encoding
 import std.fs as fs
@@ -444,3 +446,65 @@ test "the geometry service generates streaming server stubs":
     assert(has(out, "_Geometry_Describe_fn = Describe"))
     assert(has(out, "grpc.serve_stream(host, port, _Geometry_stream_route)"))
     assert(has(out, "grpc.serve_stream_tls(host, port, cert, key, _Geometry_stream_route)"))
+
+# n nested empty Node messages, built in one pass rather than by re-wrapping a
+# payload n times (which would be quadratic). level i's length is 1 for the tag
+# plus the varint for, and the size of, the level below, so the lengths come
+# from a bottom-up sweep and the bytes are written outermost-first.
+fn nested_nodes(levels: Int) -> Bytes:
+    mut lengths: List[Int] := []
+    mut len := 0
+    mut i := 0
+    while i < levels:
+        lengths.push(len)
+        len = 1 + varint_width(len) + len
+        i = i + 1
+    buf := bytes.buffer()
+    mut j := levels - 1
+    while j >= 0:
+        buf.write_byte(18) catch 0
+        mut v := lengths[j]
+        while v >= 128:
+            buf.write_byte(bits.bor(bits.band(v, 127), 128)) catch 0
+            v = bits.shr(v, 7)
+        buf.write_byte(v) catch 0
+        j = j - 1
+    out := buf.bytes()
+    buf.free()
+    return out
+
+fn varint_width(v: Int) -> Int:
+    mut n := 1
+    mut x := bits.shr(v, 7)
+    while x != 0:
+        n = n + 1
+        x = bits.shr(x, 7)
+    return n
+
+fn depth_of(n: Node) -> Int:
+    mut d := 0
+    mut cur := n.child
+    while cur != none:
+        d = d + 1
+        cur = cur.unwrap_or(Node(label: "", child: none)).child
+    return d
+
+test "a recursive message round-trips within the nesting limit":
+    inner := Node(label: "leaf", child: none)
+    outer := Node(label: "root", child: inner)
+    back := decode_Node(encode_Node(outer))!
+    assert_eq(back.label, "root")
+    assert_eq(depth_of(back), 1)
+
+test "nesting up to the limit still decodes":
+    ok := decode_Node(nested_nodes(MAX_NESTING_DEPTH))
+    assert(not ok.is_err)
+
+test "nesting past the limit is refused instead of recursing":
+    # 60000 levels is 234KB on the wire and used to take the process down with
+    # a stack overflow: no error, no output, just a dead server.
+    deep := nested_nodes(60000)
+    assert(deep.len() < 250000)
+    refused := decode_Node(deep)
+    assert(refused.is_err)
+    assert(refused.err.message.contains("nesting"))

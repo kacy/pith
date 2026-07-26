@@ -830,7 +830,7 @@ fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: 
     if f.label == "repeated":
         if is_message(f.ptype, message_names):
             tn := simple_name(f.ptype)
-            out.push("            {fref}.push(decode_{tn}(r.read_message()!)!)")
+            out.push("            {fref}.push(decode_{tn}_at(r.read_message()!, depth + 1)!)")
         elif f.ptype == "string":
             out.push("            {fref}.push(r.read_string()!)")
         elif f.ptype == "bytes":
@@ -846,7 +846,7 @@ fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: 
         return out
     if is_message(f.ptype, message_names):
         tn := simple_name(f.ptype)
-        out.push("            {fref} = decode_{tn}(r.read_message()!)!")
+        out.push("            {fref} = decode_{tn}_at(r.read_message()!, depth + 1)!")
         return out
     rmethod := read_method(f.ptype, enum_names)
     out.push("            {fref} = r.{rmethod}()!")
@@ -886,7 +886,7 @@ fn encode_map(mf: MapField, message_names: List[String], enum_names: List[String
 fn map_value_zero(vtype: String, message_names: List[String], enum_names: List[String]) -> String:
     if is_message(vtype, message_names):
         tn := simple_name(vtype)
-        return "decode_{tn}(bytes.empty())!"
+        return "decode_{tn}_at(bytes.empty(), depth + 1)!"
     return scalar_zero(scalar_pith_type(vtype, message_names, enum_names))
 
 # the decode arm for one map field: read the entry message, parse key (1) and
@@ -919,7 +919,7 @@ fn decode_map_field(mf: MapField, first: Bool, message_names: List[String], enum
     out.push("                elif {et}.field == 2:")
     if is_message(mf.value_type, message_names):
         tn := simple_name(mf.value_type)
-        out.push("                    {mv} = decode_{tn}({er}.read_message()!)!")
+        out.push("                    {mv} = decode_{tn}_at({er}.read_message()!, depth + 1)!")
     else:
         vread := read_method(mf.value_type, enum_names)
         out.push("                    {mv} = {er}.{vread}()!")
@@ -992,7 +992,7 @@ fn decode_oneof_field(ename: String, oname: String, f: Field, first: Bool, messa
     out.push("        {keyword} tag.field == {num}:")
     if is_message(f.ptype, message_names):
         tn := simple_name(f.ptype)
-        out.push("            m.{oname} = {ename}.{variant}(decode_{tn}(r.read_message()!)!)")
+        out.push("            m.{oname} = {ename}.{variant}(decode_{tn}_at(r.read_message()!, depth + 1)!)")
     else:
         rmethod := read_method(f.ptype, enum_names)
         out.push("            m.{oname} = {ename}.{variant}(r.{rmethod}()!)")
@@ -1016,7 +1016,7 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
     if pkg != "":
         lines.push("# proto package: {pkg}")
     lines.push("")
-    lines.push("from std.protobuf import ProtoError, writer, reader, WIRE_LEN")
+    lines.push("from std.protobuf import ProtoError, writer, reader, WIRE_LEN, MAX_NESTING_DEPTH, nesting_error")
     lines.push("import std.bytes as bytes")
     if pf.services.len() > 0:
         lines.push("import std.net.grpc as grpc")
@@ -1097,6 +1097,15 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         # decode
         lines.push("# decode a {m.name} from protobuf wire bytes.")
         lines.push("pub fn decode_{m.name}(data: Bytes) -> {m.name}!ProtoError:")
+        lines.push("    return decode_{m.name}_at(data, 0)!")
+        lines.push("")
+        # the depth-carrying twin. a message that nests itself decodes by
+        # recursing, and the wire format costs a sender two bytes per level, so
+        # without a ceiling a small body runs the stack out.
+        lines.push("# decode a {m.name} nested `depth` messages deep.")
+        lines.push("fn decode_{m.name}_at(data: Bytes, depth: Int) -> {m.name}!ProtoError:")
+        lines.push("    if depth > MAX_NESTING_DEPTH:")
+        lines.push("        fail nesting_error()")
         lines.push("    m := {m.name}({ctor})")
         lines.push("    r := reader(data)")
         lines.push("    while not r.at_end():")

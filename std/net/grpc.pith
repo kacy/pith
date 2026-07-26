@@ -439,6 +439,12 @@ fn has_header(fields: List[hpack.HeaderField], name: String) -> Bool:
 
 # --- streaming --------------------------------------------------------------
 
+# the largest single message a deframer will reassemble. the frame header can
+# declare up to 4 GiB, and a peer that declares a huge length and then dribbles
+# the body makes the receiver buffer toward that number long before it can tell
+# the message will never arrive. 4 MiB is grpc's own default receive limit.
+pub MAX_MESSAGE_BYTES := 4194304
+
 # a grpc message deframer: incoming DATA chunks arrive on arbitrary boundaries,
 # so it accumulates bytes and hands back complete length-prefixed messages
 # ([1-byte compression flag][4-byte big-endian length][message]) one at a time.
@@ -461,13 +467,24 @@ impl Deframer:
         if chunk.len() > 0:
             self.buf = bytes.concat(self.buf, chunk)
 
-    # whether a complete message is buffered and ready to take with next().
+    # the message length from the buffered header, or -1 if the header is not
+    # complete yet.
+    fn header_length() -> Int:
+        if self.buf.len() - self.pos < 5:
+            return -1
+        return read_u32(self.buf, self.pos + 1)
+
+    # whether next() can be called: either a complete message is buffered, or
+    # the header declares one too large to accept. an over-limit message counts
+    # as ready so the caller drains it and gets the error from next(), rather
+    # than buffering toward a length that was never going to be allowed.
     pub fn ready() -> Bool:
-        avail := self.buf.len() - self.pos
-        if avail < 5:
+        length := self.header_length()
+        if length < 0:
             return false
-        length := read_u32(self.buf, self.pos + 1)
-        return avail >= 5 + length
+        if length > MAX_MESSAGE_BYTES:
+            return true
+        return self.buf.len() - self.pos >= 5 + length
 
     # bytes buffered but not yet consumed. after draining every ready() message,
     # a non-zero remainder is a partial frame — the sender either truncated the
@@ -476,11 +493,18 @@ impl Deframer:
         return self.buf.len() - self.pos
 
     # take the next complete message and advance past it. precondition: ready().
-    # fails if the message is flagged compressed, which this client does not read.
+    # fails if the message is larger than MAX_MESSAGE_BYTES, or if it is flagged
+    # compressed, which this implementation does not read.
     pub fn next() -> Bytes!GrpcError:
+        # the size limit is checked before the compression flag, the order grpc
+        # itself uses. it matters for bytes that were never framed at all: any
+        # leading byte reads as "compressed", so checking the flag first would
+        # answer "compression unsupported" for plain garbage.
+        length := self.header_length()
+        if length > MAX_MESSAGE_BYTES:
+            fail GrpcError(GRPC_RESOURCE_EXHAUSTED, "grpc: message of {length} bytes exceeds the {MAX_MESSAGE_BYTES}-byte receive limit")
         if self.buf[self.pos] != 0:
             fail GrpcError(GRPC_UNIMPLEMENTED, "grpc message compression is not supported")
-        length := read_u32(self.buf, self.pos + 1)
         msg := self.buf.slice(self.pos + 5, self.pos + 5 + length)
         self.pos = self.pos + 5 + length
         return msg
@@ -1447,3 +1471,4 @@ test "begin_request_context stashes the context and spots a spent deadline":
     assert_eq(incoming_deadline_ms(), 0)
     assert(not begin_request_context(context_test_request("abc")!))
     assert_eq(incoming_deadline_ms(), 0)
+

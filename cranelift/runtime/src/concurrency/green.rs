@@ -533,6 +533,11 @@ struct Join {
     done: bool,
     result: i64,
     green_waiters: Vec<TaskId>,
+    /// os-thread awaiters currently blocked in `cvar.wait`. completion only
+    /// signals the condvar when this is non-zero: the overwhelmingly common
+    /// detached-or-not-yet-awaited case then skips the notify call entirely, and
+    /// a later awaiter sees `done` before it ever waits.
+    condvar_waiters: u32,
 }
 
 struct Task {
@@ -1354,7 +1359,9 @@ fn finish_task(id: TaskId, result: i64) {
         let mut j = lock_join(lock);
         j.done = true;
         j.result = result;
-        cvar.notify_all();
+        if j.condvar_waiters > 0 {
+            cvar.notify_all();
+        }
         std::mem::take(&mut j.green_waiters)
     };
     for waiter in green_waiters {
@@ -1554,6 +1561,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             done: false,
             result: 0,
             green_waiters: Vec::new(),
+            condvar_waiters: 0,
         }),
         Condvar::new(),
     ));
@@ -1654,8 +1662,15 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
     let mut j = lock_join(lock);
     while !j.done {
         match green_task {
-            // os-thread awaiter: condvar-wait, unchanged from the P1a path.
-            None => j = cvar.wait(j).unwrap_or_else(|p| p.into_inner()),
+            // os-thread awaiter: condvar-wait. the waiter count brackets the
+            // wait so completion knows a notify is worth making; it is
+            // maintained under the join lock, so the count and the wait are one
+            // atomic step from the completer's point of view.
+            None => {
+                j.condvar_waiters += 1;
+                j = cvar.wait(j).unwrap_or_else(|p| p.into_inner());
+                j.condvar_waiters -= 1;
+            }
             // green awaiter: register under the join lock, release it, and suspend
             // the coroutine. re-lock and re-check `done` on resume — a completing
             // task drains the list, so we are woken exactly when `done` is set.
@@ -1807,6 +1822,7 @@ mod tests {
                 done: false,
                 result: 0,
                 green_waiters: Vec::new(),
+                condvar_waiters: 0,
             }),
             Condvar::new(),
         ));
@@ -1895,6 +1911,7 @@ mod tests {
                 done: false,
                 result: 0,
                 green_waiters: Vec::new(),
+                condvar_waiters: 0,
             }),
             Condvar::new(),
         ))

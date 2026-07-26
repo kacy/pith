@@ -372,9 +372,17 @@ impl Server:
     # drop a stream from the table once its handler is done (or it was reset). its
     # send window is dropped and its credit channel closed, which wakes the body
     # sender if it was blocked waiting on a window (it then gives up).
+    #
+    # the inbox is closed as well as removed. deliver() takes the inbox handle
+    # under the mutex and sends outside it, so a stream that ends in that window
+    # would otherwise leave the reader parked on a send into an inbox nobody will
+    # ever drain — and the reader is shared, so that one stream wedges every
+    # other stream on the connection along with its control frames. closing wakes
+    # the send, and a send into a closed channel is a no-op.
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
+            self.streams[stream_id].close()
             self.streams.remove(stream_id)
         if self.send_windows.contains_key(stream_id):
             self.send_windows.remove(stream_id)

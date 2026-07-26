@@ -502,6 +502,7 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
         Role::Receiver => &inner.receivers,
         Role::Sender => &inner.senders,
     };
+    crate::concurrency::green::note_channel_wake();
     cvar.notify_one();
     wake_green(&mut state, role);
 }

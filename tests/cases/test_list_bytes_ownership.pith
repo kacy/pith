@@ -1,0 +1,66 @@
+# a List[Bytes] has to own its elements.
+#
+# it used to be built untagged — the same list kind used for List[Int] — so
+# pushing a handle stored the number without taking a reference. a literal like
+# `self.chunks = [buf]` therefore left the list pointing at a Bytes that the
+# enclosing scope freed on the way out, and the elements read back empty. it was
+# silent: the list still had the right length, so a caller saw a message of zero
+# bytes rather than a crash.
+#
+# every case here builds a Bytes, hands it to a list, lets the original binding
+# go out of scope, and then reads the element back.
+
+import std.bytes as bytes
+
+struct Holder:
+    mut items: List[Bytes]
+
+impl Holder:
+    fn adopt(data: Bytes):
+        self.items = [data]
+
+fn fill(h: Holder):
+    payload := bytes.from_string_utf8("hello")
+    h.items = [payload]
+
+# returns a list whose element was created inside this call, so the only
+# surviving owner is the list itself.
+fn make_list() -> List[Bytes]:
+    fresh := bytes.from_string_utf8("survivor")
+    return [fresh]
+
+fn text(data: Bytes) -> String:
+    return bytes.to_string_utf8(data) catch "<freed>"
+
+fn main():
+    # a literal assigned to a struct field from another function
+    h := Holder([])
+    fill(h)
+    print("field:" + text(h.items[0]))
+
+    # the same, through a method, where the element came in as a parameter
+    m := Holder([])
+    m.adopt(bytes.from_string_utf8("method"))
+    print("method:" + text(m.items[0]))
+
+    # a list returned from a function that owns nothing else
+    returned := make_list()
+    print("returned:" + text(returned[0]))
+
+    # several elements, some borrowed and some fresh, in one literal
+    borrowed := bytes.from_string_utf8("borrowed")
+    mixed: List[Bytes] := [borrowed, bytes.from_string_utf8("fresh")]
+    print("mixed:" + text(mixed[0]) + "," + text(mixed[1]))
+
+    # the borrowed element is still usable after the list has taken it
+    print("still-live:" + text(borrowed))
+
+    # push, then read back after the original binding's scope has ended
+    pushed := Holder([])
+    pushed.items = []
+    fill_by_push(pushed)
+    print("pushed:" + text(pushed.items[0]))
+
+fn fill_by_push(h: Holder):
+    data := bytes.from_string_utf8("pushed")
+    h.items.push(data)

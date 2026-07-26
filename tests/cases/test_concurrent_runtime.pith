@@ -21,7 +21,9 @@ fn main() -> Int!:
 
     quick := spawn slow_value(5, 9)
     print("done-before:{quick.is_done()}")
-    time.delay(10)
+    # a wide margin over the task's 5ms sleep on purpose: this used to wait 10ms,
+    # which a loaded box misses often enough to make the suite flaky.
+    time.delay(250)
     print("done-after:{quick.is_done()}")
     print("await:{await quick}")
 

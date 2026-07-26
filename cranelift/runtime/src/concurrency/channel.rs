@@ -214,10 +214,16 @@ impl Ring {
 }
 
 struct ChannelState {
-    queue: VecDeque<i64>,
     capacity: usize,
     closed: bool,
     pending_value: Option<i64>,
+    /// Rendezvous handoffs completed on this channel. A parked unbuffered
+    /// sender records this before it waits and compares afterwards: close()
+    /// clears `pending_value` the same way a receiver taking it does, so
+    /// without the counter a sender whose value *was* delivered, and which then
+    /// woke to find the channel closed, reported failure. The caller would
+    /// reasonably resend, and the value would be delivered twice.
+    deliveries: u64,
     receiver_waiting: usize,
     sender_waiting: usize,
     /// slab ids of green *receivers* suspended on this channel, and of green
@@ -255,6 +261,11 @@ enum Role {
 /// `buffered_send`).
 struct ChannelInner {
     ring: Option<Ring>,
+    /// the requested capacity, fixed at construction. kept here rather than read
+    /// back out of `state` because the buffered send path needs it on every
+    /// message: taking the parking-lot mutex for an immutable value put a lock
+    /// acquisition back on the path the ring exists to keep lock-free.
+    capacity: usize,
     closed_flag: AtomicBool,
     parked_senders: AtomicUsize,
     parked_receivers: AtomicUsize,
@@ -272,6 +283,12 @@ type PithChannelHandle = Arc<ChannelInner>;
 /// itself lock-free. channels are never freed, so the tag never needs scrubbing;
 /// garbage handles fail the alignment or magic check and read as invalid.
 const CHANNEL_MAGIC: u32 = 0x50434841;
+
+/// the largest buffered capacity a channel will allocate (16Mi values, 128 MiB
+/// of slots). the ring is eager, so an unbounded capacity turns a typo into an
+/// allocation abort; clamping keeps the failure mode "smaller buffer than you
+/// asked for" instead of "process dies".
+const MAX_CHANNEL_CAPACITY: i64 = 1 << 24;
 
 /// a channel allocation: the magic tag, then the shared handle.
 struct TaggedChannel {
@@ -418,12 +435,15 @@ fn optional_tuple(is_some: bool, value: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
-    let cap = capacity.max(0) as usize;
+    // the ring is allocated up front, so an absurd capacity would abort the
+    // process on the allocation rather than fail the call. cap it: past this
+    // many buffered values a program wants a queue it manages itself.
+    let cap = capacity.max(0).min(MAX_CHANNEL_CAPACITY) as usize;
     let state = ChannelState {
-        queue: VecDeque::new(),
         capacity: cap,
         closed: false,
         pending_value: None,
+        deliveries: 0,
         receiver_waiting: 0,
         sender_waiting: 0,
         green_receivers: Vec::new(),
@@ -431,6 +451,7 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
     };
     let channel = Arc::new(ChannelInner {
         ring: if cap > 0 { Some(Ring::new(cap)) } else { None },
+        capacity: cap,
         closed_flag: AtomicBool::new(false),
         parked_senders: AtomicUsize::new(0),
         parked_receivers: AtomicUsize::new(0),
@@ -505,7 +526,7 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
 const SPIN_TRIES: usize = 64;
 
 unsafe fn buffered_send(inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
-    let capacity = { lock_state(&inner.state).capacity };
+    let capacity = inner.capacity;
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
@@ -617,6 +638,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     if state.capacity == 0 {
         while !state.closed {
             if state.receiver_waiting > 0 && state.pending_value.is_none() {
+                let handoffs_before = state.deliveries;
                 state.pending_value = Some(value);
                 wake_receivers(inner, &mut state);
                 // count ourselves as a waiting sender while we wait for the
@@ -628,7 +650,11 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
                     state = block_on_channel(inner, state, green_task, Role::Sender);
                 }
                 state.sender_waiting -= 1;
-                return if state.closed { 0 } else { 1 };
+                // delivered is the authority, not `closed`: a receiver may have
+                // taken the value and the channel closed before this sender got
+                // the lock back.
+                let delivered = state.deliveries != handoffs_before;
+                return if delivered { 1 } else { 0 };
             }
             state.sender_waiting += 1;
             state = block_on_channel(inner, state, green_task, Role::Sender);
@@ -651,8 +677,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         if inner.closed_flag.load(Ordering::SeqCst) {
             return 0;
         }
-        let capacity = { lock_state(&inner.state).capacity };
-        if ring.try_enqueue(value, capacity) {
+        if ring.try_enqueue(value, inner.capacity) {
             wake_parked(inner, ring, Role::Receiver);
             return 1;
         }
@@ -688,6 +713,7 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
         if let Some(value) = state.pending_value.take() {
             // completed a rendezvous: wake the sender waiting for its value
             // to be taken.
+            state.deliveries += 1;
             wake_senders(inner, &mut state);
             return optional_tuple(true, value);
         }
@@ -721,6 +747,7 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
     }
     let mut state = lock_state(&inner.state);
     if let Some(value) = state.pending_value.take() {
+        state.deliveries += 1;
         wake_senders(inner, &mut state);
         return optional_tuple(true, value);
     }
@@ -760,8 +787,14 @@ pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
     if let Some(ring) = &channel.ring {
         return ring.len() as i64;
     }
+    // unbuffered: the only value "in" the channel is a rendezvous deposit
+    // waiting to be taken.
     let state = lock_state(&channel.state);
-    state.queue.len() as i64
+    if state.pending_value.is_some() {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -798,6 +831,78 @@ pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // an ALIGNED but bogus handle: the magic check is what has to reject this,
+    // since alignment alone lets the pointer be dereferenced. the older
+    // registry lookup rejected every unknown address; the tag scheme rejects
+    // anything whose first word is not CHANNEL_MAGIC, which is what this pins.
+    // (a pointer into unmapped memory is out of contract either way — the same
+    // practical guard strings, closures, and structs already use.)
+    #[test]
+    fn aligned_but_untagged_handle_is_rejected() {
+        let scratch: Box<[u64; 4]> = Box::new([0; 4]);
+        let handle = Box::into_raw(scratch) as i64;
+        assert_eq!(handle % 8, 0, "test needs an aligned allocation");
+        unsafe {
+            assert_eq!(pith_channel_send(handle, 7), 0);
+            assert_eq!(pith_channel_try_send(handle, 7), 0);
+            assert_eq!(pith_channel_close(handle), 0);
+            assert_eq!(pith_channel_len(handle), 0);
+            assert_eq!(pith_channel_cap(handle), 0);
+            assert_eq!(pith_channel_is_closed(handle), 1);
+            let recv = pith_channel_try_recv(handle) as *const i64;
+            assert_eq!(*recv, 0);
+            drop(Box::from_raw(handle as *mut [u64; 4]));
+        }
+    }
+
+    // a buffered channel's capacity is clamped rather than allocated blindly, so
+    // an absurd request degrades to a smaller buffer instead of aborting the
+    // process on a 16 GiB allocation.
+    #[test]
+    fn absurd_capacity_is_clamped() {
+        unsafe {
+            let ch = pith_channel_new(i64::MAX);
+            assert_eq!(pith_channel_cap(ch), MAX_CHANNEL_CAPACITY);
+            assert_eq!(pith_channel_try_send(ch, 1), 1);
+            let t = pith_channel_try_recv(ch) as *const i64;
+            assert_eq!((*t, *t.add(1)), (1, 1));
+        }
+    }
+
+    // an unbuffered send whose value a receiver took must report success even
+    // if the channel closes before the sender wakes up. close() clears the
+    // pending slot the same way a receiver taking it does, so a sender that
+    // looked only at `closed` reported failure for a value that had already
+    // been delivered — and a caller that retries on failure sends it twice.
+    #[test]
+    fn unbuffered_send_reports_delivery_not_closure() {
+        unsafe {
+            let ch = pith_channel_new(0);
+            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
+
+            // take the value, then close while the sender is still parked
+            let t = pith_channel_recv(ch) as *const i64;
+            assert_eq!((*t, *t.add(1)), (1, 42));
+            pith_channel_close(ch);
+
+            assert_eq!(sender.join().unwrap(), 1, "delivered value reported as failed");
+        }
+    }
+
+    // the other side of the same race: a sender parked with nobody to take its
+    // value gets a failure when the channel closes, so the caller knows the
+    // value never landed.
+    #[test]
+    fn unbuffered_send_fails_when_closed_undelivered() {
+        unsafe {
+            let ch = pith_channel_new(0);
+            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 7) });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            pith_channel_close(ch);
+            assert_eq!(sender.join().unwrap(), 0);
+        }
+    }
 
     #[test]
     fn invalid_channel_handles_return_safe_defaults() {

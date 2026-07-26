@@ -286,6 +286,27 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 `grpc.status_name(code)` gives the canonical name. raise them from a handler with
 `fail grpc.GrpcError(status: ..., message: ...)`.
 
+## limits
+
+the server refuses oversized input rather than trying to buffer it. none of
+these are configurable yet. they sit well above what ordinary traffic needs, so
+hitting one usually means something is wrong on the wire, not that the limit is
+too low.
+
+| limit | value | what happens past it |
+| --- | --- | --- |
+| `grpc.MAX_MESSAGE_BYTES` | 4 MiB | `RESOURCE_EXHAUSTED`, refused as soon as the frame header is read |
+| `grpc.MAX_STREAM_MESSAGES` | 65536 | `RESOURCE_EXHAUSTED` on a buffered request stream |
+| `http.MAX_REQUEST_BODY` | 10 MiB | the stream is reset |
+| concurrent streams per connection | 100 | `REFUSED_STREAM` |
+| concurrent connections per listener | 512 | the accept loop waits for one to end |
+| idle socket | 2 minutes | the connection is dropped |
+
+a body that is not framed cleanly — truncated, a length prefix that runs past
+what arrived, or bytes that were never framed at all — fails
+`INVALID_ARGUMENT` rather than decoding as an all-default message. a unary
+request carrying more than one message fails the same way.
+
 ## what isn't here yet
 
 - **generated streaming is server-side.** the generated *client* still collects

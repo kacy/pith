@@ -217,6 +217,13 @@ struct ChannelState {
     capacity: usize,
     closed: bool,
     pending_value: Option<i64>,
+    /// Rendezvous handoffs completed on this channel. A parked unbuffered
+    /// sender records this before it waits and compares afterwards: close()
+    /// clears `pending_value` the same way a receiver taking it does, so
+    /// without the counter a sender whose value *was* delivered, and which then
+    /// woke to find the channel closed, reported failure. The caller would
+    /// reasonably resend, and the value would be delivered twice.
+    deliveries: u64,
     receiver_waiting: usize,
     sender_waiting: usize,
     /// slab ids of green *receivers* suspended on this channel, and of green
@@ -436,6 +443,7 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         capacity: cap,
         closed: false,
         pending_value: None,
+        deliveries: 0,
         receiver_waiting: 0,
         sender_waiting: 0,
         green_receivers: Vec::new(),
@@ -630,6 +638,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     if state.capacity == 0 {
         while !state.closed {
             if state.receiver_waiting > 0 && state.pending_value.is_none() {
+                let handoffs_before = state.deliveries;
                 state.pending_value = Some(value);
                 wake_receivers(inner, &mut state);
                 // count ourselves as a waiting sender while we wait for the
@@ -641,7 +650,11 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
                     state = block_on_channel(inner, state, green_task, Role::Sender);
                 }
                 state.sender_waiting -= 1;
-                return if state.closed { 0 } else { 1 };
+                // delivered is the authority, not `closed`: a receiver may have
+                // taken the value and the channel closed before this sender got
+                // the lock back.
+                let delivered = state.deliveries != handoffs_before;
+                return if delivered { 1 } else { 0 };
             }
             state.sender_waiting += 1;
             state = block_on_channel(inner, state, green_task, Role::Sender);
@@ -700,6 +713,7 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
         if let Some(value) = state.pending_value.take() {
             // completed a rendezvous: wake the sender waiting for its value
             // to be taken.
+            state.deliveries += 1;
             wake_senders(inner, &mut state);
             return optional_tuple(true, value);
         }
@@ -733,6 +747,7 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
     }
     let mut state = lock_state(&inner.state);
     if let Some(value) = state.pending_value.take() {
+        state.deliveries += 1;
         wake_senders(inner, &mut state);
         return optional_tuple(true, value);
     }
@@ -852,6 +867,40 @@ mod tests {
             assert_eq!(pith_channel_try_send(ch, 1), 1);
             let t = pith_channel_try_recv(ch) as *const i64;
             assert_eq!((*t, *t.add(1)), (1, 1));
+        }
+    }
+
+    // an unbuffered send whose value a receiver took must report success even
+    // if the channel closes before the sender wakes up. close() clears the
+    // pending slot the same way a receiver taking it does, so a sender that
+    // looked only at `closed` reported failure for a value that had already
+    // been delivered — and a caller that retries on failure sends it twice.
+    #[test]
+    fn unbuffered_send_reports_delivery_not_closure() {
+        unsafe {
+            let ch = pith_channel_new(0);
+            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
+
+            // take the value, then close while the sender is still parked
+            let t = pith_channel_recv(ch) as *const i64;
+            assert_eq!((*t, *t.add(1)), (1, 42));
+            pith_channel_close(ch);
+
+            assert_eq!(sender.join().unwrap(), 1, "delivered value reported as failed");
+        }
+    }
+
+    // the other side of the same race: a sender parked with nobody to take its
+    // value gets a failure when the channel closes, so the caller knows the
+    // value never landed.
+    #[test]
+    fn unbuffered_send_fails_when_closed_undelivered() {
+        unsafe {
+            let ch = pith_channel_new(0);
+            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 7) });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            pith_channel_close(ch);
+            assert_eq!(sender.join().unwrap(), 0);
         }
     }
 

@@ -1274,6 +1274,13 @@ fn process_stdout_read_ctx(reader: ProcessStdout, ctx: Context, max_bytes: Int) 
             fail context_blocking_error(ctx)
         time.delay(1)
     read := await task
+    # the worker can finish the same instant the deadline fires: `is_done()`
+    # then wins the poll before the cancel is seen, so a read that came back
+    # empty only because it would have blocked is about to be mistaken for a
+    # clean end-of-stream. when the context is cancelled and nothing was read,
+    # it is the deadline, not eof.
+    if ctx.is_cancelled() and (read.is_err or read.ok.len() == 0):
+        fail context_blocking_error(ctx)
     if read.is_err:
         fail blocking_failed(read.err)
     return read.ok
@@ -1298,6 +1305,13 @@ fn process_stderr_read_ctx(reader: ProcessStderr, ctx: Context, max_bytes: Int) 
             fail context_blocking_error(ctx)
         time.delay(1)
     read := await task
+    # the worker can finish the same instant the deadline fires: `is_done()`
+    # then wins the poll before the cancel is seen, so a read that came back
+    # empty only because it would have blocked is about to be mistaken for a
+    # clean end-of-stream. when the context is cancelled and nothing was read,
+    # it is the deadline, not eof.
+    if ctx.is_cancelled() and (read.is_err or read.ok.len() == 0):
+        fail context_blocking_error(ctx)
     if read.is_err:
         fail blocking_failed(read.err)
     return read.ok
@@ -1538,6 +1552,13 @@ fn process_stdout_read_bytes_ctx(reader: ProcessStdout, ctx: Context, max_bytes:
             fail context_blocking_error(ctx)
         time.delay(1)
     read := await task
+    # the worker can finish the same instant the deadline fires: `is_done()`
+    # then wins the poll before the cancel is seen, so a read that came back
+    # empty only because it would have blocked is about to be mistaken for a
+    # clean end-of-stream. when the context is cancelled and nothing was read,
+    # it is the deadline, not eof.
+    if ctx.is_cancelled() and (read.is_err or read.ok.len() == 0):
+        fail context_blocking_error(ctx)
     if read.is_err:
         fail blocking_failed(read.err)
     return read.ok
@@ -1564,6 +1585,13 @@ fn process_stderr_read_bytes_ctx(reader: ProcessStderr, ctx: Context, max_bytes:
             fail context_blocking_error(ctx)
         time.delay(1)
     read := await task
+    # the worker can finish the same instant the deadline fires: `is_done()`
+    # then wins the poll before the cancel is seen, so a read that came back
+    # empty only because it would have blocked is about to be mistaken for a
+    # clean end-of-stream. when the context is cancelled and nothing was read,
+    # it is the deadline, not eof.
+    if ctx.is_cancelled() and (read.is_err or read.ok.len() == 0):
+        fail context_blocking_error(ctx)
     if read.is_err:
         fail blocking_failed(read.err)
     return read.ok

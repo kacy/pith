@@ -226,6 +226,16 @@ struct ChannelState {
     deliveries: u64,
     receiver_waiting: usize,
     sender_waiting: usize,
+    /// how many of the waiters counted above are *os-thread* waiters, parked in
+    /// `cvar.wait` — maintained by `block_on_channel` under this lock. a wake
+    /// only signals a role's condvar when this says an os-thread waiter is
+    /// actually parked there: std's futex-based condvar pays an unconditional
+    /// `futex(FUTEX_WAKE)` syscall on every notify, even with nobody waiting,
+    /// and on an all-green channel that made every single wake a syscall — the
+    /// dominant cost of the whole pipeline. green waiters are woken through
+    /// their scheduler instead, no syscall involved.
+    os_receivers_waiting: usize,
+    os_senders_waiting: usize,
     /// slab ids of green *receivers* suspended on this channel, and of green
     /// *senders*, kept apart. a notify only ever needs to wake the opposite role:
     /// a receiver becomes runnable when a sender makes room or deposits a value,
@@ -343,7 +353,9 @@ fn wake_green(state: &mut ChannelState, role: Role) {
 }
 
 /// notify the os-thread waiters parked on one role's condvar, skipping the
-/// syscall entirely when none are parked (`waiting == 0`).
+/// syscall entirely when none are parked (`waiting` is the role's *os-thread*
+/// waiter count — green waiters are woken through their scheduler and must not
+/// trigger a condvar futex; see `os_receivers_waiting`).
 ///
 /// a **buffered** channel hands off one value or one freed slot at a time, and
 /// any parked waiter of a role wants the same thing (a receiver wants a value, a
@@ -373,14 +385,14 @@ fn notify_role(cvar: &Condvar, capacity: usize, waiting: usize) {
 /// wake the receivers parked on this channel (opposite role of a send): one
 /// os-thread receiver if buffered, all if a rendezvous, plus any green receivers.
 fn wake_receivers(inner: &ChannelInner, state: &mut ChannelState) {
-    notify_role(&inner.receivers, state.capacity, state.receiver_waiting);
+    notify_role(&inner.receivers, state.capacity, state.os_receivers_waiting);
     wake_green(state, Role::Receiver);
 }
 
 /// wake the senders parked on this channel (opposite role of a recv): symmetric
 /// to `wake_receivers`.
 fn wake_senders(inner: &ChannelInner, state: &mut ChannelState) {
-    notify_role(&inner.senders, state.capacity, state.sender_waiting);
+    notify_role(&inner.senders, state.capacity, state.os_senders_waiting);
     wake_green(state, Role::Sender);
 }
 
@@ -397,12 +409,27 @@ fn block_on_channel<'a>(
 ) -> MutexGuard<'a, ChannelState> {
     match green_task {
         None => {
+            // count this os-thread waiter under the channel lock before
+            // waiting, so a waker holding the same lock knows a condvar notify
+            // is worth its futex syscall (see `os_receivers_waiting`).
             let cvar = match role {
-                Role::Sender => &inner.senders,
-                Role::Receiver => &inner.receivers,
+                Role::Sender => {
+                    state.os_senders_waiting += 1;
+                    &inner.senders
+                }
+                Role::Receiver => {
+                    state.os_receivers_waiting += 1;
+                    &inner.receivers
+                }
             };
-            cvar.wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            let mut state = cvar
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match role {
+                Role::Sender => state.os_senders_waiting -= 1,
+                Role::Receiver => state.os_receivers_waiting -= 1,
+            }
+            state
         }
         Some(id) => {
             // register under the lock so a concurrent notify cannot miss us, then
@@ -446,6 +473,8 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         deliveries: 0,
         receiver_waiting: 0,
         sender_waiting: 0,
+        os_receivers_waiting: 0,
+        os_senders_waiting: 0,
         green_receivers: Vec::new(),
         green_senders: Vec::new(),
     };
@@ -498,12 +527,21 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
             return;
         }
     }
-    let cvar = match role {
-        Role::Receiver => &inner.receivers,
-        Role::Sender => &inner.senders,
-    };
     crate::concurrency::green::note_channel_wake();
-    cvar.notify_one();
+    // signal the role's condvar only when an os-thread waiter is actually
+    // parked in it: std's condvar pays a futex syscall per notify regardless
+    // of waiters, and on an all-green channel every message would eat two of
+    // them. the count is exact under this lock — an os-thread waiter
+    // increments it under the same lock before it waits (block_on_channel),
+    // so it either sees our ring value on its pre-wait re-try or is counted
+    // here. green waiters go through their scheduler below, no syscall.
+    let (cvar, os_waiting) = match role {
+        Role::Receiver => (&inner.receivers, state.os_receivers_waiting),
+        Role::Sender => (&inner.senders, state.os_senders_waiting),
+    };
+    if os_waiting > 0 {
+        cvar.notify_one();
+    }
     wake_green(&mut state, role);
 }
 

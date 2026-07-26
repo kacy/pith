@@ -403,12 +403,64 @@ fn status_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderFiel
     return GRPC_OK
 
 # the grpc-message (the human-readable error detail), from the trailers or the
-# initial headers; "" when the server sends none.
+# initial headers; "" when the server sends none. the value arrives
+# percent-encoded, so it is decoded back to the text the server wrote.
 fn message_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField]) -> String:
     message := find_header(trailers, "grpc-message")
     if message != "":
-        return message
-    return find_header(headers, "grpc-message")
+        return percent_decode(message)
+    return percent_decode(find_header(headers, "grpc-message"))
+
+# grpc-message is percent-encoded on the wire (grpc's PROTOCOL-HTTP2): printable
+# ascii passes through, everything else — including the CR, LF, and NUL that
+# RFC 9113 §8.2.1 forbids in a field value, and any byte of a utf8 message —
+# becomes %XX. without this a handler that puts a newline or a non-ascii
+# character in an error message writes a field value a compliant client must
+# reject, which turns a readable error into a broken response.
+fn percent_encode(text: String) -> String:
+    hex_digits := "0123456789ABCDEF"
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        # ord is signed, so a utf8 continuation byte comes back negative; mask
+        # it to the 0-255 the escape needs.
+        code := bits.band(ord(c), 255)
+        if code >= 32 and code <= 126 and c != "%":
+            out = out + c
+        else:
+            out = out + "%" + hex_digits[code / 16] + hex_digits[code % 16]
+        i = i + 1
+    return out
+
+# the inverse. a malformed escape is left as written rather than dropped, so a
+# server that never encoded its message still reads back as itself.
+fn percent_decode(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        if text[i] == "%" and i + 2 < text.len():
+            high := percent_nibble(text[i + 1])
+            low := percent_nibble(text[i + 2])
+            if high >= 0 and low >= 0:
+                out = out + chr(high * 16 + low)
+                i = i + 3
+            else:
+                out = out + text[i]
+                i = i + 1
+        else:
+            out = out + text[i]
+            i = i + 1
+    return out
+
+fn percent_nibble(c: String) -> Int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 97 + 10
+    if c >= "A" and c <= "F":
+        return ord(c) - 65 + 10
+    return 0 - 1
 
 # parse a decimal grpc-status value; an empty or non-numeric value reads as 0.
 fn parse_status(text: String) -> Int:
@@ -439,6 +491,12 @@ fn has_header(fields: List[hpack.HeaderField], name: String) -> Bool:
 
 # --- streaming --------------------------------------------------------------
 
+# the largest single message a deframer will reassemble. the frame header can
+# declare up to 4 GiB, and a peer that declares a huge length and then dribbles
+# the body makes the receiver buffer toward that number long before it can tell
+# the message will never arrive. 4 MiB is grpc's own default receive limit.
+pub MAX_MESSAGE_BYTES := 4194304
+
 # a grpc message deframer: incoming DATA chunks arrive on arbitrary boundaries,
 # so it accumulates bytes and hands back complete length-prefixed messages
 # ([1-byte compression flag][4-byte big-endian length][message]) one at a time.
@@ -461,20 +519,44 @@ impl Deframer:
         if chunk.len() > 0:
             self.buf = bytes.concat(self.buf, chunk)
 
-    # whether a complete message is buffered and ready to take with next().
+    # the message length from the buffered header, or -1 if the header is not
+    # complete yet.
+    fn header_length() -> Int:
+        if self.buf.len() - self.pos < 5:
+            return -1
+        return read_u32(self.buf, self.pos + 1)
+
+    # whether next() can be called: either a complete message is buffered, or
+    # the header declares one too large to accept. an over-limit message counts
+    # as ready so the caller drains it and gets the error from next(), rather
+    # than buffering toward a length that was never going to be allowed.
     pub fn ready() -> Bool:
-        avail := self.buf.len() - self.pos
-        if avail < 5:
+        length := self.header_length()
+        if length < 0:
             return false
-        length := read_u32(self.buf, self.pos + 1)
-        return avail >= 5 + length
+        if length > MAX_MESSAGE_BYTES:
+            return true
+        return self.buf.len() - self.pos >= 5 + length
+
+    # bytes buffered but not yet consumed. after draining every ready() message,
+    # a non-zero remainder is a partial frame — the sender either truncated the
+    # body or framed it wrong, which callers reject rather than silently drop.
+    pub fn remaining() -> Int:
+        return self.buf.len() - self.pos
 
     # take the next complete message and advance past it. precondition: ready().
-    # fails if the message is flagged compressed, which this client does not read.
+    # fails if the message is larger than MAX_MESSAGE_BYTES, or if it is flagged
+    # compressed, which this implementation does not read.
     pub fn next() -> Bytes!GrpcError:
+        # the size limit is checked before the compression flag, the order grpc
+        # itself uses. it matters for bytes that were never framed at all: any
+        # leading byte reads as "compressed", so checking the flag first would
+        # answer "compression unsupported" for plain garbage.
+        length := self.header_length()
+        if length > MAX_MESSAGE_BYTES:
+            fail GrpcError(GRPC_RESOURCE_EXHAUSTED, "grpc: message of {length} bytes exceeds the {MAX_MESSAGE_BYTES}-byte receive limit")
         if self.buf[self.pos] != 0:
             fail GrpcError(GRPC_UNIMPLEMENTED, "grpc message compression is not supported")
-        length := read_u32(self.buf, self.pos + 1)
         msg := self.buf.slice(self.pos + 5, self.pos + 5 + length)
         self.pos = self.pos + 5 + length
         return msg
@@ -1134,18 +1216,29 @@ fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
     mut t: Map[String, String] := {}
     t.insert("grpc-status", status.to_string())
     if message.len() > 0:
-        t.insert("grpc-message", message)
+        t.insert("grpc-message", percent_encode(message))
     return t
 
 # extract the single request message from a unary request body (one
 # length-prefixed frame). an all-default proto3 message can arrive as an empty
 # body, which decodes to a default message.
 fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
+    # an all-default proto3 message encodes to no bytes, and a peer may send it
+    # as an empty body: that is the one case where "nothing" is a valid message.
+    if body.len() == 0:
+        return bytes.empty()
     d := new_deframer()
     d.push(body)
     if not d.ready():
-        return bytes.empty()
-    return d.next()!
+        # a body that is not a complete frame is malformed — truncated, or a
+        # length prefix that overruns what was sent. answering OK with an empty
+        # message would let corrupt input look like a successful default-valued
+        # call, so reject it.
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: truncated request message frame")
+    msg := d.next()!
+    if d.remaining() > 0:
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: unary request carried more than one message")
+    return msg
 
 # the http/2 handler that turns one unary grpc request into one grpc response.
 fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
@@ -1154,7 +1247,11 @@ fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
         return expired_response()
     request := grpc_unframe_unary(req.body_bytes())
     if request.is_err:
-        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_INTERNAL, "malformed request frame"))
+        # report the framing error's own status: a malformed frame is the
+        # caller's fault (INVALID_ARGUMENT), not a server fault, and a
+        # compressed message is UNIMPLEMENTED. reporting INTERNAL for all of
+        # them told a client to retry a request that will never succeed.
+        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(request.err.status, request.err.message))
     result := grpc_dispatch_fn(path, request.ok)
     if result.is_err:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
@@ -1195,6 +1292,13 @@ fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
         return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(result.ok).with_trailers(grpc_ok_trailers())
 
+# the most messages a buffered request stream will hold. a 10 MiB body of
+# five-byte empty frames is two million messages, and each one costs a list slot
+# and a Bytes header on top of its payload — a request that is small on the wire
+# turning into hundreds of megabytes of handler input. 64k is far more than a
+# buffered rpc has any reason to send; a client with more should stream.
+pub MAX_STREAM_MESSAGES := 65536
+
 # deframe every length-prefixed message in a request body. an empty body is a
 # valid empty stream (and, for unary, an all-default proto3 message).
 pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
@@ -1202,7 +1306,14 @@ pub fn unframe_messages(body: Bytes) -> List[Bytes]!GrpcError:
     d := new_deframer()
     d.push(body)
     while d.ready():
+        if out.len() >= MAX_STREAM_MESSAGES:
+            fail GrpcError(GRPC_RESOURCE_EXHAUSTED, "grpc: request stream carries more than {MAX_STREAM_MESSAGES} messages")
         out.push(d.next()!)
+    if d.remaining() > 0:
+        # leftover bytes that never completed a frame: the body was truncated or
+        # mis-framed. dropping them silently would hand the handler a short
+        # stream and report success.
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: truncated request message frame")
     return out
 
 # frame a sequence of messages into one response body: each message
@@ -1268,7 +1379,7 @@ fn grpc_response_fields() -> List[hpack.HeaderField]:
 fn grpc_status_fields(status: Int, message: String) -> List[hpack.HeaderField]:
     mut fields: List[hpack.HeaderField] := [hpack.header_field("grpc-status", status.to_string())]
     if message.len() > 0:
-        fields.push(hpack.header_field("grpc-message", message))
+        fields.push(hpack.header_field("grpc-message", percent_encode(message)))
     return fields
 
 impl GrpcStream:
@@ -1421,3 +1532,25 @@ test "begin_request_context stashes the context and spots a spent deadline":
     assert_eq(incoming_deadline_ms(), 0)
     assert(not begin_request_context(context_test_request("abc")!))
     assert_eq(incoming_deadline_ms(), 0)
+
+test "grpc-message percent-encodes what a field value may not carry":
+    # a newline in a field value is forbidden by RFC 9113 §8.2.1, so a handler
+    # that echoes user input into an error must not put it on the wire raw.
+    assert_eq(percent_encode("no such row"), "no such row")
+    assert_eq(percent_encode("bad input:\nline 2"), "bad input:%0Aline 2")
+    assert_eq(percent_encode("50% off"), "50%25 off")
+    # a utf8 message: every byte above 0x7E escapes, so the value stays ascii
+    assert_eq(percent_encode("caf" + chr(195) + chr(169)), "caf%C3%A9")
+
+test "grpc-message decodes back to what the server wrote":
+    assert_eq(percent_decode("bad input:%0Aline 2"), "bad input:\nline 2")
+    assert_eq(percent_decode("50%25 off"), "50% off")
+    assert_eq(percent_decode("caf%C3%A9"), "caf" + chr(195) + chr(169))
+    # a server that never encoded reads back unchanged rather than losing bytes
+    assert_eq(percent_decode("100% sure"), "100% sure")
+
+test "status trailers carry the encoded message":
+    fields := grpc_status_fields(GRPC_INVALID_ARGUMENT, "bad\nrequest")
+    assert_eq(fields.len(), 2)
+    assert_eq(fields[1].name, "grpc-message")
+    assert_eq(fields[1].value, "bad%0Arequest")

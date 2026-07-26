@@ -1,0 +1,65 @@
+# wake affinity must not starve the tasks queued behind a hot pair. two tasks
+# ping-pong over a channel while a third does its own round-trips; under
+# PITH_GREEN with one worker every task pins to that worker, so if a same-worker
+# wake could keep jumping the queue the pair would leapfrog the third forever
+# (preemption cannot rescue it — each half re-parks long before it overruns a
+# quantum). the affinity slot holds exactly one task and displaces its previous
+# occupant to the back of the fifo, so the pair yields on every exchange.
+#
+# a regression shows up as this test never finishing rather than as wrong
+# output: `other:` only prints once the third task has made all its progress.
+
+fn pinger(to: Channel[Int], back: Channel[Int], rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        to.send(i)
+        back.recv()
+        i = i + 1
+    to.close()
+    return rounds
+
+fn ponger(to: Channel[Int], back: Channel[Int]) -> Int:
+    mut seen := 0
+    while true:
+        v := to.recv()
+        if v == none:
+            break
+        seen = seen + 1
+        back.send(v.unwrap_or(0))
+    return seen
+
+# the task that must not be starved: its own independent round-trips.
+fn other(req: Channel[Int], resp: Channel[Int], rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        req.send(i)
+        resp.recv()
+        i = i + 1
+    req.close()
+    return rounds
+
+fn echo(req: Channel[Int], resp: Channel[Int]) -> Int:
+    mut seen := 0
+    while true:
+        v := req.recv()
+        if v == none:
+            break
+        seen = seen + 1
+        resp.send(v.unwrap_or(0))
+    return seen
+
+fn main():
+    to := Channel[Int](1)
+    back := Channel[Int](1)
+    req := Channel[Int](1)
+    resp := Channel[Int](1)
+
+    p1 := spawn pinger(to, back, 4000)
+    p2 := spawn ponger(to, back)
+    o1 := spawn other(req, resp, 200)
+    o2 := spawn echo(req, resp)
+
+    print("pair:" + (await p1).to_string())
+    await p2
+    print("other:" + (await o1).to_string())
+    await o2

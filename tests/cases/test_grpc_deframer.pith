@@ -1,0 +1,74 @@
+# the grpc deframer, driven directly rather than through a connection.
+#
+# it has to reassemble messages that arrive on arbitrary chunk boundaries, and
+# it has to do that without letting a peer decide how much memory the server
+# spends: a frame header can declare up to 4 GiB, so a sender that declares a
+# huge length and then dribbles the body would otherwise have the receiver
+# buffering toward that number for as long as it cared to keep the socket open.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+import std.encoding as encoding
+
+# a message framed the way the wire wants it: flag byte, four-byte big-endian
+# length, payload.
+fn framed(payload: String) -> Bytes:
+    return grpc.frame_messages([bytes.from_string_utf8(payload)])
+
+fn label(d: grpc.Deframer) -> String:
+    if not d.ready():
+        return "-"
+    msg := d.next() catch bytes.empty()
+    return bytes.to_string_utf8(msg) catch "?"
+
+fn main():
+    # one message split across single-byte chunks: nothing is ready until the
+    # last byte lands.
+    body := framed("hello")
+    d := grpc.new_deframer()
+    mut ready_before_last := false
+    mut i := 0
+    while i < body.len() - 1:
+        d.push(body.slice(i, i + 1))
+        if d.ready():
+            ready_before_last = true
+        i = i + 1
+    print("early:" + ready_before_last.to_string())
+    d.push(body.slice(body.len() - 1, body.len()))
+    print("split:" + label(d))
+    print("drained:" + d.remaining().to_string())
+
+    # several messages in one chunk, taken in order.
+    many := grpc.frame_messages([bytes.from_string_utf8("a"), bytes.from_string_utf8("bb"), bytes.from_string_utf8("ccc")])
+    m := grpc.new_deframer()
+    m.push(many)
+    print("many:" + label(m) + label(m) + label(m) + label(m))
+
+    # a message boundary that falls mid-chunk: the tail of one message and the
+    # head of the next arrive together.
+    pair := bytes.concat(framed("one"), framed("two"))
+    s := grpc.new_deframer()
+    s.push(pair.slice(0, 10))
+    print("first:" + label(s))
+    s.push(pair.slice(10, pair.len()))
+    print("second:" + label(s))
+
+    # a header declaring more than the receive limit is refused as soon as the
+    # header is complete — the body is never buffered. status 8 is
+    # RESOURCE_EXHAUSTED.
+    over := grpc.new_deframer()
+    over.push(encoding.from_hex("007fffffff") catch bytes.empty())
+    print("over-ready:" + over.ready().to_string())
+    taken := over.next()
+    if taken.is_err:
+        print("over-status:" + taken.err.status.to_string())
+    else:
+        print("over-status:accepted")
+
+    # a message exactly at the limit is still accepted, so the cap does not cut
+    # into legitimate traffic. only the header is checked here; buffering four
+    # megabytes to prove it would make this test slow for no extra coverage.
+    at_limit := grpc.new_deframer()
+    at_limit.push(encoding.from_hex("0000400000") catch bytes.empty())
+    print("at-limit-ready:" + at_limit.ready().to_string())
+    print("at-limit-buffered:" + at_limit.remaining().to_string())

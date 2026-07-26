@@ -559,13 +559,55 @@ struct Task {
 /// one worker's private run queues plus its own park spot. workers are created
 /// once and live for the process; there is no shutdown path (the pool dies with
 /// the process, like a daemon thread pool).
+/// a worker's pinned work: a fifo of woken tasks plus the single `next` slot a
+/// same-worker wake fills (see the `pinned` field note).
+#[derive(Default)]
+struct PinnedQueue {
+    next: Option<TaskId>,
+    queue: VecDeque<TaskId>,
+}
+
+impl PinnedQueue {
+    /// take the next task to resume: the affinity slot first, then the fifo.
+    fn pop(&mut self) -> Option<TaskId> {
+        if let Some(id) = self.next.take() {
+            return Some(id);
+        }
+        self.queue.pop_front()
+    }
+
+    /// a cross-worker (or non-worker) wake: ordinary fifo.
+    fn push(&mut self, id: TaskId) {
+        self.queue.push_back(id);
+    }
+
+    /// a same-worker wake: run this one next, displacing any previous occupant to
+    /// the back of the fifo so the slot cannot be monopolized.
+    fn push_next(&mut self, id: TaskId) {
+        if let Some(previous) = self.next.replace(id) {
+            self.queue.push_back(previous);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.next.is_none() && self.queue.is_empty()
+    }
+}
+
 struct Worker {
     /// fresh, never-resumed tasks. stealable by peers because a fresh coroutine
     /// carries no live stack (see the pinning note).
     local: Mutex<VecDeque<TaskId>>,
     /// woken started tasks pinned to this worker. only this worker drains it, so
     /// a suspended coroutine only ever resumes on the thread that first ran it.
-    pinned: Mutex<VecDeque<TaskId>>,
+    /// `next` is the single task a same-worker wake asks to run first — the other
+    /// half of a handoff, still cache-hot. holding exactly ONE such task is what
+    /// keeps wake affinity from starving the queue behind it: a second
+    /// same-worker wake displaces the first to the BACK of the fifo instead of
+    /// stacking, so a ping-ponging pair yields its slot on every exchange and
+    /// cannot leapfrog a third task forever. one mutex covers both so the
+    /// displace-and-push is a single atomic step.
+    pinned: Mutex<PinnedQueue>,
     /// preempted started tasks pinned to this worker, drained at the *lowest*
     /// priority (after pinned, local, injector, and stealing). a compute task that
     /// overran its quantum lands here so it yields to every other ready task on the
@@ -810,7 +852,7 @@ fn scheduler() -> &'static Scheduler {
         let workers = (0..n)
             .map(|_| Worker {
                 local: Mutex::new(VecDeque::new()),
-                pinned: Mutex::new(VecDeque::new()),
+                pinned: Mutex::new(PinnedQueue::default()),
                 deferred: Mutex::new(VecDeque::new()),
                 park_lock: Mutex::new(()),
                 park_cv: Condvar::new(),
@@ -951,14 +993,17 @@ fn enqueue_woken(owner: usize, id: TaskId) {
             .unwrap_or_else(|p| p.into_inner());
         // wake affinity: when the waker is the owner worker itself, the woken
         // task is usually the other half of a handoff the current task just
-        // completed — run it next (front of the queue) while its data is hot,
-        // instead of behind every earlier wake. cross-worker wakes keep fifo
-        // order; starvation is bounded by preemption (an overrunning task is
-        // parked onto the lowest-priority deferred queue regardless).
+        // completed — ask to run it next, while its data is hot, instead of
+        // behind every earlier wake. it goes in the single `next` slot, so the
+        // second such wake displaces the first to the back of the fifo: a
+        // ping-ponging pair yields the slot on every exchange and cannot starve
+        // the tasks queued behind it (preemption cannot rescue that shape —
+        // each half re-parks long before it overruns a quantum). cross-worker
+        // wakes are plain fifo.
         if CURRENT_WORKER.with(|c| c.get()) == Some(owner) {
-            pinned.push_front(id);
+            pinned.push_next(id);
         } else {
-            pinned.push_back(id);
+            pinned.push(id);
         }
     }
     // a pinned task can only ever run on its owner, and only the owner drains its
@@ -1065,7 +1110,7 @@ fn find_work(index: usize) -> Option<TaskId> {
         .pinned
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .pop_front()
+        .pop()
     {
         return Some(id);
     }

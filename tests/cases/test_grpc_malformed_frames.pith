@@ -1,0 +1,60 @@
+# adversarial request framing against grpc.serve. a malformed body must come
+# back as a status the caller can act on — and the server must stay up and serve
+# the next request. these all used to answer OK with an empty message, so corrupt
+# input looked like a successful call on an all-default message.
+#
+# statuses: 3 = INVALID_ARGUMENT (the caller's framing is wrong), 12 =
+# UNIMPLEMENTED (compression is not supported), 0 = OK.
+
+import std.net.grpc as grpc
+import std.net.http2.connection as http2
+import std.net.http2.hpack as hpack
+import std.bytes as bytes
+import std.encoding as encoding
+import std.time as time
+
+PORT := 50631
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    return request
+
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, echo_dispatch) catch 0
+
+# send one raw body with framing we control and report the terminal grpc-status.
+fn probe(label: String, body: Bytes):
+    opened := http2.open_h2c("127.0.0.1", PORT)
+    if opened.is_err:
+        print(label + ": dial-error")
+        return
+    client := opened.ok
+    fields := [hpack.header_field("content-type", "application/grpc"), hpack.header_field("te", "trailers")]
+    resp := client.request("POST", "localhost", "/t.Svc/Echo", fields, body)
+    if resp.is_err:
+        print(label + ": transport-error")
+    else:
+        mut status := "none"
+        for trailer in resp.ok.trailers:
+            if trailer.name == "grpc-status":
+                status = trailer.value
+        print(label + ":" + status)
+    client.close()
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+
+    # length prefix claims 100 bytes; only two follow
+    probe("truncated", encoding.from_hex("000000006441420000") catch bytes.empty())
+    # a length prefix that overruns anything the peer could have sent
+    probe("huge-length", encoding.from_hex("007fffffff") catch bytes.empty())
+    # compression flag set, which this implementation does not read
+    probe("compressed", encoding.from_hex("010000000141") catch bytes.empty())
+    # not framed at all
+    probe("garbage", bytes.from_string_utf8("not a grpc frame at all"))
+    # two messages on a unary rpc: exactly one is allowed
+    probe("two-messages", encoding.from_hex("000000000141000000000142") catch bytes.empty())
+    # an all-default proto3 message legitimately encodes to an empty body
+    probe("empty", bytes.empty())
+    # and a well-formed single message still succeeds
+    probe("valid", encoding.from_hex("000000000141") catch bytes.empty())

@@ -83,6 +83,25 @@ STREAM_INBOX_CAP := 64
 # how much of the receive buffer to pull from the socket per read.
 RECV_CHUNK := 16384
 
+# the most connections a listen loop serves at once. past this the accept loop
+# waits for one to finish rather than spawning without bound: every connection
+# costs a reader task, a writer task, and its buffers, so an unbounded accept
+# loop lets a client trade cheap sockets for expensive server memory. mirrors
+# std.prometheus's scrape cap.
+MAX_CONNECTIONS := 512
+
+# the in-flight permits, shared between the accept loops and the connection
+# tasks. a Semaphore is safe to share across threads; it lives as a module
+# global rather than a spawned-task argument (which the compiler cannot yet
+# dispatch for a sync-primitive type).
+mut connection_slots := Semaphore(MAX_CONNECTIONS)
+
+# how long a connection may sit without the socket making progress before the
+# read fails and the connection is dropped. an http/2 connection is long-lived
+# by design, so this is generous — it is here to reclaim the sockets of clients
+# that have gone away silently, not to bound a legitimate session.
+CONNECTION_TIMEOUT_MS := 120000
+
 # request-size limits, enforced before the server buffers or bridges a request, so
 # a hostile client cannot exhaust memory or splice extra headers into the request.
 # these are conservative fixed defaults; a later revision may make them per-server
@@ -372,9 +391,17 @@ impl Server:
     # drop a stream from the table once its handler is done (or it was reset). its
     # send window is dropped and its credit channel closed, which wakes the body
     # sender if it was blocked waiting on a window (it then gives up).
+    #
+    # the inbox is closed as well as removed. deliver() takes the inbox handle
+    # under the mutex and sends outside it, so a stream that ends in that window
+    # would otherwise leave the reader parked on a send into an inbox nobody will
+    # ever drain — and the reader is shared, so that one stream wedges every
+    # other stream on the connection along with its control frames. closing wakes
+    # the send, and a send into a closed channel is a no-op.
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
+            self.streams[stream_id].close()
             self.streams.remove(stream_id)
         if self.send_windows.contains_key(stream_id):
             self.send_windows.remove(stream_id)
@@ -1067,9 +1094,16 @@ fn send_goaway(server: Server, error_code: Int):
 # broken client only ever affects its own connection. spawn this per accepted
 # socket, or call it directly to serve a single connection.
 pub fn serve_h2c_connection(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     conn := new_live_server_conn(fd)
     serve_connection(conn, handler) catch false
     conn.close()
+
+# serve_h2c_connection with the accept loop's concurrency permit released when
+# the connection ends, however it ends.
+fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    serve_h2c_connection(fd, handler)
+    connection_slots.release()
 
 # the connection lifecycle, factored out so the offline tests can drive it over a
 # ServerConn without a socket. reads the preface, sends the server SETTINGS,
@@ -1105,7 +1139,8 @@ pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) ->
     fd := tcp_listen(host, port)!
     while true:
         client := tcp_accept(fd)!
-        spawn serve_h2c_connection(client, handler)
+        connection_slots.acquire()
+        spawn serve_h2c_slot(client, handler)
     return 0
 
 # serve one accepted tls connection as http/2 to completion. the tls handshake
@@ -1123,6 +1158,11 @@ pub fn serve_h2_tls_connection(tls_conn: tls.Conn, handler: fn(http.HttpRequestB
     serve_connection(conn, handler) catch false
     conn.close()
 
+# serve_h2_tls_connection with the accept loop's permit released at the end.
+fn serve_h2_tls_slot(client: tls.Conn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    serve_h2_tls_connection(client, handler)
+    connection_slots.release()
+
 # bind host:port for http/2 over tls and serve forever. it builds a tls server
 # config from the pem `cert`/`key` files, offers alpn "h2" (and "http/1.1", which
 # a peer may pick but this server does not yet serve — see serve_h2_tls_connection),
@@ -1134,7 +1174,8 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
     listener := tls.listen(host, port, config)!
     while true:
         client := tls.accept(listener)!
-        spawn serve_h2_tls_connection(client, handler)
+        connection_slots.acquire()
+        spawn serve_h2_tls_slot(client, handler)
     return 0
 
 # --- streaming entry points ---
@@ -1152,9 +1193,15 @@ fn streaming_unused_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
 # serve one accepted h2c connection on the streaming path. mirrors
 # serve_h2c_connection; the handler comes from the process-wide slot.
 pub fn serve_h2c_streaming_connection(fd: Int):
+    tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     conn := new_live_server_conn(fd)
     run_connection(conn, streaming_unused_handler, true) catch false
     conn.close()
+
+# serve_h2c_streaming_connection with the accept loop's permit released at the end.
+fn serve_h2c_streaming_slot(fd: Int):
+    serve_h2c_streaming_connection(fd)
+    connection_slots.release()
 
 # bind host:port for cleartext h2c and serve forever, handing each request
 # stream to `handler` while it is still arriving. mirrors listen_h2c.
@@ -1163,7 +1210,8 @@ pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -
     fd := tcp_listen(host, port)!
     while true:
         client := tcp_accept(fd)!
-        spawn serve_h2c_streaming_connection(client)
+        connection_slots.acquire()
+        spawn serve_h2c_streaming_slot(client)
     return 0
 
 # serve one accepted tls connection on the streaming path. mirrors
@@ -1176,6 +1224,11 @@ pub fn serve_h2_tls_streaming_connection(tls_conn: tls.Conn):
     run_connection(conn, streaming_unused_handler, true) catch false
     conn.close()
 
+# serve_h2_tls_streaming_connection with the accept loop's permit released at the end.
+fn serve_h2_tls_streaming_slot(client: tls.Conn):
+    serve_h2_tls_streaming_connection(client)
+    connection_slots.release()
+
 # bind host:port for http/2 over tls and serve forever on the streaming path.
 # mirrors listen_h2_tls.
 pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: String, handler: fn(ServerStream) -> Int) -> Int!:
@@ -1184,7 +1237,8 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
     listener := tls.listen(host, port, config)!
     while true:
         client := tls.accept(listener)!
-        spawn serve_h2_tls_streaming_connection(client)
+        connection_slots.acquire()
+        spawn serve_h2_tls_streaming_slot(client)
     return 0
 
 # --- offline frame tests ---

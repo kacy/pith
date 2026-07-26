@@ -1,0 +1,48 @@
+# a client whose deadlines keep expiring must not degrade: each expiry resets its
+# stream (RST_STREAM CANCEL) and forgets it, so repeated expiries on one
+# connection may not leak stream state, and the connection must stay usable for a
+# later call. a regression here shows up as the follow-up call failing or the run
+# hanging rather than as a wrong value.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50617
+
+fn dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path == "/t.Svc/Slow":
+        # comfortably longer than the client's deadline below
+        time.delay(60)
+        return request
+    return request
+
+fn run_server():
+    grpc.serve("127.0.0.1", PORT, dispatch) catch 0
+
+fn main():
+    spawn run_server()
+    time.delay(400)
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+
+    mut expired := 0
+    mut i := 0
+    while i < 20:
+        r := conn.unary_with_deadline("/t.Svc/Slow", bytes.from_string_utf8("x"), 5)
+        if r.is_err:
+            if r.err.status == grpc.GRPC_DEADLINE_EXCEEDED:
+                expired = expired + 1
+        i = i + 1
+    print("expired:" + expired.to_string())
+
+    # the same connection must still serve a call with no deadline
+    ok := conn.unary("/t.Svc/Fast", bytes.from_string_utf8("hello"))
+    if ok.is_err:
+        print("after:error " + ok.err.status.to_string())
+    else:
+        print("after:" + (ok.ok.to_string_utf8() catch "?"))
+    conn.close()

@@ -403,12 +403,64 @@ fn status_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderFiel
     return GRPC_OK
 
 # the grpc-message (the human-readable error detail), from the trailers or the
-# initial headers; "" when the server sends none.
+# initial headers; "" when the server sends none. the value arrives
+# percent-encoded, so it is decoded back to the text the server wrote.
 fn message_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField]) -> String:
     message := find_header(trailers, "grpc-message")
     if message != "":
-        return message
-    return find_header(headers, "grpc-message")
+        return percent_decode(message)
+    return percent_decode(find_header(headers, "grpc-message"))
+
+# grpc-message is percent-encoded on the wire (grpc's PROTOCOL-HTTP2): printable
+# ascii passes through, everything else — including the CR, LF, and NUL that
+# RFC 9113 §8.2.1 forbids in a field value, and any byte of a utf8 message —
+# becomes %XX. without this a handler that puts a newline or a non-ascii
+# character in an error message writes a field value a compliant client must
+# reject, which turns a readable error into a broken response.
+fn percent_encode(text: String) -> String:
+    hex_digits := "0123456789ABCDEF"
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        # ord is signed, so a utf8 continuation byte comes back negative; mask
+        # it to the 0-255 the escape needs.
+        code := bits.band(ord(c), 255)
+        if code >= 32 and code <= 126 and c != "%":
+            out = out + c
+        else:
+            out = out + "%" + hex_digits[code / 16] + hex_digits[code % 16]
+        i = i + 1
+    return out
+
+# the inverse. a malformed escape is left as written rather than dropped, so a
+# server that never encoded its message still reads back as itself.
+fn percent_decode(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        if text[i] == "%" and i + 2 < text.len():
+            high := percent_nibble(text[i + 1])
+            low := percent_nibble(text[i + 2])
+            if high >= 0 and low >= 0:
+                out = out + chr(high * 16 + low)
+                i = i + 3
+            else:
+                out = out + text[i]
+                i = i + 1
+        else:
+            out = out + text[i]
+            i = i + 1
+    return out
+
+fn percent_nibble(c: String) -> Int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 97 + 10
+    if c >= "A" and c <= "F":
+        return ord(c) - 65 + 10
+    return 0 - 1
 
 # parse a decimal grpc-status value; an empty or non-numeric value reads as 0.
 fn parse_status(text: String) -> Int:
@@ -1164,7 +1216,7 @@ fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
     mut t: Map[String, String] := {}
     t.insert("grpc-status", status.to_string())
     if message.len() > 0:
-        t.insert("grpc-message", message)
+        t.insert("grpc-message", percent_encode(message))
     return t
 
 # extract the single request message from a unary request body (one
@@ -1318,7 +1370,7 @@ fn grpc_response_fields() -> List[hpack.HeaderField]:
 fn grpc_status_fields(status: Int, message: String) -> List[hpack.HeaderField]:
     mut fields: List[hpack.HeaderField] := [hpack.header_field("grpc-status", status.to_string())]
     if message.len() > 0:
-        fields.push(hpack.header_field("grpc-message", message))
+        fields.push(hpack.header_field("grpc-message", percent_encode(message)))
     return fields
 
 impl GrpcStream:
@@ -1472,3 +1524,24 @@ test "begin_request_context stashes the context and spots a spent deadline":
     assert(not begin_request_context(context_test_request("abc")!))
     assert_eq(incoming_deadline_ms(), 0)
 
+test "grpc-message percent-encodes what a field value may not carry":
+    # a newline in a field value is forbidden by RFC 9113 §8.2.1, so a handler
+    # that echoes user input into an error must not put it on the wire raw.
+    assert_eq(percent_encode("no such row"), "no such row")
+    assert_eq(percent_encode("bad input:\nline 2"), "bad input:%0Aline 2")
+    assert_eq(percent_encode("50% off"), "50%25 off")
+    # a utf8 message: every byte above 0x7E escapes, so the value stays ascii
+    assert_eq(percent_encode("caf" + chr(195) + chr(169)), "caf%C3%A9")
+
+test "grpc-message decodes back to what the server wrote":
+    assert_eq(percent_decode("bad input:%0Aline 2"), "bad input:\nline 2")
+    assert_eq(percent_decode("50%25 off"), "50% off")
+    assert_eq(percent_decode("caf%C3%A9"), "caf" + chr(195) + chr(169))
+    # a server that never encoded reads back unchanged rather than losing bytes
+    assert_eq(percent_decode("100% sure"), "100% sure")
+
+test "status trailers carry the encoded message":
+    fields := grpc_status_fields(GRPC_INVALID_ARGUMENT, "bad\nrequest")
+    assert_eq(fields.len(), 2)
+    assert_eq(fields[1].name, "grpc-message")
+    assert_eq(fields[1].value, "bad%0Arequest")

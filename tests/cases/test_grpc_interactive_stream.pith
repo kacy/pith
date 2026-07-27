@@ -9,6 +9,7 @@
 import std.net.grpc as grpc
 import std.bytes as bytes
 import std.time as time
+import std.net.tcp as tcp
 
 PORT := 50331
 
@@ -52,9 +53,28 @@ fn chat_round(bs: grpc.BidiStream, text: String) -> Bool:
     print("chat: " + (step.ok.message.to_string_utf8() catch "?"))
     return true
 
+# wait until the spawned server is actually accepting before dialing it.
+#
+# these tests used to sleep a flat 400ms and dial once, which is a race the
+# server loses whenever the machine is busy — it failed exactly that way in ci,
+# printing a dial error instead of the reply. a tcp connect that succeeds means
+# the listener is bound, which is the thing the client is waiting for.
+fn wait_for_port(port: Int, timeout_ms: Int) -> Bool:
+    mut waited := 0
+    while waited < timeout_ms:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        time.delay(25)
+        waited = waited + 25
+    return false
+
 fn main():
     spawn run_server()
-    time.delay(400)
+    if not wait_for_port(PORT, 10000):
+        print("server never started listening")
+        return
     dialed := grpc.dial_h2c("127.0.0.1", PORT)
     if dialed.is_err:
         print("dial failed")

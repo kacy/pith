@@ -149,8 +149,23 @@ whether two tasks that talk to each other land together is chance, and the
 fan-out benchmark is bimodal because of it: ~46 ms pinned to one worker with
 `PITH_GREEN_WORKERS=1`, ~60 ms when the pipeline happens to share a worker
 anyway, ~130-170 ms when it splits. cross-worker wakes are the whole remaining
-gap to go on coordination-heavy work, and colocating communicating tasks is the
-open lever.
+gap to go on coordination-heavy work.
+
+the obvious fix is to move a parked task to whichever worker keeps waking it,
+and it does work: prototyped, it took the fan-out from a bimodal ~120 ms median
+to a flat ~42 ms, ahead of go's ~69, with cross-worker wakes dropping from
+~100k to single digits. it is also unsound, and the reason is worth recording
+so nobody spends the same day rediscovering it. the problem is not the
+coroutine stack, which migrates fine; it is that the compiler caches the
+thread-local base in a frame across a suspension, so a coroutine resumed on
+another thread reads the previous thread's `CURRENT_TASK` and `CURRENT_WORKER`.
+that was observed directly — one os thread reporting two different values of a
+variable written once at startup — and it silently dropped channel messages. no
+source-level barrier covers it, because every thread-local read in every frame
+that can span a park is exposed. so migration is gated on removing those reads
+from the resumable path, which is its own project rather than a scheduler
+tweak. `examples/grpc_chat` and `examples/grpc_reflect` are the two programs
+sensitive enough to catch a placement change going wrong; run them first.
 
 one caveat on the numbers themselves: every comparison in docs/performance.md
 and bench/README.md was measured on the same 2-core box. "green wins everywhere"

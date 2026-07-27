@@ -9,6 +9,36 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
+the short version, all on the same 2-core machine. the concurrency rows use
+the green backend (`PITH_GREEN=1`) where marked, since that is where the
+2026-07-26 scheduler work landed:
+
+| coordination | pith | go | rust | zig |
+|---|---:|---:|---:|---:|
+| chan_fanout, 1m msgs | **171 ms** (green) | 69 ms | 94-135 ms | 135-204 ms |
+| chan_fanout, pinned to 1 worker | **~46 ms** (green) | 69 ms | — | — |
+| chan_fanout, os threads | ~438 ms | 69 ms | — | — |
+| context switches over the run | 2.5k (green) | 258 | 4.8k | 60k |
+| 20k spawn + join | **~50 ms** (green) | ~27 ms | — | — |
+| 20k spawn, peak rss | 10 mb (green) | 11 mb | — | — |
+| 20k spawn, os threads | ~1450 ms / 174 mb | — | — | — |
+
+| compute | pith | go | rust | zig |
+|---|---:|---:|---:|---:|
+| event_ledger, 200k events | 955 ms (1.16x go) | 820 ms | 178 ms | 199 ms |
+| std_pipeline, 50k records | 476 ms (1.54x go) | 310 ms | 135 ms | — |
+| grpc unary echo, conc=8 | 8075 calls/s (green, 1w) | 13417 | 11012 | — |
+
+on coordination the green backend beats rust and zig outright, sits ~2.3x
+behind go at the default worker count, and beats go pinned to one worker. on
+spawn it is ~2x go at go's memory, down from ~29x before the coroutine stack
+pool. compute is the older story: competitive with go, well behind rust and
+zig, and what is left of that gap is string building rather than the runtime.
+
+the rows that oversubscribe os threads swing run to run on a 2-core box (see
+the caveat on the fan-out table below); the green and go rows are the stable
+ones.
+
 all numbers from one 2-core machine, medians of 5 where quick enough to
 repeat; the tables below were fully rerun 2026-07-15 (after the arc
 reclamation and weak-reference work), the grpc table again on 2026-07-19

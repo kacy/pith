@@ -1,0 +1,104 @@
+# a tls server has to survive clients that open a tcp connection and never
+# complete a tls handshake. a port scanner, a load balancer probe, a monitoring
+# check, and a browser racing two connections all do exactly that.
+#
+# the accept loop used to run the handshake inline and propagate its failure out
+# of the loop, so a single bare connect-and-close ended the loop for good. the
+# listening socket stayed open, so a tcp health check still reported the server
+# healthy while it answered nobody. this drives that shape: one junk connection,
+# then a real call, then a burst of junk, then a real call again.
+
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.net.tcp as tcp
+import std.protobuf as protobuf
+import std.time as time
+
+PORT := 50781
+
+# read protobuf field 1 (a string) from a message.
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/echo.Echo/Ping":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_field1(request) catch ""
+    w := protobuf.writer()
+    w.write_string(1, "echo:" + name) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run_server():
+    grpc.serve_tls("127.0.0.1", PORT, "tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key", echo_dispatch) catch 0
+
+fn client_call(name: String) -> String:
+    cfg_r := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")
+    if cfg_r.is_err:
+        return "TLS_CFG_ERR"
+    cfg := cfg_r.ok.with_alpn(["h2"])
+    conn_r := grpc.dial_with_config("localhost", PORT, cfg)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    w := protobuf.writer()
+    w.write_string(1, name) catch false
+    reply_r := conn.unary("/echo.Echo/Ping", w.bytes())
+    w.free()
+    if reply_r.is_err:
+        conn.close()
+        return "UNARY_ERR"
+    got := read_field1(reply_r.ok) catch "?"
+    conn.close()
+    return got
+
+# retry the real client until the spawned server is up. a bare tcp probe is not
+# a readiness check for a tls listener — it is the very thing under test here.
+fn call_when_ready(name: String, timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := client_call(name)
+        if got != "DIAL_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "DIAL_ERR"
+
+# open a tcp connection to the tls port and hang up without sending anything.
+fn connect_and_hang_up():
+    fd := tcp.connect("127.0.0.1", PORT) catch 0
+    if fd != 0:
+        tcp.close(fd)
+
+# open a tcp connection and send bytes that are not a tls client hello.
+fn connect_and_send_garbage():
+    fd := tcp.connect("127.0.0.1", PORT) catch 0
+    if fd != 0:
+        tcp.write(fd, "GET / HTTP/1.1") catch 0
+        tcp.close(fd)
+
+fn main():
+    spawn run_server()
+    print(call_when_ready("first", 10000))
+
+    connect_and_hang_up()
+    print(call_when_ready("second", 10000))
+
+    connect_and_send_garbage()
+    print(call_when_ready("third", 10000))
+
+    mut i := 0
+    while i < 8:
+        connect_and_hang_up()
+        connect_and_send_garbage()
+        i = i + 1
+    print(call_when_ready("fourth", 10000))

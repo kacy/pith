@@ -121,14 +121,22 @@ fixed os-thread answers (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
 
 the structural cost is that a green worker runs many tasks, so a call with no
-yield point holds all of them rather than only the task making it. file i/o is
-where that actually bites: `host_fs` goes straight to the syscall, so a task
-doing a large or slow file read or write holds its worker for the whole call and
-everything pinned to that worker waits behind it. sockets go through the epoll
-reactor and dns runs on a pool of blocking threads, so those two no longer stall
-anyone, but file i/o has no equivalent and a program can hit this purely by
-upgrading. the honest workaround today is `PITH_GREEN=0`; giving `host_fs` a
-yield point is the open work.
+yield point holds all of them rather than only the task making it. sockets go
+through the epoll reactor, and dns and file i/o go to pools of blocking threads
+while the caller parks, so none of those stall anyone any more. what is left is
+the cheap end of `host_fs`: `exists`, `size`, `rename`, `mkdir` and removing a
+single file still run on the worker, because each is one cached kernel lookup
+that costs about what handing it to another thread would. on a slow network
+mount that reasoning does not hold and a task doing one of them holds its worker
+until it returns. `PITH_GREEN=0` is the workaround; making the decision
+adaptive rather than fixed is the open work.
+
+the calling task pays for that. a file call made from inside a task now costs a
+thread handoff it did not before, so a task reading a small cached file in a
+loop runs roughly three times slower than it used to while everything else on
+its worker runs sooner. a short on-CPU wait before the park keeps the common
+case from paying for two thread wakeups. calls from `main` are unaffected, since
+main is not a green task and takes the direct path.
 
 preemption is a build-time opt-in for the same reason it always was. safe-points
 are only emitted under `PITH_GREEN_PREEMPT=1`, so a compute-only task that never

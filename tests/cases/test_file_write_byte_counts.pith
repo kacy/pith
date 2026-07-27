@@ -1,0 +1,65 @@
+# the whole-file write helpers report how many bytes they wrote, so the number
+# they return has to match the size of the file afterwards.
+#
+# the buffered path used to add two counts that describe the same bytes:
+# `write` reports everything it accepted, including what it only buffered, and
+# `flush` reports that buffered part again when it reaches the file. anything
+# smaller than the chunk size therefore came back doubled — a five byte write
+# returned ten — while a payload big enough to be written straight through
+# happened to be right, which is why it went unnoticed.
+#
+# the counts here are byte counts, not character counts, so the non-ascii cases
+# are the ones that would catch a `len()` that counts characters.
+
+import std.fs as fs
+import std.io as io
+
+fn report(label: String, wrote: Int, path: String) -> Int!:
+    size := fs.size(path)!
+    print("{label}: returned={wrote} file={size} agree={wrote == size}")
+    return 0
+
+fn main() -> Int!:
+    path := "test_write_byte_counts.tmp"
+    defer fs.remove(path)
+
+    # a payload well under any chunk size: the case that used to double.
+    small := io.write_file_text(path, "hello")!
+    report("write-small", small, path)!
+
+    chunked := io.write_file_text_chunked(path, "hello", 4096)!
+    report("write-small-chunked", chunked, path)!
+
+    # multi-byte utf-8: seven characters, eight bytes.
+    accented := io.write_file_text(path, "añadido")!
+    report("write-utf8", accented, path)!
+
+    accented_chunked := io.write_file_text_chunked(path, "añadido", 4096)!
+    report("write-utf8-chunked", accented_chunked, path)!
+
+    # a payload larger than the chunk size is written straight through rather
+    # than buffered, so it exercises the other half of the branch.
+    big := repeat_text("0123456789", 600)
+    through := io.write_file_text_chunked(path, big, 128)!
+    report("write-through", through, path)!
+
+    # append reports what it added, and the file grows by exactly that much.
+    io.write_file_text(path, "base")!
+    added := io.append_file_text(path, "-añadido")!
+    after := fs.size(path)!
+    print("append: returned={added} file={after} agree={after == 4 + added}")
+
+    io.write_file_text(path, "base")!
+    added_chunked := io.append_file_text_chunked(path, "-añadido", 4096)!
+    after_chunked := fs.size(path)!
+    print("append-chunked: returned={added_chunked} file={after_chunked} agree={after_chunked == 4 + added_chunked}")
+
+    return 0
+
+fn repeat_text(unit: String, times: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < times:
+        out = out + unit
+        i = i + 1
+    return out

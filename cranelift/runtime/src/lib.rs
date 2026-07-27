@@ -11,6 +11,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod blocking;
 pub mod bytes;
 pub mod collections;
 pub mod concurrency;

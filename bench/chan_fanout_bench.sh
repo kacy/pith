@@ -5,9 +5,10 @@
 #
 #   bench/chan_fanout_bench.sh [messages] [trials]
 #
-# defaults: 1000000 messages, 5 trials. pith is measured twice, once on
-# the default os-thread backend and once with PITH_GREEN=1. skips any
-# language whose toolchain is not installed.
+# defaults: 1000000 messages, 5 trials. pith is measured twice, once with
+# PITH_GREEN=0 (os threads) and once with PITH_GREEN=1 (green). both are set
+# explicitly, so the table means the same thing whichever backend the host
+# defaults to. skips any language whose toolchain is not installed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -47,7 +48,7 @@ printf '\nchan fanout — %s messages, median of %s trials\n\n' "$MESSAGES" "$TR
 printf '%-12s %8s %14s %12s\n' lang ms msgs_per_sec peak_rss_kb
 
 ref_checksum=""
-for entry in "pith:$PITH:0" "pith-green:$PITH:1" "go:$GO:0" "rust:$RUST:0" "zig:$ZIG:0"; do
+for entry in "pith-threads:$PITH:0" "pith-green:$PITH:1" "go:$GO:0" "rust:$RUST:0" "zig:$ZIG:0"; do
     name=${entry%%:*}
     rest=${entry#*:}
     bin=${rest%%:*}

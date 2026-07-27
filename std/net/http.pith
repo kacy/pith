@@ -2902,10 +2902,24 @@ pub fn instrument(handler: fn(HttpRequestBytes) -> HttpResponse, logger: log.Log
 pub fn wrap(handler: fn(HttpRequestBytes) -> HttpResponse, middleware: fn(fn(HttpRequestBytes) -> HttpResponse, HttpRequestBytes) -> HttpResponse) -> fn(HttpRequestBytes) -> HttpResponse:
     return fn(req: HttpRequestBytes) => middleware(handler, req)
 
+# runs a handler with the json node pool scoped to this one request.
+#
+# json.parse() hands out handles into a per-task node pool that nothing frees
+# on its own, so on a keep-alive connection every request a handler parses used
+# to stay resident for the life of the connection. the scope closes as soon as
+# the handler returns, which is safe because an HttpResponse carries bytes and
+# strings — nothing that still points into the pool. a handler that stashes a
+# handle somewhere and reads it on a later request will find it invalid, which
+# was never a supported thing to do.
+fn run_handler(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+    scope := json_mod.open_scope()
+    defer json_mod.close_scope(scope)
+    return handler(req)
+
 # serves one request using a bytes reader, writer, and handler.
 pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     req := read_request_buffered_bytes(reader)!
-    resp := handler(req)
+    resp := run_handler(handler, req)
     return send_buffered(writer, resp)
 
 # serves requests on one connection until either side asks to close.
@@ -2926,7 +2940,7 @@ pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter
         req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
-        resp := handler(req)
+        resp := run_handler(handler, req)
         connection := connection_value_for(req, resp)
         total = total + send_buffered_conn(writer, resp, connection)!
         if connection.to_lower() == "close":
@@ -2935,7 +2949,7 @@ pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter
 # serves one request from a client fd and closes the connection after writing the response.
 pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     req := read_request_bytes(fd)!
-    return send(fd, handler(req))
+    return send(fd, run_handler(handler, req))
 
 # serves requests from one client fd until the connection closes.
 pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -3028,7 +3042,7 @@ pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> Htt
         req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
-        resp := handler(req)
+        resp := run_handler(handler, req)
         connection := connection_value_for(req, resp)
         total = total + conn.write_all_bytes(resp.to_bytes_conn(connection)!)!
         if connection.to_lower() == "close":
@@ -3051,7 +3065,7 @@ pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, h
         fail blocking_failed(req.err)
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    resp := handler(req.ok)
+    resp := run_handler(handler, req.ok)
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
     sent := send_buffered(writer, resp)

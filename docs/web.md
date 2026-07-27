@@ -119,6 +119,40 @@ fn user_json(user: NewUser) -> String:
 `GET /users/:id` that echoes the path parameter as json and a `POST /users` that
 decodes a `NewUser` from the body and echoes it back.
 
+## the json node pool
+
+`json.parse` does not return a tree of objects. it returns an `Int` handle into
+a node pool that `std.json` keeps in per-task storage, and nothing in that pool
+is freed when the handle goes out of scope. on a keep-alive connection — one
+task, many requests, a body parsed per request — that adds up.
+
+servers do not have to think about it. `http.serve_connection`, the other
+`http.serve_*` entry points, and the http/2 stream handler all run your handler
+inside a pool scope and reclaim it when the handler returns, so each request
+starts from an empty pool. the same is true of `web.parse[T]` and every other
+typed decode: the compiler brackets the lowered body and gives the nodes back
+once the struct is built.
+
+what is left is a long-lived task that calls `json.parse` on its own, outside a
+request. bracket it yourself:
+
+```pith
+scope := json.open_scope()
+defer json.close_scope(scope)
+root := json.parse(text)
+name := json.object_get_string(root, "name")
+```
+
+a scope reclaims everything parsed since it opened, so scopes nest but they have
+to close innermost-first — closing an outer scope also closes anything opened
+inside it. copy the values you want out before the scope closes; strings and
+numbers pulled out of the tree are independent, but a handle is not. reading a
+handle after its scope closed reports `invalid` rather than another document's
+value, because node ids are never reused.
+
+`std.toml` has the same pool and the same `open_scope`/`close_scope`, for
+configuration that gets reloaded rather than read once at startup.
+
 ## responses
 
 `std.web` does not invent its own response type. you return an `http.HttpResponse`,

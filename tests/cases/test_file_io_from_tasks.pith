@@ -1,0 +1,68 @@
+# file reads, writes, and appends from inside spawned tasks, on whichever
+# backend is running.
+#
+# under the green backend each of these syscalls is handed to the runtime's
+# file thread pool and the calling task parks until it finishes, rather than
+# holding its worker inside the kernel. that is a scheduling change and nothing
+# else, so the answers below have to be identical to the os-thread run — which
+# is exactly what comparing this case against its expected output on both
+# backends checks. running it pinned to one worker checks the other half: the
+# park must not wedge a worker that has other tasks queued behind it.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+
+# whole-file write, append, and read back, all from one task.
+fn text_round_trip(path: String, body: String) -> String!:
+    io.write_file_text(path, body)!
+    io.append_file_text(path, "-appended")!
+    return io.read_file_text(path)!
+
+# the same shape through the streaming handle api: open, write a chunk at a
+# time, close, then read it back in small chunks.
+fn stream_round_trip(path: String, body: String) -> String!:
+    writer := fs.create(path)!
+    writer.write_all(body)!
+    writer.close()
+
+    appender := fs.open_append(path)!
+    appender.write_all("-streamed")!
+    appender.close()
+
+    reader := fs.open(path)!
+    defer reader.close()
+    return reader.read_all_chunked(3)!
+
+# bytes rather than text, so the handle-returning entry points get covered too.
+fn bytes_round_trip(path: String, body: String) -> Int!:
+    fs.write_bytes(path, bytes.from_string_utf8(body))!
+    fs.append_bytes(path, bytes.from_string_utf8("!"))!
+    return fs.read_bytes(path)!.len()
+
+fn main() -> Int!:
+    dir := "/tmp/pith_file_io_tasks"
+    fs.remove_tree(dir)
+    fs.make_dirs(dir)
+
+    # three tasks working on three files at once. under one green worker they
+    # take turns; the answers cannot depend on the order they finish in.
+    text := spawn text_round_trip("{dir}/text.txt", "alpha")
+    stream := spawn stream_round_trip("{dir}/stream.txt", "beta")
+    bytes := spawn bytes_round_trip("{dir}/bytes.bin", "gamma")
+
+    print("text:{(await text).unwrap_or("<failed>")}")
+    print("stream:{(await stream).unwrap_or("<failed>")}")
+    print("bytes-len:{(await bytes).unwrap_or(-1)}")
+
+    # listing and removing a tree are offloaded too, and both are read back
+    # from a task.
+    names := spawn count_entries(dir)
+    print("entries:{(await names).unwrap_or(-1)}")
+
+    print("removed:{fs.remove_tree(dir)}")
+    print("gone:{fs.exists(dir) == false}")
+    return 0
+
+fn count_entries(dir: String) -> Int!:
+    return fs.list(dir).len()

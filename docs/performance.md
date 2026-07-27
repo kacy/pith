@@ -142,7 +142,16 @@ that same in-userspace scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker
 (`PITH_GREEN_WORKERS=1`) turns every per-call handoff from a futex wake into a
 userspace switch. measured on the 2-core dev box, conc=8, medians of 5 runs,
-per-call counts over warmup+calls (2026-07-20 rerun):
+per-call counts over warmup+calls (2026-07-20 rerun).
+
+**these absolute numbers predate the wake-path work of 2026-07-26** (the
+coroutine stack pool, the channel condvar fix, and the slab-free wake), so
+they understate green as it stands. re-running the same shape on 2026-07-27
+at a smaller batch put pith at 5067 calls/sec os-thread, 8075 at one green
+worker (+59%), and 7083 at two (+40%) — the same relationships the table
+below records (+53% and +41%), so its conclusions hold. the table is left at
+its original batch size rather than replaced with a smaller, non-comparable
+run; re-measuring it at the documented batch is a tracked follow-up.
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
@@ -247,6 +256,28 @@ still grows with the total (the closure release lands there too, but the
 slot does not); giving that slab the same reclamation is a tracked
 follow-up, and until then this bound is a green-only property.
 
+spawn *speed* was a separate problem, fixed later: every green task
+allocated a fresh 1 MiB coroutine stack (an mmap plus a guard-page
+mprotect) and unmapped it on completion, costing a TLB shootdown across
+every core. the kernel's address-space bookkeeping dominated spawn.
+finished coroutines now donate their stacks to a pool and the next spawn
+reuses one. spawning 20k tasks and awaiting them all, medians of 5,
+interleaved with a go canary on the 2-core box (2026-07-26):
+
+| 20k spawn + join | elapsed | peak rss |
+|---|---:|---:|
+| os threads | ~1450 ms | 174 mb |
+| green, before the pool | ~580 ms | 10 mb |
+| green, after the pool | ~50 ms | 10 mb |
+| go | ~27 ms | 11 mb |
+
+page faults over the run fell 21832 -> ~2500 and context switches 25748 ->
+~3000. shrinking the stack from 1 MiB to 64 KiB changed nothing before the
+pool, which is the tell: the cost was the *number* of mappings, not their
+size. green is now within ~2x of go on this shape at the same memory, from
+~29x, and roughly 30x faster than the os-thread backend, which pays a real
+thread per task.
+
 `bench/chan_fanout` — the same fan-out shape with cross-language
 comparators: four producer tasks push one million messages through a
 bounded channel (capacity 256) and four consumer tasks drain them,
@@ -257,6 +288,13 @@ same checksum. medians of 9 on this 2-core box, 2026-07-26:
 |---|---:|---:|---:|---:|---:|
 | total | 438ms | 171ms | **75ms** | 135ms | 135ms |
 | peak rss | 3.0 mb | 3.0 mb | 2.0 mb | 2.4 mb | 2.7 mb |
+
+read the rows that oversubscribe os threads (pith os-thread, rust, zig)
+with the box in mind: eight threads on two cores, so they swing run to run.
+across two suite runs a week apart rust moved 135 -> 94 ms and zig 135 -> 204
+with no code change on either side, and pith's os-thread row has been seen
+anywhere from ~260 to ~940. the green and go rows are the stable ones and are
+what the comparison rests on.
 
 this table used to read 580 / 782 / 69 / 82 / 201 — pith last by ~8x,
 with the green backend slower than os threads on the shape it was built

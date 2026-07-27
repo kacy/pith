@@ -318,6 +318,13 @@ green wake-path work described below):
 | rust | 135 | 7.4 m | 2.4 mb |
 | zig | 135 | 7.4 m | 2.7 mb |
 
+read the rows that oversubscribe os threads (pith os-thread, rust, zig)
+with the box in mind: eight threads on two cores, so they swing run to run.
+across two suite runs a week apart rust moved 135 -> 94 ms and zig 135 -> 204
+with no code change on either side, and pith's os-thread row has been seen
+anywhere from ~260 to ~940. the green and go rows are the stable ones and are
+what the comparison rests on.
+
 for most of this benchmark's life pith lost it outright — 580ms os-thread
 and 782ms green against go's ~70, roughly 8x behind. two fixes on
 2026-07-26 changed that. the first was found with `perf`: rust's standard

@@ -139,13 +139,11 @@ the scheduler; it is the list below.
   os threads or the reactor would need a kqueue sibling.
 - **blocking calls stall a worker, not just their task** — file i/o and native
   calls have no yield point, so they hold the worker and everything pinned to
-  it. on os threads a blocking call costs only the task making it. this is the
-  structural difference that keeps the os-thread backend worth having
-  regardless of the benchmark numbers.
-- **dns still blocks a worker** — `green_connect` resolves with a synchronous
-  `getaddrinfo` before its non-blocking connect, so a dial that waits on dns
-  parks the whole worker. the tcp handshake and everything after it already
-  yield. offloading resolution to a small blocking pool is the fix.
+  it. dns was the worst case here and is not any more: `getaddrinfo` runs on a
+  small pool of blocking threads while the calling task parks. on os threads a
+  blocking call costs only the task making it. this is the structural difference
+  that keeps the os-thread backend worth having regardless of the benchmark
+  numbers.
 - **placement is left to luck** — a task pins to the first worker that runs it,
   so whether two tasks that talk to each other land together is chance. the
   fan-out benchmark is bimodal because of it: ~60 ms when the pipeline happens

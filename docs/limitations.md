@@ -132,6 +132,16 @@ the scheduler; it is the list below.
   200-million-iteration arithmetic loop. that is cheap enough — but the flag
   must flip *with* the green default, not before it, or os-thread builds pay for
   a check that never fires.
+- **the reactor is linux-only** — it is built on epoll and eventfd. macos and
+  the bsds compile a stand-in with no reactor, where a green task waiting on a
+  socket blocks its worker outright. so "green by default" is a linux-server
+  claim, not a universal one; on other platforms the default would have to stay
+  os threads or the reactor would need a kqueue sibling.
+- **blocking calls stall a worker, not just their task** — file i/o and native
+  calls have no yield point, so they hold the worker and everything pinned to
+  it. on os threads a blocking call costs only the task making it. this is the
+  structural difference that keeps the os-thread backend worth having
+  regardless of the benchmark numbers.
 - **dns still blocks a worker** — `green_connect` resolves with a synchronous
   `getaddrinfo` before its non-blocking connect, so a dial that waits on dns
   parks the whole worker. the tcp handshake and everything after it already

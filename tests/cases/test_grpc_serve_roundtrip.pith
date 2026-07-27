@@ -58,7 +58,23 @@ fn client_call() -> String:
     conn.close()
     return got
 
+# retry the real client until the spawned server is up.
+#
+# this used to sleep a flat 400ms and call once, which is a race the server
+# loses whenever the machine is busy — it failed exactly that way in ci,
+# printing a dial error instead of the reply. retrying the tls dial itself is
+# the readiness check; a bare tcp probe is not, because the dead connection it
+# leaves behind blocks the server's accept loop before the real client arrives.
+fn call_when_ready(timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := client_call()
+        if got != "DIAL_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "DIAL_ERR"
+
 fn main():
     spawn run_server()
-    time.delay(400)
-    print(client_call())
+    print(call_when_ready(10000))

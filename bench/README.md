@@ -299,7 +299,7 @@ directly:
 
 ```
 pith build bench/chan_fanout.pith && ./bench/chan_fanout 1000000
-PITH_GREEN=1 ./bench/chan_fanout 1000000
+PITH_GREEN=0 ./bench/chan_fanout 1000000
 go build -o bench/chan_fanout_go bench/chan_fanout.go
 rustc -O -o bench/chan_fanout_rust bench/chan_fanout.rs
 zig build-exe -O ReleaseFast -femit-bin=bench/chan_fanout_zig bench/chan_fanout.zig
@@ -312,8 +312,8 @@ green wake-path work described below):
 
 | lang | ms | messages/sec | peak rss |
 |---|---:|---:|---:|
-| pith (os threads) | 438 | 2.3 m | 3.0 mb |
-| pith (`PITH_GREEN=1`) | 171 | 5.8 m | 3.0 mb |
+| pith (`PITH_GREEN=0`, os threads) | 438 | 2.3 m | 3.0 mb |
+| pith (green, the linux default) | 171 | 5.8 m | 3.0 mb |
 | go | 75 | 13.3 m | 2.0 mb |
 | rust | 135 | 7.4 m | 2.4 mb |
 | zig | 135 | 7.4 m | 2.7 mb |

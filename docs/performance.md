@@ -9,25 +9,25 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-the short version, all on the same 2-core machine. the concurrency rows use
-the green backend (`PITH_GREEN=1`) where marked, since that is where the
-2026-07-26 scheduler work landed:
+the short version, all on the same 2-core machine. the concurrency rows are the
+green backend, which is the default on linux; the rows marked `PITH_GREEN=0`
+are the os-thread opt-out, kept for contrast:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **171 ms** (green) | 69 ms | 94-135 ms | 135-204 ms |
-| chan_fanout, pinned to 1 worker | **~46 ms** (green) | 69 ms | — | — |
-| chan_fanout, os threads | ~438 ms | 69 ms | — | — |
-| context switches over the run | 2.5k (green) | 258 | 4.8k | 60k |
-| 20k spawn + join | **~50 ms** (green) | ~27 ms | — | — |
-| 20k spawn, peak rss | 10 mb (green) | 11 mb | — | — |
-| 20k spawn, os threads | ~1450 ms / 174 mb | — | — | — |
+| chan_fanout, 1m msgs | **171 ms** | 69 ms | 94-135 ms | 135-204 ms |
+| chan_fanout, pinned to 1 worker | **~46 ms** | 69 ms | — | — |
+| chan_fanout, `PITH_GREEN=0` | ~438 ms | 69 ms | — | — |
+| context switches over the run | 2.5k | 258 | 4.8k | 60k |
+| 20k spawn + join | **~50 ms** | ~27 ms | — | — |
+| 20k spawn, peak rss | 10 mb | 11 mb | — | — |
+| 20k spawn, `PITH_GREEN=0` | ~1450 ms / 174 mb | — | — | — |
 
 | compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
 | event_ledger, 200k events | 955 ms (1.16x go) | 820 ms | 178 ms | 199 ms |
 | std_pipeline, 50k records | 476 ms (1.54x go) | 310 ms | 135 ms | — |
-| grpc unary echo, conc=8 | 8075 calls/s (green, 1w) | 13417 | 11012 | — |
+| grpc unary echo, conc=8 | 8075 calls/s (1 worker) | 13417 | 11012 | — |
 
 on coordination the green backend beats rust and zig outright, sits ~2.3x
 behind go at the default worker count, and beats go pinned to one worker. on
@@ -167,8 +167,8 @@ its m:n scheduler, which is most of why it does ~2x the calls at lower cpu;
 closing that gap on one connection would need the same, and the cheaper lever is
 more connections.
 
-the experimental green backend (`PITH_GREEN=1`, see `docs/concurrency.md`) is
-that same in-userspace scheduler, and this benchmark is the case it was built
+the green backend (see `docs/concurrency.md`) is that same in-userspace
+scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker
 (`PITH_GREEN_WORKERS=1`) turns every per-call handoff from a futex wake into a
 userspace switch. measured on the 2-core dev box, conc=8, medians of 5 runs,
@@ -227,8 +227,9 @@ independent fan-out or a larger connection pool wants them spread), so it is a
 task-placement change above the scheduler, not a scheduler-locality one. on this
 two-core box a connection pool can't show the spread paying off anyway: the client
 already shares both cores with the go server it calls. more cores, or a server not
-fighting the client for them, is what a pool would need to scale. green is off by
-default, so the table at the top of this section is the os-thread backend.
+fighting the client for them, is what a pool would need to scale. the table at
+the top of this section was measured on the os-thread backend, which was the
+default when it was taken.
 
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across
@@ -280,7 +281,7 @@ the tasks alive at once, not the total ever spawned.
 
 before, rss climbed ~460 bytes per task and never came back — the slab
 grew one entry per spawn and each task's closure was never freed. after,
-it is flat: 500k tasks or five million, the peak is the batch. the default
+it is flat: 500k tasks or five million, the peak is the batch. the
 os-thread backend still keeps a record per task it has run, so its rss
 still grows with the total (the closure release lands there too, but the
 slot does not); giving that slab the same reclamation is a tracked
@@ -802,8 +803,9 @@ for i in 1 2 3 4 5; do ./bench/catalog_workload 200000; done
 ./target/release/pith build bench/closure_error.pith      # closures + error paths
 for i in 1 2 3 4 5; do ./bench/closure_error 200000; done
 ./target/release/pith build bench/green_fanout.pith       # per-task memory under fan-out
-PITH_GREEN=1 ./bench/green_fanout 200000                  # green: flat rss; drop the flag to see os-thread grow
-PITH_GREEN=1 ./bench/green_fanout 500000                  # peak rss should barely move
+./bench/green_fanout 200000                               # green (the linux default): flat rss
+PITH_GREEN=0 ./bench/green_fanout 200000                  # os threads: watch rss grow
+./bench/green_fanout 500000                               # peak rss should barely move
 bench/chan_fanout_bench.sh 1000000 9                      # channels, four languages, checksum-checked
 ```
 

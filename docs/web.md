@@ -250,7 +250,8 @@ default `/healthz` route: no observability middleware and no `/metrics`.
 run on os threads or on the green runtime:
 
 ```
-PITH_GREEN=1 ./your_server
+./your_server              # green on linux, os threads elsewhere
+PITH_GREEN=0 ./your_server # one os thread per connection, anywhere
 ```
 
 on the green runtime those per-connection tasks are green threads, so a server can

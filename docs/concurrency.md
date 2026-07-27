@@ -131,11 +131,12 @@ the current concurrency story is strong enough for:
 
 ## sharing between tasks
 
-`spawn` runs on a real os thread. reference counts are atomic, so
-handing a value to another task and letting both hold a count is safe.
-what is *not* safe is two tasks mutating the same collection at once —
-a list or map is a plain buffer behind a handle, and concurrent
-mutation races on that buffer.
+a spawned task runs for real alongside its parent, whether the backend
+gives it an os thread of its own or a slice of a green worker. reference
+counts are atomic, so handing a value to another task and letting both
+hold a count is safe. what is *not* safe is two tasks mutating the same
+collection at once — a list or map is a plain buffer behind a handle, and
+concurrent mutation races on that buffer.
 
 pass data between tasks through a channel rather than sharing a
 mutable collection. a channel hands the value over instead of aliasing
@@ -146,8 +147,9 @@ checker.
 
 ## per-thread globals
 
-a module global marked `threadlocal` gets a separate copy per os thread,
-created lazily the first time a thread reads it. each task mutates its
+a module global marked `threadlocal` gets a separate copy per task,
+created lazily the first time that task reads it — one per os thread on the
+os-thread backend, one per green task on the green one. each task mutates its
 own copy with no lock and no race, which is exactly what you want for
 per-task scratch state — a parser's cursor, a buffer, a request-scoped
 counter:
@@ -158,7 +160,7 @@ threadlocal mut arena: Map[Int, Node] := {}
 ```
 
 it reads and writes like any other global; only the storage is
-per-thread. a copy is not reclaimed when its thread exits, so keep the
+per-task. what a copy holds is not released when its owner exits, so keep the
 set of `threadlocal` globals small and the values scratch-sized. use it
 for state that is genuinely per-task; a value shared *across* tasks still
 belongs in a struct or behind a channel.
@@ -176,23 +178,25 @@ things that are still intentionally explicit or still growing:
 - sharing a mutable collection across tasks is a data race (above);
   use channels
 
-## the green backend (experimental)
+## the green backend
 
-by default each `spawn` runs on its own os thread, so every channel send,
-mutex, or await that has to wait hands off through the kernel — a futex wake
-and a context switch. that is fine when tasks mostly compute, but a program
-built out of many small tasks that pass values to each other pays a kernel
-switch on every hop.
+on os threads each `spawn` runs on its own kernel thread, so every channel
+send, mutex, or await that has to wait hands off through the kernel — a futex
+wake and a context switch. that is fine when tasks mostly compute, but a
+program built out of many small tasks that pass values to each other pays a
+kernel switch on every hop.
 
-`PITH_GREEN=1` switches on a second backend. tasks become coroutines that run
-on a small pool of worker threads (`available_parallelism()` by default,
-`PITH_GREEN_WORKERS=n` to pin the count). channel, mutex, waitgroup,
-semaphore, and await operations that would block yield to the scheduler
-instead of parking their worker, so a handoff between two tasks on the same
-worker is a userspace switch with no kernel involved. socket i/o goes through
-an epoll reactor: a read or write that would block parks the task on the
-reactor and frees the worker to run something else, so the whole net stack —
-raw tcp, tls, http/2, grpc — yields the same way without any code of its own.
+the green backend is the answer to that, and on linux it is what you get
+unless you ask otherwise. tasks become coroutines that run on a small pool of
+worker threads (`available_parallelism()` by default, `PITH_GREEN_WORKERS=n`
+to pin the count). channel, mutex, waitgroup, semaphore, and await operations
+that would block yield to the scheduler instead of parking their worker, so a
+handoff between two tasks on the same worker is a userspace switch with no
+kernel involved. socket i/o goes through an epoll reactor: a read or write
+that would block parks the task on the reactor and frees the worker to run
+something else, so the whole net stack — raw tcp, tls, http/2, grpc — yields
+the same way without any code of its own. that reactor is also why the default
+is linux-only; see "which backend to use".
 
 name resolution gets there by a different route. `getaddrinfo` is synchronous
 and there is nothing to poll, so instead of yielding to the reactor the lookup
@@ -203,12 +207,15 @@ its non-blocking one.
 
 nothing in your program changes. the same `spawn`, `Channel`, `Mutex`, and
 `await` run on either backend, and a correct program prints the same thing
-both ways. the two green examples in this repo run identically with the flag
-on or off:
+both ways. `PITH_GREEN` picks one explicitly: `1`, `on`, or `true` forces
+green, `0`, `off`, or `false` forces os threads, and anything else — including
+leaving it unset — takes the platform default, which is green on linux and os
+threads everywhere else. the two green examples in this repo run identically
+whichever way you set it:
 
 ```
 pith run examples/worker_pool.pith
-PITH_GREEN=1 pith run examples/worker_pool.pith
+PITH_GREEN=0 pith run examples/worker_pool.pith
 ```
 
 it helps most when tasks coordinate a lot and compute little — a fan-out of
@@ -239,50 +246,67 @@ backend reclaims its slot and releases the closure it was spawned with, so a
 server that spawns one task per request holds only the tasks running at once,
 not one record for every request it has ever served. a fan-out of 500k short
 tasks that used to climb to ~226 mb now holds around 3 mb, flat no matter how
-many run in total — see the green fan-out row in `docs/performance.md`. (the default
+many run in total — see the green fan-out row in `docs/performance.md`. (the
 os-thread backend still keeps a record per task it has run; teaching it the
 same reclamation is the next step.)
 
 ### which backend to use
 
-green is faster on every shape this repo measures, so the short answer is to
-use it on linux for anything that coordinates a lot of tasks. the longer
-answer is why the os-thread backend is still here, because it is not just
-waiting to be deleted.
+on linux, the one you already have. green is faster on every shape this repo
+measures, so it is the default there and you only reach for `PITH_GREEN=0` if
+one of the caveats below is your workload. everywhere else the default is os
+threads, and `PITH_GREEN=1` opts in.
 
-a blocking call on a green worker stalls the worker, not only the task making
-it. the epoll reactor covers sockets and the resolver pool covers dns, so a
-client dial yields the whole way through, but nothing else does: file reads and
-writes and any slow native call hold the thread they run on, and every task
-pinned to that worker waits behind them. on os threads that same call costs one
-task, because the task is a thread and the kernel just runs someone else.
+the reason for that split is the reactor. it is epoll and eventfd, so it is
+linux-only; macos and the bsds compile a stand-in with no reactor at all, and a
+green task waiting on a socket there blocks its worker for as long as the wait
+lasts. green is still correct on those platforms and you can turn it on, but an
+i/o-heavy server on macos wants os threads until there is a kqueue sibling.
 
-the reactor is also linux-only. it is epoll and eventfd; macos and the bsds
-compile a stand-in with no reactor at all, so a green task waiting on a socket
-there blocks its worker for as long as the wait lasts. green is still correct
-on those platforms, but an i/o-heavy server on macos wants os threads. and
-preemption, which the kernel gives os threads for free, is a build-time opt-in
-under green (see `PITH_GREEN_PREEMPT` below).
+the caveats that come with the linux default all come from one fact: a green
+worker runs many tasks, so anything that holds the worker holds all of them,
+where an os thread would only cost the one task making the call.
 
-there is one more reason, which matters to this repo rather than to your
-program: os threads are the reference green gets checked against.
-`make verify-green-corpus` runs the whole regression corpus under green and
-diffs it against what the os-thread backend produces, which is how a
-single-worker deadline bug turned up. two implementations that have to agree
-is worth keeping around past the point where one of them is faster.
+file i/o is where you are most likely to meet that. `read`, `write`, and every
+other file operation goes straight to the syscall with no yield point, so a task
+doing a large or slow file read holds its worker for the whole call and every
+task pinned to that worker waits behind it. sockets do not have this problem,
+because they go through the reactor, and neither does dns, which runs on a pool
+of blocking threads while the caller parks. file i/o is the gap, and a program
+that reads files from inside a task can feel it purely by moving to the green
+default. `PITH_GREEN=0` is the answer if it bites you.
 
-it is off by default and still experimental. the known rough edges:
+preemption is the other thing the kernel used to hand you. os threads get it for
+free; under green a compute-only task that never touches a channel, await, or
+socket holds its worker until it finishes, unless the binary was built with
+safe-points (`PITH_GREEN_PREEMPT=1`, below). code that coordinates already yields
+on its own and never needs it.
+
+and placement is luck. a task pins to the first worker that runs it, so whether
+two tasks that talk to each other end up sharing one is chance. on the channel
+fan-out benchmark that is the difference between ~46ms and ~130-170ms for the
+same program. `PITH_GREEN_WORKERS=1` takes the choice away and is often the
+fastest setting for a single pipeline.
+
+there is one more reason the os-thread backend stays, which matters to this
+repo rather than to your program: it is the reference green gets checked
+against. `make verify-green-corpus` runs the whole regression corpus under
+green and diffs it against the fixed os-thread answers, which is how a
+single-worker deadline bug turned up. two implementations that have to agree is
+worth keeping around past the point where one of them is faster.
+
+the rest of the rough edges:
 
 - a compute-bound task that loops without ever touching a channel, await, or
-  socket can now be preempted, but you opt in at build time. compile with
+  socket can be preempted, but you opt in at build time. compile with
   `PITH_GREEN_PREEMPT=1` and the backend puts a safe-point at every loop
-  back-edge; run that binary under `PITH_GREEN=1` and a monitor thread makes a
+  back-edge; run that binary under green and a monitor thread makes a
   task that has held its worker past its time slice yield, so its peers on the
   same worker get to run. it is opt-in because that safe-point costs a bit on
-  every loop iteration (nothing you would notice on real work, but real on a
-  tight arithmetic loop), and the default build is almost always run os-thread,
-  so it plants no check and pays nothing. code that uses channels and sockets
-  already yields on its own and never needs this. one gap in this first version:
+  every loop iteration — nothing measurable on real work, about 6% on a
+  degenerate arithmetic loop — and a build that never runs green would pay for
+  a check that can never fire. code that uses channels and sockets already
+  yields on its own and never needs this. one gap in this first version:
   a task sitting inside a long native runtime call (a large file read, say) is
   not preempted until it returns to pith code and hits the next back-edge
 - fewer workers means more locality: a task pins to the first worker that runs

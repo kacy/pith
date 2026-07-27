@@ -314,11 +314,11 @@ fn runtime_func_ref(
         .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func)))
 }
 
-/// Whether this build should emit green-preemption safe-points. Off by default —
-/// the default binary is run os-thread and a flat loop pays a large relative cost
-/// for the per-iteration check — so it is opt-in via `PITH_GREEN_PREEMPT`. Set it
-/// at build time on the same binary you intend to run under `PITH_GREEN=1` to make
-/// compute-bound green tasks preemptible.
+/// Whether this build should emit green-preemption safe-points. Off by default,
+/// because a flat loop pays a large relative cost for the per-iteration check and
+/// most programs never have a compute-only task that needs descheduling. Set
+/// `PITH_GREEN_PREEMPT` at build time to make compute-bound green tasks
+/// preemptible.
 fn green_preempt_enabled() -> bool {
     matches!(
         std::env::var("PITH_GREEN_PREEMPT").as_deref(),
@@ -468,10 +468,10 @@ pub fn compile_from_ir(
     // green preemption safe-points are opt-in at compile time. a flat arithmetic
     // loop pays a large relative cost for the inline flag check (its body is a
     // couple of instructions, so the extra load+test+branch per iteration is a
-    // big fraction), and the default binary is almost always run os-thread. so
-    // the default codegen emits no check at all — exactly zero cost — and only a
-    // build that asks for preemption (`PITH_GREEN_PREEMPT=1`, the same build you
-    // then run under `PITH_GREEN=1`) inserts the safe-points. `None` here means
+    // big fraction), and most programs have no compute-only task that would ever
+    // need descheduling. so the default codegen emits no check at all — exactly
+    // zero cost — and only a build that asks for preemption
+    // (`PITH_GREEN_PREEMPT=1`) inserts the safe-points. `None` here means
     // "emit nothing"; `Some(flag)` carries the imported flag symbol.
     let preempt_flag = if green_preempt_enabled() {
         Some(

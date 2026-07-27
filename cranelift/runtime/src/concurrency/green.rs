@@ -1,4 +1,4 @@
-//! green-thread backend (experimental, behind `PITH_GREEN`)
+//! green-thread backend (the default on linux; `PITH_GREEN` overrides)
 //!
 //! an M:N scheduler: many pith tasks run as stackful coroutines on a small
 //! fixed pool of worker OS threads. spawning a task is a userspace enqueue, not

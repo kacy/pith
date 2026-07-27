@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-tests docsite docsite-check memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -752,15 +752,17 @@ fuzz: build
 	@./tools/fuzz/fuzz --count 300 --build-every 5
 
 # --- green-thread smoke test ---
-# the experimental green backend (PITH_GREEN=1) must produce byte-identical
-# output to the default os-thread backend on independent, non-coordinating
-# tasks. this builds the fan-out/join smoke program once and compares the two
-# runs. it does NOT run the wider suite green: many programs coordinate via
-# channels and would deadlock under the P1a "block the worker" await — that is
-# expected and is what a later phase fixes.
+# the green backend (PITH_GREEN=1) must produce byte-identical output to the
+# os-thread backend (PITH_GREEN=0) on independent, non-coordinating tasks. this
+# builds the fan-out/join smoke program once and compares the two runs.
+#
+# every green-* target below pins BOTH sides of the comparison explicitly. green
+# is the default on linux, so a run that just says `pith run` is now the green
+# side, and a differential that relied on the default for its reference would be
+# comparing green against green and passing for free.
 green-smoke: build
 	@echo "--- green-thread smoke (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/smoke.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/smoke.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/smoke.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -779,7 +781,7 @@ green-smoke: build
 # before P1b this failed green (tasks saw a sibling's leftover value).
 green-threadlocal: build
 	@echo "--- green-thread threadlocal isolation (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/threadlocal.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/threadlocal.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/threadlocal.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -799,7 +801,7 @@ green-threadlocal: build
 # tasks to completion. output must stay byte-identical to the os-thread backend.
 green-pingpong: build
 	@echo "--- green-thread channel ping-pong (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/pingpong.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/pingpong.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/pingpong.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -812,7 +814,7 @@ green-pingpong: build
 
 green-producer-consumer: build
 	@echo "--- green-thread producer/consumer (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -835,7 +837,7 @@ green-producer-consumer: build
 # program completes with output byte-identical to the os-thread backend.
 green-waitgroup: build
 	@echo "--- green-thread waitgroup fan-out (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/waitgroup.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/waitgroup.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/waitgroup.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -848,7 +850,7 @@ green-waitgroup: build
 
 green-mutex: build
 	@echo "--- green-thread mutex shared-counter (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/mutex.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/mutex.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/mutex.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -866,7 +868,7 @@ green-mutex: build
 # yield-and-wake path; the completion total must match the os-thread backend.
 green-semaphore: build
 	@echo "--- green-thread semaphore contention (byte-identical off vs on) ---"
-	@off=$$(./target/release/pith run tests/green/semaphore.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/semaphore.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/semaphore.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
@@ -887,7 +889,7 @@ green-semaphore: build
 # only be caught at one worker.
 green-barrier: build
 	@echo "--- green-thread barrier drain/release (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
@@ -910,7 +912,7 @@ green-barrier: build
 # the default count — the one-worker hang can only be caught at one worker.
 green-await-fanin: build
 	@echo "--- green-thread await fan-in (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(./target/release/pith run tests/green/await_fanin.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/await_fanin.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/await_fanin.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/await_fanin.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
@@ -935,7 +937,7 @@ green-await-fanin: build
 # os-thread backend.
 green-echo: build
 	@echo "--- green-thread tcp echo (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(./target/release/pith run tests/green/echo.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/echo.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/echo.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/echo.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
@@ -962,7 +964,7 @@ green-echo: build
 # caught at one worker.
 green-starvation: build
 	@echo "--- green-thread cooperative preemption (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
@@ -984,7 +986,7 @@ green-starvation: build
 # each half of the pair re-parks long before it overruns its quantum.
 green-pinned-fairness: build
 	@echo "--- green-thread wake affinity fairness (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
+	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/pinned_fairness.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
@@ -999,22 +1001,29 @@ green-pinned-fairness: build
 
 # --- green-thread test suite ---
 # the deterministic, bounded green-thread tests, gathered so ci can run them as
-# one step. each compares the default os-thread backend against PITH_GREEN=1 and
-# must match byte-for-byte. green-echo is intentionally left out: it binds a
+# one step. each compares PITH_GREEN=0 against PITH_GREEN=1 and must match
+# byte-for-byte. green-echo is intentionally left out: it binds a
 # fixed loopback port and races a sleep to let the server start, which is too
 # flaky for a shared runner.
 green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness
 	@echo "all green-thread tests passed"
 
-# --- full corpus under the green backend ---
-# the dedicated green-tests above prove the coordination primitives; this proves
-# the whole deterministic regression corpus produces the same output under the
-# green backend as under os threads. it is the safety net for making green the
-# default: every case with an expected file is run under PITH_GREEN=1 at the
-# default worker count and again pinned to one worker, and compared to the same
-# expected output the os-thread run is held to. a green run whose output drifts
-# from its expected file is a green correctness bug, not a timing artifact,
-# since the expected file is the fixed os-thread answer.
+# --- full corpus under each backend ---
+# the dedicated green-tests above prove the coordination primitives; these two
+# targets prove the whole deterministic regression corpus produces the same
+# output on either backend. the expected files are the fixed os-thread answers,
+# so a run whose output drifts from its expected file is a correctness bug in
+# that backend, not a timing artifact.
+#
+# both targets name their backend explicitly rather than leaning on the default.
+# green is the default on linux and `make test` therefore already covers it at
+# the default worker count, but that is a property of the host, not of the
+# target: verify-green-corpus has to hold on a mac too, and the os-thread pass
+# is the only coverage the PITH_GREEN=0 opt-out gets on a linux runner.
+#
+# green runs twice, at the default worker count and pinned to one worker, since
+# a single-worker deadlock (the shape that turned up a read deadline bug) can
+# only be caught at one worker. os threads have no such knob and run once.
 #
 # a case that legitimately differs under green (nondeterministic scheduling
 # order that its expected output happens to encode) belongs in
@@ -1044,7 +1053,28 @@ verify-green-corpus-only:
 	done; \
 	echo "$$pass passed, $$fail failed, $$skip without a source"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
-	echo "green corpus matches os-thread output"
+	echo "green corpus matches the expected output"
+
+verify-osthread-corpus: build verify-osthread-corpus-only
+
+verify-osthread-corpus-only:
+	@echo "--- regression corpus under the os-thread backend (PITH_GREEN=0) ---"
+	@pass=0; fail=0; skip=0; \
+	for f in $(GREEN_CORPUS_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		src="tests/cases/$$name.pith"; \
+		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
+		expected=$$(cat "$$f"); \
+		actual=$$(timeout 60 env PITH_GREEN=0 ./target/release/pith run "$$src" 2>/dev/null); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+		else \
+			echo "FAIL $$name (os threads)"; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed, $$skip without a source"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "os-thread corpus matches its expected output"
 
 # --- memcheck ---
 # run a curated set of memory-management-heavy programs under valgrind
@@ -1053,6 +1083,17 @@ verify-green-corpus-only:
 # enum-payload overread did exactly that until it was caught here). the
 # full example + regression corpus is valgrind-clean; this subset keeps
 # the gate fast.
+#
+# MEMCHECK_CASES runs on whatever backend is the default here, which on linux is
+# green. MEMCHECK_OSTHREAD_CASES is the handful whose whole subject is the
+# os-thread task machinery (its slab reclaim, its join state, the ownership of
+# values handed across a real thread), so those run again with PITH_GREEN=0 —
+# otherwise the flip would quietly stop testing the code they were written for.
+MEMCHECK_OSTHREAD_CASES := \
+	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
+	tests/cases/test_channel_fanout_ownership \
+	tests/cases/test_channel_try_send_ownership
+
 MEMCHECK_CASES := \
 	tests/cases/test_match_payload tests/cases/test_combo_enums_deep \
 	tests/cases/test_fn_value_positions tests/cases/test_global_fn_value \
@@ -1099,6 +1140,14 @@ memcheck: build
 			echo "ok   $$base"; \
 		else \
 			echo "FAIL $$base (valgrind)"; head -6 /tmp/pith-memcheck.txt; fail=1; \
+		fi; \
+	done; \
+	for base in $(MEMCHECK_OSTHREAD_CASES); do \
+		./target/release/pith build "$$base.pith" > /dev/null 2>&1 || { echo "FAIL build $$base"; fail=1; continue; }; \
+		if PITH_GREEN=0 PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
+			echo "ok   $$base (os threads)"; \
+		else \
+			echo "FAIL $$base (valgrind, os threads)"; head -6 /tmp/pith-memcheck.txt; fail=1; \
 		fi; \
 	done; \
 	if [ $$fail -ne 0 ]; then exit 1; fi; \

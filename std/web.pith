@@ -344,6 +344,9 @@ impl App:
     fn listen(host: String, port: Int) -> Int!:
         app := self
         fd := tcp_listen(host, port)!
+        # close the listener if the accept loop ever gives up: a listening socket
+        # nobody accepts from still passes a tcp health check.
+        defer tcp_close(fd)
         mut failures := 0
         while true:
             accepted := tcp.accept(fd)
@@ -377,6 +380,7 @@ impl App:
         app := self
         config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
         listener := tls.listen(host, port, config)!
+        defer listener.close()
         mut failures := 0
         while true:
             accepted := tls.accept_socket(listener)

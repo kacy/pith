@@ -1138,6 +1138,10 @@ fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.H
 # std.prometheus's serve.
 pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     fd := tcp_listen(host, port)!
+    # close the listener if the accept loop ever gives up. a listening socket
+    # nobody accepts from still answers a tcp health check, so leaving it open
+    # is how a dead server keeps looking alive.
+    defer tcp_close(fd)
     mut failures := 0
     while true:
         accepted := tcp.accept(fd)
@@ -1196,6 +1200,7 @@ fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequest
 pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
+    defer listener.close()
     mut failures := 0
     while true:
         accepted := tls.accept_socket(listener)
@@ -1238,6 +1243,7 @@ fn serve_h2c_streaming_slot(fd: Int):
 pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
     fd := tcp_listen(host, port)!
+    defer tcp_close(fd)
     mut failures := 0
     while true:
         accepted := tcp.accept(fd)
@@ -1278,6 +1284,7 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
     stream_handler_fn = handler
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
+    defer listener.close()
     mut failures := 0
     while true:
         accepted := tls.accept_socket(listener)

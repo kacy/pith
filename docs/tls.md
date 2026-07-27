@@ -63,6 +63,57 @@ listener_cfg := tls.with_config_selector(
 )
 ```
 
+## accepting connections
+
+`tls.listen(host, port, config)` returns a listener. `tls.accept(listener)`
+takes the next connection off it and hands back a handshaked `Conn`. that is
+the one-shot form, and it is fine for a test or a tool that serves a single
+client.
+
+a server with an accept loop wants the two halves separately, because the
+handshake reads from the network:
+
+```pith
+listener := tls.listen(host, port, config)!
+while true:
+    fd := tls.accept_socket(listener)!
+    spawn serve(tls.listener_from_handle(listener.handle), fd)
+```
+
+`accept_socket` returns the raw socket without handshaking it, and
+`tls.handshake(listener, fd)` runs the handshake on a socket that came from it.
+splitting them keeps two problems off the loop. a client that dribbles its
+handshake records now holds only its own task, instead of every other client
+waiting to be accepted. and a client whose handshake fails fails on its own task,
+instead of propagating an error out of the loop and ending it. that second one
+matters more than it sounds: the things that open a connection and never finish a
+handshake are ordinary traffic, like port scanners, load balancer probes, and
+browsers racing two connections and dropping one.
+
+the socket belongs to `handshake` once you pass it in. on success the returned
+`Conn` owns it and `Conn.close()` releases it; on failure `handshake` closes it
+before the error propagates, so a spawned task never leaks the socket of a
+client that never got past the handshake.
+
+a spawned task takes its arguments by value while the loop keeps using the
+listener, which is why the shape above passes `listener.handle` and rebuilds the
+listener with `tls.listener_from_handle` inside the task.
+
+a failed handshake is dropped without a log line, because a log line per failure
+is a way for anyone with a socket to fill your disk. what it leaves behind is a
+counter:
+
+```pith
+failures := tls.server_handshake_failures()
+```
+
+that counts every server handshake that has failed since the process started:
+peers that hang up, peers that send something that is not tls, peers that offer
+no acceptable cipher or alpn protocol, and peers that fail client-certificate
+verification. a low steady rate is background noise on any public port. a spike
+is worth an alert. `std.web`, `std.net.http2.server`, and `std.net.grpc` already
+accept this way, so their servers count failures with no extra wiring.
+
 ## connection state
 
 every native tls connection exposes a `ConnectionState`:

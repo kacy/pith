@@ -4,7 +4,12 @@ import std.toml as toml
 # regression for the typed-decode node-pool leak: decode[T]/decode_text[T]
 # own the parse that fills the json/toml node pool, so the compiler brackets
 # the lowered body with a pool mark and reclaims the nodes on every exit.
-# without that, next_node_id grew on every decode and never came back down.
+# without that, every decode left its nodes behind for good.
+#
+# occupancy is measured with pool_live_nodes() rather than the id counter:
+# ids are never reused, so the counter keeps climbing even when the pool is
+# empty. that is what keeps a handle from a reclaimed scope from aliasing a
+# later document.
 
 struct Addr:
     pub city: String
@@ -45,8 +50,8 @@ fn main():
         i = i + 1
 
     # after a thousand typed decodes both pools are fully reclaimed.
-    print("json_nodes=" + json.pool_mark_node_id().to_string())
-    print("toml_nodes=" + toml.pool_mark_node_id().to_string())
+    print("json_nodes=" + json.pool_live_nodes().to_string())
+    print("toml_nodes=" + toml.pool_live_nodes().to_string())
     print("acc=" + acc.to_string())
 
     # and the materialized fields survive the reclaim (independent heap copies).

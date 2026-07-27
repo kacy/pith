@@ -78,5 +78,21 @@ fn main() -> String!:
     # invalid parse
     bad := json.parse("not json")
     print("bad parse = {bad}")
+
+    # parsing in a loop: a scope hands the nodes back so a long-lived task does
+    # not keep every document it has ever seen. http and http/2 servers already
+    # scope each request, so this is for parses you drive yourself.
+    before := json.pool_live_nodes()
+    mut total := 0
+    mut i := 0
+    while i < 100:
+        scope := json.open_scope()
+        doc := json.parse("[1, 2, 3]")
+        total = total + json.array_len(doc)
+        json.close_scope(scope)
+        i = i + 1
+    print("scanned = {total}")
+    print("nodes left over = {json.pool_live_nodes() - before}")
+
     fs.remove(path)
     return ""

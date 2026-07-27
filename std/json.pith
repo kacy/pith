@@ -17,6 +17,13 @@ from std.bytes import ByteBuffer
 
 JSON_FILE_CHUNK_SIZE := 4096
 
+# an open node-pool scope. treat it as opaque and hand it straight back to
+# close_scope(); the fields are the pool positions the scope rolls back to.
+pub struct JsonScope:
+    pub depth: Int
+    pub node_mark: Int
+    pub array_mark: Int
+
 # saves enough parser state to roll back a speculative parse.
 pub struct JsonCheckpoint:
     pub next_node_id: Int
@@ -97,7 +104,10 @@ fn json_span_equals(input: Bytes, start: Int, end: Int, target: Bytes) -> Bool:
 # Node Pool
 # ===============================================================
 
-# Global node counter and type storage
+# Node ids come from a counter that only ever goes up, even across a
+# reclaim. Reusing ids would make a handle held past its scope silently read
+# whatever document landed on that id next; leaving the counter alone costs
+# nothing and turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
 threadlocal mut node_types: Map[Int, String] := {}
 threadlocal mut string_values: Map[Int, String] := {}
@@ -114,6 +124,11 @@ threadlocal mut object_values_by_slot: Map[String, Int] := {}
 threadlocal mut array_items_flat: List[Int] := []
 threadlocal mut array_item_offsets: Map[Int, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
+
+# How many scopes open_scope() has handed out and not yet reclaimed. A scope
+# knows its own depth, which is how close_scope() tells "already closed" from
+# "close me and anything opened inside me".
+threadlocal mut open_scope_depth: Int := 0
 
 # Allocates a new node of the specified type and returns its handle
 fn allocate_node(kind: String) -> Int:
@@ -187,13 +202,17 @@ fn get_char_at(position: Int) -> String:
         return ""
     return parser_input[position]
 
-# Returns true if a node handle points at an allocated node.
+# Returns true if a node handle points at a node that is still allocated.
+# node ids are never reused, so a handle left over from a reclaimed scope is
+# simply absent from the pool rather than aliasing some later document's node.
 fn is_valid_handle(handle: Int) -> Bool:
-    return handle >= 0 and handle < next_node_id
+    return node_types.contains_key(handle)
 
 # Returns true if a handle is valid and has the requested node kind.
+# a node's kind is never the empty string, so the default doubles as the
+# "no such node" answer and one lookup settles both questions.
 fn handle_has_type(handle: Int, kind: String) -> Bool:
-    return is_valid_handle(handle) and node_types[handle] == kind
+    return node_types.get_default(handle, "") == kind
 
 # Skips whitespace characters (space, tab, newline, carriage return)
 fn skip_whitespace():
@@ -889,6 +908,41 @@ pub fn decode_file[T](file_path: String) -> T!JsonDecodeError:
 pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!JsonDecodeError:
     return decode_path[T](parse_file(file_path), dotted_path)!
 
+# opens a node-pool scope. every node parsed between here and the matching
+# close_scope() is reclaimed when the scope closes, so a task that parses one
+# document per request stops accumulating them. pair it with defer:
+#
+#     scope := json.open_scope()
+#     defer json.close_scope(scope)
+#     root := json.parse(body)
+#
+# the values a scope produces have to be copied out before it closes — pull the
+# strings and numbers you need into your own variables and let the handles go.
+# std's http and http/2 servers already open a scope around each request, so a
+# handler that parses a body and answers from it needs nothing extra.
+pub fn open_scope() -> JsonScope:
+    open_scope_depth = open_scope_depth + 1
+    return JsonScope(open_scope_depth, next_node_id, array_items_flat.len())
+
+# closes a scope opened by open_scope() and reclaims the nodes parsed inside it.
+#
+# scopes nest, and they close innermost-first. closing an outer scope while an
+# inner one is still open also closes the inner one — an arena can only give
+# back a suffix of what it handed out. closing a scope that is already closed
+# does nothing. either way no handle from a closed scope can come back to life:
+# node ids are never reused, so reading one reports "invalid" rather than some
+# later document's value.
+pub fn close_scope(scope: JsonScope):
+    if scope.depth > open_scope_depth:
+        return
+    json_restore_to(scope.node_mark, scope.array_mark)
+    open_scope_depth = scope.depth - 1
+
+# how many nodes the pool currently holds. useful for asserting in a test that
+# a parse loop gives its nodes back.
+pub fn pool_live_nodes() -> Int:
+    return node_types.len()
+
  # captures the current parser state.
 pub fn checkpoint() -> JsonCheckpoint:
     return json_checkpoint()
@@ -906,22 +960,27 @@ fn json_restore(mark: JsonCheckpoint):
 # reclaims every node allocated since the (node_id, array_len) mark. this is
 # the integer-based core so a caller can roll the pool back without first
 # building a checkpoint struct.
+#
+# the id counter is deliberately left where it is. an inner reclaim can already
+# have dropped part of the range, so each id is checked before it is dropped
+# again — that also makes a repeated restore to the same mark a no-op instead
+# of a fault.
 fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
     mut node_id := next_node_id - 1
     while node_id >= node_id_mark:
-        node_types.remove(node_id)
-        string_values.remove(node_id)
-        integer_values.remove(node_id)
-        float_values.remove(node_id)
-        boolean_values.remove(node_id)
-        clear_object_entries(node_id)
-        object_key_counts.remove(node_id)
-        array_item_offsets.remove(node_id)
-        array_item_counts.remove(node_id)
+        if node_types.contains_key(node_id):
+            node_types.remove(node_id)
+            string_values.remove(node_id)
+            integer_values.remove(node_id)
+            float_values.remove(node_id)
+            boolean_values.remove(node_id)
+            clear_object_entries(node_id)
+            object_key_counts.remove(node_id)
+            array_item_offsets.remove(node_id)
+            array_item_counts.remove(node_id)
         node_id = node_id - 1
     while array_items_flat.len() > array_len_mark:
         array_items_flat.remove(array_items_flat.len() - 1)
-    next_node_id = node_id_mark
 
 # the typed decoders (decode[T], decode_text[T], ...) own the parse that fills
 # the node pool, then copy scalars and strings out into a concrete struct. once

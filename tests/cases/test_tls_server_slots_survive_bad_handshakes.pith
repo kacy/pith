@@ -1,0 +1,105 @@
+# the http/2 tls server caps how many connections it serves at once with a
+# semaphore. the accept loop takes a permit before the handshake runs, so a
+# handshake that fails has to give the permit back — otherwise a client that
+# only ever half-connects drains the permits and the server stops accepting
+# after MAX_CONNECTIONS attempts. that is the same denial of service as an
+# accept loop that dies, just slower and harder to spot.
+#
+# this opens more junk connections than there are permits, waits for the server
+# to have failed that many handshakes, and then makes a real call.
+
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.net.tcp as tcp
+import std.protobuf as protobuf
+import std.time as time
+
+PORT := 50783
+
+# comfortably more than std.net.http2.server's MAX_CONNECTIONS of 512, so the
+# permits have to have been recycled for the real call at the end to land.
+JUNK_CONNECTIONS := 600
+JUNK_HANDSHAKE_FAILURES := 520
+
+# read protobuf field 1 (a string) from a message.
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/echo.Echo/Ping":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_field1(request) catch ""
+    w := protobuf.writer()
+    w.write_string(1, "echo:" + name) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run_server():
+    grpc.serve_tls("127.0.0.1", PORT, "tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key", echo_dispatch) catch 0
+
+fn client_call(name: String) -> String:
+    cfg_r := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")
+    if cfg_r.is_err:
+        return "TLS_CFG_ERR"
+    cfg := cfg_r.ok.with_alpn(["h2"])
+    conn_r := grpc.dial_with_config("localhost", PORT, cfg)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    w := protobuf.writer()
+    w.write_string(1, name) catch false
+    reply_r := conn.unary("/echo.Echo/Ping", w.bytes())
+    w.free()
+    if reply_r.is_err:
+        conn.close()
+        return "UNARY_ERR"
+    got := read_field1(reply_r.ok) catch "?"
+    conn.close()
+    return got
+
+# retry the real client until the spawned server is up.
+fn call_when_ready(name: String, timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := client_call(name)
+        if got != "DIAL_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "DIAL_ERR"
+
+# open and immediately drop `count` tcp connections, the way a port scanner does.
+fn hammer(count: Int):
+    mut opened := 0
+    while opened < count:
+        fd := tcp.connect("127.0.0.1", PORT) catch 0
+        if fd != 0:
+            tcp.close(fd)
+        opened = opened + 1
+
+# wait for the server to have counted `target` failed handshakes. if permits
+# leaked, the count stalls at MAX_CONNECTIONS and this reports what it saw.
+fn wait_for_handshake_failures(target: Int, timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        if tls.server_handshake_failures() >= target:
+            return "handshake failures counted"
+        time.delay(25)
+        waited = waited + 25
+    return "stalled at " + tls.server_handshake_failures().to_string()
+
+fn main():
+    spawn run_server()
+    print(call_when_ready("before", 10000))
+    hammer(JUNK_CONNECTIONS)
+    print(wait_for_handshake_failures(JUNK_HANDSHAKE_FAILURES, 30000))
+    print(call_when_ready("after", 10000))

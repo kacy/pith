@@ -34,6 +34,14 @@ mut native_server_key_der: Map[Int, Bytes] := {}
 mut native_server_client_ca_pem: Map[Int, String] := {}
 mut native_server_client_ca_optional: Map[Int, Bool] := {}
 mut native_listener_config: Map[Int, Int] := {}
+
+# how many server handshakes have failed since the process started. a failed
+# handshake is normal traffic — probes, scanners, clients that hang up — so a
+# server drops it silently rather than logging a line an attacker could use to
+# fill the disk. the counter is what makes it observable: read it from a metric
+# or a status endpoint and watch the rate. see server_handshake_failures().
+mut server_handshake_failure_count := AtomicInt(0)
+
 # per-connection tls state was 12 module-global maps keyed by conn handle,
 # raced by two connections doing i/o at once. it now lives in one
 # NativeConnState struct in a single mutex-guarded map (defined just after
@@ -45,9 +53,10 @@ TLS_CONTENT_APPLICATION_DATA := 23
 
 # a read deadline for an accepted server connection. without it a client can
 # open a tls connection and then send nothing (or dribble ChangeCipherSpec /
-# handshake records slowly), pinning the pre-auth handshake indefinitely; many
-# such clients starve the accept loop. the deadline bounds the whole
-# handshake — and the connection's later reads — to a wall-clock window.
+# handshake records slowly), pinning the pre-auth handshake indefinitely. the
+# deadline bounds the whole handshake — and the connection's later reads — to a
+# wall-clock window. it is not a substitute for running the handshake off the
+# accept loop: see accept_socket() and handshake() below.
 SERVER_HANDSHAKE_TIMEOUT_MS := 10000
 TLS_HANDSHAKE_CLIENT_HELLO := 1
 TLS_HANDSHAKE_SERVER_HELLO := 2
@@ -1081,9 +1090,54 @@ pub fn listen(host: String, port: Int, config: Config) -> Listener!:
         fail "tls.listen needs a server config, not a client config (use tls.server_config)"
     fail "native tls server config required"
 
-# accept a tls connection.
+# accept a tls connection: take the next socket off the listener and run the
+# server handshake on it. this is the one-shot form, fine for a test or a tool
+# that serves a single client. a server with an accept loop wants the two halves
+# separately — see accept_socket() and handshake().
 pub fn accept(listener: Listener) -> Conn!:
     return Listener(listener.handle).accept()
+
+# accept the next tcp connection on a tls listener without handshaking it.
+#
+# an accept loop should use this and hand the socket to a task that calls
+# handshake(). the handshake reads from the network, so running it in the loop
+# lets one slow client hold every other client up for the whole
+# SERVER_HANDSHAKE_TIMEOUT_MS window, and lets one failed handshake take the
+# loop down with it.
+pub fn accept_socket(listener: Listener) -> Int!:
+    return Listener(listener.handle).accept_socket()
+
+# run the tls server handshake on a socket that came from accept_socket().
+#
+# the socket is owned by this call: on success the returned Conn owns it and
+# Conn.close() releases it, and on failure it is closed here before the error
+# propagates, so a caller that spawns one of these per connection never leaks an
+# fd to a client that never gets past the handshake.
+pub fn handshake(listener: Listener, fd: Int) -> Conn!:
+    return Listener(listener.handle).handshake(fd)
+
+# rebuild a Listener from its handle. an accept loop that spawns a task per
+# connection passes the handle rather than the struct, because a spawned task
+# takes its arguments by value and the loop keeps using the listener.
+pub fn listener_from_handle(handle: Int) -> Listener:
+    return Listener(handle)
+
+# how many server handshakes have failed since this process started.
+#
+# a handshake fails when a peer opens a connection and then hangs up, sends
+# something that is not tls, offers no cipher or alpn protocol the server
+# accepts, or fails client-certificate verification. a low steady rate is
+# background noise on any public port; a spike is worth an alert.
+pub fn server_handshake_failures() -> Int:
+    return server_handshake_failure_count.load()
+
+# count a failed handshake and close the socket it came in on.
+fn note_failed_handshake(fd: Int):
+    mut counted := false
+    while not counted:
+        current := server_handshake_failure_count.load()
+        counted = server_handshake_failure_count.compare_set(current, current + 1)
+    tcp_close(fd)
 
 impl Config:
     fn with_alpn(protocols: List[String]) -> Config:
@@ -1165,13 +1219,25 @@ impl Config:
 
 impl Listener:
     fn accept() -> Conn!:
+        return self.handshake(self.accept_socket()!)!
+
+    fn accept_socket() -> Int!:
         if native_listener_config.contains_key(self.handle):
             fd := tcp_accept(self.handle)!
             # bound the handshake (and the connection's reads) so a slow or
             # silent client can't pin a server task before it authenticates.
             tcp_set_timeout(fd, SERVER_HANDSHAKE_TIMEOUT_MS)
-            return native_server_handshake(TcpStream(fd), Config(native_listener_config[self.handle]))
+            return fd
         fail "native tls listener not found"
+
+    fn handshake(fd: Int) -> Conn!:
+        if not native_listener_config.contains_key(self.handle):
+            note_failed_handshake(fd)
+            fail "native tls listener not found"
+        # the socket belongs to this call, so every error exit has to close it:
+        # once the handshake fails there is no Conn for the caller to close.
+        errdefer note_failed_handshake(fd)
+        return native_server_handshake(TcpStream(fd), Config(native_listener_config[self.handle]))!
 
     fn close():
         if native_listener_config.contains_key(self.handle):

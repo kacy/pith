@@ -52,6 +52,7 @@ import std.net.http2.hpack as hpack
 import std.bytes as bytes
 import std.binary as binary
 import std.net.http as http
+import std.net.tcp as tcp
 import std.net.tls as tls
 # the request-side stream event and its constructors, plus the settings ids and
 # the default window, are shared as-is with the client — the server reads the
@@ -1102,8 +1103,8 @@ pub fn serve_h2c_connection(fd: Int, handler: fn(http.HttpRequestBytes) -> http.
 # serve_h2c_connection with the accept loop's concurrency permit released when
 # the connection ends, however it ends.
 fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    defer connection_slots.release()
     serve_h2c_connection(fd, handler)
-    connection_slots.release()
 
 # the connection lifecycle, factored out so the offline tests can drive it over a
 # ServerConn without a socket. reads the preface, sends the server SETTINGS,
@@ -1137,10 +1138,20 @@ fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.H
 # std.prometheus's serve.
 pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     fd := tcp_listen(host, port)!
+    # close the listener if the accept loop ever gives up. a listening socket
+    # nobody accepts from still answers a tcp health check, so leaving it open
+    # is how a dead server keeps looking alive.
+    defer tcp_close(fd)
+    mut failures := 0
     while true:
-        client := tcp_accept(fd)!
+        accepted := tcp.accept(fd)
+        if accepted.is_err:
+            failures = failures + 1
+            tcp.back_off_after_accept_failure(failures, accepted.err)!
+            continue
+        failures = 0
         connection_slots.acquire()
-        spawn serve_h2c_slot(client, handler)
+        spawn serve_h2c_slot(accepted.ok, handler)
     return 0
 
 # serve one accepted tls connection as http/2 to completion. the tls handshake
@@ -1158,10 +1169,22 @@ pub fn serve_h2_tls_connection(tls_conn: tls.Conn, handler: fn(http.HttpRequestB
     serve_connection(conn, handler) catch false
     conn.close()
 
-# serve_h2_tls_connection with the accept loop's permit released at the end.
-fn serve_h2_tls_slot(client: tls.Conn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
-    serve_h2_tls_connection(client, handler)
-    connection_slots.release()
+# handshake an accepted socket and serve it. split out from serve_h2_tls_slot so
+# the failure path is a plain `!` — a handshake that fails closes the socket and
+# leaves nothing for the caller to clean up.
+fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Bool!:
+    serve_h2_tls_connection(tls.handshake(tls.listener_from_handle(listener_handle), fd)!, handler)
+    return true
+
+# handshake_and_serve_h2_tls with the accept loop's permit released at the end.
+#
+# the loop takes the permit before the handshake runs, so the permit has to come
+# back on the handshake's failure path too. a client that can leak one permit per
+# connection stops the server accepting after MAX_CONNECTIONS attempts, which is
+# the same denial of service the accept loop was fixed for, only slower.
+fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    defer connection_slots.release()
+    handshake_and_serve_h2_tls(listener_handle, fd, handler) catch false
 
 # bind host:port for http/2 over tls and serve forever. it builds a tls server
 # config from the pem `cert`/`key` files, offers alpn "h2" (and "http/1.1", which
@@ -1169,13 +1192,25 @@ fn serve_h2_tls_slot(client: tls.Conn, handler: fn(http.HttpRequestBytes) -> htt
 # accepts tls connections, and runs each on its own task. this blocks, so it is
 # usually the last thing main does; spawn it if you need to keep going. mirrors
 # listen_h2c, only over tls.
+#
+# the handshake runs on the spawned task, not here. that keeps one slow client
+# from holding every other client up for the handshake deadline, and it keeps a
+# client that never completes a handshake — a port scanner, a probe, a browser
+# racing connections — from taking the accept loop down with it.
 pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
+    defer listener.close()
+    mut failures := 0
     while true:
-        client := tls.accept(listener)!
+        accepted := tls.accept_socket(listener)
+        if accepted.is_err:
+            failures = failures + 1
+            tcp.back_off_after_accept_failure(failures, accepted.err)!
+            continue
+        failures = 0
         connection_slots.acquire()
-        spawn serve_h2_tls_slot(client, handler)
+        spawn serve_h2_tls_slot(listener.handle, accepted.ok, handler)
     return 0
 
 # --- streaming entry points ---
@@ -1200,18 +1235,25 @@ pub fn serve_h2c_streaming_connection(fd: Int):
 
 # serve_h2c_streaming_connection with the accept loop's permit released at the end.
 fn serve_h2c_streaming_slot(fd: Int):
+    defer connection_slots.release()
     serve_h2c_streaming_connection(fd)
-    connection_slots.release()
 
 # bind host:port for cleartext h2c and serve forever, handing each request
 # stream to `handler` while it is still arriving. mirrors listen_h2c.
 pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
     fd := tcp_listen(host, port)!
+    defer tcp_close(fd)
+    mut failures := 0
     while true:
-        client := tcp_accept(fd)!
+        accepted := tcp.accept(fd)
+        if accepted.is_err:
+            failures = failures + 1
+            tcp.back_off_after_accept_failure(failures, accepted.err)!
+            continue
+        failures = 0
         connection_slots.acquire()
-        spawn serve_h2c_streaming_slot(client)
+        spawn serve_h2c_streaming_slot(accepted.ok)
     return 0
 
 # serve one accepted tls connection on the streaming path. mirrors
@@ -1224,21 +1266,35 @@ pub fn serve_h2_tls_streaming_connection(tls_conn: tls.Conn):
     run_connection(conn, streaming_unused_handler, true) catch false
     conn.close()
 
-# serve_h2_tls_streaming_connection with the accept loop's permit released at the end.
-fn serve_h2_tls_streaming_slot(client: tls.Conn):
-    serve_h2_tls_streaming_connection(client)
-    connection_slots.release()
+# handshake an accepted socket and serve it on the streaming path. mirrors
+# handshake_and_serve_h2_tls.
+fn handshake_and_serve_h2_tls_streaming(listener_handle: Int, fd: Int) -> Bool!:
+    serve_h2_tls_streaming_connection(tls.handshake(tls.listener_from_handle(listener_handle), fd)!)
+    return true
+
+# handshake_and_serve_h2_tls_streaming with the accept loop's permit released at
+# the end, on the failed-handshake path included. mirrors serve_h2_tls_slot.
+fn serve_h2_tls_streaming_slot(listener_handle: Int, fd: Int):
+    defer connection_slots.release()
+    handshake_and_serve_h2_tls_streaming(listener_handle, fd) catch false
 
 # bind host:port for http/2 over tls and serve forever on the streaming path.
-# mirrors listen_h2_tls.
+# mirrors listen_h2_tls, handshake off the accept loop included.
 pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: String, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
+    defer listener.close()
+    mut failures := 0
     while true:
-        client := tls.accept(listener)!
+        accepted := tls.accept_socket(listener)
+        if accepted.is_err:
+            failures = failures + 1
+            tcp.back_off_after_accept_failure(failures, accepted.err)!
+            continue
+        failures = 0
         connection_slots.acquire()
-        spawn serve_h2_tls_streaming_slot(client)
+        spawn serve_h2_tls_streaming_slot(listener.handle, accepted.ok)
     return 0
 
 # --- offline frame tests ---

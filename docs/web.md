@@ -257,6 +257,16 @@ PITH_GREEN=0 ./your_server # one os thread per connection, anywhere
 on the green runtime those per-connection tasks are green threads, so a server can
 carry many more connections than it has os threads.
 
+whatever goes wrong on one connection stays on its task. a client that fails a
+tls handshake, hangs up mid-request, or sends something unparseable costs itself
+its own connection and nothing else. the loop itself only gives up when the
+listener stops producing connections at all: it backs off after a failed accept
+rather than spinning, and stops after a bounded run of failures with nothing
+accepted in between, which is as much as it can tell from the outside. that
+matters because a listener that has quietly stopped accepting still answers a
+tcp health check — the socket is open, the kernel is filling the backlog, and
+nobody is serving.
+
 ## http/2
 
 the same app serves http/2 with a different call. `listen_h2c` speaks cleartext

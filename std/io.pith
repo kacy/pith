@@ -1178,6 +1178,9 @@ fn read_all_file_stream_chunked(stream: FileStream, chunk_size: Int) -> String!:
 # under the green backend every open and every chunk read is a separate handoff
 # to the runtime's file thread pool. use the chunked variant when the file is
 # big enough that reading it in pieces is the point.
+#
+# fails on a file that is not valid utf-8, the same as `fs.read`. reading bytes
+# that are not text is what `read_file_bytes` is for.
 pub fn read_file_text(path: String) -> String!:
     return read_file(path)
 
@@ -1201,8 +1204,12 @@ pub fn write_file_text_chunked(path: String, data: String, chunk_size: Int) -> I
     stream := file_stream_open_write(path)!
     defer stream.close()
     writer := stream.buffered_writer_chunked(chunk_size)
-    mut total := writer.write(data)!
-    total = total + writer.flush()!
+    # `write` already counts everything it accepted, whether it went to the file
+    # or into the buffer. flush moves the buffered part along and reports it a
+    # second time, so adding the two counts a small payload twice — the flush is
+    # here to write and to surface its error, not for its number.
+    total := writer.write(data)!
+    writer.flush()!
     return total
 
 # append text to a file. returns the bytes written.
@@ -1215,8 +1222,9 @@ pub fn append_file_text_chunked(path: String, data: String, chunk_size: Int) -> 
     stream := file_stream_open_append(path)!
     defer stream.close()
     writer := stream.buffered_writer_chunked(chunk_size)
-    mut total := writer.write(data)!
-    total = total + writer.flush()!
+    # see `write_file_text_chunked`: the flush is for its effect, not its count.
+    total := writer.write(data)!
+    writer.flush()!
     return total
 
 fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:

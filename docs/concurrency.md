@@ -198,12 +198,21 @@ something else, so the whole net stack — raw tcp, tls, http/2, grpc — yields
 the same way without any code of its own. that reactor is also why the default
 is linux-only; see "which backend to use".
 
-name resolution gets there by a different route. `getaddrinfo` is synchronous
-and there is nothing to poll, so instead of yielding to the reactor the lookup
-goes to a small pool of ordinary blocking threads (four at most, started on
-demand) and the task parks until one of them answers. the worker stays free for
-the whole lookup, so a dial no longer has a blocking step sitting in front of
-its non-blocking one.
+name resolution and file i/o get there by a different route. `getaddrinfo` is
+synchronous and there is nothing to poll, and a regular file is always reported
+ready by epoll however slow the disk behind it is, so neither can yield to the
+reactor. instead the call goes to a small pool of ordinary blocking threads
+(four at most, started on demand, one pool for lookups and one for files) and
+the task parks until a pool thread answers. the worker stays free for the whole
+call, so a dial no longer has a blocking step sitting in front of its
+non-blocking one, and a task that writes a log line no longer stops every other
+task on its worker while it does.
+
+a task waits a few microseconds on-CPU before it actually parks. a read the page
+cache answers comes back faster than the two thread wakeups a park costs, so
+waiting for it beats suspending, and the wait is bounded at roughly what the
+call would have held the worker for had it run inline. anything slower falls
+through to the park and frees the worker, which is the case the pool exists for.
 
 nothing in your program changes. the same `spawn`, `Channel`, `Mutex`, and
 `await` run on either backend, and a correct program prints the same thing
@@ -267,14 +276,19 @@ the caveats that come with the linux default all come from one fact: a green
 worker runs many tasks, so anything that holds the worker holds all of them,
 where an os thread would only cost the one task making the call.
 
-file i/o is where you are most likely to meet that. `read`, `write`, and every
-other file operation goes straight to the syscall with no yield point, so a task
-doing a large or slow file read holds its worker for the whole call and every
-task pinned to that worker waits behind it. sockets do not have this problem,
-because they go through the reactor, and neither does dns, which runs on a pool
-of blocking threads while the caller parks. file i/o is the gap, and a program
-that reads files from inside a task can feel it purely by moving to the green
-default. `PITH_GREEN=0` is the answer if it bites you.
+file metadata is where the last of that lives. opening, reading, writing,
+appending, listing a directory and removing a tree all go to the file pool now,
+but `exists`, `size`, `rename`, `mkdir` and removing a single file still call
+the kernel directly on the worker. each of those is one lookup that the kernel
+answers out of its cache, which costs about what handing it to another thread
+would; on a slow network mount it is not, and a task doing one there holds its
+worker until it returns. `PITH_GREEN=0` is still the answer if that bites you.
+
+the pool is not free either. a file call made from inside a task now costs a
+thread handoff that it used to not, so a task that reads a small cached file in
+a tight loop is several times slower than it was — the run finishes sooner for
+everything else on that worker and later for itself. calls made from `main`,
+which is not a green task, take the direct path and are unaffected.
 
 preemption is the other thing the kernel used to hand you. os threads get it for
 free; under green a compute-only task that never touches a channel, await, or

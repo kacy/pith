@@ -2,10 +2,10 @@
 #
 # spawns many tasks that each do a chunk of pure arithmetic and return a value,
 # with NO coordination between them (no channels, no shared mutex). that keeps
-# it valid under both backends: the os-thread backend and the experimental
-# green backend (PITH_GREEN=1). in green mode a task that blocks parks its
-# worker, so only independent tasks like these are safe today — see the green
-# scheduler docs. the output must be byte-identical with the flag on and off.
+# it valid under both backends, and it is the oldest of the green tests: it
+# predates the yield-on-block work, so it holds even under a backend where a
+# blocked task parks its worker. the output must be byte-identical under
+# PITH_GREEN=0 and PITH_GREEN=1.
 
 # a deliberately loopy pure computation so the task actually spends CPU: this is
 # what makes the context-switch difference between backends observable, and it

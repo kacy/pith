@@ -12,8 +12,10 @@
 //! stall the rest of them while one waits on i/o.
 //!
 //! that makes this good enough for local development on a mac and wrong for
-//! serving load. the fix is a kqueue reactor behind these same two functions;
-//! until then, ship green-thread workloads on linux.
+//! serving load, and it is why green is only the *default* backend on linux
+//! (see `concurrency::scheduler`). `PITH_GREEN=1` still turns it on here for
+//! anyone who wants it. the fix is a kqueue reactor behind these same two
+//! functions; until then, ship green-thread workloads on linux.
 
 use std::os::unix::io::RawFd;
 

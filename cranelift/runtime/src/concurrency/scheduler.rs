@@ -48,16 +48,19 @@ const fn platform_default() -> Backend {
 ///
 /// Unrecognized values fall to the platform default rather than to os threads,
 /// so the only values that move the backend are the ones spelled out here. A
-/// typo like `PITH_GREEN=yes` then behaves exactly like not setting the variable,
-/// which is easier to reason about than a rule where some unknown values mean
-/// "off" and the absent one means "default". Spellings are matched
-/// case-insensitively and after trimming, because the off switch is the escape
-/// hatch for anyone the linux default hurts and it should not be possible to miss
-/// it by a capital letter.
+/// typo like `PITH_GREEN=maybe` then behaves exactly like not setting the
+/// variable, which is easier to reason about than a rule where some unknown
+/// values mean "off" and the absent one means "default".
+///
+/// The off spellings are deliberately generous. `PITH_GREEN=0` is the escape
+/// hatch for anyone the linux default hurts, and someone reaching for it who
+/// writes `no` or `NO` must not silently get green instead — that is the one
+/// misreading with a real cost. Values are trimmed and lowercased for the same
+/// reason.
 fn backend_from_env(value: Option<&str>) -> Backend {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("1") | Some("on") | Some("true") => Backend::Green,
-        Some("0") | Some("off") | Some("false") => Backend::OsThread,
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("y") => Backend::Green,
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("n") => Backend::OsThread,
         _ => platform_default(),
     }
 }
@@ -136,21 +139,21 @@ mod tests {
 
     #[test]
     fn on_spellings_force_green() {
-        for value in ["1", "on", "true", "ON", "True", " on "] {
+        for value in ["1", "on", "true", "yes", "y", "ON", "True", " on "] {
             assert_eq!(backend_from_env(Some(value)), Backend::Green, "{value:?}");
         }
     }
 
     #[test]
     fn off_spellings_force_os_threads() {
-        for value in ["0", "off", "false", "OFF", "False", " off "] {
+        for value in ["0", "off", "false", "no", "n", "OFF", "False", " off ", "NO"] {
             assert_eq!(backend_from_env(Some(value)), Backend::OsThread, "{value:?}");
         }
     }
 
     #[test]
     fn unrecognized_values_behave_like_unset() {
-        for value in ["", "yes", "no", "2", "green", "osthread"] {
+        for value in ["", "maybe", "2", "green", "osthread"] {
             assert_eq!(backend_from_env(Some(value)), platform_default(), "{value:?}");
         }
     }

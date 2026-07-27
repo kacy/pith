@@ -1053,7 +1053,7 @@ verify-green-corpus-only:
 	done; \
 	echo "$$pass passed, $$fail failed, $$skip without a source"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
-	echo "green corpus matches os-thread output"
+	echo "green corpus matches the expected output"
 
 verify-osthread-corpus: build verify-osthread-corpus-only
 

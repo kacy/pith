@@ -116,7 +116,7 @@ macos and the bsds os threads are still the default with `PITH_GREEN=1` as the
 opt-in. green wins every shape this repo measures: spawn is ~30x the os-thread
 backend at a seventeenth of the memory, and the channel fan-out benchmark runs
 2.6x faster than os threads and ahead of rust and zig. the whole regression
-corpus, 260 cases at both worker counts, produces byte-identical output to the
+corpus, 261 cases at both worker counts, produces byte-identical output to the
 fixed os-thread answers (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
 

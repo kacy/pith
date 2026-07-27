@@ -236,6 +236,34 @@ many run in total — see the green fan-out row in `docs/performance.md`. (the d
 os-thread backend still keeps a record per task it has run; teaching it the
 same reclamation is the next step.)
 
+### which backend to use
+
+green is faster on every shape this repo measures, so the short answer is to
+use it on linux for anything that coordinates a lot of tasks. the longer
+answer is why the os-thread backend is still here, because it is not just
+waiting to be deleted.
+
+a blocking call on a green worker stalls the worker, not only the task making
+it. the epoll reactor covers sockets, so the whole net stack yields, but
+nothing else does — dns at dial, file reads and writes, and any slow native
+call hold the thread they run on, and every task pinned to that worker waits
+behind them. on os threads that same call costs one task, because the task is
+a thread and the kernel just runs someone else.
+
+the reactor is also linux-only. it is epoll and eventfd; macos and the bsds
+compile a stand-in with no reactor at all, so a green task waiting on a socket
+there blocks its worker for as long as the wait lasts. green is still correct
+on those platforms, but an i/o-heavy server on macos wants os threads. and
+preemption, which the kernel gives os threads for free, is a build-time opt-in
+under green (see `PITH_GREEN_PREEMPT` below).
+
+there is one more reason, which matters to this repo rather than to your
+program: os threads are the reference green gets checked against.
+`make verify-green-corpus` runs the whole regression corpus under green and
+diffs it against what the os-thread backend produces, which is how a
+single-worker deadline bug turned up. two implementations that have to agree
+is worth keeping around past the point where one of them is faster.
+
 it is off by default and still experimental. the known rough edges:
 
 - dns resolution at dial still blocks the worker (`getaddrinfo` is

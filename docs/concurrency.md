@@ -194,6 +194,13 @@ an epoll reactor: a read or write that would block parks the task on the
 reactor and frees the worker to run something else, so the whole net stack —
 raw tcp, tls, http/2, grpc — yields the same way without any code of its own.
 
+name resolution gets there by a different route. `getaddrinfo` is synchronous
+and there is nothing to poll, so instead of yielding to the reactor the lookup
+goes to a small pool of ordinary blocking threads (four at most, started on
+demand) and the task parks until one of them answers. the worker stays free for
+the whole lookup, so a dial no longer has a blocking step sitting in front of
+its non-blocking one.
+
 nothing in your program changes. the same `spawn`, `Channel`, `Mutex`, and
 `await` run on either backend, and a correct program prints the same thing
 both ways. the two green examples in this repo run identically with the flag
@@ -244,11 +251,11 @@ answer is why the os-thread backend is still here, because it is not just
 waiting to be deleted.
 
 a blocking call on a green worker stalls the worker, not only the task making
-it. the epoll reactor covers sockets, so the whole net stack yields, but
-nothing else does — dns at dial, file reads and writes, and any slow native
-call hold the thread they run on, and every task pinned to that worker waits
-behind them. on os threads that same call costs one task, because the task is
-a thread and the kernel just runs someone else.
+it. the epoll reactor covers sockets and the resolver pool covers dns, so a
+client dial yields the whole way through, but nothing else does: file reads and
+writes and any slow native call hold the thread they run on, and every task
+pinned to that worker waits behind them. on os threads that same call costs one
+task, because the task is a thread and the kernel just runs someone else.
 
 the reactor is also linux-only. it is epoll and eventfd; macos and the bsds
 compile a stand-in with no reactor at all, so a green task waiting on a socket
@@ -266,8 +273,6 @@ is worth keeping around past the point where one of them is faster.
 
 it is off by default and still experimental. the known rough edges:
 
-- dns resolution at dial still blocks the worker (`getaddrinfo` is
-  synchronous); only the tcp handshake and the bytes after it yield
 - a compute-bound task that loops without ever touching a channel, await, or
   socket can now be preempted, but you opt in at build time. compile with
   `PITH_GREEN_PREEMPT=1` and the backend puts a safe-point at every loop
@@ -278,8 +283,8 @@ it is off by default and still experimental. the known rough edges:
   tight arithmetic loop), and the default build is almost always run os-thread,
   so it plants no check and pays nothing. code that uses channels and sockets
   already yields on its own and never needs this. one gap in this first version:
-  a task sitting inside a long native runtime call (a slow `getaddrinfo`, say)
-  is not preempted until it returns to pith code and hits the next back-edge
+  a task sitting inside a long native runtime call (a large file read, say) is
+  not preempted until it returns to pith code and hits the next back-edge
 - fewer workers means more locality: a task pins to the first worker that runs
   it and every later wake goes back to that one worker, never the whole pool, so
   a coordinated pipeline stays put and its handoffs stay in userspace. at

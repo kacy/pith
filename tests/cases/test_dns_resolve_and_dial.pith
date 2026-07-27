@@ -1,0 +1,54 @@
+# name resolution followed by a dial, on whichever backend is running.
+#
+# under the green backend the lookup is handed to the runtime's resolver pool
+# and the calling task parks until an answer comes back, rather than holding its
+# worker inside getaddrinfo. that is a scheduling change and nothing else, so the
+# answers below have to be identical to the os-thread run — which is exactly what
+# comparing this case against its expected output on both backends checks.
+#
+# everything here is loopback and hosts-file only, so it is deterministic and
+# needs no network.
+
+import std.net.dns as dns
+import std.net.tcp as tcp
+
+# find a free loopback port so repeated runs never collide with TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp.listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn client(port: Int) -> Int!:
+    conn := tcp.connect("localhost", port)!
+    n := tcp.write(conn, "ping")!
+    tcp.close(conn)
+    return n
+
+fn main() -> Int!:
+    local := dns.resolve("localhost")!
+    print("localhost-resolved:{local.len() > 0}")
+
+    # nothing listens on port 1, so every address `localhost` resolves to
+    # refuses. the lookup still has to succeed for the dial to get that far.
+    refused := tcp.connect("localhost", 1)
+    print("refused-dial-fails:{refused.is_err}")
+
+    port := choose_port(19420)!
+    server := tcp.listen("127.0.0.1", port)!
+    # bind before spawning the dialer, so the client cannot beat the listener.
+    dialer := spawn client(port)
+
+    conn := tcp.accept(server)!
+    data := tcp.read(conn, 16)!
+    sent := await dialer
+    print("server-received:{data}")
+    print("client-sent:{sent.unwrap_or(-1)}")
+
+    tcp.close(conn)
+    tcp.close(server)
+    return 0

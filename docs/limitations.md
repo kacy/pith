@@ -108,49 +108,53 @@ correctness story:
   re-checked and all pass; they are now pinned by regression tests
   (`tests/cases/test_xmod_float.pith` and friends).
 
-## the green backend, and what it would take to make it the default
+## the green backend, now the default on linux
 
-as of 2026-07-27 the green backend (`PITH_GREEN=1`) wins every shape this repo
-measures: spawn is ~30x the os-thread backend at a seventeenth of the memory,
-the channel fan-out benchmark runs 2.6x faster than os threads and ahead of rust
-and zig, and the whole regression corpus — 260 cases, both worker counts —
-produces byte-identical output to the os-thread backend (`make
-verify-green-corpus`, run in ci). the reason it is still off by default is not
-the scheduler; it is the list below.
+as of 2026-07-27 the green backend is what a spawned task runs on when you
+build for linux; `PITH_GREEN=0` switches back to one os thread per task, and on
+macos and the bsds os threads are still the default with `PITH_GREEN=1` as the
+opt-in. green wins every shape this repo measures: spawn is ~30x the os-thread
+backend at a seventeenth of the memory, and the channel fan-out benchmark runs
+2.6x faster than os threads and ahead of rust and zig. the whole regression
+corpus, 260 cases at both worker counts, produces byte-identical output to the
+fixed os-thread answers (`make verify-green-corpus`, run in ci). what follows is
+what the new default still costs you, not a list of things blocking it.
 
-- **the numbers are from one 2-core box** — every comparison in
-  docs/performance.md and bench/README.md was measured on the same small
-  machine. "green wins everywhere" is true there and unverified anywhere else,
-  and the original decision to keep green opt-in explicitly wanted wider
-  hardware first. this is the gating question, and it is a judgement call rather
-  than a task.
-- **preemption is opt-in at build time** — safe-points are only emitted under
-  `PITH_GREEN_PREEMPT=1`, so a default-on green backend would let a compute-only
-  task that never touches a channel or socket hold its worker. the cost of
-  turning them on was measured: ~0% on real work (the event-ledger and
-  std-pipeline benchmarks are within noise) and ~6% on a degenerate
-  200-million-iteration arithmetic loop. that is cheap enough — but the flag
-  must flip *with* the green default, not before it, or os-thread builds pay for
-  a check that never fires.
-- **the reactor is linux-only** — it is built on epoll and eventfd. macos and
-  the bsds compile a stand-in with no reactor, where a green task waiting on a
-  socket blocks its worker outright. so "green by default" is a linux-server
-  claim, not a universal one; on other platforms the default would have to stay
-  os threads or the reactor would need a kqueue sibling.
-- **blocking calls stall a worker, not just their task** — file i/o and native
-  calls have no yield point, so they hold the worker and everything pinned to
-  it. dns was the worst case here and is not any more: `getaddrinfo` runs on a
-  small pool of blocking threads while the calling task parks. on os threads a
-  blocking call costs only the task making it. this is the structural difference
-  that keeps the os-thread backend worth having regardless of the benchmark
-  numbers.
-- **placement is left to luck** — a task pins to the first worker that runs it,
-  so whether two tasks that talk to each other land together is chance. the
-  fan-out benchmark is bimodal because of it: ~60 ms when the pipeline happens
-  to share a worker, ~130-170 ms when it splits, against ~46 ms pinned to one
-  worker with `PITH_GREEN_WORKERS=1`. cross-worker wakes are the whole remaining
-  gap to go on coordination-heavy work, and colocating communicating tasks is
-  the open lever.
+the structural cost is that a green worker runs many tasks, so a call with no
+yield point holds all of them rather than only the task making it. file i/o is
+where that actually bites: `host_fs` goes straight to the syscall, so a task
+doing a large or slow file read or write holds its worker for the whole call and
+everything pinned to that worker waits behind it. sockets go through the epoll
+reactor and dns runs on a pool of blocking threads, so those two no longer stall
+anyone, but file i/o has no equivalent and a program can hit this purely by
+upgrading. the honest workaround today is `PITH_GREEN=0`; giving `host_fs` a
+yield point is the open work.
+
+preemption is a build-time opt-in for the same reason it always was. safe-points
+are only emitted under `PITH_GREEN_PREEMPT=1`, so a compute-only task that never
+touches a channel or socket holds its worker until it finishes, where the kernel
+gives os threads that for free. turning safe-points on costs ~0% on real work
+(the event-ledger and std-pipeline benchmarks are within noise) and ~6% on a
+degenerate 200-million-iteration arithmetic loop, so the flag is cheap, but a
+build that will never run green should not pay for a check that cannot fire.
+
+the reactor being linux-only is why the default is linux-only. it is epoll and
+eventfd; elsewhere the fallback has no reactor and a green task waiting on a
+socket blocks its worker outright. green stays available on those platforms and
+stays correct, but it would be a regression as a default until there is a kqueue
+sibling.
+
+placement is left to luck. a task pins to the first worker that runs it, so
+whether two tasks that talk to each other land together is chance, and the
+fan-out benchmark is bimodal because of it: ~46 ms pinned to one worker with
+`PITH_GREEN_WORKERS=1`, ~60 ms when the pipeline happens to share a worker
+anyway, ~130-170 ms when it splits. cross-worker wakes are the whole remaining
+gap to go on coordination-heavy work, and colocating communicating tasks is the
+open lever.
+
+one caveat on the numbers themselves: every comparison in docs/performance.md
+and bench/README.md was measured on the same 2-core box. "green wins everywhere"
+is true there and unverified on wider hardware.
 
 two related ownership gaps, both bounded leaks rather than unsafety, are also
 outstanding: passing a bare `T!` or `T?` local as a call argument leaks its

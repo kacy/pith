@@ -204,20 +204,15 @@ fn fill_sockaddr(
 /// then check `SO_ERROR` to distinguish a completed connection from a refusal.
 /// returns the fd on success or `0` on failure, matching the blocking path.
 ///
-/// dns resolution stays blocking here (getaddrinfo, a documented gap) — only the
-/// TCP handshake yields. we try every resolved address in order and keep the
-/// first that connects, matching `TcpStream::connect`: a name like `localhost`
-/// often resolves to `::1` before `127.0.0.1`, and a server bound only to IPv4
-/// refuses the first before the second succeeds.
+/// the name lookup runs on the resolver pool (see `crate::dns`) so getaddrinfo
+/// blocks one of its threads rather than this worker. we try every resolved
+/// address in order and keep the first that connects, matching
+/// `TcpStream::connect`: a name like `localhost` often resolves to `::1` before
+/// `127.0.0.1`, and a server bound only to IPv4 refuses the first before the
+/// second succeeds. no addresses (a resolver failure or an empty answer) falls
+/// through to `0`, as it always has.
 fn green_connect(host: &str, port: i64) -> i64 {
-    use std::net::ToSocketAddrs;
-
-    let target = format!("{}:{}", host, port);
-    let addrs = match target.to_socket_addrs() {
-        Ok(it) => it,
-        Err(_) => return 0,
-    };
-    for addr in addrs {
+    for addr in crate::dns::resolve(host, port) {
         let fd = green_connect_addr(&addr);
         if fd != 0 {
             return fd;
@@ -637,23 +632,19 @@ pub extern "C" fn pith_tcp_close(fd: i64) {
 }
 
 /// DNS resolve — resolve hostname to IP address string
+///
+/// under the green backend the lookup runs on the resolver pool and this task
+/// parks, so the worker stays free; under os threads it blocks here as before.
+/// either way a failed lookup and one that returns no address both come back
+/// null, which is what the caller already treats as an error.
 #[no_mangle]
 pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
-    use std::net::ToSocketAddrs;
-
     let Some(host) = cstr_str(hostname) else {
         return std::ptr::null_mut();
     };
-    let addr_str = format!("{}:0", host);
-    match addr_str.to_socket_addrs() {
-        Ok(mut addrs) => {
-            if let Some(addr) = addrs.next() {
-                crate::pith_strdup_string(&addr.ip().to_string())
-            } else {
-                std::ptr::null_mut()
-            }
-        }
-        Err(_) => std::ptr::null_mut(),
+    match crate::dns::resolve(host, 0).first() {
+        Some(addr) => crate::pith_strdup_string(&addr.ip().to_string()),
+        None => std::ptr::null_mut(),
     }
 }
 

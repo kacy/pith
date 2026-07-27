@@ -15,6 +15,7 @@ pub mod bytes;
 pub mod collections;
 pub mod concurrency;
 pub mod crypto;
+pub mod dns;
 pub mod encoding;
 pub mod ffi_util;
 pub mod handle_registry;

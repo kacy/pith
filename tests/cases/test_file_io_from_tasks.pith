@@ -13,11 +13,14 @@ import std.bytes as bytes
 import std.fs as fs
 import std.io as io
 
-# whole-file write, append, and read back, all from one task.
+# whole-file write, append, and read back, all from one task. the counts the
+# two writes report are part of the answer: they are byte counts of exactly
+# what was handed in, which a payload that is longer in bytes than in
+# characters is here to check.
 fn text_round_trip(path: String, body: String) -> String!:
-    io.write_file_text(path, body)!
-    io.append_file_text(path, "-appended")!
-    return io.read_file_text(path)!
+    wrote := io.write_file_text(path, body)!
+    added := io.append_file_text(path, "-añadido")!
+    return "{io.read_file_text(path)!} wrote={wrote} added={added}"
 
 # the same shape through the streaming handle api: open, write a chunk at a
 # time, close, then read it back in small chunks.

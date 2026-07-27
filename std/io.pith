@@ -1173,8 +1173,13 @@ fn read_all_file_stream_chunked(stream: FileStream, chunk_size: Int) -> String!:
     return result
 
 # read a whole file as text.
+#
+# one call, not a stream: the whole file is coming into memory either way, and
+# under the green backend every open and every chunk read is a separate handoff
+# to the runtime's file thread pool. use the chunked variant when the file is
+# big enough that reading it in pieces is the point.
 pub fn read_file_text(path: String) -> String!:
-    return read_file_text_chunked(path, DEFAULT_CHUNK_SIZE)
+    return read_file(path)
 
 # read a whole file as text with an explicit chunk size.
 pub fn read_file_text_chunked(path: String, chunk_size: Int) -> String!:
@@ -1182,9 +1187,14 @@ pub fn read_file_text_chunked(path: String, chunk_size: Int) -> String!:
     defer stream.close()
     return read_all_file_stream_chunked(stream, chunk_size)
 
-# write text to a file, replacing existing contents.
+# write text to a file, replacing existing contents. returns the bytes written.
+#
+# one call for the same reason `read_file_text` is one call. the write either
+# lands whole or fails, so on success the count is the length of what was
+# handed in.
 pub fn write_file_text(path: String, data: String) -> Int!:
-    return write_file_text_chunked(path, data, DEFAULT_CHUNK_SIZE)
+    write_file(path, data)!
+    return data.len()
 
 # write text to a file with an explicit chunk size.
 pub fn write_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:
@@ -1195,9 +1205,10 @@ pub fn write_file_text_chunked(path: String, data: String, chunk_size: Int) -> I
     total = total + writer.flush()!
     return total
 
-# append text to a file.
+# append text to a file. returns the bytes written.
 pub fn append_file_text(path: String, data: String) -> Int!:
-    return append_file_text_chunked(path, data, DEFAULT_CHUNK_SIZE)
+    append_file(path, data)!
+    return data.len()
 
 # append text to a file with an explicit chunk size.
 pub fn append_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:

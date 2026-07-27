@@ -107,3 +107,46 @@ correctness story:
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests
   (`tests/cases/test_xmod_float.pith` and friends).
+
+## the green backend, and what it would take to make it the default
+
+as of 2026-07-27 the green backend (`PITH_GREEN=1`) wins every shape this repo
+measures: spawn is ~30x the os-thread backend at a seventeenth of the memory,
+the channel fan-out benchmark runs 2.6x faster than os threads and ahead of rust
+and zig, and the whole regression corpus — 260 cases, both worker counts —
+produces byte-identical output to the os-thread backend (`make
+verify-green-corpus`, run in ci). the reason it is still off by default is not
+the scheduler; it is the list below.
+
+- **the numbers are from one 2-core box** — every comparison in
+  docs/performance.md and bench/README.md was measured on the same small
+  machine. "green wins everywhere" is true there and unverified anywhere else,
+  and the original decision to keep green opt-in explicitly wanted wider
+  hardware first. this is the gating question, and it is a judgement call rather
+  than a task.
+- **preemption is opt-in at build time** — safe-points are only emitted under
+  `PITH_GREEN_PREEMPT=1`, so a default-on green backend would let a compute-only
+  task that never touches a channel or socket hold its worker. the cost of
+  turning them on was measured: ~0% on real work (the event-ledger and
+  std-pipeline benchmarks are within noise) and ~6% on a degenerate
+  200-million-iteration arithmetic loop. that is cheap enough — but the flag
+  must flip *with* the green default, not before it, or os-thread builds pay for
+  a check that never fires.
+- **dns still blocks a worker** — `green_connect` resolves with a synchronous
+  `getaddrinfo` before its non-blocking connect, so a dial that waits on dns
+  parks the whole worker. the tcp handshake and everything after it already
+  yield. offloading resolution to a small blocking pool is the fix.
+- **placement is left to luck** — a task pins to the first worker that runs it,
+  so whether two tasks that talk to each other land together is chance. the
+  fan-out benchmark is bimodal because of it: ~60 ms when the pipeline happens
+  to share a worker, ~130-170 ms when it splits, against ~46 ms pinned to one
+  worker with `PITH_GREEN_WORKERS=1`. cross-worker wakes are the whole remaining
+  gap to go on coordination-heavy work, and colocating communicating tasks is
+  the open lever.
+
+two related ownership gaps, both bounded leaks rather than unsafety, are also
+outstanding: passing a bare `T!` or `T?` local as a call argument leaks its
+payload (the caller-side cascade does not yet treat a call argument as the
+borrow it now provably is), and extracting the same optional local twice is a
+rare use-after-free that needs a second-extraction check rather than the blanket
+retain that was tried and reverted for regressing the common single case.

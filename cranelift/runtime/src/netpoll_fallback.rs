@@ -20,7 +20,7 @@
 use std::os::unix::io::RawFd;
 
 /// block until `fd` is ready for `read`/write, it times out, or an error is
-/// detected. returns the tri-state `pith_tcp_wait` contract: `1` ready, `0`
+/// detected. returns the tri-state readiness contract: `1` ready, `0`
 /// timed out, `-1` error.
 ///
 /// `task` is the caller's green slab id, unused here: with no reactor there is
@@ -28,7 +28,7 @@ use std::os::unix::io::RawFd;
 /// suspending the coroutine.
 pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, _task: usize) -> i64 {
     let events = if read { libc::POLLIN } else { libc::POLLOUT };
-    crate::network::pith_tcp_wait(fd as i64, events, timeout_ms)
+    crate::fdio::poll_wait(fd as i64, events, timeout_ms)
 }
 
 /// no-op: without a reactor there is no per-fd registration to tear down. the

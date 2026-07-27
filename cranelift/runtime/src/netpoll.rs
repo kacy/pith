@@ -319,7 +319,7 @@ fn nudge(reactor: &Reactor) {
 }
 
 /// block the current green task until `fd` is ready for `read`/write, it times
-/// out, or an error is detected. returns the tri-state `pith_tcp_wait` contract:
+/// out, or an error is detected. returns the tri-state readiness contract:
 /// `1` ready, `0` timed out, `-1` error. must be called only from inside a green
 /// task (the caller checks `green::current_task`); `task` is that task's slab id.
 ///

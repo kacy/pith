@@ -298,6 +298,17 @@ fn handle_tls_conn(app: App, conn: tls.Conn):
     http.serve_connection_tls(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
     conn.close()
 
+# handshake an accepted socket and serve it. spawned per connection by
+# listen_tls, so the handshake runs here rather than in the accept loop: a client
+# that never finishes one only ever costs itself, and a client that fails one
+# does not end the loop. tls.handshake closes the socket on its own failure.
+fn handshake_and_serve_tls_conn(app: App, listener_handle: Int, fd: Int) -> Bool!:
+    handle_tls_conn(app, tls.handshake(tls.listener_from_handle(listener_handle), fd)!)
+    return true
+
+fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
+    handshake_and_serve_tls_conn(app, listener_handle, fd) catch false
+
 impl App:
     # register a GET route. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
@@ -333,9 +344,18 @@ impl App:
     fn listen(host: String, port: Int) -> Int!:
         app := self
         fd := tcp_listen(host, port)!
+        # close the listener if the accept loop ever gives up: a listening socket
+        # nobody accepts from still passes a tcp health check.
+        defer tcp_close(fd)
+        mut failures := 0
         while true:
-            client := tcp_accept(fd)!
-            spawn handle_conn(app, client)
+            accepted := tcp.accept(fd)
+            if accepted.is_err:
+                failures = failures + 1
+                tcp.back_off_after_accept_failure(failures, accepted.err)!
+                continue
+            failures = 0
+            spawn handle_conn(app, accepted.ok)
         return 0
 
     # bind host:port and serve forever over cleartext http/2 (h2c), one task per
@@ -360,9 +380,16 @@ impl App:
         app := self
         config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
         listener := tls.listen(host, port, config)!
+        defer listener.close()
+        mut failures := 0
         while true:
-            client := tls.accept(listener)!
-            spawn handle_tls_conn(app, client)
+            accepted := tls.accept_socket(listener)
+            if accepted.is_err:
+                failures = failures + 1
+                tcp.back_off_after_accept_failure(failures, accepted.err)!
+                continue
+            failures = 0
+            spawn handle_tls_socket(app, listener.handle, accepted.ok)
         return 0
 
 # --- tests ---

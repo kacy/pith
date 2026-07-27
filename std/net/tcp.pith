@@ -36,6 +36,72 @@ pub fn accept(server_fd: Int) -> Int!:
     return tcp_accept(server_fd)
 
 # ===============================================================
+# Accept loops
+# ===============================================================
+
+# an accept loop must not die on one failed accept, and must not spin on a
+# listener that will fail forever. it cannot simply pick the right response,
+# because accept reports a message rather than an errno: "too many open files"
+# clears on its own as soon as a connection closes, "bad file descriptor" never
+# will, and both arrive as text. so a loop covers both cases at once. it backs
+# off after a failure, which costs a transient failure a few milliseconds and
+# keeps a permanent one from burning a core, and it gives up after a bounded run
+# of consecutive failures, which is the only honest reading of a listener that
+# has not produced a single connection in that many tries. one successful accept
+# resets the run.
+#
+# the shape a caller writes:
+#
+#     mut failures := 0
+#     while true:
+#         accepted := tcp.accept(listener_fd)
+#         if accepted.is_err:
+#             failures = failures + 1
+#             tcp.back_off_after_accept_failure(failures, accepted.err)!
+#             continue
+#         failures = 0
+#         spawn serve(accepted.ok)
+MAX_CONSECUTIVE_ACCEPT_FAILURES := 32
+ACCEPT_BACKOFF_START_MS := 5
+ACCEPT_BACKOFF_MAX_MS := 500
+
+# wait out the backoff owed after `consecutive` failed accepts in a row. it fails
+# once the run reaches MAX_CONSECUTIVE_ACCEPT_FAILURES, which ends the loop; the
+# error carries `last_error`, so whatever accept last complained about is what
+# the caller sees.
+pub fn back_off_after_accept_failure(consecutive: Int, last_error: String) -> Bool!:
+    if consecutive >= MAX_CONSECUTIVE_ACCEPT_FAILURES:
+        fail "accept failed " + consecutive.to_string() + " times in a row, giving up: " + last_error
+    sleep(accept_backoff_ms(consecutive))
+    return true
+
+# the delay owed after `consecutive` failures: it doubles from
+# ACCEPT_BACKOFF_START_MS and flattens at ACCEPT_BACKOFF_MAX_MS.
+fn accept_backoff_ms(consecutive: Int) -> Int:
+    mut ms := ACCEPT_BACKOFF_START_MS
+    mut counted := 1
+    while counted < consecutive and ms < ACCEPT_BACKOFF_MAX_MS:
+        ms = ms * 2
+        counted = counted + 1
+    if ms > ACCEPT_BACKOFF_MAX_MS:
+        return ACCEPT_BACKOFF_MAX_MS
+    return ms
+
+test "accept backoff grows and then flattens":
+    assert_eq(accept_backoff_ms(1), ACCEPT_BACKOFF_START_MS)
+    assert_eq(accept_backoff_ms(2), 10)
+    assert_eq(accept_backoff_ms(3), 20)
+    assert_eq(accept_backoff_ms(100), ACCEPT_BACKOFF_MAX_MS)
+
+test "an accept loop gives up after a bounded run of failures":
+    gave_up := back_off_after_accept_failure(MAX_CONSECUTIVE_ACCEPT_FAILURES, "bad file descriptor")
+    assert(gave_up.is_err)
+    assert(gave_up.err.contains("bad file descriptor"))
+
+test "an accept loop keeps going while the run is short":
+    assert(back_off_after_accept_failure(1, "too many open files") catch false)
+
+# ===============================================================
 # Connection I/O
 # ===============================================================
 

@@ -51,9 +51,9 @@ fn handle_scrape(fd: Int) -> Int!:
 # and release the concurrency permit. errors are swallowed so a slow or broken
 # client only affects its own connection, never the accept loop.
 fn serve_scrape(fd: Int):
+    defer scrape_slots.release()
     handle_scrape(fd) catch 0
     tcp_close(fd)
-    scrape_slots.release()
 
 # serve the /metrics endpoint on host:port. this blocks in an accept loop, so run
 # it in the background: `spawn prometheus.serve("0.0.0.0", 9464)`. each scrape is
@@ -63,10 +63,16 @@ pub fn serve(host: String, port: Int) -> Int!:
     fd := tcp_listen(host, port)!
     # close the listener if the accept loop ever exits through an error.
     defer tcp_close(fd)
+    mut failures := 0
     while true:
-        client := tcp_accept(fd)!
+        accepted := tcp.accept(fd)
+        if accepted.is_err:
+            failures = failures + 1
+            tcp.back_off_after_accept_failure(failures, accepted.err)!
+            continue
+        failures = 0
         scrape_slots.acquire()
-        spawn serve_scrape(client)
+        spawn serve_scrape(accepted.ok)
     return 0
 
 test "metrics_response carries the prometheus content type and current snapshot":

@@ -38,6 +38,14 @@ use these helpers instead of reparsing strings by hand:
 - `req.body_json()`
 - `req.body_json_or(...)`
 
+`body_json()` returns a handle into the `std.json` node pool, which lives in
+per-task storage and is not freed handle by handle. the `http.serve_*` entry
+points open a pool scope around each handler call and close it when the handler
+returns, so a kept-alive connection does not carry one request's parse tree into
+the next. that also means the handle is only good for the life of the handler:
+read what you need out of it before you return, and do not stash it. see the
+json node pool section in `docs/web.md` for scoping a parse you do yourself.
+
 for common verb checks, prefer the small route wrappers:
 - `http.get_route(...)`
 - `http.post_route(...)`

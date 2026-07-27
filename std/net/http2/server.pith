@@ -47,6 +47,7 @@
 # the codec modules are imported before std.net.http on purpose, for the same
 # loader-ordering reason documented in std.net.http2.connection: importing frames
 # and hpack first keeps std.binary's Reader single-identity.
+import std.json as json
 import std.net.http2.frames as frames
 import std.net.http2.hpack as hpack
 import std.bytes as bytes
@@ -830,6 +831,12 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
 # a streaming server hands the stream to the streaming handler instead of
 # buffering (handle_streaming_stream); the buffered path below is unchanged.
 fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
+    # scope the json node pool to this one stream. a handler that parses the
+    # request body allocates into per-task pool storage that nothing frees on
+    # its own, and the response it hands back is bytes and strings — nothing
+    # that still points into the pool — so the whole tree is dead here.
+    scope := json.open_scope()
+    defer json.close_scope(scope)
     if server.streaming:
         handle_streaming_stream(server, stream_id, inbox)
         return

@@ -1,0 +1,59 @@
+import std.net.http as http
+import std.json as json
+import std.io as io
+import std.bytes as bytes
+
+# the shape that made std.json grow without bound: one task serving many
+# requests on a kept-alive connection, parsing a json body per request. the
+# node pool lives in per-task storage, so before http.serve_connection scoped
+# each request the nodes from request one were still resident during request
+# fifty.
+#
+# this drives four requests down one connection through in-memory streams — no
+# sockets, so the run is deterministic — and has the handler report how many
+# pool nodes were already live when it was entered. that count stays flat.
+
+fn handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    carried_over := json.pool_live_nodes()
+    root := req.body_json() catch (0 - 1)
+    id := json.object_get_int(root, "id")
+    # reported as a header so each answer lands on its own line in the wire log
+    return http.text(200, "ok").header("x-pool-carried-over", carried_over.to_string() + "/" + id.to_string())
+
+fn request_for(id: Int) -> String:
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    crlf := chr(13) + chr(10)
+    body := lb + dq + "id" + dq + ":" + id.to_string() + "," + dq + "note" + dq + ":" + dq + "keep-alive" + dq + rb
+    mut head := "POST /echo HTTP/1.1" + crlf
+    head = head + "Host: localhost" + crlf
+    head = head + "Content-Type: application/json" + crlf
+    head = head + "Content-Length: " + body.len().to_string() + crlf
+    return head + crlf + body
+
+fn main() -> String!:
+    mut wire := ""
+    mut i := 1
+    while i <= 4:
+        wire = wire + request_for(i)
+        i = i + 1
+
+    reader := io.bytes_reader(bytes.from_string_utf8(wire)).buffered_chunked(64)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    http.serve_connection(reader, writer, handler)!
+    writer.flush()!
+
+    decoded := bytes.decode_utf8(sink.bytes())
+    if decoded.is_err:
+        fail "response was not utf-8"
+    response_text := decoded.ok
+    for line in response_text.split(chr(13) + chr(10)):
+        if line.starts_with("x-pool-carried-over:"):
+            print(line)
+
+    reader.free()
+    writer.free()
+    sink.free()
+    return "ok"

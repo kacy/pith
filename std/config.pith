@@ -269,6 +269,11 @@ pub fn dotted_key(prefix: String, key: String) -> String:
 
 ## parse toml text into a config.
 pub fn from_toml(text: String) -> Config!ConfigError:
+    # the parse is only here to reject malformed input — the values come from
+    # config_flatten_toml_text below, which scans the text directly. so the
+    # whole node tree is dead the moment we have checked it.
+    scope := toml.open_scope()
+    defer toml.close_scope(scope)
     root := toml.parse(text)
     if root < 0 or toml.type_of(root) != "table":
         fail config_fail("could not parse config")
@@ -287,6 +292,10 @@ pub fn from_toml_file(file_path: String) -> Config!ConfigError:
 
 ## parse json text into a config.
 pub fn from_json(text: String) -> Config!ConfigError:
+    # same as from_toml: the parse validates, config_json_flatten_object scans
+    # the text, and the node tree is dead once the check passes.
+    scope := json.open_scope()
+    defer json.close_scope(scope)
     root := json.parse(text)
     if root < 0 or json.type_of(root) != "object":
         fail config_fail("could not parse config")

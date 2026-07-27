@@ -801,19 +801,41 @@ struct Task {
 /// the process, like a daemon thread pool).
 /// a worker's pinned work: a fifo of woken tasks plus the single `next` slot a
 /// same-worker wake fills (see the `pinned` field note).
+/// how many times running the affinity slot can win over the fifo before the
+/// fifo gets a turn. high enough that an ordinary handoff never notices it, low
+/// enough that a task queued behind a busy pair waits a bounded number of
+/// exchanges rather than an unbounded one.
+const MAX_AFFINITY_STREAK: u32 = 32;
+
 #[derive(Default)]
 struct PinnedQueue {
     next: Option<TaskId>,
     queue: VecDeque<TaskId>,
+    /// consecutive `pop`s that have taken the affinity slot, reset whenever the
+    /// fifo gets one.
+    affinity_streak: u32,
 }
 
 impl PinnedQueue {
     /// take the next task to resume: the affinity slot first, then the fifo.
+    ///
+    /// the preference for the slot is bounded. displacing on `push_next` alone
+    /// does not bound it, because a ping-ponging pair empties the slot on every
+    /// `pop` before refilling it, so the displacement never fires and a third
+    /// task sitting in the fifo waits behind the pair forever. counting the
+    /// streak closes that: after `MAX_AFFINITY_STREAK` exchanges the fifo goes
+    /// first, once, and the pair carries on from there.
     fn pop(&mut self) -> Option<TaskId> {
-        if let Some(id) = self.next.take() {
-            return Some(id);
+        if self.affinity_streak < MAX_AFFINITY_STREAK {
+            if let Some(id) = self.next.take() {
+                self.affinity_streak += 1;
+                return Some(id);
+            }
         }
-        self.queue.pop_front()
+        self.affinity_streak = 0;
+        // with nothing queued there is no one to be fair to, so the slot still
+        // runs — the streak only ever costs a turn when someone is waiting.
+        self.queue.pop_front().or_else(|| self.next.take())
     }
 
     /// a cross-worker (or non-worker) wake: ordinary fifo.
@@ -841,12 +863,13 @@ struct Worker {
     /// woken started tasks pinned to this worker. only this worker drains it, so
     /// a suspended coroutine only ever resumes on the thread that first ran it.
     /// `next` is the single task a same-worker wake asks to run first — the other
-    /// half of a handoff, still cache-hot. holding exactly ONE such task is what
-    /// keeps wake affinity from starving the queue behind it: a second
+    /// half of a handoff, still cache-hot. two things keep that preference from
+    /// starving the fifo behind it: the slot holds exactly ONE task, so a second
     /// same-worker wake displaces the first to the BACK of the fifo instead of
-    /// stacking, so a ping-ponging pair yields its slot on every exchange and
-    /// cannot leapfrog a third task forever. one mutex covers both so the
-    /// displace-and-push is a single atomic step.
+    /// stacking, and `pop` gives the fifo a turn after a bounded run of slot
+    /// hits, which is what actually bounds a ping-ponging pair (it empties the
+    /// slot before refilling it, so displacement alone never fires for it). one
+    /// mutex covers both so the displace-and-push is a single atomic step.
     pinned: Mutex<PinnedQueue>,
     /// preempted started tasks pinned to this worker, drained at the *lowest*
     /// priority (after pinned, local, injector, and stealing). a compute task that
@@ -1416,6 +1439,23 @@ fn note_notify() {
 /// either were false here we would be about to run — possibly on a different
 /// worker than last time — a coroutine that may carry live pith stack, the
 /// unsound case the manual `Send` forbids. cheap, and compiled out in release.
+///
+/// worth knowing before anyone tries to relax this: the obvious win here is to
+/// re-home a *parked* task to whichever worker keeps waking it, so a pair that
+/// talks to each other stops paying a cross-worker wake per message. the state
+/// machine allows it — a parked task's coroutine is back in its block, in no
+/// queue, and the waker that wins the Parked -> Ready CAS could name a new owner
+/// in that same CAS. it was tried and it is fast. it is also **unsound**, and not
+/// because of the stack: the compiler caches the ELF thread-local base in a
+/// coroutine's frame across a suspension, so a coroutine resumed on a different
+/// thread reads the *previous* thread's `CURRENT_TASK`, `CURRENT_WORKER`,
+/// `CURRENT_TLS`, and `CURRENT_YIELDER`. that was observed directly: one physical
+/// thread reporting two different values of `CURRENT_WORKER`, which is written
+/// once at worker startup and never changes. the visible damage was
+/// `take_handoff` returning `None` for a migrated receiver and silently dropping
+/// channel messages. no source-level barrier fixes it — every thread-local read
+/// in every frame that can span a park is exposed. migration needs those reads
+/// eliminated or provably tamed first; it is not a scheduler change.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
     if let Some(block) = sync_block(id) {
@@ -2110,6 +2150,54 @@ fn join_for(task_handle: i64) -> Option<Arc<(Mutex<Join>, Condvar)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a pair of tasks handing off to each other on one worker refills the
+    // affinity slot on every exchange, which is exactly the shape that used to
+    // leapfrog the fifo forever: `pop` empties the slot before `push_next` puts
+    // the partner back, so the displace-on-occupied rule never fires. the fifo
+    // has to get a turn anyway.
+    #[test]
+    fn a_ping_ponging_pair_cannot_starve_the_fifo() {
+        let mut q = PinnedQueue::default();
+        q.push(99); // a third task, waiting behind the pair
+        let mut partner = 1;
+        for exchange in 0..(MAX_AFFINITY_STREAK as usize * 2) {
+            q.push_next(partner);
+            if q.pop() == Some(99) {
+                // the fifo got its turn; the pair is still queued and running.
+                assert!(exchange > 0, "the slot should win at least once first");
+                return;
+            }
+            partner = if partner == 1 { 2 } else { 1 };
+        }
+        panic!("the fifo never ran in {} exchanges", MAX_AFFINITY_STREAK * 2);
+    }
+
+    // the streak only costs a turn when someone is actually waiting: with an
+    // empty fifo the slot keeps running, however long the pair goes on.
+    #[test]
+    fn the_streak_costs_nothing_with_an_empty_fifo() {
+        let mut q = PinnedQueue::default();
+        for _ in 0..(MAX_AFFINITY_STREAK * 4) {
+            q.push_next(7);
+            assert_eq!(q.pop(), Some(7));
+        }
+        assert!(q.is_empty());
+    }
+
+    // a second same-worker wake while the slot is still full displaces the first
+    // to the back rather than dropping it.
+    #[test]
+    fn a_displaced_slot_task_goes_to_the_back_of_the_fifo() {
+        let mut q = PinnedQueue::default();
+        q.push(50);
+        q.push_next(10);
+        q.push_next(20);
+        assert_eq!(q.pop(), Some(20));
+        assert_eq!(q.pop(), Some(50));
+        assert_eq!(q.pop(), Some(10));
+        assert!(q.is_empty());
+    }
 
     // a coroutine that returns a constant, driven straight through — no pith,
     // no FFI. exercises the corosensei integration in isolation.

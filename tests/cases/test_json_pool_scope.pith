@@ -1,0 +1,95 @@
+import std.json as json
+import std.toml as toml
+
+# node-pool scopes. a task that parses one document per request used to keep
+# every node it had ever parsed, because the pool lives in threadlocal storage
+# and nothing ever gave it back. open_scope()/close_scope() bracket a parse so
+# the nodes come back when the scope closes.
+#
+# occupancy is read with pool_live_nodes(). the id counter is not a measure of
+# occupancy any more: ids are never reused, which is exactly what makes a
+# handle from a closed scope read as "invalid" instead of aliasing whatever
+# document landed on that id next.
+
+fn json_doc(i: Int) -> String:
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    return lb + dq + "id" + dq + ":" + i.to_string() + "," + dq + "tags" + dq + ":[1,2,3]" + rb
+
+fn toml_doc(i: Int) -> String:
+    return "id = " + i.to_string() + chr(10) + "name = " + chr(34) + "row" + chr(34)
+
+fn main():
+    base := json.pool_live_nodes()
+
+    # a hundred documents parsed one scope at a time leave nothing behind.
+    mut acc := 0
+    mut i := 0
+    while i < 100:
+        scope := json.open_scope()
+        root := json.parse(json_doc(i))
+        acc = acc + json.get_int(json.object_get(root, "id"))
+        json.close_scope(scope)
+        i = i + 1
+    print("acc=" + acc.to_string())
+    print("json_leaked=" + (json.pool_live_nodes() - base).to_string())
+
+    # a handle read after its scope closed reports invalid, and a later parse
+    # over the same pool does not bring it back to life.
+    stale_scope := json.open_scope()
+    stale := json.parse(json_doc(7))
+    print("live_type=" + json.type_of(stale))
+    json.close_scope(stale_scope)
+    print("stale_type=" + json.type_of(stale))
+    next_scope := json.open_scope()
+    fresh := json.parse(json_doc(9))
+    print("stale_after_reparse=" + json.type_of(stale))
+    print("stale_int=" + json.get_int(stale).to_string())
+    print("stale_lookup=" + json.object_get(stale, "id").to_string())
+    print("fresh_id=" + json.get_int(json.object_get(fresh, "id")).to_string())
+    json.close_scope(next_scope)
+
+    # a handle parsed before a scope opened outlives it — that is the ordering
+    # the arena can actually honour.
+    outlives := json.parse(json_doc(11))
+    inner := json.open_scope()
+    inner_root := json.parse(json_doc(13))
+    print("inner_id=" + json.get_int(json.object_get(inner_root, "id")).to_string())
+    json.close_scope(inner)
+    print("outlives_id=" + json.get_int(json.object_get(outlives, "id")).to_string())
+
+    # closing an outer scope while an inner one is open closes both. the inner
+    # close afterwards is a no-op rather than a second rollback, and so is
+    # closing the same scope twice.
+    after_outlives := json.pool_live_nodes()
+    outer := json.open_scope()
+    outer_root := json.parse(json_doc(21))
+    nested := json.open_scope()
+    nested_root := json.parse(json_doc(23))
+    json.close_scope(outer)
+    print("outer_after=" + json.type_of(outer_root) + " nested_after=" + json.type_of(nested_root))
+    json.close_scope(nested)
+    json.close_scope(outer)
+    print("json_after_nesting=" + (json.pool_live_nodes() - after_outlives).to_string())
+
+    # toml has the same arena and the same scope api, for a config reloaded
+    # over and over in one task.
+    toml_base := toml.pool_live_nodes()
+    mut ports := 0
+    mut j := 0
+    while j < 100:
+        scope := toml.open_scope()
+        root := toml.parse(toml_doc(j))
+        ports = ports + toml.get_int(root, "id")
+        toml.close_scope(scope)
+        j = j + 1
+    print("ports=" + ports.to_string())
+    print("toml_leaked=" + (toml.pool_live_nodes() - toml_base).to_string())
+
+    toml_scope := toml.open_scope()
+    toml_stale := toml.parse(toml_doc(5))
+    print("toml_live_type=" + toml.type_of(toml_stale))
+    toml.close_scope(toml_scope)
+    print("toml_stale_type=" + toml.type_of(toml_stale))
+    print("toml_stale_get=" + toml.get_int(toml_stale, "id").to_string())

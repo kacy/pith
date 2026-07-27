@@ -17,6 +17,14 @@ TOML_FILE_CHUNK_SIZE := 4096
 pub struct TomlDecodeError:
     pub message: String
 
+## An open node-pool scope. Treat it as opaque and hand it straight back to
+## close_scope(); the fields are the pool positions the scope rolls back to.
+pub struct TomlScope:
+    pub depth: Int
+    pub node_mark: Int
+    pub table_mark: Int
+    pub array_mark: Int
+
 fn toml_decode_fail(message: String) -> TomlDecodeError:
     return TomlDecodeError(message)
 
@@ -24,7 +32,10 @@ fn toml_decode_fail(message: String) -> TomlDecodeError:
 # Node Pool
 # ===============================================================
 
-# Global node storage indexed by handle
+# Node ids come from a counter that only ever goes up, even across a reclaim.
+# Reusing ids would make a handle held past its scope silently read whatever
+# document landed on that id next; leaving the counter alone costs nothing and
+# turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
 threadlocal mut node_types: Map[Int, String] := {}
 threadlocal mut string_values: Map[Int, String] := {}
@@ -42,6 +53,9 @@ threadlocal mut table_key_counts: Map[Int, Int] := {}
 threadlocal mut array_items_flat: List[Int] := []
 threadlocal mut array_item_offsets: Map[Int, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
+
+# How many scopes open_scope() has handed out and not yet reclaimed.
+threadlocal mut open_scope_depth: Int := 0
 
 # Allocates a new node of the specified type
 fn allocate_node(kind: String) -> Int:
@@ -94,15 +108,16 @@ fn push_array_element(handle: Int, val: Int):
 fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
     mut node_id := next_node_id - 1
     while node_id >= node_id_mark:
-        node_types.remove(node_id)
-        string_values.remove(node_id)
-        integer_values.remove(node_id)
-        float_values.remove(node_id)
-        boolean_values.remove(node_id)
-        table_key_offsets.remove(node_id)
-        table_key_counts.remove(node_id)
-        array_item_offsets.remove(node_id)
-        array_item_counts.remove(node_id)
+        if node_types.contains_key(node_id):
+            node_types.remove(node_id)
+            string_values.remove(node_id)
+            integer_values.remove(node_id)
+            float_values.remove(node_id)
+            boolean_values.remove(node_id)
+            table_key_offsets.remove(node_id)
+            table_key_counts.remove(node_id)
+            array_item_offsets.remove(node_id)
+            array_item_counts.remove(node_id)
         node_id = node_id - 1
     # table_keys_flat and table_values_flat grow in lockstep, so one mark covers both.
     while table_keys_flat.len() > table_flat_mark:
@@ -111,7 +126,6 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
         table_values_flat.remove(table_values_flat.len() - 1)
     while array_items_flat.len() > array_flat_mark:
         array_items_flat.remove(array_items_flat.len() - 1)
-    next_node_id = node_id_mark
 
 # node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:
@@ -128,6 +142,39 @@ pub fn pool_mark_array_len() -> Int:
 # reclaims the pool nodes a compiler-lowered typed decode allocated.
 pub fn pool_restore(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
     toml_restore_to(node_id_mark, table_flat_mark, array_flat_mark)
+
+# opens a node-pool scope. every node parsed between here and the matching
+# close_scope() is reclaimed when the scope closes. pair it with defer:
+#
+#     scope := toml.open_scope()
+#     defer toml.close_scope(scope)
+#     root := toml.parse(text)
+#
+# most programs read their toml once at startup and never need this. it exists
+# for the ones that reload configuration on a signal or a timer, where the same
+# task parses the same file over and over. copy what you need out of the tree
+# before the scope closes.
+pub fn open_scope() -> TomlScope:
+    open_scope_depth = open_scope_depth + 1
+    return TomlScope(open_scope_depth, next_node_id, table_keys_flat.len(), array_items_flat.len())
+
+# closes a scope opened by open_scope() and reclaims the nodes parsed inside it.
+#
+# scopes nest and close innermost-first. closing an outer scope while an inner
+# one is still open also closes the inner one — an arena can only give back a
+# suffix of what it handed out. closing a scope twice does nothing. no handle
+# from a closed scope can come back to life: node ids are never reused, so
+# reading one reports "invalid" rather than some later document's value.
+pub fn close_scope(scope: TomlScope):
+    if scope.depth > open_scope_depth:
+        return
+    toml_restore_to(scope.node_mark, scope.table_mark, scope.array_mark)
+    open_scope_depth = scope.depth - 1
+
+# how many nodes the pool currently holds. useful for asserting in a test that
+# a parse loop gives its nodes back.
+pub fn pool_live_nodes() -> Int:
+    return node_types.len()
 
 # ===============================================================
 # Parser (Internal)
@@ -151,13 +198,16 @@ fn get_char_at(i: Int) -> String:
         return ""
     return parser_input[i]
 
-# Returns true if a node handle points at an allocated node.
-fn is_valid_handle(handle: Int) -> Bool:
-    return handle >= 0 and handle < next_node_id
+# Returns a node's kind, or "" when the handle names no live node. A kind is
+# never empty, so one lookup answers both "does it exist" and "what is it".
+# node ids are never reused, so a handle left over from a reclaimed scope
+# reads as "no live node" rather than aliasing a later document's node.
+fn node_kind(handle: Int) -> String:
+    return node_types.get_default(handle, "")
 
 # Looks up a direct key in a table and returns the child handle, or -1.
 fn table_lookup(handle: Int, key: String) -> Int:
-    if not is_valid_handle(handle) or node_types[handle] != "table":
+    if node_kind(handle) != "table":
         return 0 - 1
     off := table_key_offsets[handle]
     cnt := table_key_counts[handle]
@@ -520,9 +570,10 @@ pub fn type_of(handle: Int) -> String:
     return toml_type_of(handle)
 
 fn toml_type_of(handle: Int) -> String:
-    if not is_valid_handle(handle):
+    kind := node_kind(handle)
+    if kind == "":
         return "invalid"
-    return node_types[handle]
+    return kind
 
 # ===============================================================
 # Public API — Table Value Accessors
@@ -538,7 +589,7 @@ pub fn get_string(handle: Int, key: String) -> String:
 
 fn toml_get_string(handle: Int, key: String) -> String:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "string":
+    if node_kind(v) == "string":
         return string_values[v]
     return ""
 
@@ -547,14 +598,14 @@ pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
         fail toml_decode_fail("missing string field: " + key)
-    if node_types[v] != "string":
+    if node_kind(v) != "string":
         fail toml_decode_fail("expected string field: " + key)
     return string_values[v]
 
 # Gets a string value by key from a table with a fallback.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "string":
+    if node_kind(v) == "string":
         return string_values[v]
     return default_value
 
@@ -564,7 +615,7 @@ pub fn get_int(handle: Int, key: String) -> Int:
 
 fn toml_get_int(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "int":
+    if node_kind(v) == "int":
         return integer_values[v]
     return 0
 
@@ -573,14 +624,14 @@ pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
         fail toml_decode_fail("missing int field: " + key)
-    if node_types[v] != "int":
+    if node_kind(v) != "int":
         fail toml_decode_fail("expected int field: " + key)
     return integer_values[v]
 
 # Gets an integer value by key from a table with a fallback.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "int":
+    if node_kind(v) == "int":
         return integer_values[v]
     return default_value
 
@@ -590,14 +641,14 @@ pub fn get_float(handle: Int, key: String) -> Float:
 
 fn toml_get_float(handle: Int, key: String) -> Float:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "float":
+    if node_kind(v) == "float":
         return float_values[v]
     return 0.0
 
 # Gets a float value by key from a table with a fallback.
 pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "float":
+    if node_kind(v) == "float":
         return float_values[v]
     return default_value
 
@@ -607,7 +658,7 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
 
 fn toml_get_bool(handle: Int, key: String) -> Bool:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "bool":
+    if node_kind(v) == "bool":
         return boolean_values[v]
     return false
 
@@ -616,14 +667,14 @@ pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
         fail toml_decode_fail("missing bool field: " + key)
-    if node_types[v] != "bool":
+    if node_kind(v) != "bool":
         fail toml_decode_fail("expected bool field: " + key)
     return boolean_values[v]
 
 # Gets a boolean value by key from a table with a fallback.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "bool":
+    if node_kind(v) == "bool":
         return boolean_values[v]
     return default_value
 
@@ -633,7 +684,7 @@ pub fn get_table(handle: Int, key: String) -> Int:
 
 fn toml_get_table(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "table":
+    if node_kind(v) == "table":
         return v
     return 0 - 1
 
@@ -643,7 +694,7 @@ pub fn get_array(handle: Int, key: String) -> Int:
 
 fn toml_get_array(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
-    if v >= 0 and node_types[v] == "array":
+    if node_kind(v) == "array":
         return v
     return 0 - 1
 
@@ -656,7 +707,7 @@ pub fn array_len(handle: Int) -> Int:
     return toml_array_len(handle)
 
 fn toml_array_len(handle: Int) -> Int:
-    if not is_valid_handle(handle) or node_types[handle] != "array":
+    if node_kind(handle) != "array":
         return 0
     return array_item_counts[handle]
 
@@ -665,7 +716,7 @@ pub fn array_get(handle: Int, index: Int) -> Int:
     return toml_array_get(handle, index)
 
 fn toml_array_get(handle: Int, index: Int) -> Int:
-    if not is_valid_handle(handle) or node_types[handle] != "array":
+    if node_kind(handle) != "array":
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
@@ -681,7 +732,7 @@ pub fn keys(handle: Int) -> List[String]:
 
 fn toml_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
-    if not is_valid_handle(handle) or node_types[handle] != "table":
+    if node_kind(handle) != "table":
         return result
     off := table_key_offsets[handle]
     cnt := table_key_counts[handle]
@@ -710,7 +761,7 @@ fn toml_require_table(handle: Int, key: String) -> Int!TomlDecodeError:
     child := table_lookup(handle, key)
     if child < 0:
         fail toml_decode_fail("missing table field: " + key)
-    if node_types[child] != "table":
+    if node_kind(child) != "table":
         fail toml_decode_fail("expected table field: " + key)
     return child
 

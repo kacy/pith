@@ -2887,7 +2887,16 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     mut elem_kind := ir_list_element_kind(list_idx)
     mapped_kind := ir_function_return_kind(mapper_idx)
 
-    return ir_emit_list_map_loop(list_r, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
+    # the result's element type is what the mapper returns, and the checked
+    # type of the call carries it; the mapper's own return type is the
+    # fallback for a call the checker left untyped. an untagged result would
+    # own nothing, and the mapper's fresh values have no other owner.
+    mut result_elem_kind := ir_rc_kind(ir_list_element_kind(idx))
+    if result_elem_kind.len() == 0:
+        result_elem_kind = ir_rc_kind(mapped_kind)
+    ctor := ir_list_ctor_for_elem_kind(result_elem_kind)
+
+    return ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 3:
@@ -2907,7 +2916,12 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
         result_kind = "list"
     mut elem_kind := ir_list_element_kind(list_idx)
 
-    return ir_emit_list_filter_loop(list_r, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
+    # filter keeps the source's own elements, so the result's element type is
+    # the source's. tagging it is what lets the result outlive the list it
+    # was filtered from: the push takes a count of its own.
+    ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem_kind))
+
+    return ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 4:

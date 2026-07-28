@@ -29,9 +29,13 @@ fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
 pub fn ir_is_list_runtime_type(obj_type: String) -> Bool:
     return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
 
-pub fn ir_emit_list_map_loop(list_r: Int, mapper_name: String, result_kind: String, elem_kind: String, mapped_kind: String, idx_name: String) -> Int:
+## emit the loop behind `xs.map(f)`. `ctor` is the list constructor the
+## caller picked from the checked element type: a tagged one makes the
+## result own its elements, which is what the mapper's fresh results need
+## since nothing else keeps them alive.
+pub fn ir_emit_list_map_loop(list_r: Int, ctor: String, mapper_name: String, result_kind: String, elem_kind: String, mapped_kind: String, idx_name: String) -> Int:
     result_r := ir_reg()
-    ir_emit_call0_raw(result_r, "__list_new", result_kind)
+    ir_emit_call0_raw(result_r, ctor, result_kind)
     len_r := ir_reg()
     ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
     zero_r := ir_reg()
@@ -52,14 +56,21 @@ pub fn ir_emit_list_map_loop(list_r: Int, mapper_name: String, result_kind: Stri
     ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
     mapped_r := ir_reg()
     ir_emit_call_text_raw(mapped_r, mapper_name, mapped_kind, 1, " " + item_r.to_string())
-    ir_emit_call2_raw(ir_reg(), "__list_push", "void", result_r, mapped_r)
+    # the mapper hands back a value it owns and the loop stops tracking it
+    # here, so the push takes that count rather than adding a second one an
+    # empty-handed loop would never release. an untagged result list has no
+    # count to take and the transfer is a no-op, as it was before.
+    ir_emit_call2_raw(ir_reg(), "pith_list_push_value_owned", "void", result_r, mapped_r)
     ir_emit_list_loop_step(idx_name, i_r, loop_l)
     ir_emit("label " + done_l)
     return result_r
 
-pub fn ir_emit_list_filter_loop(list_r: Int, keep_name: String, result_kind: String, elem_kind: String, idx_name: String) -> Int:
+## emit the loop behind `xs.filter(keep)`. unlike `map`, the elements are
+## the source list's own, so the plain retaining push is what the result
+## needs: it takes a count of its own and can outlive the list it came from.
+pub fn ir_emit_list_filter_loop(list_r: Int, ctor: String, keep_name: String, result_kind: String, elem_kind: String, idx_name: String) -> Int:
     result_r := ir_reg()
-    ir_emit_call0_raw(result_r, "__list_new", result_kind)
+    ir_emit_call0_raw(result_r, ctor, result_kind)
     len_r := ir_reg()
     ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
     zero_r := ir_reg()

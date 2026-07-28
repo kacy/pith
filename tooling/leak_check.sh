@@ -30,6 +30,7 @@ cases=(
   tests/leaks/leak_index_key
   tests/leaks/leak_direct_store
   tests/leaks/leak_loop_var_slot
+  tests/leaks/leak_list_transform
 )
 
 echo "--- leak growth (${low_rounds} vs ${high_rounds} rounds, limit ${limit_kb}kb) ---"

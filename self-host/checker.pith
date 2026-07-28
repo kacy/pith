@@ -13,7 +13,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -3668,6 +3668,27 @@ fn collect_function_return_type_with_subst(node: Node, params: List[String], arg
                 return resolve_type_with_substitution_map(cn.children[0], params, args)
     return TID_VOID
 
+# call arguments arrive wrapped in an `arg` node; the expression is inside.
+fn argument_expression_index(arg_idx: Int) -> Int:
+    arg_node := get_node(arg_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        return arg_node.children[0]
+    return arg_idx
+
+# `mod.name(x)` when the module has no such function. pith has no free-function
+# spelling for methods, so when `name` is a method on the first argument's type
+# the mistake is almost always the receiver form written inside out — say so,
+# because the plain "undefined function" reads like a typo.
+fn report_undefined_module_function(alias: String, name: String, arg_indices: List[Int], scope_id: Int):
+    message := "undefined function: " + alias + "." + name
+    if arg_indices.len() > 0:
+        recv_type := c_check_expr(argument_expression_index(arg_indices[0]), scope_id)
+        if is_error_type(recv_type) == false:
+            if method_type_map.contains_key(get_type_name(recv_type) + "." + name):
+                report_error_with_fix("E201", message, "'" + name + "' is a method on " + get_type_name(recv_type) + "; call it as receiver." + name + "(...)")
+                return
+    report_error("E201", message)
+
 fn check_method_call(node: Node, scope_id: Int) -> Int:
     # node.value = method name
     # children[0] = receiver
@@ -3723,10 +3744,15 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             qualified_name := module_import_target_name(module_path, method_name)
             module_name := module_generic_target_name(module_path, method_name)
             mut callee_type := lookup_binding(scope_id, module_name)
+            # the remaining two lookups are unqualified for all but a handful
+            # of modules, and every module's top-level names share one table.
+            # they have to stay inside the aliased module, or an untagged
+            # lookup happily answers `a.helper()` with the `helper` that
+            # module b declared.
             if callee_type < 0:
-                callee_type = lookup_binding(scope_id, qualified_name)
+                callee_type = lookup_binding_owned_by(scope_id, qualified_name, module_path)
             if callee_type < 0:
-                callee_type = lookup_binding(scope_id, method_name)
+                callee_type = lookup_binding_owned_by(scope_id, method_name, module_path)
             if callee_type < 0:
                 generic_name := module_generic_target_name(module_path, method_name)
                 if has_generic_declaration(generic_name):
@@ -3734,7 +3760,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 if has_generic_declaration(method_name):
                     return check_generic_function_call(method_name, arg_indices, scope_id)
             if callee_type < 0:
-                report_error("E201", "undefined function: " + recv_name + "." + method_name)
+                report_undefined_module_function(recv_name, method_name, arg_indices, scope_id)
                 return TID_ERR
             return check_callable_type_with_args(callee_type, arg_indices, scope_id)
 
@@ -4387,12 +4413,7 @@ fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, secon
     check_argument_type(args[1], second, scope_id)
 
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
-    arg_node := get_node(arg_idx)
-    mut expr_idx := arg_idx
-    if arg_node.kind == "arg":
-        if arg_node.children.len() > 0:
-            expr_idx = arg_node.children[0]
-    actual := c_check_expr(expr_idx, scope_id)
+    actual := c_check_expr(argument_expression_index(arg_idx), scope_id)
     if is_error_type(actual) == false:
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:
@@ -4426,10 +4447,12 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
             mut func_tid := lookup_binding(scope_id, module_name)
             if func_tid >= 0:
                 return func_tid
-            func_tid = lookup_binding(scope_id, qualified_name)
+            # the same unqualified lookups as the call path, under the same
+            # restriction: neither may answer with a name another module owns.
+            func_tid = lookup_binding_owned_by(scope_id, qualified_name, module_path)
             if func_tid >= 0:
                 return func_tid
-            func_tid = lookup_binding(scope_id, field_name)
+            func_tid = lookup_binding_owned_by(scope_id, field_name, module_path)
             if func_tid >= 0:
                 return func_tid
             report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")

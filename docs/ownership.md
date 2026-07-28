@@ -40,6 +40,12 @@ variables:
   excluded from the function's exit cleanup, a returned borrow is
   retained
 - each return releases every string local the function owns
+- a `for` loop variable is a borrow rather than an owned local: it
+  reads an element the container still holds, and takes no count of
+  its own. so it gets storage of its own for the length of the body,
+  which keeps it out of the slot a local of the same name uses — where
+  the rebind's release-the-old, and the exit cleanup on an early
+  return, would drop a count the loop never took
 
 call arguments:
 
@@ -129,13 +135,14 @@ gaps, all bounded leaks rather than dangling pointers:
 - **a struct value stored straight into a container is still counted
   twice.** strings, bytes, and nested collections hand the container the
   count the temporary was holding; struct values keep taking a second
-  one. the reason is a separate bug in loop variables: a `for` variable
-  writes a borrowed element into the same named slot that a later `:=`
-  of that name reuses, and the rebind releases a count the loop never
-  took. `std.crypto.x509.verify_chain_issuers` has that shape — `for root
-  in trusted_roots` ahead of `root := root_result.ok` — and the extra
-  count a struct store takes is what currently absorbs the release. the
-  loop variable is the thing to fix; the double count goes away with it.
+  one. what made this unsafe to change was a separate bug in loop
+  variables, and that one is fixed: a `for` variable used to write its
+  borrowed element into the same named slot a later `:=` of that name
+  reused, so the rebind released a count the loop never took, and the
+  extra count a struct store takes was all that absorbed it. a loop
+  variable now gets storage of its own for the length of the body, so
+  the only thing left here is to make the struct store transfer its
+  count like the other kinds do.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

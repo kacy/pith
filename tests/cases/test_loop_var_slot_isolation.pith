@@ -1,0 +1,153 @@
+# a `for` loop variable and a later `:=` of the same name used to land in one
+# storage slot: the emitter keeps a single flat set of locals per function,
+# while the checker scopes the loop variable to the loop. the loop stores a
+# borrowed element into that slot, so the rebind's release of the previous
+# value dropped a count the loop never took, and so did the exit cleanup when
+# the body returned early. loop variables now get a slot of their own for the
+# length of the body.
+#
+# this belongs in the curated memcheck set because the failure is a use after
+# free of a live container element rather than a leak: every read below happens
+# after the release that used to free it. the same slot sharing also let an
+# inner loop overwrite an outer loop's variable, which the printed values cover.
+
+struct Cert:
+    name: String
+    ca: Bool
+
+interface Iterator[T]:
+    fn next() -> T?
+
+# just enough of an iterator to drive the third `for` lowering (the one that
+# pulls an optional from next() rather than indexing a container).
+struct Walk:
+    items: List[String]
+    mut cur: Int
+
+impl Iterator[String] for Walk:
+    fn next() -> String?:
+        if self.cur >= self.items.len():
+            return none
+        v := self.items[self.cur]
+        self.cur = self.cur + 1
+        return v
+
+fn find_issuer(certs: List[Cert], want: String) -> Cert!:
+    for c in certs:
+        if c.name == want:
+            return c
+    fail "no issuer named {want}"
+
+# the shape the x509 chain walk has: a `for root in roots` pinning check, then
+# a `root := ...` rebind further down the same function. the rebind's release
+# used to drop the count on `roots`' last element.
+fn verify(roots: List[Cert], leaf: String) -> String:
+    for root in roots:
+        if root.name == "pinned-{leaf}":
+            return "pinned {root.name}"
+    found := find_issuer(roots, "issuer-of-{leaf}")
+    if found.is_err:
+        return "untrusted"
+    root := found.ok
+    return "chained {root.name} ca={root.ca}"
+
+# same collision with strings, and with the loop returning early so the
+# function's exit cleanup — not the rebind — is what runs over the slot.
+fn label_for(names: List[String], wanted: String) -> String:
+    for name in names:
+        if name == wanted:
+            return "exact"
+    name := "fallback"
+    return name
+
+fn first_prefixed(names: List[String], prefix: String) -> String:
+    for name in names:
+        if name.starts_with(prefix):
+            return "hit {name}"
+    name := "miss"
+    return name
+
+# an inner loop reusing the outer loop's variable name must not overwrite it.
+fn nested_names(outer: List[String], inner: List[String]) -> String:
+    mut seen := ""
+    for v in outer:
+        for v in inner:
+            seen = seen + v
+        seen = seen + "|" + v + ";"
+    return seen
+
+# ranges and iterators are lowered by their own emitters, so each gets the same
+# check the indexed form gets: a local the loop shadows keeps its value once
+# the loop ends.
+fn range_shadow() -> String:
+    i := 41
+    for i in 0..3:
+        print("range {i}")
+    return "outer {i}"
+
+fn iterator_shadow(items: List[String]) -> String:
+    part := "kept"
+    for part in Walk(items: items, cur: 0):
+        print("iter {part}")
+    return "outer {part}"
+
+# a closure built inside the loop captures the loop variable, so the capture
+# has to read the loop's own slot rather than the function local it shadows.
+fn capture_in_loop(items: List[String]) -> String:
+    mut out := ""
+    for item in items:
+        f := fn(s: String) => s + "/" + item
+        out = out + f("x")
+    item := "after"
+    return out + "|" + item
+
+fn heap_names(n: Int) -> List[String]:
+    mut names: List[String] := []
+    mut i := 0
+    while i < n:
+        names.push("name-{i}-{n}")
+        i = i + 1
+    return names
+
+fn heap_certs(n: Int) -> List[Cert]:
+    mut certs: List[Cert] := []
+    mut i := 0
+    while i < n:
+        certs.push(Cert("subject-{i}-{n}", i == 0))
+        i = i + 1
+    certs.push(Cert("pinned-subject-0-{n}", false))
+    certs.push(Cert("issuer-of-subject-1-{n}", true))
+    return certs
+
+fn main():
+    # run each shape many times so a cell freed too early gets handed out
+    # again; every round then reads the container it was freed from.
+    mut round := 0
+    mut checksum := 0
+    while round < 200:
+        names := heap_names(4)
+        certs := heap_certs(3)
+        checksum = checksum + label_for(names, "name-1-4").len()
+        checksum = checksum + first_prefixed(names, "name-2").len()
+        checksum = checksum + verify(certs, "subject-0-3").len()
+        checksum = checksum + verify(certs, "subject-1-3").len()
+        checksum = checksum + verify(certs, "nothing").len()
+        # the container has to still hand back what the loop borrowed
+        checksum = checksum + names[3].len() + certs[4].name.len()
+        round = round + 1
+    print("checksum {checksum}")
+
+    names := heap_names(3)
+    certs := heap_certs(2)
+    print(label_for(names, "name-0-3"))
+    print(label_for(names, "absent"))
+    print(first_prefixed(names, "name-2"))
+    print(first_prefixed(names, "zzz"))
+    print(verify(certs, "subject-0-2"))
+    print(verify(certs, "subject-1-2"))
+    print(verify(certs, "unknown"))
+    print("survivors {names[2]} {certs[3].name}")
+    print(nested_names(["A", "B"], ["x", "y"]))
+    print(range_shadow())
+    print(iterator_shadow(["p", "q"]))
+    print(capture_in_loop(["a", "b"]))

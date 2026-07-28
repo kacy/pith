@@ -139,6 +139,42 @@ mut ir_for_count := 0
 mut ir_break_stack: List[String] := []
 mut ir_continue_stack: List[String] := []
 
+# a `for` loop's variables are scoped to the loop — the checker rejects reading
+# one after the loop ends — but the emitter's locals are a single flat namespace
+# per function, so `for root in roots` and a later `root := ...` used to land in
+# the same slot. the loop stores a *borrowed* element there, so the rebind's
+# release-the-old (and the exit cleanup, on an early return) dropped a count the
+# loop never took. this map gives each loop variable its own slot for the length
+# of the body: source name -> slot name, "" meaning "no loop slot, use the name".
+# ir_emit_name_load / ir_emit_name_store consult it, so every read and write the
+# body lowers lands in the loop's own slot and can never alias a function local.
+mut ir_loop_var_slots: Map[String, String] := {}
+
+# the slot `name` currently resolves to, or "" when no enclosing loop bound it.
+fn ir_loop_var_slot(name: String) -> String:
+    if ir_loop_var_slots.contains_key(name):
+        return ir_loop_var_slots[name]
+    return ""
+
+# bind `name` to `slot` for a loop body and hand back the mapping it replaced,
+# so a nested loop reusing an outer loop's variable name restores the outer
+# slot when it ends. "" is the empty mapping, so there is nothing to erase.
+fn ir_loop_var_push(name: String, slot: String) -> String:
+    if name.len() == 0:
+        return ""
+    previous := ir_loop_var_slot(name)
+    ir_loop_var_slots.insert(name, slot)
+    return previous
+
+fn ir_loop_var_pop(name: String, previous: String):
+    if name.len() > 0:
+        ir_loop_var_slots.insert(name, previous)
+
+# the storage a loop variable gets. the loop id keeps two loops in one function
+# apart, including an inner loop that reuses an outer loop's variable name.
+fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
+    return "__loopvar_" + fid.to_string() + "_" + name
+
 # defer support (statically emitted, zero runtime machinery). deferred
 # statements are re-emitted at every scope-exit edge in LIFO order, before the
 # ARC cleanup. ir_defer_nodes is a flat stack of the inner statement node
@@ -1031,7 +1067,7 @@ fn ir_emit_string_cleanup(exclude: String):
             kind = ir_rc_local_kinds[i]
         if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
-            ir_emit_name_load(r, name)
+            ir_emit_local_slot_load(r, name)
             ir_rc_release_local(r, kind, name)
         i = i + 1
 
@@ -2283,7 +2319,9 @@ fn ir_closure_capture_tag(kind: String) -> Int:
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     for capture_name, i in captures:
         cap_val := ir_reg()
-        ir_emit("load " + cap_val.to_string() + " " + capture_name)
+        # this reads the enclosing scope, so a captured loop variable has to
+        # come from the loop's own slot, not the function local it shadows.
+        ir_emit_name_load(cap_val, capture_name)
         slot := ir_reg()
         ir_emit("iconst " + slot.to_string() + " " + i.to_string())
         # the closure environment keeps its own count on captured rc values
@@ -4539,6 +4577,11 @@ fn ir_reset_lambda_emit_state():
     ir_var_regs = {}
     ir_var_types = {}
     ir_closure_return_kinds.clear()
+    # a lambda / wrapper is its own function with its own slots. an enclosing
+    # loop's variable slots do not exist in that frame — the capture prologue
+    # stores captured values under their plain names — so start it empty. each
+    # caller saves the outer mapping first and puts it back afterwards.
+    ir_loop_var_slots = {}
 
 fn ir_emit_lambda_params(params: List[String]):
     for param in params:
@@ -4599,6 +4642,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # function must not have their iterables released by a return inside it.
     saved_loop_iter_vars := ir_loop_iter_vars
     saved_loop_iter_kinds := ir_loop_iter_kinds
+    saved_loop_var_slots := ir_loop_var_slots
     ir_string_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -4619,6 +4663,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_tuple_cascade_names = saved_tuple_cascade
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
+    ir_loop_var_slots = saved_loop_var_slots
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -4647,6 +4692,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
+    saved_loop_var_slots := ir_loop_var_slots
 
     ir_reset_lambda_emit_state()
     ir_emit_func_header(wrapper_name, 1, "unknown")
@@ -4655,6 +4701,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_emit("ret " + ir_expr(call_idx).to_string())
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
+    ir_loop_var_slots = saved_loop_var_slots
 
     closure_r := ir_reg()
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
@@ -4691,6 +4738,7 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
     saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
+    saved_loop_var_slots := ir_loop_var_slots
 
     ir_reset_lambda_emit_state()
     mut param_count := 1
@@ -4726,6 +4774,7 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
         ir_emit("ret " + call_r.to_string())
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
+    ir_loop_var_slots = saved_loop_var_slots
     ir_named_fn_value_wrappers.insert(target_name, wrapper_name)
     return wrapper_name
 
@@ -5706,11 +5755,11 @@ fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_k
     # var whose name matches a module function is mistaken for that function and
     # loaded as a fn-value. "unknown" carries no rc kind, so this is release-safe.
     ir_var_types.insert(value_name, item_ret_kind)
-    ir_emit("store " + value_name + " " + elem_r.to_string())
+    ir_emit_name_store(value_name, elem_r)
     if index_name.len() > 0:
         idx_val := ir_reg()
         ir_emit("load " + idx_val.to_string() + " " + index_name_internal)
-        ir_emit("store " + index_name + " " + idx_val.to_string())
+        ir_emit_name_store(index_name, idx_val)
         ir_var_types.insert(index_name, "int")
 
 # --- statement lowering ---
@@ -5996,6 +6045,8 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
     ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
+    prev_value_slot := ir_loop_var_push(names.value_name, ir_loop_var_slot_name(fid, names.value_name))
+    prev_index_slot := ir_loop_var_push(names.index_name, ir_loop_var_slot_name(fid, names.index_name))
     ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
@@ -6013,6 +6064,8 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
         ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
         ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
     ir_defer_loop_exit()
+    ir_loop_var_pop(names.index_name, prev_index_slot)
+    ir_loop_var_pop(names.value_name, prev_value_slot)
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
@@ -6066,20 +6119,24 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_emit(cmp_op + " " + cmp_r.to_string() + " " + cv.to_string() + " " + ch.to_string())
     ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
+    prev_value_slot := ir_loop_var_push(names.value_name, ir_loop_var_slot_name(fid, names.value_name))
+    prev_index_slot := ir_loop_var_push(names.index_name, ir_loop_var_slot_name(fid, names.index_name))
     bind_r := ir_reg()
     ir_emit("load " + bind_r.to_string() + " " + fv)
     ir_var_types.insert(names.value_name, "int")
-    ir_emit("store " + names.value_name + " " + bind_r.to_string())
+    ir_emit_name_store(names.value_name, bind_r)
     if has_index:
         pos_r := ir_reg()
         ir_emit("load " + pos_r.to_string() + " " + fp)
         ir_var_types.insert(names.index_name, "int")
-        ir_emit("store " + names.index_name + " " + pos_r.to_string())
+        ir_emit_name_store(names.index_name, pos_r)
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
     ir_defer_loop_enter()
     ir_block(node.children[1])
     ir_defer_loop_exit()
+    ir_loop_var_pop(names.index_name, prev_index_slot)
+    ir_loop_var_pop(names.value_name, prev_value_slot)
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
@@ -6132,20 +6189,24 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     flag_r := ir_optional_flag_field(opt_r)
     ir_emit("brif " + flag_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
+    prev_value_slot := ir_loop_var_push(names.value_name, ir_loop_var_slot_name(fid, names.value_name))
+    prev_index_slot := ir_loop_var_push(names.index_name, ir_loop_var_slot_name(fid, names.index_name))
     val_r := ir_reg()
     ir_emit("field " + val_r.to_string() + " " + opt_r.to_string() + " 8 " + elem_kind + " value")
     ir_var_types.insert(names.value_name, elem_kind)
-    ir_emit("store " + names.value_name + " " + val_r.to_string())
+    ir_emit_name_store(names.value_name, val_r)
     if has_index:
         pos_r := ir_reg()
         ir_emit("load " + pos_r.to_string() + " " + fp)
         ir_var_types.insert(names.index_name, "int")
-        ir_emit("store " + names.index_name + " " + pos_r.to_string())
+        ir_emit_name_store(names.index_name, pos_r)
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
     ir_defer_loop_enter()
     ir_block(node.children[1])
     ir_defer_loop_exit()
+    ir_loop_var_pop(names.index_name, prev_index_slot)
+    ir_loop_var_pop(names.value_name, prev_value_slot)
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
@@ -6584,6 +6645,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_defer_loop_base_stack = []
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
+    ir_loop_var_slots = {}
     ir_seed_global_types()
     ir_current_func_return_kind = ret_type
     ir_current_func_optional_inner_kind = ""
@@ -6892,20 +6954,39 @@ fn ir_name_is_threadlocal(name: String) -> Bool:
     return ir_threadlocal_slots.contains_key(name) and not ir_var_regs.contains_key(name)
 
 # emit a load of `name`, routing threadlocal globals through the tls runtime and
-# everything else (locals, plain globals) through the normal storage slot.
+# everything else (locals, plain globals) through the normal storage slot. a
+# name the enclosing `for` loop bound reads its own loop slot, so the loop
+# variable and a function local of the same name stay separate.
 fn ir_emit_name_load(dest_r: Int, name: String):
-    if ir_name_is_threadlocal(name):
+    loop_slot := ir_loop_var_slot(name)
+    if loop_slot.len() > 0:
+        ir_emit("load " + dest_r.to_string() + " " + loop_slot)
+    elif ir_name_is_threadlocal(name):
         ir_emit_tls_load(dest_r, name)
     else:
         ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
 
 # emit a store of val_r into `name`, routing threadlocal globals through the tls
-# runtime and everything else through the normal storage slot.
+# runtime and everything else through the normal storage slot. loop variables go
+# to their own slot, the same as loads.
 fn ir_emit_name_store(name: String, val_r: Int):
-    if ir_name_is_threadlocal(name):
+    loop_slot := ir_loop_var_slot(name)
+    if loop_slot.len() > 0:
+        ir_emit("store " + loop_slot + " " + val_r.to_string())
+    elif ir_name_is_threadlocal(name):
         ir_emit_tls_store(name, val_r)
     else:
         ir_emit("store " + ir_resolve_storage_name(name) + " " + val_r.to_string())
+
+# load a tracked local's own slot, ignoring any loop variable shadowing it. the
+# ARC cleanup addresses the function's storage directly: a `return` inside a
+# loop body must release what the local holds, not what the loop variable
+# happens to be borrowing at that moment.
+fn ir_emit_local_slot_load(dest_r: Int, name: String):
+    if ir_name_is_threadlocal(name):
+        ir_emit_tls_load(dest_r, name)
+    else:
+        ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
 
 fn ir_emit_global_bindings(root: Node):
     for child in root.children:

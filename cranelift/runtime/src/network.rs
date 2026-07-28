@@ -1,6 +1,6 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
-use crate::concurrency::green;
 use crate::concurrency::scheduler::{backend, Backend};
+use crate::fdio;
 use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 use crate::netpoll;
 use std::os::unix::io::RawFd;
@@ -22,30 +22,6 @@ fn is_green() -> bool {
     backend() == Backend::Green
 }
 
-/// the current errno as a plain int.
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
-/// would this syscall have blocked? (EAGAIN and EWOULDBLOCK are the same value on
-/// linux, but check both for portability of intent.)
-fn is_would_block(err: i32) -> bool {
-    err == libc::EAGAIN || err == libc::EWOULDBLOCK
-}
-
-/// set `O_NONBLOCK` on a raw fd. used only in green mode; a failure leaves the fd
-/// blocking, which is still safe (the caller would block in the syscall rather
-/// than yield).
-fn set_nonblocking(fd: RawFd) {
-    // SAFETY: plain fcntl on a valid fd we just created or accepted.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-}
-
 /// disable nagle on a raw fd — see the note in the blocking connect path for why
 /// request/response protocols want this.
 fn set_nodelay_raw(fd: RawFd) {
@@ -59,90 +35,6 @@ fn set_nodelay_raw(fd: RawFd) {
             &one as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-    }
-}
-
-/// wait for `fd` to become readable (`read`) or writable, yielding to the epoll
-/// reactor when we are running inside a green task, or blocking on `poll` when we
-/// are not (the main thread, a non-green spawn, or the flag-off backend). returns
-/// the tri-state contract: `1` ready, `0` timed out, `-1` error.
-///
-/// this is the seam: the green branch never parks the worker OS thread; the
-/// os-thread branch is exactly the original `pith_tcp_wait` and must not spin.
-fn wait_io(fd: i64, read: bool, timeout_ms: i64) -> i64 {
-    if fd <= 0 {
-        return -1;
-    }
-    match green::current_task() {
-        Some(task) => netpoll::wait_io(fd as RawFd, read, timeout_ms, task),
-        None => {
-            let events = if read { libc::POLLIN } else { libc::POLLOUT };
-            pith_tcp_wait(fd, events, timeout_ms)
-        }
-    }
-}
-
-/// green-mode read of up to `size` bytes: loop `read()`, yielding on would-block,
-/// until data arrives, the peer closes (returns an empty vec — real EOF), or a
-/// hard error (returns `None`). mirrors the blocking path's contract: 0 bytes is
-/// EOF, not an error.
-fn green_read(fd: i64, size: usize) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; size];
-    loop {
-        // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is a
-        // socket owned by pith for the duration of this call.
-        let n = unsafe { libc::read(fd as i32, buf.as_mut_ptr() as *mut libc::c_void, size) };
-        if n >= 0 {
-            buf.truncate(n as usize);
-            return Some(buf);
-        }
-        let err = errno();
-        if is_would_block(err) {
-            // nothing ready — yield to the reactor and retry when readable.
-            if wait_io(fd, true, -1) != 1 {
-                return None;
-            }
-            continue;
-        }
-        if err == libc::EINTR {
-            continue;
-        }
-        return None;
-    }
-}
-
-/// green-mode write of one buffer: `write()` once, yielding only if it would
-/// block with nothing written yet. returns the bytes written (a partial count is
-/// returned as-is — callers loop), or `0` for a real error or closed peer. it
-/// never returns `0` for a would-block: `0` must mean closed/EOF only, so a
-/// would-block waits and retries until at least one byte goes out.
-fn green_write(fd: i64, data: &[u8]) -> i64 {
-    if data.is_empty() {
-        return 0;
-    }
-    loop {
-        // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is a
-        // socket owned by pith for the duration of this call.
-        let n =
-            unsafe { libc::write(fd as i32, data.as_ptr() as *const libc::c_void, data.len()) };
-        if n > 0 {
-            return n as i64;
-        }
-        if n == 0 {
-            // a zero-length write of non-empty data means the peer is gone.
-            return 0;
-        }
-        let err = errno();
-        if is_would_block(err) {
-            if wait_io(fd, false, -1) != 1 {
-                return 0;
-            }
-            continue;
-        }
-        if err == libc::EINTR {
-            continue;
-        }
-        return 0;
     }
 }
 
@@ -234,7 +126,7 @@ fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
     if fd < 0 {
         return 0;
     }
-    set_nonblocking(fd);
+    fdio::set_nonblocking(fd);
     set_nodelay_raw(fd);
 
     // SAFETY: sockaddr_storage is plain-old-data; zeroing it is a valid start.
@@ -249,13 +141,13 @@ fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
         )
     };
     if rc != 0 {
-        let err = errno();
+        let err = fdio::errno();
         if err != libc::EINPROGRESS {
             close_raw(fd);
             return 0;
         }
         // in-progress: wait for writable (handshake done or failed).
-        if wait_io(fd as i64, false, -1) != 1 {
+        if fdio::wait_ready(fd as i64, false, -1) != 1 {
             close_raw(fd);
             return 0;
         }
@@ -296,7 +188,7 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
             // green mode: a non-blocking listener lets accept yield instead of
             // parking the worker.
             if is_green() {
-                set_nonblocking(fd as RawFd);
+                fdio::set_nonblocking(fd as RawFd);
             }
             fd
         }
@@ -349,13 +241,13 @@ pub extern "C" fn pith_tcp_accept(server_fd: i64) -> i64 {
                 libc::accept(server_fd as i32, std::ptr::null_mut(), std::ptr::null_mut())
             };
             if fd >= 0 {
-                set_nonblocking(fd);
+                fdio::set_nonblocking(fd);
                 set_nodelay_raw(fd);
                 return fd as i64;
             }
-            let err = errno();
-            if is_would_block(err) {
-                if wait_io(server_fd, true, -1) != 1 {
+            let err = fdio::errno();
+            if fdio::is_would_block(err) {
+                if fdio::wait_ready(server_fd, true, -1) != 1 {
                     return 0;
                 }
                 continue;
@@ -395,7 +287,7 @@ pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
     }
 
     if is_green() {
-        return match green_read(conn_fd, 4096) {
+        return match fdio::read_yielding(conn_fd, 4096) {
             Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
             None => std::ptr::null_mut(),
         };
@@ -433,7 +325,7 @@ pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
     };
 
     if is_green() {
-        return match green_read(conn_fd, size) {
+        return match fdio::read_yielding(conn_fd, size) {
             Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
             None => std::ptr::null_mut(),
         };
@@ -470,7 +362,7 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     };
 
     if is_green() {
-        return match green_read(conn_fd, size) {
+        return match fdio::read_yielding(conn_fd, size) {
             Some(buf) => pith_bytes_from_vec(buf),
             None => 0,
         };
@@ -490,56 +382,14 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     result
 }
 
-/// poll a single fd until it is ready, times out, or errors. the blocking wait
-/// every non-green caller uses, and the whole story on platforms without the
-/// epoll reactor (see `netpoll_fallback`).
-pub(crate) fn pith_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
-    if fd <= 0 {
-        return -1;
-    }
-    let mut poll_fd = libc::pollfd {
-        fd: fd as i32,
-        events,
-        revents: 0,
-    };
-    let timeout = if timeout_ms < 0 {
-        -1
-    } else if timeout_ms > i32::MAX as i64 {
-        i32::MAX
-    } else {
-        timeout_ms as i32
-    };
-    loop {
-        let status = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
-        if status > 0 {
-            let revents = poll_fd.revents;
-            if (revents & libc::POLLNVAL) != 0 || (revents & libc::POLLERR) != 0 {
-                return -1;
-            }
-            if (revents & events) != 0 || (revents & libc::POLLHUP) != 0 {
-                return 1;
-            }
-            return -1;
-        }
-        if status == 0 {
-            return 0;
-        }
-        let kind = std::io::Error::last_os_error().kind();
-        if kind == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return -1;
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn pith_tcp_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
-    wait_io(fd, true, timeout_ms)
+    fdio::wait_ready(fd, true, timeout_ms)
 }
 
 #[no_mangle]
 pub extern "C" fn pith_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
-    wait_io(fd, false, timeout_ms)
+    fdio::wait_ready(fd, false, timeout_ms)
 }
 
 /// TCP write — write data to connection fd, return bytes written
@@ -555,7 +405,7 @@ pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
     let s = cstr_str_or_empty(data);
 
     if is_green() {
-        return green_write(conn_fd, s.as_bytes());
+        return fdio::write_yielding(conn_fd, s.as_bytes());
     }
 
     let mut stream = TcpStream::from_raw_fd(conn_fd as i32);
@@ -583,7 +433,7 @@ pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
     }
 
     if is_green() {
-        return green_write(conn_fd, &bytes.data);
+        return fdio::write_yielding(conn_fd, &bytes.data);
     }
 
     let mut stream = TcpStream::from_raw_fd(conn_fd as i32);

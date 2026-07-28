@@ -18,6 +18,7 @@ pub mod concurrency;
 pub mod crypto;
 pub mod dns;
 pub mod encoding;
+pub mod fdio;
 pub mod ffi_util;
 pub mod handle_registry;
 pub mod host_fs;

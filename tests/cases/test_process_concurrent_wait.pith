@@ -1,0 +1,67 @@
+# waiting on a child, or reading from one, must not stop other tasks running.
+#
+# the finish order is the whole assertion. the child takes about a second and
+# the counting loop takes a fraction of a millisecond, so "work" can only be
+# reported first if the task blocked on the child handed its worker back. run
+# this at one green worker (PITH_GREEN_WORKERS=1) and it fails outright when
+# the child call blocks the worker instead of parking the task.
+
+import std.os.process as process
+
+SLOW_CHILD := "sleep 1"
+CPU_ROUNDS := 200000
+
+fn wait_for_child(done: Channel[String]):
+    started := process.start_shell(SLOW_CHILD)
+    if started.is_err:
+        done.send("wait-failed")
+        return
+    child := started.ok
+    code := child.wait()
+    child.close()
+    done.send("wait:{code}")
+
+fn read_from_child(done: Channel[String]):
+    started := process.start_shell("sleep 1; printf ready")
+    if started.is_err:
+        done.send("read-failed")
+        return
+    child := started.ok
+    text := child.stdout().read_all()
+    child.wait()
+    child.close()
+    if text.is_err:
+        done.send("read-failed")
+        return
+    done.send("read:{text.ok}")
+
+# a short burst of arithmetic, reported only once it is finished. the sum is
+# printed nowhere but checked here so the loop cannot be optimized away.
+fn count_to(done: Channel[String], label: String):
+    mut total := 0
+    mut i := 0
+    while i < CPU_ROUNDS:
+        total = total + i
+        i = i + 1
+    if total <= 0:
+        done.send("{label}-miscounted")
+        return
+    done.send(label)
+
+fn main() -> Int!:
+    waiting := Channel[String](2)
+    waiter := spawn wait_for_child(waiting)
+    wait_worker := spawn count_to(waiting, "work")
+    print("wait-first:{waiting.recv()?}")
+    print("wait-second:{waiting.recv()?}")
+    await waiter
+    await wait_worker
+
+    reading := Channel[String](2)
+    reader := spawn read_from_child(reading)
+    read_worker := spawn count_to(reading, "work")
+    print("read-first:{reading.recv()?}")
+    print("read-second:{reading.recv()?}")
+    await reader
+    await read_worker
+    return 0

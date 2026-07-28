@@ -149,6 +149,21 @@ error[E201]: undefined variable 'foo'
               ^^^
 ```
 
+`mod.name(...)` reaches only what `mod` itself declares. every module's
+top-level names live in one shared table, and without this check the lookup
+falls through to a function some unrelated module declared, then emits a call
+that resolves to nothing.
+
+a method is an easy way to land here. a method is not a module function and has
+no free-function spelling: `wait` on `Process` is written `proc.wait()`, never
+`process.wait(proc)`. when the first argument's type has a method by that name,
+the error says so.
+
+```
+error[E201]: undefined function: process.wait
+  fix: 'wait' is a method on Process; call it as receiver.wait(...)
+```
+
 ### E202 — undefined type
 
 a type name was used in an annotation but doesn't exist.

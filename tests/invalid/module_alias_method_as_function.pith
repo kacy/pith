@@ -1,0 +1,13 @@
+# `wait` is a method on std.os.process.Process, not a function the module
+# declares. pith has no free-function spelling for a method, so this has to be
+# `proc.wait()`. it used to compile: the lookup behind `process.wait` fell
+# through to a bare name in the shared table, found the `wait` that std.io
+# declares, and emitted a call that landed on an unrelated runtime intrinsic
+# and answered 0 without waiting for anything.
+
+import std.os.process as process
+
+fn main() -> Int!:
+    proc := process.start_shell("true")!
+    print(process.wait(proc).to_string())
+    return 0

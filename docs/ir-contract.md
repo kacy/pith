@@ -222,6 +222,10 @@ names the function and the offending line. these are covered by tests in
 - a `brif` or `jmp` to a label that does not exist
 - a malformed `store`, `call`, or `field`
 - a register reference that was never assigned, or a non-numeric register token
+- a `call` whose retkind promises a value when the callee returns nothing. every
+  ir-declared function returns an i64, so this can only mean the emitter's idea
+  of a runtime call disagrees with `runtime_functions.txt`. before the check,
+  the destination register got a zero nobody wrote
 
 known soft spots, where the consumer is quieter than it should be — these are the
 tightening targets, not settled behavior:

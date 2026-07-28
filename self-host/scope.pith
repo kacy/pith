@@ -102,6 +102,25 @@ pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
         i = i - 1
     return false
 
+## the type of a binding the module owns, or -1. bindings tagged with a
+## different module are skipped: the global scope holds every module's
+## top-level names at once, so a bare-name lookup behind `alias.name`
+## would otherwise reach a function some unrelated module declared.
+## builtins carry an empty tag and belong to every module.
+pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String) -> Int:
+    mut i := binding_scope_ids.len() - 1
+    while i >= 0:
+        if binding_scope_ids[i] == scope_id:
+            if binding_names_equal(binding_names[i], name):
+                tag := binding_module_tags[i]
+                if tag == "" or tag == module_path:
+                    return binding_types[i]
+        i = i - 1
+    entry := scope_entries[scope_id]
+    if entry.parent >= 0:
+        return lookup_binding_owned_by(entry.parent, name, module_path)
+    return - 1
+
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # search bindings in reverse order (latest first) for this scope
     mut i := binding_scope_ids.len() - 1

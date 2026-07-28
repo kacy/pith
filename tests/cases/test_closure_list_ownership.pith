@@ -1,0 +1,72 @@
+# a list of closures owns its elements. it used to be built untagged, which
+# meant the list held handles nothing had taken a count for: hand a fresh
+# closure to a function that stores one and the caller's release freed it
+# while the list still pointed at the box. a route table and a middleware
+# chain are exactly this shape.
+#
+# every closure here is stored by a callee and called back through the list
+# afterwards, so a missing count reads freed memory rather than printing the
+# wrong number.
+
+struct Step:
+    pub name: String
+    pub run: fn(Int) -> Int
+
+# the callee stores its argument: the list it returns has to take a count of
+# its own, because the caller's dies with the call.
+fn appended(into: List[fn(Int) -> Int], f: fn(Int) -> Int) -> List[fn(Int) -> Int]:
+    mut out: List[fn(Int) -> Int] := []
+    mut i := 0
+    while i < into.len():
+        out.push(into[i])
+        i = i + 1
+    out.push(f)
+    return out
+
+fn double(x: Int) -> Int:
+    return x * 2
+
+fn negate(x: Int) -> Int:
+    return 0 - x
+
+# build the list one call at a time, throwing away the intermediate lists —
+# each one releases its elements as it dies, so only a real count keeps the
+# survivors alive.
+fn build() -> List[fn(Int) -> Int]:
+    empty: List[fn(Int) -> Int] := []
+    mut fns := appended(empty, fn(x: Int) => x + 1)
+    fns = appended(fns, double)
+    fns = appended(fns, negate)
+    return fns
+
+fn call_all(fns: List[fn(Int) -> Int], arg: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < fns.len():
+        f := fns[i]
+        out = out + f(arg).to_string() + " "
+        i = i + 1
+    return out.trim()
+
+# a list literal of closures, and a list of structs that each hold one
+fn steps() -> List[Step]:
+    return [Step("double", double), Step("negate", negate)]
+
+fn main():
+    fns := build()
+    print(call_all(fns, 20))
+
+    # call them again: a use-after-free tends to survive the first read and
+    # not the second
+    print(call_all(fns, 100))
+
+    for s in steps():
+        print(s.name + "=" + s.run(7).to_string())
+
+    # churn the whole thing so a leaked or over-released count compounds
+    mut last := ""
+    mut i := 0
+    while i < 500:
+        last = call_all(build(), i)
+        i = i + 1
+    print(last)

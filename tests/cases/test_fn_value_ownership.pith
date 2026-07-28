@@ -1,0 +1,92 @@
+# naming a function as a value mints a closure, and that closure arrives
+# owned: `f := shout` transfers the count into `f`, `apply(shout, x)` hands
+# it to a call that releases it afterwards. treating it as a borrowed read
+# instead left two counts and one release, so every evaluation leaked a
+# closure. tests/leaks/leak_fn_value.pith measures that; this case is the
+# other half — the count has to reach zero exactly once, so every position
+# where a fn value can travel is exercised and its result printed.
+#
+# the higher-order list methods are here for the same reason: map, filter
+# and reduce open-code their loop and so never ran the release that
+# reclaims an owned argument. an owned mapper is dropped after the loop, a
+# borrowed one (a local, a parameter, a struct field) is left to its owner.
+
+struct Pipeline:
+    pub step: fn(String) -> String
+    pub keep: fn(String) -> Bool
+
+fn shout(s: String) -> String:
+    return s.to_upper() + "!"
+
+fn quiet(s: String) -> String:
+    return s.to_lower()
+
+fn is_long(s: String) -> Bool:
+    return s.len() > 3
+
+fn longest(acc: String, s: String) -> String:
+    if s.len() > acc.len():
+        return s
+    return acc
+
+fn apply(f: fn(String) -> String, s: String) -> String:
+    return f(s)
+
+# bound to a local, then called through the local
+fn through_local(s: String) -> String:
+    f := shout
+    return f(s)
+
+# named straight into an argument position, never bound
+fn through_argument(s: String) -> String:
+    return apply(shout, s)
+
+# handed back out of a function: the count travels to the caller
+fn pick(loud: Bool) -> fn(String) -> String:
+    if loud:
+        return shout
+    return quiet
+
+# stored in a struct field, read back out, and called
+fn through_field(s: String) -> String:
+    p := Pipeline(step: shout, keep: is_long)
+    f := p.step
+    if p.keep(s):
+        return f(s)
+    return s
+
+# captured by a spawned task, which keeps its own count on the closure for
+# as long as the task runs
+fn through_spawn(s: String) -> String:
+    f := shout
+    h := spawn apply(f, s)
+    return await h
+
+# an owned mapper (the bare name) and a borrowed one (a local holding it)
+# take different paths through the release
+fn transform(parts: List[String]) -> String:
+    loud := parts.map(shout)
+    kept := loud.filter(is_long)
+    same := quiet
+    hushed := kept.map(same)
+    return hushed.reduce("", longest)
+
+fn main():
+    print(through_local("ping"))
+    print(through_argument("pong"))
+    print(pick(true)("up"))
+    print(pick(false)("DOWN"))
+    print(through_field("field"))
+    print(through_spawn("task"))
+    print(transform(["alpha", "be", "gamma"]))
+
+    # the same shapes again inside a loop, so a per-round leak has somewhere
+    # to accumulate and an over-release has somewhere to trip
+    mut acc := ""
+    mut i := 0
+    while i < 200:
+        acc = through_local("r{i}")
+        acc = through_argument("r{i}")
+        acc = transform(["one-{i}", "two"])
+        i = i + 1
+    print(acc)

@@ -1,0 +1,36 @@
+# naming a function as a value mints a closure. `f := shout` and passing
+# `shout` straight to a call both allocate one, and both used to hand the
+# binding a value it retained as though it were a borrowed variable read —
+# two counts, one release, about 150 bytes gone per round.
+#
+# both spellings churn here: the bind reaches the statement path, the bare
+# argument reaches the owned-argument release, and they are not the same
+# code.
+import leakprobe as probe
+
+fn shout(s: String) -> String:
+    return s.to_upper() + "!"
+
+fn apply(f: fn(String) -> String, s: String) -> String:
+    return f(s)
+
+fn churn_round(i: Int):
+    # bound to a local, then called through the local
+    f := shout
+    a := f("alpha-{i}")
+
+    # named straight into an argument position, never bound
+    b := apply(shout, "beta-{i}")
+
+    # and into a list method that takes the function as its mapper
+    src: List[String] := ["gamma-{i}"]
+    loud := src.map(shout)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -82,6 +82,21 @@ lambdas and function values:
   strings are retained on the way out (`ir_closure_return_kinds`
   records what a closure returns so call sites treat the result as
   owned)
+- naming a function as a value mints a closure. `f := shout` and
+  `xs.map(shout)` both lower to `closure_ref`, which allocates with a
+  count of one, so the expression is owned the same way a lambda
+  literal is: the bind transfers rather than retains, and an argument
+  position releases after the call. `ir_expr_is_named_function_value`
+  decides this, and it mirrors the two emit paths that allocate — a
+  bare name (`ir_emit_ident_load`) and a module member such as
+  `hash.sha256_bytes` (`ir_emit_field_access_expr`). saying "owned"
+  where no closure was allocated would release a count nobody took
+- `map`, `filter` and `reduce` open-code their loop rather than going
+  through the general method call, so the release that reclaims an
+  owned argument does not run for them. each releases the function it
+  was handed once the loop is done, and only when that function
+  arrived owned — a local or a struct field holding the closure
+  belongs to its owner
 
 ## container flavors
 
@@ -94,6 +109,16 @@ exactly the bug that broke the emitter split twice; imported globals
 now carry their type kinds so a reassigned `{}` keeps the right
 flavor.
 
+closures are an element type like any other: a `List[fn(...) -> T]`
+uses the closure constructor, so its push retains and its free-time
+cascade releases. a route table and a middleware chain are exactly
+that shape, and untagged they held handles they did not own — which
+was survivable only while every closure that reached one was leaking a
+count somewhere else. maps and sets of closures are still untagged,
+because a map's value counting is cstring-only; a borrowed closure
+stored in one gets its count added at the store instead
+(`ir_container_store_needs_retain`), which leaks rather than dangles.
+
 the lists `map` and `filter` produce pick their flavor the same way,
 from the checked element type of the call, and the two differ in where
 the count comes from. a mapper hands back a value nothing else is
@@ -101,8 +126,8 @@ holding, so the push transfers: the loop stops tracking the result
 there and the list keeps the count the mapper returned. a filter keeps
 the source list's own elements, so its push retains, which is what lets
 the result outlive the list it was filtered from. an element type with
-no constructor of its own — a boxed enum, a closure, an optional or a
-result — still builds an untagged list, the same gap literals have.
+no constructor of its own — a boxed enum, an optional or a result —
+still builds an untagged list, the same gap literals have.
 
 the list methods implemented in the runtime rather than the emitter
 decide their own flavor: `slice` and `sort` copy the source list's tag
@@ -139,14 +164,6 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **naming a function as a value leaks the closure it allocates.**
-  `f := shout`, or passing `shout` straight to `map`, allocates a closure
-  that already arrives owned, and the bind retains it again as though it
-  were a borrowed variable read, so it ends with two counts and one
-  release. a closure is a fixed couple of hundred bytes, but a call site
-  that names a function inside a loop pays it every round. binding the
-  value once outside the loop and passing it down is the way around it
-  for now.
 - **a struct value stored straight into a container is still counted
   twice.** strings, bytes, and nested collections hand the container the
   count the temporary was holding; struct values keep taking a second
@@ -239,7 +256,10 @@ release walks the environment, drops the count the closure took on
 each captured value, and frees the box. a closure that dies locally is
 released at scope exit, and one that escapes transfers its count the
 same way a returned struct does — so building and discarding closures
-in a loop holds flat, outside the cycle case above.
+in a loop holds flat, outside the cycle case above. naming a function
+is the same story: `f := shout` allocates a closure that wraps the
+function into the closure abi, and that closure is reclaimed at the
+end of the scope it was bound in.
 
 ## threads and tasks
 

@@ -1266,8 +1266,9 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
 # same child walk ir_collect_call_arg_regs used.
 # method variant: pairs registers with ir_method_call_arg_expr so the walk
 # can never drift from the collector's. skip_pos marks a container-store
-# argument: ownership transfers to the container there, and releasing it
-# would dangle when the container is untagged and cannot retain.
+# argument: ownership transfers to the container there, and the store
+# itself completes the transfer by taking the caller's count rather than
+# adding one (see ir_owned_container_store_name).
 fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
     for reg, i in arg_regs:
         if i == skip_pos:
@@ -3378,6 +3379,64 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
 fn ir_is_list_store_name(emit_name: String) -> Bool:
     return emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push" or emit_name == "set" or emit_name == "pith_list_set_value"
 
+# true when a *borrowed* value stored into a container needs a count added
+# here rather than by the runtime store. tagged containers retain their own
+# elements, so this covers only the places where tagging cannot be
+# guaranteed: channel sends, container values inside maps, and collection
+# values inside lists (an empty-annotated List[List] is indistinguishable
+# from List[Int] in the type strings, so it is created untagged). a double
+# count on a tagged container is a bounded leak; a missing count is a
+# dangling element.
+fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Bool:
+    if ir_is_channel_send_name(emit_name):
+        return store_kind.len() > 0
+    if store_kind == "bytes":
+        # a List[Bytes] is tagged wherever the checker knows the element type
+        # — including an empty literal in a struct constructor — so the
+        # runtime push already retains and a count here would only leak.
+        return not ir_is_list_store_name(emit_name)
+    return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "struct"
+
+# the value kinds a container store may take the caller's count for.
+#
+# struct values are deliberately left on the retain path. a `for` loop
+# variable writes a borrowed element into the same named slot a later `:=`
+# of that name uses, and the rebind then releases a count the loop never
+# took — `std.crypto.x509.verify_chain_issuers` has exactly that shape, with
+# `for root in trusted_roots` ahead of `root := root_result.ok`. the second
+# count a struct store takes today is what absorbs that release, so
+# transferring instead turns a latent over-release into a live one. the loop
+# variable is the bug to fix; until it is, structs keep the extra count.
+fn ir_container_store_takes_count(store_kind: String) -> Bool:
+    if store_kind == "string" or store_kind == "bytes":
+        return true
+    return store_kind == "list" or store_kind == "map" or store_kind == "set"
+
+# the variant of a container store that takes the caller's count instead of
+# adding one of its own, or "" for a store with no such variant.
+#
+# a value built straight into a container — `l.push("v-{i}")`, `m[k] = "v-{i}"`
+# — is an owned temporary the caller stops tracking at the store. the caller
+# skips its release there (ownership transfers into the container), but the
+# runtime store also took a count of its own, so the value ended up with two
+# counts and one release. these entry points complete the transfer by not
+# taking that second count.
+#
+# whether there is a count to take is the runtime's call, not the emitter's:
+# only the container knows if it was built tagged to own its elements. an
+# untagged one takes nothing and the caller's count stays outstanding, which
+# is a leak rather than an element nothing keeps alive. see docs/ownership.md.
+fn ir_owned_container_store_name(emit_name: String) -> String:
+    if emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        return "pith_list_push_value_owned"
+    if emit_name == "set" or emit_name == "pith_list_set_value":
+        return "pith_list_set_value_owned"
+    if emit_name == "insert" or emit_name == "map_insert":
+        return "pith_map_insert_cstr_owned"
+    if emit_name == "map_insert_ikey":
+        return "pith_map_insert_ikey_owned"
+    return ""
+
 fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     if elem_kind == "string":
         return "__list_new_str"
@@ -4349,58 +4408,37 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     mut ret_type := ir_call_retkind_for_name(idx, uses_result_abi, emit_name)
     if ir_is_void_method(emit_name):
         ret_type = "void"
-    # container stores keep a count for borrowed string values; owned results
-    # transfer theirs. untagged containers never release, so a wrong guess
-    # here can only leak, never dangle.
-    # container stores get special ownership treatment twice below: the
-    # compensation retain, and the argument-release skip (ownership
-    # transfers into the container at that position)
+    # a container store treats its value argument specially: a borrowed value
+    # may need a compensating retain, an owned one transfers its count into
+    # the container, and either way the caller's own release is skipped.
     mut store_value_pos := 0 - 1
     if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
     elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
         store_value_pos = 1
+    # the name the call is emitted under. an owned value swaps in the store
+    # that takes the caller's count; everything else keeps the plain store.
+    mut call_name := emit_name
     if not impl_dispatch:
-        # tagged containers retain their elements in the runtime. the
-        # emitter still adds a count where tagging cannot be guaranteed:
-        # channel sends, container values inside maps, and collection
-        # values inside lists (an empty-annotated List[List] is
-        # indistinguishable from List[Int] in the type strings, so it is
-        # created untagged). a double count on a tagged container is a
-        # bounded leak; a missing count is a dangling element.
         if store_value_pos >= 0 and store_value_pos < arg_regs.len():
             value_expr := ir_method_call_arg_expr(node, store_value_pos)
             if value_expr >= 0:
                 store_kind := ir_rc_kind(ir_infer_type(value_expr))
-                mut compensate := false
-                if ir_is_channel_send_name(emit_name):
-                    compensate = store_kind.len() > 0
-                elif store_kind == "bytes":
-                    # a List[Bytes] is tagged wherever the checker knows the
-                    # element type — including an empty literal in a struct
-                    # constructor — so the runtime push already retains and a
-                    # count here would only leak.
-                    compensate = not ir_is_list_store_name(emit_name)
-                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "struct":
-                    compensate = true
-                if compensate and ir_string_expr_is_borrowed(value_expr):
-                    ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
+                if ir_string_expr_is_borrowed(value_expr):
+                    if ir_container_store_needs_retain(emit_name, store_kind):
+                        ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
+                elif ir_container_store_takes_count(store_kind):
+                    # an owned value has a count nobody else will release, so
+                    # hand it to the container rather than letting the store
+                    # take a second one
+                    owned_store := ir_owned_container_store_name(emit_name)
+                    if owned_store.len() > 0:
+                        call_name = owned_store
     call_args := ir_method_call_arg_regs(obj_r, arg_regs)
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
-    ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    # a string-valued map is created tagged on every construction path,
-    # so its insert retains and an owned string argument can complete
-    # its transfer by releasing here. other kinds — and maps whose value
-    # type the emitter can't prove — keep the skip: their containers may
-    # not retain, and releasing would dangle the stored element.
-    mut release_skip_pos := store_value_pos
-    if store_value_pos >= 0 and (emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey") and node.children.len() > 0:
-        skip_expr := ir_method_call_arg_expr(node, store_value_pos)
-        if skip_expr >= 0 and ir_rc_kind(ir_infer_type(skip_expr)) == "string":
-            if ir_lookup_map_value_type_for_expr(node.children[0]) == "string":
-                release_skip_pos = 0 - 1
-    ir_release_owned_method_args(node, arg_regs, release_skip_pos)
+    ir_emit_call_text(r, call_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
+    ir_release_owned_method_args(node, arg_regs, store_value_pos)
     if node.children.len() > 0:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
@@ -5099,10 +5137,18 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # compensates only for maps holding lists/maps/sets, which have no
     # tagged constructor yet.
     idx_store_kind := ir_rc_kind(value_type)
-    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes" or idx_store_kind == "struct":
-        if ir_string_expr_is_borrowed(value_idx):
+    mut set_name := ir_index_set_call_name(obj_type)
+    if ir_string_expr_is_borrowed(value_idx):
+        if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes" or idx_store_kind == "struct":
             ir_rc_retain_reg(value_r, idx_store_kind)
-    ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)
+    elif ir_container_store_takes_count(idx_store_kind):
+        # `m[k] = "v-{i}"` builds a value nobody else tracks. the store takes
+        # the count the temporary was holding instead of adding its own, which
+        # is what leaves it with exactly one owner.
+        owned_store := ir_owned_container_store_name(set_name)
+        if owned_store.len() > 0:
+            set_name = owned_store
+    ir_emit_call3(ir_reg(), set_name, "void", obj_r, idx_r, value_r)
     # a store reads its key the same way a lookup does: the runtime copies the
     # key bytes into the map's own storage rather than keeping the caller's
     # string, so an owned key temporary dies here too. the stored *value* is a

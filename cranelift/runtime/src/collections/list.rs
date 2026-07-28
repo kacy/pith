@@ -53,6 +53,7 @@ pub enum ListTypeTag {
     Map,       // Map - needs retain/release
     Struct,    // struct handle - needs retain/release (rc-counted, magic-checked)
     Bytes,     // Bytes handle - needs retain/release
+    Closure,   // closure handle - needs retain/release
 }
 
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
@@ -236,6 +237,7 @@ unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Map => crate::collections::map::pith_map_retain_handle(raw),
         ListTypeTag::Struct => crate::runtime_core::pith_struct_retain(raw),
         ListTypeTag::Bytes => crate::bytes::pith_bytes_retain(raw),
+        ListTypeTag::Closure => crate::runtime_core::pith_closure_retain(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -272,6 +274,7 @@ unsafe fn release_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Map => crate::collections::map::pith_map_release_handle(raw),
         ListTypeTag::Struct => crate::runtime_core::pith_struct_release(raw),
         ListTypeTag::Bytes => crate::bytes::pith_bytes_release(raw),
+        ListTypeTag::Closure => crate::runtime_core::pith_closure_release(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -363,6 +366,16 @@ pub unsafe extern "C" fn pith_list_new_bytes() -> PithList {
     pith_list_new(8, 5)
 }
 
+/// List that owns closure elements (List[fn(...) -> T]): push/insert retain,
+/// and the free-time cascade releases each element. a route table or a
+/// middleware chain is exactly this shape, and untagged it held handles it
+/// did not own -- so an owned closure handed to a function that stored one
+/// was freed at the call site while the list still pointed at it.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_closure() -> PithList {
+    pith_list_new(8, 6)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = match type_tag {
@@ -371,6 +384,7 @@ pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithLis
         3 => ListTypeTag::Map,
         4 => ListTypeTag::Struct,
         5 => ListTypeTag::Bytes,
+        6 => ListTypeTag::Closure,
         _ => ListTypeTag::Primitive,
     };
 

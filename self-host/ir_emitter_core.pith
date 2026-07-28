@@ -716,6 +716,13 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     # binding it transfers that count rather than borrowing one.
     if node.kind == "lambda":
         return false
+    # naming a function as a value does the same thing: `shout` and
+    # `hash.sha256_bytes` both lower to `closure_ref`, which allocates a
+    # closure with a count of one. that count is the expression's to hand
+    # on — classifying it as a borrow made the binding retain a second one
+    # and left the closure alive after its single release.
+    if ir_expr_is_named_function_value(idx):
+        return false
     if node.kind == "call" and ir_infer_type(idx) == "string":
         return false
     if node.kind == "call" or node.kind == "method_call":
@@ -2430,7 +2437,10 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # variable/field/element the caller keeps) is not released; a fresh
         # literal (a struct init, a lambda) or a transferred result is.
         mut arg_kind := ir_rc_kind(expr_type)
-        if arg_kind.len() == 0 and get_node(expr_idx).kind == "lambda":
+        # a fn type has no rc kind of its own, but the value in the register
+        # is a closure handle either way: a lambda literal, or a named
+        # function the ident load wrapped into one.
+        if arg_kind.len() == 0 and (get_node(expr_idx).kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
             arg_kind = "closure"
         if (arg_kind == "struct" or arg_kind == "closure") and not ir_string_expr_is_borrowed(expr_idx):
             ir_rc_release_reg(reg, arg_kind)
@@ -2875,6 +2885,16 @@ fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
         return - 1
     return ir_emit_list_map_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]))
 
+# map, filter and reduce open-code their loop instead of going through the
+# general method call, so the release that ordinarily reclaims an owned
+# argument never runs for the function they were handed. an owned one — a
+# lambda literal, a named function, a call that built a closure — is ours to
+# drop once the loop is done. a borrowed one (a local or a struct field
+# holding the closure) belongs to that owner and must be left alone.
+fn ir_release_higher_order_fn_arg(fn_idx: Int, fn_r: Int):
+    if not ir_string_expr_is_borrowed(fn_idx):
+        ir_rc_release_reg(fn_r, "closure")
+
 fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     list_r := ir_expr(list_idx)
     mapper_r := ir_expr(mapper_idx)
@@ -2896,7 +2916,9 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
         result_elem_kind = ir_rc_kind(mapped_kind)
     ctor := ir_list_ctor_for_elem_kind(result_elem_kind)
 
-    return ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
+    out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
+    ir_release_higher_order_fn_arg(mapper_idx, mapper_r)
+    return out_r
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 3:
@@ -2921,7 +2943,9 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
     # was filtered from: the push takes a count of its own.
     ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem_kind))
 
-    return ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
+    out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
+    ir_release_higher_order_fn_arg(keep_idx, keep_r)
+    return out_r
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 4:
@@ -2944,7 +2968,9 @@ fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_
     if result_kind.len() == 0:
         result_kind = "unknown"
 
-    return ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
+    out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
+    ir_release_higher_order_fn_arg(reducer_idx, reducer_r)
+    return out_r
 
 fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> Int:
     if callee_name == "map":
@@ -3442,10 +3468,13 @@ fn ir_is_list_store_name(emit_name: String) -> Bool:
 fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Bool:
     if ir_is_channel_send_name(emit_name):
         return store_kind.len() > 0
-    if store_kind == "bytes":
-        # a List[Bytes] is tagged wherever the checker knows the element type
-        # — including an empty literal in a struct constructor — so the
-        # runtime push already retains and a count here would only leak.
+    if store_kind == "bytes" or store_kind == "closure":
+        # a List[Bytes] and a List of closures are both tagged wherever the
+        # checker knows the element type — including an empty literal in a
+        # struct constructor — so the runtime push already retains and a
+        # count here would only leak. a map or a set holding either is not
+        # tagged (a map's value counting is cstring-only), so a borrowed
+        # value stored there still needs its count added here.
         return not ir_is_list_store_name(emit_name)
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "struct"
 
@@ -3462,7 +3491,7 @@ fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Boo
 fn ir_container_store_takes_count(store_kind: String) -> Bool:
     if store_kind == "string" or store_kind == "bytes":
         return true
-    return store_kind == "list" or store_kind == "map" or store_kind == "set"
+    return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
 # the variant of a container store that takes the caller's count instead of
 # adding one of its own, or "" for a store with no such variant.
@@ -3500,6 +3529,12 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_struct"
     if elem_kind == "bytes":
         return "__list_new_bytes"
+    # a route table or a middleware chain is a List of closures. untagged it
+    # owned nothing, which made every closure that reached one live on a
+    # count somebody else was holding — and there is no somebody else once a
+    # fn value transfers its count at the call.
+    if elem_kind == "closure":
+        return "__list_new_closure"
     return "__list_new"
 
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
@@ -4734,6 +4769,27 @@ fn ir_ident_is_function_value(idx: Int, name: String) -> Bool:
         return false
     callee := ir_ident_callee(name)
     return ir_is_declared_callable(callee.name)
+
+# true when the expression names a function instead of reading a value.
+# there are two spellings, and both mint a closure: a bare `shout`
+# (ir_emit_ident_load) and a module member `hash.sha256_bytes`
+# (ir_emit_field_access_expr). the conditions below mirror those two emit
+# paths, because the ownership answer has to agree with what was emitted —
+# if this says "owned" where no closure was allocated, the caller releases
+# a count nobody took.
+fn ir_expr_is_named_function_value(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return ir_ident_is_function_value(idx, node.value)
+    if node.kind == "field_access" and node.children.len() > 0:
+        recv_node := get_node(node.children[0])
+        if not (recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value)):
+            return false
+        expr_tid := c_get_expr_type(idx)
+        if expr_tid < 0 or get_type_info(expr_tid).kind != "function":
+            return false
+        return ir_resolve_static_callee(idx).name.len() > 0
+    return false
 
 # named functions need a small adapter so they can travel through the same
 # closure abi lambdas already use.

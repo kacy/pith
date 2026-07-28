@@ -1097,6 +1097,7 @@ MEMCHECK_OSTHREAD_CASES := \
 MEMCHECK_CASES := \
 	tests/cases/test_match_payload tests/cases/test_combo_enums_deep \
 	tests/cases/test_fn_value_positions tests/cases/test_global_fn_value \
+	tests/cases/test_fn_value_ownership tests/cases/test_closure_list_ownership \
 	tests/cases/test_optional_collections tests/cases/test_nested_optional_literals \
 	tests/cases/test_optional_value tests/cases/test_closure_struct_return \
 	tests/cases/test_combo_closures tests/cases/test_combo_structs_deep \

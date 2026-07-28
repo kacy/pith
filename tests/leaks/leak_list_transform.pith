@@ -7,11 +7,6 @@
 # it is here because the same constructor choice decides whether its result
 # can outlive the source, and a count taken where none was handed over would
 # show up here as growth.
-#
-# the mapper and the predicate are hoisted into `main` and passed down on
-# purpose: naming a function as a value allocates a closure the bind counts
-# twice, which is a leak of its own and would swamp the one this case is
-# about. see docs/ownership.md.
 import leakprobe as probe
 
 fn shout(s: String) -> String:
@@ -26,21 +21,18 @@ fn copy_part(part: List[String]) -> List[String]:
         out.push(s)
     return out
 
-fn churn_round(i: Int, shout_fn: fn(String) -> String, keep_fn: fn(String) -> Bool, copy_fn: fn(List[String]) -> List[String]):
+fn churn_round(i: Int):
     src: List[String] := ["alpha-{i}", "be"]
-    loud := src.map(shout_fn)
-    kept := src.filter(keep_fn)
+    loud := src.map(shout)
+    kept := src.filter(is_long)
     nested: List[List[String]] := [["one-{i}"], ["two"]]
-    copies := nested.map(copy_fn)
+    copies := nested.map(copy_part)
 
 fn main():
     n := probe.rounds()
-    shout_fn := shout
-    keep_fn := is_long
-    copy_fn := copy_part
     mut i := 0
     while i < n:
-        churn_round(i, shout_fn, keep_fn, copy_fn)
+        churn_round(i)
         i = i + 1
     kb := probe.peak_kb()
     print("{kb}")

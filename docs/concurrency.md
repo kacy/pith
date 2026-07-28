@@ -208,6 +208,22 @@ call, so a dial no longer has a blocking step sitting in front of its
 non-blocking one, and a task that writes a log line no longer stops every other
 task on its worker while it does.
 
+child processes take neither route. a pipe is pollable where a regular file is
+not, and linux hands out a `pidfd` that becomes readable exactly when a child
+exits, so `Process.wait`, `ProcessStdout.read` and their siblings park on the
+reactor the way a socket does. no thread is held per child either, which
+matters more here than anywhere else: a wait has no bound at all, and four
+`sleep 3600`s would have emptied a four-thread pool. a child that has already
+finished by the time you wait for it is collected on the spot, with no park.
+
+`process.output` is the exception, along with everything routed through it
+(`run`, `text`, `output_checked`) and the two shell helpers `run_shell` and
+`output_shell`. each of those runs a child to completion inside one call while
+draining both of its pipes, and draining two pipes at once without blocking
+needs a reactor wait covering more than one fd, which is not built yet. until
+it is, `start` plus your own reads and `wait` yields properly; `output_ctx` is
+that pattern already written out.
+
 a task waits a few microseconds on-CPU before it actually parks. a read the page
 cache answers comes back faster than the two thread wakeups a park costs, so
 waiting for it beats suspending, and the wait is bounded at roughly what the

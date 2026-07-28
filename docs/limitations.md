@@ -116,20 +116,32 @@ macos and the bsds os threads are still the default with `PITH_GREEN=1` as the
 opt-in. green wins every shape this repo measures: spawn is ~30x the os-thread
 backend at a seventeenth of the memory, and the channel fan-out benchmark runs
 2.6x faster than os threads and ahead of rust and zig. the whole regression
-corpus, 261 cases at both worker counts, produces byte-identical output to the
+corpus, 268 cases at both worker counts, produces byte-identical output to the
 fixed os-thread answers (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
 
 the structural cost is that a green worker runs many tasks, so a call with no
 yield point holds all of them rather than only the task making it. sockets go
-through the epoll reactor, and dns and file i/o go to pools of blocking threads
-while the caller parks, so none of those stall anyone any more. what is left is
-the cheap end of `host_fs`: `exists`, `size`, `rename`, `mkdir` and removing a
-single file still run on the worker, because each is one cached kernel lookup
-that costs about what handing it to another thread would. on a slow network
-mount that reasoning does not hold and a task doing one of them holds its worker
-until it returns. `PITH_GREEN=0` is the workaround; making the decision
+through the epoll reactor, dns and file i/o go to pools of blocking threads
+while the caller parks, and child processes park on the reactor too: pipe reads
+because a pipe is pollable, `wait` because linux gives out a `pidfd` that
+reports the exit. none of those stall anyone any more.
+
+two things are left. the cheap end of `host_fs`, meaning `exists`, `size`,
+`rename`, `mkdir` and removing a single file, still runs on the worker, because
+each is one cached kernel lookup that costs about what handing it to another
+thread would. on a slow network mount that reasoning does not hold and a task
+doing one of them holds its worker until it returns. making that decision
 adaptive rather than fixed is the open work.
+
+the other is `process.output` and the calls built on it (`run`, `text`,
+`output_checked`, `run_shell`, `output_shell`). each runs a child to completion
+inside one runtime call and holds the worker for as long as the child lives.
+draining a child's stdout and stderr at the same time without blocking needs a
+reactor wait that covers more than one fd, and the reactor waits on one; adding
+that is the fix. `start` plus explicit reads and `wait` yields properly today,
+and `output_ctx` is that pattern already written out. `PITH_GREEN=0` is the
+blunt workaround for either.
 
 the calling task pays for that. a file call made from inside a task now costs a
 thread handoff it did not before, so a task reading a small cached file in a

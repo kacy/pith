@@ -310,7 +310,7 @@ fn watch_pid(pid: u32) -> Option<RawFd> {
     // SAFETY: pidfd_open takes a pid and a flags word and returns an fd or -1.
     // the pid is live: the caller holds the registry lock and has just seen the
     // child unreaped, so the number cannot have been recycled.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint) };
     if fd < 0 {
         return None;
     }

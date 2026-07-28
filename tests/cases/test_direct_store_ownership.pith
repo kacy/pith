@@ -1,0 +1,139 @@
+# a value built straight into a container — `l.push("v-{i}")`, `m[k] = "v-{i}"` —
+# is an owned temporary the caller stops tracking at the store. the caller
+# skips its release there because ownership transfers into the container, but
+# the runtime store used to take a count of its own as well, so the value ended
+# up with two counts and one release and never came back. binding the value to
+# a local first was already correct, which is what made the direct form look
+# like a container bug rather than an ownership one.
+#
+# the second half is why this case belongs in the curated memcheck set. the fix
+# moves a count rather than adding a release, but a value classified as owned
+# when someone else still holds it would leave a container pointing at freed
+# memory. every read below happens after the stores that would expose that.
+import std.fs as fs
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+# every direct-store shape in one loop, so the flatness check below covers
+# all of them at once.
+fn churn_round(i: Int):
+    mut l: List[String] := ["seed"]
+    mut nested: List[List[String]] := [[]]
+    mut mi: Map[Int, String] := {}
+    mut ms: Map[String, String] := {}
+    l.push("push-{i}")
+    l[0] = "set-{i}"
+    l.insert(0, "insert-{i}")
+    nested[0].push("nested-{i}")
+    nested.push(["fresh-{i}"])
+    mi[0] = "map-int-{i}"
+    ms["slot"] = "map-str-{i}"
+    ms.insert("other", "insert-{i}")
+    mi.insert(1, "insert-{i}")
+
+# warm the allocator up, take the high-water mark, then do ten times the
+# work. before the fix each round orphaned ten strings, which moved the mark
+# by megabytes; now it does not move. the threshold is loose enough that
+# allocator noise cannot trip it.
+fn direct_store_memory_is_flat() -> String:
+    mut i := 0
+    while i < 10000:
+        churn_round(i)
+        i = i + 1
+    before := peak_rss_kb()
+    while i < 110000:
+        churn_round(i)
+        i = i + 1
+    growth := peak_rss_kb() - before
+    if growth < 512:
+        return "flat"
+    return "grew {growth}kb"
+
+# a directly stored value is still the container's to hand back. reading it
+# after many more stores is what an over-release shows up in.
+fn stored_values_survive(n: Int) -> String:
+    mut l: List[String] := ["seed"]
+    mut m: Map[String, String] := {}
+    l.push("kept-{n}")
+    m["k"] = "filed-{n}"
+    mut i := 0
+    while i < 200:
+        l.push("churn-{i}")
+        m["churn"] = "churn-{i}"
+        i = i + 1
+    return l[1] + "/" + m["k"] + "/" + l[l.len() - 1] + "/" + m["churn"]
+
+# the same value read out and held across later stores into the same slot.
+# the held binding took its own count, so the overwrite must not free it.
+fn held_value_survives_overwrite(n: Int) -> String:
+    mut m: Map[Int, String] := {}
+    m[0] = "first-{n}"
+    held := m[0]
+    m[0] = "second-{n}"
+    return held + "/" + m[0]
+
+fn held_element_survives_overwrite(n: Int) -> String:
+    mut l: List[String] := ["first-{n}"]
+    held := l[0]
+    l[0] = "second-{n}"
+    return held + "/" + l[0]
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+# `map` builds its result list without an element tag, so that list owns no
+# counts. a direct store into it must not hand over a count the list cannot
+# keep — the value has to stay readable, and the list has to survive being
+# freed at the end of the call.
+fn direct_store_into_untagged_list(n: Int) -> String:
+    xs := ["a", "b"]
+    mut mapped := xs.map(shout)
+    mapped.push("direct-{n}")
+    mut i := 0
+    while i < 200:
+        mapped.push("more-{i}")
+        i = i + 1
+    return mapped[0] + "/" + mapped[2] + "/" + mapped[mapped.len() - 1]
+
+# a fresh nested container transfers its count the same way a string does,
+# and its own elements have to outlive the transfer.
+fn nested_container_survives(n: Int) -> String:
+    mut rows: List[List[String]] := []
+    rows.push(["row-{n}", "second-{n}"])
+    mut buckets: Map[String, List[String]] := {}
+    buckets["b"] = ["bucket-{n}"]
+    mut i := 0
+    while i < 200:
+        rows.push(["filler-{i}"])
+        i = i + 1
+    return rows[0][0] + "/" + rows[0][1] + "/" + buckets["b"][0]
+
+# the store paths that copy rather than keep: a map key and a set element are
+# both copied into the container's own storage, so the caller's temporary
+# still dies with the operation.
+fn copied_operands_are_reclaimed(n: Int) -> String:
+    mut s: Set[String] := {}
+    mut m: Map[String, String] := {}
+    mut i := 0
+    while i < 200:
+        s.add("elem-{i}")
+        m["key-{i}"] = "value"
+        i = i + 1
+    return "{s.len()}/{m.len()}/{n}"
+
+fn main():
+    print("direct store memory: {direct_store_memory_is_flat()}")
+    print(stored_values_survive(1))
+    print(held_value_survives_overwrite(2))
+    print(held_element_survives_overwrite(3))
+    print(direct_store_into_untagged_list(4))
+    print(nested_container_survives(5))
+    print(copied_operands_are_reclaimed(6))

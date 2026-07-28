@@ -1,0 +1,108 @@
+# the lists `map` and `filter` build are tagged from their element type, so
+# they own what they hold. the two halves of that are opposite failures.
+#
+# `map` calls a mapper that hands back a value nothing else is holding, and
+# the result list is its only owner. built untagged it owned nothing, and
+# every mapped `List[String]` orphaned all of its elements.
+#
+# `filter` keeps the source list's own elements, so it has to take a count of
+# its own for each one. that is what this case is really watching: every
+# result below is read after the list it came from is gone, so a count taken
+# where none was handed over — or not taken where one was needed — shows up
+# under valgrind as a read of freed memory rather than as a smaller number.
+
+struct Row:
+    name: String
+    score: Int
+
+fn shout(s: String) -> String:
+    return s.to_upper() + "!"
+
+# a mapper that hands back its own argument. the count comes from the return,
+# not from a fresh allocation, so a result list that takes the caller's count
+# is relying on the callee having added one.
+fn same(s: String) -> String:
+    return s
+
+fn is_long(s: String) -> Bool:
+    return s.len() > 3
+
+fn doubled(n: Int) -> Int:
+    return n * 2
+
+fn labelled(r: Row) -> Row:
+    return Row(name: r.name + "-tagged", score: r.score + 1)
+
+fn keeps_score(r: Row) -> Bool:
+    return r.score > 1
+
+fn first_two(part: List[String]) -> List[String]:
+    out: List[String] := []
+    for s in part:
+        if out.len() < 2:
+            out.push(s)
+    return out
+
+# the source list is a local of this function, so it is released on the way
+# out and the returned list is the only thing keeping the strings alive.
+fn mapped_outlives_source() -> List[String]:
+    src: List[String] := ["ann", "bo", "cyd"]
+    return src.map(shout)
+
+fn identity_mapped_outlives_source() -> List[String]:
+    src: List[String] := ["keep-me", "and-me"]
+    return src.map(same)
+
+fn filtered_outlives_source() -> List[String]:
+    src: List[String] := ["short", "no", "longer", "ok"]
+    return src.filter(is_long)
+
+fn nested_mapped_outlives_source() -> List[List[String]]:
+    src: List[List[String]] := [["a", "b", "c"], ["d", "e"]]
+    return src.map(first_two)
+
+fn mapped_structs_outlive_source() -> List[Row]:
+    src: List[Row] := [Row(name: "ann", score: 1), Row(name: "bo", score: 2)]
+    return src.map(labelled)
+
+fn filtered_structs_outlive_source() -> List[Row]:
+    src: List[Row] := [Row(name: "ann", score: 1), Row(name: "bo", score: 2)]
+    return src.filter(keeps_score)
+
+fn mapped_ints_outlive_source() -> List[Int]:
+    src: List[Int] := [1, 2, 3]
+    return src.map(doubled)
+
+# churn between building a result and reading it, so a freed element is
+# reused by something else before the read rather than still holding its
+# old bytes.
+fn churn():
+    mut i := 0
+    while i < 500:
+        junk: List[String] := ["filler-{i}", "more-{i}"]
+        i = i + 1
+
+fn main():
+    loud := mapped_outlives_source()
+    kept := filtered_outlives_source()
+    same_strings := identity_mapped_outlives_source()
+    nested := nested_mapped_outlives_source()
+    rows := mapped_structs_outlive_source()
+    scored := filtered_structs_outlive_source()
+    nums := mapped_ints_outlive_source()
+    churn()
+
+    print(loud.join(","))
+    print(kept.join(","))
+    print(same_strings.join(","))
+    print(nested[0].join(",") + "/" + nested[1].join(","))
+    print(rows[0].name + "/" + rows[1].name + "/{rows[1].score}")
+    print(scored[0].name + "/{scored.len()}")
+    print(nums.join(","))
+
+    # a mapped list is a list like any other: it can be pushed to, and the
+    # value stored into it has to stay readable afterwards.
+    mut more := mapped_outlives_source()
+    more.push("added-{nums[0]}")
+    churn()
+    print(more[0] + "/" + more[more.len() - 1])

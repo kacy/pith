@@ -1,0 +1,70 @@
+# a `for` loop variable and a later `:=` of the same name used to share one
+# storage slot. the refcount half of that bug was an over-release rather than
+# a leak, so valgrind already catches it — this case is here because the
+# shape is worth pinning from both directions, and because a future fix that
+# swings the ownership the other way would show up here as growth.
+import leakprobe as probe
+
+struct Cert:
+    name: String
+    ca: Bool
+
+fn find_issuer(certs: List[Cert], want: String) -> Cert!:
+    for c in certs:
+        if c.name == want:
+            return c
+    fail "no issuer named {want}"
+
+# the shape the x509 chain walk has: a `for root in roots` pinning check and
+# a `root := ...` rebind further down the same function.
+fn verify(roots: List[Cert], leaf: String) -> String:
+    for root in roots:
+        if root.name == "pinned-{leaf}":
+            return "pinned {root.name}"
+    found := find_issuer(roots, "issuer-of-{leaf}")
+    if found.is_err:
+        return "untrusted"
+    root := found.ok
+    return "chained {root.name} ca={root.ca}"
+
+# the loop returns early here, so the function's exit cleanup runs over the
+# slot rather than the rebind.
+fn label_for(names: List[String], wanted: String) -> String:
+    for name in names:
+        if name == wanted:
+            return "exact"
+    name := "fallback"
+    return name
+
+# a closure built inside the loop captures the loop variable, so the capture
+# has to read the loop's own slot rather than the function local it shadows.
+fn capture_in_loop(items: List[String]) -> String:
+    mut out := ""
+    for item in items:
+        f := fn(s: String) => s + "/" + item
+        out = out + f("x")
+    item := "after"
+    return out + "|" + item
+
+# the cert list stays a literal on purpose. building it with `certs.push(Cert(...))`
+# would leak here through the struct store that is still counted twice, which is a
+# different bug and not the one this case is watching.
+fn churn_round(i: Int):
+    names := ["name-0-{i}", "name-1-{i}", "name-2-{i}"]
+    certs := [Cert("subject-0-{i}", true), Cert("pinned-subject-1-{i}", false), Cert("issuer-of-subject-1-{i}", true)]
+    mut used := label_for(names, "name-1-{i}").len()
+    used = used + label_for(names, "absent").len()
+    used = used + verify(certs, "subject-1-{i}").len()
+    used = used + verify(certs, "nothing").len()
+    used = used + capture_in_loop(names).len()
+    if used < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

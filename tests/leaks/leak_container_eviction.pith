@@ -1,0 +1,32 @@
+# a container dropping an element used to orphan the count it held on it.
+# removing a key, overwriting one, clearing, and the list equivalents all
+# leaked, so anything that evicts in a loop grew without limit — a
+# Map[Int, String] cache reached 38 mb over 800k rounds against a 10 mb
+# baseline.
+import leakprobe as probe
+
+fn churn_round(i: Int):
+    mut m: Map[Int, String] := {}
+    mut sm: Map[String, String] := {}
+    mut l: List[String] := ["seed"]
+    s := "value-{i}"
+    m[0] = s
+    m.remove(0)
+    sm["slot"] = s
+    sm.remove("slot")
+    m[1] = s
+    m[1] = s          # the second store overwrites the first
+    l[0] = s
+    l.push(s)
+    l.remove(0)
+    l.clear()
+    m.clear()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

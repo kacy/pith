@@ -1,0 +1,81 @@
+# a `spawn` in a loop body that captures the loop variable. the spawned call
+# is lifted into a wrapper function with the free variables of its arguments
+# as captures, and the wrapper is emitted while the enclosing loop's variable
+# slots are still in scope — so ir_emit_spawn_wrapper saves those slots, emits
+# the wrapper with none of them, and restores them afterwards. get that wrong
+# and the capture reads the function local the loop shadows instead of the
+# loop's own slot, which is silently the wrong value rather than a crash.
+#
+# every task here returns a value derived from the element it captured, and the
+# handles are awaited in the order they were spawned, so a capture reading the
+# wrong slot changes the printed output.
+
+struct Job:
+    name: String
+    weight: Int
+
+fn describe(item: String) -> String:
+    return "task:" + item
+
+fn weigh(job: Job, bonus: Int) -> Int:
+    return job.weight + bonus
+
+# the plain shape: capture the loop variable, then rebind the same name after
+# the loop. the rebind is what used to share a slot with the loop.
+fn describe_all(items: List[String]) -> String:
+    mut handles: List[Task[String]] := []
+    for item in items:
+        handles.push(spawn describe(item))
+    item := "after"
+    mut out := item
+    for h in handles:
+        out = out + " " + await h
+    return out
+
+# two loop variables live at once, and the spawned call captures both, so the
+# wrapper has to pick up each from its own loop's slot.
+fn pair_up(rows: List[String], cols: List[String]) -> String:
+    mut handles: List[Task[String]] := []
+    for row in rows:
+        for col in cols:
+            handles.push(spawn describe(row + col))
+    mut out := ""
+    for h in handles:
+        out = out + await h + ";"
+    return out
+
+# a struct element and a local mixed into one spawned call, with the local
+# rebound after the loop as well.
+fn total_weight(jobs: List[Job]) -> Int:
+    bonus := 10
+    mut handles: List[Task[Int]] := []
+    for job in jobs:
+        handles.push(spawn weigh(job, bonus))
+    job := Job(name: "after", weight: 100)
+    mut total := job.weight
+    for h in handles:
+        total = total + await h
+    return total
+
+# a range loop spawns through a different lowering than an indexed one.
+fn range_spawn() -> String:
+    mut handles: List[Task[String]] := []
+    for i in 0..3:
+        handles.push(spawn describe("r{i}"))
+    i := 99
+    mut out := "{i}"
+    for h in handles:
+        out = out + " " + await h
+    return out
+
+fn main():
+    jobs := [Job(name: "one", weight: 1), Job(name: "two", weight: 2)]
+    print(describe_all(["a", "b", "c"]))
+    print(pair_up(["x", "y"], ["1", "2"]))
+    print("weight {total_weight(jobs)}")
+    print(range_spawn())
+
+    # the elements the loops borrowed are still the list's to hand back once
+    # every task has finished with them.
+    items := ["p", "q"]
+    print(describe_all(items) + " | " + items[1])

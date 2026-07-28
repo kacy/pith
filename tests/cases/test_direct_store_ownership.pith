@@ -89,11 +89,12 @@ fn held_element_survives_overwrite(n: Int) -> String:
 fn shout(s: String) -> String:
     return s + "!"
 
-# `map` builds its result list without an element tag, so that list owns no
-# counts. a direct store into it must not hand over a count the list cannot
-# keep — the value has to stay readable, and the list has to survive being
-# freed at the end of the call.
-fn direct_store_into_untagged_list(n: Int) -> String:
+# a `map` result is a list like any other: string-tagged from its element
+# type, so it takes the count a direct store hands over. the value has to
+# stay readable, and the list has to survive being freed at the end of the
+# call — this shape read back correctly while the result was untagged too,
+# which is why it stays as a check on both.
+fn direct_store_into_mapped_list(n: Int) -> String:
     xs := ["a", "b"]
     mut mapped := xs.map(shout)
     mapped.push("direct-{n}")
@@ -134,6 +135,6 @@ fn main():
     print(stored_values_survive(1))
     print(held_value_survives_overwrite(2))
     print(held_element_survives_overwrite(3))
-    print(direct_store_into_untagged_list(4))
+    print(direct_store_into_mapped_list(4))
     print(nested_container_survives(5))
     print(copied_operands_are_reclaimed(6))

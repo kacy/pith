@@ -531,6 +531,29 @@ unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
+    insert_cstr_inner(map_handle, key, value, false);
+}
+
+/// Insert a value the caller owns under a C-string key. The map takes the
+/// caller's count instead of adding one of its own, so a value built
+/// straight into the store ends up with exactly one owner. A map that owns
+/// no value counts has nothing to take, and the caller's count stays
+/// outstanding there — see `pith_list_push_value_owned`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_cstr_owned(map_handle: i64, key: *const i8, value: i64) {
+    insert_cstr_inner(map_handle, key, value, true);
+}
+
+unsafe fn insert_cstr_inner(
+    map_handle: i64,
+    key: *const i8,
+    value: i64,
+    takes_caller_count: bool,
+) {
     if key.is_null() {
         return;
     }
@@ -542,9 +565,12 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
     // the map retains the incoming value when it owns heap values, and
-    // drops its count on whatever that displaces
+    // drops its count on whatever that displaces. an owned value arrives
+    // with the caller's count, which the map keeps as its own.
     if impl_ref.val_is_heap {
-        crate::pith_cstring_retain(value as *const i8);
+        if !takes_caller_count {
+            crate::pith_cstring_retain(value as *const i8);
+        }
         if map_trace_enabled() {
             let kb = match &map_key {
                 MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
@@ -763,6 +789,21 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
+    insert_ikey_inner(map_handle, key, value, false);
+}
+
+/// Insert a value the caller owns under an integer key. The map takes the
+/// caller's count instead of adding one of its own — see
+/// `pith_map_insert_cstr_owned`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_ikey_owned(map_handle: i64, key: i64, value: i64) {
+    insert_ikey_inner(map_handle, key, value, true);
+}
+
+unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
@@ -773,7 +814,7 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
         impl_ref.insert_int_value(key, value);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
-        if impl_ref.val_is_heap {
+        if impl_ref.val_is_heap && !takes_caller_count {
             crate::pith_cstring_retain(value as *const i8);
         }
         let val_bytes = value.to_le_bytes().to_vec();

@@ -129,11 +129,56 @@ other kinds of test, all wired through the `Makefile`:
   `db_mysql_live`, `db_redis_live`) are `test` blocks that `skip_test` when their
   server is not reachable, so `make db-live-tests` stays green with or without a
   running server and verifies the drivers where one exists.
-- **leak checks** — `make memcheck` runs a curated set under valgrind, so an arc
-  regression that double-frees or leaks is caught before it lands.
+- **invalid access** — `make memcheck` runs a curated set under valgrind, so an
+  arc regression that double-frees or reads freed memory is caught before it
+  lands.
+- **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
+  round counts and fails when memory grew between them. this is the other half
+  of `memcheck`, which has its leak check switched off on purpose.
+
+## the leak growth gate
+
+`make leak-check` builds each program under `tests/leaks/` and runs it twice, once
+at `PITH_LEAK_ROUNDS=200000` and once at `800000`, then compares the peak resident
+set the two runs reported. a program that leaks k bytes per round moves its peak
+by k times the six hundred thousand extra rounds. a correct one parks at its
+working set and reports the same number either way. the target prints the
+difference for every case and exits non-zero when one of them clears 2 mb.
+
+the number to watch is that difference and not a ceiling, because a ceiling is a
+fact about the runtime rather than about the case. it drifts whenever the
+allocator, the freelists or the stack pool change size, so it has to be retuned
+to stay meaningful, and a gate that gets retuned is a gate that gets waved
+through. a difference only cares about the slope, which is zero for every program
+that does not leak, whatever the runtime is doing underneath it.
+
+valgrind's own leak check is the obvious tool here and the wrong one. the runtime
+keeps a struct freelist, a coroutine stack pool, per-arena node pools and its
+worker threads alive for the life of the process. all of that is still reachable
+at exit and none of it is a bug, so a real leak would arrive buried in megabytes
+of output nobody would read twice.
+
+the leaks this was built from ran twenty to ninety bytes a round, so the quietest
+of them still moves the peak by twelve megabytes over the extra rounds. noise on
+a flat case measures under two hundred kilobytes run to run. 2 mb sits an order
+of magnitude above the noise and well under the smallest real signal. a case that
+clears the limit is measured again before it is called a failure, so one spike on
+a loaded machine cannot turn the gate red by itself. the whole target takes about
+ten seconds.
+
+to add a case, drop a `.pith` file in `tests/leaks/` that imports `leakprobe`,
+runs its churn `probe.rounds()` times, and prints `probe.peak_kb()` and nothing
+else. then list it in the `cases` array in `tooling/leak_check.sh`. keep the round
+body allocation-heavy and free of anything that is supposed to grow: a collection
+that keeps filling up looks exactly like a leak.
 
 ## on the roadmap
 
 a few things are not here yet: skipping and tagging tests (so the live suites can
-fold in and be skipped by default), running any test under the leak checker,
-benchmarks, and machine-readable output for CI.
+fold in and be skipped by default), benchmarks, and machine-readable output for
+CI. the leak gate covers a curated set of ownership shapes rather than every
+program, and the shapes that are known to leak today are deliberately left out of
+it — `xs.map(f)` and `xs.filter(f)` build untagged lists whose elements are never
+released, and a struct value stored straight into a container still takes a count
+too many. both are written up in [ownership.md](ownership.md). adding a case for
+either one is the last step of fixing it, not the first.

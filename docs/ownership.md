@@ -131,7 +131,11 @@ gaps, all bounded leaks rather than dangling pointers:
   caller handed over. the shape is bounded and rare — a list built by a
   literal, a bind, or a struct field is tagged from its declared or
   checked element type — but the flavors in that one path do not follow
-  the element type yet.
+  the element type yet. a loop over `xs.map(f)` grows by hundreds of
+  megabytes over a few hundred thousand rounds, which is why this shape
+  and the struct store below are the two `make leak-check` deliberately
+  leaves uncovered: a case for either belongs in the change that fixes
+  it.
 - **a struct value stored straight into a container is still counted
   twice.** strings, bytes, and nested collections hand the container the
   count the temporary was holding; struct values keep taking a second

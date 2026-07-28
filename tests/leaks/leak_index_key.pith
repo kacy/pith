@@ -1,0 +1,61 @@
+# an index key built in place — `m["{a}:{b}"]` — is an owned temporary that
+# neither a lookup nor a store keeps, so its count has to die with the
+# operation. it did not, and every such lookup and store leaked one string.
+# json.object_get was the loudest caller because object entries live under
+# composite "handle:index" slot keys: 75 mb over 800k lookups against a
+# 10 mb baseline.
+import leakprobe as probe
+import std.json as json
+
+threadlocal mut slots: Map[String, String] := {}
+threadlocal mut counts: Map[String, Int] := {}
+
+fn slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
+# the plain lookup path, through a function that returns a value
+fn lookup_string(handle: Int, index: Int) -> String:
+    return slots[slot_key(handle, index)]
+
+fn lookup_int(handle: Int, index: Int) -> Int:
+    return counts[slot_key(handle, index)]
+
+# the propagate path: inside a `T!` function `m[k]` returns early on a miss,
+# so the key has to be released before the branch or the miss arm leaks it.
+fn lookup_or_fail(handle: Int, index: Int) -> String!:
+    return slots[slot_key(handle, index)]
+
+# a store reads its key the same way, and the runtime copies the key bytes
+# into the map's own storage rather than holding the caller's string.
+fn store(handle: Int, index: Int, value: String):
+    slots[slot_key(handle, index)] = value
+
+fn churn_round(i: Int, root: Int):
+    a := lookup_string(0, 1)
+    b := lookup_int(0, 1)
+    c := lookup_or_fail(0, 1) catch "?"
+    d := lookup_or_fail(0, 9) catch "?"
+    store(0, 3, "gamma")
+    h := json.object_get(root, "name")
+    if a.len() + b + c.len() + d.len() + h < 0:
+        print("unreachable")
+
+fn main():
+    slots.insert(slot_key(0, 1), "alpha")
+    slots.insert(slot_key(0, 2), "beta")
+    counts.insert(slot_key(0, 1), 7)
+
+    q := chr(34)
+    doc := chr(123) + q + "name" + q + ":" + q + "alpha" + q + chr(125)
+    root := json.parse(doc)
+    if root < 0:
+        print("parse failed")
+        return
+
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i, root)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

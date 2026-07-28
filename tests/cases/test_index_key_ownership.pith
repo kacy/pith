@@ -1,0 +1,171 @@
+# an index key built in place — `m["{a}:{b}"]` — is an owned temporary that
+# neither a lookup nor a store keeps, so its count has to die with the
+# operation. it did not: every such lookup and every such store leaked one
+# string. binding the key to a local first was already correct, which is why
+# this only ever showed up in code that composed a key inline, most visibly
+# json.object_get, whose entries live under composite "handle:index" slot
+# keys.
+#
+# the second half is why this case belongs in the curated memcheck set. the
+# fix releases a string right after an index operation, so if the ownership
+# classification is wrong anywhere the symptom is a use-after-free rather
+# than a smaller number. every read below happens after the operations that
+# would have freed what it reads.
+import std.json as json
+import std.fs as fs
+
+threadlocal mut slots: Map[String, String] := {}
+threadlocal mut counts: Map[String, Int] := {}
+
+fn slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
+# the plain path: index read in a function that returns a value, not a result
+fn lookup_string(handle: Int, index: Int) -> String:
+    return slots[slot_key(handle, index)]
+
+fn lookup_int(handle: Int, index: Int) -> Int:
+    return counts[slot_key(handle, index)]
+
+# the propagate path: inside a `T!` function `m[k]` lowers to the _opt
+# runtime and returns early on a miss, so the key has to be released before
+# the branch or the miss arm leaks it.
+fn lookup_or_fail(handle: Int, index: Int) -> String!:
+    return slots[slot_key(handle, index)]
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+# a store reads its key the same way: the runtime copies the key bytes into
+# the map's own storage rather than holding the caller's string, so an inline
+# key leaks there too.
+fn store(handle: Int, index: Int, value: String):
+    slots[slot_key(handle, index)] = value
+
+fn churn_round(i: Int):
+    a := lookup_string(0, 1)
+    b := lookup_int(0, 1)
+    c := lookup_or_fail(0, 1) catch "?"
+    d := lookup_or_fail(0, 9) catch "?"
+    store(0, 3, "gamma")
+    if a.len() + b + c.len() + d.len() < 0:
+        print("unreachable")
+
+# warm the allocator up, take the high-water mark, then do ten times the
+# work. before the fix each round orphaned five key strings; now the mark
+# does not move. the threshold is loose enough that allocator noise cannot
+# trip it.
+fn index_key_memory_is_flat() -> String:
+    mut i := 0
+    while i < 10000:
+        churn_round(i)
+        i = i + 1
+    before := peak_rss_kb()
+    while i < 110000:
+        churn_round(i)
+        i = i + 1
+    growth := peak_rss_kb() - before
+    if growth < 512:
+        return "flat"
+    return "grew {growth}kb"
+
+# the same shape through the module it was reported against. one parse, then
+# lookups only, so any growth here is the lookup path alone.
+fn object_get_memory_is_flat(root: Int) -> String:
+    mut i := 0
+    while i < 10000:
+        h := json.object_get(root, "name")
+        if h < 0:
+            return "missing"
+        i = i + 1
+    before := peak_rss_kb()
+    while i < 110000:
+        h := json.object_get(root, "name")
+        if h < 0:
+            return "missing"
+        i = i + 1
+    growth := peak_rss_kb() - before
+    if growth < 512:
+        return "flat"
+    return "grew {growth}kb"
+
+# a value read out of a map still belongs to the map; releasing the key must
+# not touch it. reading it back after more lookups is the use-after-free
+# check valgrind sees.
+fn value_survives_more_lookups() -> String:
+    held := slots[slot_key(0, 1)]
+    mut i := 0
+    while i < 200:
+        other := slots[slot_key(0, 2)]
+        if other.len() == 0:
+            return "empty"
+        i = i + 1
+    return held + "/" + slots[slot_key(0, 1)]
+
+fn lookup_via_borrowed_key(k: String) -> String!:
+    return slots[k]
+
+# a borrowed key — a local, a struct field, an element of another container —
+# belongs to someone else, so the lookup must leave its count alone. reading
+# the key back after the lookups is what catches an over-release.
+fn borrowed_key_survives() -> String:
+    k := slot_key(0, 1)
+    mut keys: List[String] := []
+    keys.push(slot_key(0, 2))
+    mut i := 0
+    while i < 200:
+        a := slots[k]
+        b := slots[keys[0]]
+        c := lookup_via_borrowed_key(k) catch "?"
+        if a.len() + b.len() + c.len() == 0:
+            return "empty"
+        i = i + 1
+    return k + "=" + slots[k] + " " + keys[0] + "=" + slots[keys[0]]
+
+# a value stored under an inline key is still readable afterwards, and the
+# key it was filed under is still intact — an over-release on the store side
+# would corrupt one or the other.
+fn stored_value_survives() -> String:
+    mut i := 0
+    while i < 200:
+        store(0, 4, "delta-{i}")
+        i = i + 1
+    return slots[slot_key(0, 4)] + "/" + lookup_string(0, 4)
+
+# a json handle read out of an object is held across request boundaries in
+# real code, so it has to stay readable after any number of later lookups.
+fn handle_survives_more_lookups(root: Int) -> String:
+    held := json.object_get(root, "name")
+    mut i := 0
+    while i < 200:
+        skip := json.object_get(root, "city")
+        if skip < 0:
+            return "missing"
+        i = i + 1
+    return json.get_string(held) + "/" + json.object_get_string(root, "city")
+
+fn main():
+    slots.insert(slot_key(0, 1), "alpha")
+    slots.insert(slot_key(0, 2), "beta")
+    counts.insert(slot_key(0, 1), 7)
+
+    q := chr(34)
+    doc := chr(123) + q + "name" + q + ":" + q + "alpha" + q + "," + q + "city" + q + ":" + q + "portland" + q + chr(125)
+    root := json.parse(doc)
+    if root < 0:
+        print("parse failed")
+        return
+
+    print("index key memory: {index_key_memory_is_flat()}")
+    print("object_get memory: {object_get_memory_is_flat(root)}")
+    print(value_survives_more_lookups())
+    print(borrowed_key_survives())
+    print(stored_value_survives())
+    print(handle_survives_more_lookups(root))

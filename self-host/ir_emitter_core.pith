@@ -4987,7 +4987,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # can `catch` or `unwrap_or` at their level. Outside T! context, the
     # strict variants keep aborting cleanly.
     if ir_current_func_returns_result and ir_index_supports_propagate(obj_type):
-        return ir_emit_index_expr_propagate(obj_r, idx_r, obj_type, value_type)
+        return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, obj_type, value_type)
     call_name := ir_index_get_call_name(obj_type)
     if obj_type == "string":
         ir_emit_call2(r, call_name, "string", obj_r, idx_r)
@@ -4999,7 +4999,20 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
         ir_emit_call2(r, call_name, value_type, obj_r, idx_r)
     else:
         ir_emit_call2(r, call_name, ir_infer_type(idx), obj_r, idx_r)
+    ir_release_owned_index_key(node.children[1], idx_r)
     return r
+
+# an index key computed in place — `m[a.to_string() + ":" + b.to_string()]` —
+# arrives owned and nothing keeps it. a lookup reads the key and stores
+# nothing, and a store copies the key bytes into the map's own storage rather
+# than keeping the caller's string, so either way the count the caller holds
+# has to die here. binding the key to a local first was always correct,
+# because the local's scope cleanup released it; the inline form leaked one
+# string per operation. the object operand is deliberately left alone:
+# container indexing borrows the element out of the container, so releasing a
+# temporary container here would free the value we are about to return.
+fn ir_release_owned_index_key(key_idx: Int, key_r: Int):
+    ir_release_owned_string_operand(key_idx, key_r, ir_infer_type(key_idx))
 
 # True when obj_type has an `_opt` runtime we can dispatch to for
 # fail-propagate. Maps and lists ship the opt variants; string, bytes,
@@ -5019,10 +5032,13 @@ fn ir_index_supports_propagate(obj_type: String) -> Bool:
 # Emit `map[k]` / `list[i]` as a fail-propagate: call the _opt runtime,
 # branch on is_some, on none return the fail result tuple, on some
 # continue with the unwrapped value. Mirrors ir_emit_optional_unwrap.
-fn ir_emit_index_expr_propagate(obj_r: Int, idx_r: Int, obj_type: String, value_type: String) -> Int:
+fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: String, value_type: String) -> Int:
     opt_name := ir_index_get_opt_call_name(obj_type)
     opt_r := ir_reg()
     ir_emit_call2(opt_r, opt_name, "tuple", obj_r, idx_r)
+    # release the key before the branch: the miss arm returns early, so a
+    # release placed after it would only run on the hit path.
+    ir_release_owned_index_key(key_idx, idx_r)
     flag_r := ir_optional_flag_field(opt_r)
     some_l := ir_label()
     none_l := ir_label()
@@ -5087,6 +5103,12 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         if ir_string_expr_is_borrowed(value_idx):
             ir_rc_retain_reg(value_r, idx_store_kind)
     ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)
+    # a store reads its key the same way a lookup does: the runtime copies the
+    # key bytes into the map's own storage rather than keeping the caller's
+    # string, so an owned key temporary dies here too. the stored *value* is a
+    # different question — the container retains that, and it stays under the
+    # container-store exception in docs/ownership.md.
+    ir_release_owned_index_key(target.children[1], idx_r)
     return true
 
 # --- expression lowering ---

@@ -13,10 +13,19 @@ no-ops for string literals and null, so emitted code never needs to
 know where a string came from — it can retain or release any string
 register safely.
 
-collections (lists, maps, sets) own their elements. a string-valued
-map retains values on insert and releases them when overwritten or
-dropped. this only works if the map was built with the string-valued
-constructor — see "container flavors" below.
+collections (lists, maps, sets) own their elements. a tagged container
+holds exactly one count per heap element: taken on insert, dropped the
+moment that element leaves, whether it was removed, overwritten,
+cleared, or carried off when the container itself is freed. this only
+works if the container was built with the constructor that matches its
+element type (see "container flavors" below).
+
+because eviction drops the container's count, anything that reads an
+element and keeps it past a later mutation must hold a count of its
+own. the emitter arranges that: binding, assigning, or storing a
+borrowed element retains it first. sets need no count at all, since
+they copy element bytes into their own storage instead of holding the
+caller's handle.
 
 ## the rules
 
@@ -39,9 +48,12 @@ call arguments:
 - so an *owned* argument (a fresh `s[i]` char, a concat result, a
   fresh method result) dies once the call it fed returns — the caller
   releases it
-- exception: an argument stored directly into a container transfers
-  its count to the container, and the caller must not release it
-  (`skip_pos` in `ir_release_owned_method_args`)
+- exception: an argument stored directly into a container is skipped
+  by that release (`skip_pos` in `ir_release_owned_method_args`). an
+  untagged container cannot retain, so releasing there would dangle its
+  only stored copy. where the emitter can prove the container is
+  tagged, as it can for a string-valued map reached through `insert`,
+  it un-skips and the release runs, completing the transfer
 
 lambdas and function values:
 
@@ -90,9 +102,15 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **removed or overwritten container elements are not released until
-  the container itself dies.** a borrow of an element may still be in
-  flight, so the free is deferred to the container's own cleanup.
+- **a freshly built string stored straight into a tagged container is
+  counted twice.** `l.push("v-{i}")` and `m[k] = "v-{i}"` hand the
+  container an owned temporary. the container retains it as usual, but
+  the caller skips its release under the container-store exception
+  above, so the temporary's original count never dies. bind the value
+  first (`s := "v-{i}"` then `l.push(s)`) and it becomes a borrow that
+  reclaims cleanly; `map.insert(k, "v-{i}")` is already un-skipped.
+  extending the un-skip to `push` and to index assignment needs the
+  same proof that the container is tagged.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

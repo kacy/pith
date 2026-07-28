@@ -1513,6 +1513,18 @@ fn compile_ir_function(
                                 regs.insert(reg, normalized);
                             }
                         } else {
+                            // the callee returns nothing. the emitter and the
+                            // runtime table are separate notions of what a call
+                            // yields, so a retkind that promises a value here
+                            // means they disagree — `process.wait(p)` once went
+                            // out as a bare `wait`, landed on the waitgroup
+                            // intrinsic, and read back a zero nobody wrote.
+                            if retkind_expects_a_value(retkind) {
+                                return Err(CompileError::ModuleError(format!(
+                                    "ir consumer: call to '{}' in {} asks for a {} result, but the function returns nothing",
+                                    fname, func_name, retkind
+                                )));
+                            }
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         }
                         if retkind == "string" {
@@ -2047,6 +2059,13 @@ fn parse_i64_operand(
     })
 }
 
+// whether a call's retkind promises the destination register a real value.
+// `void` says the register is never read, and `unknown` is the emitter
+// admitting it does not know, so neither can contradict the callee.
+fn retkind_expects_a_value(retkind: &str) -> bool {
+    retkind != "void" && retkind != "unknown"
+}
+
 fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     if let Some(name) = retkind.strip_prefix("struct:") {
         return Some(name);
@@ -2147,6 +2166,33 @@ mod tests {
     fn call_to_unknown_function_returns_compile_error() {
         let err = compile_err_for_ir("func main 0 int\ncall 1 vanished int 0\nendfunc\n");
         assert!(err.contains("call to unknown function 'vanished'"));
+    }
+
+    // every IR-declared function returns i64, so only the runtime table can
+    // supply a callee that returns nothing — which is exactly where the
+    // emitter's idea of a call's result and the runtime's can drift apart.
+    #[test]
+    fn call_asking_a_value_of_a_void_runtime_function_returns_compile_error() {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let mut sig = codegen.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        let func_id = codegen
+            .module
+            .declare_function("pith_test_void_sink", Linkage::Import, &sig)
+            .expect("declare void runtime function");
+        let mut runtime_funcs = HashMap::new();
+        runtime_funcs.insert("void_sink".to_string(), func_id);
+
+        let result = compile_from_ir(
+            &mut codegen,
+            "func main 0 int\niconst 1 0\ncall 2 void_sink int 1 1\nret 2\nendfunc\n",
+            &runtime_funcs,
+        );
+        let err = result
+            .err()
+            .expect("expected a value-returning call to a void runtime function to fail")
+            .to_string();
+        assert!(err.contains("asks for a int result, but the function returns nothing"));
     }
 
     #[test]

@@ -54,6 +54,14 @@ call arguments:
   only stored copy. where the emitter can prove the container is
   tagged, as it can for a string-valued map reached through `insert`,
   it un-skips and the release runs, completing the transfer
+- an index key is an argument like any other, and the container-store
+  exception does not cover it: a lookup reads the key and keeps nothing,
+  a store copies the key bytes into the map's own storage, so an owned
+  key in `m[a + ":" + b]` dies with the operation either way. the stored
+  *value* is still under the exception. the object being indexed is
+  deliberately left alone — container indexing borrows the element out
+  of the container, so releasing a temporary container there would free
+  the value just returned
 
 lambdas and function values:
 

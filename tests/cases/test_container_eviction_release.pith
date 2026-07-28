@@ -1,0 +1,216 @@
+# evicting an element from a container drops the container's count on it.
+# removing a key, overwriting one, clearing, and the list equivalents all
+# used to leave the value's count orphaned until the container itself died,
+# so a bounded cache that evicted in a loop grew without limit.
+#
+# the second half is the reason this case is in the curated memcheck set: a
+# release that fires while someone else still holds the value is a
+# use-after-free, which is far worse than the leak it replaced. every read
+# below happens after the eviction that would have freed an unowned value.
+import std.fs as fs
+
+# every eviction shape in one loop, so the flatness check below covers all
+# of them at once.
+fn churn_round(i: Int):
+    mut m: Map[Int, String] := {}
+    mut sm: Map[String, String] := {}
+    mut l: List[String] := ["seed"]
+    s := "value-{i}"
+    m[0] = s
+    m.remove(0)
+    sm["slot"] = s
+    sm.remove("slot")
+    m[1] = s
+    m[1] = s          # the second store overwrites the first
+    l[0] = s
+    l.push(s)
+    l.clear()
+    m.clear()
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+# warm the allocator up, take the high-water mark, then do ten times the
+# work. before the fix each round orphaned about forty bytes, so a hundred
+# thousand rounds moved the mark by several megabytes; now it does not move
+# at all. the threshold is loose enough that allocator noise cannot trip it.
+fn eviction_memory_is_flat() -> String:
+    mut i := 0
+    while i < 10000:
+        churn_round(i)
+        i = i + 1
+    before := peak_rss_kb()
+    while i < 110000:
+        churn_round(i)
+        i = i + 1
+    growth := peak_rss_kb() - before
+    if growth < 512:
+        return "flat"
+    return "grew {growth}kb"
+
+fn churn_map() -> Int:
+    mut m: Map[Int, String] := {}
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        m[i % 4] = s
+        m.remove(i % 4)
+        i = i + 1
+    return m.len()
+
+fn churn_map_string_keys() -> Int:
+    mut m: Map[String, String] := {}
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        m["slot"] = s
+        m.remove("slot")
+        i = i + 1
+    return m.len()
+
+fn churn_overwrite() -> Int:
+    mut m: Map[Int, String] := {}
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        m[0] = s
+        i = i + 1
+    return m.len()
+
+fn churn_clear() -> Int:
+    mut m: Map[Int, String] := {}
+    mut l: List[String] := []
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        m[0] = s
+        l.push(s)
+        m.clear()
+        l.clear()
+        i = i + 1
+    return m.len() + l.len()
+
+fn churn_list() -> Int:
+    mut l: List[String] := []
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        l.push(s)
+        l.remove(0)
+        i = i + 1
+    return l.len()
+
+fn churn_list_overwrite() -> Int:
+    mut l: List[String] := ["seed"]
+    mut i := 0
+    while i < 2000:
+        s := "value-{i}"
+        l[0] = s
+        i = i + 1
+    return l.len()
+
+# a binding taken before the eviction owns its own count, so the value must
+# survive the container dropping its own.
+fn survives_map_remove(n: Int) -> String:
+    mut m: Map[Int, String] := {}
+    m[1] = "kept-through-remove-{n}"
+    held := m[1]
+    m.remove(1)
+    return held
+
+fn survives_map_overwrite(n: Int) -> String:
+    mut m: Map[String, String] := {}
+    m["k"] = "kept-through-overwrite-{n}"
+    held := m["k"]
+    m["k"] = "replacement-{n}"
+    return held + "/" + m["k"]
+
+fn survives_map_clear(n: Int) -> String:
+    mut m: Map[Int, String] := {}
+    m[0] = "kept-through-clear-{n}"
+    held := m[0]
+    m.clear()
+    return held
+
+fn survives_list_remove(n: Int) -> String:
+    mut l: List[String] := []
+    l.push("kept-through-list-remove-{n}")
+    held := l[0]
+    l.remove(0)
+    return held
+
+fn survives_list_overwrite(n: Int) -> String:
+    mut l: List[String] := ["kept-through-list-set-{n}"]
+    held := l[0]
+    l[0] = "replacement-{n}"
+    return held + "/" + l[0]
+
+fn survives_list_clear(n: Int) -> String:
+    mut l: List[String] := []
+    l.push("kept-through-list-clear-{n}")
+    held := l[0]
+    l.clear()
+    return held
+
+# `values()` hands out the map's stored handles, so the list it returns has
+# to take a count of its own. an untagged list here reads freed memory the
+# moment the map evicts anything — the eviction release found exactly that.
+fn fill(m: Map[String, String], n: Int):
+    s := "from-values-{n}"
+    m["a"] = s
+
+fn values_outlive_the_map(n: Int) -> String:
+    mut m: Map[String, String] := {}
+    fill(m, n)
+    vals := m.values()
+    m.clear()
+    mut out := ""
+    for v in vals:
+        out = out + v
+    return out
+
+# the same value in two containers: one evicting it must not free what the
+# other still owns.
+fn shared_between_containers(n: Int) -> String:
+    mut a: List[String] := []
+    mut b: Map[Int, String] := {}
+    s := "shared-{n}"
+    a.push(s)
+    b[0] = s
+    a.clear()
+    return b[0]
+
+# self-assignment: the retain has to happen before the release, or the only
+# count is gone before the new one is taken.
+fn self_assign(n: Int) -> String:
+    mut l: List[String] := ["self-{n}"]
+    l[0] = l[0]
+    mut m: Map[Int, String] := {}
+    m[0] = "also-self-{n}"
+    m[0] = m[0]
+    return l[0] + "/" + m[0]
+
+fn main():
+    print("map remove: {churn_map()}")
+    print("map remove (string keys): {churn_map_string_keys()}")
+    print("map overwrite: {churn_overwrite()}")
+    print("clear: {churn_clear()}")
+    print("list remove: {churn_list()}")
+    print("list overwrite: {churn_list_overwrite()}")
+    print("eviction memory: {eviction_memory_is_flat()}")
+    print(survives_map_remove(1))
+    print(survives_map_overwrite(2))
+    print(survives_map_clear(3))
+    print(survives_list_remove(4))
+    print(survives_list_overwrite(5))
+    print(survives_list_clear(6))
+    print(values_outlive_the_map(9))
+    print(shared_between_containers(7))
+    print(self_assign(8))

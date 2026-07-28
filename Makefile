@@ -1130,6 +1130,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_optional_temp_release \
 	tests/cases/test_loop_iter_early_return \
 	tests/cases/test_loop_var_slot_isolation \
+	tests/cases/test_spawn_in_loop_capture \
 	tests/cases/test_result_ok_reclaim \
 	tests/cases/test_os_thread_spawn_reclaim \
 	tests/cases/test_await_ownership

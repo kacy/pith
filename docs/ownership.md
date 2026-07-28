@@ -94,6 +94,22 @@ exactly the bug that broke the emitter split twice; imported globals
 now carry their type kinds so a reassigned `{}` keeps the right
 flavor.
 
+the lists `map` and `filter` produce pick their flavor the same way,
+from the checked element type of the call, and the two differ in where
+the count comes from. a mapper hands back a value nothing else is
+holding, so the push transfers: the loop stops tracking the result
+there and the list keeps the count the mapper returned. a filter keeps
+the source list's own elements, so its push retains, which is what lets
+the result outlive the list it was filtered from. an element type with
+no constructor of its own — a boxed enum, a closure, an optional or a
+result — still builds an untagged list, the same gap literals have.
+
+the list methods implemented in the runtime rather than the emitter
+decide their own flavor: `slice` and `sort` copy the source list's tag
+(`reverse` builds nothing, it reorders in place), `split` is
+string-tagged, `map.keys()` is tagged when the
+keys are strings, and `map.values()` when the values are heap values.
+
 ## where the code lives
 
 - the variable rules: statement lowering in
@@ -123,19 +139,14 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a container built without an element tag leaks what it holds.** the
-  list `map` and `filter` produce is built with the plain constructor
-  regardless of what the mapper returns, so a `List[String]` that came
-  out of `xs.map(f)` owns no counts: its elements are not released when
-  it is freed, and a value stored into it directly keeps the count the
-  caller handed over. the shape is bounded and rare — a list built by a
-  literal, a bind, or a struct field is tagged from its declared or
-  checked element type — but the flavors in that one path do not follow
-  the element type yet. a loop over `xs.map(f)` grows by hundreds of
-  megabytes over a few hundred thousand rounds, which is why this shape
-  and the struct store below are the two `make leak-check` deliberately
-  leaves uncovered: a case for either belongs in the change that fixes
-  it.
+- **naming a function as a value leaks the closure it allocates.**
+  `f := shout`, or passing `shout` straight to `map`, allocates a closure
+  that already arrives owned, and the bind retains it again as though it
+  were a borrowed variable read, so it ends with two counts and one
+  release. a closure is a fixed couple of hundred bytes, but a call site
+  that names a function inside a loop pays it every round. binding the
+  value once outside the loop and passing it down is the way around it
+  for now.
 - **a struct value stored straight into a container is still counted
   twice.** strings, bytes, and nested collections hand the container the
   count the temporary was holding; struct values keep taking a second
@@ -146,7 +157,8 @@ gaps, all bounded leaks rather than dangling pointers:
   extra count a struct store takes was all that absorbed it. a loop
   variable now gets storage of its own for the length of the body, so
   the only thing left here is to make the struct store transfer its
-  count like the other kinds do.
+  count like the other kinds do. `make leak-check` has no case for this
+  shape; one belongs in the change that fixes it.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

@@ -164,6 +164,35 @@ impl MapImpl {
             None => None,
         }
     }
+
+    /// Drop the map's count on a value that has just left the map — removed,
+    /// overwritten, or cleared. A heap-valued map holds exactly one count per
+    /// stored value, so anyone still reading it after this point must be
+    /// holding a count of their own (the emitter retains borrowed values into
+    /// locals, fields, and other containers).
+    ///
+    /// # Safety
+    /// `val` must be the raw storage of a value this map owned.
+    unsafe fn release_value(&self, val: &[u8]) {
+        if !self.val_is_heap || val.len() < 8 {
+            return;
+        }
+        let raw = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
+        crate::pith_cstring_release(raw as *const i8);
+    }
+
+    /// Drop the map's count on every stored value, for clear and free.
+    ///
+    /// # Safety
+    /// The caller must not use the values afterwards.
+    unsafe fn release_all_values(&self) {
+        if !self.val_is_heap {
+            return;
+        }
+        for val in self.data.values() {
+            self.release_value(val);
+        }
+    }
 }
 
 /// Magic word for MapImpl ("PMAP"). Distinct per collection kind so a list
@@ -307,8 +336,7 @@ pub unsafe extern "C" fn pith_map_insert_int(
     crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
     let val_vec = val_slice.to_vec();
 
-    // The map owns one count per stored string value. the overwritten
-    // value is NOT released — a borrow may still be live — so it leaks.
+    // The map owns one count per stored string value.
     // (the retain must stay gated on val_is_heap: magic-checking an
     // arbitrary integer dereferences value-16, which faults on values
     // that resemble unmapped addresses.)
@@ -316,8 +344,11 @@ pub unsafe extern "C" fn pith_map_insert_int(
         crate::pith_cstring_retain(value as *const i8);
     }
 
-    // Insert into map
-    impl_ref.insert(MapKey::Int(key), val_vec);
+    // Retain before insert, release the displaced value after: `m[k] = m[k]`
+    // must not drop the last count before the new one is taken.
+    if let Some(old) = impl_ref.insert(MapKey::Int(key), val_vec) {
+        impl_ref.release_value(&old);
+    }
 }
 
 /// Clear all entries from map
@@ -331,14 +362,7 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
         return;
     };
 
-    // Release all values if they're heap types
-    if impl_ref.val_is_heap {
-        for (_, val) in &impl_ref.data {
-            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
-            crate::pith_cstring_release(v as *const i8);
-        }
-    }
-
+    impl_ref.release_all_values();
     impl_ref.clear();
 }
 
@@ -391,13 +415,7 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
-    // Release all values if they're heap types
-    if impl_ref.val_is_heap {
-        for (_, val) in &impl_ref.data {
-            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
-            crate::pith_cstring_release(v as *const i8);
-        }
-    }
+    impl_ref.release_all_values();
 
     // Free the map implementation. Scrub the magic first so any handle
     // that outlives the map fails the fast validity check.
@@ -523,8 +541,8 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
-    // the map retains the incoming value when it owns heap values; an
-    // overwritten one is NOT released (a borrow may still be live)
+    // the map retains the incoming value when it owns heap values, and
+    // drops its count on whatever that displaces
     if impl_ref.val_is_heap {
         crate::pith_cstring_retain(value as *const i8);
         if map_trace_enabled() {
@@ -536,7 +554,9 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
         }
     }
     let val_bytes = value.to_le_bytes().to_vec();
-    impl_ref.insert(map_key, val_bytes);
+    if let Some(old) = impl_ref.insert(map_key, val_bytes) {
+        impl_ref.release_value(&old);
+    }
 }
 
 /// Get an i64 value by C-string key. Returns 0 if the key is not found.
@@ -728,8 +748,9 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
     let map_key = cstr_to_map_key(key);
-    // the removed value is NOT released: a borrow may still be live
-    impl_ref.remove(&map_key);
+    if let Some(old) = impl_ref.remove(&map_key) {
+        impl_ref.release_value(&old);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +777,9 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
             crate::pith_cstring_retain(value as *const i8);
         }
         let val_bytes = value.to_le_bytes().to_vec();
-        impl_ref.insert(MapKey::Int(key), val_bytes);
+        if let Some(old) = impl_ref.insert(MapKey::Int(key), val_bytes) {
+            impl_ref.release_value(&old);
+        }
     }
 }
 
@@ -896,8 +919,9 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
         impl_ref.remove_int_value(key);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
-        // the removed value is NOT released: a borrow may still be live
-        impl_ref.remove(&MapKey::Int(key));
+        if let Some(old) = impl_ref.remove(&MapKey::Int(key)) {
+            impl_ref.release_value(&old);
+        }
     }
 }
 
@@ -1025,6 +1049,7 @@ pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
+    impl_ref.release_all_values();
     impl_ref.clear();
 }
 
@@ -1057,7 +1082,11 @@ pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     };
-    let list = pith_list_new(8, 0);
+    // a heap-valued map hands out its stored handles, so the list has to be
+    // string-tagged: push takes a count of its own and the list's free
+    // cascades it back. an untagged list would leave the caller holding raw
+    // pointers the map is free to evict and release out from under.
+    let list = pith_list_new(8, if impl_ref.val_is_heap { 1 } else { 0 });
 
     for val in impl_ref.values() {
         if val.len() >= 8 {
@@ -1089,6 +1118,114 @@ mod tests {
             pith_map_clear(&mut map);
             pith_map_clear_handle(12345);
             pith_map_release(bogus_map());
+        }
+    }
+
+    /// A string-valued int-key map holding one value the caller has already
+    /// let go of, so the map's count is the only one left.
+    unsafe fn map_owning_one_value(text: &[u8]) -> (i64, *mut i8) {
+        let handle = pith_map_new_int_cstr_val().ptr as i64;
+        let s = crate::pith_copy_bytes_to_cstring(text);
+        pith_map_insert_ikey(handle, 1, s as i64);
+        crate::pith_cstring_release(s);
+        assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+        (handle, s)
+    }
+
+    #[test]
+    fn removing_a_key_drops_the_maps_count_on_its_value() {
+        unsafe {
+            let (handle, s) = map_owning_one_value(b"evicted");
+            pith_map_remove_ikey(handle, 1);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+            pith_map_release_handle(handle);
+        }
+    }
+
+    #[test]
+    fn clearing_drops_the_maps_count_on_every_value() {
+        unsafe {
+            let (handle, s) = map_owning_one_value(b"cleared");
+            pith_map_clear_handle(handle);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+            assert_eq!(pith_map_len_handle(handle), 0);
+            pith_map_release_handle(handle);
+        }
+    }
+
+    #[test]
+    fn overwriting_retains_the_new_value_before_releasing_the_old() {
+        unsafe {
+            let (handle, s) = map_owning_one_value(b"old");
+            let t = crate::pith_copy_bytes_to_cstring(b"new");
+            pith_map_insert_ikey(handle, 1, t as i64);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+            assert_eq!(crate::cstring_refcount_for_tests(t), Some(2));
+
+            // storing a key over itself must not free the value in between
+            pith_map_insert_ikey(handle, 1, t as i64);
+            assert_eq!(crate::cstring_refcount_for_tests(t), Some(2));
+            assert_eq!(pith_map_get_ikey(handle, 1), t as i64);
+
+            pith_map_release_handle(handle);
+            assert_eq!(crate::cstring_refcount_for_tests(t), Some(1));
+            crate::pith_cstring_release(t);
+        }
+    }
+
+    #[test]
+    fn a_second_owner_survives_the_maps_eviction() {
+        unsafe {
+            let handle = pith_map_new_cstr_val().ptr as i64;
+            let s = crate::pith_copy_bytes_to_cstring(b"held elsewhere");
+            let key = b"k\0".as_ptr() as *const i8;
+            pith_map_insert_cstr(handle, key, s as i64);
+            // the caller keeps its own count, as a binding of `m[k]` would
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            pith_map_remove_cstr(handle, key);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+
+            pith_map_release_handle(handle);
+            crate::pith_cstring_release(s);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+        }
+    }
+
+    #[test]
+    fn values_returns_a_list_that_owns_what_it_hands_back() {
+        unsafe {
+            use crate::collections::list::{pith_list_get_value, pith_list_release_handle};
+
+            let (handle, s) = map_owning_one_value(b"handed out");
+            let vals = pith_map_values_handle(handle);
+            // the list took its own count, so the map is free to evict
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            pith_map_clear_handle(handle);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+            assert_eq!(pith_list_get_value(
+                crate::collections::list::PithList { ptr: vals as *mut () },
+                0
+            ), s as i64);
+
+            pith_list_release_handle(vals);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+            pith_map_release_handle(handle);
+        }
+    }
+
+    #[test]
+    fn plain_int_maps_never_touch_their_values() {
+        unsafe {
+            // 7 is not a pointer; a value-releasing map would dereference it
+            let handle = pith_map_new_int().ptr as i64;
+            pith_map_insert_ikey(handle, 1, 7);
+            pith_map_insert_ikey(handle, 1, 8);
+            assert_eq!(pith_map_get_ikey(handle, 1), 8);
+            pith_map_remove_ikey(handle, 1);
+            pith_map_clear_handle(handle);
+            pith_map_release_handle(handle);
         }
     }
 

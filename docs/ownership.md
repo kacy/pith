@@ -49,11 +49,18 @@ call arguments:
   fresh method result) dies once the call it fed returns — the caller
   releases it
 - exception: an argument stored directly into a container is skipped
-  by that release (`skip_pos` in `ir_release_owned_method_args`). an
-  untagged container cannot retain, so releasing there would dangle its
-  only stored copy. where the emitter can prove the container is
-  tagged, as it can for a string-valued map reached through `insert`,
-  it un-skips and the release runs, completing the transfer
+  by that release (`skip_pos` in `ir_release_owned_method_args`),
+  because ownership transfers into the container there rather than
+  ending with the call. the store completes that transfer: an owned
+  value goes through the variant of the store that keeps the caller's
+  count instead of taking a second one — `pith_list_push_value_owned`,
+  `pith_list_set_value_owned`, `pith_map_insert_cstr_owned`,
+  `pith_map_insert_ikey_owned`. the emitter picks the variant from the
+  value's ownership alone (`ir_owned_container_store_name`); whether
+  there is a count to take is the container's own business, since only
+  it knows if it was built tagged. an untagged container takes nothing
+  and the caller's count stays outstanding, which is a leak rather than
+  an element nothing keeps alive
 - an index key is an argument like any other, and the container-store
   exception does not cover it: a lookup reads the key and keeps nothing,
   a store copies the key bytes into the map's own storage, so an owned
@@ -110,15 +117,25 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a freshly built string stored straight into a tagged container is
-  counted twice.** `l.push("v-{i}")` and `m[k] = "v-{i}"` hand the
-  container an owned temporary. the container retains it as usual, but
-  the caller skips its release under the container-store exception
-  above, so the temporary's original count never dies. bind the value
-  first (`s := "v-{i}"` then `l.push(s)`) and it becomes a borrow that
-  reclaims cleanly; `map.insert(k, "v-{i}")` is already un-skipped.
-  extending the un-skip to `push` and to index assignment needs the
-  same proof that the container is tagged.
+- **a container built without an element tag leaks what it holds.** the
+  list `map` and `filter` produce is built with the plain constructor
+  regardless of what the mapper returns, so a `List[String]` that came
+  out of `xs.map(f)` owns no counts: its elements are not released when
+  it is freed, and a value stored into it directly keeps the count the
+  caller handed over. the shape is bounded and rare — a list built by a
+  literal, a bind, or a struct field is tagged from its declared or
+  checked element type — but the flavors in that one path do not follow
+  the element type yet.
+- **a struct value stored straight into a container is still counted
+  twice.** strings, bytes, and nested collections hand the container the
+  count the temporary was holding; struct values keep taking a second
+  one. the reason is a separate bug in loop variables: a `for` variable
+  writes a borrowed element into the same named slot that a later `:=`
+  of that name reuses, and the rebind releases a count the loop never
+  took. `std.crypto.x509.verify_chain_issuers` has that shape — `for root
+  in trusted_roots` ahead of `root := root_result.ok` — and the extra
+  count a struct store takes is what currently absorbs the release. the
+  loop variable is the thing to fix; the double count goes away with it.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

@@ -1,0 +1,12 @@
+# an import alias reaches its own module and nothing else. `foreign_value`
+# belongs to the other support module, but every module's top-level names share
+# one table, so the lookup behind `home.foreign_value` used to find it anyway
+# and emit a call under a name that resolved to nothing at all.
+
+import support.alias_leak_home_mod as home
+import support.alias_leak_other_mod as other
+
+fn main():
+    print(home.home_value().to_string())
+    print(home.foreign_value().to_string())
+    print(other.foreign_value().to_string())

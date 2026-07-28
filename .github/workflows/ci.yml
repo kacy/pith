@@ -41,6 +41,13 @@ jobs:
       - name: regression corpus under os threads
         run: make verify-osthread-corpus-only
 
+      # the memcheck step below runs with valgrind's leak check off, because
+      # the runtime's freelists and pools are still reachable at exit and
+      # would bury a real signal. this covers leaks instead, by measuring
+      # growth across two round counts.
+      - name: leak growth
+        run: make leak-check-only
+
       - name: build self-hosted compiler
         run: make self-host
 

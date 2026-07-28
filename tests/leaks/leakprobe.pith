@@ -1,0 +1,27 @@
+# shared plumbing for the leak cases in this directory.
+#
+# every case has the same shape: run `rounds()` rounds of one churn pattern
+# and print `peak_kb()` and nothing else. a case never decides for itself
+# whether it grew — `make leak-check` runs it twice at different round counts
+# and compares the two numbers.
+import std.env as env
+import std.fs as fs
+
+# how many churn rounds this run should do. the harness sets the variable;
+# the default keeps a bare `pith run` of a case cheap enough to try by hand.
+pub fn rounds() -> Int:
+    return env.int_or("PITH_LEAK_ROUNDS", 20000)
+
+# the process high-water resident set in kilobytes. the high-water mark
+# rather than the current size because it never dips: a leak drives it up
+# monotonically, while a correct program parks it at its working set no
+# matter how long it runs.
+pub fn peak_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0

@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check memcheck leak-check leak-check-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -1130,6 +1130,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_optional_temp_release \
 	tests/cases/test_loop_iter_early_return \
 	tests/cases/test_loop_var_slot_isolation \
+	tests/cases/test_spawn_in_loop_capture \
 	tests/cases/test_result_ok_reclaim \
 	tests/cases/test_os_thread_spawn_reclaim \
 	tests/cases/test_await_ownership
@@ -1156,6 +1157,20 @@ memcheck: build
 	done; \
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
 	echo "all memcheck cases clean"
+
+# --- leak growth gate ---
+# valgrind above catches a use-after-free but is run with its leak check off
+# on purpose, because the runtime's freelists, stack pool and arenas live for
+# the whole process and drown a real leak in "still reachable" noise. this
+# target covers the other half: each case under tests/leaks/ churns one
+# ownership shape at two round counts and its peak resident set has to be the
+# same either way. the details, and how to add a case, are in
+# tooling/leak_check.sh and docs/ownership.md.
+
+leak-check: build leak-check-only
+
+leak-check-only:
+	@bash tooling/leak_check.sh
 
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output

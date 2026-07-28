@@ -1,0 +1,30 @@
+# a value built straight into a container — `l.push("v-{i}")`, `m[0] = "v-{i}"` —
+# is an owned temporary the caller stops tracking at the store, because
+# ownership transfers into the container. the runtime store used to take a
+# count of its own on top of that, so the value ended up with two counts and
+# one release: 18 mb over 400k rounds against a 10 mb baseline.
+import leakprobe as probe
+
+fn churn_round(i: Int):
+    mut l: List[String] := ["seed"]
+    mut nested: List[List[String]] := [[]]
+    mut mi: Map[Int, String] := {}
+    mut ms: Map[String, String] := {}
+    l.push("push-{i}")
+    l[0] = "set-{i}"
+    l.insert(0, "insert-{i}")
+    nested[0].push("nested-{i}")
+    nested.push(["fresh-{i}"])
+    mi[0] = "map-int-{i}"
+    ms["slot"] = "map-str-{i}"
+    ms.insert("other", "insert-{i}")
+    mi.insert(1, "insert-{i}")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

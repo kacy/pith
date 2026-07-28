@@ -455,15 +455,36 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
 }
 
 /// Push an i64-sized value into a list using the list handle directly.
-/// This is a simpler ABI used by generated method calls.
+/// This is a simpler ABI used by generated method calls. The caller keeps
+/// its own count and the list takes one of its own.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
+    push_value_inner(list, value, false);
+}
+
+/// Push a value the caller owns and is about to stop tracking — a freshly
+/// built string, a collection literal, a transferred call result. The list
+/// keeps the count the caller was holding instead of adding a second one,
+/// which is what leaves a directly stored temporary with exactly one owner.
+///
+/// An untagged list holds no counts at all, so there is nothing for it to
+/// take: the caller's count stays outstanding, exactly as it did before.
+/// That is a leak rather than an element the list cannot keep alive, which
+/// is why the ownership decision lives here and not in the emitter.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_push_value_owned(list: PithList, value: i64) {
+    push_value_inner(list, value, true);
+}
+
+unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
-    retain_element(impl_ref.type_tag, value);
+    if !takes_caller_count {
+        retain_element(impl_ref.type_tag, value);
+    }
     impl_ref.push_value(value);
 }
 
@@ -484,6 +505,18 @@ pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, valu
 /// Set element at index (value-based API, stores i64).
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: i64) {
+    set_value_inner(list, index, value, false);
+}
+
+/// Set element at index with a value the caller owns. The list takes the
+/// caller's count rather than adding one, the same transfer
+/// `pith_list_push_value_owned` performs.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, value: i64) {
+    set_value_inner(list, index, value, true);
+}
+
+unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
@@ -494,8 +527,12 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
         return;
     }
     // retain the incoming element before dropping the count on what it
-    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment
-    retain_element(impl_ref.type_tag, value);
+    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment.
+    // an owned value is a buffer nobody else holds, so it can never be
+    // what it displaces and needs no count of its own.
+    if !takes_caller_count {
+        retain_element(impl_ref.type_tag, value);
+    }
     let displaced = displaced_element(impl_ref, idx);
     impl_ref.set_value(idx, value);
     if let Some(raw) = displaced {

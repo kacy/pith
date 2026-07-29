@@ -3959,6 +3959,14 @@ fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
     # (`r.unwrap_or(bytes.empty())`) every ok iteration. this mirrors the
     # optional unwrap_or, which already defers its default into the none arm.
     fallback_r := ir_expr(arg_idx)
+    # consumers treat a heap-kind unwrap_or value as owned and release it, so
+    # a fallback that arrives borrowed (a named local, a field) needs a count
+    # of its own here — without one that release strips the owner's count and
+    # the owner's next use reads freed memory. a string fallback is excluded
+    # because a string unwrap_or stays classified borrowed (the escape site
+    # retains), mirroring the ok arm.
+    if not ir_string_expr_is_borrowed(idx) and ir_string_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
     if operand_class != "borrowed":
         ir_emit_release_result_error(recv_r, recv_tid)
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
@@ -4411,6 +4419,15 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 ir_emit_label(none_l)
                 default_idx := ir_method_call_arg_expr(node, 0)
                 default_r := ir_expr(default_idx)
+                # consumers treat a heap-kind unwrap_or value as owned and
+                # release it, so a default that arrives borrowed (a named
+                # local, a field) needs its own count here — without one that
+                # release strips the owner's count and the owner's next use
+                # reads freed memory. strings stay on the borrowed
+                # classification (the escape site retains), so they are
+                # excluded. mirrors the result unwrap_or's fallback arm.
+                if inner_kind.len() > 0 and not ir_string_expr_is_borrowed(idx) and ir_string_expr_is_borrowed(default_idx):
+                    ir_rc_retain_reg(default_r, inner_kind)
                 ir_emit("store " + tmp + " " + default_r.to_string())
                 ir_emit_label(end_l)
                 if owns_subject:

@@ -36,6 +36,12 @@ these helpers can be combined on the same config:
 - `enable_session_resumption()`
 - `with_verify_connection(...)`
 
+`enable_session_resumption()` turns on the in-process session stores: the
+server's ticket store and the client's session cache. both are guarded by a
+lock inside `std.net.tls`, so it is safe to run handshakes concurrently from
+many tasks. a server can handshake each connection in its own task, and a
+client can dial from a pool of tasks, with no locking of its own.
+
 for servers that need to choose policy before the handshake finishes, use:
 - `tls.with_config_selector(config, chooser)`
 

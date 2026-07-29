@@ -1,0 +1,40 @@
+# a struct built straight into a list — `certs.push(Cert(...))`,
+# `certs[0] = Cert(...)` — is an owned temporary the caller stops tracking
+# at the store. a struct-tagged list retains what is pushed into it, so the
+# store used to take a count of its own on top of the one the constructor
+# handed over: two counts, one release, and a leaked struct pins every heap
+# field it holds. this churn grew by over 200 mb across 600k extra rounds
+# before the store transferred the caller's count.
+#
+# maps are deliberately absent: a map holds no counts on struct values, so
+# a struct stored in one keeps the caller's count outstanding whether or
+# not the store transfers — a bounded leak docs/ownership.md accepts in
+# exchange for never dangling.
+import leakprobe as probe
+
+struct Cert:
+    der: String
+    subject: String
+    is_ca: Bool
+
+fn make_cert(i: Int) -> Cert:
+    return Cert("der-{i}", "subject-{i}", i % 2 == 0)
+
+fn churn_round(i: Int):
+    mut certs: List[Cert] := [Cert("seed", "seed", false)]
+    # a constructor call in the store argument
+    certs.push(Cert("push-{i}", "pushed", true))
+    certs[0] = Cert("set-{i}", "set", false)
+    # a struct returned from a function arrives owned and transfers the
+    # same way
+    certs.push(make_cert(i))
+    certs[0] = make_cert(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

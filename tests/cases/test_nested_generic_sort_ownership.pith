@@ -1,0 +1,46 @@
+# the sitegen shape: structs holding a List[String] flow through
+# algo.sort_by_key_desc, whose body is a nested generic call followed by a
+# void-method chain — `sort_by_key(items, key).reverse()`. two separate
+# over-releases met here. the nested call had no checked argument types, so
+# its type param inferred "unknown" and its out list built untagged, owning
+# none of the structs it handed back. and reverse() is a void method whose
+# value is its receiver, so the owned receiver release freed the very list
+# being returned — with a struct-tagged list, that free cascades into every
+# element and its fields. the tag strings then came back as recycled path
+# segments in the churn below.
+import std.algo as algo
+
+struct Post:
+    slug: String
+    date: String
+    tags: List[String]
+
+fn load_posts() -> List[Post]:
+    mut posts: List[Post] := []
+    posts.push(Post("hello", "2026-01-02", ["memory", "intro"]))
+    posts.push(Post("ownership", "2026-01-03", ["memory"]))
+    posts.push(Post("meta", "2026-01-01", ["meta"]))
+    # posts dies at this return; the sorted list must own what it returns
+    return algo.sort_by_key_desc(posts, fn(p: Post) => p.date)
+
+fn churn_paths() -> Int:
+    mut n := 0
+    mut i := 0
+    while i < 200:
+        parts := "/tmp/out-{i}/tags/page-{i}.html".split("/")
+        for part in parts:
+            n = n + part.len()
+        i = i + 1
+    return n
+
+fn main():
+    posts := load_posts()
+    # recycle the freed blocks with path segments before reading the tags —
+    # this is what renamed the sitegen tag pages after its output directory
+    churned := churn_paths()
+    mut tag_line := ""
+    for p in posts:
+        for t in p.tags:
+            tag_line = tag_line + p.slug + ":" + t + " "
+    print(tag_line.trim())
+    print("{posts[0].slug}/{posts[2].slug}/{churned > 0}")

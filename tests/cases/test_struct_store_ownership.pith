@@ -1,0 +1,97 @@
+# a struct built straight into a list — `certs.push(Cert(...))`, a pushed
+# function result, `certs[0] = Cert(...)` — is an owned temporary the caller
+# stops tracking at the store. the runtime store used to take a count of its
+# own on top of the one the constructor handed over, so the struct and every
+# heap field it held stayed alive forever. the store now keeps the caller's
+# count instead.
+#
+# the danger in that fix is the reverse mistake: a struct classified as owned
+# while someone else still holds it would leave the list releasing a count it
+# was never given, and a struct release cascades into its fields. so this case
+# also stores borrowed structs and reads both the container copy and the
+# original after the sources have died — under valgrind (memcheck) with the
+# struct freelist off, an over-transfer shows up as a use-after-free here.
+import std.fs as fs
+
+struct Cert:
+    der: String
+    subject: String
+    is_ca: Bool
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+fn make_cert(i: Int) -> Cert:
+    return Cert("der-{i}", "subject-{i}", i % 2 == 0)
+
+fn churn_round(i: Int):
+    mut certs: List[Cert] := [Cert("seed", "seed", false)]
+    certs.push(Cert("push-{i}", "pushed", true))
+    certs[0] = Cert("set-{i}", "set", false)
+    certs.push(make_cert(i))
+    certs[0] = make_cert(i)
+
+# before the store transferred, each round above orphaned four certs and
+# their string fields — megabytes across this loop. the threshold is loose
+# enough that allocator noise cannot trip it.
+fn struct_store_memory_is_flat() -> String:
+    mut i := 0
+    while i < 5000:
+        churn_round(i)
+        i = i + 1
+    before := peak_rss_kb()
+    while i < 55000:
+        churn_round(i)
+        i = i + 1
+    growth := peak_rss_kb() - before
+    if growth < 512:
+        return "flat"
+    return "grew {growth}kb"
+
+# the sources of the stored values — the constructor temporaries, the
+# function-call results, the frames they were built in — are all gone by the
+# time these reads happen; the list's count is the only thing keeping the
+# structs alive.
+fn stored_structs_survive_their_sources() -> String:
+    mut certs: List[Cert] := []
+    certs.push(Cert("ctor-der", "ctor-subject", true))
+    certs.push(make_cert(7))
+    mut i := 0
+    while i < 200:
+        certs.push(make_cert(i))
+        i = i + 1
+    return certs[0].subject + "/" + certs[1].der + "/" + certs[certs.len() - 1].subject
+
+# a borrowed struct stored into a list: the list takes a count of its own,
+# the original keeps its own, and both stay readable after churn.
+fn borrowed_struct_and_original_both_live() -> String:
+    original := Cert("borrowed-der", "borrowed-subject", false)
+    mut certs: List[Cert] := []
+    certs.push(original)
+    mut i := 0
+    while i < 200:
+        certs.push(make_cert(i))
+        i = i + 1
+    return certs[0].der + "/" + original.subject
+
+# an element read out and held across an owned store into the same slot. the
+# held binding took its own count, so the overwrite's displacement release
+# must not free it — and its fields must still be whole.
+fn held_element_survives_owned_overwrite() -> String:
+    mut certs: List[Cert] := [Cert("first-der", "first-subject", true)]
+    held := certs[0]
+    certs[0] = Cert("second-der", "second-subject", false)
+    return held.subject + "/" + certs[0].subject
+
+fn main():
+    print("struct store memory: {struct_store_memory_is_flat()}")
+    print(stored_structs_survive_their_sources())
+    print(borrowed_struct_and_original_both_live())
+    print(held_element_survives_owned_overwrite())

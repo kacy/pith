@@ -1,0 +1,38 @@
+# a generic helper that collects into `mut out: List[T] := []` has no checked
+# type on that literal (specialized bodies suppress them), so the list used to
+# build untagged: its stores owned nothing, and the elements it handed back
+# lived on counts the source list dropped at its own scope exit. the struct
+# store transfer made that live — the extra count a struct push used to leak
+# was the only thing keeping such results alive (the docsite's sorted module
+# list segfaulted). the annotation now picks the tagged constructor, so the
+# out list owns its elements like a non-generic one.
+import std.algo as algo
+
+struct Thing:
+    name: String
+    tag: String
+
+fn build_sorted() -> List[Thing]:
+    mut src: List[Thing] := []
+    src.push(Thing("bravo", "value-b"))
+    src.push(Thing("alpha", "value-a"))
+    src.push(Thing("charlie", "value-c"))
+    # src dies at this return; only the sorted list's own counts keep the
+    # elements alive for the caller
+    return algo.sort_by_key(src, fn(t: Thing) => t.name)
+
+fn churn() -> Int:
+    mut n := 0
+    mut i := 0
+    while i < 200:
+        junk := [Thing("filler-{i}", "x"), Thing("filler2-{i}", "y")]
+        n = n + junk[0].name.len()
+        i = i + 1
+    return n
+
+fn main():
+    sorted := build_sorted()
+    # recycle the heap the source list vacated before reading the results
+    churned := churn()
+    print("{sorted[0].name}/{sorted[1].name}/{sorted[2].name}")
+    print("{sorted[0].tag}/{sorted[2].tag}/{churned > 0}")

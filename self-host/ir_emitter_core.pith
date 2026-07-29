@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -3480,16 +3480,17 @@ fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Boo
 
 # the value kinds a container store may take the caller's count for.
 #
-# struct values are deliberately left on the retain path. a `for` loop
-# variable writes a borrowed element into the same named slot a later `:=`
-# of that name uses, and the rebind then releases a count the loop never
-# took — `std.crypto.x509.verify_chain_issuers` has exactly that shape, with
-# `for root in trusted_roots` ahead of `root := root_result.ok`. the second
-# count a struct store takes today is what absorbs that release, so
-# transferring instead turns a latent over-release into a live one. the loop
-# variable is the bug to fix; until it is, structs keep the extra count.
+# struct values were the last holdout: a `for` loop variable used to write
+# its borrowed element into the same named slot a later `:=` of that name
+# reused, so the rebind released a count the loop never took —
+# `std.crypto.x509.verify_chain_issuers` had exactly that shape — and the
+# second count a struct store took was what absorbed that over-release.
+# loop variables now get storage of their own, so the mask is gone and a
+# struct built straight into a container transfers like every other kind.
 fn ir_container_store_takes_count(store_kind: String) -> Bool:
     if store_kind == "string" or store_kind == "bytes":
+        return true
+    if store_kind == "struct":
         return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
@@ -4530,7 +4531,14 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
         if recv_kind.len() > 0 and not ir_string_expr_is_borrowed(recv_idx):
-            ir_rc_release_reg(obj_r, recv_kind)
+            # a void method's value IS its receiver (see the return below), so
+            # the receiver's count must survive the call and travel with that
+            # value — `sort_by_key(xs, key).reverse()` returns the reversed
+            # list, and releasing the owned receiver here freed the very list
+            # being returned. a discarded void-method chain now leaks its
+            # receiver instead, which is the survivable direction.
+            if not ir_is_void_method(emit_name):
+                ir_rc_release_reg(obj_r, recv_kind)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):
@@ -5591,6 +5599,44 @@ fn ir_emit_return_stmt(node: Node):
         ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
 
+# the tagged constructor for an empty `List[T]` bind whose element type only
+# the annotation knows, or "" when the normal target path already handles it.
+#
+# active only inside specialized generic bodies, where the checked types are
+# suppressed: everywhere else the checked type on the literal picks the
+# constructor, and second-guessing it here would fight that path. `List[T]`
+# with T substituted to string already resolves to the list_string target
+# upstream; every other heap element kind used to collapse to the coarse
+# "list" target and build untagged — a list whose stores own nothing, handing
+# back elements that lived on counts their source dropped at its own exit
+# (algo.sort_by_key over structs was the live case).
+fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) -> String:
+    if bind_target != "list" or val_idx < 0 or type_idx < 0:
+        return ""
+    if ir_active_generic_params.len() == 0 and ir_current_impl_subst_params.len() == 0:
+        return ""
+    vn := get_node(val_idx)
+    if vn.kind != "list" or vn.children.len() > 0:
+        return ""
+    tn := get_node(type_idx)
+    if tn.kind != "generic_type" or tn.value != "List" or tn.children.len() == 0:
+        return ""
+    mut elem := ir_resolve_type_node(tn.children[0])
+    if ir_rc_kind(elem).len() == 0:
+        # impl-method substitution (T -> the impl's concrete argument) is not
+        # part of ir_resolve_type_node's active-generic path, so try it as the
+        # fallback — and only when it actually substituted something, so a
+        # still-abstract T cannot clobber a resolution that already worked
+        inner := get_node(tn.children[0])
+        if inner.kind == "type":
+            substituted := ir_substitute_type_name(inner.value)
+            if substituted != inner.value:
+                elem = ir_resolve_type_hint(substituted)
+    ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem))
+    if ctor == "__list_new":
+        return ""
+    return ctor
+
 fn ir_emit_bind_stmt(node: Node):
     parts := ir_collect_bind_parts(node)
     name := parts.name
@@ -5634,7 +5680,13 @@ fn ir_emit_bind_stmt(node: Node):
             old_r = ir_reg()
             ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
-        r := ir_emit_value_for_target(val_idx, bind_target)
+        mut r := 0 - 1
+        annot_ctor := ir_generic_empty_list_ctor(val_idx, type_idx, bind_target)
+        if annot_ctor.len() > 0:
+            r = ir_reg()
+            ir_emit_call0(r, annot_ctor, "list")
+        if r < 0:
+            r = ir_emit_value_for_target(val_idx, bind_target)
         if tracked and bind_target != "tuple" and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
@@ -6490,7 +6542,113 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
 fn ir_infer_generic_concrete_types(name: String, node: Node) -> List[String]:
     if not ir_generic_decl_indices.contains_key(name):
         return ir_generic_arg_types(node)
-    return ir_infer_generic_concrete_types_with_state(name, node, ir_generic_decl_indices)
+    inferred := ir_infer_generic_concrete_types_with_state(name, node, ir_generic_decl_indices)
+    return ir_fill_unknown_concretes_from_caller(name, node, inferred)
+
+# the type node a named parameter of a function declaration was written
+# with, or -1 when the name is not one of its parameters.
+fn ir_decl_param_type_node(decl_idx: Int, param_name: String) -> Int:
+    decl_node := get_node(decl_idx)
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "param" and cn.value == param_name and cn.children.len() > 0:
+            return cn.children[0]
+    return 0 - 1
+
+# unify a callee parameter's type node against the caller parameter's type
+# node that supplied the argument, binding the callee's generic params to
+# concrete names resolved under the active substitution. only structurally
+# parallel shapes with plain-name leaves bind; anything else stays unbound,
+# which leaves the concrete "unknown" exactly as before.
+fn ir_unify_generic_param_nodes(callee_idx: Int, caller_idx: Int, callee_params: List[String], bindings: Map[String, String]):
+    if callee_idx < 0 or caller_idx < 0:
+        return
+    cn := get_node(callee_idx)
+    an := get_node(caller_idx)
+    if cn.kind == "type":
+        if not callee_params.contains(cn.value):
+            return
+        if an.kind != "type":
+            return
+        resolved := ir_specialize_type_name(an.value, ir_active_generic_params, ir_active_generic_concrete_types)
+        # an unresolved caller-side type variable must not bind: it would name
+        # a type that does not exist and the specialization would misclassify
+        if ir_active_generic_params.contains(resolved):
+            return
+        if not bindings.contains_key(cn.value):
+            bindings.insert(cn.value, resolved)
+        return
+    if cn.kind == "generic_type" and an.kind == "generic_type" and cn.value == an.value:
+        mut i := 0
+        while i < cn.children.len() and i < an.children.len():
+            ir_unify_generic_param_nodes(cn.children[i], an.children[i], callee_params, bindings)
+            i = i + 1
+        return
+    if cn.kind == "fn_type" and an.kind == "fn_type":
+        mut ci := 0
+        mut ai := 0
+        while ci < cn.children.len():
+            ccn := get_node(cn.children[ci])
+            while ai < an.children.len() and get_node(an.children[ai]).kind != ccn.kind:
+                ai = ai + 1
+            if ai < an.children.len():
+                if ccn.kind == "param" and ccn.children.len() > 0:
+                    acn := get_node(an.children[ai])
+                    if acn.children.len() > 0:
+                        ir_unify_generic_param_nodes(ccn.children[0], acn.children[0], callee_params, bindings)
+                elif ccn.kind == "returns" and ccn.children.len() > 0:
+                    acn := get_node(an.children[ai])
+                    if acn.children.len() > 0:
+                        ir_unify_generic_param_nodes(ccn.children[0], acn.children[0], callee_params, bindings)
+                ai = ai + 1
+            ci = ci + 1
+
+# a generic call inside a specialized generic body has no checked argument
+# types, so tid-based inference reports its type params "unknown" — and an
+# unknown element type builds untagged containers whose stores own nothing
+# (sort_by_key_desc's inner sort_by_key was exactly this, handing back
+# structs nothing owned). when an argument is the enclosing body's own
+# parameter, both declarations wrote down a type node; unifying the two
+# under the active substitution recovers the concrete type. anything the
+# unification cannot see stays "unknown", which is the old behavior.
+fn ir_fill_unknown_concretes_from_caller(name: String, node: Node, inferred: List[String]) -> List[String]:
+    if not inferred.contains("unknown"):
+        return inferred
+    if ir_active_generic_params.len() == 0 or ir_active_generic_decl_idx < 0:
+        return inferred
+    callee_decl := ir_generic_decl_indices[name]
+    callee_params := ir_collect_generic_param_names(get_node(callee_decl))
+    mut bindings: Map[String, String] := {}
+    mut arg_pos := 0
+    for child, i in node.children:
+        if i == 0:
+            continue
+        mut expr_idx := child
+        cn := get_node(child)
+        if cn.kind == "arg":
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        en := get_node(expr_idx)
+        if en.kind == "ident":
+            caller_type_idx := ir_decl_param_type_node(ir_active_generic_decl_idx, en.value)
+            if caller_type_idx >= 0:
+                # a `:=` inside the body may rebind a parameter's name to a
+                # different type; only unify while the tracked type still
+                # matches what the parameter declared
+                declared := ir_resolve_type_node(caller_type_idx)
+                tracked := ir_lookup_name_type(en.value)
+                if tracked.len() == 0 or tracked == declared:
+                    callee_type_idx := ir_decl_param_type_node(callee_decl, ir_param_name_at(callee_decl, arg_pos))
+                    ir_unify_generic_param_nodes(callee_type_idx, caller_type_idx, callee_params, bindings)
+        arg_pos = arg_pos + 1
+    mut filled: List[String] := []
+    for concrete, i in inferred:
+        if concrete == "unknown" and i < callee_params.len() and bindings.contains_key(callee_params[i]):
+            filled.push(bindings[callee_params[i]])
+        else:
+            filled.push(concrete)
+    return filled
 
 fn ir_resolve_explicit_generic_type_arg(type_idx: Int) -> String:
     type_node := get_node(type_idx)
@@ -6594,8 +6752,10 @@ fn ir_emit_generic_specialization(key: String):
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
     saved_param_optional_tids := ir_active_param_optional_tids
+    saved_decl_idx := ir_active_generic_decl_idx
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
+    ir_active_generic_decl_idx = decl_idx
     ir_active_param_optional_tids = ir_collect_param_optional_tids(decl_idx, key)
     if ir_generic_decl_module_paths.contains_key(base_name):
         ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
@@ -6633,6 +6793,7 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
     ir_active_param_optional_tids = saved_param_optional_tids
+    ir_active_generic_decl_idx = saved_decl_idx
 
 fn ir_collect_param_optional_tids(fn_idx: Int, spec_key: String) -> Map[String, Int]:
     result: Map[String, Int] := {}

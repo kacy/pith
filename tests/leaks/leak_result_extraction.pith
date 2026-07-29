@@ -1,0 +1,43 @@
+# extracting from a result held in a named local. `r.unwrap_or(d)`,
+# `r catch d`, and `r!` all classify a named operand as borrowed: the ok
+# arm hands the consumer a freshly retained count and leaves the shell
+# holding the count it was built with, for the local's cleanup to release.
+# these uses must therefore keep the local cascade-eligible — before they
+# did, cleanup freed only the three-slot shell and one heap payload (or,
+# on the err arm, one heap error string) leaked per extraction.
+import std.bytes as bytes
+import leakprobe as probe
+
+fn make_payload(i: Int) -> Bytes!:
+    if i % 4 == 3:
+        fail "err-{i}"
+    return bytes.from_string_utf8("heap-payload-{i}")
+
+fn via_unwrap_or(i: Int) -> Int:
+    r := make_payload(i)
+    b := r.unwrap_or(bytes.empty())
+    return b.len()
+
+fn via_catch(i: Int) -> Int:
+    r := make_payload(i)
+    b := r catch bytes.empty()
+    return b.len()
+
+fn via_try(i: Int) -> Int!:
+    r := make_payload(i)
+    b := r!
+    return b.len()
+
+fn churn_round(i: Int):
+    mut total := via_unwrap_or(i)
+    total = total + via_catch(i)
+    total = total + (via_try(i) catch 0)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

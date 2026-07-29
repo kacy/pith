@@ -1117,6 +1117,9 @@ MEMCHECK_CASES := \
 	tests/cases/test_container_eviction_release \
 	tests/cases/test_index_key_ownership \
 	tests/cases/test_direct_store_ownership \
+	tests/cases/test_struct_store_ownership \
+	tests/cases/test_generic_out_list_ownership \
+	tests/cases/test_nested_generic_sort_ownership \
 	tests/cases/test_list_transform_ownership \
 	tests/cases/test_result_unwrap_or_fallback_leak \
 	tests/cases/test_borrowed_operand_extraction \
@@ -1401,6 +1404,9 @@ test: build
 	./self-host/pith_main version
 	./self-host/pith_main lex examples/hello.pith > /dev/null
 	./self-host/pith_main parse examples/hello.pith > /dev/null
+	@echo "=== Step 14: tool golden checks ==="
+	@$(MAKE) --no-print-directory docsite-check
+	@$(MAKE) --no-print-directory sitegen-check
 	@echo "=== all tests passed ==="
 
 clean:

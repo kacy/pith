@@ -63,6 +63,11 @@ pub fn ir_record_global_type(name: String, global_type: String):
 pub mut ir_active_generic_params: List[String] := []
 pub mut ir_active_generic_concrete_types: List[String] := []
 pub mut ir_active_generic_module_path := ""
+# the declaration node of the generic function whose specialized body is
+# being emitted, or -1 outside one. a nested generic call in that body has
+# no checked arg types to infer from, so the caller's own param type nodes
+# are the fallback (see ir_fill_unknown_concretes_from_caller).
+pub mut ir_active_generic_decl_idx := 0 - 1
 
 ## Per-specialization map from parameter name to the concrete Optional tid
 ## of that parameter (only params whose substituted type is Optional[X] get

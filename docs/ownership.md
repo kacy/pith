@@ -129,6 +129,15 @@ the result outlive the list it was filtered from. an element type with
 no constructor of its own — a boxed enum, an optional or a result —
 still builds an untagged list, the same gap literals have.
 
+a generic body is the one place the checked types cannot pick the
+flavor, because specialization suppresses them. an empty list bound
+with an annotation (`mut out: List[T] := []`) resolves the element
+type from that annotation under the active substitution instead, so
+`algo.sort_by_key` over structs builds a struct-tagged list whose
+stores own their elements. an untagged out list owned nothing, and
+everything it handed back lived on counts its source dropped at its
+own scope exit.
+
 the list methods implemented in the runtime rather than the emitter
 decide their own flavor: `slice` and `sort` copy the source list's tag
 (`reverse` builds nothing, it reorders in place), `split` is
@@ -164,18 +173,18 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a struct value stored straight into a container is still counted
-  twice.** strings, bytes, and nested collections hand the container the
-  count the temporary was holding; struct values keep taking a second
-  one. what made this unsafe to change was a separate bug in loop
-  variables, and that one is fixed: a `for` variable used to write its
-  borrowed element into the same named slot a later `:=` of that name
-  reused, so the rebind released a count the loop never took, and the
-  extra count a struct store takes was all that absorbed it. a loop
-  variable now gets storage of its own for the length of the body, so
-  the only thing left here is to make the struct store transfer its
-  count like the other kinds do. `make leak-check` has no case for this
-  shape; one belongs in the change that fixes it.
+- **a struct value stored in a map keeps its count outstanding.** a
+  map's value counting is cstring-only, so it takes no count on a
+  struct value and releases none when the entry is evicted; a struct
+  stored in one lives forever on the count the store left with it — the
+  caller's transferred count for an owned value, the compensating
+  retain for a borrowed one. this is the same untagged-container gap
+  closures and nested collections have, and it errs the same way: the
+  struct outlives the map rather than dangling inside it. lists are not
+  part of this gap — a struct-tagged list retains, releases on
+  eviction, and takes the caller's count when the stored value arrives
+  owned, the same transfer every other kind makes (`make leak-check`
+  covers that shape in `leak_struct_store`).
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

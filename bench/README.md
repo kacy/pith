@@ -39,14 +39,15 @@ cargo build --release --manifest-path bench/event_ledger_rust/Cargo.toml
 zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledger.zig
 ```
 
-Latest measured results on this machine, 200000 events, median of 5:
+Latest measured results on this machine, 200000 events, median of 5
+(2026-07-29):
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 322 | 199 | 56 | 0 | 575 |
-| go | 127 | 354 | 16 | 0 | 490 |
-| rust | 31 | 62 | 24 | 0 | 122 |
-| zig | 19 | 104 | 9 | 0 | 136 |
+| pith | 325 | 202 | 61 | 0 | 618 |
+| go | 100 | 372 | 16 | 0 | 481 |
+| rust | 29 | 61 | 26 | 0 | 117 |
+| zig | 22 | 114 | 11 | 0 | 137 |
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
@@ -97,7 +98,10 @@ bench/http_bench.sh ./bench/http_server_go 8081 120
 ```
 
 It prints a per-10s RSS table and a summary line (requests, throughput, and
-RSS start / end / peak). The Pith server holds flat RSS across the run.
+RSS start / end / peak). The Pith server holds flat RSS across the run: on
+the 2026-07-29 30-second run it served 8079 req/s with 4 kb of RSS growth,
+against the Go server's 28453 req/s with 6.1 mb of growth. Go is ~3.5x
+faster here; the flat line is the part this benchmark exists to watch.
 
 ## catalog service benchmark
 
@@ -189,7 +193,14 @@ candidate index lists for common region/active filters, which is closer to how
 an actual in-memory service would avoid rescanning the full catalog on every
 request.
 
-latest measured results on this machine, using the median of 5 trials:
+latest measured results on this machine, using the median of 5 trials
+(2026-07-29, direct 200k-iteration runs interleaved):
+
+| iterations | go total | pith total | ratio | rust total |
+|---|---:|---:|---:|---:|
+| `200000` | `~436 ms` | `~114 ms` | `0.26x` | `~80 ms` |
+
+the earlier 1m-iteration medians, for the trend:
 
 | iterations | go total | pith total | ratio | go batch | pith batch |
 |---|---:|---:|---:|---:|---:|
@@ -318,6 +329,10 @@ green wake-path work described below):
 | rust | 135 | 7.4 m | 2.4 mb |
 | zig | 135 | 7.4 m | 2.7 mb |
 
+the 2026-07-29 rerun (medians of 7, interleaved) held the same shape with
+the usual comparator drift: green ~133 (bimodal, best runs at ~69), green
+pinned to one worker ~46, go ~75, rust ~75, zig ~240.
+
 read the rows that oversubscribe os threads (pith os-thread, rust, zig)
 with the box in mind: eight threads on two cores, so they swing run to run.
 across two suite runs a week apart rust moved 135 -> 94 ms and zig 135 -> 204
@@ -400,11 +415,13 @@ and takes it away from the thing being measured — enough of it, and the
 oom killer starts taking builds out mid-run. go's default cache is on
 disk, which is what you want.
 
-latest measured results on this machine, using the median of 5 trials:
+latest measured results on this machine, using the median of 5 trials
+(totals rerun 2026-07-29; the phase breakdown below is from the 2026-07-21
+run and its shape still holds):
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `324 ms` | `136 ms` | `482 ms` | `1.49x` | `3.54x` |
+| `50000` | `~352 ms` | `~177 ms` | `~576 ms` | `1.63x` | `3.25x` |
 
 phase breakdown from the same run:
 

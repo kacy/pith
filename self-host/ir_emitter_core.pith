@@ -3480,16 +3480,17 @@ fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Boo
 
 # the value kinds a container store may take the caller's count for.
 #
-# struct values are deliberately left on the retain path. a `for` loop
-# variable writes a borrowed element into the same named slot a later `:=`
-# of that name uses, and the rebind then releases a count the loop never
-# took — `std.crypto.x509.verify_chain_issuers` has exactly that shape, with
-# `for root in trusted_roots` ahead of `root := root_result.ok`. the second
-# count a struct store takes today is what absorbs that release, so
-# transferring instead turns a latent over-release into a live one. the loop
-# variable is the bug to fix; until it is, structs keep the extra count.
+# struct values were the last holdout: a `for` loop variable used to write
+# its borrowed element into the same named slot a later `:=` of that name
+# reused, so the rebind released a count the loop never took —
+# `std.crypto.x509.verify_chain_issuers` had exactly that shape — and the
+# second count a struct store took was what absorbed that over-release.
+# loop variables now get storage of their own, so the mask is gone and a
+# struct built straight into a container transfers like every other kind.
 fn ir_container_store_takes_count(store_kind: String) -> Bool:
     if store_kind == "string" or store_kind == "bytes":
+        return true
+    if store_kind == "struct":
         return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 

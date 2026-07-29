@@ -27,6 +27,16 @@ fn main() -> Int!:
     value := await spawn compute(21)
     print(value.to_string())
 
+    # fan out over a list of tasks; the list needs no annotation, the
+    # first push names its element type
+    mut work := []
+    for n in 1..=3:
+        work.push(spawn compute(n))
+    mut doubled := []
+    for t in work:
+        doubled.push(await t)
+    print("doubled: {doubled[0]} {doubled[1]} {doubled[2]}")
+
     jobs := Channel[Int](1)
     jobs.send(7)
     picked := select:

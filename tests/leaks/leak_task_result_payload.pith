@@ -1,0 +1,34 @@
+# a heap payload extracted from an awaited task result must change hands
+# exactly once. the awaited shell is a fresh tuple the extraction owns, so
+# `unwrap_or` hands the ok payload out and frees the shell; on the err arm
+# the unused ok slot is empty, the error must be released, and the fallback
+# (built inside the err arm) becomes the value. a `.ok` read is a borrow.
+# both arms churn here — a count taken twice or a shell kept alive shows
+# up as growth.
+import leakprobe as probe
+
+fn make_words(i: Int) -> List[String]!:
+    if i % 2 == 1:
+        fail "odd-{i}"
+    return ["alpha-{i}", "beta"]
+
+fn churn_round(i: Int):
+    t := spawn make_words(i)
+    words := (await t).unwrap_or(["fallback-{i}"])
+    mut total := 0
+    for w in words:
+        total = total + w.len()
+    u := spawn make_words(i)
+    r := await u
+    if r.is_ok:
+        for w in r.ok:
+            total = total + w.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

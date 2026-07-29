@@ -1,0 +1,147 @@
+# awaiting a task pulled out of an inferred list (`mut tasks := []`)
+# used to lose the result type: the binding stayed untyped, so the
+# ok-payload extraction lowered to an unresolvable call (`unwrap_or`)
+# or an offset-less field read (`.is_ok`/`.ok`). the checker now takes
+# the element type from the first push. every payload kind is covered
+# in both extraction spellings, plus `!` propagation and `catch`.
+import std.bytes as bytes
+
+struct Point:
+    x: Int
+    y: Int
+
+fn make_int() -> Int!:
+    return 42
+fn make_string() -> String!:
+    return "hello"
+fn make_bytes() -> Bytes!:
+    return bytes.from_string_utf8("bz")
+fn make_list() -> List[Int]!:
+    return [1, 2, 3]
+fn make_map() -> Map[String, Int]!:
+    return {"a": 7}
+fn make_struct() -> Point!:
+    return Point(3, 4)
+fn make_bool() -> Bool!:
+    return true
+fn make_float() -> Float!:
+    return 1.5
+
+fn bang_through_list() -> Int!:
+    mut tasks := []
+    tasks.push(spawn make_list())
+    mut total := 0
+    for t in tasks:
+        vals := (await t)!
+        for v in vals:
+            total = total + v
+    return total
+
+fn unwrap_or_spelling():
+    mut ints := []
+    ints.push(spawn make_int())
+    for t in ints:
+        print("int={(await t).unwrap_or(-1)}")
+    mut strings := []
+    strings.push(spawn make_string())
+    for t in strings:
+        print("string={(await t).unwrap_or("x")}")
+    mut byte_tasks := []
+    byte_tasks.push(spawn make_bytes())
+    for t in byte_tasks:
+        b := (await t).unwrap_or(bytes.empty())
+        print("bytes={b.len()}")
+    mut lists := []
+    lists.push(spawn make_list())
+    for t in lists:
+        l := (await t).unwrap_or([])
+        print("list={l[0]}{l[1]}{l[2]}")
+    mut maps := []
+    maps.push(spawn make_map())
+    for t in maps:
+        m := (await t).unwrap_or({})
+        print("map={m["a"]}")
+    mut structs := []
+    structs.push(spawn make_struct())
+    for t in structs:
+        p := (await t).unwrap_or(Point(0, 0))
+        print("struct={p.x},{p.y}")
+    mut bools := []
+    bools.push(spawn make_bool())
+    for t in bools:
+        print("bool={(await t).unwrap_or(false)}")
+    mut floats := []
+    floats.push(spawn make_float())
+    for t in floats:
+        print("float={(await t).unwrap_or(0.0)}")
+
+fn field_spelling():
+    mut ints := []
+    ints.push(spawn make_int())
+    for t in ints:
+        r1 := await t
+        if r1.is_ok:
+            print("ok-int={r1.ok}")
+    mut strings := []
+    strings.push(spawn make_string())
+    for t in strings:
+        r2 := await t
+        if r2.is_ok:
+            print("ok-string={r2.ok}")
+    mut byte_tasks := []
+    byte_tasks.push(spawn make_bytes())
+    for t in byte_tasks:
+        r3 := await t
+        if r3.is_ok:
+            print("ok-bytes={r3.ok.len()}")
+    mut lists := []
+    lists.push(spawn make_list())
+    for t in lists:
+        r4 := await t
+        if r4.is_ok:
+            for v in r4.ok:
+                print("ok-list={v}")
+    mut maps := []
+    maps.push(spawn make_map())
+    for t in maps:
+        r5 := await t
+        if r5.is_ok:
+            m := r5.ok
+            print("ok-map={m["a"]}")
+    mut structs := []
+    structs.push(spawn make_struct())
+    for t in structs:
+        r6 := await t
+        if r6.is_ok:
+            p := r6.ok
+            print("ok-struct={p.x},{p.y}")
+    mut bools := []
+    bools.push(spawn make_bool())
+    for t in bools:
+        r7 := await t
+        if r7.is_ok:
+            print("ok-bool={r7.ok}")
+    mut floats := []
+    floats.push(spawn make_float())
+    for t in floats:
+        r8 := await t
+        if r8.is_ok:
+            print("ok-float={r8.ok}")
+
+fn catch_spelling():
+    mut lists := []
+    lists.push(spawn make_list())
+    for t in lists:
+        l := await t catch [9]
+        print("catch-list={l[0]}")
+    mut strings := []
+    strings.push(spawn make_string())
+    for t in strings:
+        s := await t catch "fallback"
+        print("catch-string={s}")
+
+fn main():
+    unwrap_or_spelling()
+    field_spelling()
+    catch_spelling()
+    print("bang={bang_through_list().unwrap_or(-1)}")

@@ -58,17 +58,16 @@ fn echo_request(payload: Bytes) -> Bytes:
     w.write_bytes(1, payload) catch false
     return w.bytes()
 
-# time each call, pushing the latency of every call into `lat` (a shared list
-# handle created by the caller — task results with list payloads are avoided on
-# purpose, the handle is the simpler contract).
-fn timed_batch(ch: grpc.Conn, method: String, request: Bytes, count: Int, lat: List[Int]) -> Int:
+# time each call and return the latency of every call.
+fn timed_batch(ch: grpc.Conn, method: String, request: Bytes, count: Int) -> List[Int]:
+    mut lat := []
     mut i := 0
     while i < count:
         t0 := time.mono_nanos()
         ch.unary(method, request) catch bytes.empty()
         lat.push(time.mono_nanos() - t0)
         i = i + 1
-    return count
+    return lat
 
 # each worker gets its OWN connection from the pool (round-robin) and keeps its
 # calls on that one connection's pipeline, so the pool spreads load across
@@ -77,18 +76,14 @@ fn timed_batch(ch: grpc.Conn, method: String, request: Bytes, count: Int, lat: L
 fn run_concurrent(pool: grpc.PoolConn, method: String, request: Bytes, calls: Int, conc: Int, merged: List[Int]):
     per := calls / conc
     mut tasks := []
-    mut buckets: List[List[Int]] := []
     mut w := 0
     while w < conc:
         c := pool.at(w % pool.size())
-        bucket: List[Int] := []
-        buckets.push(bucket)
-        tasks.push(spawn timed_batch(c, method, request, per, bucket))
+        tasks.push(spawn timed_batch(c, method, request, per))
         w = w + 1
     for t in tasks:
-        await t
-    for bucket in buckets:
-        for v in bucket:
+        lat := await t
+        for v in lat:
             merged.push(v)
 
 # the value at `pct` percent of the way through a sorted list, matching the
@@ -160,7 +155,8 @@ fn main():
     start := time.now()
     latencies: List[Int] := []
     if conc <= 1:
-        timed_batch(ch.at(0), method, request, calls, latencies)
+        for v in timed_batch(ch.at(0), method, request, calls):
+            latencies.push(v)
     else:
         run_concurrent(ch, method, request, calls, conc, latencies)
     elapsed := time.now() - start

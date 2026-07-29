@@ -33,6 +33,7 @@ cases=(
   tests/leaks/leak_loop_var_slot
   tests/leaks/leak_list_transform
   tests/leaks/leak_fn_value
+  tests/leaks/leak_task_result_payload
 )
 
 echo "--- leak growth (${low_rounds} vs ${high_rounds} rounds, limit ${limit_kb}kb) ---"

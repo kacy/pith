@@ -24,7 +24,7 @@ rows are the green backend, which is the default on linux; rows marked
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
 | catalog workload, 200k requests | **~114 ms** | ~436 ms | ~80 ms | — |
-| grpc unary echo, conc=8, 16 B | 8326 calls/s | 14795 | 11788 | — |
+| grpc unary echo, conc=8, 16 B | 7476 calls/s | 14731 | 12005 | — |
 | http server under wrk, 30 s | 8079 req/s, rss flat (+4 kb) | 28453 req/s (+6.1 mb) | — | — |
 | event_ledger, 200k events | 618 ms (1.28x go) | 481 ms | 117 ms | 137 ms |
 | std_pipeline, 50k records | 576 ms (1.63x go) | 352 ms | 177 ms | — |
@@ -227,18 +227,20 @@ binaries.
 
 | payload, conc=8 | pith | go | rust |
 |---|---:|---:|---:|
-| 16 B, calls/sec | 8326 | **14795** | 11788 |
-| 16 B, latency | 120 µs avg | 465 µs median, 1.7 ms p99 | 593 µs median, 2.3 ms p99 |
-| 1 KiB, calls/sec | 6216 | **11339** | 9557 |
-| 1 KiB, latency | 160 µs avg | 600 µs median, 2.9 ms p99 | 712 µs median, 3.3 ms p99 |
+| 16 B, calls/sec | 7476 | **14731** | 12005 |
+| 16 B, median / p99 | 954 µs / 2.9 ms | 471 µs / 2.0 ms | 591 µs / 2.3 ms |
+| 1 KiB, calls/sec | 7598 | **12366** | 9545 |
+| 1 KiB, median / p99 | 957 µs / 2.5 ms | 555 µs / 2.5 ms | 717 µs / 3.3 ms |
 
-pith sits at ~55% of go and ~65-70% of rust on throughput. the latency
-rows are not directly comparable — the pith client reports a plain
-average where go and rust report median and p99 — but the shape is
-consistent: pith's per-call time is low and its ceiling is the two-core
-box splitting the client, the server, and the connection's single reader
-task. teaching the pith client to report percentiles is a small follow-up
-that would make the row honest to compare.
+all three clients now report the same metrics: per-call median and p99
+from the full sorted latency set, timed with each language's monotonic
+clock. pith sits at ~50-60% of go and ~60-80% of rust on throughput, with
+a per-call median about 2x go's — one connection means one reader task,
+and the two-core box splits it against the server and seven sibling
+callers. the earlier revision of this table printed a pith "average"
+computed as wall-clock over total calls, which under eight-way concurrency
+flattered pith by nearly an order of magnitude; the percentile reporting
+replaced it.
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|

@@ -121,6 +121,28 @@ pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String)
         return lookup_binding_owned_by(entry.parent, name, module_path)
     return - 1
 
+## the arena index of the binding a lookup from this scope would find,
+## or -1. the checker uses it to retype a binding after the fact: an
+## empty collection literal has no element type at its declaration, so
+## the binding starts out untyped and takes its real type from the
+## first value stored into it.
+pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
+    mut i := binding_scope_ids.len() - 1
+    while i >= 0:
+        if binding_scope_ids[i] == scope_id:
+            if binding_names_equal(binding_names[i], name):
+                return i
+        i = i - 1
+    entry := scope_entries[scope_id]
+    if entry.parent >= 0:
+        return lookup_binding_index(entry.parent, name)
+    return - 1
+
+## replace the recorded type of an existing binding by arena index.
+pub fn set_binding_type_at(index: Int, type_id: Int):
+    if index >= 0 and index < binding_types.len():
+        binding_types[index] = type_id
+
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # search bindings in reverse order (latest first) for this scope
     mut i := binding_scope_ids.len() - 1

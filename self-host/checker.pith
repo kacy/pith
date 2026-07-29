@@ -13,7 +13,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, lookup_binding_index, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -101,6 +101,12 @@ pub mut struct_instance_tids: List[Int] := []
 mut suppress_unknown_type_for: Map[String, Int] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
 pub mut expression_type_cache: Map[Int, Int] := {}
+# bindings declared from an empty collection literal with no annotation
+# (`mut tasks := []`), keyed by binding arena index, valued with the
+# literal's node index. such a binding has no element type yet; the
+# first push/insert/add supplies one, and the entry is dropped once the
+# binding is retyped. see refine_empty_literal_binding.
+mut open_empty_literal_bindings: Map[Int, Int] := {}
 
 # ---------------------------------------------------------------
 # initialization
@@ -125,6 +131,7 @@ pub fn initialize_checker(file_path: String):
     struct_instance_tids = []
     suppress_unknown_type_for = {}
     expression_type_cache = {}
+    open_empty_literal_bindings = {}
     module_aliases = {}
     module_export_entries = []
     wildcard_imports = []
@@ -1558,6 +1565,14 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
     elif node.children.len() == 1:
         val_type := c_check_expr(node.children[0], scope_id)
         define_binding(scope_id, name, val_type, is_mut)
+        # an empty collection literal with no annotation has no element
+        # type yet; remember the binding so the first value stored into
+        # it can retype it (refine_empty_literal_binding).
+        if is_error_type(val_type):
+            val_node := get_node(node.children[0])
+            if val_node.children.len() == 0:
+                if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
+                    open_empty_literal_bindings.insert(lookup_binding_index(scope_id, name), node.children[0])
 
 # ---------------------------------------------------------------
 # assignment statement
@@ -3689,6 +3704,45 @@ fn report_undefined_module_function(alias: String, name: String, arg_indices: Li
                 return
     report_error("E201", message)
 
+# give a binding declared as an empty collection literal its type from
+# the first value stored into it. `mut tasks := []` checks as an error
+# (the literal has nothing to name an element type), so `tasks.push(v)`
+# retypes the binding to List[typeof(v)] here, and records the type on
+# the literal node so the emitter builds a tagged container that retains
+# its elements. returns the collection type, or TID_ERR when the binding
+# is not an open empty literal or the stored value is itself untyped
+# (pushing `none` or another empty literal decides nothing, so the
+# binding stays open for a later, typed store).
+fn refine_empty_literal_binding(name: String, method: String, args: List[Int], scope_id: Int, recv_idx: Int) -> Int:
+    binding_index := lookup_binding_index(scope_id, name)
+    if binding_index < 0:
+        return TID_ERR
+    if open_empty_literal_bindings.contains_key(binding_index) == false:
+        return TID_ERR
+    literal_idx := open_empty_literal_bindings[binding_index]
+    literal_kind := get_node(literal_idx).kind
+    mut refined := TID_ERR
+    if literal_kind == "list" and method == "push" and args.len() == 1:
+        elem := c_check_expr(argument_expression_index(args[0]), scope_id)
+        if is_error_type(elem) == false:
+            refined = intern_list_type(elem)
+    elif literal_kind == "set" and method == "add" and args.len() == 1:
+        elem := c_check_expr(argument_expression_index(args[0]), scope_id)
+        if is_error_type(elem) == false:
+            refined = intern_set_type(elem)
+    elif literal_kind == "map" and method == "insert" and args.len() == 2:
+        key_type := c_check_expr(argument_expression_index(args[0]), scope_id)
+        value_type := c_check_expr(argument_expression_index(args[1]), scope_id)
+        if is_error_type(key_type) == false and is_error_type(value_type) == false:
+            refined = intern_map_type(key_type, value_type)
+    if is_error_type(refined):
+        return TID_ERR
+    set_binding_type_at(binding_index, refined)
+    open_empty_literal_bindings.remove(binding_index)
+    expression_type_cache.insert(literal_idx, refined)
+    expression_type_cache.insert(recv_idx, refined)
+    return refined
+
 fn check_method_call(node: Node, scope_id: Int) -> Int:
     # node.value = method name
     # children[0] = receiver
@@ -3764,7 +3818,14 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 return TID_ERR
             return check_callable_type_with_args(callee_type, arg_indices, scope_id)
 
-    receiver_type := c_check_expr(node.children[0], scope_id)
+    mut receiver_type := c_check_expr(node.children[0], scope_id)
+    if is_error_type(receiver_type) and recv_node.kind == "ident":
+        # `mut tasks := []` left the binding untyped; the first value
+        # stored into it names the element type. without this, every
+        # later use of the binding stayed silently untyped — awaiting a
+        # task pulled out of such a list lost its result type, and the
+        # ok-payload extraction lowered to an unresolvable call.
+        receiver_type = refine_empty_literal_binding(recv_node.value, method_name, arg_indices, scope_id, node.children[0])
     if is_error_type(receiver_type):
         return TID_ERR
     mut recv_info := get_type_info(receiver_type)

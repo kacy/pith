@@ -129,6 +129,15 @@ the result outlive the list it was filtered from. an element type with
 no constructor of its own — a boxed enum, an optional or a result —
 still builds an untagged list, the same gap literals have.
 
+a generic body is the one place the checked types cannot pick the
+flavor, because specialization suppresses them. an empty list bound
+with an annotation (`mut out: List[T] := []`) resolves the element
+type from that annotation under the active substitution instead, so
+`algo.sort_by_key` over structs builds a struct-tagged list whose
+stores own their elements. an untagged out list owned nothing, and
+everything it handed back lived on counts its source dropped at its
+own scope exit.
+
 the list methods implemented in the runtime rather than the emitter
 decide their own flavor: `slice` and `sort` copy the source list's tag
 (`reverse` builds nothing, it reorders in place), `split` is

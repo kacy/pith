@@ -9,35 +9,70 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-the short version, all on the same 2-core machine. the concurrency rows are the
-green backend, which is the default on linux; the rows marked `PITH_GREEN=0`
-are the os-thread opt-out, kept for contrast:
+the short version, all on the same 2-core machine, fully rerun 2026-07-29
+after the july hardening pass (details in the summary below). the concurrency
+rows are the green backend, which is the default on linux; rows marked
+`PITH_GREEN=0` are the os-thread opt-out, kept for contrast:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **171 ms** | 69 ms | 94-135 ms | 135-204 ms |
-| chan_fanout, pinned to 1 worker | **~46 ms** | 69 ms | — | — |
-| chan_fanout, `PITH_GREEN=0` | ~438 ms | 69 ms | — | — |
-| context switches over the run | 2.5k | 258 | 4.8k | 60k |
-| 20k spawn + join | **~50 ms** | ~27 ms | — | — |
-| 20k spawn, peak rss | 10 mb | 11 mb | — | — |
-| 20k spawn, `PITH_GREEN=0` | ~1450 ms / 174 mb | — | — | — |
+| chan_fanout, 1m msgs | **~133 ms** (bimodal, best 69) | ~75 ms | ~75 ms | ~240 ms |
+| chan_fanout, pinned to 1 worker | **~46 ms** | ~75 ms | — | — |
+| 20k spawn + join (batches of 64) | **~56 ms / 3.2 mb** | ~8 ms / 3.8 mb | — | — |
+| 20k spawn, `PITH_GREEN=0` | ~1017 ms / 3.5 mb | — | — | — |
 
-| compute | pith | go | rust | zig |
+| services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| event_ledger, 200k events | 955 ms (1.16x go) | 820 ms | 178 ms | 199 ms |
-| std_pipeline, 50k records | 476 ms (1.54x go) | 310 ms | 135 ms | — |
-| grpc unary echo, conc=8 | 8075 calls/s (1 worker) | 13417 | 11012 | — |
+| catalog workload, 200k requests | **~114 ms** | ~436 ms | ~80 ms | — |
+| grpc unary echo, conc=8, 16 B | ~8000 calls/s | 14409 | 11604 | — |
+| http server under wrk, 30 s | 8079 req/s, rss flat (+4 kb) | 28453 req/s (+6.1 mb) | — | — |
+| event_ledger, 200k events | 618 ms (1.28x go) | 481 ms | 117 ms | 137 ms |
+| std_pipeline, 50k records | 576 ms (1.63x go) | 352 ms | 177 ms | — |
 
-on coordination the green backend beats rust and zig outright, sits ~2.3x
-behind go at the default worker count, and beats go pinned to one worker. on
-spawn it is ~2x go at go's memory, down from ~29x before the coroutine stack
-pool. compute is the older story: competitive with go, well behind rust and
-zig, and what is left of that gap is string building rather than the runtime.
+reading it honestly: on channel coordination green matches rust and beats zig,
+runs ~1.8x behind go at the default worker count (placement is still decided
+by first-resume luck, hence the bimodal spread), and beats go pinned to one
+worker. raw spawn/await is where go's scheduler still clearly wins; what the
+green backend buys over pith's own os-thread backend there is ~18x the speed
+at flat memory. the service-shaped rows are the strongest: the catalog
+workload — lookups, filtered scans, json batch scoring — runs ~4x faster than
+go's version, because a flat struct decodes in one pass with no reflection,
+and the http server holds byte-flat rss across a sustained load where the go
+server grows. the compute rows keep their long-standing shape: modestly behind
+go, well behind rust and zig, with string building the remaining gap.
 
-the rows that oversubscribe os threads swing run to run on a 2-core box (see
-the caveat on the fan-out table below); the green and go rows are the stable
-ones.
+## july 2026 hardening, in numbers
+
+between 2026-07-26 and 2026-07-29 the green backend became the linux default,
+every blocking call got a yield point, and an ownership sweep fixed seven
+leak/use-after-free defects in the emitter and runtime. what that changed,
+each measured before and after on this machine:
+
+| what | before | after |
+|---|---:|---:|
+| a co-tenant cpu task while another task waits on dns | blocked until the lookup ended | decoupled (~78 ms) |
+| the same, while another task appends to a log file | 257-273 ms | 122-124 ms |
+| the same, while another task waits on a child process | 1013-1018 ms | 8-9 ms |
+| one bare tcp connect to a tls server | server dead, health checks green | survives; >512 junk handshakes hold no slots |
+| json parse per request, 20k docs on one task | 89 mb, degrading | 10 mb flat, ~30% faster |
+| map/list eviction churn, 800k rounds | 38 mb | 10 mb flat |
+| `container[expr()]` index keys, 800k | 26-75 mb | flat |
+| `xs.map(f)` result lists, 800k rounds | 269 mb | flat |
+| fn values named in a loop, 800k | 309 mb | flat |
+| struct values stored in containers, 800k | 318 mb | flat |
+
+three of those "leaks" were masking live use-after-free bugs (a lambda stored
+in a `List[fn]` segfaulted the moment its leak was fixed; sitegen's tag pages
+came out named after the output path when struct stores stopped over-counting),
+which is the argument for fixing leaks even when the memory alone would be
+tolerable. the sweep is pinned by `make leak-check`, a growth gate that runs
+six churn shapes at two round counts in ci and fails on ~2 mb of drift — it
+was proven by reverting each fix and watching it go red.
+
+the cost side, stated plainly: single-task tight-loop file reads pay ~2x for
+the blocking-pool handoff that keeps file i/o from stalling a green worker,
+and event_ledger/std_pipeline drifted a few percent slower as hot paths gained
+the releases they had been skipping. flat memory was bought at list price.
 
 all numbers from one 2-core machine, medians of 5 where quick enough to
 repeat; the tables below were fully rerun 2026-07-15 (after the arc
@@ -56,9 +91,9 @@ in a single pass, filled straight into the struct.
 `bench/chan_fanout`, the coordination benchmark, was the one pith lost
 outright — ~580ms against go's ~69 for a million messages between eight
 tasks. the green wake-path work on 2026-07-26 (details below) brought
-the green backend to 171ms, ahead of rust and zig and 2.3x go, with
-~46ms — faster than go on this box — when the pipeline is pinned to one
-worker. the batch benchmarks measure compute and pith is competitive
+the green backend to ~133ms on the 2026-07-29 rerun — level with rust,
+ahead of zig, ~1.8x go — with ~46ms, faster than go on this box, when the
+pipeline is pinned to one worker. the batch benchmarks measure compute and pith is competitive
 there; coordination is now a genuine strength of the green backend
 rather than the standing embarrassment it was.
 
@@ -179,9 +214,11 @@ coroutine stack pool, the channel condvar fix, and the slab-free wake), so
 they understate green as it stands. re-running the same shape on 2026-07-27
 at a smaller batch put pith at 5067 calls/sec os-thread, 8075 at one green
 worker (+59%), and 7083 at two (+40%) — the same relationships the table
-below records (+53% and +41%), so its conclusions hold. the table is left at
-its original batch size rather than replaced with a smaller, non-comparable
-run; re-measuring it at the documented batch is a tracked follow-up.
+below records (+53% and +41%), so its conclusions hold. the 2026-07-29
+rerun of the cross-language shape (16-byte payload, conc=8, prebuilt
+client) put pith at ~7500-8900 calls/sec against go's 14409 and rust's
+11604 on the same server. the table is left at its original batch size
+rather than replaced with a smaller, non-comparable run.
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
@@ -297,17 +334,22 @@ interleaved with a go canary on the 2-core box (2026-07-26):
 
 | 20k spawn + join | elapsed | peak rss |
 |---|---:|---:|
-| os threads | ~1450 ms | 174 mb |
+| os threads (2026-07-26) | ~1450 ms | 174 mb |
+| os threads (2026-07-29) | ~1017 ms | 3.5 mb |
 | green, before the pool | ~580 ms | 10 mb |
-| green, after the pool | ~50 ms | 10 mb |
-| go | ~27 ms | 11 mb |
+| green (2026-07-29) | ~56 ms | 3.2 mb |
+| go (batch twin, 2026-07-29) | ~8 ms | 3.8 mb |
 
 page faults over the run fell 21832 -> ~2500 and context switches 25748 ->
 ~3000. shrinking the stack from 1 MiB to 64 KiB changed nothing before the
 pool, which is the tell: the cost was the *number* of mappings, not their
-size. green is now within ~2x of go on this shape at the same memory, from
-~29x, and roughly 30x faster than the os-thread backend, which pays a real
-thread per task.
+size. the 2026-07-29 rerun, against a minimal go twin of the same batch shape,
+puts go clearly ahead on raw spawn/await (~7x) — go's scheduler reuses
+goroutine stacks with no fd or slab work at all — while green holds an
+~18x lead over pith's own os-thread backend at flat memory. the os-thread
+rss collapse from 174 mb to 3.5 mb came free with the july ownership
+sweep: the task table's records now release their payloads on eviction
+like every other container.
 
 `bench/chan_fanout` — the same fan-out shape with cross-language
 comparators: four producer tasks push one million messages through a
@@ -315,9 +357,10 @@ bounded channel (capacity 256) and four consumer tasks drain them,
 folding each into an order-independent sum. all four languages print the
 same checksum. medians of 9 on this 2-core box, 2026-07-26:
 
-| | pith | pith green | go | rust | zig |
+| | pith `PITH_GREEN=0` | pith green | go | rust | zig |
 |---|---:|---:|---:|---:|---:|
-| total | 438ms | 171ms | **75ms** | 135ms | 135ms |
+| total (2026-07-26) | 438ms | 171ms | **75ms** | 135ms | 135ms |
+| total (2026-07-29) | — | ~133ms | ~75ms | ~75ms | ~240ms |
 | peak rss | 3.0 mb | 3.0 mb | 2.0 mb | 2.4 mb | 2.7 mb |
 
 read the rows that oversubscribe os threads (pith os-thread, rust, zig)

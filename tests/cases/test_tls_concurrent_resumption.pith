@@ -1,0 +1,106 @@
+# the tls session stores — the server's ticket map and the client's session
+# cache, each with an lru order list — are module globals shared by every
+# handshake in the process. clients dial from many tasks at once and a server
+# runs each handshake in its own spawned task, so with resumption enabled both
+# stores see concurrent lookups, inserts, and lru evictions. they used to be
+# bare maps with no lock, which is a torn-map crash waiting on scheduling.
+#
+# this hammers both sides at once: many client tasks, each with its own
+# resumption-enabled config (own cache key), dialing a resumption-enabled
+# server that handshakes every connection in its own task. more workers than
+# the client cache holds and more handshakes than the server ticket store
+# holds, so both lru evictions run concurrently too. the assertion is pure
+# outcome: every dial completes and echoes correctly, whether or not it
+# resumed. a torn store shows up as a failed dial, a wrong echo, or a hang.
+
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+PORT := 50791
+
+# more workers than TLS_MAX_CLIENT_SESSION_CACHE (32) and more total
+# handshakes than TLS_MAX_SERVER_SESSION_TICKETS (64).
+WORKERS := 40
+DIALS_PER_WORKER := 3
+
+fn serve_conn(listener_handle: Int, fd: Int):
+    conn_r := tls.listener_from_handle(listener_handle).handshake(fd)
+    if conn_r.is_err:
+        return
+    conn := conn_r.ok
+    msg_r := conn.read(64)
+    if msg_r.is_err:
+        conn.close()
+        return
+    conn.write_all("echo:" + msg_r.ok) catch 0
+    conn.close()
+
+fn run_server(listener_handle: Int):
+    listener := tls.listener_from_handle(listener_handle)
+    while true:
+        fd_r := listener.accept_socket()
+        if fd_r.is_err:
+            return
+        spawn serve_conn(listener_handle, fd_r.ok)
+
+fn dial_once(cfg: tls.Config, tag: String) -> Bool:
+    conn_r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
+    if conn_r.is_err:
+        return false
+    conn := conn_r.ok
+    if conn.write_all(tag).is_err:
+        conn.close()
+        return false
+    got_r := conn.read(64)
+    conn.close()
+    if got_r.is_err:
+        return false
+    return got_r.ok == "echo:" + tag
+
+fn worker(id: Int, cfg: tls.Config, done: Channel[Int]):
+    mut ok := 0
+    mut i := 0
+    while i < DIALS_PER_WORKER:
+        if dial_once(cfg, "w" + id.to_string() + "-" + i.to_string()):
+            ok = ok + 1
+        i = i + 1
+    done.send(ok)
+
+fn main() -> Int!:
+    # bind the listener before any client task starts, so a dial can never
+    # race the bind: an accepted socket just waits in the backlog until the
+    # accept loop picks it up. no sleeps, no readiness polling needed.
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.enable_session_resumption()
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    spawn run_server(listener.handle)
+
+    # each worker gets its own config, so each has its own client cache key.
+    # the configs are built here rather than in the workers because the config
+    # registry itself is not the store under test — only the session stores
+    # take concurrent traffic here, from the handshakes themselves.
+    configs: List[tls.Config] := []
+    mut created := 0
+    while created < WORKERS:
+        configs.push(tls.client_config_with_ca_file(CA_PATH)!.enable_session_resumption())
+        created = created + 1
+
+    done := Channel[Int](WORKERS)
+    mut started := 0
+    while started < WORKERS:
+        cfg := configs[started]
+        spawn worker(started, cfg, done)
+        started = started + 1
+
+    mut total := 0
+    mut finished := 0
+    while finished < WORKERS:
+        total = total + done.recv().unwrap_or(0)
+        finished = finished + 1
+
+    for cfg in configs:
+        cfg.close()
+    print(total.to_string() + "/" + (WORKERS * DIALS_PER_WORKER).to_string())
+    return 0

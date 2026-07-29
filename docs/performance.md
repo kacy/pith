@@ -24,7 +24,7 @@ rows are the green backend, which is the default on linux; rows marked
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
 | catalog workload, 200k requests | **~114 ms** | ~436 ms | ~80 ms | — |
-| grpc unary echo, conc=8, 16 B | ~8000 calls/s | 14409 | 11604 | — |
+| grpc unary echo, conc=8, 16 B | 8326 calls/s | 14795 | 11788 | — |
 | http server under wrk, 30 s | 8079 req/s, rss flat (+4 kb) | 28453 req/s (+6.1 mb) | — | — |
 | event_ledger, 200k events | 618 ms (1.28x go) | 481 ms | 117 ms | 137 ms |
 | std_pipeline, 50k records | 576 ms (1.63x go) | 352 ms | 177 ms | — |
@@ -214,11 +214,31 @@ coroutine stack pool, the channel condvar fix, and the slab-free wake), so
 they understate green as it stands. re-running the same shape on 2026-07-27
 at a smaller batch put pith at 5067 calls/sec os-thread, 8075 at one green
 worker (+59%), and 7083 at two (+40%) — the same relationships the table
-below records (+53% and +41%), so its conclusions hold. the 2026-07-29
-rerun of the cross-language shape (16-byte payload, conc=8, prebuilt
-client) put pith at ~7500-8900 calls/sec against go's 14409 and rust's
-11604 on the same server. the table is left at its original batch size
-rather than replaced with a smaller, non-comparable run.
+below records (+53% and +41%), so its conclusions hold. the table is left
+at its original batch size rather than replaced with a smaller,
+non-comparable run.
+
+the cross-language shape was rerun in full on 2026-07-29: one local tls
+server (`bench/grpc`), three prebuilt clients each timing 20000 unary
+calls over a single connection after 2000 warmup calls, eight concurrent,
+medians of three interleaved rounds. compile time is outside every lane —
+the pith client is built once beforehand, the same as the go and rust
+binaries.
+
+| payload, conc=8 | pith | go | rust |
+|---|---:|---:|---:|
+| 16 B, calls/sec | 8326 | **14795** | 11788 |
+| 16 B, latency | 120 µs avg | 465 µs median, 1.7 ms p99 | 593 µs median, 2.3 ms p99 |
+| 1 KiB, calls/sec | 6216 | **11339** | 9557 |
+| 1 KiB, latency | 160 µs avg | 600 µs median, 2.9 ms p99 | 712 µs median, 3.3 ms p99 |
+
+pith sits at ~55% of go and ~65-70% of rust on throughput. the latency
+rows are not directly comparable — the pith client reports a plain
+average where go and rust report median and p99 — but the shape is
+consistent: pith's per-call time is low and its ceiling is the two-core
+box splitting the client, the server, and the connection's single reader
+task. teaching the pith client to report percentiles is a small follow-up
+that would make the row honest to compare.
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|

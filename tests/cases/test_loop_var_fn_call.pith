@@ -1,0 +1,44 @@
+# calling a function through a `for` loop variable.
+#
+# the loop variable lives in its own storage slot (that is what keeps it from
+# clobbering an outer binding of the same name), so a call through it has to
+# name that slot. it used to name the source variable instead, the consumer
+# found no such variable, and the call fell through to the runtime's
+# unresolved-function stub — a compile-clean program that died at runtime.
+# indexing the list always worked, which is why this hid for a while.
+
+fn double(x: Int) -> Int:
+    return x * 2
+
+fn add_one(x: Int) -> Int:
+    return x + 1
+
+fn describe(x: Int) -> String:
+    return "value-" + x.to_string()
+
+fn main():
+    fns: List[fn(Int) -> Int] := [double, add_one]
+
+    # the plain loop call
+    mut total := 0
+    for f in fns:
+        total = total + f(10)
+    print("loop total={total}")
+
+    # nested loops, two live fn loop variables at once
+    mut nested := 0
+    for f in fns:
+        for g in fns:
+            nested = nested + f(g(1))
+    print("nested={nested}")
+
+    # rebinding the loop variable's name after the loop still calls the
+    # rebound value, not the loop slot
+    f := describe
+    print("rebound={f(7)}")
+
+    # a loop variable calling with another loop variable's result, mixed types
+    words: List[fn(Int) -> String] := [describe]
+    for w in words:
+        for n in fns:
+            print("mixed={w(n(3))}")

@@ -3355,6 +3355,16 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
+        # a call through a loop variable: `for f in fns:` binds f to a loop
+        # slot, so the call has to name that slot or the consumer will look up
+        # a variable that does not exist and fall through to the error stub.
+        # only a name that is not a declared function can be a variable call,
+        # which keeps a loop variable that shadows nothing extra out of this.
+        callee_n := get_node(node.children[0])
+        if callee_n.kind == "ident" and not ir_is_declared_callable(callee.name):
+            loop_slot := ir_loop_var_slot(callee.name)
+            if loop_slot.len() > 0:
+                callee = ResolvedCallee(loop_slot, callee.imported)
     # ord of any byte operand is just that byte: ord(s[i]) reads it with byte_at
     # instead of minting a one-character string, and ord("/") folds to a
     # constant. the argument is wrapped in an "arg" node, so unwrap it first.

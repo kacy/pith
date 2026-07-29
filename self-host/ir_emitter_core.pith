@@ -5592,6 +5592,44 @@ fn ir_emit_return_stmt(node: Node):
         ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
 
+# the tagged constructor for an empty `List[T]` bind whose element type only
+# the annotation knows, or "" when the normal target path already handles it.
+#
+# active only inside specialized generic bodies, where the checked types are
+# suppressed: everywhere else the checked type on the literal picks the
+# constructor, and second-guessing it here would fight that path. `List[T]`
+# with T substituted to string already resolves to the list_string target
+# upstream; every other heap element kind used to collapse to the coarse
+# "list" target and build untagged — a list whose stores own nothing, handing
+# back elements that lived on counts their source dropped at its own exit
+# (algo.sort_by_key over structs was the live case).
+fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) -> String:
+    if bind_target != "list" or val_idx < 0 or type_idx < 0:
+        return ""
+    if ir_active_generic_params.len() == 0 and ir_current_impl_subst_params.len() == 0:
+        return ""
+    vn := get_node(val_idx)
+    if vn.kind != "list" or vn.children.len() > 0:
+        return ""
+    tn := get_node(type_idx)
+    if tn.kind != "generic_type" or tn.value != "List" or tn.children.len() == 0:
+        return ""
+    mut elem := ir_resolve_type_node(tn.children[0])
+    if ir_rc_kind(elem).len() == 0:
+        # impl-method substitution (T -> the impl's concrete argument) is not
+        # part of ir_resolve_type_node's active-generic path, so try it as the
+        # fallback — and only when it actually substituted something, so a
+        # still-abstract T cannot clobber a resolution that already worked
+        inner := get_node(tn.children[0])
+        if inner.kind == "type":
+            substituted := ir_substitute_type_name(inner.value)
+            if substituted != inner.value:
+                elem = ir_resolve_type_hint(substituted)
+    ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem))
+    if ctor == "__list_new":
+        return ""
+    return ctor
+
 fn ir_emit_bind_stmt(node: Node):
     parts := ir_collect_bind_parts(node)
     name := parts.name
@@ -5635,7 +5673,13 @@ fn ir_emit_bind_stmt(node: Node):
             old_r = ir_reg()
             ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
-        r := ir_emit_value_for_target(val_idx, bind_target)
+        mut r := 0 - 1
+        annot_ctor := ir_generic_empty_list_ctor(val_idx, type_idx, bind_target)
+        if annot_ctor.len() > 0:
+            r = ir_reg()
+            ir_emit_call0(r, annot_ctor, "list")
+        if r < 0:
+            r = ir_emit_value_for_target(val_idx, bind_target)
         if tracked and bind_target != "tuple" and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:

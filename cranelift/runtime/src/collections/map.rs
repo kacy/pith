@@ -3,7 +3,6 @@
 //! Hybrid approach: Uses hashbrown::HashMap internally for O(1) lookups,
 //! but presents FFI-compatible interface matching the C runtime.
 
-use crate::collections::list::PithList;
 use crate::handle_registry::{self, HandleKind};
 use crate::runtime_core::optional_tuple;
 use hashbrown::HashMap;
@@ -364,37 +363,6 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
 
     impl_ref.release_all_values();
     impl_ref.clear();
-}
-
-/// Get all values as a list
-///
-/// # Safety
-/// Returns a new list that must be released
-#[no_mangle]
-pub unsafe extern "C" fn pith_map_values(map: PithMap) -> PithList {
-    use crate::collections::list::pith_list_new;
-
-    let Some(impl_ref) = map_ref(map) else {
-        return PithList {
-            ptr: std::ptr::null_mut(),
-        };
-    };
-    let mut list = pith_list_new(
-        impl_ref.val_size as i64,
-        if impl_ref.val_is_heap { 1 } else { 0 },
-    );
-
-    for val in impl_ref.values() {
-        crate::collections::list::pith_list_push(&mut list, val.as_ptr(), impl_ref.val_size as i64);
-
-        // The destination list gets its own count for each copied value
-        if impl_ref.val_is_heap {
-            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
-            crate::pith_cstring_retain(v as *const i8);
-        }
-    }
-
-    list
 }
 
 /// Release map and free memory

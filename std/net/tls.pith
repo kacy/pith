@@ -16,7 +16,9 @@ import std.os.certs as os_certs
 import std.time as time
 from std.io import TcpStream
 
-# handle allocators. valid handles are non-negative (error paths fail with a
+# the config registry: a config is a plain Int handle, and everything it holds
+# lives in these handle-keyed maps. handle allocators come first. valid handles
+# are non-negative (error paths fail with a
 # Result, they don't hand back a config); the two ranges are kept apart — configs
 # from 0, connections from a high base — so a handle reads unambiguously in a
 # trace. they count up so every handle stays non-negative. (these start values
@@ -34,6 +36,54 @@ mut native_server_key_der: Map[Int, Bytes] := {}
 mut native_server_client_ca_pem: Map[Int, String] := {}
 mut native_server_client_ca_optional: Map[Int, Bool] := {}
 mut native_listener_config: Map[Int, Int] := {}
+
+# guards the whole config registry above, the two hook maps declared further
+# down, and the handle counter. the registry is not startup-only state: an https
+# client builds a fresh config for every request (see std.net.http), so one task
+# is allocating a handle and inserting while another is mid-handshake reading
+# the same maps and a third is removing from them in Config.close(). two tasks
+# that read the counter together would also land on the same handle and share a
+# registry slot, so a handshake could pick up another config's certificate and
+# key. the lock only ever spans a single map operation — pem parsing,
+# certificate verification, and the user-supplied config hooks all run off it.
+mut native_config_mu := Mutex()
+
+# the registry accessors. each takes native_config_mu for one map operation and
+# hands the value back to the caller, so nothing outside them touches a registry
+# map. they are generic over the value type because the registry is a dozen maps
+# of eight value types that all share this access shape.
+fn config_has[V](values: Map[Int, V], handle: Int) -> Bool:
+    native_config_mu.lock()
+    found := values.contains_key(handle)
+    native_config_mu.unlock()
+    return found
+
+fn config_get[V](values: Map[Int, V], handle: Int, fallback: V) -> V:
+    native_config_mu.lock()
+    mut out := fallback
+    if values.contains_key(handle):
+        out = values[handle]
+    native_config_mu.unlock()
+    return out
+
+fn config_put[V](values: Map[Int, V], handle: Int, value: V):
+    native_config_mu.lock()
+    values.insert(handle, value)
+    native_config_mu.unlock()
+
+fn config_drop[V](values: Map[Int, V], handle: Int):
+    native_config_mu.lock()
+    if values.contains_key(handle):
+        values.remove(handle)
+    native_config_mu.unlock()
+
+# hand out the next config handle, one per caller.
+fn next_config_handle() -> Int:
+    native_config_mu.lock()
+    handle := next_native_config_handle
+    next_native_config_handle = next_native_config_handle + 1
+    native_config_mu.unlock()
+    return handle
 
 # how many server handshakes have failed since the process started. a failed
 # handshake is normal traffic — probes, scanners, clients that hang up — so a
@@ -244,17 +294,22 @@ struct ServerResumptionDecision:
 pub struct Listener:
     pub handle: Int
 
+# the config hooks, guarded by native_config_mu like the rest of the registry.
 mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
 mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
+
+# the value config_get falls back to when a config has no hook installed: it
+# approves the connection and selects nothing, which is what "no hook" means.
+fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
+    return ConfigHookResult(Config(0), "")
 
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
         fail "tls root certificates not found"
     # parse once here so config creation fails early for bad pem data.
     x509.parse_pem_chain(roots_pem)!
-    handle := next_native_config_handle
-    next_native_config_handle = next_native_config_handle + 1
-    native_config_roots_pem.insert(handle, roots_pem)
+    handle := next_config_handle()
+    config_put(native_config_roots_pem, handle, roots_pem)
     return Config(handle)
 
 fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
@@ -264,16 +319,14 @@ fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
     key := encoding.pem_decode(key_pem)!
     if key.kind != "PRIVATE KEY":
         fail "tls private key must be pkcs#8 pem"
-    handle := next_native_config_handle
-    next_native_config_handle = next_native_config_handle + 1
-    native_server_cert_pem.insert(handle, cert_pem)
-    native_server_key_der.insert(handle, key.body)
+    handle := next_config_handle()
+    config_put(native_server_cert_pem, handle, cert_pem)
+    config_put(native_server_key_der, handle, key.body)
     return Config(handle)
 
 fn config_alpn_protocols(config: Config) -> List[String]:
-    if native_config_alpn.contains_key(config.handle):
-        return native_config_alpn[config.handle]
-    return []
+    none_offered: List[String] := []
+    return config_get(native_config_alpn, config.handle, none_offered)
 
 fn config_alpn_key(config: Config) -> String:
     protocols := config_alpn_protocols(config)
@@ -285,21 +338,24 @@ fn config_session_cache_key(config: Config, server_name: String) -> String:
     return config.handle.to_string() + "|" + server_name + "|" + config_alpn_key(config)
 
 fn config_has_client_certificate(config: Config) -> Bool:
-    return native_client_cert_pem.contains_key(config.handle) and native_client_key_der.contains_key(config.handle)
+    return config_has(native_client_cert_pem, config.handle) and config_has(native_client_key_der, config.handle)
 
 fn config_requires_client_certificate(config: Config) -> Bool:
-    return native_server_client_ca_pem.contains_key(config.handle) and (not native_server_client_ca_optional.contains_key(config.handle) or not native_server_client_ca_optional[config.handle])
+    # a config with client ca roots requires a certificate unless it was
+    # installed as optional; an absent flag reads as required.
+    return config_has(native_server_client_ca_pem, config.handle) and not config_get(native_server_client_ca_optional, config.handle, false)
 
 fn config_requests_client_certificate(config: Config) -> Bool:
-    return native_server_client_ca_pem.contains_key(config.handle)
+    return config_has(native_server_client_ca_pem, config.handle)
 
 fn config_resumption_enabled(config: Config) -> Bool:
-    return native_config_resumption_enabled.contains_key(config.handle) and native_config_resumption_enabled[config.handle]
+    return config_get(native_config_resumption_enabled, config.handle, false)
 
 fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
-    if not native_client_cert_pem.contains_key(config.handle):
+    cert_pem := config_get(native_client_cert_pem, config.handle, "")
+    if cert_pem == "":
         fail "native tls client certificate not found"
-    blocks := encoding.pem_decode_all(native_client_cert_pem[config.handle])!
+    blocks := encoding.pem_decode_all(cert_pem)!
     certs: List[Bytes] := []
     for block in blocks:
         if block.kind == "CERTIFICATE":
@@ -309,28 +365,31 @@ fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
     return certs
 
 fn native_client_private_key(config: Config) -> Bytes!:
-    if not native_client_key_der.contains_key(config.handle):
+    key := config_get(native_client_key_der, config.handle, bytes.empty())
+    if key.len() == 0:
         fail "native tls client key not found"
-    return native_client_key_der[config.handle]
+    return key
 
 fn native_config_roots(config: Config) -> List[x509.Certificate]!:
-    if not native_config_roots_pem.contains_key(config.handle):
+    roots_pem := config_get(native_config_roots_pem, config.handle, "")
+    if roots_pem == "":
         fail "native tls client config not found"
-    return x509.parse_pem_chain(native_config_roots_pem[config.handle])!
+    return x509.parse_pem_chain(roots_pem)!
 
 fn is_native_config(config: Config) -> Bool:
-    return native_config_roots_pem.contains_key(config.handle)
+    return config_has(native_config_roots_pem, config.handle)
 
 fn is_native_server_config(config: Config) -> Bool:
-    return native_server_cert_pem.contains_key(config.handle)
+    return config_has(native_server_cert_pem, config.handle)
 
 fn is_native_conn(handle: Int) -> Bool:
     return native_conn_has(handle)
 
 fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
-    if not native_server_cert_pem.contains_key(config.handle):
+    cert_pem := config_get(native_server_cert_pem, config.handle, "")
+    if cert_pem == "":
         fail "native tls server config not found"
-    blocks := encoding.pem_decode_all(native_server_cert_pem[config.handle])!
+    blocks := encoding.pem_decode_all(cert_pem)!
     certs: List[Bytes] := []
     for block in blocks:
         if block.kind == "CERTIFICATE":
@@ -340,9 +399,10 @@ fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
     return certs
 
 fn native_server_private_key(config: Config) -> Bytes!:
-    if not native_server_key_der.contains_key(config.handle):
+    key := config_get(native_server_key_der, config.handle, bytes.empty())
+    if key.len() == 0:
         fail "native tls server key not found"
-    return native_server_key_der[config.handle]
+    return key
 
 fn checked_read(result: Int!binary.BinaryError) -> Int!:
     if result.is_err:
@@ -444,9 +504,10 @@ fn verify_certificate_chain(certs: List[x509.Certificate], config: Config, serve
     return true
 
 fn verify_client_certificate_chain(certs: List[x509.Certificate], config: Config) -> Bool!:
-    if not native_server_client_ca_pem.contains_key(config.handle):
+    ca_pem := config_get(native_server_client_ca_pem, config.handle, "")
+    if ca_pem == "":
         fail "native tls client ca config not found"
-    roots := x509.parse_pem_chain(native_server_client_ca_pem[config.handle])!
+    roots := x509.parse_pem_chain(ca_pem)!
     result := x509.verify_client_chain(certs, roots)
     if not result.ok:
         fail result.reason
@@ -535,20 +596,25 @@ fn copy_client_hello_info(info: ClientHelloInfo) -> ClientHelloInfo:
     return ClientHelloInfo(info.server_name, copy_string_list(info.alpn_protocols))
 
 fn run_verify_connection_hook(config: Config, state: ConnectionState) -> Bool!:
-    if not native_config_verify_connection.contains_key(config.handle):
+    if not config_has(native_config_verify_connection, config.handle):
         return true
+    hook := config_get(native_config_verify_connection, config.handle, no_config_hook)
     ctx := ConfigHookContext("verify_connection", copy_connection_state(state), empty_client_hello_info())
-    result := native_config_verify_connection[config.handle](ctx)
+    # the hook is application code and may do anything, so it runs off the
+    # registry lock — config_get already copied the fn value out.
+    result := hook(ctx)
     if result.reason != "":
         fail result.reason
     return true
 
 fn select_server_config(config: Config, client_hello: tls13.ClientHello) -> Config!:
-    if not native_server_config_selector.contains_key(config.handle):
+    if not config_has(native_server_config_selector, config.handle):
         return config
+    selector := config_get(native_server_config_selector, config.handle, no_config_hook)
     info := ClientHelloInfo(client_hello.server_name, copy_string_list(client_hello.alpn_protocols))
     ctx := ConfigHookContext("select_server_config", empty_connection_state(), copy_client_hello_info(info))
-    result := native_server_config_selector[config.handle](ctx)
+    # application code again: called off the lock.
+    result := selector(ctx)
     selected := result.selected_config
     if not is_native_server_config(selected):
         fail "tls config selector must return a server config"
@@ -1122,7 +1188,7 @@ pub fn server_config(cert_path: String, key_path: String) -> Config!:
 
 # install a server-side config selector that runs before the native handshake.
 pub fn with_config_selector(config: Config, chooser: fn(ClientHelloInfo) -> Config) -> Config:
-    native_server_config_selector.insert(config.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(chooser(ctx.client_hello), ""))
+    config_put(native_server_config_selector, config.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(chooser(ctx.client_hello), ""))
     return config
 
 # dial a tls server with system roots and host name verification.
@@ -1153,7 +1219,7 @@ pub fn conn_from_handle(handle: Int) -> Conn:
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:
     if is_native_server_config(config):
         fd := tcp_listen(host, port)!
-        native_listener_config.insert(fd, config.handle)
+        config_put(native_listener_config, fd, config.handle)
         return Listener(fd)
     if is_native_config(config):
         fail "tls.listen needs a server config, not a client config (use tls.server_config)"
@@ -1215,10 +1281,9 @@ impl Config:
             if protocol != "":
                 next_protocols.push(protocol)
         if next_protocols.len() == 0:
-            if native_config_alpn.contains_key(self.handle):
-                native_config_alpn.remove(self.handle)
+            config_drop(native_config_alpn, self.handle)
             return self
-        native_config_alpn.insert(self.handle, next_protocols)
+        config_put(native_config_alpn, self.handle, next_protocols)
         return self
 
     fn with_client_certificate(cert_path: String, key_path: String) -> Config!:
@@ -1230,8 +1295,8 @@ impl Config:
         key := encoding.pem_decode(key_pem)!
         if key.kind != "PRIVATE KEY":
             fail "tls client private key must be pkcs#8 pem"
-        native_client_cert_pem.insert(self.handle, cert_pem)
-        native_client_key_der.insert(self.handle, key.body)
+        config_put(native_client_cert_pem, self.handle, cert_pem)
+        config_put(native_client_key_der, self.handle, key.body)
         return self
 
     fn require_client_ca_file(path: String) -> Config!:
@@ -1239,9 +1304,8 @@ impl Config:
         roots := x509.parse_pem_chain(roots_pem)!
         if roots.len() == 0:
             fail "tls client ca bundle is empty"
-        native_server_client_ca_pem.insert(self.handle, roots_pem)
-        if native_server_client_ca_optional.contains_key(self.handle):
-            native_server_client_ca_optional.remove(self.handle)
+        config_put(native_server_client_ca_pem, self.handle, roots_pem)
+        config_drop(native_server_client_ca_optional, self.handle)
         return self
 
     fn request_client_ca_file(path: String) -> Config!:
@@ -1249,41 +1313,30 @@ impl Config:
         roots := x509.parse_pem_chain(roots_pem)!
         if roots.len() == 0:
             fail "tls client ca bundle is empty"
-        native_server_client_ca_pem.insert(self.handle, roots_pem)
-        native_server_client_ca_optional.insert(self.handle, true)
+        config_put(native_server_client_ca_pem, self.handle, roots_pem)
+        config_put(native_server_client_ca_optional, self.handle, true)
         return self
 
     fn enable_session_resumption() -> Config:
-        native_config_resumption_enabled.insert(self.handle, true)
+        config_put(native_config_resumption_enabled, self.handle, true)
         return self
 
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
-        native_config_verify_connection.insert(self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
+        config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
         return self
 
     fn close():
-        if native_config_roots_pem.contains_key(self.handle):
-            native_config_roots_pem.remove(self.handle)
-        if native_config_alpn.contains_key(self.handle):
-            native_config_alpn.remove(self.handle)
-        if native_config_resumption_enabled.contains_key(self.handle):
-            native_config_resumption_enabled.remove(self.handle)
-        if native_config_verify_connection.contains_key(self.handle):
-            native_config_verify_connection.remove(self.handle)
-        if native_server_config_selector.contains_key(self.handle):
-            native_server_config_selector.remove(self.handle)
-        if native_client_cert_pem.contains_key(self.handle):
-            native_client_cert_pem.remove(self.handle)
-        if native_client_key_der.contains_key(self.handle):
-            native_client_key_der.remove(self.handle)
-        if native_server_cert_pem.contains_key(self.handle):
-            native_server_cert_pem.remove(self.handle)
-        if native_server_key_der.contains_key(self.handle):
-            native_server_key_der.remove(self.handle)
-        if native_server_client_ca_pem.contains_key(self.handle):
-            native_server_client_ca_pem.remove(self.handle)
-        if native_server_client_ca_optional.contains_key(self.handle):
-            native_server_client_ca_optional.remove(self.handle)
+        config_drop(native_config_roots_pem, self.handle)
+        config_drop(native_config_alpn, self.handle)
+        config_drop(native_config_resumption_enabled, self.handle)
+        config_drop(native_config_verify_connection, self.handle)
+        config_drop(native_server_config_selector, self.handle)
+        config_drop(native_client_cert_pem, self.handle)
+        config_drop(native_client_key_der, self.handle)
+        config_drop(native_server_cert_pem, self.handle)
+        config_drop(native_server_key_der, self.handle)
+        config_drop(native_server_client_ca_pem, self.handle)
+        config_drop(native_server_client_ca_optional, self.handle)
         return
 
 impl Listener:
@@ -1291,7 +1344,7 @@ impl Listener:
         return self.handshake(self.accept_socket()!)!
 
     fn accept_socket() -> Int!:
-        if native_listener_config.contains_key(self.handle):
+        if config_has(native_listener_config, self.handle):
             fd := tcp_accept(self.handle)!
             # bound the handshake (and the connection's reads) so a slow or
             # silent client can't pin a server task before it authenticates.
@@ -1300,17 +1353,20 @@ impl Listener:
         fail "native tls listener not found"
 
     fn handshake(fd: Int) -> Conn!:
-        if not native_listener_config.contains_key(self.handle):
+        # config handles count up from 0, so a negative one means this listener
+        # has no config registered (it was never listened on, or it was closed).
+        config_handle := config_get(native_listener_config, self.handle, 0 - 1)
+        if config_handle < 0:
             note_failed_handshake(fd)
             fail "native tls listener not found"
         # the socket belongs to this call, so every error exit has to close it:
         # once the handshake fails there is no Conn for the caller to close.
         errdefer note_failed_handshake(fd)
-        return native_server_handshake(TcpStream(fd), Config(native_listener_config[self.handle]))!
+        return native_server_handshake(TcpStream(fd), Config(config_handle))!
 
     fn close():
-        if native_listener_config.contains_key(self.handle):
-            native_listener_config.remove(self.handle)
+        if config_has(native_listener_config, self.handle):
+            config_drop(native_listener_config, self.handle)
             tcp_close(self.handle)
             return
         return
@@ -1456,13 +1512,13 @@ test "tls config helpers track alpn, client auth, and resumption":
     assert_eq(config_alpn_protocols(client_cfg)[0], "pith.rpc")
     assert(config_has_client_certificate(client_cfg))
     assert(config_resumption_enabled(client_cfg))
-    assert(native_config_verify_connection.contains_key(client_cfg.handle))
+    assert(config_has(native_config_verify_connection, client_cfg.handle))
     assert_eq(select_alpn_protocol(server_cfg, ["pith.rpc", "http/1.1"])!, "pith.rpc")
     assert(select_alpn_protocol(server_cfg, ["http/1.1"]).is_err)
     assert(config_requests_client_certificate(server_cfg))
     assert(config_requires_client_certificate(server_cfg))
-    assert(native_config_verify_connection.contains_key(server_cfg.handle))
-    assert(native_server_config_selector.contains_key(server_cfg.handle))
+    assert(config_has(native_config_verify_connection, server_cfg.handle))
+    assert(config_has(native_server_config_selector, server_cfg.handle))
 
     optional_cfg := server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.request_client_ca_file("tests/live/fixtures/localhost-ca.crt")!
     assert(config_requests_client_certificate(optional_cfg))

@@ -31,6 +31,10 @@ pub extern "C" fn pith_exit(code: i64) {
 /// consistent with how socket waits degrade there.
 #[no_mangle]
 pub extern "C" fn pith_sleep(ms: i64) {
+    // a negative duration is not a very long one: `ms as u64` turns -5 into
+    // about 584 million years, which is indistinguishable from a hang. clamp
+    // first, so both paths below see a duration that means what it says.
+    let ms = ms.max(0);
     if let Some(task) = crate::concurrency::green::current_task() {
         crate::netpoll::sleep_task(ms, task);
         return;

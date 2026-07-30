@@ -299,9 +299,12 @@ mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHoo
 mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
 
 # the value config_get falls back to when a config has no hook installed: it
-# approves the connection and selects nothing, which is what "no hook" means.
+# approves the connection and selects nothing. the callers check first and only
+# reach this if the hook was removed in between, so the selected config is the
+# negative handle no config can have rather than 0, which in a server-only
+# program is a real server config the selector must not be able to land on.
 fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
-    return ConfigHookResult(Config(0), "")
+    return ConfigHookResult(Config(0 - 1), "")
 
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":

@@ -40,6 +40,9 @@ import std.time as time
 # for two reasons: a Db then carries only a plain handle, which sidesteps a
 # cross-module retain bug when a caller holds the handle; and one lock covers
 # every pool, so concurrent tasks borrow and return connections safely.
+# every read of `pools` — open, the three acquire/release/discard helpers, and
+# Db.close — takes registry_mu around the lookup and nothing else, so a slow
+# connect or close happens off the lock.
 mut pools: List[mysql.Pool] := []
 mut registry_mu := Mutex()
 
@@ -117,12 +120,17 @@ struct Pin:
     mut broken: Bool
     mut finished: Bool
 
+# every access to `pins` is one of the small helpers below, and each takes
+# pins_mu around exactly one field read or write; the connection i/o that
+# follows (release, discard) happens after the unlock.
 mut pins: List[Pin] := []
 mut pins_mu := Mutex()
 
 # the server-side prepared statement behind each Stmt, indexed by the slot the
 # Stmt carries. it lives beside the pin registry (not inside Pin) so a Tx, which
-# prepares nothing lasting, needs no placeholder statement.
+# prepares nothing lasting, needs no placeholder statement — and it is guarded
+# by pins_mu, the same lock, since register_prepared and prepared_stmt are its
+# only two accesses.
 mut prepared: List[mysql.Stmt] := []
 
 # pin a fresh connection from pool `pool_handle` and register it, returning the

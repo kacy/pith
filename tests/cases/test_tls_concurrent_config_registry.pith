@@ -1,0 +1,167 @@
+# the tls config registry — the dozen handle-keyed maps holding every config's
+# roots, certificate, key, alpn list and hooks, plus the counter that hands out
+# the handles — is shared by every task in the process. it is not startup-only
+# state: an https client builds a fresh config for each request, and the config
+# builders (with_alpn, enable_session_resumption, close) write to those maps
+# whenever they are called. unguarded, two tasks reading the counter together
+# got the same handle and shared one registry slot, which is how a handshake
+# ends up with another config's certificate and key; two tasks writing the same
+# map together corrupted it outright.
+#
+# this runs the writers and the readers at the same time. one set of tasks
+# churns the builder maps as fast as it can; another set builds fresh configs
+# and uses them for real handshakes against a tls echo server, whose own
+# handshakes are meanwhile reading the server config out of the same maps. the
+# assertions are the two things a torn registry breaks: every config gets a
+# handle of its own, and every dial completes and echoes correctly.
+
+import std.net.tls as tls
+import std.time as time
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+PORT := 50793
+
+# the tasks hammering the builder maps, and how hard.
+CHURNERS := 6
+ROUNDS := 60000
+
+# the tasks doing real handshakes, and how many configs each builds.
+DIALERS := 6
+CONFIGS_PER_DIALER := 3
+
+fn serve_conn(listener_handle: Int, fd: Int):
+    conn_r := tls.listener_from_handle(listener_handle).handshake(fd)
+    if conn_r.is_err:
+        return
+    conn := conn_r.ok
+    msg_r := conn.read(64)
+    if msg_r.is_err:
+        conn.close()
+        return
+    conn.write_all("echo:" + msg_r.ok) catch 0
+    conn.close()
+
+fn run_server(listener_handle: Int):
+    listener := tls.listener_from_handle(listener_handle)
+    while true:
+        fd_r := listener.accept_socket()
+        if fd_r.is_err:
+            return
+        spawn serve_conn(listener_handle, fd_r.ok)
+
+# write to the registry without pause: set an alpn list, set the resumption
+# flag, drop the alpn list again. every round is three map operations on maps
+# the handshakes below are reading.
+fn churn(cfg: tls.Config, rounds: Int, done: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        cfg.with_alpn(["h2", "http/1.1"])
+        cfg.enable_session_resumption()
+        cfg.with_alpn([])
+        i = i + 1
+    done.send(rounds)
+
+fn dial_once(cfg: tls.Config, tag: String) -> Bool:
+    conn_r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
+    if conn_r.is_err:
+        return false
+    conn := conn_r.ok
+    if conn.write_all(tag).is_err:
+        conn.close()
+        return false
+    got_r := conn.read(64)
+    conn.close()
+    if got_r.is_err:
+        return false
+    return got_r.ok == "echo:" + tag
+
+# a transient socket failure on a loaded box — a starved accept loop, a refused
+# connect while the backlog drains — is retried, the same way the resumption
+# case does it, so the exact-count output stays about the registry.
+fn dial_with_retry(cfg: tls.Config, tag: String) -> Bool:
+    mut attempt := 0
+    while attempt < 5:
+        if dial_once(cfg, tag):
+            return true
+        attempt = attempt + 1
+        time.delay(20 * attempt)
+    return false
+
+# build a config, handshake with it, close it, over and over: creation and
+# teardown race the churners' writes and each other's handle allocation.
+fn dialer(id: Int, handles: Channel[Int], done: Channel[Int]):
+    mut ok := 0
+    mut i := 0
+    while i < CONFIGS_PER_DIALER:
+        built := tls.client_config_with_ca_file(CA_PATH)
+        if built.is_err:
+            i = i + 1
+            continue
+        cfg := built.ok.with_alpn(["pith.rpc"])
+        handles.send(cfg.handle)
+        if dial_with_retry(cfg, "d" + id.to_string() + "-" + i.to_string()):
+            ok = ok + 1
+        cfg.close()
+        i = i + 1
+    done.send(ok)
+
+fn main() -> Int!:
+    # bind before any client task starts, so a dial can never race the bind.
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["pith.rpc"])
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    spawn run_server(listener.handle)
+
+    total_configs := DIALERS * CONFIGS_PER_DIALER
+    handles := Channel[Int](total_configs)
+    dialed := Channel[Int](DIALERS)
+    churned := Channel[Int](CHURNERS)
+
+    # the churners get their own configs so their writes never disturb what a
+    # dialer or the server is about to read back — only the maps are shared.
+    churn_configs: List[tls.Config] := []
+    mut made := 0
+    while made < CHURNERS:
+        churn_configs.push(tls.client_config_with_ca_file(CA_PATH)!)
+        made = made + 1
+
+    mut started := 0
+    while started < CHURNERS:
+        cfg := churn_configs[started]
+        spawn churn(cfg, ROUNDS, churned)
+        started = started + 1
+    mut launched := 0
+    while launched < DIALERS:
+        spawn dialer(launched, handles, dialed)
+        launched = launched + 1
+
+    mut echoed := 0
+    mut finished := 0
+    while finished < DIALERS:
+        echoed = echoed + dialed.recv().unwrap_or(0)
+        finished = finished + 1
+    mut rounds := 0
+    mut settled := 0
+    while settled < CHURNERS:
+        rounds = rounds + churned.recv().unwrap_or(0)
+        settled = settled + 1
+
+    mut seen: Map[Int, Bool] := {}
+    mut duplicates := 0
+    mut collected := 0
+    while collected < total_configs:
+        handle := handles.recv().unwrap_or(0 - 1)
+        if seen.contains_key(handle):
+            duplicates = duplicates + 1
+        seen.insert(handle, true)
+        collected = collected + 1
+
+    for cfg in churn_configs:
+        cfg.close()
+
+    print("duplicate handles: {duplicates}")
+    print("echoed: {echoed}/{total_configs}")
+    print("churn rounds: {rounds}")
+    return 0

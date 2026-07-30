@@ -223,3 +223,40 @@ payload (the caller-side cascade does not yet treat a call argument as the
 borrow it now provably is), and extracting the same optional local twice is a
 rare use-after-free that needs a second-extraction check rather than the blanket
 retain that was tried and reverted for regressing the common single case.
+
+sweeping std's shared globals for the same class of bug turned up three things
+that are questions of design rather than repairs, so they are recorded here
+instead of decided.
+
+`std.metrics` is correct under concurrency and does not scale. one mutex covers
+all thirteen registries, so every counter increment, gauge set and histogram
+observation in the process serializes on it, and a metric written once per
+request is the normal case. measured on the 2-core box, one task manages 7.4M
+increments a second; two manage 3.7M between them, four 3.0M, eight 2.4M — the
+aggregate falls as tasks are added, which is what a single lock looks like. the
+absolute cost is still small next to a request, around 0.4 µs per increment at
+eight tasks, so nothing is on fire. it is the shape that will not hold if a
+process ever writes metrics faster than it serves requests. every way out costs
+something. sharding by metric name spreads the contention but makes a coherent
+snapshot harder to take. a lock per series adds a lookup to the hot path.
+atomic counters are the obvious answer for a counter and no answer at all for a
+histogram, which updates seven values as one unit.
+
+`std.net.tls` configs are never closed, and `std.net.http` builds one per https
+request. `Config.close()` exists and removes the config's entries from the
+registry, but nothing in std or the examples calls it, so every https request
+adds another copy of the system root bundle — 219 KB here — to a map that only
+grows. two hundred configs held 44 MB that closing them released. the fix is an
+ownership decision rather than a patch: either the http client closes the config
+it built, which means being sure no response still refers to it, or the default
+client config becomes a process-wide value built once, which changes what
+`tls.client_config()` returns.
+
+`std.args` is safe by convention, with nothing enforcing the convention. its ten
+globals have no lock, which is fine given the parser's shape: init, then the
+add_flag / add_option / add_positional calls, then parse, all from main, after
+which everything left only reads. no path in the module mutates from the query
+side, so the state really is fixed once parse returns. nothing stops a program
+from calling the setup half from a spawned task, though, and there would be no
+diagnostic if it did — just a torn string. a lock here is cheap. whether a cli
+argument parser should carry one is the part worth an opinion.

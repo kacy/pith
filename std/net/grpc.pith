@@ -1202,6 +1202,15 @@ EXPIRED_ON_ARRIVAL := "grpc: deadline expired before the handler ran"
 fn expired_response() -> http.HttpResponse:
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL))
 
+# the process-wide unary dispatch, and the same for the body-level and streaming
+# forms further down. all three are shared and unlocked, and safe because of
+# where they are written: each is assigned as the first statement of the serve()
+# call that installs it, and that call then blocks in the accept loop for the
+# life of the process. so the write happens before the listener exists, let
+# alone the first request task, and nothing writes them again. the cost is one
+# dispatch per process — two concurrent serve() calls would fight over the slot,
+# which is the same single-handler constraint std.net.http2.server documents for
+# its streaming handler.
 mut grpc_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
 
 fn grpc_no_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
@@ -1281,6 +1290,8 @@ pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: f
 # this, deframing per method. buffered means the whole request and reply pass
 # through memory — the right tool for bounded streams, not endless ones.
 
+# installed by serve_body / serve_body_tls; see grpc_dispatch_fn above for why
+# this needs no lock.
 mut grpc_body_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
 
 fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
@@ -1457,6 +1468,8 @@ impl GrpcStream:
 # the stream dispatch lives in a module global for the same reason the unary
 # dispatch does: a pith closure cannot capture a fn-value, so there is one
 # streaming grpc server per process.
+# installed by the streaming serve calls; see grpc_dispatch_fn above for why
+# this needs no lock.
 mut grpc_stream_dispatch_fn: fn(String, GrpcStream) -> Int!GrpcError := grpc_no_stream_dispatch
 
 fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:

@@ -60,6 +60,16 @@ pub struct Event:
     pub message: String
     pub fields: List[Field]
 
+# the global logger's settings, and the lock over them. reconfiguration is not
+# a startup-only step: set_level, set_format and set_file are public, documented
+# as plain calls with no ordering requirement, and a server that raises its log
+# level while it is serving is the obvious reason to have them. so these are
+# written from one task while every other task is reading them on its way
+# through root() — and sink_path is a string, whose reassignment releases the
+# old value under a reader that has just loaded it. the lock covers the reads
+# and the writes; it is never held across the log write itself, which happens
+# from emit_record on a Logger that already carries its own copy.
+mut settings_mu := Mutex()
 mut min_level: Int := LEVEL_DEBUG
 mut sink_path: String := ""
 mut output_format: Int := FORMAT_CONSOLE
@@ -141,9 +151,16 @@ fn add_field(base: List[Field], item: Field) -> List[Field]:
     out.push(item)
     return out
 
-# create a logger from the current global settings.
+# create a logger from the current global settings. the three are read together
+# so a logger never mixes a level from before a reconfiguration with a sink from
+# after it.
 pub fn root() -> Logger:
-    return Logger(min_level, output_format, sink_path, [], "", "", "")
+    settings_mu.lock()
+    level := min_level
+    format := output_format
+    path := sink_path
+    settings_mu.unlock()
+    return Logger(level, format, path, [], "", "", "")
 
 # create a compact trace id suitable for logs and future propagation.
 pub fn new_trace_id() -> String!:
@@ -161,11 +178,15 @@ pub fn set_level(level: Int):
     log_set_level(level)
 
 fn log_set_level(level: Int):
+    settings_mu.lock()
     min_level = level
+    settings_mu.unlock()
 
 # set the global output format.
 pub fn set_format(format: Int):
+    settings_mu.lock()
     output_format = format
+    settings_mu.unlock()
 
 # use console output for the global logger.
 pub fn set_console():
@@ -180,14 +201,18 @@ pub fn set_file(path: String):
     log_set_file(path)
 
 fn log_set_file(path: String):
+    settings_mu.lock()
     sink_path = path
+    settings_mu.unlock()
 
 # stop writing log output to a file sink.
 pub fn clear_file():
     log_clear_file()
 
 fn log_clear_file():
+    settings_mu.lock()
     sink_path = ""
+    settings_mu.unlock()
 
 impl Logger:
     fn with(fields: List[Field]) -> Logger:

@@ -146,8 +146,9 @@ fn pith_store_process_handle(mut child: Child) -> i64 {
 }
 
 fn pith_strdup_string(text: &str) -> *mut i8 {
-    let owned = format!("{}\0", text);
-    unsafe { crate::pith_strdup(owned.as_ptr() as *const i8) }
+    // the shared helper allocates from the known length without probing the
+    // rust buffer for a header it cannot have (see runtime_core).
+    crate::runtime_core::pith_strdup_string(text)
 }
 
 unsafe fn pith_build_command(

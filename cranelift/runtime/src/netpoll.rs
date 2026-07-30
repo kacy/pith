@@ -42,9 +42,13 @@
 //!   the last waiter leaving does `EPOLL_CTL_DEL`. keeping epoll state a pure
 //!   function of the waiter lists is what makes the arm/disarm bookkeeping easy to
 //!   reason about.
-//! - `deadlines`: a min-heap of `(instant, seq, fd, interest)` for waits that
-//!   carry a finite timeout. the reactor sets each `epoll_wait` timeout to the
-//!   nearest deadline and, on expiry, wakes the task with a timeout result.
+//! - `deadlines`: a min-heap of timestamped entries for waits that carry a
+//!   finite timeout. the reactor sets each `epoll_wait` timeout to the nearest
+//!   deadline and, on expiry, wakes the task with a timeout result. an entry
+//!   targets either an fd wait or a pure timer.
+//! - `timers`: tasks sleeping with no fd at all (`sleep_task`, behind
+//!   `pith_sleep`). a sleep is a deadline wait minus the fd: same heap, same
+//!   sweep, nothing armed in epoll.
 //!
 //! ## the eventfd nudge
 //!
@@ -119,12 +123,21 @@ struct Waiter {
     outcome: Arc<AtomicI32>,
 }
 
+/// what a heap entry resolves when it expires: an fd wait that carried a
+/// timeout, or a pure timer with no fd at all (a green task sleeping). the two
+/// are distinct variants — rather than a sentinel fd smuggled through the io
+/// shape — so the fd-arming code (`reconcile_fd`, `desired_mask`, `on_close`)
+/// can never be handed a value that is not a real fd.
+enum DeadlineTarget {
+    Io { fd: RawFd, interest: Interest },
+    Timer,
+}
+
 /// a finite-timeout registration, ordered by instant for the min-heap.
 struct Deadline {
     at: Instant,
     seq: u64,
-    fd: RawFd,
-    interest: Interest,
+    target: DeadlineTarget,
 }
 
 // order deadlines by time (then seq) so a `BinaryHeap<Reverse<Deadline>>` pops the
@@ -159,6 +172,10 @@ struct Inner {
     waiters: HashMap<(RawFd, Interest), Vec<Waiter>>,
     fds: HashMap<RawFd, FdReg>,
     deadlines: BinaryHeap<std::cmp::Reverse<Deadline>>,
+    /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
+    /// (fd, interest) to key on, and giving it its own map keeps it out of
+    /// `waiters` — where everything is fd-shaped — entirely.
+    timers: HashMap<u64, Waiter>,
     next_seq: u64,
 }
 
@@ -168,6 +185,7 @@ impl Inner {
             waiters: HashMap::new(),
             fds: HashMap::new(),
             deadlines: BinaryHeap::new(),
+            timers: HashMap::new(),
             next_seq: 0,
         }
     }
@@ -362,8 +380,7 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i6
             inner.deadlines.push(std::cmp::Reverse(Deadline {
                 at,
                 seq,
-                fd,
-                interest,
+                target: DeadlineTarget::Io { fd, interest },
             }));
         }
         reconcile_fd(reactor, &mut inner, fd);
@@ -391,6 +408,65 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i6
         // mistaking it for a timeout.
         _ => 1,
     }
+}
+
+/// park the current green task for `ms` milliseconds without holding its worker.
+/// this is `wait_io` minus the fd: register a deadline, nudge the reactor if it
+/// is now the nearest one, and suspend; the deadline sweep wakes us. must be
+/// called only from inside a green task (the caller checks
+/// `green::current_task`); `task` is that task's slab id.
+///
+/// a zero or negative duration returns immediately — there is nothing to wait
+/// for, so nothing is registered.
+pub(crate) fn sleep_task(ms: i64, task: usize) {
+    if ms <= 0 {
+        return;
+    }
+    ensure_started();
+    let reactor = reactor();
+    let outcome = Arc::new(AtomicI32::new(PENDING));
+    let at = Instant::now() + Duration::from_millis(ms as u64);
+
+    let should_nudge = register_timer(reactor, at, task, &outcome);
+    if should_nudge {
+        nudge(reactor);
+    }
+
+    // park until the sweep marks us done. unlike `wait_io` — where a spurious
+    // wake is safe because the task re-runs its syscall — a sleep has no
+    // syscall to act as the source of truth, so an early resume must go back
+    // to sleep: our timer entry is still registered and the sweep will wake us
+    // again. once the outcome is terminal the entry is gone and we return.
+    while outcome.load(AtomicOrdering::Acquire) == PENDING {
+        green::park_current();
+    }
+}
+
+/// the registration half of `sleep_task`, split out so it can be exercised
+/// without a live coroutine to suspend. pushes a timer deadline and its waiter
+/// under the lock; returns whether the reactor must be nudged (only when this
+/// deadline is nearer than whatever it is currently sleeping on).
+fn register_timer(reactor: &Reactor, at: Instant, task: usize, outcome: &Arc<AtomicI32>) -> bool {
+    let mut inner = lock_inner(reactor);
+    let seq = inner.next_seq;
+    inner.next_seq += 1;
+
+    let nudge = inner.deadlines.peek().map_or(true, |top| at < top.0.at);
+
+    inner.timers.insert(
+        seq,
+        Waiter {
+            task,
+            seq,
+            outcome: outcome.clone(),
+        },
+    );
+    inner.deadlines.push(std::cmp::Reverse(Deadline {
+        at,
+        seq,
+        target: DeadlineTarget::Timer,
+    }));
+    nudge
 }
 
 /// the reactor thread: wait on epoll, wake the tasks whose fds are ready or whose
@@ -514,7 +590,8 @@ fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Ve
 
 /// pop every deadline at or before `now`, mark the matching still-pending waiter
 /// timed out, remove it, and queue it to wake. a stale heap entry (its waiter
-/// already fired ready and was removed) simply matches nothing.
+/// already fired ready and was removed) simply matches nothing. a timer entry
+/// has no fd, so it wakes its sleeper directly and never touches epoll.
 fn collect_expired(reactor: &Reactor, inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
     // track which fds we touch so we can re-arm/disarm them once at the end.
     let mut touched: Vec<RawFd> = Vec::new();
@@ -522,30 +599,51 @@ fn collect_expired(reactor: &Reactor, inner: &mut Inner, now: Instant, to_wake: 
         if top.0.at > now {
             break;
         }
-        let Deadline {
-            seq, fd, interest, ..
-        } = inner.deadlines.pop().unwrap().0;
+        let Deadline { seq, target, .. } = inner.deadlines.pop().unwrap().0;
 
-        if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
-            if let Some(pos) = waiters.iter().position(|w| w.seq == seq) {
-                let w = waiters.remove(pos);
-                if w
-                    .outcome
-                    .compare_exchange(
-                        PENDING,
-                        TIMED_OUT,
-                        AtomicOrdering::AcqRel,
-                        AtomicOrdering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    to_wake.push(w.task);
+        match target {
+            DeadlineTarget::Timer => {
+                // a sleep expiring is its success case; the same PENDING->
+                // terminal compare-exchange keeps the resolve-once discipline
+                // even though nothing else currently races for a timer.
+                if let Some(w) = inner.timers.remove(&seq) {
+                    if w
+                        .outcome
+                        .compare_exchange(
+                            PENDING,
+                            TIMED_OUT,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        to_wake.push(w.task);
+                    }
                 }
-                if waiters.is_empty() {
-                    inner.waiters.remove(&(fd, interest));
-                }
-                if !touched.contains(&fd) {
-                    touched.push(fd);
+            }
+            DeadlineTarget::Io { fd, interest } => {
+                if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
+                    if let Some(pos) = waiters.iter().position(|w| w.seq == seq) {
+                        let w = waiters.remove(pos);
+                        if w
+                            .outcome
+                            .compare_exchange(
+                                PENDING,
+                                TIMED_OUT,
+                                AtomicOrdering::AcqRel,
+                                AtomicOrdering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            to_wake.push(w.task);
+                        }
+                        if waiters.is_empty() {
+                            inner.waiters.remove(&(fd, interest));
+                        }
+                        if !touched.contains(&fd) {
+                            touched.push(fd);
+                        }
+                    }
                 }
             }
         }
@@ -639,14 +737,15 @@ mod tests {
         heap.push(std::cmp::Reverse(Deadline {
             at: now + Duration::from_millis(50),
             seq: 1,
-            fd: 3,
-            interest: Interest::Read,
+            target: DeadlineTarget::Io {
+                fd: 3,
+                interest: Interest::Read,
+            },
         }));
         heap.push(std::cmp::Reverse(Deadline {
             at: now + Duration::from_millis(10),
             seq: 2,
-            fd: 4,
-            interest: Interest::Write,
+            target: DeadlineTarget::Timer,
         }));
         // the nearer deadline (10ms) must come out first.
         assert_eq!(heap.pop().unwrap().0.seq, 2);
@@ -719,6 +818,66 @@ mod tests {
         let inner = lock_inner(reactor);
         assert!(inner.waiters.get(&(fd, Interest::Read)).is_none());
         assert!(inner.fds.get(&fd).is_none());
+    }
+
+    // the two timer tests share the one process-global registry, so they must
+    // not interleave with each other (cargo runs tests concurrently).
+    static TIMER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // a timer registration must land in the timers map and the deadline heap,
+    // and — once the sweep runs past it — resolve to TIMED_OUT with the entry
+    // gone and no fd touched. driven by hand (register_timer + collect_expired)
+    // because a real sleep_task needs a live coroutine to suspend into.
+    #[test]
+    fn timer_registers_expires_and_wakes() {
+        let _guard = TIMER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let reactor = reactor();
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        let at = Instant::now() + Duration::from_millis(5);
+        register_timer(reactor, at, usize::MAX, &outcome);
+
+        // identify our entry by its shared outcome cell, not by map emptiness:
+        // the registry is global and other tests may hold entries of their own.
+        let ours = |inner: &Inner| {
+            inner
+                .timers
+                .values()
+                .any(|w| Arc::ptr_eq(&w.outcome, &outcome))
+        };
+
+        let mut to_wake = Vec::new();
+        {
+            let mut inner = lock_inner(reactor);
+            assert!(ours(&inner));
+
+            // not due yet: the sweep leaves it alone.
+            collect_expired(reactor, &mut inner, at - Duration::from_millis(1), &mut to_wake);
+            assert!(to_wake.is_empty());
+            assert_eq!(outcome.load(AtomicOrdering::Acquire), PENDING);
+
+            // due: it resolves to TIMED_OUT, queues the task, and cleans up.
+            collect_expired(reactor, &mut inner, at, &mut to_wake);
+            assert!(!ours(&inner));
+        }
+        assert_eq!(to_wake, vec![usize::MAX]);
+        assert_eq!(outcome.load(AtomicOrdering::Acquire), TIMED_OUT);
+    }
+
+    // the nudge decision: a timer nearer than the current top asks for one, a
+    // farther timer rides on the reactor's existing sleep. asserted relative to
+    // a timer of our own, since the global registry may hold other entries.
+    #[test]
+    fn timer_nudges_only_when_nearest() {
+        let _guard = TIMER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let reactor = reactor();
+        let far = Instant::now() + Duration::from_secs(600);
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        register_timer(reactor, far, usize::MAX, &outcome);
+        assert!(register_timer(reactor, far - Duration::from_secs(60), usize::MAX, &outcome));
+        assert!(!register_timer(reactor, far + Duration::from_secs(60), usize::MAX, &outcome));
+        // the far-future entries left behind are inert: nothing sweeps them
+        // until long after every test in this process has finished, and their
+        // task id (usize::MAX) makes any eventual wake a no-op.
     }
 
     // on_close must only close out a *pending* wait: a waiter a readiness or

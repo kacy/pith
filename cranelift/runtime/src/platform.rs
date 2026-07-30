@@ -18,9 +18,23 @@ pub extern "C" fn pith_exit(code: i64) {
     std::process::exit(code as i32);
 }
 
-/// Sleep for given number of milliseconds
+/// Sleep for given number of milliseconds.
+///
+/// from inside a green task this parks the *task* on the reactor's timer heap
+/// and gives the worker back — a sleeping task must not stall every other task
+/// pinned to its worker (`select`'s idle probe sleeps in a loop, so before
+/// this two idle selects could occupy a whole two-worker pool). the guard is
+/// the same one `dns.rs` uses: `current_task()` is `None` on the main thread,
+/// on any plain OS thread, and on the whole os-thread backend, and there
+/// blocking the thread is exactly right, so that path is unchanged. on
+/// non-linux there is no reactor and `netpoll`'s fallback blocks the worker,
+/// consistent with how socket waits degrade there.
 #[no_mangle]
 pub extern "C" fn pith_sleep(ms: i64) {
+    if let Some(task) = crate::concurrency::green::current_task() {
+        crate::netpoll::sleep_task(ms, task);
+        return;
+    }
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 

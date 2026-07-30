@@ -216,13 +216,15 @@ matters more here than anywhere else: a wait has no bound at all, and four
 `sleep 3600`s would have emptied a four-thread pool. a child that has already
 finished by the time you wait for it is collected on the spot, with no park.
 
-`process.output` is the exception, along with everything routed through it
-(`run`, `text`, `output_checked`) and the two shell helpers `run_shell` and
-`output_shell`. each of those runs a child to completion inside one call while
-draining both of its pipes, and draining two pipes at once without blocking
-needs a reactor wait covering more than one fd, which is not built yet. until
-it is, `start` plus your own reads and `wait` yields properly; `output_ctx` is
-that pattern already written out.
+`process.output` — along with everything routed through it (`run`, `text`,
+`output_checked`) and the two shell helpers `run_shell` and `output_shell` —
+runs a child to completion inside one call while draining both of its pipes,
+which the reactor cannot cover (it waits on one fd at a time). those calls go
+to a small process pool of their own instead, the dns/file shape: the command
+crosses to a blocking thread, the task parks, and the worker stays free for
+however long the child runs. `exec` and `exec_output` take the same route.
+`start` plus your own reads and `wait` still parks on the reactor directly,
+with no pool thread involved.
 
 a task waits a few microseconds on-CPU before it actually parks. a read the page
 cache answers comes back faster than the two thread wakeups a park costs, so

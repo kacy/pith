@@ -68,6 +68,9 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
 
 /// Execute a command and return exit code
 ///
+/// the child runs to completion via the process pool (see `process`), so a
+/// green worker is not held for however long the command takes.
+///
 /// # Safety
 /// command must be a valid null-terminated C string
 #[no_mangle]
@@ -87,24 +90,34 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
         cmd.args(&parts[1..]);
     }
 
-    if let Ok(status) = cmd.status() {
-        if let Some(code) = status.code() {
-            return code as i64;
-        }
-        return 0;
+    match crate::process::command_status(cmd) {
+        Some(status) => status.code().unwrap_or(0) as i64,
+        None => -1,
     }
-    -1
+}
+
+/// the multiplier/increment of the LCG behind `pith_random_float` (knuth's
+/// MMIX constants).
+const LCG_MUL: u64 = 6364136223846793005;
+const LCG_INC: u64 = 1;
+
+fn lcg_step(s: u64) -> u64 {
+    s.wrapping_mul(LCG_MUL).wrapping_add(LCG_INC)
 }
 
 /// Random float between 0.0 and 1.0
 #[no_mangle]
 pub extern "C" fn pith_random_float() -> f64 {
-    use std::num::Wrapping;
-
-    let s = RANDOM_SEED.load(Ordering::Relaxed);
-    let new_s = Wrapping(s) * Wrapping(6364136223846793005) + Wrapping(1);
-    RANDOM_SEED.store(new_s.0, Ordering::Relaxed);
-    (new_s.0 >> 11) as f64 / (1u64 << 53) as f64
+    // step the seed with a compare-exchange rather than a load/store pair: two
+    // tasks on different workers drawing at once must each claim a distinct
+    // step of the sequence, not both advance from the same seed and return the
+    // identical "random" value. relaxed ordering is enough — the value itself
+    // is the only payload, nothing else is published through it.
+    let prev = RANDOM_SEED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| Some(lcg_step(s)))
+        .unwrap_or(0); // unreachable: the closure never returns None
+    let new_s = lcg_step(prev);
+    (new_s >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Seed the random number generator
@@ -151,6 +164,50 @@ pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // both random tests reseed the one process-global sequence, so they must
+    // not interleave with each other (cargo runs tests concurrently).
+    static RANDOM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // seeding pins the whole sequence: same seed, same draws. this is the
+    // contract the CAS step must preserve for single-threaded callers.
+    #[test]
+    fn seeded_draws_are_reproducible() {
+        let _guard = RANDOM_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        pith_random_seed(42);
+        let first: Vec<u64> = (0..8).map(|_| pith_random_float().to_bits()).collect();
+        pith_random_seed(42);
+        let second: Vec<u64> = (0..8).map(|_| pith_random_float().to_bits()).collect();
+        assert_eq!(first, second);
+    }
+
+    // the race this guards against: with a load/store seed update, two threads
+    // can both step from the same seed and return the identical draw. the
+    // compare-exchange gives every draw its own step of the sequence, so
+    // concurrent draws are distinct (up to the astronomically unlikely 53-bit
+    // output collision between different seeds).
+    #[test]
+    fn concurrent_draws_do_not_repeat() {
+        let _guard = RANDOM_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        pith_random_seed(7);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..2000)
+                        .map(|_| pith_random_float().to_bits())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u64> = threads
+            .into_iter()
+            .flat_map(|t| t.join().expect("drawing thread panicked"))
+            .collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "two concurrent draws returned the same value");
+    }
 
     #[test]
     fn exec_rejects_null_and_invalid_utf8() {

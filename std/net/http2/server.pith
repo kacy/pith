@@ -95,7 +95,9 @@ MAX_CONNECTIONS := 512
 # the in-flight permits, shared between the accept loops and the connection
 # tasks. a Semaphore is safe to share across threads; it lives as a module
 # global rather than a spawned-task argument (which the compiler cannot yet
-# dispatch for a sync-primitive type).
+# dispatch for a sync-primitive type). it is `mut` only because that is how a
+# global holding a constructed value is declared — the binding itself is never
+# reassigned, and the permit count is the semaphore's own synchronized state.
 mut connection_slots := Semaphore(MAX_CONNECTIONS)
 
 # how long a connection may sit without the socket making progress before the
@@ -554,6 +556,11 @@ impl ServerStream:
 # fn(ServerStream) would make Server and ServerStream mutually recursive, which
 # the type system resolves in file order and so cannot express. the cost is one
 # streaming handler per process — the same shape grpc already documents.
+#
+# shared and unlocked, and safe for the same reason grpc's dispatch is: the
+# assignment is the first statement of the listen_*_streaming call that installs
+# it, and that call then blocks in the accept loop, so it lands before the
+# listener exists and is never written again.
 mut stream_handler_fn: fn(ServerStream) -> Int := stream_handler_unset
 
 # the default streaming handler: refuse the stream, so a misconfigured server

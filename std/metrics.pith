@@ -33,6 +33,13 @@ mut histogram_bucket_defs: Map[String, List[Float]] := {}
 # guards all the metric maps so concurrent updates from separate threads do not
 # race. each public operation takes it around its whole read-modify-write; the
 # internal helpers (ensure_*, *_value, render_*) assume it is already held.
+#
+# every access to every map in this module goes through that rule — checked, not
+# assumed: nothing reads a map outside the lock, which is the failure a
+# write-guarded registry usually still has. holding it across a whole
+# snapshot_text() render is deliberate and safe: rendering is string building
+# with no i/o in it, so it cannot park a green task, and the scrape's socket
+# write happens in std.prometheus after this module has handed the text back.
 mut metrics_mu := Mutex()
 
 # label support. a metric can have several series, one per distinct label set

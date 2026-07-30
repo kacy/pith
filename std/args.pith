@@ -15,6 +15,14 @@
 # cross-module access in the current runtime
 # ===============================================================
 
+# these are shared globals with no lock, and that is safe because the parser has
+# exactly one shape: init, add_flag / add_option / add_positional, then parse,
+# all from main before the program does any work. every function that writes is
+# one of those setup calls, and every function that reads (get_flag, get_option,
+# get_positional, has_errors, get_errors, help_text) only reads — there is no
+# path in the module that mutates from the query side, so once parse returns the
+# state is fixed for the life of the process. calling the setup half from a
+# spawned task is not supported and would need a lock.
 mut app_name: String := ""
 mut app_desc: String := ""
 mut flags_data: String := ""

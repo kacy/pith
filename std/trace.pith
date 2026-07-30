@@ -73,6 +73,12 @@ pub struct Link:
 
 # global on/off. off => start() returns a non-recording span and touches no
 # per-thread state, so the overhead of leaving trace calls in is negligible.
+#
+# shared and unlocked on purpose. std.obs.init sets it once at startup, before
+# any task exists, and it is a machine word holding no reference, so a later
+# flip cannot tear or free anything under a reader — the worst a racing task
+# sees is the previous answer for one span, which is what turning tracing on or
+# off mid-flight means anyway.
 mut trace_active := false
 
 # turn tracing on or off process-wide. std.obs.init sets this from the
@@ -198,6 +204,13 @@ pub SAMPLER_PARENT_ALWAYS_OFF := 4
 pub SAMPLER_PARENT_TRACEIDRATIO := 5
 
 # the active sampler and its ratio (only used by the traceidratio modes).
+#
+# shared and unlocked for the same reason trace_active is: std.obs.start
+# installs the sampler before it turns tracing on, so both are set before the
+# first span, and both are plain words holding no reference. a task that reads
+# the mode while a later set_sampler is halfway through can pair a new mode with
+# an old ratio, which changes at most one span's sampling decision — and only
+# for the traceidratio modes, which are the ones that consult the ratio at all.
 mut sampler_mode := SAMPLER_PARENT_ALWAYS_ON
 mut sampler_ratio := 1.0
 
@@ -409,6 +422,12 @@ impl Span:
             record_finished_span(self)
 
 # --- export buffer: ended spans wait here for the OTLP exporter to drain ---
+#
+# every span that ends writes here and the exporter drains from here, so unlike
+# the two settings above this really is contended state. all three accesses
+# (set_sink, record_finished_span, drain_finished_spans) take the lock, and the
+# drain hands the list over and installs a fresh one rather than exporting under
+# it, so the exporter's POST runs off the lock.
 mut sink_mu := Mutex()
 mut sink_spans: List[Span] := []
 mut sink_active := false

@@ -51,7 +51,11 @@ DEFAULT_SPAN_DELAY_MS := 5000
 # module constant, because a module-level float constant is miscompiled to zero.
 DEFAULT_SAMPLER := "parentbased_always_on"
 
-# guards the two flags below so init/shutdown and the loop agree on state.
+# guards the two flags below so init/shutdown and the loop agree on state. every
+# access goes through it: set_running and is_running for the loop, and the
+# read-modify-writes in start and shutdown, which is what makes init idempotent
+# rather than merely usually-idempotent. the flush calls are outside it, so the
+# exporter's POST never runs under the lock.
 mut obs_mu := Mutex()
 # whether init has already run (init is idempotent).
 mut started := false

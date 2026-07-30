@@ -621,6 +621,26 @@ mod tests {
         }
     }
 
+    // structs travel between tasks, and tasks run on different worker threads,
+    // so the last strong owner can die on a thread the weak reader never runs
+    // on. the dead flag is an atomic for exactly this shape; the join gives the
+    // load a happens-after edge, so it must observe the death.
+    #[test]
+    fn weak_load_sees_a_release_from_another_thread() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            assert_eq!(pith_struct_weak_load(s), s);
+
+            std::thread::spawn(move || pith_struct_release(s))
+                .join()
+                .expect("releasing thread panicked");
+
+            assert_eq!(pith_struct_weak_load(s), 0);
+            pith_struct_weak_release(s);
+        }
+    }
+
     #[test]
     fn weak_load_on_a_dead_or_invalid_pointer_is_none() {
         unsafe {
@@ -1689,6 +1709,15 @@ unsafe fn struct_weak(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
     &*(base.add(STRUCT_OFF_WEAK) as *const std::sync::atomic::AtomicU32)
 }
 
+// the dead flag must be an atomic like its neighbors: structs cross task (and
+// therefore worker-thread) boundaries, so the last strong owner can set it on
+// one thread while a weak reference reads it on another. the release store
+// pairs with the acquire load in `pith_struct_weak_load`, so a reader that
+// observes the value as dead also observes everything the destructor did.
+unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
+    &*(base.add(STRUCT_OFF_DEAD) as *const std::sync::atomic::AtomicU32)
+}
+
 // drop one unit of weak; free the allocation when it reaches zero. this is the
 // single place a struct header is deallocated, so the strong path and every
 // weak reference funnel their final drop through here.
@@ -1787,9 +1816,11 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         f(ptr);
     }
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    // the value is now dead; a weak read after this returns none. drop the
-    // implicit weak unit, which frees the header if no weak refs remain.
-    (base.add(STRUCT_OFF_DEAD) as *mut u32).write(1);
+    // the value is now dead; a weak read after this returns none. the release
+    // store publishes the destructor's writes to any thread whose weak load
+    // sees the flag. then drop the implicit weak unit, which frees the header
+    // if no weak refs remain.
+    struct_dead(base).store(1, std::sync::atomic::Ordering::Release);
     struct_weak_drop(base);
 }
 
@@ -1828,7 +1859,9 @@ pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
     let Some(base) = struct_base(ptr) else {
         return 0;
     };
-    if (base.add(STRUCT_OFF_DEAD) as *const u32).read() != 0 {
+    // acquire pairs with the release store in `pith_struct_release`: a load
+    // that sees the target dead also sees its destructor's effects.
+    if struct_dead(base).load(std::sync::atomic::Ordering::Acquire) != 0 {
         return 0;
     }
     ptr

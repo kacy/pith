@@ -68,6 +68,9 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
 
 /// Execute a command and return exit code
 ///
+/// the child runs to completion via the process pool (see `process`), so a
+/// green worker is not held for however long the command takes.
+///
 /// # Safety
 /// command must be a valid null-terminated C string
 #[no_mangle]
@@ -87,13 +90,10 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
         cmd.args(&parts[1..]);
     }
 
-    if let Ok(status) = cmd.status() {
-        if let Some(code) = status.code() {
-            return code as i64;
-        }
-        return 0;
+    match crate::process::command_status(cmd) {
+        Some(status) => status.code().unwrap_or(0) as i64,
+        None => -1,
     }
-    -1
 }
 
 /// Random float between 0.0 and 1.0

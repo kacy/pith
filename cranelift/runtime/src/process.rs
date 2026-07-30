@@ -10,14 +10,17 @@
 //! worth waiting for is pollable. the pipes are pipes, and linux will hand out
 //! a `pidfd` that becomes readable exactly when the child exits. so both waits
 //! go to the epoll reactor that already serves sockets (`netpoll`), and no
-//! thread is parked on a child anywhere in the runtime.
+//! green worker is parked on a spawned child anywhere in the runtime.
 //!
-//! that also settles the question of what may run off the task's own thread:
-//! nothing does. the reactor never runs pith code — it only marks a task
-//! runnable, and the task resumes on the worker it was pinned to — so every
-//! handle, `Bytes`, and C string here is built where it always was.
+//! the run-to-completion calls (`process.output`, `exec`) cannot use the
+//! reactor: `Command::output` and `Command::status` spawn, drain, and wait in
+//! one opaque std call. those go to a small thread pool instead, the same
+//! shape dns and file i/o use — see `command_output`/`command_status` and the
+//! rule in `blocking` about what may cross to a pool thread. the `Command`
+//! going in and the `Output` coming back are plain owned data; every handle,
+//! `Bytes`, and C string is still built on the calling task's thread.
 
-use crate::blocking;
+use crate::blocking::{self, Pool};
 use crate::collections::list::PithList;
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fdio;
@@ -30,6 +33,25 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
+
+/// the threads that run whole-child commands (`Command::output`/`status`) for
+/// green tasks. a child decides for itself when it exits, so one of these can
+/// be held for an unbounded time — its own small pool keeps that from queueing
+/// behind (or in front of) file i/o or dns.
+static POOL: Pool = Pool::new("pith-proc", 4);
+
+/// run `command.output()` — spawn, drain both pipes, wait — without holding a
+/// green worker for the child's lifetime. off a green task it runs inline,
+/// exactly as the callers always did. `None` is any spawn/read failure.
+pub(crate) fn command_output(mut command: Command) -> Option<std::process::Output> {
+    blocking::run(&POOL, move || command.output().ok())
+}
+
+/// run `command.status()` — spawn and wait, stdio inherited — with the same
+/// offload-or-inline split as `command_output`.
+pub(crate) fn command_status(mut command: Command) -> Option<std::process::ExitStatus> {
+    blocking::run(&POOL, move || command.status().ok())
+}
 
 /// which of a child's three pipes a caller wants.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -232,18 +254,20 @@ pub unsafe extern "C" fn pith_process_output_argv(
     env_keys: PithList,
     env_values: PithList,
 ) -> i64 {
-    let Some(mut command) = pith_build_command(program, argv, cwd, env_keys, env_values) else {
+    let Some(command) = pith_build_command(program, argv, cwd, env_keys, env_values) else {
         return 0;
     };
 
-    match command.output() {
-        Ok(output) => {
+    // the child runs to completion on a pool thread (or inline, off green); the
+    // pith-visible handle is built here either way.
+    match command_output(command) {
+        Some(output) => {
             let status = output.status.code().unwrap_or(-1) as i64;
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             pith_store_process_output(status, stdout, stderr)
         }
-        Err(_) => 0,
+        None => 0,
     }
 }
 
@@ -438,6 +462,26 @@ pub extern "C" fn pith_process_close(handle: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // unit tests never run on a green worker, so these exercise the inline arm
+    // of the offload split; the pool arm is the same closure on another thread.
+    #[test]
+    fn command_output_captures_both_pipes_and_the_exit_code() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let output = command_output(cmd).expect("sh should run");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    #[test]
+    fn command_status_reports_the_exit_code() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 5"]);
+        assert_eq!(command_status(cmd).expect("sh should run").code(), Some(5));
+        assert!(command_status(Command::new("/nonexistent-program")).is_none());
+    }
 
     #[test]
     fn invalid_process_handles_return_safe_defaults() {

@@ -1,0 +1,86 @@
+# std.log's global settings — the minimum level, the output format and the file
+# sink path — are read by every task on its way through log.root(), and written
+# by set_level / set_format / set_file / clear_file, which are public calls with
+# no documented ordering. so a server that raises its log level or switches its
+# sink while it is serving has one task writing the settings under all the
+# others reading them. the level and the format are words, but the sink path is
+# a string: reassigning it releases the value a reader may have just loaded.
+#
+# the readers below check that every logger root() hands back carries a
+# recognizable triple — a level that was actually set, a format that was
+# actually set, and a sink path that is either empty or one the writers set. the
+# writers hand each set_file a freshly built path rather than a module constant,
+# because a constant's string is never freed and so never exposes the window.
+# unguarded, this segfaults on every run.
+
+import std.log as log
+
+SINK_PATH := "/tmp/pith-log-reconfigure-sink.txt"
+
+READERS := 4
+WRITERS := 2
+READS := 50000
+WRITES := 50000
+
+# flip every setting back and forth as fast as possible.
+fn reconfigure(rounds: Int, done: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        log.set_file(SINK_PATH + "." + i.to_string())
+        log.set_level(log.warn_level())
+        log.set_json()
+        log.clear_file()
+        log.set_level(log.debug_level())
+        log.set_console()
+        i = i + 1
+    done.send(rounds)
+
+# read the settings back through root() and count anything unrecognizable.
+fn observe(rounds: Int, done: Channel[Int]):
+    mut bad := 0
+    mut i := 0
+    while i < rounds:
+        logger := log.root()
+        if logger.min_level != log.debug_level() and logger.min_level != log.warn_level():
+            bad = bad + 1
+        if logger.format != 0 and logger.format != 1:
+            bad = bad + 1
+        if logger.sink_path != "" and not logger.sink_path.starts_with(SINK_PATH):
+            bad = bad + 1
+        i = i + 1
+    done.send(bad)
+
+fn main() -> Int:
+    written := Channel[Int](WRITERS)
+    observed := Channel[Int](READERS)
+
+    mut w := 0
+    while w < WRITERS:
+        spawn reconfigure(WRITES, written)
+        w = w + 1
+    mut r := 0
+    while r < READERS:
+        spawn observe(READS, observed)
+        r = r + 1
+
+    mut torn := 0
+    mut seen := 0
+    while seen < READERS:
+        torn = torn + observed.recv().unwrap_or(0 - 1)
+        seen = seen + 1
+    mut rounds := 0
+    mut settled := 0
+    while settled < WRITERS:
+        rounds = rounds + written.recv().unwrap_or(0)
+        settled = settled + 1
+
+    # leave the process where it started so nothing downstream inherits a sink.
+    # nothing is ever logged here, so no sink file is created to clean up.
+    log.clear_file()
+    log.set_console()
+    log.set_level(log.debug_level())
+
+    print("torn reads: {torn}")
+    print("reads: {READERS * READS}")
+    print("reconfigurations: {rounds}")
+    return 0

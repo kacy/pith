@@ -4,8 +4,16 @@ use crate::string;
 use std::alloc::{alloc, Layout};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
-    let owned = format!("{}\0", text);
-    unsafe { pith_strdup(owned.as_ptr() as *const i8) }
+    // the length is already known, so allocate the headered cstring directly.
+    // routing through pith_strdup would probe 16 bytes in front of the rust
+    // string's buffer looking for a header no rust allocation has — a read of
+    // memory this process does not own whenever the buffer starts its heap
+    // block. pith_alloc_cstring writes the nul terminator itself.
+    unsafe {
+        let result = pith_alloc_cstring(text.len());
+        std::ptr::copy_nonoverlapping(text.as_ptr() as *const i8, result, text.len());
+        result
+    }
 }
 
 #[no_mangle]

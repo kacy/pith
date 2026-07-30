@@ -282,9 +282,25 @@ fn huff_table() -> List[HuffEntry]:
         HuffEntry(0x3fffffff, 30),
 ]
 
-# reverse lookup for decoding, keyed by "length:code", built once on demand.
-mut decode_map: Map[String, Int] := {}
-mut decode_ready := false
+# reverse lookup for decoding, keyed by "length:code".
+#
+# it is derived from the fixed table above, so it is built when the module loads
+# rather than on the first header block that needs it. module initializers run on
+# the main thread before main's body, so by the time any connection task exists
+# the map is already whole and read-only, and concurrent decoders never observe
+# it half-built. building it costs well under a millisecond, paid once.
+decode_map: Map[String, Int] := build_decode_map()
+
+# invert the code table into the "length:code" -> symbol map that `decode` walks.
+fn build_decode_map() -> Map[String, Int]:
+    table := huff_table()
+    mut built: Map[String, Int] := {}
+    mut i := 0
+    while i < table.len():
+        entry := table[i]
+        built.insert(decode_key(entry.length, entry.code), i)
+        i = i + 1
+    return built
 
 # a low bit mask of `n` ones (0 for n == 0).
 fn low_mask(n: Int) -> Int:
@@ -293,18 +309,6 @@ fn low_mask(n: Int) -> Int:
 # the decode-map key that uniquely identifies a codeword.
 fn decode_key(length: Int, code: Int) -> String:
     return length.to_string() + ":" + code.to_string()
-
-# populate the decode map on first use.
-fn ensure_decode_map():
-    if decode_ready:
-        return
-    table := huff_table()
-    mut i := 0
-    while i < table.len():
-        entry := table[i]
-        decode_map.insert(decode_key(entry.length, entry.code), i)
-        i = i + 1
-    decode_ready = true
 
 # huffman-encode bytes. the result is padded to a byte boundary with the
 # most-significant bits of the EOS symbol, per RFC 7541 §5.2.
@@ -344,7 +348,6 @@ pub fn encoded_length(input: Bytes) -> Int:
 
 # huffman-decode bytes, rejecting a whole EOS symbol and malformed padding.
 pub fn decode(input: Bytes) -> Bytes!:
-    ensure_decode_map()
     out := bytes.buffer()
     mut code := 0
     mut length := 0

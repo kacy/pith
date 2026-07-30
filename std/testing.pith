@@ -11,27 +11,44 @@
 
 import std.fs as fs
 
+# the tally, and the lock over it. an assertion made from a spawned task is a
+# perfectly ordinary thing to write — testing concurrent code is what spawning
+# in a test is for — and two tasks incrementing a bare counter lose results,
+# which here means a failure that never gets reported. the lock covers the
+# counters and the silent flag; the line is printed after it is released, so a
+# slow terminal never serializes the tasks under test.
+mut counts_mu := Mutex()
 mut pass_count: Int := 0
 mut fail_count: Int := 0
 mut silent: Bool := false
 
 fn reset_counts():
+    counts_mu.lock()
     pass_count = 0
     fail_count = 0
     silent = false
+    counts_mu.unlock()
 
 fn silence_output():
+    counts_mu.lock()
     silent = true
+    counts_mu.unlock()
 
 fn record_pass(name: String):
+    counts_mu.lock()
     pass_count = pass_count + 1
-    if silent:
+    quiet := silent
+    counts_mu.unlock()
+    if quiet:
         return
     print("  ok   " + name)
 
 fn record_fail(name: String, detail: String):
+    counts_mu.lock()
     fail_count = fail_count + 1
-    if silent:
+    quiet := silent
+    counts_mu.unlock()
+    if quiet:
         return
     print("  FAIL " + name + " -- " + detail)
 
@@ -144,12 +161,15 @@ pub fn with_temp_dir(prefix: String, run: fn(String) -> Bool) -> Bool:
 
 # print summary
 pub fn done():
-    total := pass_count + fail_count
+    counts_mu.lock()
+    passed := pass_count
+    failed := fail_count
+    counts_mu.unlock()
     print("")
-    if fail_count == 0:
-        print(total.to_string() + " passed")
+    if failed == 0:
+        print((passed + failed).to_string() + " passed")
     else:
-        print(pass_count.to_string() + " passed, " + fail_count.to_string() + " failed")
+        print(passed.to_string() + " passed, " + failed.to_string() + " failed")
 
 test "testing helpers count passing checks":
     reset_counts()
@@ -197,6 +217,36 @@ test "testing helpers inspect files and temp dirs":
 
     assert(ok)
     assert(pass_count == 1)
+    assert(fail_count == 0)
+
+# assert from a task, so the tally takes concurrent writes. the counters are
+# private to this module, which is why this regression lives beside them rather
+# than in tests/cases.
+fn assert_from_task(rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        assert_eq(i, i)
+        assert_ne(i, i + 1)
+        i = i + 1
+    return rounds * 2
+
+test "the tally survives assertions made from several tasks at once":
+    reset_counts()
+    silence_output()
+
+    per := 2000
+    a := spawn assert_from_task(per)
+    b := spawn assert_from_task(per)
+    c := spawn assert_from_task(per)
+    d := spawn assert_from_task(per)
+
+    mut expected := 0
+    expected = expected + await a
+    expected = expected + await b
+    expected = expected + await c
+    expected = expected + await d
+
+    assert(pass_count == expected)
     assert(fail_count == 0)
 
 # a payload enum for the compiler regression test below. the two payload

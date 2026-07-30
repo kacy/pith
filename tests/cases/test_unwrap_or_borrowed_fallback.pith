@@ -1,0 +1,45 @@
+# `unwrap_or` with a fallback read from a named local. the consumer treats
+# a heap-kind unwrap_or value as owned and releases it, so when the err arm
+# (or the none arm, for an optional) hands out a borrowed fallback it must
+# retain first — without that the consumer's release strips the owner's
+# count and the owner's next use reads freed memory.
+#
+# valgrind-gated in MEMCHECK_CASES with the struct freelist disabled: the
+# recycled block makes the totals come out right even after the over-release,
+# so only valgrind sees the use-after-free.
+
+import std.bytes as bytes
+
+fn make(i: Int) -> Bytes!:
+    if i % 2 == 1:
+        fail "odd-" + i.to_string()
+    return bytes.from_string_utf8("ok-payload-" + i.to_string())
+
+fn find(i: Int) -> Bytes?:
+    if i % 2 == 0:
+        return none
+    return bytes.from_string_utf8("found-" + i.to_string())
+
+fn result_round(i: Int) -> Int:
+    fb := bytes.from_string_utf8("result-fallback")
+    r := make(i)
+    b := r.unwrap_or(fb)
+    # the fallback local must still be alive and intact after the
+    # extraction released its own copy of the value
+    return b.len() + fb.len()
+
+fn optional_round(i: Int) -> Int:
+    fb := bytes.from_string_utf8("optional-fallback")
+    o := find(i)
+    b := o.unwrap_or(fb)
+    return b.len() + fb.len()
+
+fn main() -> Int:
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        total = total + result_round(i)
+        total = total + optional_round(i)
+        i = i + 1
+    print("total " + total.to_string())
+    return 0

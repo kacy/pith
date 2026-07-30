@@ -206,14 +206,19 @@ gaps, all bounded leaks rather than dangling pointers:
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a
-  probe (`.is_ok`, `.is_err`, `== none`) or a payload read (`.ok`, `.err`)
-  now releases its payload: a probe never touches it, and a read borrows,
-  taking a fresh count only where the value escapes. either way the local
-  is still the last owner. any other use leaks as before — passed to a
-  call, returned whole, consumed by `catch` or `unwrap_or`, bound by
-  `if let`, or captured by a closure, which takes the shell and not the
-  payload. writing `x := call()!` avoids the whole question — `!` hands
-  the count to you rather than leaving it in the tuple.
+  probe (`.is_ok`, `.is_err`, `== none`), a payload read (`.ok`, `.err`),
+  or — for a result — an extraction (`r.unwrap_or(d)`, `r catch d`, `r!`)
+  releases its payload: a probe never touches it, a read borrows, and an
+  extraction hands its consumer a freshly retained count, so in every
+  case the local is still the last owner of the count the shell arrived
+  with. any other use leaks as before — passed to a call, returned
+  whole, bound by `if let`, or captured by a closure, which takes the
+  shell and not the payload. one more shape stays on the leak side:
+  rebinding one name to results of different payload types (`r :=
+  await ta` then `r := await tb` where the two tasks return different
+  `T!`s) — the cleanup path is keyed by name and cannot pick one payload
+  shape, so it frees only the shell. bind results of different types to
+  different names.
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.

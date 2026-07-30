@@ -1123,6 +1123,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_list_transform_ownership \
 	tests/cases/test_result_unwrap_or_fallback_leak \
 	tests/cases/test_borrowed_operand_extraction \
+	tests/cases/test_unwrap_or_borrowed_fallback \
 	tests/cases/test_task_result_payloads \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \

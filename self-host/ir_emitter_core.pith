@@ -874,7 +874,39 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # tests/cases/test_http2_tls_roundtrip fail valgrind. that turned out to be a
 # separate ownership bug the leak had been hiding — a channel `try_send` handed
 # its value to another task without taking a count — and is fixed.
-fn ir_tuple_use_is_whitelisted(parent: Node, name: String) -> Bool:
+#
+# for a RESULT local the extraction forms qualify too. `name.unwrap_or(d)`,
+# `name catch d`, and `name!` all classify a named operand as borrowed and
+# leave the shell holding the count it was built with: the ok arm hands the
+# consumer a freshly retained count (or, for a string payload, a borrow the
+# escape site retains), and the err arm keeps the error in the shell. so the
+# cleanup path is still the payload's sole owner, exactly like a `.ok` read.
+# without these entries an extraction disqualified the local from the cascade
+# and the count the shell holds was never released — one heap payload leaked
+# per extraction. `is_result` gates them because the OPTIONAL unwrap_or moves
+# a borrowed subject's count out to the extracted value instead of retaining
+# a new one; cascading such a local would release a count it no longer holds.
+fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
+    if is_result and parent.kind == "method_call" and parent.children.len() > 0:
+        recv := get_node(parent.children[0])
+        if recv.kind == "ident" and recv.value == name and ir_plain_method_name(parent.value) == "unwrap_or":
+            # only the receiver position is safe; the name appearing inside
+            # the fallback argument is a use the walk must judge on its own
+            mut ai := 1
+            mut arg_mentions := false
+            while ai < parent.children.len():
+                if ir_subtree_mentions_ident(parent.children[ai], name):
+                    arg_mentions = true
+                ai = ai + 1
+            return not arg_mentions
+    if is_result and parent.kind == "catch_expr" and parent.children.len() > 1:
+        operand := get_node(parent.children[0])
+        if operand.kind == "ident" and operand.value == name:
+            return not ir_subtree_mentions_ident(parent.children[1], name)
+    if is_result and parent.kind == "try" and parent.children.len() > 0:
+        operand := get_node(parent.children[0])
+        if operand.kind == "ident" and operand.value == name:
+            return true
     if parent.kind == "field_access":
         # the ident must be the receiver, and the field a flag or payload read
         if parent.children.len() == 0:
@@ -915,7 +947,7 @@ fn ir_subtree_mentions_ident(idx: Int, name: String) -> Bool:
 # walk the subtree: every occurrence of ident `name` must appear as the child of
 # a whitelisted parent. any other appearance (bound, returned, passed, unwrapped,
 # matched, iterated, ...) makes cascade unsafe and returns false.
-fn ir_tuple_uses_all_safe(idx: Int, name: String) -> Bool:
+fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     node := get_node(idx)
     # a lambda that mentions the local captures the three-slot shell and retains
     # only that, never the payload behind it. the closure can outlive this
@@ -934,12 +966,12 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String) -> Bool:
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
-            if not ir_tuple_use_is_whitelisted(node, name):
+            if not ir_tuple_use_is_whitelisted(node, name, is_result):
                 return false
             # a whitelisted parent consumes this ident safely; its sibling
             # children are still visited by the loop below
         else:
-            if not ir_tuple_uses_all_safe(child_idx, name):
+            if not ir_tuple_uses_all_safe(child_idx, name, is_result):
                 return false
     return true
 
@@ -961,8 +993,10 @@ fn ir_tuple_cascade_scan(body_idx: Int):
         # already in ir_var_regs, which at this point holds exactly the params.
         if kind == "tuple" and ir_tuple_local_tid.contains_key(name) and not ir_var_regs.contains_key(name):
             tid := ir_tuple_local_tid[name]
-            if tid >= 0 and ir_tuple_local_has_rc_payload(tid) and ir_tuple_uses_all_safe(body_idx, name):
-                ir_tuple_cascade_names.push(name)
+            if tid >= 0 and ir_tuple_local_has_rc_payload(tid):
+                is_result := get_type_info(tid).kind == "result"
+                if ir_tuple_uses_all_safe(body_idx, name, is_result):
+                    ir_tuple_cascade_names.push(name)
         i = i + 1
 
 # true when a result/optional type holds an rc payload worth cascading: either
@@ -3925,6 +3959,14 @@ fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
     # (`r.unwrap_or(bytes.empty())`) every ok iteration. this mirrors the
     # optional unwrap_or, which already defers its default into the none arm.
     fallback_r := ir_expr(arg_idx)
+    # consumers treat a heap-kind unwrap_or value as owned and release it, so
+    # a fallback that arrives borrowed (a named local, a field) needs a count
+    # of its own here — without one that release strips the owner's count and
+    # the owner's next use reads freed memory. a string fallback is excluded
+    # because a string unwrap_or stays classified borrowed (the escape site
+    # retains), mirroring the ok arm.
+    if not ir_string_expr_is_borrowed(idx) and ir_string_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
     if operand_class != "borrowed":
         ir_emit_release_result_error(recv_r, recv_tid)
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
@@ -4377,6 +4419,15 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 ir_emit_label(none_l)
                 default_idx := ir_method_call_arg_expr(node, 0)
                 default_r := ir_expr(default_idx)
+                # consumers treat a heap-kind unwrap_or value as owned and
+                # release it, so a default that arrives borrowed (a named
+                # local, a field) needs its own count here — without one that
+                # release strips the owner's count and the owner's next use
+                # reads freed memory. strings stay on the borrowed
+                # classification (the escape site retains), so they are
+                # excluded. mirrors the result unwrap_or's fallback arm.
+                if inner_kind.len() > 0 and not ir_string_expr_is_borrowed(idx) and ir_string_expr_is_borrowed(default_idx):
+                    ir_rc_retain_reg(default_r, inner_kind)
                 ir_emit("store " + tmp + " " + default_r.to_string())
                 ir_emit_label(end_l)
                 if owns_subject:

@@ -107,6 +107,24 @@ correctness story:
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests
   (`tests/cases/test_xmod_float.pith` and friends).
+- `os.set_env` after tasks have started is a libc-level race. glibc's `setenv`
+  and `getenv` are not synchronized against each other, and the runtime's own
+  pool threads read the environment behind your back — `getaddrinfo` on the
+  dns pool consults `RES_OPTIONS` and friends on every lookup. rust's internal
+  env lock only covers rust-side accesses, so a `set_env` concurrent with a
+  dial can crash in libc. set environment variables before spawning tasks. the
+  candidate fixes (snapshot the environment at startup, or make late `set_env`
+  write to an overlay that child processes inherit) both change observable
+  semantics, so this is documented rather than decided for now.
+- closing an fd-backed handle races a concurrent call on the same handle. a
+  task parked on a socket or pipe that another task closes is woken with an
+  error (the reactor's close teardown), which is the common case and safe.
+  what remains is the standard raw-fd hazard: between one task's handle
+  lookup and its syscall, a close plus a new open can recycle the fd number,
+  and the syscall lands on the wrong fd. present on both backends and
+  inherited from fd semantics; closing it needs handles that carry liveness
+  (a generation, like task handles have) rather than raw fd numbers. do not
+  share a connection between tasks without coordinating its close.
 
 ## the green backend, now the default on linux
 
@@ -134,14 +152,22 @@ thread would. on a slow network mount that reasoning does not hold and a task
 doing one of them holds its worker until it returns. making that decision
 adaptive rather than fixed is the open work.
 
-the other is `process.output` and the calls built on it (`run`, `text`,
-`output_checked`, `run_shell`, `output_shell`). each runs a child to completion
-inside one runtime call and holds the worker for as long as the child lives.
-draining a child's stdout and stderr at the same time without blocking needs a
-reactor wait that covers more than one fd, and the reactor waits on one; adding
-that is the fix. `start` plus explicit reads and `wait` yields properly today,
-and `output_ctx` is that pattern already written out. `PITH_GREEN=0` is the
-blunt workaround for either.
+the other is `sleep`, and everything built on it. `time.delay` maps straight
+to the blocking sleep, so a green task that sleeps holds its worker for the
+duration — and the waiting loops built on delay hold one too: a `select` with
+no ready arm sleeps a millisecond per probe until an arm fires, and the
+`concurrent.after`/`ticker` workers and a context's deadline watcher do the
+same. each slice is short and correctness is unaffected, but on a two-worker
+host two idle selects can occupy both workers while they poll. the fix is a
+real timer in the reactor — the deadline heap `netpoll` already keeps could
+serve a pure-timeout wait with no fd — so a sleeping task parks the way a
+socket read does. `PITH_GREEN=0` is the blunt workaround.
+
+(`process.output` and the calls built on it — `run`, `text`, `output_checked`,
+`run_shell`, `output_shell`, plus `exec` and `exec_output` — used to be on
+this list for holding a worker while a child ran to completion; they now hand
+the whole spawn-drain-wait to a process pool of their own and the caller
+parks, the same shape dns and file i/o use.)
 
 the calling task pays for that. a file call made from inside a task now costs a
 thread handoff it did not before, so a task reading a small cached file in a

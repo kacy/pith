@@ -45,6 +45,9 @@ pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
 }
 
 /// Execute command and capture output — returns stdout as C string
+///
+/// the child runs to completion via the process pool (see `process`), so a
+/// green worker is not held for however long the command takes.
 #[no_mangle]
 pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
     let Some(cmd_str) = cstr_str(cmd) else {
@@ -52,15 +55,13 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
     };
     let parts: Vec<&str> = cmd_str.split_whitespace().collect();
     if parts.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        match std::process::Command::new(parts[0])
-            .args(&parts[1..])
-            .output()
-        {
-            Ok(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
-            Err(_) => std::ptr::null_mut(),
-        }
+        return std::ptr::null_mut();
+    }
+    let mut command = std::process::Command::new(parts[0]);
+    command.args(&parts[1..]);
+    match crate::process::command_output(command) {
+        Some(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
+        None => std::ptr::null_mut(),
     }
 }
 

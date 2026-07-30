@@ -1,0 +1,58 @@
+# std's shared lookup tables — the sha round constants, the hpack static table
+# and the huffman decode map — used to be filled in on first use behind an
+# unsynchronized flag, so two tasks reaching a cold table at the same time could
+# read it half-built or corrupt it by filling it twice. they are built at module
+# load now, and this pins that: every task below touches all three tables for the
+# first time at the same instant and must come back with the same answer.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.hash as hash
+import std.net.http2.hpack as hpack
+import std.net.http2.huffman as huffman
+
+TASKS := 16
+
+# touch all three tables and fold what they produce into one comparable string.
+fn probe(gate: AtomicInt) -> String:
+    # spin rather than sleep so the tasks pile onto the tables together instead
+    # of arriving one at a time behind a timer.
+    mut spins := 0
+    while gate.load() == 0:
+        spins = spins + 1
+
+    sha256_digest := hash.sha256(bytes.from_string_utf8("abc"))
+    sha512_digest := hash.sha512(bytes.from_string_utf8("abc"))
+
+    round_trip := huffman.decode(huffman.encode(bytes.from_string_utf8("www.example.com"))) catch bytes.empty()
+
+    # RFC 7541 C.4.1: three indexed static-table fields plus a huffman-coded
+    # :authority literal.
+    block := encoding.from_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff") catch bytes.empty()
+    decoder := hpack.new_decoder(4096)
+    fields := decoder.decode(block) catch []
+
+    return sha256_digest + "|" + sha512_digest + "|" + encoding.to_hex(round_trip) + "|" + fields.len().to_string()
+
+fn main() -> Int:
+    gate := AtomicInt(0)
+    mut tasks: List[Task[String]] := []
+    mut started := 0
+    while started < TASKS:
+        tasks.push(spawn probe(gate))
+        started = started + 1
+    gate.store(1)
+
+    mut first := ""
+    mut disagreements := 0
+    for task in tasks:
+        answer := await task
+        if first == "":
+            first = answer
+        elif answer != first:
+            disagreements = disagreements + 1
+
+    print("tasks: {TASKS}")
+    print("disagreements: {disagreements}")
+    print("answer: {first}")
+    return 0

@@ -19,164 +19,64 @@ fn mask32(value: Int) -> Int:
 fn rotate_right(value: Int, amount: Int) -> Int:
     return bits.rotr32(value, amount)
 
-mut sha256_round_constants: List[Int] := []
-mut constants_initialized: Bool := false
-mut sha512_round_constants: List[Int] := []
-mut sha512_constants_initialized: Bool := false
+# the sha-256 round constants: the first 32 bits of the fractional parts of the
+# cube roots of the first 64 primes (fips 180-4 section 4.2.2).
+#
+# both round-constant tables are plain data, so they are built when the module
+# loads rather than filled in on first use. module initializers run on the main
+# thread before main's body, which is before any task exists, so every hashing
+# task reads a table that was already complete when its worker started.
+sha256_round_constants: List[Int] := [
+    1116352408, 1899447441, 3049323471, 3921009573,
+    961987163, 1508970993, 2453635748, 2870763221,
+    3624381080, 310598401, 607225278, 1426881987,
+    1925078388, 2162078206, 2614888103, 3248222580,
+    3835390401, 4022224774, 264347078, 604807628,
+    770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671,
+    3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291,
+    1695183700, 1986661051, 2177026350, 2456956037,
+    2730485921, 2820302411, 3259730800, 3345764771,
+    3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877,
+    958139571, 1322822218, 1537002063, 1747873779,
+    1955562222, 2024104815, 2227730452, 2361852424,
+    2428436474, 2756734187, 3204031479, 3329325298,
+]
 
-fn sha_init():
-    if constants_initialized:
-        return
-    constants_initialized = true
-    sha256_round_constants.push(1116352408)
-    sha256_round_constants.push(1899447441)
-    sha256_round_constants.push(3049323471)
-    sha256_round_constants.push(3921009573)
-    sha256_round_constants.push(961987163)
-    sha256_round_constants.push(1508970993)
-    sha256_round_constants.push(2453635748)
-    sha256_round_constants.push(2870763221)
-    sha256_round_constants.push(3624381080)
-    sha256_round_constants.push(310598401)
-    sha256_round_constants.push(607225278)
-    sha256_round_constants.push(1426881987)
-    sha256_round_constants.push(1925078388)
-    sha256_round_constants.push(2162078206)
-    sha256_round_constants.push(2614888103)
-    sha256_round_constants.push(3248222580)
-    sha256_round_constants.push(3835390401)
-    sha256_round_constants.push(4022224774)
-    sha256_round_constants.push(264347078)
-    sha256_round_constants.push(604807628)
-    sha256_round_constants.push(770255983)
-    sha256_round_constants.push(1249150122)
-    sha256_round_constants.push(1555081692)
-    sha256_round_constants.push(1996064986)
-    sha256_round_constants.push(2554220882)
-    sha256_round_constants.push(2821834349)
-    sha256_round_constants.push(2952996808)
-    sha256_round_constants.push(3210313671)
-    sha256_round_constants.push(3336571891)
-    sha256_round_constants.push(3584528711)
-    sha256_round_constants.push(113926993)
-    sha256_round_constants.push(338241895)
-    sha256_round_constants.push(666307205)
-    sha256_round_constants.push(773529912)
-    sha256_round_constants.push(1294757372)
-    sha256_round_constants.push(1396182291)
-    sha256_round_constants.push(1695183700)
-    sha256_round_constants.push(1986661051)
-    sha256_round_constants.push(2177026350)
-    sha256_round_constants.push(2456956037)
-    sha256_round_constants.push(2730485921)
-    sha256_round_constants.push(2820302411)
-    sha256_round_constants.push(3259730800)
-    sha256_round_constants.push(3345764771)
-    sha256_round_constants.push(3516065817)
-    sha256_round_constants.push(3600352804)
-    sha256_round_constants.push(4094571909)
-    sha256_round_constants.push(275423344)
-    sha256_round_constants.push(430227734)
-    sha256_round_constants.push(506948616)
-    sha256_round_constants.push(659060556)
-    sha256_round_constants.push(883997877)
-    sha256_round_constants.push(958139571)
-    sha256_round_constants.push(1322822218)
-    sha256_round_constants.push(1537002063)
-    sha256_round_constants.push(1747873779)
-    sha256_round_constants.push(1955562222)
-    sha256_round_constants.push(2024104815)
-    sha256_round_constants.push(2227730452)
-    sha256_round_constants.push(2361852424)
-    sha256_round_constants.push(2428436474)
-    sha256_round_constants.push(2756734187)
-    sha256_round_constants.push(3204031479)
-    sha256_round_constants.push(3329325298)
-
-fn sha512_init():
-    if sha512_constants_initialized:
-        return
-    sha512_constants_initialized = true
-    sha512_round_constants.push(4794697086780616226)
-    sha512_round_constants.push(8158064640168781261)
-    sha512_round_constants.push(-5349999486874862801)
-    sha512_round_constants.push(-1606136188198331460)
-    sha512_round_constants.push(4131703408338449720)
-    sha512_round_constants.push(6480981068601479193)
-    sha512_round_constants.push(-7908458776815382629)
-    sha512_round_constants.push(-6116909921290321640)
-    sha512_round_constants.push(-2880145864133508542)
-    sha512_round_constants.push(1334009975649890238)
-    sha512_round_constants.push(2608012711638119052)
-    sha512_round_constants.push(6128411473006802146)
-    sha512_round_constants.push(8268148722764581231)
-    sha512_round_constants.push(-9160688886553864527)
-    sha512_round_constants.push(-7215885187991268811)
-    sha512_round_constants.push(-4495734319001033068)
-    sha512_round_constants.push(-1973867731355612462)
-    sha512_round_constants.push(-1171420211273849373)
-    sha512_round_constants.push(1135362057144423861)
-    sha512_round_constants.push(2597628984639134821)
-    sha512_round_constants.push(3308224258029322869)
-    sha512_round_constants.push(5365058923640841347)
-    sha512_round_constants.push(6679025012923562964)
-    sha512_round_constants.push(8573033837759648693)
-    sha512_round_constants.push(-7476448914759557205)
-    sha512_round_constants.push(-6327057829258317296)
-    sha512_round_constants.push(-5763719355590565569)
-    sha512_round_constants.push(-4658551843659510044)
-    sha512_round_constants.push(-4116276920077217854)
-    sha512_round_constants.push(-3051310485924567259)
-    sha512_round_constants.push(489312712824947311)
-    sha512_round_constants.push(1452737877330783856)
-    sha512_round_constants.push(2861767655752347644)
-    sha512_round_constants.push(3322285676063803686)
-    sha512_round_constants.push(5560940570517711597)
-    sha512_round_constants.push(5996557281743188959)
-    sha512_round_constants.push(7280758554555802590)
-    sha512_round_constants.push(8532644243296465576)
-    sha512_round_constants.push(-9096487096722542874)
-    sha512_round_constants.push(-7894198246740708037)
-    sha512_round_constants.push(-6719396339535248540)
-    sha512_round_constants.push(-6333637450476146687)
-    sha512_round_constants.push(-4446306890439682159)
-    sha512_round_constants.push(-4076793802049405392)
-    sha512_round_constants.push(-3345356375505022440)
-    sha512_round_constants.push(-2983346525034927856)
-    sha512_round_constants.push(-860691631967231958)
-    sha512_round_constants.push(1182934255886127544)
-    sha512_round_constants.push(1847814050463011016)
-    sha512_round_constants.push(2177327727835720531)
-    sha512_round_constants.push(2830643537854262169)
-    sha512_round_constants.push(3796741975233480872)
-    sha512_round_constants.push(4115178125766777443)
-    sha512_round_constants.push(5681478168544905931)
-    sha512_round_constants.push(6601373596472566643)
-    sha512_round_constants.push(7507060721942968483)
-    sha512_round_constants.push(8399075790359081724)
-    sha512_round_constants.push(8693463985226723168)
-    sha512_round_constants.push(-8878714635349349518)
-    sha512_round_constants.push(-8302665154208450068)
-    sha512_round_constants.push(-8016688836872298968)
-    sha512_round_constants.push(-6606660893046293015)
-    sha512_round_constants.push(-4685533653050689259)
-    sha512_round_constants.push(-4147400797238176981)
-    sha512_round_constants.push(-3880063495543823972)
-    sha512_round_constants.push(-3348786107499101689)
-    sha512_round_constants.push(-1523767162380948706)
-    sha512_round_constants.push(-757361751448694408)
-    sha512_round_constants.push(500013540394364858)
-    sha512_round_constants.push(748580250866718886)
-    sha512_round_constants.push(1242879168328830382)
-    sha512_round_constants.push(1977374033974150939)
-    sha512_round_constants.push(2944078676154940804)
-    sha512_round_constants.push(3659926193048069267)
-    sha512_round_constants.push(4368137639120453308)
-    sha512_round_constants.push(4836135668995329356)
-    sha512_round_constants.push(5532061633213252278)
-    sha512_round_constants.push(6448918945643986474)
-    sha512_round_constants.push(6902733635092675308)
-    sha512_round_constants.push(7801388544844847127)
+# the sha-512 round constants: the first 64 bits of the fractional parts of the
+# cube roots of the first 80 primes (fips 180-4 section 4.2.3), written as signed
+# 64-bit values.
+sha512_round_constants: List[Int] := [
+    4794697086780616226, 8158064640168781261, -5349999486874862801,
+    -1606136188198331460, 4131703408338449720, 6480981068601479193,
+    -7908458776815382629, -6116909921290321640, -2880145864133508542,
+    1334009975649890238, 2608012711638119052, 6128411473006802146,
+    8268148722764581231, -9160688886553864527, -7215885187991268811,
+    -4495734319001033068, -1973867731355612462, -1171420211273849373,
+    1135362057144423861, 2597628984639134821, 3308224258029322869,
+    5365058923640841347, 6679025012923562964, 8573033837759648693,
+    -7476448914759557205, -6327057829258317296, -5763719355590565569,
+    -4658551843659510044, -4116276920077217854, -3051310485924567259,
+    489312712824947311, 1452737877330783856, 2861767655752347644,
+    3322285676063803686, 5560940570517711597, 5996557281743188959,
+    7280758554555802590, 8532644243296465576, -9096487096722542874,
+    -7894198246740708037, -6719396339535248540, -6333637450476146687,
+    -4446306890439682159, -4076793802049405392, -3345356375505022440,
+    -2983346525034927856, -860691631967231958, 1182934255886127544,
+    1847814050463011016, 2177327727835720531, 2830643537854262169,
+    3796741975233480872, 4115178125766777443, 5681478168544905931,
+    6601373596472566643, 7507060721942968483, 8399075790359081724,
+    8693463985226723168, -8878714635349349518, -8302665154208450068,
+    -8016688836872298968, -6606660893046293015, -4685533653050689259,
+    -4147400797238176981, -3880063495543823972, -3348786107499101689,
+    -1523767162380948706, -757361751448694408, 500013540394364858,
+    748580250866718886, 1242879168328830382, 1977374033974150939,
+    2944078676154940804, 3659926193048069267, 4368137639120453308,
+    4836135668995329356, 5532061633213252278, 6448918945643986474,
+    6902733635092675308, 7801388544844847127,
+]
 
 fn word32_to_hex(val: Int) -> String:
     hex := "0123456789abcdef"
@@ -208,8 +108,6 @@ fn word64_from_be(msg: List[Int], off: Int) -> Int:
     return bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.shl(msg[off], 56), bits.shl(msg[off + 1], 48)), bits.shl(msg[off + 2], 40)), bits.shl(msg[off + 3], 32)), bits.shl(msg[off + 4], 24)), bits.shl(msg[off + 5], 16)), bits.shl(msg[off + 6], 8)), msg[off + 7])
 
 fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
-    sha_init()
-
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2
@@ -297,8 +195,6 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
     return out
 
 fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
-    sha512_init()
-
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2

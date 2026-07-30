@@ -44,80 +44,75 @@ STATIC_TABLE_LEN := 61
 DECODE_MAX_HEADER_BYTES := 1048576
 DECODE_MAX_HEADER_COUNT := 10000
 
-# the fixed static table, cached after first use.
-mut static_cache: List[HeaderField] := []
-mut static_ready := false
-
-# build (once) and return the RFC 7541 Appendix A static table. entry N in the
-# spec is at index N-1 here.
-fn static_table() -> List[HeaderField]:
-    if static_ready:
-        return static_cache
-    static_cache = [
-        HeaderField(":authority", ""),
-        HeaderField(":method", "GET"),
-        HeaderField(":method", "POST"),
-        HeaderField(":path", "/"),
-        HeaderField(":path", "/index.html"),
-        HeaderField(":scheme", "http"),
-        HeaderField(":scheme", "https"),
-        HeaderField(":status", "200"),
-        HeaderField(":status", "204"),
-        HeaderField(":status", "206"),
-        HeaderField(":status", "304"),
-        HeaderField(":status", "400"),
-        HeaderField(":status", "404"),
-        HeaderField(":status", "500"),
-        HeaderField("accept-charset", ""),
-        HeaderField("accept-encoding", "gzip, deflate"),
-        HeaderField("accept-language", ""),
-        HeaderField("accept-ranges", ""),
-        HeaderField("accept", ""),
-        HeaderField("access-control-allow-origin", ""),
-        HeaderField("age", ""),
-        HeaderField("allow", ""),
-        HeaderField("authorization", ""),
-        HeaderField("cache-control", ""),
-        HeaderField("content-disposition", ""),
-        HeaderField("content-encoding", ""),
-        HeaderField("content-language", ""),
-        HeaderField("content-length", ""),
-        HeaderField("content-location", ""),
-        HeaderField("content-range", ""),
-        HeaderField("content-type", ""),
-        HeaderField("cookie", ""),
-        HeaderField("date", ""),
-        HeaderField("etag", ""),
-        HeaderField("expect", ""),
-        HeaderField("expires", ""),
-        HeaderField("from", ""),
-        HeaderField("host", ""),
-        HeaderField("if-match", ""),
-        HeaderField("if-modified-since", ""),
-        HeaderField("if-none-match", ""),
-        HeaderField("if-range", ""),
-        HeaderField("if-unmodified-since", ""),
-        HeaderField("last-modified", ""),
-        HeaderField("link", ""),
-        HeaderField("location", ""),
-        HeaderField("max-forwards", ""),
-        HeaderField("proxy-authenticate", ""),
-        HeaderField("proxy-authorization", ""),
-        HeaderField("range", ""),
-        HeaderField("referer", ""),
-        HeaderField("refresh", ""),
-        HeaderField("retry-after", ""),
-        HeaderField("server", ""),
-        HeaderField("set-cookie", ""),
-        HeaderField("strict-transport-security", ""),
-        HeaderField("transfer-encoding", ""),
-        HeaderField("user-agent", ""),
-        HeaderField("vary", ""),
-        HeaderField("via", ""),
-        HeaderField("www-authenticate", ""),
+# the RFC 7541 Appendix A static table; entry N in the spec is at index N-1 here.
+#
+# it is fixed data, so it is built when the module loads rather than on the first
+# request that needs it. module initializers run on the main thread before main's
+# body, so by the time any connection task exists the table is already whole and
+# read-only, and concurrent decoders never observe it half-built.
+static_table: List[HeaderField] := [
+    HeaderField(":authority", ""),
+    HeaderField(":method", "GET"),
+    HeaderField(":method", "POST"),
+    HeaderField(":path", "/"),
+    HeaderField(":path", "/index.html"),
+    HeaderField(":scheme", "http"),
+    HeaderField(":scheme", "https"),
+    HeaderField(":status", "200"),
+    HeaderField(":status", "204"),
+    HeaderField(":status", "206"),
+    HeaderField(":status", "304"),
+    HeaderField(":status", "400"),
+    HeaderField(":status", "404"),
+    HeaderField(":status", "500"),
+    HeaderField("accept-charset", ""),
+    HeaderField("accept-encoding", "gzip, deflate"),
+    HeaderField("accept-language", ""),
+    HeaderField("accept-ranges", ""),
+    HeaderField("accept", ""),
+    HeaderField("access-control-allow-origin", ""),
+    HeaderField("age", ""),
+    HeaderField("allow", ""),
+    HeaderField("authorization", ""),
+    HeaderField("cache-control", ""),
+    HeaderField("content-disposition", ""),
+    HeaderField("content-encoding", ""),
+    HeaderField("content-language", ""),
+    HeaderField("content-length", ""),
+    HeaderField("content-location", ""),
+    HeaderField("content-range", ""),
+    HeaderField("content-type", ""),
+    HeaderField("cookie", ""),
+    HeaderField("date", ""),
+    HeaderField("etag", ""),
+    HeaderField("expect", ""),
+    HeaderField("expires", ""),
+    HeaderField("from", ""),
+    HeaderField("host", ""),
+    HeaderField("if-match", ""),
+    HeaderField("if-modified-since", ""),
+    HeaderField("if-none-match", ""),
+    HeaderField("if-range", ""),
+    HeaderField("if-unmodified-since", ""),
+    HeaderField("last-modified", ""),
+    HeaderField("link", ""),
+    HeaderField("location", ""),
+    HeaderField("max-forwards", ""),
+    HeaderField("proxy-authenticate", ""),
+    HeaderField("proxy-authorization", ""),
+    HeaderField("range", ""),
+    HeaderField("referer", ""),
+    HeaderField("refresh", ""),
+    HeaderField("retry-after", ""),
+    HeaderField("server", ""),
+    HeaderField("set-cookie", ""),
+    HeaderField("strict-transport-security", ""),
+    HeaderField("transfer-encoding", ""),
+    HeaderField("user-agent", ""),
+    HeaderField("vary", ""),
+    HeaderField("via", ""),
+    HeaderField("www-authenticate", ""),
 ]
-    static_ready = true
-    return static_cache
 
 # --- error and byte helpers ---
 
@@ -248,7 +243,7 @@ impl DynamicTable:
     fn get_field(index: Int) -> HeaderField!:
         if index <= 0:
             fail "hpack index must be positive"
-        table := static_table()
+        table := static_table
         if index <= table.len():
             return table[index - 1]
         position := index - table.len()
@@ -258,7 +253,7 @@ impl DynamicTable:
 
     # the hpack index of an exact name/value match, or 0 if none.
     fn find_full(name: String, value: String) -> Int:
-        table := static_table()
+        table := static_table
         mut i := 0
         while i < table.len():
             if table[i].name == name and table[i].value == value:
@@ -274,7 +269,7 @@ impl DynamicTable:
 
     # the hpack index of a name match, or 0 if none (static preferred).
     fn find_name(name: String) -> Int:
-        table := static_table()
+        table := static_table
         mut i := 0
         while i < table.len():
             if table[i].name == name:
@@ -437,7 +432,7 @@ test "hpack integer coding survives prefix boundaries":
         value = value + 1
 
 test "hpack static table has the expected shape":
-    table := static_table()
+    table := static_table
     assert_eq(table.len(), 61)
     assert_eq(table[1].name, ":method")
     assert_eq(table[1].value, "GET")

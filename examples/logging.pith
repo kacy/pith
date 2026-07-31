@@ -24,9 +24,12 @@ fn main() -> String!:
     logger := log.root().json().file(json_path).with([log.str("service", "api")]).target("http").trace_context("trace-demo", "span-demo")
     logger.info().int("port", 8080).bool("tls", false).duration_ms("elapsed_ms", 12).msg("server started")
     json_content := fs.read(json_path)!
-    print("json has message: {json_content.contains(chr(34) + "message" + chr(34) + ":" + chr(34) + "server started" + chr(34))}")
-    print("json has service: {json_content.contains(chr(34) + "service" + chr(34) + ":" + chr(34) + "api" + chr(34))}")
-    print("json has trace: {json_content.contains(chr(34) + "trace_id" + chr(34) + ":" + chr(34) + "trace-demo" + chr(34))}")
+    has_message := json_content.contains("\"message\":\"server started\"")
+    has_service := json_content.contains("\"service\":\"api\"")
+    has_trace := json_content.contains("\"trace_id\":\"trace-demo\"")
+    print("json has message: {has_message}")
+    print("json has service: {has_service}")
+    print("json has trace: {has_trace}")
     fs.remove(json_path)
 
     trace_id := log.new_trace_id()!
@@ -40,7 +43,7 @@ fn main() -> String!:
     requests.inc()
     requests.add(2.0)
     inflight.set(1.0)
-    inflight.add(0.0 - 1.0)
+    inflight.add(-1.0)
     latency.observe(12.0)
     latency.observe(30.0)
     snapshot := metrics.snapshot_text()

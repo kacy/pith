@@ -8,7 +8,7 @@ struct Request:
     header_count: Int
 
 fn parse_request(raw: String) -> Request:
-    nl := chr(10)
+    nl := "\n"
     mut header_part := raw
     mut body := ""
     mut i := 0
@@ -36,11 +36,11 @@ fn parse_request(raw: String) -> Request:
     return Request(method, path, version, body, hdr_count)
 
 fn respond(status: Int, body: String) -> String:
-    return "HTTP/1.1 {status} OK{chr(10)}{body}"
+    return "HTTP/1.1 {status} OK{"\n"}{body}"
 
 fn main():
     # parse a GET request
-    nl := chr(10)
+    nl := "\n"
     raw := "GET /api/users HTTP/1.1{nl}Host: example.com{nl}{nl}"
     req := parse_request(raw)
     print("method: {req.method}")

@@ -9,7 +9,6 @@
 # counted every request on its own.
 import std.web as web
 import std.net.http as http
-import std.net.tcp as tcp
 
 # GET /greet?name=... — a plain handler with no metrics code of its own.
 fn greet(req: web.Request) -> http.HttpResponse:
@@ -24,24 +23,18 @@ fn build_app() -> web.App:
 fn serve_bg(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# a minimal GET that returns just the response body, so we can print it.
+# fetch a path and return just the response body, so we can print it.
 fn fetch(port: Int, path: String) -> String:
-    fd := tcp.connect("127.0.0.1", port) catch 0
-    crlf := chr(13) + chr(10)
-    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
-    raw := tcp.read(fd, 65536) catch ""
-    tcp.close(fd)
-    split := raw.index_of(crlf + crlf)
-    if split < 0:
-        return raw
-    return raw.substring(split + 4, raw.len())
+    resp := http.get_request("127.0.0.1", port, path).send() catch:
+        return "no response"
+    return resp.body_text() catch ""
 
 # pull the value of the request-counter series whose labels contain `marker` out
 # of the prometheus text: find its line and return whatever follows "} ".
 fn counter_value(metrics_text: String, marker: String) -> String:
-    for line in metrics_text.split(chr(10)):
-        if line.starts_with("http_server_requests_total" + chr(123)) and line.contains(marker):
-            close := line.index_of(chr(125) + " ")
+    for line in metrics_text.split("\n"):
+        if line.starts_with("http_server_requests_total{{") and line.contains(marker):
+            close := line.index_of("}} ")
             if close >= 0:
                 return line.substring(close + 2, line.len())
     return "?"
@@ -61,7 +54,7 @@ fn main() -> Int!:
 
     # scrape the endpoint web.new() serves for free and read the counter back.
     metrics_text := fetch(port, "/metrics")
-    marker := "route=" + chr(34) + "/greet" + chr(34)
+    marker := "route=\"/greet\""
     print("/metrics served: " + metrics_text.contains("# TYPE http_server_requests_total counter").to_string())
     print("requests to /greet: " + counter_value(metrics_text, marker))
     return 0

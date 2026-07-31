@@ -12,11 +12,10 @@
 # `verify` are the whole story for most callers; `needs_rehash` is how you
 # raise the parameters later without locking anyone out.
 #
-# `std.crypto.jwt` signs and verifies json web tokens. it can issue HS256,
-# HS384, HS512 and PS256, and can verify those plus EdDSA, ES256 and RS256 from
-# an outside issuer — the runtime has no ed25519, ecdsa or rsa pkcs#1 signer,
-# so those three are verification only. every verifier names the algorithm it
-# accepts rather than reading it off the token.
+# `std.crypto.jwt` signs and verifies json web tokens: HS256, HS384 and HS512
+# over a shared secret, and PS256, RS256, ES256 and EdDSA over a pkcs#8
+# private key. every verifier names the algorithm it accepts rather than
+# reading it off the token.
 #
 # ## keys, macs and randomness
 #
@@ -51,9 +50,9 @@
 #
 # ## what is not here
 #
-# there is no asymmetric key generation beyond ecdh, no ed25519 or ecdsa
-# signing, and no certificate issuance. unkeyed hashes live in `std.hash`, and
-# base64, base32 and hex live in `std.encoding`.
+# there is no asymmetric key generation beyond ecdh — signing keys come from
+# outside, as pkcs#8 — and no certificate issuance. unkeyed hashes live in
+# `std.hash`, and base64, base32 and hex live in `std.encoding`.
 
 import std.algo as algo
 import std.fs as fs

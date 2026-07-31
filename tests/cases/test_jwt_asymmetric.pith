@@ -1,10 +1,15 @@
 # jwt against keys and tokens that came from somewhere else.
 #
-# the RS256 and EdDSA tokens below were signed with openssl, so verifying them
+# the RS256 and EdDSA tokens below were signed with openssl. verifying them
 # says the compact serialization and the signing input agree with another
-# implementation and not only with this module. PS256 is a round trip instead,
-# because rsa-pss is the one asymmetric algorithm pith can sign with.
+# implementation and not only with this module. and because both algorithms
+# are deterministic — rsa pkcs#1 v1.5 by construction, ed25519 by design —
+# signing the same claims with the same key must reproduce openssl's token
+# byte for byte, which pins the signing half to the same standard the
+# verifying half was already held to. ES256 cannot be pinned that way (each
+# signature uses a fresh nonce), so it round trips and is checked for shape.
 
+import std.bytes as bytes
 import std.encoding as encoding
 import std.crypto.jwt as jwt
 import std.crypto.x509 as x509
@@ -16,8 +21,25 @@ RS256_TOKEN := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N
 EDDSA_TOKEN := "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N1ZXIiLCJzdWIiOiJ1LTQyIiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.lCrCeRMDoOAJWgCygsdIgpg9c2lWHIOaZfTCf786EC7nHZzduYXvp-rF55-IVZfXTYd7wG-f1ScWXBKTgz_NDA"
 EDDSA_PUBLIC_KEY := "1ab366e6b16df7f5b5d43f4366b999cf62d9b7001439620b2169e55b54520fdc"
 
-# both tokens expire in 2030. validating at a fixed instant keeps the test from
-# depending on when it runs, in either direction.
+# a second throwaway ed25519 key, this time with the pkcs#8 private half kept,
+# and the token openssl minted with it over SIGNED_CLAIMS. sign_eddsa must
+# reproduce this exactly.
+SIGN_ED_PKCS8 := "302e020100300506032b6570042204203c45f8def30c9ff29dd61917167a63c8f61e3e44a33b7605314216b213aed1a2"
+SIGN_ED_PUBLIC := "dfba27d215d5f538d67a960089fe937079ff88f3206553fd8c1d197a4be10881"
+SIGN_ED_EXPECTED := "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwaXRoIiwic3ViIjoidS03IiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.H6bSWyAe2u5ZP5dUemqTvIHrzjhHkxHoglMfAmGLOFgkgQJGfMkg8Ia8oIJKx4shoHRNaD7UI63NTm4VSDLBAw"
+
+# what openssl mints for SIGNED_CLAIMS with localhost.key. sign_rs256 must
+# reproduce this exactly.
+SIGN_RS_EXPECTED := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwaXRoIiwic3ViIjoidS03IiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.ry0m9uIQnQ4Q6KTB1y_PpNFw20voRcyquCFkiDp3aiiZz4CrNlIT_urkaKfs61u6qmQA_3GCVViZ0db0HmB3H2mh_RMoEZjYhJDlxMBbHWafQ2NIwbKTccf_bsitXMIkjUgyYAH6QoRsgFfhDAEdtkyblr5LBC91c0k__zLM6Vn3cDnv3E6IS49lPCyHTssfam1rzcXFbSYxthUu_Ylgqv8YLt7Qg-3PGhT2F4imondz-1HQRl9Q51JfTcTgcZMl5xttJjYuKdWpEmyM-LPCSTR70hWWFpv8oz1ER4Lb3jG7cSAXkfJtT6ZO6dszGL_-5nt0TaXoYRXfp30GQ2JtOg"
+
+# a throwaway p-256 key: pkcs#8 private half, uncompressed public point.
+SIGN_EC_PKCS8 := "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+SIGN_EC_PUBLIC := "04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+
+SIGNED_CLAIMS := "{{\"iss\":\"pith\",\"sub\":\"u-7\",\"aud\":\"chat\",\"exp\":1900000000}}"
+
+# both external tokens expire in 2030. validating at a fixed instant keeps the
+# test from depending on when it runs, in either direction.
 INSTANT := 1800000000
 
 fn main() -> Int!:
@@ -48,4 +70,29 @@ fn main() -> Int!:
     round_tripped := jwt.verify_ps256(issued, rsa_public, jwt.with_audience(base, "chat"))!
     print("ps256 claims: " + round_tripped.claims)
     print("ps256 wrong verifier: " + jwt.verify_rs256(issued, rsa_public, base).is_err.to_string())
+
+    # rsa pkcs#1 v1.5 is deterministic, so the token pith signs has to be the
+    # token openssl signed, not merely one that verifies.
+    minted_rs := jwt.sign_rs256(SIGNED_CLAIMS, rsa_private.body)!
+    print("rs256 matches openssl: " + (minted_rs == SIGN_RS_EXPECTED).to_string())
+
+    # ed25519 is deterministic by design; same check.
+    sign_ed_key := encoding.from_hex(SIGN_ED_PKCS8)!
+    minted_ed := jwt.sign_eddsa(SIGNED_CLAIMS, sign_ed_key)!
+    print("eddsa matches openssl: " + (minted_ed == SIGN_ED_EXPECTED).to_string())
+    sign_ed_public := encoding.from_hex(SIGN_ED_PUBLIC)!
+    print("eddsa self-verifies: " + jwt.verify_eddsa(minted_ed, sign_ed_public, jwt.with_audience(base, "chat")).is_ok.to_string())
+
+    # es256 signs with a fresh nonce each time, so no byte comparison is
+    # possible: two signatures over the same input differ and both verify.
+    ec_key := encoding.from_hex(SIGN_EC_PKCS8)!
+    ec_public := encoding.from_hex(SIGN_EC_PUBLIC)!
+    first := jwt.sign_es256(SIGNED_CLAIMS, ec_key)!
+    second := jwt.sign_es256(SIGNED_CLAIMS, ec_key)!
+    print("es256 nonces differ: " + (first != second).to_string())
+    print("es256 both verify: " + (jwt.verify_es256(first, ec_public, jwt.with_audience(base, "chat")).is_ok and jwt.verify_es256(second, ec_public, jwt.with_audience(base, "chat")).is_ok).to_string())
+    print("es256 wrong key: " + jwt.verify_es256(first, encoding.from_hex(SIGN_EC_PUBLIC.substring(0, 128) + "00")!, base).is_err.to_string())
+
+    # a garbage private key fails loudly instead of producing garbage.
+    print("bad key refused: " + jwt.sign_eddsa(SIGNED_CLAIMS, bytes.from_string_utf8("not a key")).is_err.to_string())
     return 0

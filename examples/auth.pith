@@ -58,7 +58,6 @@ fn main() -> Int!:
     print("wrong secret: " + jwt.verify_hs256(token, bytes.from_string_utf8("guess"), expected).is_err.to_string())
     print("wrong audience: " + jwt.verify_hs256(token, signing_secret(), jwt.with_audience(jwt.at_time(jwt.default_options(), NOW), "billing")).is_err.to_string())
     print("expired an hour later: " + jwt.verify_hs256(token, signing_secret(), jwt.at_time(jwt.default_options(), NOW + 7200)).is_err.to_string())
-    # pith cannot issue RS256 at all, and it will not verify an HS256 token
-    # through the rs256 path either.
+    # an HS256 token is refused by the rs256 path on its alg header alone.
     print("hs256 token, rs256 verifier: " + jwt.verify_rs256(token, signing_secret(), expected).is_err.to_string())
     return 0

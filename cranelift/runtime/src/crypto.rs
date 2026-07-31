@@ -395,6 +395,66 @@ pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, messa
     sign_rsa_with(&signature::RSA_PSS_SHA256, pkcs8, message)
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    sign_rsa_with(&signature::RSA_PKCS1_SHA256, pkcs8, message)
+}
+
+/// Sign `message` with an ed25519 private key in pkcs#8 form. The
+/// maybe_unchecked parser is what accepts openssl's output: openssl writes
+/// pkcs#8 v1 (seed only), and ring's strict parser demands v2 with the
+/// public key embedded. "unchecked" only skips the seed/public-key
+/// consistency check that v1 makes impossible. The signature itself is
+/// deterministic, so there is no rng to mishandle. Returns a 64-byte
+/// signature handle, or 0 on a malformed key.
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Ok(key_pair) = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8) else {
+        return 0;
+    };
+    pith_bytes_from_vec(key_pair.sign(message).as_ref().to_vec())
+}
+
+/// Sign `message` with a p-256 private key in pkcs#8 form. Uses the FIXED
+/// encoding, so the signature comes out as raw r‖s (64 bytes) — the form jws
+/// carries — rather than asn.1 der. The per-signature nonce comes from the
+/// system rng inside ring; it is never chosen here, which is the property
+/// that keeps ecdsa keys from leaking through a repeated nonce. Returns 0 on
+/// a malformed key.
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let rng = rand::SystemRandom::new();
+    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
+        &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        pkcs8,
+        &rng,
+    ) else {
+        return 0;
+    };
+    let Ok(sig) = key_pair.sign(&rng, message) else {
+        return 0;
+    };
+    pith_bytes_from_vec(sig.as_ref().to_vec())
+}
+
 /// BLAKE2b digest of `data`, keyed when `key` is non-empty. `out_len` selects
 /// the digest length (1 to 64 bytes). Returns a bytes handle, or 0 on invalid
 /// input.

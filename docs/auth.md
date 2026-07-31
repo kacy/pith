@@ -83,22 +83,15 @@ older scheme the first time its owner signs in.
 
 ## json web tokens
 
-`std.crypto.jwt` reads and writes the jws compact serialization. the api is
-deliberately asymmetric, and the asymmetry is visible in the function names:
+`std.crypto.jwt` reads and writes the jws compact serialization. every
+algorithm both signs and verifies: HS256, HS384 and HS512 take a shared
+secret, and PS256, RS256, ES256 and EdDSA take a pkcs#8 private key — the der
+inside what `openssl genpkey` writes, once the pem armor is stripped.
 
-| algorithm | sign | verify |
-| --- | --- | --- |
-| HS256, HS384, HS512 | yes | yes |
-| PS256 | yes | yes |
-| RS256 | no | yes |
-| ES256 | no | yes |
-| EdDSA | no | yes |
-
-the runtime's only signing primitives are hmac and rsa-pss. it can verify
-ed25519, ecdsa and rsa pkcs#1 signatures but cannot produce them, so a pith
-service can validate tokens from an outside issuer using any of those and can
-only issue HS\* or PS256 itself. there is no `sign_rs256` to discover at
-runtime; the function does not exist.
+which one to pick: HS\* when a single service both issues and checks its own
+tokens; EdDSA or PS256 when other parties need to verify without being able to
+forge; RS256 when the other end demands it, which hosted issuers commonly do.
+ES256 is there for the ecosystems that standardized on p-256.
 
 ```pith
 import std.bytes as bytes
@@ -176,9 +169,18 @@ ES256 token against the exact serializations the rfc prints, and
 signed with openssl. a token that only round trips against the module that made
 it says nothing about talking to anyone else.
 
+the signing half is held to the same standard. rsa pkcs#1 v1.5 and ed25519 are
+deterministic, so for a fixed key and claims there is exactly one valid token —
+and the tests check that `sign_rs256` and `sign_eddsa` produce, byte for byte,
+the token openssl produces. ES256 cannot be pinned like that (every signature
+uses a fresh nonce, on purpose — a repeated ecdsa nonce forfeits the private
+key), so it is tested by round trip and by checking two signatures over the
+same input differ.
+
 ES256 needs a small translation on the way in: jws carries the ecdsa signature
 as r and s glued together at a fixed width, and the runtime's verifier reads
-the asn.1 der encoding, so `verify_es256` re-wraps it.
+the asn.1 der encoding, so `verify_es256` re-wraps it. signing has no
+translation — the runtime signs in the fixed-width form directly.
 
 key formats, which are the usual place to get stuck:
 
@@ -186,5 +188,7 @@ key formats, which are the usual place to get stuck:
 - `verify_es256` takes the uncompressed p-256 point: `0x04`, then x, then y
 - `verify_rs256` and `verify_ps256` take the pkcs#1 rsapublickey der, which is
   what `std.crypto.x509` returns as a certificate's `subject_public_key`
-- `sign_ps256` takes a pkcs#8 private key, which is what
-  `encoding.pem_decode` gives you from a `BEGIN PRIVATE KEY` file
+- every `sign_*` takes a pkcs#8 private key, which is what
+  `encoding.pem_decode` gives you from a `BEGIN PRIVATE KEY` file. an rsa key
+  in the older `BEGIN RSA PRIVATE KEY` form needs one pass through
+  `openssl pkcs8 -topk8` first

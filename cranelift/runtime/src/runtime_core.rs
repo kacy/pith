@@ -761,6 +761,28 @@ pub unsafe extern "C" fn pith_print_err(ptr: *const i8) {
     }
 }
 
+/// Report an error escaping `main` and exit nonzero. The emitter calls this on
+/// main's error-return paths, because the entry glue pins main's process exit
+/// code to 0 — without this, a program that failed out of main looked like it
+/// succeeded. `is_string` says whether `err` is a string handle; a typed error
+/// gets a generic line rather than a read through a non-string pointer.
+#[no_mangle]
+pub unsafe extern "C" fn pith_main_error_exit(err: i64, is_string: i64) -> i64 {
+    if is_string != 0 && err != 0 {
+        let ptr = err as *const i8;
+        let len = string::pith_cstring_len(ptr) as usize;
+        let slice = std::slice::from_raw_parts(ptr as *const u8, len);
+        if let Ok(msg) = std::str::from_utf8(slice) {
+            eprintln!("error: {}", msg);
+        } else {
+            eprintln!("error: main returned an error");
+        }
+    } else {
+        eprintln!("error: main returned an error");
+    }
+    std::process::exit(1);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     if a.is_null() && b.is_null() {

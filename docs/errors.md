@@ -591,3 +591,16 @@ error[E251]: 'frame_message' is not public in module 'grpc'
  11 |     framed := grpc.frame_message(bytes.from_string_utf8("hi"))
                                                                     ^
 ```
+
+### E252 — this file has no main function
+
+`pith build` and `pith run` make an executable, and an executable needs an
+entry point. a file without a top-level `fn main` is a library: it can be
+imported, checked and linted, but not built on its own. before this check the
+build sailed through to the system linker, which answered with an
+undefined-reference dump instead of a diagnosis.
+
+```
+error[E252]: this file has no main function
+  fix: `pith build` and `pith run` make an executable. a module without main can be imported, checked and linted, but not built on its own
+```

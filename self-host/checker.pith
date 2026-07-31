@@ -2077,6 +2077,15 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         # current module's own names always pass.
         if binding_visible_from(scope_id, name, current_checker_module_path) == false:
             if current_module_imports_name(name) == false:
+                # a generic declaration never enters the binding table, so a
+                # module calling its own generic fn can land here when some
+                # other loaded module has a concrete fn of the same name
+                # (collections.partition[T] vs strings.partition). the generic
+                # resolver is module-aware and prefers the current module, so
+                # let the generic call path take over exactly as it does when
+                # no concrete binding exists at all.
+                if has_generic_declaration(name):
+                    return TID_ERR
                 report_error_with_fix_at(node_idx, "E201", "'" + name + "' belongs to another module and is not imported here", "import it where it is defined")
                 return TID_ERR
         return tid

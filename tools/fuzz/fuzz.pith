@@ -77,8 +77,12 @@ fn check_fmt_stable(path: String, source: String):
     if recheck.status != 0:
         record("fmt_breaks", path, "formatted output no longer checks", source)
 
-## oracle 3: what the checker accepts, the backend must build.
+## oracle 3: what the checker accepts, the backend must build. a mutation can
+## delete main, which turns the program into a library — building that into an
+## executable is a user error the driver reports on purpose (E252), not a seam.
 fn check_builds(path: String, source: String):
+    if not source.contains("fn main"):
+        return
     result := run_pith("build", path, "45") catch RunResult(0 - 1, "spawn failed")
     if result.status == 124:
         record("build_hang", path, "build timed out", source)

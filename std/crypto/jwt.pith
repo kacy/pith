@@ -49,6 +49,133 @@ pub struct Verified:
     pub header: String
     pub claims: String
 
+impl Verified:
+    # a string claim by name, or "" when it is absent or not a string.
+    fn claim(name: String) -> String:
+        scope := json.open_scope()
+        defer json.close_scope(scope)
+        root := json.parse(self.claims)
+        node := json.object_get(root, name)
+        if json.type_of(node) != "string":
+            return ""
+        return json.get_string(node)
+
+    # an integer claim by name, or 0 when it is absent or not a number.
+    fn claim_int(name: String) -> Int:
+        scope := json.open_scope()
+        defer json.close_scope(scope)
+        root := json.parse(self.claims)
+        node := json.object_get(root, name)
+        if json.type_of(node) != "int":
+            return 0
+        return json.get_int(node)
+
+    # who the token is about — the `sub` claim, or "" when it carries none.
+    fn subject() -> String:
+        return self.claim("sub")
+
+# a claims object under construction. build one with `claims()`, describe it
+# with the chainable setters, and finish with a `sign_*` method — the json,
+# the escaping and the `iat`/`exp` arithmetic happen at signing time:
+#
+#   token := jwt.claims().issuer("chat").subject(user).expires_in(3600).sign_hs256(secret)!
+#
+# `expires_in` counts seconds from the moment of signing and stamps both
+# `iat` and `exp`, so callers never touch epoch arithmetic.
+pub struct Claims:
+    issuer_v: String
+    audience_v: String
+    subject_v: String
+    lifetime: Int
+    text_keys: List[String]
+    text_values: List[String]
+    int_keys: List[String]
+    int_values: List[Int]
+
+pub fn claims() -> Claims:
+    return Claims("", "", "", 0, [], [], [], [])
+
+impl Claims:
+    fn issuer(v: String) -> Claims:
+        return Claims(v, self.audience_v, self.subject_v, self.lifetime, self.text_keys, self.text_values, self.int_keys, self.int_values)
+
+    fn audience(v: String) -> Claims:
+        return Claims(self.issuer_v, v, self.subject_v, self.lifetime, self.text_keys, self.text_values, self.int_keys, self.int_values)
+
+    fn subject(v: String) -> Claims:
+        return Claims(self.issuer_v, self.audience_v, v, self.lifetime, self.text_keys, self.text_values, self.int_keys, self.int_values)
+
+    # the token is valid for this many seconds from the moment it is signed.
+    fn expires_in(seconds: Int) -> Claims:
+        return Claims(self.issuer_v, self.audience_v, self.subject_v, seconds, self.text_keys, self.text_values, self.int_keys, self.int_values)
+
+    # a custom string claim. reserved names are refused at signing time.
+    fn claim(key: String, value: String) -> Claims:
+        mut keys := self.text_keys
+        mut values := self.text_values
+        keys.push(key)
+        values.push(value)
+        return Claims(self.issuer_v, self.audience_v, self.subject_v, self.lifetime, keys, values, self.int_keys, self.int_values)
+
+    # a custom integer claim. reserved names are refused at signing time.
+    fn claim_int(key: String, value: Int) -> Claims:
+        mut keys := self.int_keys
+        mut values := self.int_values
+        keys.push(key)
+        values.push(value)
+        return Claims(self.issuer_v, self.audience_v, self.subject_v, self.lifetime, self.text_keys, self.text_values, keys, values)
+
+    fn sign_hs256(secret: Bytes) -> String!:
+        return sign_hs256(build_claims_json(self)!, secret)!
+
+    fn sign_hs384(secret: Bytes) -> String!:
+        return sign_hs384(build_claims_json(self)!, secret)!
+
+    fn sign_hs512(secret: Bytes) -> String!:
+        return sign_hs512(build_claims_json(self)!, secret)!
+
+    fn sign_ps256(pkcs8_private_key: Bytes) -> String!:
+        return sign_ps256(build_claims_json(self)!, pkcs8_private_key)!
+
+    fn sign_rs256(pkcs8_private_key: Bytes) -> String!:
+        return sign_rs256(build_claims_json(self)!, pkcs8_private_key)!
+
+    fn sign_es256(pkcs8_private_key: Bytes) -> String!:
+        return sign_es256(build_claims_json(self)!, pkcs8_private_key)!
+
+    fn sign_eddsa(pkcs8_private_key: Bytes) -> String!:
+        return sign_eddsa(build_claims_json(self)!, pkcs8_private_key)!
+
+fn claims_key_reserved(key: String) -> Bool:
+    return key == "iss" or key == "aud" or key == "sub" or key == "exp" or key == "iat" or key == "nbf"
+
+# render the builder to the claims json the signing functions take. custom
+# claims that spell a registered name are refused rather than silently
+# overriding what the builder's own setters wrote.
+fn build_claims_json(c: Claims) -> String!:
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    root := json.make_object()
+    if c.issuer_v.len() > 0:
+        json.object_set(root, "iss", json.make_string(c.issuer_v))
+    if c.audience_v.len() > 0:
+        json.object_set(root, "aud", json.make_string(c.audience_v))
+    if c.subject_v.len() > 0:
+        json.object_set(root, "sub", json.make_string(c.subject_v))
+    if c.lifetime > 0:
+        now := time.now() / 1000
+        json.object_set(root, "iat", json.make_int(now))
+        json.object_set(root, "exp", json.make_int(now + c.lifetime))
+    for key, i in c.text_keys:
+        if claims_key_reserved(key):
+            fail "claim '" + key + "' is registered; set it through the builder"
+        json.object_set(root, key, json.make_string(c.text_values[i]))
+    for key, i in c.int_keys:
+        if claims_key_reserved(key):
+            fail "claim '" + key + "' is registered; set it through the builder"
+        json.object_set(root, key, json.make_int(c.int_values[i]))
+    return json.encode(root)
+
 # how strictly to check the registered claims. `now` of zero means "read the
 # clock"; set it to a unix timestamp to validate against a fixed instant.
 # `leeway` is the clock skew allowed on every time comparison. an empty
@@ -606,3 +733,25 @@ test "an oversized token is refused before it is parsed":
 
     assert(sign_hs256(long_claims, secret()).is_err)
     assert(verify_hs256("a.b." + "c".repeat(MAX_TOKEN_LEN), secret(), options).is_err)
+
+test "the claims builder writes what the verifier reads":
+    secret_key := secret()
+    token := claims().issuer("chat").audience("api").subject("u-7").expires_in(3600).claim("role", "admin").claim_int("level", 9).sign_hs256(secret_key)!
+
+    expected := with_issuer(with_audience(default_options(), "api"), "chat")
+    verified := verify_hs256(token, secret_key, expected)!
+    assert_eq(verified.subject(), "u-7")
+    assert_eq(verified.claim("role"), "admin")
+    assert_eq(verified.claim_int("level"), 9)
+    assert(verified.claim_int("exp") > time.now() / 1000)
+    assert_eq(verified.claim("missing"), "")
+    assert_eq(verified.claim_int("role"), 0)
+
+test "the builder escapes claim values":
+    tricky := claims().subject("a\"b\\c").sign_hs256(secret())!
+    got := verify_hs256(tricky, secret(), without_time_checks(default_options()))!
+    assert_eq(got.subject(), "a\"b\\c")
+
+test "a custom claim cannot spell a registered name":
+    assert(claims().claim("exp", "soon").sign_hs256(secret()).is_err)
+    assert(claims().claim_int("iat", 0).sign_hs256(secret()).is_err)

@@ -1,9 +1,72 @@
-# std.crypto - practical cryptographic building blocks
+# std.crypto - the standard library's cryptography, and where each piece lives
 #
-# most code should use the submodules directly:
-# `std.crypto.random`, `std.crypto.hmac`, `std.crypto.kdf`,
-# `std.crypto.subtle`, `std.crypto.aead`, `std.crypto.ecdh`,
-# `std.crypto.signature`, and `std.crypto.x509`.
+# pith has no re-export, so importing this module hands you nothing; import the
+# submodule you want directly, as `import std.crypto.password as password`.
+# what this file is for is the moment before that, when you know you need a mac
+# or a password hash and not yet which module holds it.
+#
+# ## storing and checking credentials
+#
+# `std.crypto.password` hashes passwords with argon2id and writes the result as
+# a phc string, so the cost parameters travel with the hash. `hash` and
+# `verify` are the whole story for most callers; `needs_rehash` is how you
+# raise the parameters later without locking anyone out.
+#
+# `std.crypto.jwt` signs and verifies json web tokens. it can issue HS256,
+# HS384, HS512 and PS256, and can verify those plus EdDSA, ES256 and RS256 from
+# an outside issuer — the runtime has no ed25519, ecdsa or rsa pkcs#1 signer,
+# so those three are verification only. every verifier names the algorithm it
+# accepts rather than reading it off the token.
+#
+# ## keys, macs and randomness
+#
+# `std.crypto.random` is the os random source. use it for keys, nonces, salts
+# and session ids; `std.rand` is the seedable one, for tests and simulations.
+#
+# `std.crypto.hmac` is hmac over sha-1, sha-256, sha-384 and sha-512, with
+# constant-time verify helpers.
+#
+# `std.crypto.kdf` derives keys: hkdf for key material you already have, and
+# pbkdf2 for legacy password hashes you are migrating off. new passwords go
+# through `std.crypto.password`.
+#
+# `std.crypto.ecdh` is x25519 and p-256 key agreement, which is how tls gets to
+# a shared secret.
+#
+# ## encrypting and authenticating messages
+#
+# `std.crypto.aead` is aes-128-gcm and chacha20-poly1305. both authenticate as
+# well as encrypt, so a tampered ciphertext fails to open rather than
+# decrypting to garbage.
+#
+# `std.crypto.signature` verifies ed25519, ecdsa p-256 and p-384, and rsa
+# pkcs#1 and pss signatures, and signs with rsa-pss.
+#
+# `std.crypto.subtle` compares byte strings without an early return. anything
+# that compares a secret — a mac, a password tag, a token signature — goes
+# through it, and everything in std that compares one does.
+#
+# `std.crypto.x509` parses certificates and applies the hostname, validity and
+# name-constraint checks tls needs.
+#
+# ## what is not here
+#
+# there is no asymmetric key generation beyond ecdh, no ed25519 or ecdsa
+# signing, and no certificate issuance. unkeyed hashes live in `std.hash`, and
+# base64, base32 and hex live in `std.encoding`.
 
-test "crypto root module loads":
-    assert(true)
+import std.algo as algo
+import std.fs as fs
+import std.strings as strings
+
+# the submodules the index above describes. the test below reads the directory
+# and compares, so a new module cannot ship without a line in the index.
+INDEXED := "aead,ecdh,hmac,jwt,kdf,password,random,signature,subtle,x509"
+
+test "the index covers every submodule that ships":
+    mut found: List[String] := []
+    for entry in fs.list("std/crypto"):
+        if entry.ends_with(".pith"):
+            found.push(strings.remove_suffix(entry, ".pith"))
+
+    assert_eq(algo.sort_strings(found).join(","), INDEXED)

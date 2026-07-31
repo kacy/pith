@@ -1,0 +1,51 @@
+# jwt against keys and tokens that came from somewhere else.
+#
+# the RS256 and EdDSA tokens below were signed with openssl, so verifying them
+# says the compact serialization and the signing input agree with another
+# implementation and not only with this module. PS256 is a round trip instead,
+# because rsa-pss is the one asymmetric algorithm pith can sign with.
+
+import std.encoding as encoding
+import std.crypto.jwt as jwt
+import std.crypto.x509 as x509
+
+# signed with tests/live/fixtures/localhost.key.
+RS256_TOKEN := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N1ZXIiLCJzdWIiOiJ1LTQyIiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.PUnc4hVzxTmUdMsqUeg1cOiFjNal3YkpWIin1I9So4W6rhCpJWINCG1nuxmkk-DknncDj6YmJQlvsp_bnyZ7AVd_XTI1JPQPublSn5g1IdkmsSincob7rOhcYePFtpvkHP8v7YsMIT3OZOWnW3V4S4gXXXso8gRB1ZXiOLyfPjEK9oGA6DJO2xSkq2gpAmYtHJTYgwtaZkrpOBr55DTuemllumPylCj1rhaRUMEHDLE21s-FCBtiVxIiQWwNTBBvShF_XIgg33PoM_thCrnxPL6_SS8lq4Kr-5BnzXxLYZyajTusyc9jhhaN7SSoORJKI7z5Z0wkukDUr2ksYP_7hQ"
+
+# signed with a throwaway ed25519 key; the raw public key is below it.
+EDDSA_TOKEN := "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N1ZXIiLCJzdWIiOiJ1LTQyIiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.lCrCeRMDoOAJWgCygsdIgpg9c2lWHIOaZfTCf786EC7nHZzduYXvp-rF55-IVZfXTYd7wG-f1ScWXBKTgz_NDA"
+EDDSA_PUBLIC_KEY := "1ab366e6b16df7f5b5d43f4366b999cf62d9b7001439620b2169e55b54520fdc"
+
+# both tokens expire in 2030. validating at a fixed instant keeps the test from
+# depending on when it runs, in either direction.
+INSTANT := 1800000000
+
+fn main() -> Int!:
+    cert := x509.parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!
+    rsa_public := cert.subject_public_key
+    rsa_private := encoding.pem_decode(read_file("tests/live/fixtures/localhost.key")!)!
+    ed_public := encoding.from_hex(EDDSA_PUBLIC_KEY)!
+
+    base := jwt.at_time(jwt.default_options(), INSTANT)
+    expected := jwt.with_issuer(jwt.with_audience(base, "chat"), "external-issuer")
+
+    rs := jwt.verify_rs256(RS256_TOKEN, rsa_public, expected)!
+    print("rs256 claims: " + rs.claims)
+    print("rs256 wrong audience: " + jwt.verify_rs256(RS256_TOKEN, rsa_public, jwt.with_audience(base, "billing")).is_err.to_string())
+    print("rs256 wrong key: " + jwt.verify_rs256(RS256_TOKEN, ed_public, base).is_err.to_string())
+
+    ed := jwt.verify_eddsa(EDDSA_TOKEN, ed_public, expected)!
+    print("eddsa claims: " + ed.claims)
+    print("eddsa wrong key: " + jwt.verify_eddsa(EDDSA_TOKEN, rsa_public, base).is_err.to_string())
+
+    # an RS256 token handed to the rsa-pss verifier is refused on its `alg`
+    # before either signature is looked at, and the reverse holds too.
+    print("rs256 through the ps256 verifier: " + jwt.verify_ps256(RS256_TOKEN, rsa_public, base).is_err.to_string())
+    print("eddsa through the rs256 verifier: " + jwt.verify_rs256(EDDSA_TOKEN, ed_public, base).is_err.to_string())
+
+    claims := "{{\"sub\":\"u-7\",\"aud\":\"chat\"}}"
+    issued := jwt.sign_ps256(claims, rsa_private.body)!
+    round_tripped := jwt.verify_ps256(issued, rsa_public, jwt.with_audience(base, "chat"))!
+    print("ps256 claims: " + round_tripped.claims)
+    print("ps256 wrong verifier: " + jwt.verify_rs256(issued, rsa_public, base).is_err.to_string())
+    return 0

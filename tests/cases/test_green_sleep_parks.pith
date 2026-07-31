@@ -1,0 +1,47 @@
+# a sleeping task must not hold its worker. under the green backend a
+# `time.delay` parks the task on the reactor's timer heap, so with a single
+# worker (the corpus runs PITH_GREEN_WORKERS=1) a runnable task still gets the
+# cpu while two spawned-earlier tasks sleep. before that fix the first sleeper
+# blocked the only worker and "sleeper-a" finished first here.
+
+import std.time as time
+
+fn sleeper(name: String, ms: Int, done: Channel[String]):
+    time.delay(ms)
+    done.send(name)
+
+fn busy(done: Channel[String]):
+    mut total := 0
+    mut i := 0
+    while i < 200000:
+        total = total + i
+        i = i + 1
+    if total > 0:
+        done.send("busy")
+
+fn main() -> Int!:
+    start := time.mono_millis()
+    done := Channel[String](3)
+
+    # the sleepers are spawned first on purpose: with one worker they reach the
+    # cpu first, and only parking (not blocking) lets the busy task overtake.
+    a := spawn sleeper("sleeper-a", 250, done)
+    b := spawn sleeper("sleeper-b", 700, done)
+    c := spawn busy(done)
+
+    print("first finished: {done.recv()?}")
+    print("second finished: {done.recv()?}")
+    print("third finished: {done.recv()?}")
+
+    await a
+    await b
+    await c
+
+    elapsed := time.mono_millis() - start
+    # the longest sleeper is 700ms, so anything shorter means delay came back
+    # early. the two sleeps overlapping (700ms total, not 950ms serialized)
+    # proves the timer heap serves concurrent sleepers; the bound is loose so a
+    # slow ci box does not trip it.
+    print("slept the full duration: {elapsed >= 700}")
+    print("sleepers overlapped: {elapsed < 940}")
+    return 0

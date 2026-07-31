@@ -145,29 +145,25 @@ while the caller parks, and child processes park on the reactor too: pipe reads
 because a pipe is pollable, `wait` because linux gives out a `pidfd` that
 reports the exit. none of those stall anyone any more.
 
-two things are left. the cheap end of `host_fs`, meaning `exists`, `size`,
-`rename`, `mkdir` and removing a single file, still runs on the worker, because
-each is one cached kernel lookup that costs about what handing it to another
-thread would. on a slow network mount that reasoning does not hold and a task
-doing one of them holds its worker until it returns. making that decision
-adaptive rather than fixed is the open work.
-
-the other is `sleep`, and everything built on it. `time.delay` maps straight
-to the blocking sleep, so a green task that sleeps holds its worker for the
-duration — and the waiting loops built on delay hold one too: a `select` with
-no ready arm sleeps a millisecond per probe until an arm fires, and the
-`concurrent.after`/`ticker` workers and a context's deadline watcher do the
-same. each slice is short and correctness is unaffected, but on a two-worker
-host two idle selects can occupy both workers while they poll. the fix is a
-real timer in the reactor — the deadline heap `netpoll` already keeps could
-serve a pure-timeout wait with no fd — so a sleeping task parks the way a
-socket read does. `PITH_GREEN=0` is the blunt workaround.
+what is left is the cheap end of `host_fs`, meaning `exists`, `size`,
+`rename`, `mkdir` and removing a single file, which still runs on the worker,
+because each is one cached kernel lookup that costs about what handing it to
+another thread would. on a slow network mount that reasoning does not hold and
+a task doing one of them holds its worker until it returns. making that
+decision adaptive rather than fixed is the open work.
 
 (`process.output` and the calls built on it — `run`, `text`, `output_checked`,
 `run_shell`, `output_shell`, plus `exec` and `exec_output` — used to be on
 this list for holding a worker while a child ran to completion; they now hand
 the whole spawn-drain-wait to a process pool of their own and the caller
-parks, the same shape dns and file i/o use.)
+parks, the same shape dns and file i/o use. `sleep` used to be on it too:
+`time.delay` mapped to a blocking sleep, so a sleeping task held its worker
+and an idle `select`, probing in a one-millisecond sleep loop, could pin a
+whole worker to no work at all. a green task's sleep now registers a timer on
+the reactor's deadline heap — the same sweep that times out socket waits — and
+parks the way a socket read does, which carries `select`'s idle probing, the
+`concurrent.after`/`ticker` workers, and a context's deadline watcher along
+with it.)
 
 the calling task pays for that. a file call made from inside a task now costs a
 thread handoff it did not before, so a task reading a small cached file in a

@@ -195,8 +195,11 @@ handoff between two tasks on the same worker is a userspace switch with no
 kernel involved. socket i/o goes through an epoll reactor: a read or write
 that would block parks the task on the reactor and frees the worker to run
 something else, so the whole net stack — raw tcp, tls, http/2, grpc — yields
-the same way without any code of its own. that reactor is also why the default
-is linux-only; see "which backend to use".
+the same way without any code of its own. sleeping parks there too: a
+`time.delay` from inside a task registers a timer on the reactor's deadline
+heap instead of blocking the worker, so a task sleeping out a backoff — or a
+`select` idling between probes — costs nothing but its own time. that reactor
+is also why the default is linux-only; see "which backend to use".
 
 name resolution and file i/o get there by a different route. `getaddrinfo` is
 synchronous and there is nothing to poll, and a regular file is always reported
@@ -286,8 +289,9 @@ threads, and `PITH_GREEN=1` opts in.
 
 the reason for that split is the reactor. it is epoll and eventfd, so it is
 linux-only; macos and the bsds compile a stand-in with no reactor at all, and a
-green task waiting on a socket there blocks its worker for as long as the wait
-lasts. green is still correct on those platforms and you can turn it on, but an
+green task waiting on a socket there — or sleeping — blocks its worker for as
+long as the wait lasts. green is still correct on those platforms and you can
+turn it on, but an
 i/o-heavy server on macos wants os threads until there is a kqueue sibling.
 
 the caveats that come with the linux default all come from one fact: a green

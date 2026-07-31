@@ -32,6 +32,7 @@ PARITY_EXAMPLES := \
 	error_handling \
 	json_ops \
 	toml_ops \
+	yaml_ops \
 	http_parsing \
 	uuid_ops \
 	matrix_math \

@@ -185,7 +185,10 @@ fn finish(parts: Parts, options: Options) -> Verified!:
 fn resolved_now(options: Options) -> Int:
     if options.now > 0:
         return options.now
-    return time.now()
+    # rfc 7519 numeric dates are unix seconds; time.now() is milliseconds.
+    # comparing claims against the raw millisecond clock made every honestly
+    # stamped token look a thousand times older than it was.
+    return time.now() / 1000
 
 # read a numeric-date claim. rfc 7519 allows a fraction of a second, which
 # nothing that matters here cares about, so a float is floored.
@@ -510,6 +513,17 @@ test "a tampered token does not verify":
 
     assert(verify_hs256(swapped_signature, secret(), options).is_err)
     assert(verify_hs256(swapped_payload, secret(), options).is_err)
+
+test "the system clock compares in seconds, not milliseconds":
+    # every other time test pins the clock with at_time, so this is the only
+    # exercise of the default path. it once compared claims against the raw
+    # millisecond clock, which made every honestly stamped token look a
+    # thousand times older than it was.
+    live := sign_hs256("{{\"iat\":" + (time.now() / 1000).to_string() + ",\"exp\":" + (time.now() / 1000 + 3600).to_string() + "}}", secret())!
+    stale := sign_hs256("{{\"exp\":" + (time.now() / 1000 - 3600).to_string() + "}}", secret())!
+
+    assert(verify_hs256(live, secret(), default_options()).is_ok)
+    assert(verify_hs256(stale, secret(), default_options()).is_err)
 
 test "expiry, not-before and issued-at are checked":
     issued := 1_700_000_000

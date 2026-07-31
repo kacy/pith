@@ -1,0 +1,575 @@
+# std.crypto.jwt - json web tokens over the jws compact serialization
+#
+# the signing and verification halves are deliberately not symmetric, because
+# the runtime's primitives are not either. hmac and rsa-pss can sign; ed25519,
+# ecdsa and rsa pkcs#1 can only verify. so a pith service can issue HS256,
+# HS384, HS512 and PS256 tokens, and can validate those plus EdDSA, ES256 and
+# RS256 tokens minted somewhere else. that asymmetry is in the function names:
+# there is no `sign_rs256`, and there never silently was one.
+#
+# every verifier names the algorithm it will accept. the token's own `alg`
+# header is only ever compared against that name, never used to pick the
+# verification path, and `alg: none` is refused with no way to opt in.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.json as json
+import std.strings as strings
+import std.time as time
+import std.crypto.hmac as hmac
+import std.crypto.signature as signature
+import std.crypto.subtle as subtle
+
+# the algorithm names this module knows, spelled the way rfc 7518 spells them.
+pub HS256 := "HS256"
+pub HS384 := "HS384"
+pub HS512 := "HS512"
+pub PS256 := "PS256"
+pub RS256 := "RS256"
+pub ES256 := "ES256"
+pub EDDSA := "EdDSA"
+
+# a compact jws is three dot-separated fields. asking for a few more splits
+# than that means a token with extra fields comes back too long rather than
+# quietly folding its tail into the signature.
+MAX_FIELDS := 8
+
+# tokens are credentials, not documents. anything past this is either not a
+# token or an attempt to make the parser do work.
+MAX_TOKEN_LEN := 8192
+MAX_HEADER_PARAMS := 16
+MAX_CLAIMS := 64
+MAX_AUDIENCE_ENTRIES := 32
+
+# a p-256 signature carries r and s as 32 bytes each (rfc 7518 section 3.4).
+P256_COORDINATE_LEN := 32
+
+# what a verified token carries: the decoded header and claims, as the json
+# text they were sent as. parse them with std.json — `json.decode_text[T]` if
+# you have a struct for your claims, `json.parse` if you want handles.
+pub struct Verified:
+    pub header: String
+    pub claims: String
+
+# how strictly to check the registered claims. `now` of zero means "read the
+# clock"; set it to a unix timestamp to validate against a fixed instant.
+# `leeway` is the clock skew allowed on every time comparison. an empty
+# `audience`, `issuer` or `subject` means that claim is not checked.
+pub struct Options:
+    pub now: Int
+    pub leeway: Int
+    pub check_exp: Bool
+    pub check_nbf: Bool
+    pub check_iat: Bool
+    pub require_exp: Bool
+    pub audience: String
+    pub issuer: String
+    pub subject: String
+
+# the defaults: check exp, nbf and iat, allow a minute of clock skew, and do
+# not compare an audience, issuer or subject the caller has not named.
+pub fn default_options() -> Options:
+    return Options(0, 60, true, true, true, false, "", "", "")
+
+# validate against a fixed unix timestamp instead of the system clock.
+pub fn at_time(options: Options, unix_seconds: Int) -> Options:
+    return Options(unix_seconds, options.leeway, options.check_exp, options.check_nbf, options.check_iat, options.require_exp, options.audience, options.issuer, options.subject)
+
+# change how much clock skew the time comparisons tolerate, in seconds.
+pub fn with_leeway(options: Options, seconds: Int) -> Options:
+    return Options(options.now, seconds, options.check_exp, options.check_nbf, options.check_iat, options.require_exp, options.audience, options.issuer, options.subject)
+
+# require the token's `aud` claim to name this audience.
+pub fn with_audience(options: Options, audience: String) -> Options:
+    return Options(options.now, options.leeway, options.check_exp, options.check_nbf, options.check_iat, options.require_exp, audience, options.issuer, options.subject)
+
+# require the token's `iss` claim to be this issuer.
+pub fn with_issuer(options: Options, issuer: String) -> Options:
+    return Options(options.now, options.leeway, options.check_exp, options.check_nbf, options.check_iat, options.require_exp, options.audience, issuer, options.subject)
+
+# require the token's `sub` claim to be this subject.
+pub fn with_subject(options: Options, subject: String) -> Options:
+    return Options(options.now, options.leeway, options.check_exp, options.check_nbf, options.check_iat, options.require_exp, options.audience, options.issuer, subject)
+
+# refuse a token that carries no `exp` claim. tokens that never expire are a
+# revocation problem, so this is worth turning on for anything long-lived.
+pub fn requiring_exp(options: Options) -> Options:
+    return Options(options.now, options.leeway, options.check_exp, options.check_nbf, options.check_iat, true, options.audience, options.issuer, options.subject)
+
+# turn off the `exp`, `nbf` and `iat` comparisons. this is for replaying a
+# fixed test vector, not for production traffic.
+pub fn without_time_checks(options: Options) -> Options:
+    return Options(options.now, options.leeway, false, false, false, false, options.audience, options.issuer, options.subject)
+
+# the three fields of a compact token, plus the bytes the signature covers.
+struct Parts:
+    header: String
+    signing_input: Bytes
+    payload_b64: String
+    signature: Bytes
+
+fn decode_b64url(text: String, what: String) -> Bytes!:
+    decoded := encoding.b64_url_raw_decode(text)
+    if decoded.is_err:
+        fail what + " is not valid base64url"
+    return decoded.ok
+
+fn decode_b64url_text(text: String, what: String) -> String!:
+    decoded := decode_b64url(text, what)!
+    utf8 := decoded.to_string_utf8()
+    if utf8.is_err:
+        fail what + " is not valid utf-8"
+    return utf8.ok
+
+# read the header's `alg`, refusing the shapes that have no business being
+# verified at all. this never returns a value the caller then dispatches on —
+# see `open_token`.
+fn header_algorithm(header: String) -> String!:
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+
+    root := json.parse(header)
+    if json.type_of(root) != "object":
+        fail "token header is not a json object"
+    if json.object_keys(root).len() > MAX_HEADER_PARAMS:
+        fail "token header has too many parameters"
+    # rfc 7515 section 4.1.11: a verifier that does not understand every
+    # extension listed in `crit` has to reject the token rather than ignore it.
+    if json.object_has(root, "crit"):
+        fail "token header names a critical extension this verifier does not implement"
+
+    alg_node := json.object_get(root, "alg")
+    if json.type_of(alg_node) != "string":
+        fail "token header has no alg"
+    alg := json.get_string(alg_node)
+    if alg.len() == 0 or strings.equals_ignore_case(alg, "none"):
+        fail "unsecured tokens (alg none) are never accepted"
+    return alg
+
+# split a compact token and confirm it claims to be the algorithm the caller
+# asked for. the expected algorithm comes from the caller, and the header's
+# `alg` is only ever compared against it. letting the token choose the
+# verification path is the algorithm confusion bug: an attacker re-signs a
+# token as HS256 using an rsa public key as the hmac secret, and a verifier
+# that dispatches on the header hands them a valid token.
+fn open_token(token: String, expected_alg: String) -> Parts!:
+    if token.len() == 0 or token.len() > MAX_TOKEN_LEN:
+        fail "token is empty or longer than " + MAX_TOKEN_LEN.to_string() + " bytes"
+
+    fields := strings.split_n(token, ".", MAX_FIELDS)
+    if fields.len() != 3:
+        fail "a compact jws has three dot-separated fields"
+    if fields[0].len() == 0 or fields[1].len() == 0 or fields[2].len() == 0:
+        fail "a compact jws field is empty"
+
+    header := decode_b64url_text(fields[0], "token header")!
+    alg := header_algorithm(header)!
+    if alg != expected_alg:
+        fail "token is signed with " + alg + ", expected " + expected_alg
+
+    sig := decode_b64url(fields[2], "token signature")!
+    signing_input := bytes.from_string_utf8(fields[0] + "." + fields[1])
+    return Parts(header, signing_input, fields[1], sig)
+
+fn require_signature(matched: Bool) -> Bool!:
+    if not matched:
+        fail "token signature does not verify"
+    return true
+
+# decode the payload and check the registered claims. everything up to here
+# has already established that the signature is good, so a failure past this
+# point is about the token's contents rather than its authenticity.
+fn finish(parts: Parts, options: Options) -> Verified!:
+    claims := decode_b64url_text(parts.payload_b64, "token payload")!
+    check_claims(claims, options)!
+    return Verified(parts.header, claims)
+
+fn resolved_now(options: Options) -> Int:
+    if options.now > 0:
+        return options.now
+    return time.now()
+
+# read a numeric-date claim. rfc 7519 allows a fraction of a second, which
+# nothing that matters here cares about, so a float is floored.
+fn numeric_claim(root: Int, name: String) -> Int!:
+    node := json.object_get(root, name)
+    kind := json.type_of(node)
+    if kind == "int":
+        return json.get_int(node)
+    if kind == "float":
+        return floor(json.get_float(node)).to_int()
+    fail "the " + name + " claim is not a number"
+
+fn audience_matches(root: Int, wanted: String) -> Bool!:
+    node := json.object_get(root, "aud")
+    kind := json.type_of(node)
+    if kind == "string":
+        return json.get_string(node) == wanted
+    if kind != "array":
+        fail "token has no aud claim"
+    count := json.array_len(node)
+    if count > MAX_AUDIENCE_ENTRIES:
+        fail "token audience list is too long"
+    mut i := 0
+    while i < count:
+        if json.get_string(json.array_get(node, i)) == wanted:
+            return true
+        i = i + 1
+    return false
+
+fn check_claims(claims: String, options: Options) -> Bool!:
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+
+    root := json.parse(claims)
+    if json.type_of(root) != "object":
+        fail "token payload is not a json object"
+    if json.object_keys(root).len() > MAX_CLAIMS:
+        fail "token payload has too many claims"
+
+    now := resolved_now(options)
+    has_exp := json.object_has(root, "exp")
+    if options.require_exp and not has_exp:
+        fail "token has no exp claim"
+    if options.check_exp and has_exp:
+        exp := numeric_claim(root, "exp")!
+        if now > exp + options.leeway:
+            fail "token expired"
+    if options.check_nbf and json.object_has(root, "nbf"):
+        nbf := numeric_claim(root, "nbf")!
+        if now + options.leeway < nbf:
+            fail "token is not valid yet"
+    if options.check_iat and json.object_has(root, "iat"):
+        iat := numeric_claim(root, "iat")!
+        if now + options.leeway < iat:
+            fail "token was issued in the future"
+
+    if options.issuer.len() > 0 and json.object_get_string(root, "iss") != options.issuer:
+        fail "token issuer does not match"
+    if options.subject.len() > 0 and json.object_get_string(root, "sub") != options.subject:
+        fail "token subject does not match"
+    if options.audience.len() > 0 and not audience_matches(root, options.audience)!:
+        fail "token audience does not match"
+    return true
+
+# check that a claims document is an object of a sane size before signing it.
+# minting a token nobody can verify is a bug worth catching at the source.
+fn check_claims_document(claims: String) -> Bool!:
+    if claims.len() == 0 or claims.len() > MAX_TOKEN_LEN:
+        fail "claims json is empty or longer than " + MAX_TOKEN_LEN.to_string() + " bytes"
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    root := json.parse(claims)
+    if json.type_of(root) != "object":
+        fail "claims json is not an object"
+    if json.object_keys(root).len() > MAX_CLAIMS:
+        fail "claims json has too many claims"
+    return true
+
+# the two encoded fields the signature covers. the header is a fixed string
+# per algorithm, so there is nothing to escape. the doubled braces are pith's
+# escape for a literal brace in a string, which is otherwise the start of an
+# interpolation; the json in this file is written that way throughout.
+fn signing_input(alg: String, claims: String) -> String!:
+    check_claims_document(claims)!
+    header := "{{\"alg\":\"" + alg + "\",\"typ\":\"JWT\"}}"
+    return encoding.b64_url_raw_encode(bytes.from_string_utf8(header)) + "." + encoding.b64_url_raw_encode(bytes.from_string_utf8(claims))
+
+fn assemble(unsigned: String, sig: Bytes) -> String:
+    return unsigned + "." + encoding.b64_url_raw_encode(sig)
+
+# sign a claims object with hmac-sha256 and return a compact token.
+pub fn sign_hs256(claims: String, secret: Bytes) -> String!:
+    unsigned := signing_input(HS256, claims)!
+    return assemble(unsigned, hmac.sha256(secret, bytes.from_string_utf8(unsigned)))
+
+# sign a claims object with hmac-sha384 and return a compact token.
+pub fn sign_hs384(claims: String, secret: Bytes) -> String!:
+    unsigned := signing_input(HS384, claims)!
+    return assemble(unsigned, hmac.sha384(secret, bytes.from_string_utf8(unsigned)))
+
+# sign a claims object with hmac-sha512 and return a compact token.
+pub fn sign_hs512(claims: String, secret: Bytes) -> String!:
+    unsigned := signing_input(HS512, claims)!
+    return assemble(unsigned, hmac.sha512(secret, bytes.from_string_utf8(unsigned)))
+
+# sign a claims object with rsa-pss and sha-256, given a pkcs#8 private key.
+# this is the only asymmetric algorithm pith can issue.
+pub fn sign_ps256(claims: String, pkcs8_private_key: Bytes) -> String!:
+    unsigned := signing_input(PS256, claims)!
+    sig := signature.sign_rsa_pss_sha256_pkcs8(pkcs8_private_key, bytes.from_string_utf8(unsigned))!
+    return assemble(unsigned, sig)
+
+# verify an HS256 token. a token that names any other algorithm is rejected
+# before its signature is looked at.
+pub fn verify_hs256(token: String, secret: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, HS256)!
+    require_signature(subtle.equal(hmac.sha256(secret, parts.signing_input), parts.signature))!
+    return finish(parts, options)!
+
+# verify an HS384 token.
+pub fn verify_hs384(token: String, secret: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, HS384)!
+    require_signature(subtle.equal(hmac.sha384(secret, parts.signing_input), parts.signature))!
+    return finish(parts, options)!
+
+# verify an HS512 token.
+pub fn verify_hs512(token: String, secret: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, HS512)!
+    require_signature(subtle.equal(hmac.sha512(secret, parts.signing_input), parts.signature))!
+    return finish(parts, options)!
+
+# verify a PS256 token. `public_key` is the pkcs#1 rsapublickey der, which is
+# what `std.crypto.x509` hands back as a certificate's subject public key.
+pub fn verify_ps256(token: String, public_key: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, PS256)!
+    require_signature(signature.verify_rsa_pss_sha256(public_key, parts.signing_input, parts.signature))!
+    return finish(parts, options)!
+
+# verify an RS256 token issued elsewhere. `public_key` is the pkcs#1
+# rsapublickey der. pith cannot issue RS256: the runtime has no pkcs#1 signer.
+pub fn verify_rs256(token: String, public_key: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, RS256)!
+    require_signature(signature.verify_rsa_pkcs1_sha256(public_key, parts.signing_input, parts.signature))!
+    return finish(parts, options)!
+
+# verify an EdDSA (ed25519) token issued elsewhere. `public_key` is the raw 32
+# byte key. pith cannot issue EdDSA: the runtime has no ed25519 signer.
+pub fn verify_eddsa(token: String, public_key: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, EDDSA)!
+    require_signature(signature.verify_ed25519(public_key, parts.signing_input, parts.signature))!
+    return finish(parts, options)!
+
+# one asn.1 der INTEGER holding a big-endian unsigned value. der wants the
+# shortest form, and a leading bit of 1 would read as negative, so a zero byte
+# goes in front of it.
+fn der_unsigned_integer(value: Bytes) -> Bytes:
+    mut start := 0
+    while start + 1 < value.len() and value[start] == 0:
+        start = start + 1
+    body := value.slice(start, value.len())
+    pad := body[0] >= 128
+
+    out := bytes.buffer_with_capacity(body.len() + 3)
+    defer out.free()
+    out.write_byte(2) catch 0
+    if pad:
+        out.write_byte(body.len() + 1) catch 0
+        out.write_byte(0) catch 0
+    else:
+        out.write_byte(body.len()) catch 0
+    out.write(body) catch 0
+    return out.bytes()
+
+# jws carries an ecdsa signature as r and s glued together at a fixed width
+# (rfc 7518 section 3.4); the runtime verifier reads the asn.1 der encoding, so
+# the two have to be re-wrapped.
+fn ecdsa_der_signature(raw: Bytes, half: Int) -> Bytes!:
+    if raw.len() != half * 2:
+        fail "an ecdsa jws signature must be " + (half * 2).to_string() + " bytes"
+    body := der_unsigned_integer(raw.slice(0, half)).concat(der_unsigned_integer(raw.slice(half, raw.len())))
+    # two p-256 integers never reach the 128 bytes that would need der's long
+    # length form, so the single-byte length below is always enough.
+    if body.len() > 127:
+        fail "ecdsa signature is out of range"
+
+    out := bytes.buffer_with_capacity(body.len() + 2)
+    defer out.free()
+    out.write_byte(48) catch 0
+    out.write_byte(body.len()) catch 0
+    out.write(body) catch 0
+    return out.bytes()
+
+# verify an ES256 token issued elsewhere. `public_key` is the uncompressed
+# p-256 point: 0x04 followed by x and y. pith cannot issue ES256: the runtime
+# has no ecdsa signer.
+pub fn verify_es256(token: String, public_key: Bytes, options: Options) -> Verified!:
+    parts := open_token(token, ES256)!
+    der := ecdsa_der_signature(parts.signature, P256_COORDINATE_LEN)!
+    require_signature(signature.verify_ecdsa_p256_sha256_asn1(public_key, parts.signing_input, der))!
+    return finish(parts, options)!
+
+# rfc 7515 appendix a.1: an HS256 token, its key, and the exact compact
+# serialization, all written by someone else. a token that only round trips
+# against this module would prove nothing about interoperating with anyone.
+RFC7515_A1_TOKEN := "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+RFC7515_A1_KEY := "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"
+
+# rfc 7515 appendix a.3: the same claims signed with ES256, and the p-256
+# public key as its two jwk coordinates.
+RFC7515_A3_TOKEN := "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"
+RFC7515_A3_X := "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"
+RFC7515_A3_Y := "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+
+# the appendix tokens expire in 2011, so the tests read the clock from a
+# moment when they were still good.
+RFC7515_INSTANT := 1300819000
+
+fn rfc7515_options() -> Options:
+    return at_time(default_options(), RFC7515_INSTANT)
+
+fn secret() -> Bytes:
+    return bytes.from_string_utf8("a shared secret nobody else knows")
+
+test "hs256 verifies the rfc 7515 appendix a.1 vector":
+    key := encoding.b64_url_raw_decode(RFC7515_A1_KEY)!
+    verified := verify_hs256(RFC7515_A1_TOKEN, key, rfc7515_options())!
+
+    assert(verified.claims.contains("\"iss\":\"joe\""))
+    assert(verified.header.contains("HS256"))
+    assert(verify_hs256(RFC7515_A1_TOKEN, bytes.from_string_utf8("wrong"), rfc7515_options()).is_err)
+
+test "es256 verifies the rfc 7515 appendix a.3 vector":
+    x := encoding.b64_url_raw_decode(RFC7515_A3_X)!
+    y := encoding.b64_url_raw_decode(RFC7515_A3_Y)!
+    public_key := bytes.from_string_utf8(chr(4)).concat(x).concat(y)
+    verified := verify_es256(RFC7515_A3_TOKEN, public_key, rfc7515_options())!
+
+    assert(verified.claims.contains("\"iss\":\"joe\""))
+    assert(verify_es256(RFC7515_A3_TOKEN, public_key.slice(0, 64), rfc7515_options()).is_err)
+
+test "hmac tokens round trip at every digest size":
+    claims := "{{\"sub\":\"u-1\",\"iss\":\"pith\"}}"
+    options := without_time_checks(default_options())
+
+    assert_eq(verify_hs256(sign_hs256(claims, secret())!, secret(), options)!.claims, claims)
+    assert_eq(verify_hs384(sign_hs384(claims, secret())!, secret(), options)!.claims, claims)
+    assert_eq(verify_hs512(sign_hs512(claims, secret())!, secret(), options)!.claims, claims)
+
+test "a verifier only accepts the algorithm it was asked for":
+    claims := "{{\"sub\":\"u-1\"}}"
+    token := sign_hs256(claims, secret())!
+    options := without_time_checks(default_options())
+
+    # the header says HS256, so every other verifier refuses it — including the
+    # asymmetric ones an attacker would aim a re-signed token at.
+    assert(verify_hs384(token, secret(), options).is_err)
+    assert(verify_hs512(token, secret(), options).is_err)
+    assert(verify_rs256(token, secret(), options).is_err)
+    assert(verify_ps256(token, secret(), options).is_err)
+    assert(verify_es256(token, secret(), options).is_err)
+    assert(verify_eddsa(token, secret(), options).is_err)
+
+test "an algorithm confusion attempt is refused":
+    # the attack: take a token meant for an rsa verifier, re-sign it as HS256
+    # with the rsa public key as the hmac secret, and hand it to a verifier
+    # that picks its algorithm from the header. every verifier here names its
+    # own algorithm, so the re-signed token never reaches the rsa path.
+    public_key := bytes.from_string_utf8("-----BEGIN PUBLIC KEY----- pretend this is rsa")
+    forged := sign_hs256("{{\"sub\":\"admin\"}}", public_key)!
+    options := without_time_checks(default_options())
+
+    assert(verify_rs256(forged, public_key, options).is_err)
+    assert(verify_ps256(forged, public_key, options).is_err)
+    # it is a perfectly good HS256 token; it is simply not an rsa one.
+    assert(verify_hs256(forged, public_key, options).is_ok)
+
+test "an alg none token is rejected":
+    header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"none\",\"typ\":\"JWT\"}}"))
+    payload := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"sub\":\"admin\"}}"))
+    options := without_time_checks(default_options())
+
+    # unsigned, and with a signature field bolted on, and spelled to dodge a
+    # case-sensitive check.
+    assert(verify_hs256(header + "." + payload + ".", secret(), options).is_err)
+    assert(verify_hs256(header + "." + payload + ".AAAA", secret(), options).is_err)
+    upper := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"NONE\"}}"))
+    assert(verify_hs256(upper + "." + payload + ".AAAA", secret(), options).is_err)
+
+test "a tampered token does not verify":
+    token := sign_hs256("{{\"sub\":\"u-1\"}}", secret())!
+    options := without_time_checks(default_options())
+    cut := token.len() - 1
+    mut last := "A"
+    if token[cut] == "A":
+        last = "B"
+
+    swapped_signature := token.substring(0, cut) + last
+    fields := strings.split_n(token, ".", MAX_FIELDS)
+    forged_claims := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"sub\":\"admin\"}}"))
+    swapped_payload := fields[0] + "." + forged_claims + "." + fields[2]
+
+    assert(verify_hs256(swapped_signature, secret(), options).is_err)
+    assert(verify_hs256(swapped_payload, secret(), options).is_err)
+
+test "expiry, not-before and issued-at are checked":
+    issued := 1_700_000_000
+    fresh := sign_hs256("{{\"exp\":1700000600,\"iat\":1700000000}}", secret())!
+    future := sign_hs256("{{\"nbf\":1700000600,\"exp\":1700001200}}", secret())!
+
+    assert(verify_hs256(fresh, secret(), at_time(default_options(), issued + 60)).is_ok)
+    assert(verify_hs256(fresh, secret(), at_time(default_options(), issued + 6000)).is_err)
+    assert(verify_hs256(future, secret(), at_time(default_options(), issued)).is_err)
+    assert(verify_hs256(future, secret(), at_time(default_options(), issued + 600)).is_ok)
+    # a token dated well into the future is refused, and the leeway is what
+    # decides "well into".
+    ahead := sign_hs256("{{\"iat\":1700000600}}", secret())!
+    assert(verify_hs256(ahead, secret(), at_time(without_time_checks(default_options()), issued)).is_ok)
+    assert(verify_hs256(ahead, secret(), at_time(default_options(), issued)).is_err)
+    assert(verify_hs256(ahead, secret(), with_leeway(at_time(default_options(), issued), 3600)).is_ok)
+
+test "a missing exp is only fatal when required":
+    token := sign_hs256("{{\"sub\":\"u-1\"}}", secret())!
+    options := at_time(default_options(), 1_700_000_000)
+
+    assert(verify_hs256(token, secret(), options).is_ok)
+    assert(verify_hs256(token, secret(), requiring_exp(options)).is_err)
+
+test "audience, issuer and subject are compared when asked for":
+    token := sign_hs256("{{\"iss\":\"pith\",\"sub\":\"u-1\",\"aud\":\"chat\"}}", secret())!
+    listed := sign_hs256("{{\"aud\":[\"web\",\"chat\"]}}", secret())!
+    options := without_time_checks(default_options())
+
+    assert(verify_hs256(token, secret(), with_audience(options, "chat")).is_ok)
+    assert(verify_hs256(token, secret(), with_audience(options, "billing")).is_err)
+    assert(verify_hs256(token, secret(), with_issuer(options, "pith")).is_ok)
+    assert(verify_hs256(token, secret(), with_issuer(options, "somebody-else")).is_err)
+    assert(verify_hs256(token, secret(), with_subject(options, "u-1")).is_ok)
+    assert(verify_hs256(token, secret(), with_subject(options, "u-2")).is_err)
+    assert(verify_hs256(listed, secret(), with_audience(options, "chat")).is_ok)
+    assert(verify_hs256(listed, secret(), with_audience(options, "admin")).is_err)
+
+test "malformed tokens fail cleanly":
+    options := without_time_checks(default_options())
+
+    assert(verify_hs256("", secret(), options).is_err)
+    assert(verify_hs256("not-a-token", secret(), options).is_err)
+    assert(verify_hs256("a.b", secret(), options).is_err)
+    assert(verify_hs256("a.b.c.d", secret(), options).is_err)
+    # a header that is not base64url, then one that is not json, then one that
+    # is json but not an object.
+    assert(verify_hs256("!!!.aaaa.bbbb", secret(), options).is_err)
+    not_json := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{oh no"))
+    assert(verify_hs256(not_json + ".aaaa.bbbb", secret(), options).is_err)
+    array_header := encoding.b64_url_raw_encode(bytes.from_string_utf8("[\"HS256\"]"))
+    assert(verify_hs256(array_header + ".aaaa.bbbb", secret(), options).is_err)
+
+test "a signed token with a malformed payload fails after the signature":
+    # the signature is genuine, so these exercise the payload path rather than
+    # the signature one.
+    unsigned := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"HS256\",\"typ\":\"JWT\"}}")) + "." + encoding.b64_url_raw_encode(bytes.from_string_utf8("nope, not json"))
+    mac := hmac.sha256(secret(), bytes.from_string_utf8(unsigned))
+    token := unsigned + "." + encoding.b64_url_raw_encode(mac)
+
+    assert(verify_hs256(token, secret(), without_time_checks(default_options())).is_err)
+
+test "signing refuses claims that are not a bounded json object":
+    assert(sign_hs256("", secret()).is_err)
+    assert(sign_hs256("not json", secret()).is_err)
+    assert(sign_hs256("[1,2,3]", secret()).is_err)
+
+    mut big := "{{"
+    mut i := 0
+    while i <= MAX_CLAIMS:
+        if i > 0:
+            big = big + ","
+        big = big + "\"k" + i.to_string() + "\":1"
+        i = i + 1
+    assert(sign_hs256(big + "}}", secret()).is_err)
+
+test "an oversized token is refused before it is parsed":
+    long_claims := "{{\"pad\":\"" + "x".repeat(MAX_TOKEN_LEN) + "\"}}"
+    options := without_time_checks(default_options())
+
+    assert(sign_hs256(long_claims, secret()).is_err)
+    assert(verify_hs256("a.b." + "c".repeat(MAX_TOKEN_LEN), secret(), options).is_err)

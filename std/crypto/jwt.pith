@@ -1,11 +1,9 @@
 # std.crypto.jwt - json web tokens over the jws compact serialization
 #
-# the signing and verification halves are deliberately not symmetric, because
-# the runtime's primitives are not either. hmac and rsa-pss can sign; ed25519,
-# ecdsa and rsa pkcs#1 can only verify. so a pith service can issue HS256,
-# HS384, HS512 and PS256 tokens, and can validate those plus EdDSA, ES256 and
-# RS256 tokens minted somewhere else. that asymmetry is in the function names:
-# there is no `sign_rs256`, and there never silently was one.
+# every algorithm here both signs and verifies: HS256, HS384 and HS512 over a
+# shared secret, and PS256, RS256, ES256 and EdDSA over a pkcs#8 private key.
+# when you control both ends and want an asymmetric token, prefer PS256 or
+# EdDSA; RS256 is here because it is what most hosted issuers speak.
 #
 # every verifier names the algorithm it will accept. the token's own `alg`
 # header is only ever compared against that name, never used to pick the
@@ -294,10 +292,31 @@ pub fn sign_hs512(claims: String, secret: Bytes) -> String!:
     return assemble(unsigned, hmac.sha512(secret, bytes.from_string_utf8(unsigned)))
 
 # sign a claims object with rsa-pss and sha-256, given a pkcs#8 private key.
-# this is the only asymmetric algorithm pith can issue.
 pub fn sign_ps256(claims: String, pkcs8_private_key: Bytes) -> String!:
     unsigned := signing_input(PS256, claims)!
     sig := signature.sign_rsa_pss_sha256_pkcs8(pkcs8_private_key, bytes.from_string_utf8(unsigned))!
+    return assemble(unsigned, sig)
+
+# sign a claims object with rsa pkcs#1 v1.5 and sha-256, given a pkcs#8
+# private key. prefer PS256 when you control both ends; RS256 is here because
+# it is what most hosted issuers speak.
+pub fn sign_rs256(claims: String, pkcs8_private_key: Bytes) -> String!:
+    unsigned := signing_input(RS256, claims)!
+    sig := signature.sign_rsa_pkcs1_sha256_pkcs8(pkcs8_private_key, bytes.from_string_utf8(unsigned))!
+    return assemble(unsigned, sig)
+
+# sign a claims object with ed25519, given a pkcs#8 private key.
+pub fn sign_eddsa(claims: String, pkcs8_private_key: Bytes) -> String!:
+    unsigned := signing_input(EDDSA, claims)!
+    sig := signature.sign_ed25519_pkcs8(pkcs8_private_key, bytes.from_string_utf8(unsigned))!
+    return assemble(unsigned, sig)
+
+# sign a claims object with ecdsa p-256 and sha-256, given a pkcs#8 private
+# key. the runtime signs in the raw r‖s form jws wants, so unlike the verify
+# path there is no der conversion here.
+pub fn sign_es256(claims: String, pkcs8_private_key: Bytes) -> String!:
+    unsigned := signing_input(ES256, claims)!
+    sig := signature.sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key, bytes.from_string_utf8(unsigned))!
     return assemble(unsigned, sig)
 
 # verify an HS256 token. a token that names any other algorithm is rejected

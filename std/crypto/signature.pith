@@ -1,6 +1,9 @@
-# std.crypto.signature - verification helpers
+# std.crypto.signature - signing and verification kernels
 #
-# these are runtime-backed verifier kernels for x.509 and tls.
+# these are runtime-backed kernels for x.509, tls and jws. verification takes
+# a public key; signing takes a private key in pkcs#8 der form, which is what
+# `openssl genpkey` and `openssl pkcs8 -topk8` produce once the pem armor is
+# stripped.
 
 import std.bytes as bytes
 import std.encoding as encoding
@@ -32,6 +35,21 @@ pub fn verify_rsa_pss_sha256(public_key: Bytes, message: Bytes, signature: Bytes
 # sign with an rsa pkcs#8 private key using pss and sha-256.
 pub fn sign_rsa_pss_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
     return crypto_sign_rsa_pss_sha256_pkcs8(pkcs8_private_key, message)!
+
+# sign with an rsa pkcs#8 private key using pkcs#1 v1.5 and sha-256.
+pub fn sign_rsa_pkcs1_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8_private_key, message)!
+
+# sign with an ed25519 pkcs#8 private key. deterministic: the same key and
+# message always produce the same 64-byte signature.
+pub fn sign_ed25519_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_ed25519_pkcs8(pkcs8_private_key, message)!
+
+# sign with a p-256 pkcs#8 private key using ecdsa and sha-256. the signature
+# comes back as raw r‖s (64 bytes), the form jws carries; wrap it in asn.1 der
+# yourself if an x.509 consumer needs it.
+pub fn sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key, message)!
 
 test "ed25519 verification matches rfc 8032 empty message vector":
     public_key := encoding.from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")!

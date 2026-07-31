@@ -921,6 +921,17 @@ impl HttpRequestBytes:
         return parse_json_or_fail(self.body_text()!)
     fn body_json_or(fallback: Int) -> Int:
         return self.body_json() catch fallback
+    # the token from an `Authorization: Bearer <token>` header. fails when the
+    # header is missing or names another scheme, which is the shape an auth
+    # guard wants: `token := req.bearer_token() catch: return unauthorized`.
+    fn bearer_token() -> String!:
+        header := self.header_or("Authorization", "")
+        if not header.starts_with("Bearer "):
+            fail "no bearer token in the Authorization header"
+        token := header.substring(7, header.len())
+        if token.len() == 0:
+            fail "empty bearer token"
+        return token
     fn matches(method_name: String, path_name: String) -> Bool!:
         return self.method()! == method_name and self.path()! == path_name
     fn is_get(path_name: String) -> Bool!:
@@ -1682,6 +1693,9 @@ impl HttpResponse:
 
     fn body_json() -> Int!:
         return parse_json_or_fail(self.body_text()!)
+
+    fn body_json_or(fallback: Int) -> Int:
+        return self.body_json() catch fallback
 
     fn to_bytes() -> Bytes!:
         return self.to_bytes_conn("")

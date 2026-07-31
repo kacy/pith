@@ -100,19 +100,27 @@ import std.bytes as bytes
 import std.crypto.jwt as jwt
 
 secret := bytes.from_string_utf8(env("SESSION_SECRET"))
-claims := "{{\"iss\":\"chat\",\"sub\":\"u-1024\",\"exp\":1750003600}}"
 
-token := jwt.sign_hs256(claims, secret)!
+token := jwt.claims().issuer("chat").subject("u-1024").expires_in(3600).sign_hs256(secret)!
 session := jwt.verify_hs256(token, secret, jwt.default_options())!
-print(session.claims)
+print(session.subject())
 ```
 
-json in a pith string literal is written with doubled braces, since a single
-`{` starts an interpolation.
+the builder writes the json, escapes the values, and stamps `iat` and `exp`
+at signing time — `expires_in` counts seconds from now, so no epoch
+arithmetic reaches your code. custom claims go on with `.claim("role",
+"admin")` and `.claim_int("level", 9)`; a custom claim that spells a
+registered name (`iss`, `exp`, ...) is refused rather than silently
+overriding the setters. the `sign_*` methods cover every algorithm the
+module signs with.
 
-`verify_*` hands back a `Verified` holding the header and claims as the json
-text they arrived as. parse them with `std.json` — `json.decode_text[T]` if you
-have a struct for your claims, `json.parse` if you would rather have handles.
+`verify_*` hands back a `Verified`. read the registered subject with
+`.subject()` and anything else with `.claim(name)` / `.claim_int(name)`;
+for a struct of your own, the claims json is still there —
+`json.decode_text[T]` on `.claims` fills it. raw claims json can also be
+signed directly with `jwt.sign_hs256(text, secret)` when it comes from
+somewhere else; a pith string literal writes json with doubled braces,
+since a single `{` starts an interpolation.
 
 ## the two things jwt libraries get wrong
 

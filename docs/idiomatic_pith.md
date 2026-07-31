@@ -204,6 +204,25 @@ fn main() -> Int!:
     ...
 ```
 
+When the recovery is control flow rather than a value — answer a 401, skip
+this item, stop the loop — `catch` takes a block. The block runs only on the
+error path and has to leave (`return`, `fail`, `continue` or `break`), since
+it produces no value for the binding:
+
+```pith
+fn handle(req: web.Request) -> http.HttpResponse:
+    session := jwt.verify_hs256(token, secret, expected) catch:
+        return http.unauthorized_response()
+    ...
+
+for line in lines:
+    parsed := parse_row(line) catch:
+        continue                       # skip the malformed row
+```
+
+Before this form existed, that shape forced a helper function whose only job
+was to route the error — the block is that helper, inline.
+
 When you want to _observe_ the miss without crashing or propagating —
 distinguishing "not present" from "present with value 0" — reach for
 the `.get()` methods, which return `T?`:

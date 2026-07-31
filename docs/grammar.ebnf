@@ -269,8 +269,11 @@ select_arm    = IDENT , ":=" , postfix_expr , "=>" , expression
               | "timeout" , expression , "=>" , expression
               | "default" , "=>" , expression ;
 
-(* catch — fallback when the left side is a failed result *)
-catch_expr    = or_expr , { "catch" , or_expr } ;
+(* catch — fallback when the left side is a failed result. the block form
+   runs the block on the error path instead of producing a value; the block
+   must end with return, fail, continue or break *)
+catch_expr    = or_expr , { "catch" , or_expr }
+              | or_expr , "catch" , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
 or_expr       = and_expr , { "or" , and_expr } ;
 and_expr      = not_expr , { "and" , not_expr } ;
 not_expr      = "not" , not_expr | comparison ;

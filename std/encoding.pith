@@ -107,6 +107,7 @@ fn b64_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
         text = append_padding(text, 4)
 
     buf := bytes.buffer_with_capacity(text.len())
+    defer buf.free()
     mut i := 0
     while i < text.len():
         a := table_char_val(text[i], table)
@@ -229,6 +230,7 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
             fail "invalid base32 padding"
 
     buf := bytes.buffer_with_capacity(text.len())
+    defer buf.free()
     mut buffer := 0
     mut bits_left := 0
     mut seen_pad := false
@@ -350,6 +352,7 @@ pub fn base58_decode(input: String) -> Bytes!:
         i = i + 1
 
     out := bytes.buffer_with_capacity(zeroes + digits.len())
+    defer out.free()
     i = 0
     while i < zeroes:
         out.write_byte(0)
@@ -431,6 +434,7 @@ pub fn varint_encode(value: Int) -> Bytes!:
     if value < 0:
         fail "varint value must be non-negative"
     out := bytes.buffer()
+    defer out.free()
     mut remaining := value
     while true:
         mut byte_value := bits.band(remaining, 127)

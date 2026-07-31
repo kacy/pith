@@ -1140,7 +1140,9 @@ MEMCHECK_CASES := \
 	tests/cases/test_spawn_in_loop_capture \
 	tests/cases/test_result_ok_reclaim \
 	tests/cases/test_os_thread_spawn_reclaim \
-	tests/cases/test_await_ownership
+	tests/cases/test_await_ownership \
+	tests/cases/test_yaml_structure tests/cases/test_yaml_malformed \
+	tests/cases/test_yaml_derived_decode
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

@@ -314,9 +314,12 @@ fn strip_comment(text: String) -> String:
 # splits the input into the line table. returns false when the input is not
 # scannable at all, which today means a tab used for indentation.
 fn scan_lines(input: String) -> Bool:
-    line_indent = []
-    line_text = []
-    line_raw = []
+    # cleared in place rather than reassigned: the line table is rebuilt on
+    # every parse, and reusing the three lists keeps a parse-per-request loop
+    # from handing the allocator three fresh lists each time round.
+    line_indent.clear()
+    line_text.clear()
+    line_raw.clear()
     line_pos = 0
     mut start := 0
     mut i := 0

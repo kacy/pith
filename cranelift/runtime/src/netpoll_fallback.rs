@@ -31,6 +31,18 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, _task: usize) -> i
     crate::fdio::poll_wait(fd as i64, events, timeout_ms)
 }
 
+/// sleep for `ms` milliseconds. `task` is the caller's green slab id, unused
+/// here: with no reactor there is no timer heap to park the task on, so the
+/// worker OS thread blocks for the duration — the same degradation socket
+/// waits take on this platform (see the module comment). a zero or negative
+/// duration returns immediately, matching the linux reactor's contract.
+pub(crate) fn sleep_task(ms: i64, _task: usize) {
+    if ms <= 0 {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+}
+
 /// no-op: without a reactor there is no per-fd registration to tear down. the
 /// linux build cleans up parked waiters here; a `poll` wait owns its fd for the
 /// length of one call and leaves nothing behind.

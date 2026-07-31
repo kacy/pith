@@ -1,0 +1,36 @@
+# a sleep has to mean what it says at the edges.
+#
+# a negative duration used to hang: the runtime cast the millisecond count to
+# an unsigned width, so -5 became roughly 584 million years and looked exactly
+# like a deadlock. zero and negative both return immediately now, on either
+# backend, and a batch of sleepers overlaps instead of serializing — which is
+# the property that makes a sleeping task cheap.
+
+import std.time as time
+
+fn napper() -> Int:
+    time.delay(120)
+    return 1
+
+fn main():
+    start := time.mono_millis()
+    time.delay(0)
+    time.delay(0 - 5)
+    time.delay(0 - 1000000)
+    print("edge_durations_return_promptly={time.mono_millis() - start < 100}")
+
+    # a sleeper that is the only live task still gets woken
+    print("solo_sleeper_woke={await spawn napper()}")
+
+    # eight sleepers on a two-worker pool: if a sleep held its worker these
+    # would run four batches deep, so the elapsed time separates the two.
+    mut tasks := []
+    mut i := 0
+    while i < 8:
+        tasks.push(spawn napper())
+        i = i + 1
+    batch := time.mono_millis()
+    mut woke := 0
+    for t in tasks:
+        woke = woke + (await t)
+    print("all_woke={woke} overlapped={time.mono_millis() - batch < 400}")

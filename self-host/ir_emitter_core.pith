@@ -15,7 +15,7 @@
 #   ir_struct_registry  struct and enum shapes
 #   ir_method_tables    method symbols and return kinds
 #   ir_generics         generic declarations and specializations
-#   ir_decode_emit      json / toml / config decode-call emission
+#   ir_decode_emit      json / handle-pool / config decode-call emission
 #   ir_match_emit       match lowering
 #
 # the satellites never import this module back. where one needs an
@@ -48,11 +48,11 @@ from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_sp
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
-from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
+from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -64,10 +64,10 @@ from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_flo
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
-from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_toml_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_toml_decode_specialization, ir_is_toml_decode_path_specialization, ir_is_toml_decode_text_path_specialization, ir_is_toml_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
+from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_handle_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_handle_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_handle_decode_specialization, ir_is_handle_decode_path_specialization, ir_is_handle_decode_text_path_specialization, ir_is_handle_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_handle_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_declared_callable_return_type_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
-from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_toml_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state, ir_record_generic_spec_arg_tids, ir_decode_generic_spec_arg_tids
+from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_handle_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state, ir_record_generic_spec_arg_tids, ir_decode_generic_spec_arg_tids
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
@@ -2884,14 +2884,14 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
-fn ir_emit_local_toml_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
+fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
     arg_regs := ir_collect_call_arg_regs(node, 1)
     if arg_regs.len() < 2:
         return ir_zero_reg()
 
     input_r := arg_regs[0]
     dotted_path_r := arg_regs[1]
-    temp_name := ir_new_temp_name("toml_decode_text_path")
+    temp_name := ir_new_temp_name("handle_decode_text_path")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
     parse_result_r := ir_reg()
@@ -3102,21 +3102,21 @@ fn ir_emit_index_json_decode_call(idx: Int, node: Node, callee_idx: Int) -> Int:
         return ir_emit_json_decode_file_call(idx, node, true, ir_expr, ir_emit_value_for_target)
     return 0 - 1
 
-fn ir_emit_index_toml_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node) -> Int:
-    if ir_is_toml_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "handle"):
-        return ir_emit_toml_decode_call(idx, node, false, ir_expr, ir_emit_value_for_target)
-    if ir_is_toml_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
-        return ir_emit_toml_decode_call(idx, node, true, ir_expr, ir_emit_value_for_target)
-    if ir_is_toml_decode_callee(callee_idx, "decode_path"):
-        return ir_emit_toml_decode_path_call(idx, node, false, ir_expr, ir_emit_value_for_target)
-    if ir_is_toml_decode_callee(callee_idx, "decode_text_path"):
-        return ir_emit_toml_decode_path_call(idx, node, true, ir_expr, ir_emit_value_for_target)
+fn ir_emit_index_handle_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node) -> Int:
+    if ir_is_handle_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "handle"):
+        return ir_emit_handle_decode_call(idx, node, false, ir_expr, ir_emit_value_for_target)
+    if ir_is_handle_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
+        return ir_emit_handle_decode_call(idx, node, true, ir_expr, ir_emit_value_for_target)
+    if ir_is_handle_decode_callee(callee_idx, "decode_path"):
+        return ir_emit_handle_decode_path_call(idx, node, false, ir_expr, ir_emit_value_for_target)
+    if ir_is_handle_decode_callee(callee_idx, "decode_text_path"):
+        return ir_emit_handle_decode_path_call(idx, node, true, ir_expr, ir_emit_value_for_target)
     if ir_is_local_generic_callee(callee_idx, "decode_text_path", "input"):
-        return ir_emit_local_toml_decode_text_path_call(idx, node, callee_node)
-    if ir_is_toml_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
-        return ir_emit_toml_decode_file_call(idx, node, false, ir_expr, ir_emit_value_for_target)
-    if ir_is_toml_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
-        return ir_emit_toml_decode_file_call(idx, node, true, ir_expr, ir_emit_value_for_target)
+        return ir_emit_local_handle_decode_text_path_call(idx, node, callee_node)
+    if ir_is_handle_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
+        return ir_emit_handle_decode_file_call(idx, node, false, ir_expr, ir_emit_value_for_target)
+    if ir_is_handle_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
+        return ir_emit_handle_decode_file_call(idx, node, true, ir_expr, ir_emit_value_for_target)
     return 0 - 1
 
 fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node) -> Int:
@@ -3126,7 +3126,7 @@ fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node:
     config_r := ir_emit_index_config_decode_call(idx, node, callee_idx, ir_expr, ir_emit_value_for_target)
     if config_r >= 0:
         return config_r
-    return ir_emit_index_toml_decode_call(idx, node, callee_idx, callee_node)
+    return ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node)
 
 fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     expr_tid := c_get_expr_type(idx)
@@ -6832,14 +6832,14 @@ fn ir_emit_generic_specialization(key: String):
         ir_emit_config_decode_specialization_body(concrete_types[0], false, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
     elif concrete_types.len() == 1 and ir_is_config_decode_specialization(base_name, true, ir_active_generic_module_path, decl_idx):
         ir_emit_config_decode_specialization_body(concrete_types[0], true, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
-    elif concrete_types.len() == 1 and ir_is_toml_decode_specialization(base_name, ir_active_generic_module_path, decl_idx):
-        ir_emit_toml_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
-    elif concrete_types.len() == 1 and ir_is_toml_decode_text_specialization(base_name, ir_active_generic_module_path, decl_idx):
-        ir_emit_toml_decode_text_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
-    elif concrete_types.len() == 1 and ir_is_toml_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
-        ir_emit_toml_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
-    elif concrete_types.len() == 1 and ir_is_toml_decode_text_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
-        ir_emit_toml_decode_text_path_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_text_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_text_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_expr, ir_emit_value_for_target, ir_emit_default_return)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_text_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_text_path_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
     elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, false):
         ir_emit_json_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, false, ir_emit_value_for_target, ir_emit_default_return)
     elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, true):

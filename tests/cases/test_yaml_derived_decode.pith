@@ -1,0 +1,115 @@
+import std.yaml as yaml
+import std.fs as fs
+import std.os.path as os_path
+
+# typed decoding, the same shapes std.toml covers.
+
+struct YamlDerivedFixture:
+    pub name: String
+    pub score: Int
+    pub active: Bool
+
+struct YamlServerFixture:
+    pub host: String
+    pub port: Int
+
+struct YamlOptionalFixture:
+    pub name: String
+    pub tls: Bool?
+
+struct YamlDefaultFixture:
+    pub name: String
+    pub tls: Bool = false
+
+struct YamlNestedDefaultServer:
+    pub host: String
+    pub port: Int = 8080
+    pub tls: Bool = false
+
+struct YamlNestedDefaultApp:
+    pub name: String
+    pub server: YamlNestedDefaultServer = YamlNestedDefaultServer("localhost")
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+fn main() -> Int!:
+    doc := line("name: pith") + line("score: 42") + line("active: true")
+    nested_doc := line("server:") + line("  host: localhost") + line("  port: 8080")
+
+    root := yaml.parse(doc)
+    from_handle := yaml.decode[YamlDerivedFixture](root)
+    if from_handle.is_ok:
+        print("{from_handle.ok.name}:{from_handle.ok.score}:{from_handle.ok.active}")
+
+    from_text := yaml.decode_text[YamlDerivedFixture](doc)
+    if from_text.is_ok:
+        print("{from_text.ok.name}@{from_text.ok.score}")
+
+    missing := yaml.decode_text[YamlDerivedFixture](line("name: pith"))
+    print("{missing.is_err}")
+    if missing.is_err:
+        print("{missing.err.message.contains("score")}")
+
+    invalid := yaml.decode_text[YamlDerivedFixture](line("name: pith") + line("  bad: 1"))
+    print("{invalid.is_err}")
+    if invalid.is_err:
+        print("{invalid.err.message.contains("invalid yaml")}")
+
+    optional_present := yaml.decode_text[YamlOptionalFixture](line("name: pith") + line("tls: true"))
+    optional_missing := yaml.decode_text[YamlOptionalFixture](line("name: pith"))
+    if optional_present.is_ok:
+        print("{optional_present.ok.name}:{optional_present.ok.tls?}")
+    if optional_missing.is_ok:
+        print("{optional_missing.ok.name}:{optional_missing.ok.tls == none}")
+
+    defaulted := yaml.decode_text[YamlDefaultFixture](line("name: pith"))
+    if defaulted.is_ok:
+        print("{defaulted.ok.name}:{defaulted.ok.tls}")
+
+    nested_default_missing := yaml.decode_text[YamlNestedDefaultApp](line("name: pith"))
+    nested_default_partial := yaml.decode_text[YamlNestedDefaultApp](line("name: pith") + line("server:") + line("  host: edge"))
+    if nested_default_missing.is_ok:
+        app := nested_default_missing.ok
+        print("{app.name}:{app.server.host}:{app.server.port}:{app.server.tls}")
+    if nested_default_partial.is_ok:
+        app := nested_default_partial.ok
+        print("{app.name}:{app.server.host}:{app.server.port}:{app.server.tls}")
+
+    nested_root := yaml.parse(nested_doc)
+    nested := yaml.decode_path[YamlServerFixture](nested_root, "server")
+    if nested.is_ok:
+        print("{nested.ok.host}#{nested.ok.port}")
+
+    nested_text := yaml.decode_text_path[YamlServerFixture](nested_doc, "server")
+    if nested_text.is_ok:
+        print("{nested_text.ok.host}${nested_text.ok.port}")
+
+    temp_root := fs.make_temp_dir("pith-yaml-derived-")!
+    nested_path := os_path.join(temp_root, "app.yaml")
+    flat_path := os_path.join(temp_root, "flat.yaml")
+    assert(fs.write(nested_path, nested_doc)!)
+    assert(fs.write(flat_path, line("host: flat") + line("port: 9000"))!)
+    from_file := yaml.decode_file[YamlServerFixture](flat_path)
+    if from_file.is_ok:
+        print("{from_file.ok.host}&{from_file.ok.port}")
+    nested_file := yaml.decode_file_path[YamlServerFixture](nested_path, "server")
+    if nested_file.is_ok:
+        print("{nested_file.ok.host}%{nested_file.ok.port}")
+    assert(fs.remove_tree(temp_root))
+
+    nested_missing := yaml.decode_text_path[YamlServerFixture](nested_doc, "database")
+    print("{nested_missing.is_err}")
+    if nested_missing.is_err:
+        print("{nested_missing.err.message.contains("missing table field")}")
+
+    # the pool gives back everything a text decode allocated
+    base := yaml.pool_live_nodes()
+    mut i := 0
+    while i < 50:
+        row := yaml.decode_text[YamlDerivedFixture](doc)
+        if row.is_err:
+            print("unexpected error")
+        i = i + 1
+    print("pool_growth:{yaml.pool_live_nodes() - base}")
+    return 0

@@ -1439,7 +1439,9 @@ pub fn decode[T](handle: Int) -> T!YamlDecodeError:
 pub fn decode_text[T](input: String) -> T!YamlDecodeError:
     fail yaml_decode_fail("yaml.decode_text requires compiler support")
 
-fn yaml_require_table(handle: Int, key: String) -> Int!YamlDecodeError:
+## the nested mapping a key names, or a typed error when the key is missing or
+## does not hold a mapping. this is the step a dotted decode path walks with.
+pub fn require_table(handle: Int, key: String) -> Int!YamlDecodeError:
     child := map_lookup(handle, key)
     if child < 0:
         fail yaml_decode_fail("missing table field: " + key)
@@ -1453,7 +1455,7 @@ pub fn decode_path[T](handle: Int, dotted_path: String) -> T!YamlDecodeError:
     for part in dotted_path.split("."):
         if part == "":
             continue
-        current = yaml_require_table(current, part)!
+        current = require_table(current, part)!
     return decode[T](current)!
 
 ## parses YAML text and decodes a nested mapping selected by a dotted path.

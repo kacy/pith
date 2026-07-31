@@ -1,0 +1,59 @@
+import std.yaml as yaml
+import std.json as json
+
+# json is a subset of yaml 1.2, so the same document read through std.json and
+# through std.yaml has to produce the same values. this pins the two data
+# models together where they overlap.
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+fn main() -> Int!:
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+
+    doc := lb + dq + "name" + dq + ": " + dq + "gateway" + dq + ", " + dq + "port" + dq + ": 8080, " + dq + "tls" + dq + ": true, " + dq + "ratio" + dq + ": 0.25, " + dq + "tags" + dq + ": [" + dq + "a" + dq + ", " + dq + "b" + dq + "]" + rb
+
+    json_root := json.parse(doc)
+    yaml_root := yaml.parse(doc)
+
+    print("kinds:{json.type_of(json_root)}/{yaml.type_of(yaml_root)}")
+    print("name:{json.object_get_string(json_root, "name") == yaml.get_string(yaml_root, "name")}")
+    print("port:{json.object_get_int(json_root, "port") == yaml.get_int(yaml_root, "port")}")
+    print("tls:{json.object_get_bool(json_root, "tls") == yaml.get_bool(yaml_root, "tls")}")
+    print("ratio:{json.object_get_float(json_root, "ratio") == yaml.get_float(yaml_root, "ratio")}")
+
+    json_tags := json.object_get_array(json_root, "tags")
+    yaml_tags := yaml.get_array(yaml_root, "tags")
+    print("tags_len:{json.array_len(json_tags) == yaml.array_len(yaml_tags)}")
+    print("tags_0:{json.get_string(json.array_get(json_tags, 0)) == yaml.scalar_string(yaml.array_get(yaml_tags, 0))}")
+    print("tags_1:{json.get_string(json.array_get(json_tags, 1)) == yaml.scalar_string(yaml.array_get(yaml_tags, 1))}")
+
+    # the same data written as block yaml reads back the same as the json form
+    mut block := line("name: gateway")
+    block = block + line("port: 8080")
+    block = block + line("tls: true")
+    block = block + line("ratio: 0.25")
+    block = block + line("tags:")
+    block = block + line("  - a")
+    block = block + line("  - b")
+
+    block_root := yaml.parse(block)
+    print("block_name:{yaml.get_string(block_root, "name") == json.object_get_string(json_root, "name")}")
+    print("block_port:{yaml.get_int(block_root, "port") == json.object_get_int(json_root, "port")}")
+    print("block_tls:{yaml.get_bool(block_root, "tls") == json.object_get_bool(json_root, "tls")}")
+    print("block_ratio:{yaml.get_float(block_root, "ratio") == json.object_get_float(json_root, "ratio")}")
+    print("block_keys:{yaml.keys(block_root).join(",")}")
+    print("block_tags:{yaml.scalar_string(yaml.array_get(yaml.get_array(block_root, "tags"), 1))}")
+
+    # both pools keep their own scopes and neither leaks into the other
+    json_base := json.pool_live_nodes()
+    yaml_base := yaml.pool_live_nodes()
+    scope := yaml.open_scope()
+    reparsed := yaml.parse(doc)
+    print("reparsed:{yaml.get_int(reparsed, "port")}")
+    yaml.close_scope(scope)
+    print("json_untouched:{json.pool_live_nodes() - json_base}")
+    print("yaml_reclaimed:{yaml.pool_live_nodes() - yaml_base}")
+    return 0

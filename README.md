@@ -65,7 +65,7 @@ small language carry on its own back? the answer so far:
   collector, but a struct graph can break its own cycles with a `weak`
   field — mark the back edge `weak` and a parent/child ring reclaims.
 - **the stdlib doesn't shell out.** TLS 1.3, http/1.1 and http/2, websockets, json,
-  toml, csv, tar, zip, gzip (interops with system gzip in both
+  toml, yaml, csv, tar, zip, gzip (interops with system gzip in both
   directions), sha-256, a linear-time regex engine — written in pith.
   when the language couldn't express something well, that became a
   language feature to build rather than a binding to hide behind.
@@ -142,13 +142,14 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-80 modules, ~36,000 lines, all pith. the areas: io and filesystems
+81 modules, ~37,000 lines, all pith. the areas: io and filesystems
 (fs, glob, path, process), networking (tcp, dns, url, http, http2,
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling — plus db, a
 pooled high-level layer over a connection url, see [docs/db.md](docs/db.md)),
 data (json,
-toml, csv, config, table), bytes and crypto (hash, checksum, encoding,
+toml, yaml, csv, config, table, see [docs/yaml.md](docs/yaml.md) for the
+yaml subset), bytes and crypto (hash, checksum, encoding,
 crypto, bits, binary), compression and archives (gzip/zlib, tar, zip),
 text (regex, scanner, fmt), app plumbing (log, metrics, cli, env, testing,
 diagnostic, time, datetime, rand, uuid, math), observability (trace,

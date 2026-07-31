@@ -757,7 +757,9 @@ pub fn decode[T](handle: Int) -> T!TomlDecodeError:
 pub fn decode_text[T](input: String) -> T!TomlDecodeError:
     fail toml_decode_fail("toml.decode_text requires compiler support")
 
-fn toml_require_table(handle: Int, key: String) -> Int!TomlDecodeError:
+## the sub-table a key names, or a typed error when the key is missing or does
+## not hold a table. this is the step a dotted decode path walks with.
+pub fn require_table(handle: Int, key: String) -> Int!TomlDecodeError:
     child := table_lookup(handle, key)
     if child < 0:
         fail toml_decode_fail("missing table field: " + key)
@@ -771,7 +773,7 @@ pub fn decode_path[T](handle: Int, dotted_path: String) -> T!TomlDecodeError:
     for part in dotted_path.split("."):
         if part == "":
             continue
-        current = toml_require_table(current, part)!
+        current = require_table(current, part)!
     return decode[T](current)!
 
 ## parse toml text and decode a nested table selected by a dotted path.

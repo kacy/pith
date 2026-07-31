@@ -1,0 +1,46 @@
+# parsing yaml over and over inside one task. the node pool lives in
+# threadlocal storage, so a task that parses per request holds on to every node
+# it ever parsed unless something gives them back — open_scope()/close_scope()
+# is what gives them back, and this churns it two ways: a single document, and
+# a multi-document stream, which allocates a sequence node per document on top
+# of each document's own tree.
+#
+# a bare parse() with no scope around it is deliberately not part of the round.
+# that form keeps its nodes on purpose: the handles it returns stay valid for
+# as long as the caller wants them, the same contract std.json and std.toml
+# have.
+import std.yaml as yaml
+import leakprobe as probe
+
+fn document(i: Int) -> String:
+    nl := chr(10)
+    return "id: " + i.to_string() + nl + "name: row" + nl + "tags: [a, b]" + nl
+
+fn scoped_parse(i: Int) -> Int:
+    scope := yaml.open_scope()
+    root := yaml.parse(document(i))
+    id := yaml.get_int(root, "id") + yaml.array_len(yaml.get_array(root, "tags"))
+    yaml.close_scope(scope)
+    return id
+
+fn scoped_parse_all(i: Int) -> Int:
+    scope := yaml.open_scope()
+    stream := document(i) + "---" + chr(10) + document(i + 1)
+    all := yaml.parse_all(stream)
+    count := yaml.array_len(all)
+    yaml.close_scope(scope)
+    return count
+
+fn main():
+    n := probe.rounds()
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        if i % 2 == 0:
+            acc = acc + scoped_parse(i)
+        else:
+            acc = acc + scoped_parse_all(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

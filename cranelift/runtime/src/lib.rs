@@ -11,6 +11,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod argon2;
+pub mod blake2b;
 pub mod blocking;
 pub mod bytes;
 pub mod collections;

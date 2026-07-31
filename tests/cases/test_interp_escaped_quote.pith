@@ -1,0 +1,13 @@
+# an escaped quote right before an interpolation. the literal segment ahead
+# of the brace ends in `\"`, and the quote-stripper used to read that final
+# quote as the string's closing delimiter — the quote vanished and the
+# backslash survived, so "a\"{x}\"b" printed as a\7"b. json built this way
+# was silently invalid.
+
+fn main():
+    x := 7
+    print("a\"{x}\"b")
+    print("{x}\"")
+    print("\"{x}")
+    name := "ada"
+    print("{{\"sub\":\"{name}\",\"n\":{x}}}")

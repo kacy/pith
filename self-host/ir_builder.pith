@@ -32,7 +32,17 @@ fn ir_strip_quotes(s: String) -> String:
         if result.substring(0, 1) == chr(34):
             result = result.substring(1, result.len())
         if result.len() > 0 and result.substring(result.len() - 1, result.len()) == chr(34):
-            result = result.substring(0, result.len() - 1)
+            # a final quote is only a delimiter when it is not itself escaped.
+            # an interpolation's leading segment can end in `\"` (the text
+            # before the brace in "a\"{x}"), and stripping that quote would
+            # orphan the backslash and corrupt the literal.
+            mut backslashes := 0
+            mut j := result.len() - 2
+            while j >= 0 and result.substring(j, j + 1) == chr(92):
+                backslashes = backslashes + 1
+                j = j - 1
+            if backslashes % 2 == 0:
+                result = result.substring(0, result.len() - 1)
     return result
 
 fn ir_string_symbol_name(index: Int) -> String:

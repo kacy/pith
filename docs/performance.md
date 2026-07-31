@@ -43,9 +43,10 @@ go, well behind rust and zig, with string building the remaining gap.
 
 ## july 2026 hardening, in numbers
 
-between 2026-07-26 and 2026-07-29 the green backend became the linux default,
-every blocking call got a yield point, and an ownership sweep fixed seven
-leak/use-after-free defects in the emitter and runtime. what that changed,
+between 2026-07-26 and 2026-07-31 the green backend became the linux default,
+every blocking call got a yield point, an ownership sweep fixed seven
+leak/use-after-free defects in the emitter and runtime, and a concurrency
+audit of the shared state the flip exposed fixed six more. what that changed,
 each measured before and after on this machine:
 
 | what | before | after |
@@ -53,7 +54,13 @@ each measured before and after on this machine:
 | a co-tenant cpu task while another task waits on dns | blocked until the lookup ended | decoupled (~78 ms) |
 | the same, while another task appends to a log file | 257-273 ms | 122-124 ms |
 | the same, while another task waits on a child process | 1013-1018 ms | 8-9 ms |
+| the same, while two tasks run `process.output` | 2012 ms at 1 worker, 1007 at 2 | 8 ms |
+| the same, while another task sleeps a second | 1018 ms | 7-23 ms |
+| the same, while a `select` waits on an idle channel | 3015 ms | 20 ms, and the send now arrives in time |
+| twelve concurrent sleepers, 120 ms each | serialized behind their workers | all wake in ~201 ms |
 | one bare tcp connect to a tls server | server dead, health checks green | survives; >512 junk handshakes hold no slots |
+| concurrent https requests sharing the tls config registry | racing handle counter — a handshake could pick up another config's cert and key | serialized behind one lock |
+| `time.delay` with a negative duration | hung (≈584 million years) | returns immediately |
 | json parse per request, 20k docs on one task | 89 mb, degrading | 10 mb flat, ~30% faster |
 | map/list eviction churn, 800k rounds | 38 mb | 10 mb flat |
 | `container[expr()]` index keys, 800k | 26-75 mb | flat |

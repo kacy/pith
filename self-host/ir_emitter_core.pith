@@ -690,7 +690,7 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     # payload out of the shell; the fallback arm retains a borrow — see
     # ir_emit_catch_expr), so the result arrives owned. treating it as borrowed
     # makes the binding retain again and leaks the payload.
-    if node.kind == "catch_expr":
+    if node.kind == "catch_expr" or node.kind == "catch_block":
         return false
     # awaiting a task transfers the result's count out to the single awaiter:
     # the task's thread produced the value with count 1 and stored it raw in the
@@ -899,7 +899,7 @@ fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> B
                     arg_mentions = true
                 ai = ai + 1
             return not arg_mentions
-    if is_result and parent.kind == "catch_expr" and parent.children.len() > 1:
+    if is_result and (parent.kind == "catch_expr" or parent.kind == "catch_block") and parent.children.len() > 1:
         operand := get_node(parent.children[0])
         if operand.kind == "ident" and operand.value == name:
             return not ir_subtree_mentions_ident(parent.children[1], name)
@@ -1146,7 +1146,7 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
             # the underlying result tuple), so a list/map/set binding would be
             # released with the wrong struct-shaped kind and leak its backing.
             # take the ok kind the emitter itself uses for the ok field.
-            if val_node.kind == "catch_expr" and val_node.children.len() > 0:
+            if (val_node.kind == "catch_expr" or val_node.kind == "catch_block") and val_node.children.len() > 0:
                 catch_ok := ir_result_ok_kind_for_expr(val_node.children[0])
                 if ir_rc_kind(catch_ok).len() > 0:
                     bind_type = catch_ok
@@ -5544,6 +5544,46 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# `expr catch:` with a block. the ok arm is the same extraction the inline
+# catch performs; the error arm disposes of the failed result and then runs
+# the user's block, which the checker guarantees leaves (return, fail,
+# continue or break). the trailing jmp is dead code on every real path — it
+# only keeps the ir well formed.
+fn ir_emit_catch_block(node: Node) -> Int:
+    result_r := ir_expr(node.children[0])
+    result_tid := c_get_expr_type(node.children[0])
+    operand_class := ir_extraction_operand_class(node.children[0])
+    cond_r := ir_emit_result_flag_field(result_r, "is_ok")
+    temp_name := ir_new_temp_name("catch_block")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ok_value_r := ir_emit_result_value_field(result_r, result_tid, "ok")
+    if operand_class == "borrowed":
+        # the operand's owner keeps the shell and its payload count; the
+        # extracted value gets a count of its own, exactly as the inline
+        # catch's ok arm does.
+        ir_rc_retain_reg(ok_value_r, ir_rc_kind(ir_result_field_kind(result_tid, "ok")))
+    else:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+    ir_emit("store " + temp_name + " " + ok_value_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    # the error is not consumed by the block (there is no binding for it in
+    # this form), so drop it before user code runs — unless the operand is a
+    # borrow, in which case the error and the shell stay with their owner.
+    if operand_class != "borrowed":
+        ir_emit_release_result_error(result_r, result_tid)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+    ir_block(node.children[1])
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_grouped_expr(node: Node) -> Int:
     if node.children.len() > 0:
         return ir_expr(node.children[0])
@@ -5616,6 +5656,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
 
     if kind == "catch_expr":
         return ir_emit_catch_expr(node)
+    if kind == "catch_block":
+        return ir_emit_catch_block(node)
 
     if kind == "select_expr":
         return ir_emit_select_expr(node)

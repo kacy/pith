@@ -357,6 +357,16 @@ fn parse_catch_expression() -> Int:
     mut left := parse_or_expression()
     while check("kw_catch"):
         advance_token()
+        # block form: `catch:` opening an indented block. the colon has to be
+        # followed by a newline, so an inline `catch fallback` anywhere in an
+        # expression is untouched. the block runs on the error path and must
+        # leave (return, fail, continue, break) — it produces no value, so
+        # falling out of it would leave the binding with nothing.
+        if check("colon") and _peek_ahead_kind(1) == "newline":
+            advance_token()
+            block := parse_block()
+            mut block_children: List[Int] := [left, block]
+            return add_node_with_position("catch_block", "", block_children)
         fallback := parse_or_expression()
         mut children: List[Int] := [left, fallback]
         left = add_node_with_position("catch_expr", "", children)

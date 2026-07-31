@@ -1,0 +1,67 @@
+# `expr catch:` with a block: the error path runs the block instead of
+# producing a fallback value, and the block must leave — return, fail,
+# continue or break. the shapes here are the ones that have historically
+# broken result extraction: heap payloads, borrowed operands, and loops.
+
+fn make(n: Int) -> String!:
+    if n < 0:
+        fail "negative"
+    return "value-" + n.to_string()
+
+fn pick(n: Int) -> String:
+    s := make(n) catch:
+        return "fell back"
+    return s
+
+fn total_of(nums: List[Int]) -> Int:
+    mut total := 0
+    for n in nums:
+        s := make(n) catch:
+            continue
+        total = total + s.len()
+    return total
+
+fn first_bad(nums: List[Int]) -> Int:
+    mut seen := 0
+    for n in nums:
+        s := make(n) catch:
+            break
+        seen = seen + 1
+        keep := s
+        if keep.len() == 0:
+            return -1
+    return seen
+
+fn relay(n: Int) -> String!:
+    s := make(n) catch:
+        fail "relay saw the error"
+    return s + "!"
+
+# a borrowed operand: the result lives in a named local, and the catch block
+# reads through it without consuming it.
+fn borrowed(n: Int) -> String:
+    held := make(n)
+    s := held catch:
+        return "held an error"
+    return s
+
+fn main():
+    print(pick(3))
+    print(pick(0 - 1))
+    print("total={total_of([1, 0 - 1, 22])}")
+    print("seen={first_bad([5, 6, 0 - 2, 7])}")
+    print(relay(2) catch "relayed")
+    print(relay(0 - 3) catch "relayed")
+    print(borrowed(9))
+    print(borrowed(0 - 9))
+
+    # statement position: the value is discarded, the block still guards
+    mut hits := 0
+    mut i := 0
+    while i < 4:
+        make(i - 2) catch:
+            i = i + 1
+            continue
+        hits = hits + 1
+        i = i + 1
+    print("hits={hits}")

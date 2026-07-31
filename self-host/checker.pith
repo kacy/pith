@@ -2010,6 +2010,8 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_try_expression(node, scope_id)
     if node.kind == "catch_expr":
         return check_catch_expression(node, scope_id)
+    if node.kind == "catch_block":
+        return check_catch_block(node, scope_id)
     if node.kind == "select_expr":
         return check_select_expression(node, scope_id)
     if node.kind == "match_expr":
@@ -4752,6 +4754,33 @@ fn check_catch_expression(node: Node, scope_id: Int) -> Int:
         return TID_ERR
     if types_compatible(fallback_type, result_info.inner) == false:
         report_error("E219", "catch fallback type mismatch: expected " + get_type_name(result_info.inner) + ", got " + get_type_name(fallback_type))
+        return TID_ERR
+    return result_info.inner
+
+# `expr catch:` with an indented block. the block runs on the error path and
+# produces no value, so it has to leave — return, fail, continue or break —
+# rather than fall through to code that would read a binding nothing wrote.
+fn check_catch_block(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 2:
+        return TID_ERR
+    result_type := c_check_expr(node.children[0], scope_id)
+    if is_error_type(result_type):
+        return TID_ERR
+    result_info := get_type_info(result_type)
+    if result_info.kind != "result":
+        report_error("E224", "catch requires a result type, got " + get_type_name(result_type))
+        return TID_ERR
+
+    block_node := get_node(node.children[1])
+    block_scope := create_scope(scope_id)
+    check_block_statement(block_node, block_scope)
+
+    if block_node.children.len() == 0:
+        report_error("E253", "a catch block cannot be empty; it runs on the error path and must leave with return, fail, continue or break")
+        return TID_ERR
+    last := get_node(block_node.children[block_node.children.len() - 1])
+    if last.kind != "return" and last.kind != "fail" and last.kind != "continue" and last.kind != "break":
+        report_error("E253", "a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression")
         return TID_ERR
     return result_info.inner
 

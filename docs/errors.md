@@ -604,3 +604,14 @@ undefined-reference dump instead of a diagnosis.
 error[E252]: this file has no main function
   fix: `pith build` and `pith run` make an executable. a module without main can be imported, checked and linted, but not built on its own
 ```
+
+
+### E253 — catch block must leave
+
+the block form of `catch` runs on the error path and produces no value, so
+falling out of its end would leave the surrounding binding with nothing.
+end the block with `return`, `fail`, `continue` or `break`.
+
+```
+error[E253]: a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression
+```

@@ -395,6 +395,67 @@ pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, messa
     sign_rsa_with(&signature::RSA_PSS_SHA256, pkcs8, message)
 }
 
+/// BLAKE2b digest of `data`, keyed when `key` is non-empty. `out_len` selects
+/// the digest length (1 to 64 bytes). Returns a bytes handle, or 0 on invalid
+/// input.
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_blake2b(data: i64, key: i64, out_len: i64) -> i64 {
+    let Some(data) = bytes_slice(data) else {
+        return 0;
+    };
+    let Some(key) = bytes_slice(key) else {
+        return 0;
+    };
+    if out_len < 1 || out_len > crate::blake2b::MAX_OUT_LEN as i64 {
+        return 0;
+    }
+    match crate::blake2b::hash(out_len as usize, key, data) {
+        Some(digest) => pith_bytes_from_vec(digest),
+        None => 0,
+    }
+}
+
+/// Argon2id tag for `password` and `salt` with the given time cost (passes),
+/// memory cost (KiB), and parallelism. Returns a bytes handle, or 0 when a
+/// parameter is out of range (including the runtime's memory-cost cap).
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_argon2id(
+    password: i64,
+    salt: i64,
+    passes: i64,
+    memory_kib: i64,
+    lanes: i64,
+    out_len: i64,
+) -> i64 {
+    let Some(password) = bytes_slice(password) else {
+        return 0;
+    };
+    let Some(salt) = bytes_slice(salt) else {
+        return 0;
+    };
+    // the argon2 module re-validates ranges; these checks only make the
+    // i64 -> u32/usize conversions safe
+    if passes < 0 || memory_kib < 0 || lanes < 0 || out_len < 0 {
+        return 0;
+    }
+    if passes > u32::MAX as i64 || memory_kib > u32::MAX as i64 || lanes > u32::MAX as i64 {
+        return 0;
+    }
+    match crate::argon2::argon2id(
+        password,
+        salt,
+        b"",
+        b"",
+        passes as u32,
+        memory_kib as u32,
+        lanes as u32,
+        out_len as usize,
+    ) {
+        Ok(tag) => pith_bytes_from_vec(tag),
+        Err(_) => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
     let mut candidates = Vec::new();

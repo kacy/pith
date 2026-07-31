@@ -149,13 +149,6 @@ struct Route:
     pattern: String
     handler: fn(Request) -> http.HttpResponse
 
-# a web application: an ordered list of routes plus the middleware that wraps
-# them. build one with new(), add routes with get/post/put/delete and middleware
-# with use_mw, then call listen().
-#
-# the middleware fn-type is written inline here (and everywhere it appears) on
-# purpose: a type-aliased fn field is miscopied when the App builder clones
-# itself, the same reason Route.handler is written out longhand.
 # a middleware bound to a path prefix by group(): it only wraps requests
 # whose path lives under that prefix. the fn-type is written out longhand
 # for the same builder-cloning reason as App.middleware.
@@ -163,6 +156,13 @@ struct Scoped:
     prefix: String
     mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse
 
+# a web application: an ordered list of routes plus the middleware that wraps
+# them. build one with new(), add routes with get/post/put/delete and middleware
+# with use_mw (app-wide) or group (bound to a path prefix), then call listen().
+#
+# the middleware fn-type is written inline here (and everywhere it appears) on
+# purpose: a type-aliased fn field is miscopied when the App builder clones
+# itself, the same reason Route.handler is written out longhand.
 pub struct App:
     routes: List[Route]
     middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]

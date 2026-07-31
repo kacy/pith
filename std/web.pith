@@ -66,8 +66,25 @@ pub struct Request:
     pub raw: http.HttpRequestBytes
     pub params: Map[String, String]
     pub pattern: String
+    pub values: Map[String, String]
 
 impl Request:
+    # a copy of the request with `key` set in its value store. middleware
+    # hands data to handlers this way — explicitly, through the request that
+    # flows down the chain, rather than through module state:
+    #
+    #   return next(req.with_value("user", session.subject()))
+    fn with_value(key: String, value: String) -> Request:
+        mut updated := self.values
+        updated.insert(key, value)
+        return Request(self.raw, self.params, self.pattern, updated)
+
+    # a value an earlier middleware attached, or "" when nothing did.
+    fn value(key: String) -> String:
+        if self.values.contains_key(key):
+            return self.values[key]
+        return ""
+
     # the value of a path parameter, e.g. req.param("id") for a `/users/:id`
     # route. returns "" when the route has no such parameter.
     fn param(name: String) -> String:
@@ -139,9 +156,17 @@ struct Route:
 # the middleware fn-type is written inline here (and everywhere it appears) on
 # purpose: a type-aliased fn field is miscopied when the App builder clones
 # itself, the same reason Route.handler is written out longhand.
+# a middleware bound to a path prefix by group(): it only wraps requests
+# whose path lives under that prefix. the fn-type is written out longhand
+# for the same builder-cloning reason as App.middleware.
+struct Scoped:
+    prefix: String
+    mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse
+
 pub struct App:
     routes: List[Route]
     middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
+    scoped: List[Scoped]
 
 # a batteries-included App: the default `GET /healthz`, the built-in
 # observability middleware wrapping every route (metrics + a per-request trace
@@ -160,7 +185,7 @@ pub fn new() -> App:
 # opinionated, observable default.
 pub fn bare() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
-    return App([Route("GET", "/healthz", healthz)], [])
+    return App([Route("GET", "/healthz", healthz)], [], [])
 
 # return a copy of `routes` with `route` appended. building a new list keeps the
 # App builder pure: adding a route never mutates an App someone else is holding.
@@ -271,13 +296,29 @@ fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String
 # middleware onion, run it, and return the response. a request that matches
 # nothing gets a 404 and skips middleware entirely. this is the single place
 # every request funnels through, and where the middleware chain wraps in.
+# true when `path` lives under `prefix`: the prefix itself, or anything
+# below it. "/api" scopes "/api" and "/api/me" but not "/apiary".
+fn path_in_scope(path: String, prefix: String) -> Bool:
+    if path == prefix:
+        return true
+    return path.starts_with(prefix + "/")
+
 fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     method := req.method() catch "GET"
+    path := req.path() catch "/"
     for route in app.routes:
         matched := req.matches_path(route.pattern) catch false
         if route.method == method and matched:
-            handler := wrap_middleware(app.middleware, route.handler)
-            return handler(Request(req, params_for(route.pattern, req), route.pattern))
+            # app-wide middleware first, then any group middleware whose
+            # prefix covers this path — so a group guard runs inside the
+            # logging and metrics that wrap everything.
+            mut chain := app.middleware
+            for scope in app.scoped:
+                if path_in_scope(path, scope.prefix):
+                    chain = with_mw(chain, scope.mw)
+            handler := wrap_middleware(chain, route.handler)
+            empty_values: Map[String, String] := {}
+            return handler(Request(req, params_for(route.pattern, req), route.pattern, empty_values))
     return http.not_found_response()
 
 # serve one accepted connection to completion on its own task, then close it.
@@ -313,19 +354,19 @@ impl App:
     # register a GET route. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
     fn get(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware)
+        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware, self.scoped)
 
     # register a POST route. returns a new App.
     fn post(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware)
+        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware, self.scoped)
 
     # register a PUT route. returns a new App.
     fn put(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware)
+        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware, self.scoped)
 
     # register a DELETE route. returns a new App.
     fn delete(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware)
+        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware, self.scoped)
 
     # register a middleware. returns a new App, so calls chain alongside routes.
     # the first middleware registered runs outermost: it sees the request first
@@ -337,7 +378,25 @@ impl App:
     #
     # here logging wraps auth wraps home.
     fn use_mw(mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
-        return App(self.routes, with_mw(self.middleware, mw))
+        return App(self.routes, with_mw(self.middleware, mw), self.scoped)
+
+    # bind a middleware to a path prefix: it wraps only the routes that live
+    # under that prefix, and runs after (inside) the app-wide middleware. the
+    # routes that guard a service usually split into a public handful and a
+    # protected rest, and this is that split, spelled at one site:
+    #
+    #   app := web.new()
+    #       .post("/login", login)
+    #       .group("/api", require_token)
+    #       .get("/api/me", me)
+    #
+    # `/login` and `/healthz` stay open; everything under `/api` is guarded.
+    fn group(prefix: String, mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
+        mut out: List[Scoped] := []
+        for existing in self.scoped:
+            out.push(existing)
+        out.push(Scoped(prefix, mw))
+        return App(self.routes, self.middleware, out)
 
     # bind host:port and serve forever, one task per connection. this blocks, so
     # it is usually the last thing main does; spawn it if you need to keep going.
@@ -532,7 +591,7 @@ struct ParsedUser:
 # request fields are left empty.
 fn request_with_body(body: String) -> Request:
     raw := http.HttpRequestBytes(bytes.empty(), bytes.from_string_utf8(body), "POST", "/users", "", "HTTP/1.1", "", body, {}, {}, [])
-    return Request(raw, {}, "/users")
+    return Request(raw, {}, "/users", {})
 
 test "web.parse decodes a valid json body into a typed struct":
     dq := chr(34)

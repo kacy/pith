@@ -15,6 +15,12 @@ fn time_now_ms() -> Int:
 pub fn now() -> Int:
     return time_now_ms()
 
+## return the current unix timestamp in seconds — the unit protocols mean
+## when they say "unix time": jwt claims, cookie expiry, cache headers.
+## dividing now() by a thousand at every call site is how unit bugs happen.
+pub fn unix() -> Int:
+    return time_now_ms() / 1000
+
 ## return a monotonic timestamp in nanoseconds.
 ## the value only ever increases and is unaffected by wall-clock changes, so it
 ## is meant for measuring durations rather than telling the time of day. it is

@@ -368,12 +368,97 @@ fn json_byte_skip_whitespace(input: Bytes, pos: Int) -> Int:
         i = i + 1
     return i
 
+fn json_hex_digit_value(c: String) -> Int:
+    o := ord(c)
+    if o >= 48 and o <= 57:
+        return o - 48
+    if o >= 97 and o <= 102:
+        return o - 87
+    if o >= 65 and o <= 70:
+        return o - 55
+    return 0 - 1
+
+fn json_utf8_encode(code: Int) -> String:
+    if code < 0x80:
+        return chr(code)
+    if code < 0x800:
+        return chr(0xC0 + code / 64) + chr(0x80 + code % 64)
+    if code < 0x10000:
+        return chr(0xE0 + code / 4096) + chr(0x80 + (code / 64) % 64) + chr(0x80 + code % 64)
+    return chr(0xF0 + code / 262144) + chr(0x80 + (code / 4096) % 64) + chr(0x80 + (code / 64) % 64) + chr(0x80 + code % 64)
+
+# decode the escapes in a json string's raw content (the text between the
+# quotes). returns the decoded text and whether every escape was valid.
+# rfc 8259 escapes only; a \u surrogate pair combines into one code point.
+fn json_unescape_text(raw: String) -> (String, Bool):
+    mut out := ""
+    mut i := 0
+    while i < raw.len():
+        c := raw[i]
+        if c != chr(92):
+            out = out + c
+            i = i + 1
+            continue
+        if i + 1 >= raw.len():
+            return (out, false)
+        e := raw[i + 1]
+        if e == chr(34) or e == chr(92) or e == "/":
+            out = out + e
+        elif e == "b":
+            out = out + chr(8)
+        elif e == "f":
+            out = out + chr(12)
+        elif e == "n":
+            out = out + chr(10)
+        elif e == "r":
+            out = out + chr(13)
+        elif e == "t":
+            out = out + chr(9)
+        elif e == "u":
+            if i + 5 >= raw.len():
+                return (out, false)
+            mut code := 0
+            mut d := 0
+            while d < 4:
+                digit := json_hex_digit_value(raw[i + 2 + d])
+                if digit < 0:
+                    return (out, false)
+                code = code * 16 + digit
+                d = d + 1
+            i = i + 6
+            # a high surrogate must be followed by \u and a low surrogate;
+            # the pair combines into one supplementary code point.
+            if code >= 0xD800 and code <= 0xDBFF:
+                if i + 5 >= raw.len() or raw[i] != chr(92) or raw[i + 1] != "u":
+                    return (out, false)
+                mut low := 0
+                d = 0
+                while d < 4:
+                    digit := json_hex_digit_value(raw[i + 2 + d])
+                    if digit < 0:
+                        return (out, false)
+                    low = low * 16 + digit
+                    d = d + 1
+                if low < 0xDC00 or low > 0xDFFF:
+                    return (out, false)
+                code = 0x10000 + (code - 0xD800) * 1024 + (low - 0xDC00)
+                i = i + 6
+            elif code >= 0xDC00 and code <= 0xDFFF:
+                return (out, false)
+            out = out + json_utf8_encode(code)
+            continue
+        else:
+            return (out, false)
+        i = i + 2
+    return (out, true)
+
 fn json_byte_read_string(input: Bytes, pos: Int) -> JsonByteString:
     if pos < 0 or pos >= input.len() or input[pos] != 34:
         return JsonByteString(false, "", pos)
     mut i := pos + 1
     start := i
     mut escaped := false
+    mut had_escape := false
     while i < input.len():
         b := input[i]
         if escaped:
@@ -382,13 +467,19 @@ fn json_byte_read_string(input: Bytes, pos: Int) -> JsonByteString:
             continue
         if b == 92:
             escaped = true
+            had_escape = true
             i = i + 1
             continue
         if b == 34:
             text := bytes.substring_utf8(input, start, i)
             if text.is_err:
                 return JsonByteString(false, "", i)
-            return JsonByteString(true, text.ok, i + 1)
+            if not had_escape:
+                return JsonByteString(true, text.ok, i + 1)
+            decoded := json_unescape_text(text.ok)
+            if not decoded.1:
+                return JsonByteString(false, "", i)
+            return JsonByteString(true, decoded.0, i + 1)
         i = i + 1
     return JsonByteString(false, "", i)
 
@@ -598,8 +689,10 @@ fn parse_string_raw() -> String:
     # skip opening quote
     parser_position = parser_position + 1
     start := parser_position
+    mut had_escape := false
     while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
         if get_char_at(parser_position) == chr(92):
+            had_escape = true
             parser_position = parser_position + 1
         parser_position = parser_position + 1
     if parser_position >= parser_input.len():
@@ -609,7 +702,16 @@ fn parse_string_raw() -> String:
         return ""
     val := parser_input.substring(start, parser_position)
     parser_position = parser_position + 1
-    return val
+    if not had_escape:
+        return val
+    # the raw slice kept the backslashes; hand back the decoded text. this
+    # once returned the escaped span as-is, so any string with a quote,
+    # backslash or \u in it survived encode but came back wrong from parse.
+    decoded := json_unescape_text(val)
+    if not decoded.1:
+        parser_error = true
+        return ""
+    return decoded.0
 
 # Main recursive value parser - handles all JSON types.
 # Guards nesting depth so a pathological "[[[[..." or "{\"a\":{..." body
@@ -1301,6 +1403,21 @@ fn json_make_object() -> Int:
 pub fn object_set(obj: Int, key: String, val: Int):
     json_object_set(obj, key, val)
 
+# A one-pair object in a single call: `json.of("token", token)`. The common
+# shape for a small response body, which otherwise takes a make_object and an
+# object_set per field.
+pub fn of(key: String, value: String) -> Int:
+    obj := json_make_object()
+    json_object_set(obj, key, make_string(value))
+    return obj
+
+# An object from a string map: `json.of_map({"username": u, "password": p})`.
+pub fn of_map(pairs: Map[String, String]) -> Int:
+    obj := json_make_object()
+    for key in pairs.keys():
+        json_object_set(obj, key, make_string(pairs[key]))
+    return obj
+
 fn json_object_set(obj: Int, key: String, val: Int):
     set_object_property(obj, key, val)
 
@@ -1781,3 +1898,20 @@ fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
     if write_result.is_err:
         return 0 - 1
     return write_result.ok
+
+test "parse decodes string escapes":
+    # encode → parse must round trip text that needs escaping. parse once
+    # returned the raw escaped span, so a"b came back as a\"b.
+    tricky := "a\"b\\c" + chr(10) + chr(9) + "end"
+    obj := make_object()
+    object_set(obj, "s", make_string(tricky))
+    back := parse(encode(obj))
+    assert_eq(get_string(object_get(back, "s")), tricky)
+
+    # \u escapes, including a surrogate pair for a supplementary code point
+    parsed := parse("{{\"u\":\"caf\\u00e9 \\ud83d\\ude00\"}}")
+    assert_eq(get_string(object_get(parsed, "u")), "café 😀")
+
+    # a lone surrogate half and a bad escape are malformed, not text
+    assert_eq(type_of(parse("{{\"u\":\"\\ud800\"}}")), "invalid")
+    assert_eq(type_of(parse("{{\"u\":\"\\q\"}}")), "invalid")

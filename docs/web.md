@@ -204,6 +204,42 @@ write middleware as a named function, as above. `examples/web_middleware.pith` i
 complete, self-checking example: two middleware bracket the response body with markers
 so the nesting is visible in the output.
 
+## route groups
+
+`use_mw` wraps every route, but a guard usually belongs to some routes and
+not others: a service splits into a public handful — login, health, metrics —
+and a protected rest. `group` binds a middleware to a path prefix, so the
+split is spelled at one site instead of as an allowlist inside the guard:
+
+```pith
+app := web.new()
+    .post("/login", handle_login)
+    .group("/api", require_token)
+    .get("/api/me", handle_me)
+```
+
+`/login` and `/healthz` stay open; everything under `/api` runs through
+`require_token`, inside whatever app-wide middleware is registered. the
+prefix covers itself and anything below it — `/api` scopes `/api` and
+`/api/me`, not `/apiary`.
+
+a guard usually learns something the handler wants — who the caller is,
+which tenant, what role. `with_value` attaches it to the request that flows
+down the chain, and `value` reads it back:
+
+```pith
+fn require_token(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    session := jwt.verify_hs256(req.raw.bearer_token() catch "", secret, expected) catch:
+        return http.unauthorized_response()
+    return next(req.with_value("user", session.subject()))
+
+fn handle_me(req: web.Request) -> http.HttpResponse:
+    return http.response(200).json_body(json.of("user", req.value("user")))
+```
+
+`examples/web_auth.pith` runs this exact shape end to end — login, group
+guard, and the requests a bad token gets back.
+
 ## observability
 
 a server built with `web.new()` is observable out of the box. every route is wrapped

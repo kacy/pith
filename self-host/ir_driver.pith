@@ -436,10 +436,28 @@ fn should_skip_imported_module(module_root: Int) -> Bool:
     module_path := get_resolved_module_path(module_root)
     return is_runtime_builtin_module(module_path)
 
+# true when the module declares a top-level fn main, pub or not.
+fn module_declares_main(root: Int) -> Bool:
+    for child in get_node(root).children:
+        mut item := get_node(child)
+        if item.kind == "pub" and item.children.len() > 0:
+            item = get_node(item.children[0])
+        if (item.kind == "fn" or item.kind == "fn_decl") and item.value == "main":
+            return true
+    return false
+
 fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -> String!:
     parsed := parse_and_check(path)!
     root := parsed.root
     import_roots := parsed.import_roots
+
+    # an executable needs an entry point. without this the build sails through
+    # to the system linker, which answers with an undefined-reference-to-main
+    # dump instead of a diagnosis. a test build generates its own main.
+    if not emit_tests and not module_declares_main(root):
+        print(path + ": error[E252]: this file has no main function")
+        print("  fix: `pith build` and `pith run` make an executable. a module without main can be imported, checked and linted, but not built on its own")
+        exit(1)
 
     mut imported_init_funcs: List[String] := []
     mut all_ir: List[String] := []

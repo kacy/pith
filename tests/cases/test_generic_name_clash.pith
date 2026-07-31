@@ -1,0 +1,14 @@
+# std.strings and std.collections both declare `partition` — one concrete,
+# one generic. loading both used to break collections itself: its own bare
+# call to its generic resolved to the concrete binding strings registered,
+# and the checker refused the whole program. the fix lets the module-aware
+# generic resolver take over when the only concrete binding is foreign.
+
+import std.strings as strings
+import std.collections as collections
+
+fn main():
+    halves := strings.partition("key:value", ":")
+    print(halves[0] + "/" + halves[2])
+    split := collections.partition([3, 1, 2], fn(n: Int) => n >= 2)
+    print("kept={split[0].len()} dropped={split[1].len()}")

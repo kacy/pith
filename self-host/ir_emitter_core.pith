@@ -1234,6 +1234,11 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
 # params (params are locals under the same rule, so the exit cleanup
 # releasing them stays balanced with the caller's count).
 mut ir_current_arc_func := ""
+# true while emitting main's own body — not a lambda defined inside it, and
+# not a test function. error returns emitted under this flag also report the
+# error and exit nonzero, because the entry glue pins main's exit code to 0
+# and a failing program must not look like a passing one.
+mut ir_emitting_main_body := false
 
 # params are borrows: the caller keeps its count alive for the whole call,
 # so an unmodified string param needs no rc traffic at all. a param the
@@ -2114,6 +2119,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
         si := ir_str("unwrap of none")
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + si)
+        ir_emit_main_error_report(err_r, true)
         ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
     ir_emit_label(merge_l)
     return decoded_r
@@ -4768,6 +4774,10 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
     ir_reset_lambda_emit_state()
+    # a lambda defined inside main is not main: an error return in its body
+    # goes to whoever called the lambda, not out of the process.
+    saved_in_main := ir_emitting_main_body
+    ir_emitting_main_body = false
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
     ir_emit_lambda_params(parts.params)
@@ -4775,6 +4785,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_body_value(parts.body_idx)
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
+    ir_emitting_main_body = saved_in_main
     ir_string_locals = saved_string_locals
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
@@ -5124,6 +5135,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 fresh_err_r := ir_emit_err_result_tuple(err_r)
                 ir_defer_emit_to_function_frame(true)
                 ir_emit_string_cleanup("")
+                ir_emit_main_error_report(err_r, err_kind == "string")
                 ir_emit("ret " + fresh_err_r.to_string())
             else:
                 # propagating the error out early skips the normal return,
@@ -5131,6 +5143,9 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 # tuple being returned is a fresh value, not a tracked local
                 ir_defer_emit_to_function_frame(true)
                 ir_emit_string_cleanup("")
+                if ir_emitting_main_body:
+                    report_err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
+                    ir_emit_main_error_report(report_err_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
                 ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
             return decoded_r
@@ -5167,6 +5182,20 @@ fn ir_emit_try_expr(node: Node) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+# on main's error-return paths, print the error and exit 1 before the ret:
+# the entry glue forces main's return value to 0, so without this the error
+# vanished and the process reported success. err_is_string routes a typed
+# error to a generic message instead of reading a non-string pointer.
+fn ir_emit_main_error_report(err_r: Int, err_is_string: Bool):
+    if not ir_emitting_main_body:
+        return
+    flag_r := ir_reg()
+    mut flag_v := "0"
+    if err_is_string:
+        flag_v = "1"
+    ir_emit("iconst " + flag_r.to_string() + " " + flag_v)
+    ir_emit_call2(ir_reg(), "pith_main_error_exit", "int", err_r, flag_r)
+
 fn ir_emit_fail_expr(node: Node) -> Int:
     if node.children.len() > 0:
         err_r := ir_expr(node.children[0])
@@ -5186,10 +5215,12 @@ fn ir_emit_fail_expr(node: Node) -> Int:
         tuple_r := ir_emit_err_result_tuple(err_r)
         ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup(exclude)
+        ir_emit_main_error_report(err_r, ir_infer_type(node.children[0]) == "string")
         ir_emit("ret " + tuple_r.to_string())
     else:
         ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup("")
+        ir_emit_main_error_report(ir_zero_reg(), false)
         ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
     ir_emit_label(ub)
@@ -5294,6 +5325,7 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
         msg := ir_str("index out of bounds")
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + msg)
+        ir_emit_main_error_report(err_r, true)
         ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
     ir_emit_label(merge_l)
     return unwrapped_r
@@ -7047,10 +7079,12 @@ fn ir_func(idx: Int):
     ir_current_arc_func = name
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_emitting_main_body = name == "main"
     ir_emit_func_header(name, param_count, ret_type)
     ir_emit_fn_params(idx)
     ir_emit_string_prologue(body_idx)
     ir_finish_func_emission(body_idx)
+    ir_emitting_main_body = false
 
 # --- emit impl method ---
 fn ir_impl_func(idx: Int, impl_type: String):

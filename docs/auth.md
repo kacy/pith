@@ -2,7 +2,9 @@
 
 authentication in pith is two modules. `std.crypto.password` handles the
 password at rest, and `std.crypto.jwt` handles the session that follows.
-`examples/auth.pith` runs the whole flow end to end.
+`examples/auth.pith` runs the whole flow end to end, and
+`examples/web_auth.pith` wires it into a `std.web` server — a login route
+that issues tokens and a middleware that guards everything else.
 
 ## hashing a password
 

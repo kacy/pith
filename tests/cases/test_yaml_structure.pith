@@ -1,0 +1,89 @@
+import std.yaml as yaml
+
+# block mappings, block sequences, the two nested in each other, and flow
+# collections.
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+fn main() -> Int!:
+    lb := chr(123)
+    rb := chr(125)
+
+    mut doc := line("name: gateway")
+    doc = doc + line("server:")
+    doc = doc + line("  host: localhost")
+    doc = doc + line("  tls:")
+    doc = doc + line("    enabled: true")
+    doc = doc + line("    ciphers:")
+    doc = doc + line("      - fast")
+    doc = doc + line("      - safe")
+    doc = doc + line("ports:")
+    doc = doc + line("  - 80")
+    doc = doc + line("  - 443")
+    doc = doc + line("routes:")
+    doc = doc + line("  - path: /health")
+    doc = doc + line("    method: GET")
+    doc = doc + line("  - path: /metrics")
+    doc = doc + line("    method: POST")
+    doc = doc + line("matrix:")
+    doc = doc + line("  - - 1")
+    doc = doc + line("    - 2")
+    doc = doc + line("  - - 3")
+    doc = doc + line("limits: " + lb + "cpu: 2, memory: 512" + rb)
+    doc = doc + line("tags: [a, b, c]")
+    doc = doc + line("nested_flow: " + lb + "outer: [1, " + lb + "inner: two" + rb + "]" + rb)
+    doc = doc + line("empty_flow: " + lb + rb)
+    doc = doc + line("empty_list: []")
+
+    root := yaml.parse(doc)
+    print("root:{yaml.type_of(root)} keys:{yaml.keys(root).join(",")}")
+
+    server := yaml.get_map(root, "server")
+    print("host:{yaml.get_string(server, "host")}")
+
+    tls := yaml.get_map(server, "tls")
+    print("tls_enabled:{yaml.get_bool(tls, "enabled")}")
+
+    ciphers := yaml.get_array(tls, "ciphers")
+    print("ciphers:{yaml.array_len(ciphers)}:{yaml.scalar_string(yaml.array_get(ciphers, 0))}:{yaml.scalar_string(yaml.array_get(ciphers, 1))}")
+
+    ports := yaml.get_array(root, "ports")
+    print("ports:{yaml.array_len(ports)}:{yaml.scalar_int(yaml.array_get(ports, 0))}:{yaml.scalar_int(yaml.array_get(ports, 1))}")
+
+    routes := yaml.get_array(root, "routes")
+    print("routes:{yaml.array_len(routes)}")
+    mut i := 0
+    while i < yaml.array_len(routes):
+        route := yaml.array_get(routes, i)
+        print("  route:{yaml.get_string(route, "path")}:{yaml.get_string(route, "method")}")
+        i = i + 1
+
+    matrix := yaml.get_array(root, "matrix")
+    row0 := yaml.array_get(matrix, 0)
+    row1 := yaml.array_get(matrix, 1)
+    print("matrix:{yaml.array_len(matrix)}:{yaml.array_len(row0)}:{yaml.scalar_int(yaml.array_get(row0, 1))}:{yaml.scalar_int(yaml.array_get(row1, 0))}")
+
+    limits := yaml.get_map(root, "limits")
+    print("limits:{yaml.get_int(limits, "cpu")}:{yaml.get_int(limits, "memory")}")
+
+    tags := yaml.get_array(root, "tags")
+    print("tags:{yaml.array_len(tags)}:{yaml.scalar_string(yaml.array_get(tags, 2))}")
+
+    nested := yaml.get_map(root, "nested_flow")
+    outer := yaml.get_array(nested, "outer")
+    inner := yaml.array_get(outer, 1)
+    print("nested:{yaml.array_len(outer)}:{yaml.scalar_int(yaml.array_get(outer, 0))}:{yaml.get_string(inner, "inner")}")
+
+    print("empty_flow:{yaml.type_of(yaml.get_value(root, "empty_flow"))}:{yaml.keys(yaml.get_map(root, "empty_flow")).len()}")
+    print("empty_list:{yaml.array_len(yaml.get_array(root, "empty_list"))}")
+
+    # get_table is the std.toml spelling of get_map
+    print("alias:{yaml.get_table(root, "server") == yaml.get_map(root, "server")}")
+
+    # accessors on missing or wrongly typed values stay quiet
+    print("missing_map:{yaml.get_map(root, "nope")}")
+    print("missing_seq:{yaml.get_array(root, "nope")}")
+    print("missing_elem:{yaml.array_get(ports, 7)}")
+    print("not_a_seq:{yaml.array_len(server)}")
+    return 0

@@ -1,0 +1,43 @@
+import std.yaml as yaml
+
+# multiple documents in one stream.
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+fn main() -> Int!:
+    mut stream := line("name: first")
+    stream = stream + line("---")
+    stream = stream + line("name: second")
+    stream = stream + line("...")
+    stream = stream + line("---")
+    stream = stream + line("- one")
+    stream = stream + line("- two")
+
+    # parse returns the first document
+    first := yaml.parse(stream)
+    print("first:{yaml.get_string(first, "name")}")
+
+    all := yaml.parse_all(stream)
+    print("count:{yaml.array_len(all)}")
+    print("doc0:{yaml.get_string(yaml.array_get(all, 0), "name")}")
+    print("doc1:{yaml.get_string(yaml.array_get(all, 1), "name")}")
+    doc2 := yaml.array_get(all, 2)
+    print("doc2:{yaml.type_of(doc2)}:{yaml.array_len(doc2)}:{yaml.scalar_string(yaml.array_get(doc2, 1))}")
+
+    # a leading marker is allowed and does not add an empty document
+    leading := yaml.parse_all(line("---") + line("only: 1"))
+    print("leading:{yaml.array_len(leading)}:{yaml.get_int(yaml.array_get(leading, 0), "only")}")
+
+    # an empty document between markers is null
+    gaps := yaml.parse_all(line("---") + line("---") + line("a: 1"))
+    print("gaps:{yaml.array_len(gaps)}:{yaml.type_of(yaml.array_get(gaps, 0))}:{yaml.get_int(yaml.array_get(gaps, 1), "a")}")
+
+    # a single document without markers still comes back as one document
+    single := yaml.parse_all(line("a: 1"))
+    print("single:{yaml.array_len(single)}")
+
+    # content on the same line as the marker is refused rather than guessed at
+    print("inline_marker:{yaml.parse_all(line("--- a: 1")) < 0}")
+    print("reason:{yaml.last_error().contains("same line")}")
+    return 0

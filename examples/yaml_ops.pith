@@ -1,0 +1,78 @@
+# yaml parsing
+import std.yaml as yaml
+import std.fs as fs
+import std.io as io
+
+struct ServerConfig:
+    pub host: String
+    pub port: Int
+
+fn main() -> String!:
+    path := "/tmp/pith_yaml_ops.yaml"
+
+    # build a yaml document
+    newline := chr(10)
+    doc_buf := io.string_buffer()
+    doc_buf.write("title: pith{newline}")!
+    doc_buf.write("version: 42{newline}")!
+    doc_buf.write("pi: 3.14{newline}")!
+    doc_buf.write("enabled: true{newline}")!
+    doc_buf.write("tags: [lang, fast]{newline}")!
+    doc_buf.write("notes: |{newline}")!
+    doc_buf.write("  first line{newline}")!
+    doc_buf.write("  second line{newline}")!
+    doc_buf.write("server:{newline}")!
+    doc_buf.write("  host: localhost   # trailing comments are ignored{newline}")!
+    doc_buf.write("  port: 8080{newline}")!
+    doc := doc_buf.string()
+
+    root := yaml.parse(doc)
+    print("type: {yaml.type_of(root)}")
+
+    # basic values
+    print("title: {yaml.get_string(root, "title")}")
+    print("version: {yaml.get_int(root, "version")}")
+    print("pi: {yaml.get_float(root, "pi")}")
+    print("enabled: {yaml.get_bool(root, "enabled")}")
+    print("missing title: {yaml.get_string_or(root, "missing_title", "n/a")}")
+    print("missing port: {yaml.get_int_or(root, "missing_port", 9000)}")
+
+    # has key
+    print("has title: {yaml.has(root, "title")}")
+    print("has missing: {yaml.has(root, "missing")}")
+
+    # sequence
+    tags := yaml.get_array(root, "tags")
+    print("tags count: {yaml.array_len(tags)}")
+    print("tag 0: {yaml.scalar_string(yaml.array_get(tags, 0))}")
+
+    # block scalar
+    notes := yaml.get_string(root, "notes")
+    print("notes first line: {notes.split(chr(10))[0]}")
+
+    # nested mapping
+    server := yaml.get_map(root, "server")
+    print("server host: {yaml.get_string(server, "host")}")
+    print("server port: {yaml.get_int(server, "port")}")
+    typed_server := yaml.decode[ServerConfig](server)
+    if typed_server.is_ok:
+        print("typed server: {typed_server.ok.host}:{typed_server.ok.port}")
+
+    # keys
+    print("key count: {yaml.keys(root).len()}")
+
+    # malformed input reports why instead of guessing
+    broken := yaml.parse("a: [1, 2")
+    print("broken: {broken < 0} ({yaml.last_error()})")
+
+    # several documents in one stream
+    stream := "one: 1{newline}---{newline}two: 2{newline}"
+    all := yaml.parse_all(stream)
+    print("documents: {yaml.array_len(all)}")
+    print("second: {yaml.get_int(yaml.array_get(all, 1), "two")}")
+
+    fs.write(path, doc)!
+    file_root := yaml.parse_file(path)
+    print("file host: {yaml.get_string(yaml.get_map(file_root, "server"), "host")}")
+    fs.remove(path)
+    return ""

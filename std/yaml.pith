@@ -1,0 +1,1528 @@
+# std.yaml — YAML parser for the configuration subset
+#
+# parse YAML into a tree of nodes addressed by opaque Int handles, the same
+# shape std.json and std.toml use.
+#
+#   import std.yaml as yaml
+#   root := yaml.parse(data)
+#   name := yaml.get_string(root, "name")
+#   db := yaml.get_map(root, "database")
+#   host := yaml.get_string(db, "host")
+#
+# YAML 1.2 in full is a much larger language than a configuration file needs,
+# so this parser implements the part configuration actually uses and refuses
+# the rest with a message instead of guessing. docs/yaml.md writes out both
+# lists; the short version is that block mappings, block sequences, flow
+# collections, the three scalar styles, block scalars and multiple documents
+# are in, and anchors, aliases, tags, merge keys, complex keys and directives
+# are out.
+
+import std.io as io
+
+YAML_FILE_CHUNK_SIZE := 4096
+
+# ===============================================================
+# Limits
+# ===============================================================
+#
+# every one of these bounds something an attacker controls. they are module
+# constants rather than a table built on first use: a lazily initialized table
+# is a data race under the green runtime, and a constant costs nothing.
+
+## largest document this parser will look at, in bytes. matches the 4 MiB
+## receive cap std.net.grpc uses, so a service that accepts both agrees with
+## itself about what "too big" means.
+pub MAX_DOCUMENT_BYTES := 4194304
+
+## deepest nesting of mappings, sequences and flow collections. indentation
+## drives recursion here, so a crafted file of nothing but indentation would
+## otherwise overflow the native stack — and a stack overflow is a SIGSEGV that
+## no error handler can catch. 64 levels is far past anything a human writes.
+pub MAX_NESTING_DEPTH := 64
+
+## most nodes one parse may allocate. a document under the size cap can still
+## ask for a very large number of tiny nodes; this bounds the node pool.
+pub MAX_NODES := 262144
+
+## most entries in a single mapping or sequence.
+pub MAX_COLLECTION_ENTRIES := 65536
+
+## longest single scalar, including a block scalar's folded body.
+pub MAX_SCALAR_BYTES := 1048576
+
+## longest mapping key. keys are short by nature, and a small cap keeps a
+## document that is one enormous key from becoming one enormous allocation.
+pub MAX_KEY_BYTES := 4096
+
+## YAML decode failure with a human-readable message.
+pub struct YamlDecodeError:
+    pub message: String
+
+## An open node-pool scope. Treat it as opaque and hand it straight back to
+## close_scope(); the fields are the pool positions the scope rolls back to.
+pub struct YamlScope:
+    pub depth: Int
+    pub node_mark: Int
+    pub map_mark: Int
+    pub seq_mark: Int
+
+fn yaml_decode_fail(message: String) -> YamlDecodeError:
+    return YamlDecodeError(message)
+
+# ===============================================================
+# Node Pool
+# ===============================================================
+
+# Node ids come from a counter that only ever goes up, even across a reclaim.
+# Reusing ids would make a handle held past its scope silently read whatever
+# document landed on that id next; leaving the counter alone costs nothing and
+# turns that mistake into a plain "invalid handle".
+threadlocal mut next_node_id: Int := 0
+threadlocal mut node_types: Map[Int, String] := {}
+threadlocal mut string_values: Map[Int, String] := {}
+threadlocal mut integer_values: Map[Int, Int] := {}
+threadlocal mut float_values: Map[Int, Float] := {}
+threadlocal mut boolean_values: Map[Int, Bool] := {}
+
+# Mapping children: flat append-only storage with offset/count.
+threadlocal mut map_keys_flat: List[String] := []
+threadlocal mut map_values_flat: List[Int] := []
+threadlocal mut map_key_offsets: Map[Int, Int] := {}
+threadlocal mut map_key_counts: Map[Int, Int] := {}
+
+# Sequence children: flat append-only storage with offset/count.
+threadlocal mut seq_items_flat: List[Int] := []
+threadlocal mut seq_item_offsets: Map[Int, Int] := {}
+threadlocal mut seq_item_counts: Map[Int, Int] := {}
+
+# How many scopes open_scope() has handed out and not yet reclaimed.
+threadlocal mut open_scope_depth: Int := 0
+
+# How many nodes the parse currently running has allocated, against MAX_NODES.
+threadlocal mut nodes_this_parse: Int := 0
+
+fn allocate_node(kind: String) -> Int:
+    idx := next_node_id
+    next_node_id = next_node_id + 1
+    nodes_this_parse = nodes_this_parse + 1
+    node_types.insert(idx, kind)
+    string_values.insert(idx, "")
+    integer_values.insert(idx, 0)
+    float_values.insert(idx, 0.0)
+    boolean_values.insert(idx, false)
+    map_key_offsets.insert(idx, 0)
+    map_key_counts.insert(idx, 0)
+    seq_item_offsets.insert(idx, 0)
+    seq_item_counts.insert(idx, 0)
+    return idx
+
+# ===============================================================
+# Node-pool reclamation
+# ===============================================================
+#
+# the typed decoders (decode_text[T], decode_text_path[T]) own the parse that
+# fills the node pool, then copy scalars and strings out into a concrete
+# struct. once that struct is materialized the nodes are dead, so the compiler
+# brackets the lowered decode body with a mark taken here and a pool_restore()
+# on every exit. the marks are plain ints, so the bracket allocates nothing.
+
+# reclaims every node allocated since the given marks. mapping and sequence
+# children live in append-only flat lists, so truncating them to the marked
+# lengths drops exactly the entries added since. safe once the struct is built:
+# its string fields are independent heap copies, not references into the pool.
+fn yaml_restore_to(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
+    mut node_id := next_node_id - 1
+    while node_id >= node_id_mark:
+        if node_types.contains_key(node_id):
+            node_types.remove(node_id)
+            string_values.remove(node_id)
+            integer_values.remove(node_id)
+            float_values.remove(node_id)
+            boolean_values.remove(node_id)
+            map_key_offsets.remove(node_id)
+            map_key_counts.remove(node_id)
+            seq_item_offsets.remove(node_id)
+            seq_item_counts.remove(node_id)
+        node_id = node_id - 1
+    # map_keys_flat and map_values_flat grow in lockstep, so one mark covers both.
+    while map_keys_flat.len() > map_flat_mark:
+        map_keys_flat.remove(map_keys_flat.len() - 1)
+    while map_values_flat.len() > map_flat_mark:
+        map_values_flat.remove(map_values_flat.len() - 1)
+    while seq_items_flat.len() > seq_flat_mark:
+        seq_items_flat.remove(seq_items_flat.len() - 1)
+
+## node-pool position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_node_id() -> Int:
+    return next_node_id
+
+## mapping-children position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_table_len() -> Int:
+    return map_keys_flat.len()
+
+## sequence-children position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_array_len() -> Int:
+    return seq_items_flat.len()
+
+## reclaims the pool nodes a compiler-lowered typed decode allocated.
+pub fn pool_restore(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
+    yaml_restore_to(node_id_mark, map_flat_mark, seq_flat_mark)
+
+## opens a node-pool scope. every node parsed between here and the matching
+## close_scope() is reclaimed when the scope closes. pair it with defer:
+##
+##     scope := yaml.open_scope()
+##     defer yaml.close_scope(scope)
+##     root := yaml.parse(text)
+##
+## most programs read their configuration once at startup and never need this.
+## it exists for the ones that reload on a signal or a timer, and for request
+## handlers that parse a document per request — without a scope the pool grows
+## for the life of the task. copy what you need out of the tree before the
+## scope closes.
+pub fn open_scope() -> YamlScope:
+    open_scope_depth = open_scope_depth + 1
+    return YamlScope(open_scope_depth, next_node_id, map_keys_flat.len(), seq_items_flat.len())
+
+## closes a scope opened by open_scope() and reclaims the nodes parsed inside.
+##
+## scopes nest and close innermost-first. closing an outer scope while an inner
+## one is still open also closes the inner one — an arena can only give back a
+## suffix of what it handed out. closing a scope twice does nothing. no handle
+## from a closed scope can come back to life: node ids are never reused, so
+## reading one reports "invalid" rather than some later document's value.
+pub fn close_scope(scope: YamlScope):
+    if scope.depth > open_scope_depth:
+        return
+    yaml_restore_to(scope.node_mark, scope.map_mark, scope.seq_mark)
+    open_scope_depth = scope.depth - 1
+
+## how many nodes the pool currently holds. useful for asserting in a test that
+## a parse loop gives its nodes back.
+pub fn pool_live_nodes() -> Int:
+    return node_types.len()
+
+# Returns a node's kind, or "" when the handle names no live node. A kind is
+# never empty, so one lookup answers both "does it exist" and "what is it".
+# node ids are never reused, so a handle left over from a reclaimed scope reads
+# as "no live node" rather than aliasing a later document's node.
+fn node_kind(handle: Int) -> String:
+    return node_types.get_default(handle, "")
+
+# ===============================================================
+# Parser state
+# ===============================================================
+
+threadlocal mut parser_error: Bool := false
+threadlocal mut parser_message: String := ""
+threadlocal mut parser_depth: Int := 0
+
+# the scanned line table. three parallel lists rather than a list of structs
+# because the block-scalar reader needs the raw line while the structure walk
+# needs the comment-stripped one, and the sequence reader rewrites a line in
+# place (see parse_seq).
+threadlocal mut line_indent: List[Int] := []
+threadlocal mut line_text: List[String] := []
+threadlocal mut line_raw: List[String] := []
+threadlocal mut line_pos: Int := 0
+
+# flow-collection scanner state, used only while a `{...}` or `[...]` is being
+# read out of a single line.
+threadlocal mut flow_input: String := ""
+threadlocal mut flow_pos: Int := 0
+
+fn yaml_fail(message: String):
+    if not parser_error:
+        parser_error = true
+        parser_message = message
+
+fn yaml_fail_at(message: String, line_index: Int):
+    yaml_fail(message + " (line " + (line_index + 1).to_string() + ")")
+
+## the message from the most recent failed parse, or "" after a parse that
+## succeeded. parse() reports failure as -1; this says what went wrong.
+pub fn last_error() -> String:
+    return parser_message
+
+# ===============================================================
+# Scanner
+# ===============================================================
+
+# a brace cannot be written as a string literal in pith — `{` opens a string
+# interpolation — so the two flow-mapping delimiters are compared by code point.
+fn is_open_brace(c: String) -> Bool:
+    return ord(c) == 123
+
+fn is_close_brace(c: String) -> Bool:
+    return ord(c) == 125
+
+# true when the text opens a flow collection, either kind.
+fn starts_flow(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    return is_open_brace(text[0]) or text[0] == "["
+
+# index just past a quoted run starting at `start`, or the end of the text when
+# the quote is never closed.
+fn skip_quoted(text: String, start: Int) -> Int:
+    quote := text[start]
+    mut i := start + 1
+    while i < text.len():
+        c := text[i]
+        if quote == chr(34) and c == chr(92):
+            i = i + 2
+            continue
+        if c == quote:
+            # inside single quotes a doubled quote is an escaped quote
+            if quote == "'" and i + 1 < text.len() and text[i + 1] == "'":
+                i = i + 2
+                continue
+            return i + 1
+        i = i + 1
+    return text.len()
+
+# true when a quote opens in this text and never closes.
+fn has_unterminated_quote(text: String) -> Bool:
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        if c == chr(34) or c == "'":
+            after := skip_quoted(text, i)
+            if after >= text.len() and (after == i + 1 or text[text.len() - 1] != c):
+                return true
+            i = after
+            continue
+        i = i + 1
+    return false
+
+# drops a trailing comment. a "#" only starts one at the beginning of the line
+# or after a space, and never inside a quoted scalar — `url: "a#b"` and
+# `tag: a#b` both keep their hash.
+fn strip_comment(text: String) -> String:
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        if c == chr(34) or c == "'":
+            i = skip_quoted(text, i)
+            continue
+        if c == "#":
+            if i == 0 or text[i - 1] == " " or text[i - 1] == chr(9):
+                return text.substring(0, i)
+        i = i + 1
+    return text
+
+# splits the input into the line table. returns false when the input is not
+# scannable at all, which today means a tab used for indentation.
+fn scan_lines(input: String) -> Bool:
+    # cleared in place rather than reassigned: the line table is rebuilt on
+    # every parse, and reusing the three lists keeps a parse-per-request loop
+    # from handing the allocator three fresh lists each time round.
+    line_indent.clear()
+    line_text.clear()
+    line_raw.clear()
+    line_pos = 0
+    mut start := 0
+    mut i := 0
+    while i <= input.len():
+        at_end := i == input.len()
+        if at_end or input[i] == chr(10):
+            mut raw := input.substring(start, i)
+            if raw.len() > 0 and raw[raw.len() - 1] == chr(13):
+                raw = raw.substring(0, raw.len() - 1)
+            if not add_line(raw):
+                return false
+            start = i + 1
+        i = i + 1
+    return true
+
+fn add_line(raw: String) -> Bool:
+    mut indent := 0
+    while indent < raw.len() and raw[indent] == " ":
+        indent = indent + 1
+    # YAML forbids tabs in indentation. accepting them would make the file mean
+    # one thing here and another in every other parser, so refuse instead.
+    if indent < raw.len() and raw[indent] == chr(9):
+        yaml_fail_at("tab used for indentation", line_indent.len())
+        return false
+    line_indent.push(indent)
+    line_text.push(strip_comment(raw.substring(indent, raw.len())).trim())
+    line_raw.push(raw)
+    return true
+
+fn line_count() -> Int:
+    return line_text.len()
+
+fn at_end() -> Bool:
+    return line_pos >= line_count()
+
+# true when the current line starts or ends a document rather than carrying
+# content of its own.
+fn at_document_boundary() -> Bool:
+    if at_end():
+        return false
+    text := line_text[line_pos]
+    if text == "---" or text == "..." or text.starts_with("--- "):
+        return true
+    return false
+
+fn skip_blank_lines():
+    while line_pos < line_count() and line_text[line_pos] == "":
+        line_pos = line_pos + 1
+
+# ===============================================================
+# Scalars
+# ===============================================================
+
+fn null_node() -> Int:
+    return allocate_node("null")
+
+fn string_node(value: String) -> Int:
+    if value.len() > MAX_SCALAR_BYTES:
+        yaml_fail("scalar of " + value.len().to_string() + " bytes exceeds the " + MAX_SCALAR_BYTES.to_string() + "-byte limit")
+        return 0 - 1
+    idx := allocate_node("string")
+    string_values.insert(idx, value)
+    return idx
+
+fn bool_node(value: Bool) -> Int:
+    idx := allocate_node("bool")
+    boolean_values.insert(idx, value)
+    return idx
+
+fn int_node(value: Int) -> Int:
+    idx := allocate_node("int")
+    integer_values.insert(idx, value)
+    return idx
+
+fn float_node(value: Float) -> Int:
+    idx := allocate_node("float")
+    float_values.insert(idx, value)
+    return idx
+
+fn hex_digit_value(c: String) -> Int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 87
+    if c >= "A" and c <= "F":
+        return ord(c) - 55
+    return 0 - 1
+
+# a unicode scalar as utf-8. chr() writes one byte, so anything past ascii is
+# assembled here rather than handed to chr() directly.
+fn utf8_encode(code: Int) -> String:
+    if code < 0x80:
+        return chr(code)
+    if code < 0x800:
+        return chr(0xC0 + code / 64) + chr(0x80 + code % 64)
+    return chr(0xE0 + code / 4096) + chr(0x80 + (code / 64) % 64) + chr(0x80 + code % 64)
+
+# decodes the body of a double-quoted scalar (the text between the quotes).
+fn decode_double_quoted(body: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < body.len():
+        c := body[i]
+        if c != chr(92):
+            out = out + c
+            i = i + 1
+            continue
+        if i + 1 >= body.len():
+            yaml_fail("double-quoted scalar ends with a dangling backslash")
+            return ""
+        e := body[i + 1]
+        if e == "n":
+            out = out + chr(10)
+        elif e == "t":
+            out = out + chr(9)
+        elif e == "r":
+            out = out + chr(13)
+        elif e == "0":
+            out = out + chr(0)
+        elif e == "a":
+            out = out + chr(7)
+        elif e == "b":
+            out = out + chr(8)
+        elif e == "f":
+            out = out + chr(12)
+        elif e == "v":
+            out = out + chr(11)
+        elif e == "e":
+            out = out + chr(27)
+        elif e == chr(34) or e == chr(92) or e == "/" or e == " ":
+            out = out + e
+        elif e == "u":
+            if i + 5 >= body.len():
+                yaml_fail("truncated \\u escape in a double-quoted scalar")
+                return ""
+            mut code := 0
+            mut d := 0
+            while d < 4:
+                digit := hex_digit_value(body[i + 2 + d])
+                if digit < 0:
+                    yaml_fail("invalid \\u escape in a double-quoted scalar")
+                    return ""
+                code = code * 16 + digit
+                d = d + 1
+            out = out + utf8_encode(code)
+            i = i + 6
+            continue
+        else:
+            yaml_fail("unknown escape \\" + e + " in a double-quoted scalar")
+            return ""
+        i = i + 2
+    return out
+
+# decodes the body of a single-quoted scalar. the only escape is a doubled
+# quote, and backslashes are literal.
+fn decode_single_quoted(body: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < body.len():
+        c := body[i]
+        if c == "'" and i + 1 < body.len() and body[i + 1] == "'":
+            out = out + "'"
+            i = i + 2
+            continue
+        out = out + c
+        i = i + 1
+    return out
+
+# the text of a quoted scalar, with its quotes removed and escapes applied.
+fn decode_quoted(text: String) -> String:
+    quote := text[0]
+    if text.len() < 2 or text[text.len() - 1] != quote or skip_quoted(text, 0) != text.len():
+        if quote == chr(34):
+            yaml_fail("unterminated double-quoted scalar: " + text)
+        else:
+            yaml_fail("unterminated single-quoted scalar: " + text)
+        return ""
+    body := text.substring(1, text.len() - 1)
+    if quote == chr(34):
+        return decode_double_quoted(body)
+    return decode_single_quoted(body)
+
+fn is_digit_char(c: String) -> Bool:
+    return c >= "0" and c <= "9"
+
+# true when every character from `start` is a digit in the given base and there
+# is at least one of them.
+fn all_digits_in_base(text: String, start: Int, base: Int) -> Bool:
+    if start >= text.len():
+        return false
+    mut i := start
+    while i < text.len():
+        v := hex_digit_value(text[i])
+        if v < 0 or v >= base:
+            return false
+        i = i + 1
+    return true
+
+fn parse_digits_in_base(text: String, start: Int, base: Int) -> Int:
+    mut value := 0
+    mut i := start
+    while i < text.len():
+        digit := hex_digit_value(text[i])
+        if value > 922337203685477580 / base:
+            yaml_fail("integer literal out of range: " + text)
+            return 0
+        value = value * base + digit
+        i = i + 1
+    return value
+
+# the sign of a numeric literal and where its digits start.
+struct YamlSign:
+    negative: Bool
+    start: Int
+
+fn split_sign(text: String) -> YamlSign:
+    if text.len() > 0 and text[0] == "-":
+        return YamlSign(true, 1)
+    if text.len() > 0 and text[0] == "+":
+        return YamlSign(false, 1)
+    return YamlSign(false, 0)
+
+# an integer node when the text is an integer literal, otherwise -1 without
+# touching the parser error state.
+fn try_integer_node(text: String) -> Int:
+    sign := split_sign(text)
+    mut start := sign.start
+    mut base := 10
+    if text.len() >= start + 2 and text[start] == "0" and (text[start + 1] == "x" or text[start + 1] == "X"):
+        base = 16
+        start = start + 2
+    elif text.len() >= start + 2 and text[start] == "0" and (text[start + 1] == "o" or text[start + 1] == "O"):
+        base = 8
+        start = start + 2
+    if not all_digits_in_base(text, start, base):
+        return 0 - 1
+    value := parse_digits_in_base(text, start, base)
+    if parser_error:
+        return 0 - 1
+    if sign.negative:
+        return int_node(0 - value)
+    return int_node(value)
+
+# true when the text looks like a decimal float: digits, at most one dot, an
+# optional exponent, and at least one digit.
+fn looks_like_float(text: String) -> Bool:
+    sign := split_sign(text)
+    mut i := sign.start
+    mut digits := 0
+    mut dots := 0
+    mut exponents := 0
+    mut saw_marker := false
+    while i < text.len():
+        c := text[i]
+        if is_digit_char(c):
+            digits = digits + 1
+        elif c == ".":
+            dots = dots + 1
+            saw_marker = true
+        elif c == "e" or c == "E":
+            exponents = exponents + 1
+            saw_marker = true
+            # an exponent may carry its own sign
+            if i + 1 < text.len() and (text[i + 1] == "+" or text[i + 1] == "-"):
+                i = i + 1
+        else:
+            return false
+        i = i + 1
+    return digits > 0 and saw_marker and dots <= 1 and exponents <= 1
+
+fn parse_float_manual(text: String) -> Float:
+    sign := split_sign(text)
+    mut int_part := 0
+    mut frac := 0.0
+    mut frac_div := 1.0
+    mut in_frac := false
+    mut exponent := 0
+    mut exponent_negative := false
+    mut in_exponent := false
+    mut i := sign.start
+    while i < text.len():
+        c := text[i]
+        if c == ".":
+            in_frac = true
+        elif c == "e" or c == "E":
+            in_exponent = true
+            if i + 1 < text.len() and text[i + 1] == "-":
+                exponent_negative = true
+                i = i + 1
+            elif i + 1 < text.len() and text[i + 1] == "+":
+                i = i + 1
+        elif in_exponent:
+            exponent = exponent * 10 + (ord(c) - 48)
+        elif in_frac:
+            frac_div = frac_div * 10.0
+            frac = frac + (ord(c) - 48).to_float() / frac_div
+        else:
+            int_part = int_part * 10 + (ord(c) - 48)
+        i = i + 1
+    mut value := int_part.to_float() + frac
+    mut e := 0
+    while e < exponent:
+        if exponent_negative:
+            value = value / 10.0
+        else:
+            value = value * 10.0
+        e = e + 1
+    if sign.negative:
+        return 0.0 - value
+    return value
+
+# a plain (unquoted) scalar, resolved against the YAML 1.2 core schema.
+#
+# `yes`/`no`/`on`/`off` are deliberately strings, not booleans. that mapping
+# comes from YAML 1.1 and is the reason `country: NO` famously reads as false;
+# the 1.2 core schema dropped it, and so does this parser.
+fn plain_scalar_node(text: String) -> Int:
+    if text == "" or text == "~" or text == "null" or text == "Null" or text == "NULL":
+        return null_node()
+    if text == "true" or text == "True" or text == "TRUE":
+        return bool_node(true)
+    if text == "false" or text == "False" or text == "FALSE":
+        return bool_node(false)
+    as_int := try_integer_node(text)
+    if parser_error:
+        return 0 - 1
+    if as_int >= 0:
+        return as_int
+    if looks_like_float(text):
+        return float_node(parse_float_manual(text))
+    return string_node(text)
+
+# the node for one scalar written out in a value position.
+fn scalar_node(text: String) -> Int:
+    if text.len() == 0:
+        return null_node()
+    c := text[0]
+    if c == "&" or c == "*":
+        yaml_fail("anchors and aliases are not supported: " + text)
+        return 0 - 1
+    if c == "!":
+        yaml_fail("yaml tags are not supported: " + text)
+        return 0 - 1
+    if c == chr(34) or c == "'":
+        value := decode_quoted(text)
+        if parser_error:
+            return 0 - 1
+        return string_node(value)
+    return plain_scalar_node(text)
+
+# the text of a mapping key, with quotes removed.
+fn key_text(raw: String) -> String:
+    if raw.len() == 0:
+        yaml_fail("mapping key is empty")
+        return ""
+    if raw.len() > MAX_KEY_BYTES:
+        yaml_fail("mapping key of " + raw.len().to_string() + " bytes exceeds the " + MAX_KEY_BYTES.to_string() + "-byte limit")
+        return ""
+    if raw.starts_with("<<"):
+        yaml_fail("merge keys (<<) are not supported")
+        return ""
+    c := raw[0]
+    if c == "?":
+        yaml_fail("explicit (complex) keys are not supported")
+        return ""
+    if c == "&" or c == "*":
+        yaml_fail("anchors and aliases are not supported: " + raw)
+        return ""
+    if c == "!":
+        yaml_fail("yaml tags are not supported: " + raw)
+        return ""
+    if c == chr(34) or c == "'":
+        value := decode_quoted(raw)
+        if parser_error:
+            return ""
+        return value
+    return raw
+
+# ===============================================================
+# Collections
+# ===============================================================
+
+fn finish_map(keys_in: List[String], values_in: List[Int]) -> Int:
+    idx := allocate_node("map")
+    if keys_in.len() == 0:
+        return idx
+    map_key_offsets.insert(idx, map_keys_flat.len())
+    for key in keys_in:
+        map_keys_flat.push(key)
+    for value in values_in:
+        map_values_flat.push(value)
+    map_key_counts.insert(idx, keys_in.len())
+    return idx
+
+fn finish_seq(items: List[Int]) -> Int:
+    idx := allocate_node("seq")
+    if items.len() == 0:
+        return idx
+    seq_item_offsets.insert(idx, seq_items_flat.len())
+    for item in items:
+        seq_items_flat.push(item)
+    seq_item_counts.insert(idx, items.len())
+    return idx
+
+# guards against a document that is all structure and no content.
+fn over_budget() -> Bool:
+    if nodes_this_parse > MAX_NODES:
+        yaml_fail("document allocates more than " + MAX_NODES.to_string() + " nodes")
+        return true
+    return false
+
+fn too_many_entries(count: Int) -> Bool:
+    if count >= MAX_COLLECTION_ENTRIES:
+        yaml_fail("collection holds more than " + MAX_COLLECTION_ENTRIES.to_string() + " entries")
+        return true
+    return false
+
+# ===============================================================
+# Flow collections
+# ===============================================================
+
+fn flow_skip_spaces():
+    while flow_pos < flow_input.len() and (flow_input[flow_pos] == " " or flow_input[flow_pos] == chr(9)):
+        flow_pos = flow_pos + 1
+
+# the raw text of one flow scalar, stopping at a separator that belongs to the
+# enclosing collection. quotes hide separators.
+fn flow_read_scalar_text(stop_at_colon: Bool) -> String:
+    start := flow_pos
+    while flow_pos < flow_input.len():
+        c := flow_input[flow_pos]
+        if c == chr(34) or c == "'":
+            flow_pos = skip_quoted(flow_input, flow_pos)
+            continue
+        if c == "," or c == "]" or is_close_brace(c):
+            break
+        if stop_at_colon and c == ":":
+            break
+        flow_pos = flow_pos + 1
+    return flow_input.substring(start, flow_pos).trim()
+
+fn parse_flow_value() -> Int:
+    parser_depth = parser_depth + 1
+    if parser_depth > MAX_NESTING_DEPTH:
+        yaml_fail("nesting exceeds " + MAX_NESTING_DEPTH.to_string() + " levels")
+        parser_depth = parser_depth - 1
+        return 0 - 1
+    result := parse_flow_value_inner()
+    parser_depth = parser_depth - 1
+    return result
+
+fn parse_flow_value_inner() -> Int:
+    flow_skip_spaces()
+    if flow_pos >= flow_input.len():
+        yaml_fail("flow collection ends early")
+        return 0 - 1
+    c := flow_input[flow_pos]
+    if is_open_brace(c):
+        return parse_flow_map()
+    if c == "[":
+        return parse_flow_seq()
+    return scalar_node(flow_read_scalar_text(false))
+
+fn parse_flow_map() -> Int:
+    flow_pos = flow_pos + 1
+    mut keys_in: List[String] := []
+    mut values_in: List[Int] := []
+    flow_skip_spaces()
+    if flow_pos < flow_input.len() and is_close_brace(flow_input[flow_pos]):
+        flow_pos = flow_pos + 1
+        return finish_map(keys_in, values_in)
+    while flow_pos < flow_input.len() and not parser_error:
+        flow_skip_spaces()
+        raw_key := flow_read_scalar_text(true)
+        key := key_text(raw_key)
+        if parser_error:
+            return 0 - 1
+        flow_skip_spaces()
+        if flow_pos >= flow_input.len() or flow_input[flow_pos] != ":":
+            yaml_fail("flow mapping entry '" + raw_key + "' has no value")
+            return 0 - 1
+        flow_pos = flow_pos + 1
+        value := parse_flow_value()
+        if parser_error:
+            return 0 - 1
+        if too_many_entries(keys_in.len()) or over_budget():
+            return 0 - 1
+        keys_in.push(key)
+        values_in.push(value)
+        flow_skip_spaces()
+        if flow_pos >= flow_input.len():
+            break
+        if flow_input[flow_pos] == ",":
+            flow_pos = flow_pos + 1
+            continue
+        if is_close_brace(flow_input[flow_pos]):
+            flow_pos = flow_pos + 1
+            return finish_map(keys_in, values_in)
+        yaml_fail("unexpected '" + flow_input[flow_pos] + "' in a flow mapping")
+        return 0 - 1
+    yaml_fail("unterminated flow mapping")
+    return 0 - 1
+
+fn parse_flow_seq() -> Int:
+    flow_pos = flow_pos + 1
+    mut items: List[Int] := []
+    flow_skip_spaces()
+    if flow_pos < flow_input.len() and flow_input[flow_pos] == "]":
+        flow_pos = flow_pos + 1
+        return finish_seq(items)
+    while flow_pos < flow_input.len() and not parser_error:
+        value := parse_flow_value()
+        if parser_error:
+            return 0 - 1
+        if too_many_entries(items.len()) or over_budget():
+            return 0 - 1
+        items.push(value)
+        flow_skip_spaces()
+        if flow_pos >= flow_input.len():
+            break
+        if flow_input[flow_pos] == ",":
+            flow_pos = flow_pos + 1
+            continue
+        if flow_input[flow_pos] == "]":
+            flow_pos = flow_pos + 1
+            return finish_seq(items)
+        yaml_fail("unexpected '" + flow_input[flow_pos] + "' in a flow sequence")
+        return 0 - 1
+    yaml_fail("unterminated flow sequence")
+    return 0 - 1
+
+# a value written on one line: a flow collection or a single scalar. flow
+# collections have to close on the line they open on; a multi-line flow
+# collection is refused rather than half-read.
+fn parse_inline_value(text: String) -> Int:
+    if starts_flow(text):
+        flow_input = text
+        flow_pos = 0
+        value := parse_flow_value()
+        if parser_error:
+            return 0 - 1
+        flow_skip_spaces()
+        if flow_pos != flow_input.len():
+            yaml_fail("unexpected text after a flow collection: " + text.substring(flow_pos, text.len()))
+            return 0 - 1
+        return value
+    return scalar_node(text)
+
+# ===============================================================
+# Block scalars
+# ===============================================================
+
+fn repeat_newlines(count: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < count:
+        out = out + chr(10)
+        i = i + 1
+    return out
+
+# reads a `|` or `>` block whose header is `header` and whose owning key sits
+# at `parent_indent`.
+fn parse_block_scalar(parent_indent: Int, header: String) -> Int:
+    style := header[0]
+    mut chomp := "clip"
+    mut i := 1
+    while i < header.len():
+        c := header[i]
+        if c == "-":
+            chomp = "strip"
+        elif c == "+":
+            chomp = "keep"
+        elif is_digit_char(c):
+            yaml_fail("explicit block scalar indentation indicators are not supported: " + header)
+            return 0 - 1
+        else:
+            yaml_fail("unexpected text in a block scalar header: " + header)
+            return 0 - 1
+        i = i + 1
+
+    mut content: List[String] := []
+    mut block_indent := 0 - 1
+    while line_pos < line_count():
+        raw := line_raw[line_pos]
+        if raw.trim() == "":
+            content.push("")
+            line_pos = line_pos + 1
+            continue
+        indent := line_indent[line_pos]
+        if indent <= parent_indent:
+            break
+        if block_indent < 0:
+            block_indent = indent
+        if indent < block_indent:
+            break
+        content.push(raw.substring(block_indent, raw.len()))
+        line_pos = line_pos + 1
+
+    # trailing blank lines belong to the block, but how many survive is what
+    # the chomping indicator decides, so hold them aside while folding.
+    mut trailing := 0
+    while content.len() > 0 and content[content.len() - 1] == "":
+        content.remove(content.len() - 1)
+        trailing = trailing + 1
+
+    mut body := ""
+    mut j := 0
+    while j < content.len():
+        line := content[j]
+        if j == 0:
+            body = line
+        elif style == "|":
+            body = body + chr(10) + line
+        elif line == "":
+            # a blank line inside a folded block is a real line break
+            body = body + chr(10)
+        elif content[j - 1] == "":
+            body = body + line
+        else:
+            body = body + " " + line
+        j = j + 1
+
+    if content.len() == 0:
+        if chomp == "keep":
+            return string_node(repeat_newlines(trailing))
+        return string_node("")
+    if chomp == "strip":
+        return string_node(body)
+    if chomp == "keep":
+        return string_node(body + repeat_newlines(trailing + 1))
+    return string_node(body + chr(10))
+
+# ===============================================================
+# Block structure
+# ===============================================================
+
+# the index of the ":" that separates a mapping key from its value, or -1.
+# quotes and flow brackets hide a colon, so `a: {b: 1}` separates at index 1
+# and `{b: 1}` separates nowhere.
+fn find_key_colon(text: String) -> Int:
+    mut i := 0
+    mut depth := 0
+    while i < text.len():
+        c := text[i]
+        if c == chr(34) or c == "'":
+            i = skip_quoted(text, i)
+            continue
+        if c == "[" or is_open_brace(c):
+            depth = depth + 1
+        elif c == "]" or is_close_brace(c):
+            depth = depth - 1
+        elif c == ":" and depth == 0:
+            if i + 1 >= text.len() or text[i + 1] == " ":
+                return i
+        i = i + 1
+    return 0 - 1
+
+fn starts_sequence_entry(text: String) -> Bool:
+    return text == "-" or text.starts_with("- ")
+
+# how many spaces the text after a "-" is indented by, so a compact entry
+# (`- name: a`) knows what column its mapping starts at.
+fn dash_content_offset(text: String) -> Int:
+    mut i := 1
+    while i < text.len() and text[i] == " ":
+        i = i + 1
+    return i
+
+fn parse_block(indent: Int) -> Int:
+    parser_depth = parser_depth + 1
+    if parser_depth > MAX_NESTING_DEPTH:
+        yaml_fail("nesting exceeds " + MAX_NESTING_DEPTH.to_string() + " levels")
+        parser_depth = parser_depth - 1
+        return 0 - 1
+    result := parse_block_inner(indent)
+    parser_depth = parser_depth - 1
+    return result
+
+fn parse_block_inner(indent: Int) -> Int:
+    text := line_text[line_pos]
+    if text == "?" or text.starts_with("? "):
+        yaml_fail_at("explicit (complex) keys are not supported", line_pos)
+        return 0 - 1
+    if starts_sequence_entry(text):
+        return parse_seq(indent)
+    if starts_flow(text):
+        line_pos = line_pos + 1
+        return parse_inline_value(text)
+    if find_key_colon(text) >= 0:
+        return parse_map(indent)
+    # a document that is a single scalar, such as a file holding just `hello`
+    line_pos = line_pos + 1
+    return scalar_node(text)
+
+# the value of `key:` when the rest of the line is empty: a nested block, or
+# null when nothing deeper follows.
+fn parse_nested_value(parent_indent: Int) -> Int:
+    skip_blank_lines()
+    if at_end() or at_document_boundary():
+        return null_node()
+    indent := line_indent[line_pos]
+    if indent > parent_indent:
+        return parse_block(indent)
+    # a sequence may sit at its key's own indentation:
+    #     ports:
+    #     - 80
+    #     - 443
+    if indent == parent_indent and starts_sequence_entry(line_text[line_pos]):
+        return parse_seq(indent)
+    return null_node()
+
+# rejects a line that is indented further than the value it follows. a plain
+# scalar continued on the next line is legal YAML but not supported here, and
+# quietly dropping the continuation would change what the document says.
+fn reject_deeper_continuation(parent_indent: Int):
+    skip_blank_lines()
+    if at_end() or at_document_boundary():
+        return
+    if line_indent[line_pos] > parent_indent:
+        yaml_fail_at("unexpected indentation; multi-line plain scalars are not supported", line_pos)
+
+# the value for `key: <rest>` where the key sits at `parent_indent`.
+fn parse_value_after_key(parent_indent: Int, rest: String) -> Int:
+    if rest.len() == 0:
+        return parse_nested_value(parent_indent)
+    if rest.starts_with("|") or rest.starts_with(">"):
+        return parse_block_scalar(parent_indent, rest)
+    value := parse_inline_value(rest)
+    if parser_error:
+        return 0 - 1
+    reject_deeper_continuation(parent_indent)
+    return value
+
+fn parse_map(indent: Int) -> Int:
+    mut keys_in: List[String] := []
+    mut values_in: List[Int] := []
+    while not parser_error:
+        skip_blank_lines()
+        if at_end() or at_document_boundary():
+            break
+        if line_indent[line_pos] < indent:
+            break
+        if line_indent[line_pos] > indent:
+            yaml_fail_at("unexpected indentation", line_pos)
+            break
+        text := line_text[line_pos]
+        if starts_sequence_entry(text):
+            yaml_fail_at("sequence entry where a mapping key was expected", line_pos)
+            break
+        if text == "?" or text.starts_with("? "):
+            yaml_fail_at("explicit (complex) keys are not supported", line_pos)
+            break
+        colon := find_key_colon(text)
+        if colon < 0:
+            if has_unterminated_quote(text):
+                yaml_fail_at("unterminated quoted scalar", line_pos)
+            else:
+                yaml_fail_at("expected 'key: value'", line_pos)
+            break
+        key := key_text(text.substring(0, colon).trim())
+        if parser_error:
+            break
+        rest := text.substring(colon + 1, text.len()).trim()
+        line_pos = line_pos + 1
+        value := parse_value_after_key(indent, rest)
+        if parser_error:
+            break
+        if too_many_entries(keys_in.len()) or over_budget():
+            break
+        keys_in.push(key)
+        values_in.push(value)
+    if parser_error:
+        return 0 - 1
+    return finish_map(keys_in, values_in)
+
+fn parse_seq(indent: Int) -> Int:
+    mut items: List[Int] := []
+    while not parser_error:
+        skip_blank_lines()
+        if at_end() or at_document_boundary():
+            break
+        if line_indent[line_pos] < indent:
+            break
+        if line_indent[line_pos] > indent:
+            yaml_fail_at("unexpected indentation", line_pos)
+            break
+        text := line_text[line_pos]
+        if not starts_sequence_entry(text):
+            break
+        mut item := 0 - 1
+        if text == "-":
+            line_pos = line_pos + 1
+            item = parse_nested_value(indent)
+        else:
+            offset := dash_content_offset(text)
+            rest := text.substring(offset, text.len())
+            if find_key_colon(rest) >= 0 or starts_sequence_entry(rest):
+                # a compact entry: `- name: a` opens a mapping whose keys line
+                # up under `name`. rewriting the line in place lets the ordinary
+                # block parser handle it, and the rewrite is invisible outside
+                # this parse because the line table is rebuilt per document.
+                line_indent[line_pos] = indent + offset
+                line_text[line_pos] = rest
+                item = parse_block(indent + offset)
+            elif rest.starts_with("|") or rest.starts_with(">"):
+                line_pos = line_pos + 1
+                item = parse_block_scalar(indent, rest)
+            else:
+                line_pos = line_pos + 1
+                item = parse_inline_value(rest)
+                if not parser_error:
+                    reject_deeper_continuation(indent)
+        if parser_error:
+            break
+        if too_many_entries(items.len()) or over_budget():
+            break
+        items.push(item)
+    if parser_error:
+        return 0 - 1
+    return finish_seq(items)
+
+fn parse_document_body() -> Int:
+    skip_blank_lines()
+    if at_end() or at_document_boundary():
+        return null_node()
+    return parse_block(line_indent[line_pos])
+
+# walks the whole input, returning one root per document.
+fn parse_documents() -> List[Int]:
+    mut roots: List[Int] := []
+    while not parser_error:
+        skip_blank_lines()
+        if at_end():
+            break
+        text := line_text[line_pos]
+        if text == "...":
+            line_pos = line_pos + 1
+            continue
+        if text.starts_with("--- "):
+            yaml_fail_at("content on the same line as a '---' marker is not supported", line_pos)
+            break
+        if text == "---":
+            line_pos = line_pos + 1
+            roots.push(parse_document_body())
+            continue
+        if text.starts_with("%"):
+            yaml_fail_at("yaml directives (%YAML, %TAG) are not supported", line_pos)
+            break
+        roots.push(parse_document_body())
+    if parser_error:
+        return []
+    if roots.len() == 0:
+        roots.push(null_node())
+    return roots
+
+fn begin_parse(input: String) -> Bool:
+    parser_error = false
+    parser_message = ""
+    parser_depth = 0
+    nodes_this_parse = 0
+    if input.len() > MAX_DOCUMENT_BYTES:
+        yaml_fail("document of " + input.len().to_string() + " bytes exceeds the " + MAX_DOCUMENT_BYTES.to_string() + "-byte limit")
+        return false
+    return scan_lines(input)
+
+# ===============================================================
+# Public API — Parsing
+# ===============================================================
+
+## parses a YAML document and returns the root node handle, or -1 on failure.
+## last_error() carries the reason. when the input holds several documents this
+## returns the first one; use parse_all for the rest.
+pub fn parse(input: String) -> Int:
+    if not begin_parse(input):
+        return 0 - 1
+    roots := parse_documents()
+    if parser_error or roots.len() == 0:
+        return 0 - 1
+    return roots[0]
+
+## parses every document in the input and returns a sequence handle holding one
+## root per document. returns -1 on failure.
+pub fn parse_all(input: String) -> Int:
+    if not begin_parse(input):
+        return 0 - 1
+    roots := parse_documents()
+    if parser_error:
+        return 0 - 1
+    return finish_seq(roots)
+
+## parses a YAML file from disk. returns -1 when the file cannot be read or the
+## document is invalid.
+pub fn parse_file(path: String) -> Int:
+    return parse_file_chunked(path, YAML_FILE_CHUNK_SIZE)
+
+## parses a YAML file using a custom read chunk size.
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    data := io.read_file_text_chunked(path, chunk_size)
+    if data.is_err:
+        return 0 - 1
+    return parse(data.ok)
+
+## parses YAML and fails with a typed error when the input is invalid.
+pub fn parse_required(input: String) -> Int!YamlDecodeError:
+    root := parse(input)
+    if root < 0:
+        fail yaml_decode_fail("invalid yaml document: " + parser_message)
+    return root
+
+## parses a YAML file and fails with a typed error when it cannot be read or is
+## invalid.
+pub fn parse_file_required(file_path: String) -> Int!YamlDecodeError:
+    root := parse_file(file_path)
+    if root < 0:
+        fail yaml_decode_fail("invalid yaml document: " + parser_message)
+    return root
+
+# ===============================================================
+# Public API — Type and Introspection
+# ===============================================================
+
+## the kind of a node: "map", "seq", "string", "int", "float", "bool" or
+## "null", and "invalid" for a handle that names no live node.
+pub fn type_of(handle: Int) -> String:
+    kind := node_kind(handle)
+    if kind == "":
+        return "invalid"
+    return kind
+
+## true when the node is the YAML null value (`null`, `~` or an empty value).
+pub fn is_null(handle: Int) -> Bool:
+    return node_kind(handle) == "null"
+
+# looks up a direct key in a mapping and returns the child handle, or -1.
+fn map_lookup(handle: Int, key: String) -> Int:
+    if node_kind(handle) != "map":
+        return 0 - 1
+    off := map_key_offsets[handle]
+    count := map_key_counts[handle]
+    mut i := 0
+    while i < count:
+        if map_keys_flat[off + i] == key:
+            return map_values_flat[off + i]
+        i = i + 1
+    return 0 - 1
+
+# ===============================================================
+# Public API — Reading a node directly
+# ===============================================================
+
+## the text of a string node, or "" for anything else. use this on a sequence
+## element, where there is no key to look the value up by.
+pub fn scalar_string(handle: Int) -> String:
+    if node_kind(handle) == "string":
+        return string_values[handle]
+    return ""
+
+## the value of an int node, or 0 for anything else.
+pub fn scalar_int(handle: Int) -> Int:
+    if node_kind(handle) == "int":
+        return integer_values[handle]
+    return 0
+
+## the value of a float node, or 0.0 for anything else.
+pub fn scalar_float(handle: Int) -> Float:
+    if node_kind(handle) == "float":
+        return float_values[handle]
+    return 0.0
+
+## the value of a bool node, or false for anything else.
+pub fn scalar_bool(handle: Int) -> Bool:
+    if node_kind(handle) == "bool":
+        return boolean_values[handle]
+    return false
+
+# ===============================================================
+# Public API — Mapping accessors
+# ===============================================================
+
+## the child handle for a key in a mapping, or -1 when there is no such key.
+pub fn get_value(handle: Int, key: String) -> Int:
+    return map_lookup(handle, key)
+
+## a string field, or "" when it is missing or holds another kind.
+pub fn get_string(handle: Int, key: String) -> String:
+    return scalar_string(map_lookup(handle, key))
+
+## a required string field, or a typed decode error.
+pub fn require_string(handle: Int, key: String) -> String!YamlDecodeError:
+    v := map_lookup(handle, key)
+    if v < 0:
+        fail yaml_decode_fail("missing string field: " + key)
+    if node_kind(v) != "string":
+        fail yaml_decode_fail("expected string field: " + key)
+    return string_values[v]
+
+## a string field with a fallback used when it is missing or holds another kind.
+pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "string":
+        return string_values[v]
+    return default_value
+
+## an int field, or 0 when it is missing or holds another kind.
+pub fn get_int(handle: Int, key: String) -> Int:
+    return scalar_int(map_lookup(handle, key))
+
+## a required int field, or a typed decode error.
+pub fn require_int(handle: Int, key: String) -> Int!YamlDecodeError:
+    v := map_lookup(handle, key)
+    if v < 0:
+        fail yaml_decode_fail("missing int field: " + key)
+    if node_kind(v) != "int":
+        fail yaml_decode_fail("expected int field: " + key)
+    return integer_values[v]
+
+## an int field with a fallback used when it is missing or holds another kind.
+pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "int":
+        return integer_values[v]
+    return default_value
+
+## a float field, or 0.0 when it is missing or holds another kind.
+pub fn get_float(handle: Int, key: String) -> Float:
+    return scalar_float(map_lookup(handle, key))
+
+## a float field with a fallback used when it is missing or holds another kind.
+pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "float":
+        return float_values[v]
+    return default_value
+
+## a bool field, or false when it is missing or holds another kind.
+pub fn get_bool(handle: Int, key: String) -> Bool:
+    return scalar_bool(map_lookup(handle, key))
+
+## a required bool field, or a typed decode error.
+pub fn require_bool(handle: Int, key: String) -> Bool!YamlDecodeError:
+    v := map_lookup(handle, key)
+    if v < 0:
+        fail yaml_decode_fail("missing bool field: " + key)
+    if node_kind(v) != "bool":
+        fail yaml_decode_fail("expected bool field: " + key)
+    return boolean_values[v]
+
+## a bool field with a fallback used when it is missing or holds another kind.
+pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "bool":
+        return boolean_values[v]
+    return default_value
+
+## a nested mapping by key, or -1 when it is missing or is not a mapping.
+pub fn get_map(handle: Int, key: String) -> Int:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "map":
+        return v
+    return 0 - 1
+
+## a nested mapping by key. the same thing get_map returns, under the name
+## std.toml uses for it, so code that moves between the two formats reads the
+## same either way.
+pub fn get_table(handle: Int, key: String) -> Int:
+    return get_map(handle, key)
+
+## a sequence by key, or -1 when it is missing or is not a sequence.
+pub fn get_array(handle: Int, key: String) -> Int:
+    v := map_lookup(handle, key)
+    if node_kind(v) == "seq":
+        return v
+    return 0 - 1
+
+## the keys of a mapping in document order. empty for anything else.
+pub fn keys(handle: Int) -> List[String]:
+    mut result: List[String] := []
+    if node_kind(handle) != "map":
+        return result
+    off := map_key_offsets[handle]
+    count := map_key_counts[handle]
+    mut i := 0
+    while i < count:
+        result.push(map_keys_flat[off + i])
+        i = i + 1
+    return result
+
+## true when a mapping holds the given key.
+pub fn has(handle: Int, key: String) -> Bool:
+    return map_lookup(handle, key) >= 0
+
+# ===============================================================
+# Public API — Sequence accessors
+# ===============================================================
+
+## the number of elements in a sequence, or 0 for anything else.
+pub fn array_len(handle: Int) -> Int:
+    if node_kind(handle) != "seq":
+        return 0
+    return seq_item_counts[handle]
+
+## the handle of a sequence element, or -1 when the index is out of bounds.
+pub fn array_get(handle: Int, index: Int) -> Int:
+    if node_kind(handle) != "seq":
+        return 0 - 1
+    if index < 0 or index >= seq_item_counts[handle]:
+        return 0 - 1
+    return seq_items_flat[seq_item_offsets[handle] + index]
+
+# ===============================================================
+# Public API — Typed decoding
+# ===============================================================
+
+## decodes a YAML mapping handle into a concrete struct with public
+## string/int/bool fields.
+pub fn decode[T](handle: Int) -> T!YamlDecodeError:
+    fail yaml_decode_fail("yaml.decode requires compiler support")
+
+## parses YAML text and decodes it into a concrete struct.
+pub fn decode_text[T](input: String) -> T!YamlDecodeError:
+    fail yaml_decode_fail("yaml.decode_text requires compiler support")
+
+## the nested mapping a key names, or a typed error when the key is missing or
+## does not hold a mapping. this is the step a dotted decode path walks with.
+pub fn require_table(handle: Int, key: String) -> Int!YamlDecodeError:
+    child := map_lookup(handle, key)
+    if child < 0:
+        fail yaml_decode_fail("missing table field: " + key)
+    if node_kind(child) != "map":
+        fail yaml_decode_fail("expected table field: " + key)
+    return child
+
+## decodes a nested mapping selected by a dotted path.
+pub fn decode_path[T](handle: Int, dotted_path: String) -> T!YamlDecodeError:
+    mut current := handle
+    for part in dotted_path.split("."):
+        if part == "":
+            continue
+        current = require_table(current, part)!
+    return decode[T](current)!
+
+## parses YAML text and decodes a nested mapping selected by a dotted path.
+pub fn decode_text_path[T](input: String, dotted_path: String) -> T!YamlDecodeError:
+    root := parse_required(input)!
+    return decode_path[T](root, dotted_path)!
+
+## loads a YAML file and decodes it into a concrete struct.
+pub fn decode_file[T](file_path: String) -> T!YamlDecodeError:
+    return decode[T](parse_file_required(file_path)!)!
+
+## loads a YAML file and decodes a nested mapping selected by a dotted path.
+pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!YamlDecodeError:
+    return decode_path[T](parse_file_required(file_path)!, dotted_path)!
+
+# ===============================================================
+# Colocated tests
+# ===============================================================
+
+test "yaml scanner strips comments outside quotes":
+    dq := chr(34)
+    assert_eq(strip_comment("key: value # trailing"), "key: value ")
+    assert_eq(strip_comment("key: " + dq + "a#b" + dq), "key: " + dq + "a#b" + dq)
+    assert_eq(strip_comment("key: a#b"), "key: a#b")
+    assert_eq(strip_comment("# whole line"), "")
+
+test "yaml scanner finds the key separator":
+    dq := chr(34)
+    assert_eq(find_key_colon("key: value"), 3)
+    assert_eq(find_key_colon("key:"), 3)
+    flow := chr(123) + "a: 1" + chr(125)
+    assert_eq(find_key_colon(flow), 0 - 1)
+    assert_eq(find_key_colon("key: " + flow), 3)
+    assert_eq(find_key_colon(dq + "a: b" + dq + ": v"), 6)
+    assert_eq(find_key_colon("12:30"), 0 - 1)
+
+test "yaml types plain scalars against the core schema":
+    root := parse("a: 1" + chr(10) + "b: 1.5" + chr(10) + "c: true" + chr(10) + "d: text" + chr(10) + "e: ~" + chr(10) + "f: yes")
+    assert_eq(type_of(get_value(root, "a")), "int")
+    assert_eq(type_of(get_value(root, "b")), "float")
+    assert_eq(type_of(get_value(root, "c")), "bool")
+    assert_eq(type_of(get_value(root, "d")), "string")
+    assert_eq(type_of(get_value(root, "e")), "null")
+    # yes/no/on/off are strings under the 1.2 core schema
+    assert_eq(type_of(get_value(root, "f")), "string")
+
+test "yaml reads nested blocks and sequences":
+    nl := chr(10)
+    doc := "server:" + nl + "  host: localhost" + nl + "  ports:" + nl + "    - 80" + nl + "    - 443"
+    root := parse(doc)
+    server := get_map(root, "server")
+    assert_eq(get_string(server, "host"), "localhost")
+    ports := get_array(server, "ports")
+    assert_eq(array_len(ports), 2)
+    assert_eq(scalar_int(array_get(ports, 1)), 443)
+    assert_eq(keys(root).join(","), "server")
+
+test "yaml rejects tabs and unterminated quotes":
+    nl := chr(10)
+    dq := chr(34)
+    assert(parse("a:" + nl + chr(9) + "b: 1") < 0)
+    assert(last_error().contains("tab"))
+    assert(parse("a: " + dq + "unclosed") < 0)
+    assert(parse("a: [1, 2") < 0)
+    assert(last_error().contains("flow"))
+    assert(parse("a: 1") >= 0)
+    assert_eq(last_error(), "")

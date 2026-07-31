@@ -1,0 +1,77 @@
+import std.yaml as yaml
+
+# scalar typing, quoting, escapes and comments.
+
+fn main() -> Int!:
+    nl := chr(10)
+    dq := chr(34)
+    sq := "'"
+
+    mut doc := "count: 42" + nl
+    doc = doc + "negative: -7" + nl
+    doc = doc + "hex: 0x1f" + nl
+    doc = doc + "octal: 0o17" + nl
+    doc = doc + "ratio: 1.5" + nl
+    doc = doc + "scaled: 2.5e2" + nl
+    doc = doc + "tiny: 1.0e-2" + nl
+    doc = doc + "yes_flag: true" + nl
+    doc = doc + "no_flag: False" + nl
+    doc = doc + "empty:" + nl
+    doc = doc + "tilde: ~" + nl
+    doc = doc + "spelled: null" + nl
+    doc = doc + "word: plain text" + nl
+    doc = doc + "human: yes" + nl
+    doc = doc + "version: 1.2.3" + nl
+    doc = doc + "quoted: " + dq + "  spaced  " + dq + nl
+    doc = doc + "single: " + sq + "it" + sq + sq + "s here" + sq + nl
+    doc = doc + "escaped: " + dq + "a" + chr(92) + "tb" + chr(92) + "nc" + chr(92) + dq + "d" + chr(92) + chr(92) + "e" + dq + nl
+    doc = doc + "unicode: " + dq + chr(92) + "u00e9" + chr(92) + "u4e2d" + dq + nl
+    doc = doc + "hashed: a#b   # a real comment" + nl
+    doc = doc + "in_quotes: " + dq + "a # b" + dq + "   # another comment" + nl
+    doc = doc + "# a whole-line comment" + nl
+
+    root := yaml.parse(doc)
+    print("root:{yaml.type_of(root)}")
+
+    print("count:{yaml.get_int(root, "count")}")
+    print("negative:{yaml.get_int(root, "negative")}")
+    print("hex:{yaml.get_int(root, "hex")}")
+    print("octal:{yaml.get_int(root, "octal")}")
+    print("ratio:{yaml.get_float(root, "ratio")}")
+    print("scaled:{yaml.get_float(root, "scaled")}")
+    print("tiny:{yaml.get_float(root, "tiny")}")
+    print("yes_flag:{yaml.get_bool(root, "yes_flag")}")
+    print("no_flag:{yaml.get_bool(root, "no_flag")}")
+
+    print("empty:{yaml.type_of(yaml.get_value(root, "empty"))}")
+    print("tilde:{yaml.is_null(yaml.get_value(root, "tilde"))}")
+    print("spelled:{yaml.is_null(yaml.get_value(root, "spelled"))}")
+
+    print("word:{yaml.get_string(root, "word")}")
+    # yes/no/on/off are strings under the yaml 1.2 core schema
+    print("human:{yaml.type_of(yaml.get_value(root, "human"))}:{yaml.get_string(root, "human")}")
+    print("version:{yaml.type_of(yaml.get_value(root, "version"))}:{yaml.get_string(root, "version")}")
+    print("quoted:[{yaml.get_string(root, "quoted")}]")
+    print("single:{yaml.get_string(root, "single")}")
+    print("escaped:{yaml.get_string(root, "escaped")}")
+    print("unicode:{yaml.get_string(root, "unicode")}")
+    print("hashed:{yaml.get_string(root, "hashed")}")
+    print("in_quotes:{yaml.get_string(root, "in_quotes")}")
+
+    # fallbacks and presence
+    print("missing:{yaml.get_string_or(root, "nope", "fallback")}")
+    print("missing_int:{yaml.get_int_or(root, "nope", 9000)}")
+    print("missing_float:{yaml.get_float_or(root, "nope", 0.5)}")
+    print("missing_bool:{yaml.get_bool_or(root, "nope", true)}")
+    print("has_count:{yaml.has(root, "count")}")
+    print("has_nope:{yaml.has(root, "nope")}")
+    print("keys:{yaml.keys(root).len()}")
+
+    # a document that is a single scalar
+    lone := yaml.parse("just a string")
+    print("lone:{yaml.type_of(lone)}:{yaml.scalar_string(lone)}")
+
+    # an empty document is null
+    blank := yaml.parse("")
+    print("blank:{yaml.type_of(blank)}")
+    return 0

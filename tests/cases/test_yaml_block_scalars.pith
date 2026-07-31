@@ -1,0 +1,69 @@
+import std.yaml as yaml
+
+# literal and folded block scalars with each chomping indicator.
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+# print a string with its line breaks made visible, so the expected output
+# stays a single line per case.
+fn show(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        if text[i] == chr(10):
+            out = out + "\\n"
+        else:
+            out = out + text[i]
+        i = i + 1
+    return out
+
+fn main() -> Int!:
+    mut doc := line("literal: |")
+    doc = doc + line("  first line")
+    doc = doc + line("  second line")
+    doc = doc + line("stripped: |-")
+    doc = doc + line("  no trailing break")
+    doc = doc + line("kept: |+")
+    doc = doc + line("  one")
+    doc = doc + line("")
+    doc = doc + line("")
+    doc = doc + line("folded: >")
+    doc = doc + line("  these lines")
+    doc = doc + line("  become one")
+    doc = doc + line("")
+    doc = doc + line("  after a break")
+    doc = doc + line("folded_stripped: >-")
+    doc = doc + line("  joined")
+    doc = doc + line("  up")
+    doc = doc + line("indented: |")
+    doc = doc + line("    deeper than needed")
+    doc = doc + line("      one more level")
+    doc = doc + line("hashes: |")
+    doc = doc + line("  # this is content, not a comment")
+    doc = doc + line("after: done")
+
+    root := yaml.parse(doc)
+    print("literal:{show(yaml.get_string(root, "literal"))}")
+    print("stripped:{show(yaml.get_string(root, "stripped"))}")
+    print("kept:{show(yaml.get_string(root, "kept"))}")
+    print("folded:{show(yaml.get_string(root, "folded"))}")
+    print("folded_stripped:{show(yaml.get_string(root, "folded_stripped"))}")
+    print("indented:{show(yaml.get_string(root, "indented"))}")
+    print("hashes:{show(yaml.get_string(root, "hashes"))}")
+    print("after:{yaml.get_string(root, "after")}")
+
+    # a block scalar as a sequence entry
+    mut seq_doc := line("notes:")
+    seq_doc = seq_doc + line("  - |")
+    seq_doc = seq_doc + line("    alpha")
+    seq_doc = seq_doc + line("    beta")
+    seq_doc = seq_doc + line("  - plain")
+    seq_root := yaml.parse(seq_doc)
+    notes := yaml.get_array(seq_root, "notes")
+    print("notes:{yaml.array_len(notes)}:{show(yaml.scalar_string(yaml.array_get(notes, 0)))}:{yaml.scalar_string(yaml.array_get(notes, 1))}")
+
+    # an empty block scalar
+    empty_root := yaml.parse(line("body: |") + line("next: 1"))
+    print("empty:[{show(yaml.get_string(empty_root, "body"))}] next:{yaml.get_int(empty_root, "next")}")
+    return 0

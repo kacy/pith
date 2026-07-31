@@ -1,0 +1,74 @@
+import std.yaml as yaml
+
+# node-pool scopes, the same discipline std.json and std.toml use. a task that
+# parses one document per request keeps every node it ever parsed unless the
+# parse is bracketed, because the pool lives in threadlocal storage.
+#
+# occupancy is read with pool_live_nodes(). the id counter is not a measure of
+# occupancy: ids are never reused, which is what makes a handle from a closed
+# scope read as "invalid" instead of aliasing whatever document landed on that
+# id next.
+
+fn doc(i: Int) -> String:
+    nl := chr(10)
+    return "id: " + i.to_string() + nl + "tags:" + nl + "  - a" + nl + "  - b" + nl
+
+fn main():
+    base := yaml.pool_live_nodes()
+
+    # a hundred documents parsed one scope at a time leave nothing behind.
+    mut acc := 0
+    mut i := 0
+    while i < 100:
+        scope := yaml.open_scope()
+        root := yaml.parse(doc(i))
+        acc = acc + yaml.get_int(root, "id")
+        yaml.close_scope(scope)
+        i = i + 1
+    print("acc={acc}")
+    print("leaked={yaml.pool_live_nodes() - base}")
+
+    # a handle read after its scope closed reports invalid, and a later parse
+    # over the same pool does not bring it back to life.
+    stale_scope := yaml.open_scope()
+    stale := yaml.parse(doc(7))
+    print("live_type={yaml.type_of(stale)}")
+    yaml.close_scope(stale_scope)
+    print("stale_type={yaml.type_of(stale)}")
+    next_scope := yaml.open_scope()
+    fresh := yaml.parse(doc(9))
+    print("stale_after_reparse={yaml.type_of(stale)}")
+    print("stale_int={yaml.get_int(stale, "id")}")
+    print("stale_lookup={yaml.get_value(stale, "id")}")
+    print("fresh_id={yaml.get_int(fresh, "id")}")
+    yaml.close_scope(next_scope)
+
+    # a handle parsed before a scope opened outlives it — that is the ordering
+    # the arena can actually honour.
+    outlives := yaml.parse(doc(11))
+    inner := yaml.open_scope()
+    inner_root := yaml.parse(doc(13))
+    print("inner_id={yaml.get_int(inner_root, "id")}")
+    yaml.close_scope(inner)
+    print("outlives_id={yaml.get_int(outlives, "id")}")
+
+    # closing an outer scope while an inner one is open closes both. the inner
+    # close afterwards is a no-op rather than a second rollback, and so is
+    # closing the same scope twice.
+    after_outlives := yaml.pool_live_nodes()
+    outer := yaml.open_scope()
+    outer_root := yaml.parse(doc(21))
+    nested := yaml.open_scope()
+    nested_root := yaml.parse(doc(23))
+    yaml.close_scope(outer)
+    print("outer_after={yaml.type_of(outer_root)} nested_after={yaml.type_of(nested_root)}")
+    yaml.close_scope(nested)
+    yaml.close_scope(outer)
+    print("after_nesting={yaml.pool_live_nodes() - after_outlives}")
+
+    # a failed parse gives its partial nodes back with the scope, too.
+    fail_base := yaml.pool_live_nodes()
+    fail_scope := yaml.open_scope()
+    print("failed={yaml.parse("a: 1" + chr(10) + "  b: 2") < 0}")
+    yaml.close_scope(fail_scope)
+    print("after_failure={yaml.pool_live_nodes() - fail_base}")

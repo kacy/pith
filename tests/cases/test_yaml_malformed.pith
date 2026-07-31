@@ -1,0 +1,92 @@
+import std.yaml as yaml
+
+# malformed and hostile input. every case has to come back as a clean error
+# with a message, never a crash, a hang or a silently wrong tree.
+
+fn line(text: String) -> String:
+    return text + chr(10)
+
+# parse the input, then report whether it failed and whether the message says
+# why. printing the keyword rather than the whole message keeps the expected
+# output stable if the wording is ever polished.
+fn refuses(name: String, input: String, keyword: String):
+    handle := yaml.parse(input)
+    reason := yaml.last_error()
+    print("{name}:{handle < 0}:{reason.contains(keyword)}")
+
+fn repeat_text(unit: String, doublings: Int) -> String:
+    mut s := unit
+    mut i := 0
+    while i < doublings:
+        s = s + s
+        i = i + 1
+    return s
+
+fn main() -> Int!:
+    dq := chr(34)
+    sq := "'"
+    tab := chr(9)
+    lb := chr(123)
+    rb := chr(125)
+
+    # quoting
+    refuses("unterminated_double", line("a: " + dq + "oops"), "unterminated")
+    refuses("unterminated_single", line("a: " + sq + "oops"), "unterminated")
+    refuses("unterminated_key", line(dq + "oops: 1"), "unterminated")
+    refuses("bad_escape", line("a: " + dq + chr(92) + "q" + dq), "escape")
+    refuses("truncated_unicode", line("a: " + dq + chr(92) + "u00" + dq), "escape")
+
+    # indentation
+    refuses("tab_indent", line("a:") + tab + line("b: 1"), "tab")
+    refuses("over_indent", line("a: 1") + line("  b: 2"), "indentation")
+    refuses("seq_for_key", line("a:") + line("  - 1") + line("  b: 2"), "indentation")
+    refuses("no_separator", line("a: 1") + line("just words"), "key: value")
+
+    # flow collections
+    refuses("truncated_seq", line("a: [1, 2"), "flow")
+    refuses("truncated_map", line("a: " + lb + "x: 1"), "flow")
+    refuses("flow_no_value", line("a: " + lb + "x" + rb), "no value")
+    refuses("flow_trailing", line("a: [1] junk"), "after a flow")
+
+    # the yaml features this parser deliberately does not implement
+    refuses("anchor", line("a: &base 1"), "anchors")
+    refuses("alias", line("a: *base"), "aliases")
+    refuses("merge_key", line("a:") + line("  <<: 1"), "merge")
+    refuses("tag", line("a: !!str 1"), "tags")
+    refuses("complex_key", line("? a") + line(": 1"), "complex")
+    refuses("directive", line("%YAML 1.2") + line("a: 1"), "directives")
+    refuses("block_indent_indicator", line("a: |2") + line("  x"), "indentation indicators")
+    refuses("multiline_plain", line("a: one") + line("  two"), "multi-line")
+
+    # a nesting bomb built out of indentation alone
+    mut deep := ""
+    mut i := 0
+    while i < 400:
+        deep = deep + line(" ".repeat(i) + "a:")
+        i = i + 1
+    refuses("deep_block", deep, "nesting")
+
+    # the same bomb written with flow brackets
+    refuses("deep_flow", line("a: " + repeat_text("[", 9)), "nesting")
+
+    # a legal document that is deep but inside the cap still parses
+    mut shallow := ""
+    mut j := 0
+    while j < 40:
+        shallow = shallow + line(" ".repeat(j) + "a:")
+        j = j + 1
+    shallow = shallow + line(" ".repeat(40) + "leaf: 1")
+    print("legal_depth:{yaml.parse(shallow) >= 0}")
+
+    # an enormous key
+    huge_key := repeat_text("k", 14)
+    refuses("huge_key", line(huge_key + ": 1"), "key of")
+
+    # an enormous document
+    big := repeat_text(line("a: 1"), 20)
+    refuses("huge_document", big, "document of")
+
+    # after all of that the parser still works
+    print("recovered:{yaml.get_int(yaml.parse(line("a: 1")), "a")}")
+    print("no_error:[{yaml.last_error()}]")
+    return 0

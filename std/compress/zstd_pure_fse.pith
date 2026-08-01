@@ -18,15 +18,34 @@ fn spread_step(size: Int) -> Int:
 
 ## one decode-table entry: the symbol emitted, how many bits to read next,
 ## and the base state those bits add to.
-pub struct FseEntry:
-    pub symbol: Int
-    pub nbits: Int
-    pub base: Int
-
 ## a built fse decode table: its log2 size and its entries.
+##
+## an entry is one packed Int, not a three-field struct: symbol in the low
+## eight bits, bit count in the next eight, base above that. decoding a
+## sequence indexes these tables six times, and a struct entry means six
+## heap handles and six reference-count round trips per sequence. use
+## entry_symbol/entry_nbits/entry_base to read one.
 pub struct FseTable:
     pub log: Int
-    pub entries: List[FseEntry]
+    pub entries: List[Int]
+
+## pack a symbol, bit count, and base into one table entry. read_ncount
+## caps the accuracy log at 22, so base stays under 2^22 and the three
+## fields never collide.
+pub fn fse_entry(symbol: Int, nbits: Int, base: Int) -> Int:
+    return symbol + bits.shl(nbits, 8) + bits.shl(base, 16)
+
+## the symbol a packed entry emits.
+pub fn entry_symbol(entry: Int) -> Int:
+    return bits.band(entry, 255)
+
+## how many bits a packed entry reads to reach the next state.
+pub fn entry_nbits(entry: Int) -> Int:
+    return bits.band(bits.shr(entry, 8), 255)
+
+## the state a packed entry's transition starts from.
+pub fn entry_base(entry: Int) -> Int:
+    return bits.shr(entry, 16)
 
 ## build a decode table from normalized counts (one per symbol; -1 means the
 ## "less than one" probability that occupies the top slots). this is the
@@ -78,10 +97,10 @@ pub fn build_decode_table(counts: List[Int], log: Int) -> FseTable:
             next_state.push(counts[s])
         s = s + 1
 
-    mut entries: List[FseEntry] := []
+    mut entries: List[Int] := []
     i = 0
     while i < size:
-        entries.push(FseEntry(0, 0, 0))
+        entries.push(0)
         i = i + 1
 
     i = 0
@@ -93,7 +112,7 @@ pub fn build_decode_table(counts: List[Int], log: Int) -> FseTable:
         # states begin.
         nb := log - (bit_length(state) - 1)
         base := bits.shl(state, nb) - size
-        entries[i] = FseEntry(sym, nb, base)
+        entries[i] = fse_entry(sym, nb, base)
         i = i + 1
 
     return FseTable(log, entries)
@@ -121,12 +140,12 @@ pub fn fse_decoder(table: FseTable, reader: stream.BackReader) -> FseDecoder:
 impl FseDecoder:
     ## the symbol at the current state (does not advance).
     fn symbol() -> Int:
-        return self.table.entries[self.state].symbol
+        return entry_symbol(self.table.entries[self.state])
 
     ## consume the current entry's bits and move to the next state.
     fn advance(reader: stream.BackReader):
         entry := self.table.entries[self.state]
-        self.state = entry.base + reader.read(entry.nbits)
+        self.state = entry_base(entry) + reader.read(entry_nbits(entry))
 
 # ---------------------------------------------------------------
 # encoder side
@@ -146,7 +165,7 @@ pub fn build_encode_states(counts: List[Int], log: Int) -> List[List[Int]]:
         s = s + 1
     mut i := 0
     while i < table.entries.len():
-        by_symbol[table.entries[i].symbol].push(i)
+        by_symbol[entry_symbol(table.entries[i])].push(i)
         i = i + 1
     return by_symbol
 
@@ -171,12 +190,12 @@ pub fn fse_encode(symbols: List[Int], counts: List[Int], log: Int) -> List[Int]:
         prev_sym := symbols[k - 1]
         mut chosen := -1
         for j in slots[prev_sym]:
-            base := table.entries[j].base
-            span := bits.shl(1, table.entries[j].nbits)
+            base := entry_base(table.entries[j])
+            span := bits.shl(1, entry_nbits(table.entries[j]))
             if next_state >= base and next_state < base + span:
                 chosen = j
-        bit_values.push(next_state - table.entries[chosen].base)
-        bit_widths.push(table.entries[chosen].nbits)
+        bit_values.push(next_state - entry_base(table.entries[chosen]))
+        bit_widths.push(entry_nbits(table.entries[chosen]))
         next_state = chosen
         k = k - 1
 
@@ -214,13 +233,12 @@ pub fn decompress_two_state(table: FseTable, reader: stream.BackReader, max_out:
     mut turn := 0
     while out.len() < max_out:
         entry := table.entries[states[turn]]
-        out.push(entry.symbol)
-        states[turn] = entry.base + reader.read(entry.nbits)
+        out.push(entry_symbol(entry))
+        states[turn] = entry_base(entry) + reader.read(entry_nbits(entry))
         if reader.remaining() < 0:
             # the read ran past the start of the stream, so this is the end.
             # the other state still holds one symbol that was never emitted.
-            other := table.entries[states[1 - turn]]
-            out.push(other.symbol)
+            out.push(entry_symbol(table.entries[states[1 - turn]]))
             return out
         turn = 1 - turn
     fail "zstd: fse stream produced more symbols than expected"
@@ -468,9 +486,9 @@ test "a decode table places every slot and stays in range":
     mut seen0 := 0
     while i < 32:
         e := table.entries[i]
-        assert(e.symbol >= 0 and e.symbol < 3)
-        assert(e.nbits >= 0 and e.nbits <= 5)
-        if e.symbol == 0:
+        assert(entry_symbol(e) >= 0 and entry_symbol(e) < 3)
+        assert(entry_nbits(e) >= 0 and entry_nbits(e) <= 5)
+        if entry_symbol(e) == 0:
             seen0 = seen0 + 1
         i = i + 1
     # symbol 0 has count 10, so it occupies exactly ten slots.

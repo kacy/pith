@@ -25,15 +25,28 @@ pub LITERALS_TREELESS := 3
 ## the largest huffman table log zstd allows for literals.
 pub MAX_TABLE_LOG := 11
 
-## one decode-table entry.
-pub struct HuffEntry:
-    pub symbol: Int
-    pub nbits: Int
-
 ## a built huffman decode table: 2^log flat entries.
+##
+## an entry is one packed Int rather than a two-field struct — symbol in the
+## high bits, code length in the low eight. the decode loop indexes this
+## table once per output byte, and a struct there means a heap handle and a
+## reference-count round trip per byte; an Int is a plain load. use
+## entry_symbol/entry_nbits to read one.
 pub struct HuffTable:
     pub log: Int
-    pub entries: List[HuffEntry]
+    pub entries: List[Int]
+
+## pack a symbol and its code length into one table entry.
+pub fn huff_entry(symbol: Int, nbits: Int) -> Int:
+    return bits.shl(symbol, 8) + nbits
+
+## the symbol a packed entry decodes to.
+pub fn entry_symbol(entry: Int) -> Int:
+    return bits.shr(entry, 8)
+
+## the code length of a packed entry; 0 means no symbol is assigned here.
+pub fn entry_nbits(entry: Int) -> Int:
+    return bits.band(entry, 255)
 
 # floor(log2(v)) + 1 for v >= 1; 0 for v == 0.
 fn bit_length(v: Int) -> Int:
@@ -96,10 +109,10 @@ pub fn build_table(weights: List[Int]) -> HuffTable!:
         w = w + 1
 
     size := bits.shl(1, max_bits)
-    mut entries: List[HuffEntry] := []
+    mut entries: List[Int] := []
     i = 0
     while i < size:
-        entries.push(HuffEntry(0, 0))
+        entries.push(0)
         i = i + 1
 
     mut sym := 0
@@ -111,25 +124,38 @@ pub fn build_table(weights: List[Int]) -> HuffTable!:
             start := rank_start[weight]
             mut k := 0
             while k < span:
-                entries[start + k] = HuffEntry(sym, nbits)
+                entries[start + k] = huff_entry(sym, nbits)
                 k = k + 1
             rank_start[weight] = start + span
         sym = sym + 1
 
     return HuffTable(max_bits, entries)
 
-## read `count` symbols from a backward stream using the table: peek the
-## table log, index, emit the symbol, consume that entry's code length.
-pub fn decode_stream(table: HuffTable, reader: stream.BackReader, count: Int) -> List[Int]!:
-    mut out: List[Int] := []
+## decode `count` symbols straight into `out`: peek the table log, index,
+## append the symbol, consume that entry's code length. writing into the
+## buffer as it goes avoids a second per-byte pass over an intermediate list.
+pub fn decode_stream_into(table: HuffTable, reader: stream.BackReader, count: Int, out: ByteBuffer) -> Int!:
     mut i := 0
     while i < count:
-        index := reader.peek(table.log)
-        entry := table.entries[index]
-        if entry.nbits == 0:
+        entry := table.entries[reader.peek(table.log)]
+        nbits := entry_nbits(entry)
+        if nbits == 0:
             fail "zstd: huffman code has no symbol"
-        out.push(entry.symbol)
-        reader.skip(entry.nbits)
+        out.write_byte(entry_symbol(entry))
+        reader.skip(nbits)
+        i = i + 1
+    return count
+
+## the same, collected into a list — for tests and small callers.
+pub fn decode_stream(table: HuffTable, reader: stream.BackReader, count: Int) -> List[Int]!:
+    mut buf := bytes.buffer()
+    defer buf.free()
+    decode_stream_into(table, reader, count, buf)!
+    data := buf.bytes()
+    mut out: List[Int] := []
+    mut i := 0
+    while i < data.len():
+        out.push(data[i])
         i = i + 1
     return out
 
@@ -147,12 +173,13 @@ pub fn build_codes(table: HuffTable) -> (List[Int], List[Int]) :
         i = i + 1
     mut index := 0
     while index < table.entries.len():
-        entry := table.entries[index]
-        if entry.nbits > 0 and lengths[entry.symbol] == 0:
-            lengths[entry.symbol] = entry.nbits
+        symbol := entry_symbol(table.entries[index])
+        nbits := entry_nbits(table.entries[index])
+        if nbits > 0 and lengths[symbol] == 0:
+            lengths[symbol] = nbits
             # every index sharing this prefix decodes to the symbol, so the
             # code is the first such index shifted down to its own width.
-            codes[entry.symbol] = bits.shr(index, table.log - entry.nbits)
+            codes[symbol] = bits.shr(index, table.log - nbits)
         index = index + 1
     return (codes, lengths)
 
@@ -226,8 +253,7 @@ pub fn decode_literals(table: HuffTable, data: Bytes, start: Int, end: Int, rege
         reader := stream.back_reader(data, start, end)
         if not reader.ok:
             fail "zstd: malformed literals stream"
-        for symbol in decode_stream(table, reader, regenerated)!:
-            out.write_byte(symbol)
+        decode_stream_into(table, reader, regenerated, out)!
         result := out.bytes()
         out.free()
         return result
@@ -256,8 +282,7 @@ pub fn decode_literals(table: HuffTable, data: Bytes, start: Int, end: Int, rege
         reader := stream.back_reader(data, starts[i], starts[i] + sizes[i])
         if not reader.ok:
             fail "zstd: malformed literals stream " + i.to_string()
-        for symbol in decode_stream(table, reader, want)!:
-            out.write_byte(symbol)
+        decode_stream_into(table, reader, want, out)!
         produced = produced + want
         i = i + 1
 

@@ -141,7 +141,7 @@ pub fn parse_block_header(data: Bytes, off: Int) -> BlockHeader!:
 
 # decode one compressed block: a literals section, then a sequence section
 # that weaves those literals together with matches into earlier output.
-fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, budget: Int, trees: List[huffman.HuffTable], seq_tables: List[sequences.SequenceTables], reps: List[Int]) -> Bytes!:
+fn decode_compressed_block(data: Bytes, start: Int, end: Int, out: ByteBuffer, max_output: Int, trees: List[huffman.HuffTable], seq_tables: List[sequences.SequenceTables], reps: List[Int]) -> Int!:
     lit := huffman.parse_literals_header(data, start)!
     mut pos := start + lit.header_len
 
@@ -182,12 +182,18 @@ fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, bu
 
     # a block with no sequences is literals alone.
     if pos >= end:
-        return literals
+        if out.len() + literals.len() > max_output:
+            fail "zstd: output would exceed the decode limit"
+        out.write(literals)!
+        return out.len()
 
     count := sequences.read_sequence_count(data, pos)!
     pos = pos + count.bytes_used
     if count.count == 0:
-        return literals
+        if out.len() + literals.len() > max_output:
+            fail "zstd: output would exceed the decode limit"
+        out.write(literals)!
+        return out.len()
 
     built := sequences.read_tables(data, pos, end, seq_tables)!
     pos = pos + built.1
@@ -195,7 +201,7 @@ fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, bu
     seq_tables.clear()
     seq_tables.push(built.0)
     decoded := sequences.decode_sequences(data, pos, end, count.count, built.0, reps)!
-    return sequences.execute(decoded, literals, history, budget)!
+    return sequences.execute_into(decoded, literals, out, max_output)!
 
 ## decompress a frame, holding output to `max_output`. raw, rle, and
 ## compressed blocks all decode; huffman-coded literals are the remaining
@@ -222,10 +228,7 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
                 fail "zstd: raw block runs past the end of the frame"
             if out.len() + block.size > max_output:
                 fail "zstd: output would exceed " + max_output.to_string() + " bytes"
-            mut i := 0
-            while i < block.size:
-                out.write_byte(data[block.body_start + i])
-                i = i + 1
+            out.write(data.slice(block.body_start, block.body_start + block.size))!
             pos = block.body_start + block.size
         elif block.kind == BLOCK_RLE:
             if block.body_start >= data.len():
@@ -241,12 +244,10 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
         else:
             if block.body_start + block.size > data.len():
                 fail "zstd: compressed block runs past the end of the frame"
-            history := out.bytes()
-            piece := decode_compressed_block(data, block.body_start, block.body_start + block.size, history, max_output - out.len(), trees, seq_tables, reps)!
-            mut i := 0
-            while i < piece.len():
-                out.write_byte(piece[i])
-                i = i + 1
+            # the block appends straight into the frame buffer: a match
+            # reaching into an earlier block just indexes further back, so
+            # there is no per-block history copy.
+            decode_compressed_block(data, block.body_start, block.body_start + block.size, out, max_output, trees, seq_tables, reps)!
             pos = block.body_start + block.size
         done = block.last
 

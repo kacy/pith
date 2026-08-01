@@ -146,29 +146,46 @@ pub fn read_tables(data: Bytes, off: Int, end: Int, previous: List[SequenceTable
     tables := SequenceTables(ll_built.0, ml_built.0, of_built.0, ll_built.2, ml_built.2, of_built.2)
     return (tables, pos - off)
 
-## resolve an offset value against the repeat history, returning the real
-## offset and the updated history. values above 3 are literal offsets and
+## resolve an offset value against the repeat history: return the real
+## offset and update `reps` in place. values above 3 are literal offsets and
 ## push the history down; 1-3 name a remembered offset, shifted by one more
 ## when the sequence carries no literals.
-pub fn resolve_offset(offset_value: Int, literal_length: Int, reps: List[Int]) -> (Int, List[Int])!:
+##
+## `reps` is updated rather than replaced because this runs once per
+## sequence, and returning a fresh three-element list each time cost more
+## than the rest of the sequence decode put together.
+pub fn resolve_offset(offset_value: Int, literal_length: Int, reps: List[Int]) -> Int!:
     if offset_value > 3:
         actual := offset_value - 3
-        return (actual, [actual, reps[0], reps[1]])
+        reps[2] = reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
     mut index := offset_value
     if literal_length == 0:
         index = index + 1
     if index == 1:
-        return (reps[0], reps)
+        return reps[0]
     if index == 2:
-        return (reps[1], [reps[1], reps[0], reps[2]])
+        actual := reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
     if index == 3:
-        return (reps[2], [reps[2], reps[0], reps[1]])
+        actual := reps[2]
+        reps[2] = reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
     # index 4 only arises from value 3 with no literals: one before the most
     # recent offset, which is the format's way of coding a near-repeat.
     actual := reps[0] - 1
     if actual < 1:
         fail "zstd: repeat offset underflow"
-    return (actual, [actual, reps[0], reps[1]])
+    reps[2] = reps[1]
+    reps[1] = reps[0]
+    reps[0] = actual
+    return actual
 
 ## decode `count` sequences from the backward bitstream in [start, end).
 ## the three fse states are initialized literal-length, offset, match-length
@@ -198,13 +215,13 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
     while i < count:
         mut ll_code := tables.ll_rle
         if ll_code < 0:
-            ll_code = tables.ll.entries[ll_state].symbol
+            ll_code = fse.entry_symbol(tables.ll.entries[ll_state])
         mut ml_code := tables.ml_rle
         if ml_code < 0:
-            ml_code = tables.ml.entries[ml_state].symbol
+            ml_code = fse.entry_symbol(tables.ml.entries[ml_state])
         mut of_code := tables.of_rle
         if of_code < 0:
-            of_code = tables.of.entries[of_state].symbol
+            of_code = fse.entry_symbol(tables.of.entries[of_state])
 
         if ll_code >= ll_b.len() or ml_code >= ml_b.len():
             fail "zstd: sequence code out of range"
@@ -217,76 +234,62 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
 
         # the repeat history lives for the whole frame, not the block, so it
         # is updated in place in the caller's list.
-        resolved := resolve_offset(offset_value, literal_length, reps)!
-        reps[0] = resolved.1[0]
-        reps[1] = resolved.1[1]
-        reps[2] = resolved.1[2]
-        out.push(Sequence(literal_length, match_length, resolved.0))
+        offset := resolve_offset(offset_value, literal_length, reps)!
+        out.push(Sequence(literal_length, match_length, offset))
 
         # the states advance only between sequences, not after the last one.
         if i + 1 < count:
             if tables.ll_rle < 0:
                 entry := tables.ll.entries[ll_state]
-                ll_state = entry.base + reader.read(entry.nbits)
+                ll_state = fse.entry_base(entry) + reader.read(fse.entry_nbits(entry))
             if tables.ml_rle < 0:
                 entry := tables.ml.entries[ml_state]
-                ml_state = entry.base + reader.read(entry.nbits)
+                ml_state = fse.entry_base(entry) + reader.read(fse.entry_nbits(entry))
             if tables.of_rle < 0:
                 entry := tables.of.entries[of_state]
-                of_state = entry.base + reader.read(entry.nbits)
+                of_state = fse.entry_base(entry) + reader.read(fse.entry_nbits(entry))
         i = i + 1
 
     return out
 
-## run the sequences against the literals to produce the block's output.
-## `history` is everything decoded so far in the frame, which a match may
-## reach back into; the returned bytes are this block's contribution.
-pub fn execute(sequences: List[Sequence], literals: Bytes, history: Bytes, max_output: Int) -> Bytes!:
-    mut out := bytes.buffer()
-    errdefer out.free()
+## run the sequences into `out`, which already holds everything decoded so
+## far in the frame — matches reach back into it directly, so there is no
+## per-block history copy. literal runs are written in bulk; a match copies
+## byte-at-a-time because it may overlap itself, which is how zstd codes a
+## repeating run.
+pub fn execute_into(sequences: List[Sequence], literals: Bytes, out: ByteBuffer, max_output: Int) -> Int!:
     mut lit_pos := 0
-    mut produced := 0
-
     for seq in sequences:
         if lit_pos + seq.literal_length > literals.len():
             fail "zstd: sequence wants more literals than the block holds"
-        if produced + seq.literal_length + seq.match_length > max_output:
+        if out.len() + seq.literal_length + seq.match_length > max_output:
             fail "zstd: output would exceed the decode limit"
-        mut k := 0
-        while k < seq.literal_length:
-            out.write_byte(literals[lit_pos + k])
-            k = k + 1
-        lit_pos = lit_pos + seq.literal_length
-        produced = produced + seq.literal_length
+        if seq.literal_length > 0:
+            out.write(literals.slice(lit_pos, lit_pos + seq.literal_length))!
+            lit_pos = lit_pos + seq.literal_length
 
-        # the match reaches back `offset` from the current end, which may
-        # land in an earlier block. a match can also overlap itself, so this
-        # copies one byte at a time rather than in blocks.
-        total := history.len() + produced
+        total := out.len()
         if seq.offset > total:
             fail "zstd: match offset reaches before the start of the frame"
-        mut copied := 0
-        while copied < seq.match_length:
-            src := total - seq.offset + copied
-            mut byte := 0
-            if src < history.len():
-                byte = history[src]
-            else:
-                byte = out.get(src - history.len())
-            out.write_byte(byte)
-            copied = copied + 1
-        produced = produced + seq.match_length
+        if not out.copy_within(total - seq.offset, seq.match_length):
+            fail "zstd: match copy out of range"
 
-    # whatever literals the sequences did not consume finish the block.
-    if produced + (literals.len() - lit_pos) > max_output:
+    if out.len() + (literals.len() - lit_pos) > max_output:
         fail "zstd: output would exceed the decode limit"
-    while lit_pos < literals.len():
-        out.write_byte(literals[lit_pos])
-        lit_pos = lit_pos + 1
+    if lit_pos < literals.len():
+        out.write(literals.slice(lit_pos, literals.len()))!
+    return out.len()
 
-    result := out.bytes()
+## the same, as a standalone call over a fresh buffer seeded with `history`.
+pub fn execute(sequences: List[Sequence], literals: Bytes, history: Bytes, max_output: Int) -> Bytes!:
+    mut out := bytes.buffer()
+    errdefer out.free()
+    if history.len() > 0:
+        out.write(history)!
+    execute_into(sequences, literals, out, max_output + history.len())!
+    whole := out.bytes()
     out.free()
-    return result
+    return whole.slice(history.len(), whole.len())
 
 # ---------------------------------------------------------------
 # tests
@@ -368,39 +371,39 @@ test "sequence counts read at all three widths":
     assert_eq(c3.bytes_used, 3)
 
 test "offset resolution walks the repeat history":
-    start := [1, 4, 8]
     # a literal offset pushes the history down
-    r1 := resolve_offset(10, 5, start)!
-    assert_eq(r1.0, 7)
-    assert_eq(r1.1[0], 7)
-    assert_eq(r1.1[1], 1)
-    assert_eq(r1.1[2], 4)
+    mut reps := [1, 4, 8]
+    assert_eq(resolve_offset(10, 5, reps)!, 7)
+    assert_eq(reps[0], 7)
+    assert_eq(reps[1], 1)
+    assert_eq(reps[2], 4)
 
     # value 1 with literals repeats the most recent offset and changes nothing
-    r2 := resolve_offset(1, 5, start)!
-    assert_eq(r2.0, 1)
-    assert_eq(r2.1[0], 1)
-    assert_eq(r2.1[1], 4)
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(1, 5, reps)!, 1)
+    assert_eq(reps[0], 1)
+    assert_eq(reps[1], 4)
 
     # value 2 promotes the second offset
-    r3 := resolve_offset(2, 5, start)!
-    assert_eq(r3.0, 4)
-    assert_eq(r3.1[0], 4)
-    assert_eq(r3.1[1], 1)
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(2, 5, reps)!, 4)
+    assert_eq(reps[0], 4)
+    assert_eq(reps[1], 1)
 
     # with no literals every reference shifts by one: value 1 now means the
     # second offset, not the first
-    r4 := resolve_offset(1, 0, start)!
-    assert_eq(r4.0, 4)
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(1, 0, reps)!, 4)
 
     # value 3 with no literals is the one-before case
-    r5 := resolve_offset(3, 0, [5, 9, 13])!
-    assert_eq(r5.0, 4)
-    assert_eq(r5.1[0], 4)
-    assert_eq(r5.1[1], 5)
+    reps = [5, 9, 13]
+    assert_eq(resolve_offset(3, 0, reps)!, 4)
+    assert_eq(reps[0], 4)
+    assert_eq(reps[1], 5)
 
     # and it refuses to underflow
-    assert(resolve_offset(3, 0, [1, 4, 8]).is_err)
+    reps = [1, 4, 8]
+    assert(resolve_offset(3, 0, reps).is_err)
 
 test "execution copies literals and matches, including overlap":
     literals := bytes.from_string_utf8("abcXYZ")

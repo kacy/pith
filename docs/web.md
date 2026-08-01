@@ -204,6 +204,11 @@ write middleware as a named function, as above. `examples/web_middleware.pith` i
 complete, self-checking example: two middleware bracket the response body with markers
 so the nesting is visible in the output.
 
+two middleware come built: `web.rate_limit(limiter)` answers 429 when a shared
+token bucket runs dry, and `web.circuit(breaker)` answers 503 while a circuit
+breaker is open, counting the handler's 5xx responses as failures. both take
+their state from `std.resilience` — see [docs/resilience.md](resilience.md).
+
 ## route groups
 
 `use_mw` wraps every route, but a guard usually belongs to some routes and

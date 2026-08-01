@@ -1,0 +1,110 @@
+# zstd_decode — the pure-pith zstd decoder against the crate-backed kernel.
+#
+# the corpus is built from the repo itself plus a generated log file, so
+# there are no binary fixtures to keep in tree and the shapes stay
+# realistic: source, prose, and json lines compress between roughly 2:1 and
+# 5:1, which is what a decoder actually meets in a content-encoding or an
+# otlp export.
+#
+# highly compressible input is deliberately NOT the headline. a frame that
+# packs 80KB into 22 bytes decodes almost entirely through the match copy,
+# so it measures memory bandwidth rather than entropy decoding and flatters
+# the pure decoder by a factor of five. one such case is kept at the end,
+# labelled for what it is.
+#
+# each phase runs to a wall-clock budget instead of a fixed rep count: the
+# crate decodes some of these in tens of microseconds, and a fixed count
+# lands inside the millisecond clock's granularity and reports noise.
+
+import std.fs as fs
+import std.bytes as bytes
+import std.time as time
+import std.compress.zstd as kernel
+import std.compress.zstd_pure_frame as pure
+
+BUDGET_MS := 400
+MAX_OUTPUT := 8000000
+
+# concatenate every file under `dir` ending in `suffix`, up to `limit` bytes.
+fn gather(dir: String, suffix: String, limit: Int) -> Bytes!:
+    mut buf := bytes.buffer()
+    defer buf.free()
+    for entry in fs.walk(dir)!:
+        if buf.len() >= limit:
+            break
+        if entry.is_dir or not entry.path.ends_with(suffix):
+            continue
+        buf.write(fs.read_bytes(entry.path)!)!
+    whole := buf.bytes()
+    if whole.len() <= limit:
+        return whole
+    return whole.slice(0, limit)
+
+# structured log lines: repetitive keys, high-cardinality trace ids. the
+# counter stands in for randomness so the corpus is identical run to run.
+fn synth_logs(count: Int) -> Bytes!:
+    levels := ["INFO", "WARN", "ERROR", "DEBUG"]
+    paths := ["/api/v1/users", "/api/v1/orders", "/health", "/metrics"]
+    mut buf := bytes.buffer()
+    defer buf.free()
+    mut i := 0
+    while i < count:
+        trace := (i * 2654435761 + 1013904223).to_string()
+        # the braces are doubled: a lone { opens an interpolation, so a json
+        # literal written the obvious way silently becomes an expression.
+        line := "{{\"ts\":\"2026-08-01T18:{i % 60}:{(i * 7) % 60}Z\",\"level\":\"" + levels[i % 4] + "\",\"svc\":\"checkout\",\"trace\":\"" + trace + "\",\"path\":\"" + paths[i % 4] + "\",\"status\":{200 + (i % 5) * 76},\"ms\":{i % 250}}}\n"
+        buf.write(bytes.from_string_utf8(line))!
+        i = i + 1
+    return buf.bytes()
+
+fn bench(label: String, raw: Bytes) -> Int!:
+    frame := kernel.compress(raw)
+
+    # both decoders must agree before either is timed
+    a := kernel.decompress(frame)!
+    b := pure.decompress_bounded(frame, MAX_OUTPUT)!
+    if a != b or a.len() != raw.len():
+        fail "decoders disagree on " + label
+
+    mut kernel_reps := 0
+    t0 := time.mono_millis()
+    while time.mono_millis() - t0 < BUDGET_MS:
+        c := kernel.decompress(frame)!
+        if c.len() == 0:
+            fail "empty decode"
+        kernel_reps = kernel_reps + 1
+    kernel_ms := time.mono_millis() - t0
+
+    mut pure_reps := 0
+    t1 := time.mono_millis()
+    while time.mono_millis() - t1 < BUDGET_MS:
+        p := pure.decompress_bounded(frame, MAX_OUTPUT)!
+        if p.len() == 0:
+            fail "empty decode"
+        pure_reps = pure_reps + 1
+    pure_ms := time.mono_millis() - t1
+
+    # integer math throughout; the ratio is carried at x100 for two decimals
+    kb := raw.len() * kernel_reps / (kernel_ms + 1)
+    pb := raw.len() * pure_reps / (pure_ms + 1)
+    ratio := kb * 100 / (pb + 1)
+    packed := raw.len() * 10 / frame.len()
+    print(label + ": {raw.len() / 1024}KB at {packed / 10}.{packed % 10}:1   kernel {kb * 1000 / 1048576} MB/s ({kernel_reps} reps)   pure {pb * 1000 / 1048576} MB/s ({pure_reps} reps)   ratio {ratio / 100}.{ratio % 100}x")
+    return 0
+
+fn main() -> Int!:
+    bench("text  ", fs.read_bytes("README.md")!)!
+    bench("prose ", gather("docs", ".md", 300000)!)!
+    bench("source", gather("std", ".pith", 600000)!)!
+    bench("json  ", synth_logs(4000)!)!
+
+    # not a realistic workload — see the note at the top. a single long run
+    # decodes through the match copy and says nothing about entropy decoding.
+    mut runs := bytes.buffer()
+    defer runs.free()
+    mut i := 0
+    while i < 80000:
+        runs.write_byte(97 + (i / 4096) % 26)
+        i = i + 1
+    bench("runs  ", runs.bytes())!
+    return 0

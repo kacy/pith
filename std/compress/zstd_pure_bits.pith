@@ -10,6 +10,34 @@
 import std.bits as bits
 import std.bytes as bytes
 
+# a window base no real bit index can reach, so the first read of a stream
+# always refills. it has to sit ABOVE any valid index rather than below:
+# the emptiness test is `at < window_base`, and a short stream's reads all
+# fit under sixty-four bits, so a negative sentinel would let them read an
+# all-zero window instead.
+WINDOW_UNSET := 1099511627776
+
+# extract `n` bits starting at absolute bit index `at`, lsb-first — bit `at`
+# becomes the result's low bit. this is the hot primitive of the whole
+# decoder, so it loads the two-to-five bytes the field spans as one word and
+# shifts, rather than walking bit by bit: a huffman symbol costs one of these
+# and used to cost eleven loop iterations, each with a divide and a modulo.
+# bytes past the end of the data read as zero.
+fn extract(data: Bytes, at: Int, n: Int) -> Int:
+    first := at / 8
+    shift := at % 8
+    need := (shift + n + 7) / 8
+    mut word := 0
+    mut k := need - 1
+    while k >= 0:
+        idx := first + k
+        mut b := 0
+        if idx < data.len():
+            b = data[idx]
+        word = bits.bor(bits.shl(word, 8), b)
+        k = k - 1
+    return bits.band(bits.shr(word, shift), bits.shl(1, n) - 1)
+
 # ---------------------------------------------------------------
 # backward reader
 # ---------------------------------------------------------------
@@ -21,19 +49,24 @@ pub struct BackReader:
     start_bit: Int
     pos: Int
     ok: Bool
+    # a cached 64-bit window over the data, so a field read is a shift and a
+    # mask instead of a fresh multi-byte load. reads walk downward, so one
+    # window serves about fifty bits before it has to be refilled.
+    window: Int
+    window_base: Int
 
 ## open the stream: find the sentinel in the last byte and stand just below
 ## it. an all-zero final byte has no sentinel and marks the stream corrupt.
 pub fn back_reader(data: Bytes, start: Int, end: Int) -> BackReader:
     if end <= start or end > data.len():
-        return BackReader(data, 0, 0, false)
+        return BackReader(data, 0, 0, false, 0, WINDOW_UNSET)
     last := data[end - 1]
     if last == 0:
-        return BackReader(data, 0, 0, false)
+        return BackReader(data, 0, 0, false, 0, WINDOW_UNSET)
     mut top := 7
     while bits.band(bits.shr(last, top), 1) == 0:
         top = top - 1
-    return BackReader(data, start * 8, (end - 1) * 8 + top, true)
+    return BackReader(data, start * 8, (end - 1) * 8 + top, true, 0, WINDOW_UNSET)
 
 impl BackReader:
     ## how many readable bits remain.
@@ -48,27 +81,45 @@ impl BackReader:
         if n == 0:
             return 0
         self.pos = self.pos - n
-        mut floor_bit := self.pos
-        if floor_bit < self.start_bit:
-            floor_bit = self.start_bit
-        mut value := 0
-        mut i := self.pos + n - 1
-        while i >= floor_bit:
-            value = bits.bor(bits.shl(value, 1), bits.band(bits.shr(self.data[i / 8], i % 8), 1))
-            i = i - 1
-        # bits conceptually below the start read as zero
-        if self.pos < self.start_bit:
-            value = bits.shl(value, self.start_bit - self.pos)
-        return value
+        return self.at(self.pos, n)
+
+    # the bits at [at, at+n), with anything below the stream's start reading
+    # as zero — the tolerance the final state reads rely on.
+    fn at(at: Int, n: Int) -> Int:
+        if at >= self.start_bit:
+            if at < self.window_base or at + n > self.window_base + 64:
+                self.refill(at, n)
+            return bits.band(bits.shr(self.window, at - self.window_base), bits.shl(1, n) - 1)
+        available := at + n - self.start_bit
+        if available <= 0:
+            return 0
+        return bits.shl(extract(self.data, self.start_bit, available), self.start_bit - at)
+
+    # reload the window so [at, at+n) sits at its top, leaving the rest of
+    # the sixty-four bits below for the reads that follow.
+    fn refill(at: Int, n: Int):
+        mut byte_index := (at + n) / 8 - 7
+        if byte_index < 0:
+            byte_index = 0
+        self.window_base = byte_index * 8
+        mut word := 0
+        mut k := 7
+        while k >= 0:
+            idx := byte_index + k
+            mut b := 0
+            if idx < self.data.len():
+                b = self.data[idx]
+            word = bits.bor(bits.shl(word, 8), b)
+            k = k - 1
+        self.window = word
 
     ## look at the next `n` bits without consuming them. huffman decoding
     ## needs this: it peeks a full table-log worth of bits to index the
     ## table, then consumes only the code length the entry names.
     fn peek(n: Int) -> Int:
-        saved := self.pos
-        value := self.read(n)
-        self.pos = saved
-        return value
+        if n == 0:
+            return 0
+        return self.at(self.pos - n, n)
 
     ## consume `n` bits without decoding them.
     fn skip(n: Int):
@@ -97,13 +148,13 @@ impl ForwardReader:
         return (self.pos - start * 8 + 7) / 8
 
     fn read(n: Int) -> Int:
+        mut take := n
+        if self.pos + take > self.limit_bit:
+            take = self.limit_bit - self.pos
         mut value := 0
-        mut i := 0
-        while i < n:
-            if self.pos < self.limit_bit:
-                value = bits.bor(value, bits.shl(bits.band(bits.shr(self.data[self.pos / 8], self.pos % 8), 1), i))
-            self.pos = self.pos + 1
-            i = i + 1
+        if take > 0:
+            value = extract(self.data, self.pos, take)
+        self.pos = self.pos + n
         return value
 
     ## look at `n` bits without consuming them.

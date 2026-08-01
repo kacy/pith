@@ -135,15 +135,42 @@ pub fn build_table(weights: List[Int]) -> HuffTable!:
 ## append the symbol, consume that entry's code length. writing into the
 ## buffer as it goes avoids a second per-byte pass over an intermediate list.
 pub fn decode_stream_into(table: HuffTable, reader: stream.BackReader, count: Int, out: ByteBuffer) -> Int!:
+    # the loop runs once per literal byte, so the reader's window arithmetic
+    # is inlined here rather than paid as two method calls (peek, skip) per
+    # byte — the peek is a shift and a mask against a local window, and only
+    # a window miss or the stream tail goes back through the reader. the
+    # locals mirror BackReader's fields; pos is written back at every cold
+    # call and at the end so the reader stays coherent.
+    log := table.log
+    entries := table.entries
+    start_bit := reader.start_bit
+    mask := bits.shl(1, log) - 1
+    mut pos := reader.pos
+    mut window := reader.window
+    mut window_base := reader.window_base
     mut i := 0
     while i < count:
-        entry := table.entries[reader.peek(table.log)]
-        nbits := entry_nbits(entry)
+        at := pos - log
+        mut peeked := 0
+        if at >= start_bit:
+            if at < window_base or at + log > window_base + 64:
+                # cold: refill through the reader, then re-adopt its window
+                reader.refill(at, log)
+                window = reader.window
+                window_base = reader.window_base
+            peeked = bits.band(bits.shr(window, at - window_base), mask)
+        else:
+            # cold tail: bits below the stream's start read as zero
+            reader.pos = pos
+            peeked = reader.peek(log)
+        entry := entries[peeked]
+        nbits := bits.band(entry, 255)
         if nbits == 0:
             fail "zstd: huffman code has no symbol"
-        out.write_byte(entry_symbol(entry))
-        reader.skip(nbits)
+        out.write_byte(bits.shr(entry, 8))
+        pos = pos - nbits
         i = i + 1
+    reader.pos = pos
     return count
 
 ## the same, collected into a list — for tests and small callers.

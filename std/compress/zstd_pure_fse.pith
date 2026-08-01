@@ -200,8 +200,207 @@ pub fn fse_decode_all(data: Bytes, counts: List[Int], log: Int, count: Int) -> L
     return out
 
 # ---------------------------------------------------------------
+# table descriptions — the normalized counts on the wire
+# ---------------------------------------------------------------
+
+## a table description read off the wire: the normalized counts (a -1 marks
+## the "less than one" probability), the accuracy log, and how many bytes
+## the description occupied.
+pub struct NCount:
+    pub counts: List[Int]
+    pub log: Int
+    pub bytes_used: Int
+
+## read an fse table description. the field width shrinks as the remaining
+## probability space does, which is why this peeks a wide field and then
+## consumes only the width that field turned out to need. a zero count is
+## followed by a repeat field, so long runs of absent symbols cost little.
+pub fn read_ncount(data: Bytes, start: Int, end: Int, max_symbol: Int) -> NCount!:
+    if start >= end:
+        fail "zstd: empty fse table description"
+    reader := stream.forward_reader(data, start, end)
+    log := reader.read(4) + 5
+    if log > 22:
+        fail "zstd: fse accuracy log " + log.to_string() + " is out of range"
+
+    mut counts: List[Int] := []
+    mut remaining := bits.shl(1, log) + 1
+    mut threshold := bits.shl(1, log)
+    mut nbits := log + 1
+    mut previous0 := false
+
+    while remaining > 1 and counts.len() <= max_symbol:
+        if previous0:
+            # a run of absent symbols: 2 bits at a time, where 3 means
+            # "three more and keep reading".
+            mut skipped := 0
+            while reader.peek(2) == 3:
+                skipped = skipped + 3
+                reader.skip(2)
+            skipped = skipped + reader.peek(2)
+            reader.skip(2)
+            mut k := 0
+            while k < skipped and counts.len() <= max_symbol:
+                counts.push(0)
+                k = k + 1
+            previous0 = false
+            continue
+
+        max := (2 * threshold - 1) - remaining
+        value := reader.peek(nbits)
+        mut count := 0
+        if bits.band(value, threshold - 1) < max:
+            count = bits.band(value, threshold - 1)
+            reader.skip(nbits - 1)
+        else:
+            count = bits.band(value, 2 * threshold - 1)
+            if count >= threshold:
+                count = count - max
+            reader.skip(nbits)
+
+        # the stored value is biased by one so that 0 can mean -1.
+        count = count - 1
+        mut magnitude := count
+        if magnitude < 0:
+            magnitude = 0 - magnitude
+        remaining = remaining - magnitude
+        counts.push(count)
+        previous0 = count == 0
+
+        while remaining < threshold:
+            nbits = nbits - 1
+            threshold = bits.shr(threshold, 1)
+
+    if remaining != 1:
+        fail "zstd: fse table description does not sum to its accuracy log"
+    # the forward reader yields zeros past the end rather than refusing, so
+    # a truncated description would otherwise fabricate symbols out of
+    # imaginary bits and still balance. consuming past the data is the tell.
+    if reader.remaining() < 0:
+        fail "zstd: fse table description runs past the end of its data"
+    return NCount(counts, log, reader.bytes_used(start))
+
+## write a table description the reader accepts. the encoder needs it, and
+## it makes the reader testable without a reference frame.
+pub fn write_ncount(counts: List[Int], log: Int) -> List[Int]:
+    w := stream.forward_writer()
+    w.write(log - 5, 4)
+
+    mut remaining := bits.shl(1, log) + 1
+    mut threshold := bits.shl(1, log)
+    mut nbits := log + 1
+    mut i := 0
+    mut previous0 := false
+
+    while remaining > 1 and i < counts.len():
+        if previous0:
+            # emit the run length of absent symbols in the same 2-bit form
+            start := i
+            while i < counts.len() and counts[i] == 0:
+                i = i + 1
+            mut run := i - start
+            while run >= 3:
+                w.write(3, 2)
+                run = run - 3
+            w.write(run, 2)
+            previous0 = false
+            if i >= counts.len():
+                break
+            continue
+
+        count := counts[i]
+        i = i + 1
+        max := (2 * threshold - 1) - remaining
+        mut magnitude := count
+        if magnitude < 0:
+            magnitude = 0 - magnitude
+        remaining = remaining - magnitude
+        mut encoded := count + 1
+        if encoded >= threshold:
+            encoded = encoded + max
+        if encoded < max:
+            w.write(encoded, nbits - 1)
+        else:
+            w.write(encoded, nbits)
+        previous0 = encoded == 1
+        while remaining < threshold:
+            nbits = nbits - 1
+            threshold = bits.shr(threshold, 1)
+
+    return w.finish()
+
+# ---------------------------------------------------------------
 # tests — round trip through a table built from real counts
 # ---------------------------------------------------------------
+
+fn ncount_round_trip(counts: List[Int], log: Int, max_symbol: Int) -> NCount!:
+    packed := write_ncount(counts, log)
+    mut buf := bytes.buffer()
+    for byte in packed:
+        buf.write_byte(byte)
+    data := buf.take_bytes()
+    return read_ncount(data, 0, data.len(), max_symbol)!
+
+test "a table description round trips":
+    # counts summing to 2^5 = 32
+    counts := [10, 12, 10]
+    result := ncount_round_trip(counts, 5, 255)!
+    assert_eq(result.log, 5)
+    got := result.counts
+    assert_eq(got.len(), 3)
+    mut i := 0
+    while i < 3:
+        assert_eq(got[i], counts[i])
+        i = i + 1
+
+test "a description round trips low-probability and absent symbols":
+    # -1 is the "less than one" probability; zeros are absent symbols that
+    # travel as a run. 4 + 1 + 1 + 24 + 1 + 1 = 32 in magnitude.
+    counts := [4, -1, -1, 0, 0, 0, 24, -1, -1]
+    got := ncount_round_trip(counts, 5, 255)!.counts
+    mut i := 0
+    while i < counts.len():
+        assert_eq(got[i], counts[i])
+        i = i + 1
+
+test "a long run of absent symbols survives":
+    mut counts: List[Int] := [16]
+    mut i := 0
+    while i < 30:
+        counts.push(0)
+        i = i + 1
+    counts.push(16)
+    got := ncount_round_trip(counts, 5, 255)!.counts
+    assert_eq(got[0], 16)
+    assert_eq(got[31], 16)
+    mut k := 1
+    while k < 31:
+        assert_eq(got[k], 0)
+        k = k + 1
+
+test "a truncated or malformed description is refused":
+    assert(read_ncount(bytes.empty(), 0, 0, 255).is_err)
+
+    # two zero bytes would decode as thirty-two low-probability symbols,
+    # which balances — but only by reading bits that are not there.
+    mut short_desc := bytes.buffer()
+    short_desc.write_byte(0)
+    short_desc.write_byte(0)
+    assert(read_ncount(short_desc.take_bytes(), 0, 2, 255).is_err)
+
+    # an accuracy log past the format's ceiling
+    mut bad_log := bytes.buffer()
+    bad_log.write_byte(15)
+    bad_log.write_byte(0)
+    bad_log.write_byte(0)
+    bad_log.write_byte(0)
+    assert(read_ncount(bad_log.take_bytes(), 0, 4, 255).is_err)
+
+    # a well-formed description that stops short of balancing
+    packed := write_ncount([10, 12, 10], 5)
+    mut truncated := bytes.buffer()
+    truncated.write_byte(packed[0])
+    assert(read_ncount(truncated.take_bytes(), 0, 1, 255).is_err)
 
 test "fse round trips a symbol sequence through a real backward stream":
     counts := [10, 12, 10]

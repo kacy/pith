@@ -46,19 +46,53 @@ fn code_bits(packed: Int) -> Int:
 
 # the predefined distributions, used when a mode says so and as the reset
 # point for repeat mode. each sums to its accuracy log by construction.
-fn ll_default() -> List[Int]:
+# they are pub because the encoder must build its encode states from the
+# very distributions the decoder will assume.
+
+## the predefined literal-length distribution (rfc 8878 table 6).
+pub fn ll_default() -> List[Int]:
     return [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1]
 
-fn ml_default() -> List[Int]:
+## the predefined match-length distribution (rfc 8878 table 8).
+pub fn ml_default() -> List[Int]:
     return [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
 
-fn of_default() -> List[Int]:
+## the predefined offset-code distribution (rfc 8878 table 10).
+pub fn of_default() -> List[Int]:
     return [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
 
 ## the accuracy logs the predefined tables use.
 pub LL_DEFAULT_LOG := 6
 pub ML_DEFAULT_LOG := 6
 pub OF_DEFAULT_LOG := 5
+
+## the literal-length code for a length, with its baseline and extra-bit
+## width, as (code, base, bits) — the encoder's inverse of ll_codes, kept
+## beside the table it must match. extra bits are `value - base`.
+pub fn ll_code_for(value: Int) -> (Int, Int, Int):
+    if value < 16:
+        return (value, value, 0)
+    table := ll_codes()
+    mut i := table.len() - 1
+    while i > 16:
+        if code_base(table[i]) <= value:
+            return (i, code_base(table[i]), code_bits(table[i]))
+        i = i - 1
+    return (16, code_base(table[16]), code_bits(table[16]))
+
+## the match-length code for a length (minimum 3), with its baseline and
+## extra-bit width, as (code, base, bits) — the encoder's inverse of
+## ml_codes.
+pub fn ml_code_for(value: Int) -> (Int, Int, Int):
+    if value < 35:
+        return (value - 3, value, 0)
+    table := ml_codes()
+    mut i := table.len() - 1
+    while i > 32:
+        if code_base(table[i]) <= value:
+            return (i, code_base(table[i]), code_bits(table[i]))
+        i = i - 1
+    return (32, code_base(table[32]), code_bits(table[32]))
 
 ## one decoded sequence.
 pub struct Sequence:
@@ -752,6 +786,23 @@ test "the packed code tables carry the spec's baselines and widths":
         span := bits.shl(1, code_bits(ml[i - 1]))
         assert_eq(code_base(ml[i]), code_base(ml[i - 1]) + span)
         i = i + 1
+
+test "the length-code lookups invert the code tables":
+    ll := ll_codes()
+    ml := ml_codes()
+    # every representable value must land in the code whose span holds it
+    for v in [0, 1, 15, 16, 17, 31, 32, 63, 64, 100, 1000, 65535, 65536, 131071]:
+        got := ll_code_for(v)
+        assert(got.1 <= v)
+        assert(v < got.1 + bits.shl(1, got.2))
+        assert_eq(got.1, code_base(ll[got.0]))
+        assert_eq(got.2, code_bits(ll[got.0]))
+    for v in [3, 4, 34, 35, 36, 37, 100, 4096, 65538, 65539, 131074]:
+        got := ml_code_for(v)
+        assert(got.1 <= v)
+        assert(v < got.1 + bits.shl(1, got.2))
+        assert_eq(got.1, code_base(ml[got.0]))
+        assert_eq(got.2, code_bits(ml[got.0]))
 
 test "sequence counts read at all three widths":
     mut one := bytes.buffer()

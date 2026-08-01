@@ -92,7 +92,7 @@ pub struct SequenceTables:
 # build a table for one code stream given its mode, returning the table and
 # how many bytes of description it consumed. an rle mode carries a single
 # byte naming the only symbol, and needs no table.
-fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, defaults: List[Int], default_log: Int, max_symbol: Int) -> (fse.FseTable, Int, Int)!:
+fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, defaults: List[Int], default_log: Int, max_symbol: Int, prev: List[fse.FseTable], prev_rle: List[Int]) -> (fse.FseTable, Int, Int)!:
     if mode == MODE_PREDEFINED:
         return (fse.build_decode_table(defaults, default_log), 0, -1)
     if mode == MODE_RLE:
@@ -102,10 +102,14 @@ fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, defaults: List[Int
     if mode == MODE_FSE:
         desc := fse.read_ncount(data, pos, end, max_symbol)!
         return (fse.build_decode_table(desc.counts, desc.log), desc.bytes_used, -1)
-    fail "zstd: repeat mode has no previous table in this block"
+    # repeat mode: whatever this stream used in the previous block of the
+    # frame, carried forward rather than re-described.
+    if prev.len() == 0:
+        fail "zstd: repeat mode with no previous table in this frame"
+    return (prev[0], 0, prev_rle[0])
 
 ## parse the modes byte and the table descriptions that follow it.
-pub fn read_tables(data: Bytes, off: Int, end: Int) -> (SequenceTables, Int)!:
+pub fn read_tables(data: Bytes, off: Int, end: Int, previous: List[SequenceTables]) -> (SequenceTables, Int)!:
     if off >= data.len():
         fail "zstd: truncated sequence modes"
     modes := data[off]
@@ -115,13 +119,28 @@ pub fn read_tables(data: Bytes, off: Int, end: Int) -> (SequenceTables, Int)!:
     of_mode := bits.band(bits.shr(modes, 4), 3)
     ml_mode := bits.band(bits.shr(modes, 2), 3)
 
+    # unpack the previous block's tables so repeat mode can name them
+    mut prev_ll: List[fse.FseTable] := []
+    mut prev_ml: List[fse.FseTable] := []
+    mut prev_of: List[fse.FseTable] := []
+    mut prev_ll_rle: List[Int] := []
+    mut prev_ml_rle: List[Int] := []
+    mut prev_of_rle: List[Int] := []
+    if previous.len() > 0:
+        prev_ll.push(previous[0].ll)
+        prev_ml.push(previous[0].ml)
+        prev_of.push(previous[0].of)
+        prev_ll_rle.push(previous[0].ll_rle)
+        prev_ml_rle.push(previous[0].ml_rle)
+        prev_of_rle.push(previous[0].of_rle)
+
     mut pos := off + 1
     # the descriptions appear in this order regardless of the modes.
-    ll_built := build_for_mode(ll_mode, data, pos, end, ll_default(), LL_DEFAULT_LOG, 35)!
+    ll_built := build_for_mode(ll_mode, data, pos, end, ll_default(), LL_DEFAULT_LOG, 35, prev_ll, prev_ll_rle)!
     pos = pos + ll_built.1
-    of_built := build_for_mode(of_mode, data, pos, end, of_default(), OF_DEFAULT_LOG, 31)!
+    of_built := build_for_mode(of_mode, data, pos, end, of_default(), OF_DEFAULT_LOG, 31, prev_of, prev_of_rle)!
     pos = pos + of_built.1
-    ml_built := build_for_mode(ml_mode, data, pos, end, ml_default(), ML_DEFAULT_LOG, 52)!
+    ml_built := build_for_mode(ml_mode, data, pos, end, ml_default(), ML_DEFAULT_LOG, 52, prev_ml, prev_ml_rle)!
     pos = pos + ml_built.1
 
     tables := SequenceTables(ll_built.0, ml_built.0, of_built.0, ll_built.2, ml_built.2, of_built.2)
@@ -154,7 +173,7 @@ pub fn resolve_offset(offset_value: Int, literal_length: Int, reps: List[Int]) -
 ## decode `count` sequences from the backward bitstream in [start, end).
 ## the three fse states are initialized literal-length, offset, match-length
 ## and updated in that same order after each sequence's extra bits are read.
-pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: SequenceTables) -> List[Sequence]!:
+pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: SequenceTables, reps: List[Int]) -> List[Sequence]!:
     reader := stream.back_reader(data, start, end)
     if not reader.ok:
         fail "zstd: malformed sequence bitstream"
@@ -174,7 +193,6 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
     if tables.ml_rle < 0:
         ml_state = reader.read(tables.ml.log)
 
-    mut reps := [1, 4, 8]
     mut out: List[Sequence] := []
     mut i := 0
     while i < count:
@@ -197,8 +215,12 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
         match_length := ml_b[ml_code] + reader.read(ml_x[ml_code])
         literal_length := ll_b[ll_code] + reader.read(ll_x[ll_code])
 
+        # the repeat history lives for the whole frame, not the block, so it
+        # is updated in place in the caller's list.
         resolved := resolve_offset(offset_value, literal_length, reps)!
-        reps = resolved.1
+        reps[0] = resolved.1[0]
+        reps[1] = resolved.1[1]
+        reps[2] = resolved.1[2]
         out.push(Sequence(literal_length, match_length, resolved.0))
 
         # the states advance only between sequences, not after the last one.

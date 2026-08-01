@@ -14,6 +14,7 @@
 import std.bits as bits
 import std.bytes as bytes
 import std.compress.zstd_pure_bits as stream
+import std.compress.zstd_pure_fse as fse
 
 ## literals section block types, from the header's low two bits.
 pub LITERALS_RAW := 0
@@ -172,6 +173,99 @@ pub fn read_direct_weights(data: Bytes, off: Int, count: Int) -> List[Int]!:
             weights.push(bits.band(byte, 15))
         i = i + 1
     return weights
+
+## the largest weight value a huffman description can carry.
+MAX_WEIGHT_SYMBOL := 12
+
+## a huffman tree description read off the wire, and the bytes it took.
+pub struct TreeDescription:
+    pub table: HuffTable
+    pub bytes_used: Int
+
+## read a huffman tree description. a leading byte of 128 or more means the
+## weights follow directly, 4 bits each; anything less is the byte length of
+## an fse-coded weight stream, whose table description comes first and whose
+## payload carries two interleaved states.
+pub fn read_tree_description(data: Bytes, off: Int, end: Int) -> TreeDescription!:
+    if off >= end:
+        fail "zstd: truncated huffman tree description"
+    header := data[off]
+    if header >= 128:
+        count := header - 127
+        weights := read_direct_weights(data, off + 1, count)!
+        return TreeDescription(build_table(weights)!, 1 + (count + 1) / 2)
+
+    # fse-coded weights: `header` is the byte length of the whole coded
+    # description, table and payload together.
+    coded_end := off + 1 + header
+    if coded_end > end:
+        fail "zstd: fse weight description runs past the literals section"
+    desc := fse.read_ncount(data, off + 1, coded_end, MAX_WEIGHT_SYMBOL)!
+    weight_table := fse.build_decode_table(desc.counts, desc.log)
+    payload_start := off + 1 + desc.bytes_used
+    if payload_start >= coded_end:
+        fail "zstd: fse weight description has no payload"
+    reader := stream.back_reader(data, payload_start, coded_end)
+    if not reader.ok:
+        fail "zstd: malformed fse weight stream"
+    weights := fse.decompress_two_state(weight_table, reader, 255)!
+    return TreeDescription(build_table(weights)!, 1 + header)
+
+fn read_le16(data: Bytes, off: Int) -> Int:
+    return bits.bor(data[off], bits.shl(data[off + 1], 8))
+
+## decode the huffman-coded literals in [start, end) against `table`,
+## producing exactly `regenerated` bytes. four-stream layouts open with a
+## six-byte jump table giving the first three stream lengths; the output
+## splits into four equal segments, the last taking the remainder.
+pub fn decode_literals(table: HuffTable, data: Bytes, start: Int, end: Int, regenerated: Int, streams: Int) -> Bytes!:
+    mut out := bytes.buffer()
+    errdefer out.free()
+
+    if streams == 1:
+        reader := stream.back_reader(data, start, end)
+        if not reader.ok:
+            fail "zstd: malformed literals stream"
+        for symbol in decode_stream(table, reader, regenerated)!:
+            out.write_byte(symbol)
+        result := out.bytes()
+        out.free()
+        return result
+
+    if start + 6 > end:
+        fail "zstd: truncated literals jump table"
+    size1 := read_le16(data, start)
+    size2 := read_le16(data, start + 2)
+    size3 := read_le16(data, start + 4)
+    body := start + 6
+    size4 := end - body - size1 - size2 - size3
+    if size1 < 0 or size2 < 0 or size3 < 0 or size4 < 0:
+        fail "zstd: literals jump table does not fit the section"
+
+    segment := (regenerated + 3) / 4
+    starts := [body, body + size1, body + size1 + size2, body + size1 + size2 + size3]
+    sizes := [size1, size2, size3, size4]
+    mut produced := 0
+    mut i := 0
+    while i < 4:
+        mut want := segment
+        if i == 3:
+            want = regenerated - 3 * segment
+        if want < 0:
+            fail "zstd: literals segment sizes do not add up"
+        reader := stream.back_reader(data, starts[i], starts[i] + sizes[i])
+        if not reader.ok:
+            fail "zstd: malformed literals stream " + i.to_string()
+        for symbol in decode_stream(table, reader, want)!:
+            out.write_byte(symbol)
+        produced = produced + want
+        i = i + 1
+
+    if produced != regenerated:
+        fail "zstd: literals streams produced the wrong length"
+    result := out.bytes()
+    out.free()
+    return result
 
 ## a parsed literals section header.
 pub struct LiteralsHeader:

@@ -1214,6 +1214,28 @@ zstd-interop-check:
 	cmp "$$tmpdir/back3" README.md && cmp "$$tmpdir/back19" README.md && \
 	echo "pith reads system zstd output at levels 3 and 19 byte-identical"
 
+# --- pure-pith zstd decoder interop ---
+# the pure decoder (no libzstd) against frames the system tool produced,
+# across the shapes that exercise every block and literals type: raw blocks
+# from incompressible input, huffman literals from wide-alphabet text,
+# multi-block frames with carried repeat-offset state, and the edge sizes.
+
+zstd-pure-check:
+	@echo "--- pure-pith zstd decoder interop ---"
+	@tmpdir=$$(mktemp -d /tmp/pith-zstdpure-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	cp README.md "$$tmpdir/text.bin"; \
+	head -c 120000 /dev/urandom > "$$tmpdir/random.bin"; \
+	python3 -c "import sys; sys.stdout.write(''.join(chr(32+(i*37)%95) for i in range(150000)))" > "$$tmpdir/spread.bin"; \
+	python3 -c "import sys; sys.stdout.write('ab'*40000)" > "$$tmpdir/repeat.bin"; \
+	printf '' > "$$tmpdir/empty.bin"; \
+	printf 'a' > "$$tmpdir/one.bin"; \
+	for f in text random spread repeat empty one; do \
+	  for lvl in 1 5 19; do zstd -$$lvl -c "$$tmpdir/$$f.bin" > "$$tmpdir/$$f.$$lvl.zst" 2>/dev/null; done; \
+	done; \
+	printf 'import std.fs as fs\nimport std.compress.zstd_pure_frame as zf\n\nfn main() -> Int!:\n    mut ok := 0\n    for name in ["text", "random", "spread", "repeat", "empty", "one"]:\n        raw := fs.read_bytes("'"$$tmpdir"'/" + name + ".bin")!\n        for lvl in ["1", "5", "19"]:\n            got := zf.decompress_bounded(fs.read_bytes("'"$$tmpdir"'/" + name + "." + lvl + ".zst")!, 4000000)!\n            if got != raw:\n                fail "mismatch: " + name + " -" + lvl\n            ok = ok + 1\n    print("{ok} system zstd frames decoded byte-identical by the pure decoder")\n    return 0\n' > "$$tmpdir/check.pith"; \
+	./target/release/pith run "$$tmpdir/check.pith"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

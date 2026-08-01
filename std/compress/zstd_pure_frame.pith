@@ -141,7 +141,7 @@ pub fn parse_block_header(data: Bytes, off: Int) -> BlockHeader!:
 
 # decode one compressed block: a literals section, then a sequence section
 # that weaves those literals together with matches into earlier output.
-fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, budget: Int) -> Bytes!:
+fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, budget: Int, trees: List[huffman.HuffTable], seq_tables: List[sequences.SequenceTables], reps: List[Int]) -> Bytes!:
     lit := huffman.parse_literals_header(data, start)!
     mut pos := start + lit.header_len
 
@@ -163,7 +163,22 @@ fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, bu
         literals = buf.bytes()
         pos = pos + 1
     else:
-        fail "zstd: huffman-coded literals are not decoded yet"
+        # compressed literals carry their own tree; treeless literals reuse
+        # the last one this frame built, which is why the table is threaded
+        # from block to block.
+        lit_end := pos + lit.compressed_size
+        if lit_end > end:
+            fail "zstd: literals section runs past the block"
+        mut table_start := pos
+        if lit.kind == huffman.LITERALS_COMPRESSED:
+            desc := huffman.read_tree_description(data, pos, lit_end)!
+            trees.clear()
+            trees.push(desc.table)
+            table_start = pos + desc.bytes_used
+        if trees.len() == 0:
+            fail "zstd: treeless literals with no previous huffman table"
+        literals = huffman.decode_literals(trees[0], data, table_start, lit_end, lit.regenerated_size, lit.streams)!
+        pos = lit_end
 
     # a block with no sequences is literals alone.
     if pos >= end:
@@ -174,9 +189,12 @@ fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, bu
     if count.count == 0:
         return literals
 
-    built := sequences.read_tables(data, pos, end)!
+    built := sequences.read_tables(data, pos, end, seq_tables)!
     pos = pos + built.1
-    decoded := sequences.decode_sequences(data, pos, end, count.count, built.0)!
+    # remember this block's tables so a later block can repeat them
+    seq_tables.clear()
+    seq_tables.push(built.0)
+    decoded := sequences.decode_sequences(data, pos, end, count.count, built.0, reps)!
     return sequences.execute(decoded, literals, history, budget)!
 
 ## decompress a frame, holding output to `max_output`. raw, rle, and
@@ -189,6 +207,12 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     mut out := bytes.buffer()
     errdefer out.free()
     mut pos := header.header_len
+    # state a later block inherits from an earlier one: the huffman table a
+    # treeless block reuses, the sequence tables repeat mode names, and the
+    # repeat-offset history — which lives for the whole frame, not the block.
+    mut trees: List[huffman.HuffTable] := []
+    mut seq_tables: List[sequences.SequenceTables] := []
+    mut reps := [1, 4, 8]
 
     mut done := false
     while not done:
@@ -218,7 +242,7 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
             if block.body_start + block.size > data.len():
                 fail "zstd: compressed block runs past the end of the frame"
             history := out.bytes()
-            piece := decode_compressed_block(data, block.body_start, block.body_start + block.size, history, max_output - out.len())!
+            piece := decode_compressed_block(data, block.body_start, block.body_start + block.size, history, max_output - out.len(), trees, seq_tables, reps)!
             mut i := 0
             while i < piece.len():
                 out.write_byte(piece[i])

@@ -204,6 +204,27 @@ pub fn fse_decode_all(data: Bytes, counts: List[Int], log: Int, count: Int) -> L
         i = i + 1
     return out
 
+## decode a stand-alone fse stream that carries two interleaved states —
+## the shape huffman weight descriptions use. symbols alternate between the
+## states, and the stream ends when the bits run out rather than at a
+## declared count: the two live states each contribute one final symbol.
+pub fn decompress_two_state(table: FseTable, reader: stream.BackReader, max_out: Int) -> List[Int]!:
+    mut states := [reader.read(table.log), reader.read(table.log)]
+    mut out: List[Int] := []
+    mut turn := 0
+    while out.len() < max_out:
+        entry := table.entries[states[turn]]
+        out.push(entry.symbol)
+        states[turn] = entry.base + reader.read(entry.nbits)
+        if reader.remaining() < 0:
+            # the read ran past the start of the stream, so this is the end.
+            # the other state still holds one symbol that was never emitted.
+            other := table.entries[states[1 - turn]]
+            out.push(other.symbol)
+            return out
+        turn = 1 - turn
+    fail "zstd: fse stream produced more symbols than expected"
+
 # ---------------------------------------------------------------
 # table descriptions — the normalized counts on the wire
 # ---------------------------------------------------------------

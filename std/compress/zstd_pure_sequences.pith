@@ -23,20 +23,26 @@ pub MODE_RLE := 1
 pub MODE_FSE := 2
 pub MODE_REPEAT := 3
 
-# literal-length codes: baseline and extra bits. codes 0-15 are their own
-# value; past that the baselines climb geometrically.
-fn ll_base() -> List[Int]:
-    return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+# literal-length and match-length codes, each packed as baseline * 256 +
+# extra bits. one packed list costs the decode loop a single index per code
+# where a baseline list and a bits list cost two, and a list index is the
+# most expensive thing that loop does.
+#
+# codes 0-15 are their own literal length; past that the baselines climb
+# geometrically. the shortest match is 3 bytes, so match code 0 is 3.
+fn ll_codes() -> List[Int]:
+    return [0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4097, 4609, 5121, 5633, 6146, 7170, 8195, 10243, 12292, 16390, 32775, 65544, 131081, 262154, 524299, 1048588, 2097165, 4194318, 8388623, 16777232]
 
-fn ll_bits() -> List[Int]:
-    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+fn ml_codes() -> List[Int]:
+    return [768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6400, 6656, 6912, 7168, 7424, 7680, 7936, 8192, 8448, 8704, 8961, 9473, 9985, 10497, 11010, 12034, 13059, 15107, 17156, 21252, 25349, 33543, 66312, 131849, 262922, 525067, 1049356, 2097933, 4195086, 8389391, 16778000]
 
-# match-length codes: the shortest match is 3 bytes, so code 0 is 3.
-fn ml_base() -> List[Int]:
-    return [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539]
+## the baseline a packed length code carries.
+fn code_base(packed: Int) -> Int:
+    return bits.shr(packed, 8)
 
-fn ml_bits() -> List[Int]:
-    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+## how many extra bits a packed length code reads.
+fn code_bits(packed: Int) -> Int:
+    return bits.band(packed, 255)
 
 # the predefined distributions, used when a mode says so and as the reset
 # point for repeat mode. each sums to its accuracy log by construction.
@@ -195,10 +201,10 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
     if not reader.ok:
         fail "zstd: malformed sequence bitstream"
 
-    ll_b := ll_base()
-    ll_x := ll_bits()
-    ml_b := ml_base()
-    ml_x := ml_bits()
+    ll_c := ll_codes()
+    ml_c := ml_codes()
+    ll_max := ll_c.len()
+    ml_max := ml_c.len()
 
     mut ll_state := 0
     mut of_state := 0
@@ -223,14 +229,16 @@ pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: S
         if of_code < 0:
             of_code = fse.entry_symbol(tables.of.entries[of_state])
 
-        if ll_code >= ll_b.len() or ml_code >= ml_b.len():
+        if ll_code >= ll_max or ml_code >= ml_max:
             fail "zstd: sequence code out of range"
 
         # extra bits are read offset first, then match length, then literal
         # length — the reverse of how the codes were named.
+        ml_packed := ml_c[ml_code]
+        ll_packed := ll_c[ll_code]
         offset_value := bits.shl(1, of_code) + reader.read(of_code)
-        match_length := ml_b[ml_code] + reader.read(ml_x[ml_code])
-        literal_length := ll_b[ll_code] + reader.read(ll_x[ll_code])
+        match_length := code_base(ml_packed) + reader.read(code_bits(ml_packed))
+        literal_length := code_base(ll_packed) + reader.read(code_bits(ll_packed))
 
         # the repeat history lives for the whole frame, not the block, so it
         # is updated in place in the caller's list.
@@ -334,17 +342,44 @@ test "the predefined tables build":
     of := fse.build_decode_table(of_default(), OF_DEFAULT_LOG)
     assert_eq(of.entries.len(), 32)
 
-test "the code tables line up":
-    # every code needs both a baseline and an extra-bit count
-    assert_eq(ll_base().len(), ll_bits().len())
-    assert_eq(ml_base().len(), ml_bits().len())
-    # the shortest match zstd can express is three bytes
-    assert_eq(ml_base()[0], 3)
-    # literal-length codes below 16 are their own value
+test "the packed code tables carry the spec's baselines and widths":
+    # the tables are packed by hand, so this pins every value that the
+    # format fixes rather than trusting the packing arithmetic.
+    ll := ll_codes()
+    ml := ml_codes()
+    assert_eq(ll.len(), 36)
+    assert_eq(ml.len(), 53)
+
+    # literal-length codes below 16 are their own value and read no extra bits
     mut i := 0
     while i < 16:
-        assert_eq(ll_base()[i], i)
-        assert_eq(ll_bits()[i], 0)
+        assert_eq(code_base(ll[i]), i)
+        assert_eq(code_bits(ll[i]), 0)
+        i = i + 1
+    # and match codes below 32 are i+3, the shortest match being three bytes
+    i = 0
+    while i < 32:
+        assert_eq(code_base(ml[i]), i + 3)
+        assert_eq(code_bits(ml[i]), 0)
+        i = i + 1
+
+    # the top of each table, where a mispacked value would hide
+    assert_eq(code_base(ll[35]), 65536)
+    assert_eq(code_bits(ll[35]), 16)
+    assert_eq(code_base(ml[52]), 65539)
+    assert_eq(code_bits(ml[52]), 16)
+
+    # each baseline must sit exactly one past the span the previous code
+    # covers, or some length is unreachable and another is ambiguous
+    i = 1
+    while i < ll.len():
+        span := bits.shl(1, code_bits(ll[i - 1]))
+        assert_eq(code_base(ll[i]), code_base(ll[i - 1]) + span)
+        i = i + 1
+    i = 1
+    while i < ml.len():
+        span := bits.shl(1, code_bits(ml[i - 1]))
+        assert_eq(code_base(ml[i]), code_base(ml[i - 1]) + span)
         i = i + 1
 
 test "sequence counts read at all three widths":

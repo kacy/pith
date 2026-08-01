@@ -12,7 +12,8 @@ use crate::{CodeGen, CompileError};
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
 use pith_runtime::collections::list::{
-    LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET,
+    LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET,
+    LIST_IMPL_VALUES8_PTR_OFFSET, LIST_MAGIC, LIST_TYPE_TAG_PRIMITIVE,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -133,6 +134,363 @@ fn inline_list_get_value(
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]
+}
+
+#[cfg(pith_cranelift_new_api)]
+fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Value, b: Value) {
+    builder.ins().jump(
+        block,
+        &[
+            cranelift::codegen::ir::instructions::BlockArg::Value(a),
+            cranelift::codegen::ir::instructions::BlockArg::Value(b),
+        ],
+    );
+}
+
+#[cfg(not(pith_cranelift_new_api))]
+fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Value, b: Value) {
+    builder.ins().jump(block, &[a, b]);
+}
+
+// `xs[i]` lowers to a call to pith_list_get_opt, which heap-allocates a
+// two-slot Optional tuple that the very next instructions unpack (flag at
+// offset 0, value at offset 8) and release. When scan_inline_list_get_opt_regs
+// proves a call's result is used only by that unpack pattern, the whole round
+// trip collapses to these loads and compares — no call, no allocation, no
+// release. The checks mirror the runtime path exactly: a null or stale handle
+// (magic scrubbed on free), a non-8-byte-element list, or an out-of-range
+// index all yield is_some == 0, which the emitted IR turns into the same loud
+// "index out of bounds" failure the runtime call produced.
+fn inline_list_get_opt(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    index: Value,
+) -> (Value, Value) {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64); // is_some
+    builder.append_block_param(done, types::I64); // value
+
+    let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
+    let null_block = builder.create_block();
+    let after_null = builder.create_block();
+    builder
+        .ins()
+        .brif(list_is_null, null_block, &[], after_null, &[]);
+    builder.switch_to_block(null_block);
+    jump_with_two_i64_args(builder, done, zero, zero);
+    builder.switch_to_block(after_null);
+
+    // the magic word is scrubbed when a list is freed, so this rejects stale
+    // handles the same way list_ref does in the runtime.
+    let magic = builder.ins().load(types::I32, MemFlags::new(), list, 0);
+    let magic_bad = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, magic, LIST_MAGIC as i64);
+    let magic_fail = builder.create_block();
+    let after_magic = builder.create_block();
+    builder
+        .ins()
+        .brif(magic_bad, magic_fail, &[], after_magic, &[]);
+    builder.switch_to_block(magic_fail);
+    jump_with_two_i64_args(builder, done, zero, zero);
+    builder.switch_to_block(after_magic);
+
+    let elem_size = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_ELEM_SIZE_OFFSET,
+    );
+    let is_eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
+    let size_fail = builder.create_block();
+    let after_size = builder.create_block();
+    builder
+        .ins()
+        .brif(is_eight, after_size, &[], size_fail, &[]);
+    builder.switch_to_block(size_fail);
+    jump_with_two_i64_args(builder, done, zero, zero);
+    builder.switch_to_block(after_size);
+
+    // one unsigned compare covers both `index < 0` and `index >= len`.
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_LEN_OFFSET,
+    );
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let bounds_fail = builder.create_block();
+    let after_bounds = builder.create_block();
+    builder
+        .ins()
+        .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
+    builder.switch_to_block(bounds_fail);
+    jump_with_two_i64_args(builder, done, zero, zero);
+    builder.switch_to_block(after_bounds);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_PTR_OFFSET,
+    );
+    let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
+    let ptr_fail = builder.create_block();
+    let load_block = builder.create_block();
+    builder
+        .ins()
+        .brif(data_is_null, ptr_fail, &[], load_block, &[]);
+    builder.switch_to_block(ptr_fail);
+    jump_with_two_i64_args(builder, done, zero, zero);
+    builder.switch_to_block(load_block);
+
+    let byte_offset = builder.ins().ishl_imm(index, 3);
+    let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), elem_addr, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    jump_with_two_i64_args(builder, done, one, value);
+
+    builder.switch_to_block(done);
+    let params = builder.block_params(done);
+    (params[0], params[1])
+}
+
+// `xs[i] = v` on a primitive-element list is an in-bounds store with no
+// retain/release choreography, so the common case inlines to a handful of
+// loads and one store. Anything the fast path cannot prove — a tagged list
+// (element counts to move), an out-of-bounds index (a silent no-op by the
+// runtime's contract), a stale or null handle — falls back to the real
+// runtime call, which keeps every semantic exactly as it was.
+fn inline_list_set_value(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    index: Value,
+    value: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) {
+    let done = builder.create_block();
+    let slow = builder.create_block();
+
+    let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
+    let check_magic = builder.create_block();
+    builder.ins().brif(list_is_null, slow, &[], check_magic, &[]);
+    builder.switch_to_block(check_magic);
+
+    let magic = builder.ins().load(types::I32, MemFlags::new(), list, 0);
+    let magic_bad = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, magic, LIST_MAGIC as i64);
+    let check_size = builder.create_block();
+    builder.ins().brif(magic_bad, slow, &[], check_size, &[]);
+    builder.switch_to_block(check_size);
+
+    let elem_size = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_ELEM_SIZE_OFFSET,
+    );
+    let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
+    let check_tag = builder.create_block();
+    builder.ins().brif(not_eight, slow, &[], check_tag, &[]);
+    builder.switch_to_block(check_tag);
+
+    let tag = builder.ins().load(
+        types::I32,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_TYPE_TAG_OFFSET,
+    );
+    let not_primitive = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, tag, LIST_TYPE_TAG_PRIMITIVE as i64);
+    let check_bounds = builder.create_block();
+    builder.ins().brif(not_primitive, slow, &[], check_bounds, &[]);
+    builder.switch_to_block(check_bounds);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_LEN_OFFSET,
+    );
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let check_ptr = builder.create_block();
+    builder.ins().brif(out_of_bounds, slow, &[], check_ptr, &[]);
+    builder.switch_to_block(check_ptr);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_PTR_OFFSET,
+    );
+    let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
+    let store_block = builder.create_block();
+    builder.ins().brif(data_is_null, slow, &[], store_block, &[]);
+    builder.switch_to_block(store_block);
+
+    let byte_offset = builder.ins().ishl_imm(index, 3);
+    let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
+    builder
+        .ins()
+        .store(MemFlags::new(), value, elem_addr, 0);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(slow);
+    builder.ins().call(fallback, &[list, index, value]);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(done);
+}
+
+// the native instruction behind a bit builtin, or None for anything else.
+// these mirror the runtime externs exactly: pith_bit_shr is a logical shift
+// (ushr) and shift amounts mask mod 64 on both paths.
+fn bits_builtin_op(builtin: &str) -> Option<&'static str> {
+    match builtin {
+        "bit_and" => Some("band"),
+        "bit_or" => Some("bor"),
+        "bit_xor" => Some("bxor"),
+        "bit_shl" => Some("shl"),
+        "bit_shr" => Some("shr"),
+        _ => None,
+    }
+}
+
+// std.bits wraps the bit builtins in one-line named functions, which made
+// every `bits.band` in a hot loop a pith call into an FFI call — two call
+// layers for one machine instruction. When a two-parameter function's body is
+// verifiably just `return <bit builtin>(p0, p1)`, calls to it lower to that
+// single instruction instead. The body is matched structurally against the
+// exact shape the emitter produces (two param loads, the builtin call on
+// them, the return, and the emitter's dead fallthrough tail), so an edited
+// wrapper simply stops matching and keeps its call semantics.
+fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'static str> {
+    if param_names.len() != 2 {
+        return None;
+    }
+    let insns: Vec<Vec<&str>> = body_lines
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<&str>>())
+        .filter(|p| !p.is_empty() && !p[0].starts_with(';'))
+        .collect();
+    if insns.len() < 4 {
+        return None;
+    }
+    let (a, b, c, r) = (&insns[0], &insns[1], &insns[2], &insns[3]);
+    if a.len() != 3 || a[0] != "load" || a[2] != param_names[0] {
+        return None;
+    }
+    if b.len() != 3 || b[0] != "load" || b[2] != param_names[1] {
+        return None;
+    }
+    if c.len() != 7
+        || c[0] != "call"
+        || c[3] != "int"
+        || c[4] != "2"
+        || c[5] != a[1]
+        || c[6] != b[1]
+    {
+        return None;
+    }
+    let op = bits_builtin_op(c[2])?;
+    if r.len() != 2 || r[0] != "ret" || r[1] != c[1] {
+        return None;
+    }
+    // the only thing allowed after the return is the emitter's unreachable
+    // `iconst N 0 / ret N` tail.
+    for extra in insns.iter().skip(4) {
+        let dead_const = extra[0] == "iconst" && extra.len() == 3 && extra[2] == "0";
+        let dead_ret = extra[0] == "ret" && extra.len() == 2;
+        if !dead_const && !dead_ret {
+            return None;
+        }
+    }
+    Some(op)
+}
+
+fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value) -> Value {
+    match op {
+        "band" => builder.ins().band(a, b),
+        "bor" => builder.ins().bor(a, b),
+        "bxor" => builder.ins().bxor(a, b),
+        "shl" => builder.ins().ishl(a, b),
+        _ => builder.ins().ushr(a, b),
+    }
+}
+
+// the defining shape of an inlinable indexed read: call R pith_list_get_opt
+// tuple 2 LIST INDEX.
+fn is_list_get_opt_def(parts: &[&str]) -> bool {
+    parts.len() == 7
+        && parts[0] == "call"
+        && parts[2] == "pith_list_get_opt"
+        && parts[3] == "tuple"
+        && parts[4] == "2"
+}
+
+// a token occurrence (parts[i]) the inline unpack understands: the defining
+// call itself, a field read of tuple slot 0 or 8, or the release of the
+// throwaway tuple shell. anything else — a store, a return, an argument to
+// some other call — means the tuple escapes and must really exist.
+fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
+    if is_list_get_opt_def(parts) {
+        return i == 1;
+    }
+    if parts.len() == 6 && parts[0] == "field" && (parts[3] == "0" || parts[3] == "8") {
+        return i == 2;
+    }
+    if parts.len() == 6
+        && parts[0] == "call"
+        && parts[2] == "pith_struct_release"
+        && parts[4] == "1"
+    {
+        return i == 5;
+    }
+    false
+}
+
+// registers holding a pith_list_get_opt result whose every textual use is the
+// emitter's own unpack pattern. the scan is deliberately conservative: any
+// numeric token equal to a candidate register that sits outside a sanctioned
+// position disqualifies it, so an escaping optional (`.get(i)` stored in a
+// variable, passed on, returned) always takes the real runtime call.
+fn scan_inline_list_get_opt_regs(body_lines: &[&str]) -> HashSet<usize> {
+    let mut candidates: HashMap<usize, u32> = HashMap::new();
+    for line in body_lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if is_list_get_opt_def(&parts) {
+            if let Ok(r) = parts[1].parse::<usize>() {
+                *candidates.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    // a register defined twice is not in SSA shape; leave it alone.
+    candidates.retain(|_, count| *count == 1);
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    for line in body_lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() || parts[0].starts_with(';') {
+            continue;
+        }
+        for (i, tok) in parts.iter().enumerate() {
+            let Ok(r) = tok.parse::<usize>() else { continue };
+            if candidates.contains_key(&r) && !is_sanctioned_opt_use(&parts, i) {
+                candidates.remove(&r);
+            }
+        }
+    }
+    candidates.into_keys().collect()
 }
 
 fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Value) -> Value {
@@ -670,6 +1028,42 @@ pub fn compile_from_ir(
         }
     }
 
+    // Pass 1.5: find bit-wrapper functions (std.bits and anything shaped like
+    // it) whose calls can lower to a single native instruction. This must see
+    // every function before any body compiles, since callers usually precede
+    // the wrappers in the stream.
+    let mut bits_aliases: HashMap<String, &'static str> = HashMap::new();
+    {
+        let mut j = 0;
+        while j < lines.len() {
+            let parts: Vec<&str> = lines[j].split_whitespace().collect();
+            if parts.is_empty() || parts[0] != "func" {
+                j += 1;
+                continue;
+            }
+            let fname = parts[1].to_string();
+            j += 1;
+            let mut body: Vec<&str> = Vec::new();
+            let mut params: Vec<String> = Vec::new();
+            while j < lines.len() {
+                let bparts: Vec<&str> = lines[j].split_whitespace().collect();
+                if !bparts.is_empty() && bparts[0] == "endfunc" {
+                    j += 1;
+                    break;
+                }
+                if !bparts.is_empty() && bparts[0] == "param" && bparts.len() >= 2 {
+                    params.push(bparts[1].to_string());
+                } else {
+                    body.push(lines[j]);
+                }
+                j += 1;
+            }
+            if let Some(op) = detect_bits_wrapper(&params, &body) {
+                bits_aliases.entry(fname).or_insert(op);
+            }
+        }
+    }
+
     // Pass 2: compile function bodies (first definition wins for duplicates)
     let mut compiled_funcs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut i = 0;
@@ -721,6 +1115,7 @@ pub fn compile_from_ir(
                 &str_globals,
                 &string_global_names,
                 preempt_flag,
+                &bits_aliases,
             )?;
         }
     }
@@ -758,6 +1153,7 @@ fn compile_ir_function(
     str_globals: &[(String, String)],
     string_global_names: &std::collections::HashSet<String>,
     preempt_flag: Option<cranelift_module::DataId>,
+    bits_aliases: &HashMap<String, &'static str>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -937,6 +1333,13 @@ fn compile_ir_function(
             labels.insert(parts[1].to_string(), block);
         }
     }
+
+    // Pre-scan for indexed list reads whose Optional tuple never escapes; those
+    // calls compile to inline loads instead (see inline_list_get_opt). The map
+    // carries each virtualized register's (is_some, value) pair for the field
+    // reads that follow.
+    let inline_opt_regs = scan_inline_list_get_opt_regs(body_lines);
+    let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
     // Older emitters briefly lowered `break` in `while true` loops through an
     // extra join label. The current self-hosted emitter already jumps straight
@@ -1369,6 +1772,35 @@ fn compile_ir_function(
                         float_regs.remove(&reg);
                     }
                 } else {
+                    // an indexed read whose Optional tuple never escapes: no
+                    // call, no tuple — compute (is_some, value) inline and let
+                    // the field reads below pick them up.
+                    if fname == "pith_list_get_opt"
+                        && nargs == 2
+                        && parts.len() > arg_start + 1
+                        && inline_opt_regs.contains(&reg)
+                    {
+                        let list = get_reg(&regs, parts[arg_start])?;
+                        let index = get_reg(&regs, parts[arg_start + 1])?;
+                        let pair = inline_list_get_opt(&mut builder, list, index);
+                        virtual_opts.insert(reg, pair);
+                        // deliberately not in regs: a use the pre-scan missed
+                        // must fail loudly, not read a stale value.
+                        regs.remove(&reg);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        continue;
+                    }
+                    // releasing a virtualized tuple: it was never allocated,
+                    // so there is nothing to free.
+                    if fname == "pith_struct_release" && nargs == 1 && parts.len() > arg_start {
+                        if let Ok(arg_reg) = parts[arg_start].parse::<usize>() {
+                            if virtual_opts.contains_key(&arg_reg) {
+                                continue;
+                            }
+                        }
+                    }
                     // the tcp_read/tcp_read2 arity overload is now resolved by the
                     // emitter (ir_call_helpers.pith), so the ir names tcp_read2
                     // directly and no rewrite is needed here.
@@ -1388,6 +1820,52 @@ fn compile_ir_function(
                         if j + arg_start < parts.len() {
                             args.push(get_reg(&regs, parts[j + arg_start])?);
                         }
+                    }
+                    // a call to a verified bit wrapper (or to a bit builtin
+                    // directly) is one native instruction. a local variable
+                    // shadowing the name keeps its call, same as below.
+                    if args.len() == 2 && !named_vars.contains_key(fname) {
+                        let alias_op = bits_aliases.get(fname).copied().or_else(|| {
+                            if declared_funcs.contains_key(fname) {
+                                None
+                            } else {
+                                bits_builtin_op(fname)
+                            }
+                        });
+                        if let Some(op) = alias_op {
+                            let v = emit_bits_op(&mut builder, op, args[0], args[1]);
+                            regs.insert(reg, v);
+                            string_regs.remove(&reg);
+                            bytes_regs.remove(&reg);
+                            float_regs.remove(&reg);
+                            struct_regs.remove(&reg);
+                            continue;
+                        }
+                    }
+                    if (fname == "pith_list_set_value" || fname == "pith_list_set_value_owned")
+                        && args.len() == 3
+                    {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            fname,
+                        )?;
+                        inline_list_set_value(
+                            &mut builder,
+                            args[0],
+                            args[1],
+                            args[2],
+                            fallback,
+                        );
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        regs.insert(reg, zero);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
                     }
                     if fname == "bytes_get" && args.len() == 2 {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
@@ -1759,6 +2237,53 @@ fn compile_ir_function(
 
             "field" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
+                // unpacking a virtualized pith_list_get_opt result: slot 0 is
+                // the is_some flag, slot 8 the element value, both already in
+                // registers — no tuple to load from.
+                if let Ok(obj_reg) = parts[2].parse::<usize>() {
+                    if let Some(&(flag, value)) = virtual_opts.get(&obj_reg) {
+                        let v = match parts[3] {
+                            "0" => flag,
+                            "8" => value,
+                            _ => {
+                                return Err(CompileError::ModuleError(format!(
+                                    "ir consumer: unexpected field offset on inlined \
+                                     list get in {}: {}",
+                                    func_name, line
+                                )))
+                            }
+                        };
+                        regs.insert(reg, v);
+                        reg_source_vars.remove(&reg);
+                        struct_regs.remove(&reg);
+                        if parts.len() >= 6 {
+                            let retkind = parts[4];
+                            if retkind == "string" {
+                                string_regs.insert(reg);
+                            } else {
+                                string_regs.remove(&reg);
+                            }
+                            if retkind == "bytes" {
+                                bytes_regs.insert(reg);
+                            } else {
+                                bytes_regs.remove(&reg);
+                            }
+                            if retkind == "float" {
+                                float_regs.insert(reg);
+                            } else {
+                                float_regs.remove(&reg);
+                            }
+                            if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                                struct_regs.insert(reg, struct_name.to_string());
+                            }
+                        } else {
+                            string_regs.remove(&reg);
+                            bytes_regs.remove(&reg);
+                            float_regs.remove(&reg);
+                        }
+                        continue;
+                    }
+                }
                 let obj = get_reg(&regs, parts[2])?;
                 let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
                 {
@@ -2103,6 +2628,85 @@ fn get_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bits_wrapper_detection_matches_only_the_exact_shape() {
+        let params = vec!["left".to_string(), "right".to_string()];
+        let wrapper = vec![
+            "load 2 left",
+            "load 3 right",
+            "call 4 bit_and int 2 2 3",
+            "ret 4",
+            "iconst 5 0",
+            "ret 5",
+        ];
+        assert_eq!(detect_bits_wrapper(&params, &wrapper), Some("band"));
+
+        // swapped operands are a different function; it must keep its call
+        let swapped = vec![
+            "load 2 left",
+            "load 3 right",
+            "call 4 bit_and int 2 3 2",
+            "ret 4",
+        ];
+        assert_eq!(detect_bits_wrapper(&params, &swapped), None);
+
+        // extra work after the return means the body is not just the builtin
+        let with_extra = vec![
+            "load 2 left",
+            "load 3 right",
+            "call 4 bit_and int 2 2 3",
+            "ret 4",
+            "call 6 print void 1 4",
+        ];
+        assert_eq!(detect_bits_wrapper(&params, &with_extra), None);
+
+        // a non-bit builtin never aliases
+        let other_call = vec![
+            "load 2 left",
+            "load 3 right",
+            "call 4 map_get int 2 2 3",
+            "ret 4",
+        ];
+        assert_eq!(detect_bits_wrapper(&params, &other_call), None);
+    }
+
+    #[test]
+    fn list_get_opt_scan_accepts_the_unpack_pattern_and_nothing_else() {
+        // the emitter's indexed-read shape: call, flag read, value read,
+        // release on both arms
+        let body = vec![
+            "call 10 pith_list_get_opt tuple 2 4 5",
+            "field 11 10 0 bool is_some",
+            "brif 11 L1 L2",
+            "label L1",
+            "field 12 10 8 int value",
+            "call 13 pith_struct_release void 1 10",
+            "jmp L3",
+            "label L2",
+            "call 14 pith_struct_release void 1 10",
+            "ret 0",
+            "label L3",
+        ];
+        let regs = scan_inline_list_get_opt_regs(&body);
+        assert!(regs.contains(&10));
+
+        // an escaping optional (stored into a variable) must keep the call
+        let escaping = vec![
+            "call 10 pith_list_get_opt tuple 2 4 5",
+            "store opt 10",
+            "field 11 10 0 bool is_some",
+        ];
+        assert!(scan_inline_list_get_opt_regs(&escaping).is_empty());
+
+        // passing the tuple to any other call disqualifies it too
+        let passed = vec![
+            "call 10 pith_list_get_opt tuple 2 4 5",
+            "field 11 10 0 bool is_some",
+            "call 12 some_fn int 1 10",
+        ];
+        assert!(scan_inline_list_get_opt_regs(&passed).is_empty());
+    }
 
     #[test]
     fn parse_call_shape_requires_explicit_retkind() {

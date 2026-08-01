@@ -43,6 +43,7 @@ import std.net.url as url_mod
 import std.protobuf as protobuf
 import std.strings as strings
 import std.time as time
+import std.resilience as resilience
 import std.trace as trace
 
 # the telemetry.sdk.version reported on every exported resource.
@@ -63,13 +64,12 @@ pub DEFAULT_HTTP_PORT := 4318
 # none. obs also uses this as the OTEL_EXPORTER_OTLP_TIMEOUT fallback.
 pub DEFAULT_TIMEOUT_MS := 10000
 
-# retry policy for a transient export failure. we try an export up to
-# MAX_EXPORT_ATTEMPTS times, backing off BACKOFF_BASE_MS and doubling each retry
-# up to BACKOFF_MAX_MS. the exporter is best-effort, so once these are exhausted
-# the batch is dropped rather than blocking the program.
-MAX_EXPORT_ATTEMPTS := 5
-BACKOFF_BASE_MS := 1000
-BACKOFF_MAX_MS := 30000
+# retry policy for a transient export failure: up to 5 attempts, backing off
+# from a second and capping at 30. the curve is std.resilience's — the same
+# doubling every backoff in std runs on — and the exporter is best-effort,
+# so once attempts are exhausted the batch is dropped rather than blocking
+# the program.
+EXPORT_RETRY := resilience.retries(5).base(1000).cap(30000)
 
 # OTLP AggregationTemporality.CUMULATIVE — the only temporality pith reports,
 # since std.metrics counters and histograms accumulate for the process lifetime.
@@ -482,18 +482,9 @@ fn prepare_body(cfg: Target, body: Bytes) -> (Bytes, Bool):
 pub fn is_retryable(status: Int) -> Bool:
     return status == 429 or status >= 500
 
-# exponential backoff for retry `attempt` (0-indexed): BACKOFF_BASE_MS, then
-# double each step, capped at BACKOFF_MAX_MS. deterministic (no jitter) so the
-# behavior is easy to test and reason about.
+# the shared curve, shifted for this module's 0-indexed attempt counters.
 fn backoff_ms(attempt: Int) -> Int:
-    mut delay := BACKOFF_BASE_MS
-    mut i := 0
-    while i < attempt:
-        delay = delay * 2
-        if delay >= BACKOFF_MAX_MS:
-            return BACKOFF_MAX_MS
-        i = i + 1
-    return delay
+    return EXPORT_RETRY.delay_ms(attempt + 1)
 
 # how long to wait before the next retry: the exponential backoff, unless the
 # collector sent a larger Retry-After (in seconds) we should honor instead.
@@ -531,13 +522,13 @@ fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> http.HttpRespon
 
 # POST a signal with retries. best-effort: returns true once the collector
 # accepts the body (2xx). a transport error or a retryable status (429/5xx) backs
-# off and retries until MAX_EXPORT_ATTEMPTS is reached; a permanent rejection (any
+# off and retries until the policy's attempts are exhausted; a permanent rejection (any
 # other 4xx) is dropped immediately. never propagates, so callers keep running.
 fn post_with_retry(cfg: Target, signal_path: String, body: Bytes) -> Bool:
     mut attempt := 0
-    while attempt < MAX_EXPORT_ATTEMPTS:
+    while attempt < EXPORT_RETRY.attempts:
         result := post_signal(cfg, signal_path, body)
-        last_attempt := attempt + 1 >= MAX_EXPORT_ATTEMPTS
+        last_attempt := attempt + 1 >= EXPORT_RETRY.attempts
         if result.is_err:
             # transport failure (connect/timeout/reset): retry while attempts remain.
             if last_attempt:
@@ -594,7 +585,7 @@ fn grpc_export_attempt(cfg: Target, full_method: String, body: Bytes) -> Int:
 
 # export an already-encoded OTLP request over grpc, best-effort with the same
 # retry policy as the http path: an UNAVAILABLE backs off and retries up to
-# MAX_EXPORT_ATTEMPTS, any other error is permanent and dropped, and an exhausted
+# the policy allows, any other error is permanent and dropped, and an exhausted
 # retry returns false. never propagates a failed export — but a non-tls grpc
 # target is a configuration error (pith's grpc client has no cleartext h2c
 # transport, only tls), so that case fails loudly rather than breaking silently.
@@ -602,11 +593,11 @@ fn export_over_grpc(cfg: Target, full_method: String, body: Bytes) -> Bool!:
     if not cfg.use_tls:
         fail "otlp: grpc transport requires tls (h2c cleartext is unsupported); use an https endpoint or http/protobuf"
     mut attempt := 0
-    while attempt < MAX_EXPORT_ATTEMPTS:
+    while attempt < EXPORT_RETRY.attempts:
         status := grpc_export_attempt(cfg, full_method, body)
         if status == grpc.GRPC_OK:
             return true
-        last_attempt := attempt + 1 >= MAX_EXPORT_ATTEMPTS
+        last_attempt := attempt + 1 >= EXPORT_RETRY.attempts
         if last_attempt or not grpc_is_retryable(status):
             return false
         time.delay(backoff_ms(attempt))
@@ -1117,16 +1108,16 @@ test "is_retryable retries 429 and 5xx but not other statuses":
     assert(is_retryable(504))
 
 test "backoff doubles each attempt and caps at the maximum":
-    assert_eq(backoff_ms(0), BACKOFF_BASE_MS)          # first retry waits the base
-    assert_eq(backoff_ms(1), BACKOFF_BASE_MS * 2)
-    assert_eq(backoff_ms(2), BACKOFF_BASE_MS * 4)
-    assert_eq(backoff_ms(3), BACKOFF_BASE_MS * 8)
+    assert_eq(backoff_ms(0), 1000)          # first retry waits the base
+    assert_eq(backoff_ms(1), 2000)
+    assert_eq(backoff_ms(2), 4000)
+    assert_eq(backoff_ms(3), 8000)
     # it is monotonic increasing until it saturates.
     assert(backoff_ms(1) > backoff_ms(0))
     assert(backoff_ms(2) > backoff_ms(1))
     # a late attempt saturates at the cap and stays there.
-    assert_eq(backoff_ms(5), BACKOFF_MAX_MS)
-    assert_eq(backoff_ms(20), BACKOFF_MAX_MS)
+    assert_eq(backoff_ms(6), 30000)
+    assert_eq(backoff_ms(20), 30000)
 
 test "prepare_body gzips only when the target enables compression":
     body := bytes.from_string_utf8("an otlp protobuf body")

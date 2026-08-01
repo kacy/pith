@@ -1,7 +1,7 @@
 # ir_field_helpers.pith - field access metadata and emission helpers
 
 from checker import c_get_expr_type
-from ir_builder import ir_emit
+from ir_builder import ir_emit, ir_reg
 from ir_type_helpers import ir_retkind_with_state, ir_type_from_tid
 from ir_utils import ir_parse_field_index, ir_unpack_field_index
 from types import get_type_info
@@ -52,6 +52,29 @@ pub fn ir_emit_named_field_access_with_state(result_reg: Int, obj_r: Int, lookup
         if unique_offset >= 0:
             unique_kind := ir_unique_field_kind_with_state(field_name, struct_field_lookup, type_aliases, struct_names)
             ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + unique_offset.to_string() + " " + unique_kind + " " + field_name)
+        elif field_name == "is_ok" or field_name == "is_err" or field_name == "ok" or field_name == "err":
+            # a result field on a value whose payload type is a generic
+            # parameter: the struct lookup knows nothing, but a result's
+            # layout is fixed regardless of what it carries — flag at 0,
+            # ok at 8, err at 16. without this the bare no-offset form went
+            # out and the consumer rejected the program. is_err is the flag
+            # negated, since only is_ok is stored.
+            if field_name == "is_err":
+                flag_r := ir_reg()
+                ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
+                zero_r := ir_reg()
+                ir_emit("iconst " + zero_r.to_string() + " 0")
+                ir_emit("eq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+            else:
+                mut offset := 0
+                mut kind := "bool"
+                if field_name == "ok":
+                    offset = 8
+                    kind = "unknown"
+                elif field_name == "err":
+                    offset = 16
+                    kind = "unknown"
+                ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + kind + " " + field_name)
         else:
             ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
 

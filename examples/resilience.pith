@@ -1,0 +1,71 @@
+# retry, rate limiting, and circuit breaking with std.resilience.
+#
+# these are the pieces a service composes around anything that can fail or
+# flood. the same retry curve backs off every retry loop in std — otlp
+# exports, tcp accept failures, grpc unary retries — and std.web wraps the
+# limiter and breaker into middleware (web.rate_limit, web.circuit), so the
+# behavior shown here standalone is exactly what a served app gets.
+
+import std.resilience as resilience
+
+mut fetch_calls := 0
+
+# a dependency that fails twice and then recovers — the shape retries exist
+# for.
+fn fetch_report() -> String!:
+    fetch_calls = fetch_calls + 1
+    if fetch_calls < 3:
+        fail "connection reset"
+    return "report ready after {fetch_calls} calls"
+
+fn validate_input() -> String!:
+    fail "invalid: the request itself is wrong"
+
+fn is_transient(err: String) -> Bool:
+    return not err.starts_with("invalid")
+
+fn main() -> Int!:
+    print("=== retry with backoff ===")
+    policy := resilience.retries(5).base(10).cap(200)
+    print("delays: {policy.delay_ms(1)}ms, {policy.delay_ms(2)}ms, {policy.delay_ms(3)}ms ... capped at {policy.delay_ms(9)}ms")
+    print(resilience.attempt(policy, fetch_report)!)
+
+    # a permanent error is not worth five attempts: the classifier refuses
+    # it on the first failure, with no backoff spent.
+    rejected := resilience.attempt_if(policy, validate_input, is_transient) catch "gave up immediately"
+    print(rejected)
+
+    print("")
+    print("=== rate limiting ===")
+    # 100 tokens/second with a burst reserve of 3: the burst passes, the
+    # fourth call is denied, and the bucket refills as time passes.
+    limiter := resilience.rate_limiter(100, 3)
+    mut allowed := 0
+    mut denied := 0
+    mut i := 0
+    while i < 4:
+        if limiter.allow():
+            allowed = allowed + 1
+        else:
+            denied = denied + 1
+        i = i + 1
+    print("burst of 4: {allowed} allowed, {denied} denied")
+    sleep(30)
+    print("after refill: allowed={limiter.allow()}")
+
+    print("")
+    print("=== circuit breaking ===")
+    # two consecutive failures trip the circuit; while open, callers are
+    # refused instantly instead of piling onto a drowning dependency. after
+    # reset_ms one probe goes through, and its outcome decides.
+    breaker := resilience.circuit_breaker(2, 50)
+    breaker.failure()
+    breaker.failure()
+    print("after two failures: {breaker.state()}")
+    print("calls allowed while open: {breaker.allow()}")
+    sleep(80)
+    print("probe allowed after reset: {breaker.allow()}")
+    print("state during the probe: {breaker.state()}")
+    breaker.success()
+    print("after the probe succeeds: {breaker.state()}")
+    return 0

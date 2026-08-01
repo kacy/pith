@@ -10,7 +10,6 @@
 # and exit.
 import std.web as web
 import std.net.http as http
-import std.net.tcp as tcp
 
 # GET /hello/:name — greet whoever is named in the path.
 fn greet(req: web.Request) -> http.HttpResponse:
@@ -28,17 +27,12 @@ fn build_app() -> web.App:
 fn serve_bg(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# a minimal GET that returns just the response body, so we can print it.
+# fetch a path and return just the response body, so we can print it.
 fn fetch(port: Int, path: String) -> String:
-    fd := tcp.connect("127.0.0.1", port) catch 0
-    crlf := chr(13) + chr(10)
-    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
-    raw := tcp.read(fd, 65536) catch ""
-    tcp.close(fd)
-    split := raw.index_of(crlf + crlf)
-    if split < 0:
-        return raw
-    return raw.substring(split + 4, raw.len())
+    resp := http.get_request("127.0.0.1", port, path).send() catch:
+        return "no response"
+    return resp.body_text() catch ""
+
 
 fn main() -> Int!:
     port := 18080

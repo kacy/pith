@@ -1,16 +1,12 @@
 # signing a user up, logging them in, and handing them a session token.
 #
 # the two halves of an auth story: argon2id for the password at rest, and a
-# signed json web token for the session that follows. json in string literals
-# is written with doubled braces, which is pith's escape for a literal brace.
+# signed json web token for the session that follows.
 
 import std.bytes as bytes
 import std.crypto.jwt as jwt
 import std.crypto.password as password
-
-# a fixed instant so the example prints the same thing every run. real code
-# leaves `now` alone and lets the verifier read the clock.
-NOW := 1_750_000_000
+import std.time as time
 
 fn signing_secret() -> Bytes:
     return bytes.from_string_utf8("keep this in the environment, not the source")
@@ -25,8 +21,8 @@ fn log_in(attempt: String, stored: String) -> Bool:
     return password.verify(attempt, stored)
 
 fn issue(subject: String) -> String!:
-    claims := "{{\"iss\":\"pith-chat\",\"sub\":\"" + subject + "\",\"aud\":\"chat\",\"iat\":1750000000,\"exp\":1750003600}}"
-    return jwt.sign_hs256(claims, signing_secret())!
+    # the builder writes the json and stamps iat/exp at signing time.
+    return jwt.claims().issuer("pith-chat").audience("chat").subject(subject).expires_in(3600).sign_hs256(signing_secret())!
 
 fn main() -> Int!:
     print("=== registering ===")
@@ -49,15 +45,15 @@ fn main() -> Int!:
     # the verifier names its algorithm and what it expects to find inside. it
     # never reads the algorithm off the token, which is what stops an attacker
     # re-signing one and choosing the verification path for you.
-    expected := jwt.with_audience(jwt.with_issuer(jwt.at_time(jwt.default_options(), NOW), "pith-chat"), "chat")
+    expected := jwt.with_audience(jwt.with_issuer(jwt.default_options(), "pith-chat"), "chat")
     session := jwt.verify_hs256(token, signing_secret(), expected)!
-    print("claims: " + session.claims)
+    print("subject: " + session.subject())
 
     print("")
     print("=== what gets turned away ===")
     print("wrong secret: " + jwt.verify_hs256(token, bytes.from_string_utf8("guess"), expected).is_err.to_string())
-    print("wrong audience: " + jwt.verify_hs256(token, signing_secret(), jwt.with_audience(jwt.at_time(jwt.default_options(), NOW), "billing")).is_err.to_string())
-    print("expired an hour later: " + jwt.verify_hs256(token, signing_secret(), jwt.at_time(jwt.default_options(), NOW + 7200)).is_err.to_string())
+    print("wrong audience: " + jwt.verify_hs256(token, signing_secret(), jwt.with_audience(jwt.default_options(), "billing")).is_err.to_string())
+    print("expired two hours on: " + jwt.verify_hs256(token, signing_secret(), jwt.at_time(jwt.default_options(), time.unix() + 7200)).is_err.to_string())
     # an HS256 token is refused by the rs256 path on its alg header alone.
     print("hs256 token, rs256 verifier: " + jwt.verify_rs256(token, signing_secret(), expected).is_err.to_string())
     return 0

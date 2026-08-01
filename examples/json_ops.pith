@@ -2,7 +2,6 @@
 
 import std.json as json
 import std.fs as fs
-import std.io as io
 import std.fmt as fmt
 
 struct ToolInfo:
@@ -13,16 +12,9 @@ struct ToolInfo:
 fn main() -> String!:
     path := "/tmp/pith_json_ops.json"
 
-    # note: use chr(123)/chr(125) for curly braces in string literals
-    lb := chr(123)
-    rb := chr(125)
-
-    # parse a simple object
-    input_buf := io.string_buffer()
-    input_buf.write(lb)!
-    input_buf.write("\"name\":\"pith\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]")!
-    input_buf.write(rb)!
-    input := input_buf.string()
+    # a literal brace in a pith string is doubled, since a single { starts
+    # an interpolation
+    input := "{{\"name\":\"pith\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]}}"
     root := json.parse(input)
     print("type = {json.type_of(root)}")
 
@@ -32,7 +24,7 @@ fn main() -> String!:
     print("active = {json.object_get_bool(root, "active")}")
     print("missing = {json.object_get_string_or(root, "missing", "n/a")}")
 
-    shallow := "{lb}\"name\":\"pith\",\"version\":1,\"active\":true{rb}"
+    shallow := "{{\"name\":\"pith\",\"version\":1,\"active\":true}}"
     info := json.decode_text[ToolInfo](shallow)
     if info.is_ok:
         print("decoded = {info.ok.name}@{info.ok.version}")

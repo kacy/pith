@@ -1,7 +1,6 @@
 # toml parsing
 import std.toml as toml
 import std.fs as fs
-import std.io as io
 
 struct ServerConfig:
     pub host: String
@@ -10,20 +9,19 @@ struct ServerConfig:
 fn main() -> String!:
     path := "/tmp/pith_toml_ops.toml"
 
-    # build a TOML document
-    newline := chr(10)
-    quote := chr(34)
-    doc_buf := io.string_buffer()
-    doc_buf.write("title = {quote}pith{quote}{newline}")!
-    doc_buf.write("version = 42{newline}")!
-    doc_buf.write("pi = 3.14{newline}")!
-    doc_buf.write("enabled = true{newline}")!
-    doc_buf.write("tags = [{quote}lang{quote}, {quote}fast{quote}]{newline}")!
-    doc_buf.newline()!
-    doc_buf.write("[server]{newline}")!
-    doc_buf.write("host = {quote}localhost{quote}{newline}")!
-    doc_buf.write("port = 8080{newline}")!
-    doc := doc_buf.string()
+    # build a TOML document, one line per entry
+    lines := [
+        "title = \"pith\"",
+        "version = 42",
+        "pi = 3.14",
+        "enabled = true",
+        "tags = [\"lang\", \"fast\"]",
+        "",
+        "[server]",
+        "host = \"localhost\"",
+        "port = 8080",
+    ]
+    doc := lines.join("\n") + "\n"
 
     root := toml.parse(doc)
     print("type: {toml.type_of(root)}")

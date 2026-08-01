@@ -10,7 +10,6 @@
 # replies, and exit.
 import std.web as web
 import std.net.http as http
-import std.net.tcp as tcp
 import std.json as json
 
 # the shape we expect in a POST /users body. web.parse reads the fields straight
@@ -55,42 +54,24 @@ fn build_app() -> web.App:
 fn serve_bg(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# a minimal GET that returns just the response body, so we can print it.
+# fetch a path and return just the response body, so we can print it.
 fn get_body(port: Int, path: String) -> String:
-    fd := tcp.connect("127.0.0.1", port) catch 0
-    crlf := chr(13) + chr(10)
-    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
-    return read_body(fd)
+    resp := http.get_request("127.0.0.1", port, path).send() catch:
+        return "no response"
+    return resp.body_text() catch ""
 
-# a minimal POST with a json body, returning just the response body.
+# POST a json body and return just the response body.
 fn post_json(port: Int, path: String, body: String) -> String:
-    fd := tcp.connect("127.0.0.1", port) catch 0
-    crlf := chr(13) + chr(10)
-    mut request := "POST " + path + " HTTP/1.1" + crlf
-    request = request + "Host: localhost" + crlf
-    request = request + "Content-Type: application/json" + crlf
-    request = request + "Content-Length: " + body.len().to_string() + crlf
-    request = request + "Connection: close" + crlf + crlf + body
-    tcp.write(fd, request) catch 0
-    return read_body(fd)
-
-# read a whole response off the socket and return only the body.
-fn read_body(fd: Int) -> String:
-    crlf := chr(13) + chr(10)
-    raw := tcp.read(fd, 65536) catch ""
-    tcp.close(fd)
-    split := raw.index_of(crlf + crlf)
-    if split < 0:
-        return raw
-    return raw.substring(split + 4, raw.len())
+    resp := http.post_request("127.0.0.1", port, path).header("Content-Type", "application/json").body_text(body).send() catch:
+        return "no response"
+    return resp.body_text() catch ""
 
 fn main() -> Int!:
     port := 18082
     spawn serve_bg(port)
     sleep(200)   # give the listener a moment to bind
 
-    dq := chr(34)
-    body := chr(123) + dq + "name" + dq + ":" + dq + "ada" + dq + "," + dq + "age" + dq + ":36" + chr(125)
+    body := "{{\"name\":\"ada\",\"age\":36}}"
 
     # GET echoes the path parameter as json.
     print(get_body(port, "/users/42"))

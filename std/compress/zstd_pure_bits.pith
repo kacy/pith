@@ -27,6 +27,10 @@ fn extract(data: Bytes, at: Int, n: Int) -> Int:
     first := at / 8
     shift := at % 8
     need := (shift + n + 7) / 8
+    # the in-bounds span is one word read; the byte loop survives only for
+    # the tail, where bytes past the end must read as zero
+    if first + need <= data.len():
+        return bits.band(bits.shr(bytes.read_word(data, first, need), shift), bits.shl(1, n) - 1)
     mut word := 0
     mut k := need - 1
     while k >= 0:
@@ -102,6 +106,11 @@ impl BackReader:
         if byte_index < 0:
             byte_index = 0
         self.window_base = byte_index * 8
+        # one word read when the window sits fully inside the data; the
+        # byte loop remains for the tail, whose missing bytes read as zero
+        if byte_index + 8 <= self.data.len():
+            self.window = bytes.read_word(self.data, byte_index, 8)
+            return
         mut word := 0
         mut k := 7
         while k >= 0:

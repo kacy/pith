@@ -30,23 +30,17 @@ fn prime4() -> Int:
 fn prime5() -> Int:
     return bits.bor(bits.shl(0x27D4EB2F, 32), 0x165667C5)
 
-# read a little-endian 64-bit word at `off`.
+# read a little-endian 64-bit word at `off`. the builtin is called
+# directly rather than through the std.bytes wrapper: the stripe loop pays
+# one call per eight bytes, and each wrapper layer showed up whole in the
+# checksum's share of frame decode. the callers' loop bounds keep the
+# range inside the data, so the read never sees the out-of-range zero.
 fn read64(data: Bytes, off: Int) -> Int:
-    mut value := 0
-    mut i := 7
-    while i >= 0:
-        value = bits.bor(bits.shl(value, 8), data[off + i])
-        i = i - 1
-    return value
+    return bytes_read_word(data, off, 8)
 
 # read a little-endian 32-bit word at `off`, zero-extended.
 fn read32(data: Bytes, off: Int) -> Int:
-    mut value := 0
-    mut i := 3
-    while i >= 0:
-        value = bits.bor(bits.shl(value, 8), data[off + i])
-        i = i - 1
-    return value
+    return bytes_read_word(data, off, 4)
 
 fn round(acc: Int, input: Int) -> Int:
     return bits.rotl64(acc + input * prime2(), 31) * prime1()
@@ -61,15 +55,28 @@ pub fn xxh64(data: Bytes, seed: Int) -> Int:
     mut pos := 0
 
     if n >= 32:
-        mut v1 := seed + prime1() + prime2()
-        mut v2 := seed + prime2()
+        # the stripe loop is the whole cost of hashing a frame, so the
+        # primes live in locals and the round arithmetic is spelled out:
+        # a call per lane per stripe was most of the checksum's share of
+        # frame decode. keep this in sync with round().
+        p1 := prime1()
+        p2 := prime2()
+        mut v1 := seed + p1 + p2
+        mut v2 := seed + p2
         mut v3 := seed
-        mut v4 := seed - prime1()
+        mut v4 := seed - p1
         while pos + 32 <= n:
-            v1 = round(v1, read64(data, pos))
-            v2 = round(v2, read64(data, pos + 8))
-            v3 = round(v3, read64(data, pos + 16))
-            v4 = round(v4, read64(data, pos + 24))
+            # rotl64 spelled as shifts: the rotate amount is fixed at 31,
+            # and the shl/shr/bor calls collapse to native instructions
+            # where the rotl64 wrapper stays a call
+            a1 := v1 + bytes_read_word(data, pos, 8) * p2
+            v1 = bits.bor(bits.shl(a1, 31), bits.shr(a1, 33)) * p1
+            a2 := v2 + bytes_read_word(data, pos + 8, 8) * p2
+            v2 = bits.bor(bits.shl(a2, 31), bits.shr(a2, 33)) * p1
+            a3 := v3 + bytes_read_word(data, pos + 16, 8) * p2
+            v3 = bits.bor(bits.shl(a3, 31), bits.shr(a3, 33)) * p1
+            a4 := v4 + bytes_read_word(data, pos + 24, 8) * p2
+            v4 = bits.bor(bits.shl(a4, 31), bits.shr(a4, 33)) * p1
             pos = pos + 32
         h = bits.rotl64(v1, 1) + bits.rotl64(v2, 7) + bits.rotl64(v3, 12) + bits.rotl64(v4, 18)
         h = merge_round(h, v1)

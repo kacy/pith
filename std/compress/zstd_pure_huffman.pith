@@ -148,6 +148,11 @@ pub fn decode_stream_into(table: HuffTable, reader: stream.BackReader, count: In
     mut pos := reader.pos
     mut window := reader.window
     mut window_base := reader.window_base
+    # decoded symbols pack into an integer, low byte first, and flush eight
+    # at a time: one write_word call in place of eight write_byte calls,
+    # and the extern call was most of each byte's cost.
+    mut acc := 0
+    mut shift := 0
     mut i := 0
     while i < count:
         at := pos - log
@@ -167,9 +172,16 @@ pub fn decode_stream_into(table: HuffTable, reader: stream.BackReader, count: In
         nbits := bits.band(entry, 255)
         if nbits == 0:
             fail "zstd: huffman code has no symbol"
-        out.write_byte(bits.shr(entry, 8))
+        acc = bits.bor(acc, bits.shl(bits.shr(entry, 8), shift))
+        shift = shift + 8
+        if shift == 64:
+            out.write_word(acc, 8)
+            acc = 0
+            shift = 0
         pos = pos - nbits
         i = i + 1
+    if shift > 0:
+        out.write_word(acc, shift / 8)
     reader.pos = pos
     return count
 

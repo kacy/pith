@@ -4,6 +4,7 @@
 # Connections are represented as plain Int file descriptors.
 #
 #   from std.net.tcp import connect, read, write, close
+import std.resilience as resilience
 #   fd := connect("127.0.0.1", 8080)!
 #   write(fd, "hello")!
 #   data := read(fd, 1024)!
@@ -62,8 +63,9 @@ pub fn accept(server_fd: Int) -> Int!:
 #         failures = 0
 #         spawn serve(accepted.ok)
 MAX_CONSECUTIVE_ACCEPT_FAILURES := 32
-ACCEPT_BACKOFF_START_MS := 5
-ACCEPT_BACKOFF_MAX_MS := 500
+# the delay curve after consecutive accept failures: 5 ms doubling to a
+# 500 ms ceiling, on std.resilience's shared curve.
+ACCEPT_RETRY := resilience.retries(MAX_CONSECUTIVE_ACCEPT_FAILURES).base(5).cap(500)
 
 # wait out the backoff owed after `consecutive` failed accepts in a row. it fails
 # once the run reaches MAX_CONSECUTIVE_ACCEPT_FAILURES, which ends the loop; the
@@ -72,26 +74,14 @@ ACCEPT_BACKOFF_MAX_MS := 500
 pub fn back_off_after_accept_failure(consecutive: Int, last_error: String) -> Bool!:
     if consecutive >= MAX_CONSECUTIVE_ACCEPT_FAILURES:
         fail "accept failed " + consecutive.to_string() + " times in a row, giving up: " + last_error
-    sleep(accept_backoff_ms(consecutive))
+    sleep(ACCEPT_RETRY.delay_ms(consecutive))
     return true
 
-# the delay owed after `consecutive` failures: it doubles from
-# ACCEPT_BACKOFF_START_MS and flattens at ACCEPT_BACKOFF_MAX_MS.
-fn accept_backoff_ms(consecutive: Int) -> Int:
-    mut ms := ACCEPT_BACKOFF_START_MS
-    mut counted := 1
-    while counted < consecutive and ms < ACCEPT_BACKOFF_MAX_MS:
-        ms = ms * 2
-        counted = counted + 1
-    if ms > ACCEPT_BACKOFF_MAX_MS:
-        return ACCEPT_BACKOFF_MAX_MS
-    return ms
-
 test "accept backoff grows and then flattens":
-    assert_eq(accept_backoff_ms(1), ACCEPT_BACKOFF_START_MS)
-    assert_eq(accept_backoff_ms(2), 10)
-    assert_eq(accept_backoff_ms(3), 20)
-    assert_eq(accept_backoff_ms(100), ACCEPT_BACKOFF_MAX_MS)
+    assert_eq(ACCEPT_RETRY.delay_ms(1), 5)
+    assert_eq(ACCEPT_RETRY.delay_ms(2), 10)
+    assert_eq(ACCEPT_RETRY.delay_ms(3), 20)
+    assert_eq(ACCEPT_RETRY.delay_ms(100), 500)
 
 test "an accept loop gives up after a bounded run of failures":
     gave_up := back_off_after_accept_failure(MAX_CONSECUTIVE_ACCEPT_FAILURES, "bad file descriptor")

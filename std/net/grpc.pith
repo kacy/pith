@@ -77,6 +77,7 @@ import std.protobuf as protobuf
 import std.bytes as bytes
 import std.bits as bits
 import std.encoding as encoding
+import std.resilience as resilience
 import std.net.tls as tls
 import std.trace as trace
 import std.metrics as metrics
@@ -101,6 +102,13 @@ pub GRPC_INTERNAL := 13
 pub GRPC_UNAVAILABLE := 14
 pub GRPC_DATA_LOSS := 15
 pub GRPC_UNAUTHENTICATED := 16
+
+# the status codes worth retrying: the ones that describe the service's
+# moment rather than the request's content. UNAVAILABLE is the transport
+# code and what a server says mid-restart; RESOURCE_EXHAUSTED and ABORTED
+# clear on their own. everything else fails the same way every time.
+pub fn retryable_code(code: Int) -> Bool:
+    return code == GRPC_UNAVAILABLE or code == GRPC_RESOURCE_EXHAUSTED or code == GRPC_ABORTED
 
 # a failed grpc call: the numeric grpc-status and the server's message.
 pub struct GrpcError:
@@ -130,6 +138,25 @@ impl Conn:
     pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
         no_metadata: List[String] := []
         return self.unary_with_headers_and_deadline(full_method, request, no_metadata, 0)!
+
+    # like unary, but retried under `policy` when the failure is one worth
+    # retrying: UNAVAILABLE (the transport-error code, and what a server says
+    # while restarting), RESOURCE_EXHAUSTED, and ABORTED. anything else — a
+    # deadline, a bad argument, an application error — propagates on the
+    # first attempt. the backoff curve is std.resilience's.
+    pub fn unary_retry(full_method: String, request: Bytes, policy: resilience.Retry) -> Bytes!GrpcError:
+        mut tries := 0
+        while true:
+            result := self.unary(full_method, request)
+            if result.is_ok:
+                return result.ok
+            if not retryable_code(result.err.status):
+                fail result.err
+            tries = tries + 1
+            if tries >= policy.attempts:
+                fail result.err
+            sleep(policy.delay_ms(tries))
+        fail GrpcError(GRPC_UNKNOWN, "unreachable")
 
     # like unary, but also sends `extra_headers` — a flat [k1, v1, k2, v2, ...]
     # list — as grpc metadata: custom http/2 request headers layered on top of the
@@ -1567,3 +1594,12 @@ test "status trailers carry the encoded message":
     assert_eq(fields.len(), 2)
     assert_eq(fields[1].name, "grpc-message")
     assert_eq(fields[1].value, "bad%0Arequest")
+
+test "only the transient status codes are retryable":
+    assert(retryable_code(GRPC_UNAVAILABLE))
+    assert(retryable_code(GRPC_RESOURCE_EXHAUSTED))
+    assert(retryable_code(GRPC_ABORTED))
+    assert(not retryable_code(GRPC_OK))
+    assert(not retryable_code(GRPC_DEADLINE_EXCEEDED))
+    assert(not retryable_code(GRPC_INVALID_ARGUMENT))
+    assert(not retryable_code(GRPC_UNAUTHENTICATED))

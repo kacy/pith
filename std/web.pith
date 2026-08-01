@@ -7,6 +7,7 @@
 #
 #   import std.web as web
 #   import std.net.http as http
+import std.resilience as resilience
 #
 #   fn main() -> Int!:
 #       app := web.new().get("/", fn(req: web.Request) => http.text(200, "hello"))
@@ -281,6 +282,41 @@ pub fn access_log(next: fn(Request) -> http.HttpResponse, req: Request) -> http.
     elapsed := time_mod.now() - started
     log.root().target("http.access").info().str("method", req.method()).str("route", req.pattern).str("path", req.path()).int("status", resp.status).duration_ms("elapsed_ms", elapsed).msg("request")
     return resp
+
+# a middleware that spends one token from `limiter` per request and answers
+# 429 when the bucket is empty. build one limiter and share it — that is the
+# point: every serving task drains the same bucket, so the cap holds for the
+# whole app no matter how many connections are open.
+#
+#   limiter := resilience.rate_limiter(100, 20)
+#   app := web.new().use_mw(web.rate_limit(limiter)).get("/", home)
+#
+# scope it to a group to shield one expensive surface:
+#   app.group("/search", web.rate_limit(limiter))
+pub fn rate_limit(limiter: resilience.Limiter) -> fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse:
+    return fn(next: fn(Request) -> http.HttpResponse, req: Request):
+        if not limiter.allow():
+            return http.response(429).text_body("rate limited")
+        return next(req)
+
+# a middleware that runs requests through a circuit breaker: a 5xx from the
+# handler counts as a failure, and once the breaker trips, callers get an
+# immediate 503 instead of waiting on a downstream that is already drowning.
+# the breaker's half-open probe is a real request; its outcome decides
+# whether the circuit closes again.
+#
+#   breaker := resilience.circuit_breaker(5, 10_000)
+#   app.group("/reports", web.circuit(breaker))
+pub fn circuit(breaker: resilience.Breaker) -> fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse:
+    return fn(next: fn(Request) -> http.HttpResponse, req: Request):
+        if not breaker.allow():
+            return http.response(503).text_body("temporarily unavailable")
+        resp := next(req)
+        if resp.status >= 500:
+            breaker.failure()
+        else:
+            breaker.success()
+        return resp
 
 # the path parameters named in `pattern` (its `:name` segments), pulled out of
 # the request's actual path so a handler can read them by name.
@@ -764,3 +800,35 @@ test "a web.App served over h2c returns a 404 body for an unmatched path":
     spawn serve_h2c_bg(app, port)
     sleep(200)
     assert(h2c_get_body(port, "/missing").contains("404"))
+
+fn always_pong(req: Request) -> http.HttpResponse:
+    return http.text(200, "pong")
+
+fn always_broken(req: Request) -> http.HttpResponse:
+    return http.server_error_response()
+
+test "the rate limit middleware answers 429 once the bucket is empty":
+    limiter := resilience.rate_limiter(50, 2)
+    guarded := rate_limit(limiter)
+    req := request_with_body("")
+
+    assert_eq(guarded(always_pong, req).status, 200)
+    assert_eq(guarded(always_pong, req).status, 200)
+    assert_eq(guarded(always_pong, req).status, 429)
+    # 50/s refills a token every 20 ms; wait comfortably past one.
+    sleep(60)
+    assert_eq(guarded(always_pong, req).status, 200)
+
+test "the circuit middleware trips on 5xx and recovers through its probe":
+    breaker := resilience.circuit_breaker(2, 40)
+    shielded := circuit(breaker)
+    req := request_with_body("")
+
+    assert_eq(shielded(always_broken, req).status, 500)
+    assert_eq(shielded(always_broken, req).status, 500)
+    # tripped: the handler is no longer reached.
+    assert_eq(shielded(always_pong, req).status, 503)
+    sleep(60)
+    # the half-open probe is a real request; a 200 closes the circuit.
+    assert_eq(shielded(always_pong, req).status, 200)
+    assert_eq(shielded(always_pong, req).status, 200)

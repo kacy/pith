@@ -1,0 +1,331 @@
+# std.resilience - retry, backoff, rate limiting, and circuit breaking
+#
+# the primitives a service composes around anything that can fail or flood:
+# a retry policy with exponential backoff, a token-bucket rate limiter, and a
+# circuit breaker. they carry no protocol knowledge — grpc, otlp and tcp
+# consume the same delay curve, and std.web wraps the limiter and breaker
+# into middleware — so the decision "how do we behave under failure" is
+# written once and read everywhere.
+#
+#   policy := resilience.retries(5).base(100).cap(2_000)
+#   body := resilience.attempt(policy, fetch_report)!
+#
+# the limiter and breaker are shared across tasks by design: one bucket, one
+# breaker, however many tasks are serving. their state lives behind a module
+# mutex, and every method takes it for a single short section.
+
+import std.time as time
+
+# ---------------------------------------------------------------
+# retry policy
+# ---------------------------------------------------------------
+
+# how many attempts to make and how to space them: `base_ms`, doubling each
+# retry, capped at `max_ms`. deterministic — no jitter — so behavior is easy
+# to test and reason about; spread callers out with the rate limiter instead.
+pub struct Retry:
+    pub attempts: Int
+    pub base_ms: Int
+    pub max_ms: Int
+
+# a policy that makes `attempts` tries in total, backing off from 100 ms and
+# capping at 10 s. tune the curve with `base` and `cap`.
+pub fn retries(attempts: Int) -> Retry:
+    return Retry(attempts, 100, 10_000)
+
+impl Retry:
+    # the first delay, in milliseconds. later delays double from here.
+    fn base(ms: Int) -> Retry:
+        return Retry(self.attempts, ms, self.max_ms)
+
+    # the largest delay the doubling is allowed to reach.
+    fn cap(ms: Int) -> Retry:
+        return Retry(self.attempts, self.base_ms, ms)
+
+    # the delay owed before retry `attempt` (1 is the first retry): base_ms,
+    # then double each step, capped at max_ms. pure, so protocols with their
+    # own loops — a typed error to classify, a Retry-After to honor — reuse
+    # the curve without adopting the runner.
+    fn delay_ms(attempt: Int) -> Int:
+        mut delay := self.base_ms
+        mut step := 1
+        while step < attempt and delay < self.max_ms:
+            delay = delay * 2
+            step = step + 1
+        if delay > self.max_ms:
+            return self.max_ms
+        return delay
+
+# run `op` under the policy: return its first success, sleep the backoff
+# between failures, and propagate the last error once attempts are exhausted.
+pub fn attempt[T](policy: Retry, op: fn() -> T!) -> T!:
+    mut tries := 0
+    while true:
+        result := op()
+        if result.is_ok:
+            return result.ok
+        tries = tries + 1
+        if tries >= policy.attempts:
+            fail result.err
+        sleep(policy.delay_ms(tries))
+    fail "unreachable"
+
+# like attempt, but `transient` decides which errors are worth retrying: a
+# permanent error propagates immediately with no backoff. the classifier
+# sees the error text, so it can match on whatever the operation reports.
+pub fn attempt_if[T](policy: Retry, op: fn() -> T!, transient: fn(String) -> Bool) -> T!:
+    mut tries := 0
+    while true:
+        result := op()
+        if result.is_ok:
+            return result.ok
+        if not transient(result.err):
+            fail result.err
+        tries = tries + 1
+        if tries >= policy.attempts:
+            fail result.err
+        sleep(policy.delay_ms(tries))
+    fail "unreachable"
+
+# ---------------------------------------------------------------
+# shared state — one mutex over the limiter and breaker registries
+# ---------------------------------------------------------------
+
+# every limiter and breaker method holds this for one short section. the
+# registries are handle-keyed maps because the state is genuinely shared:
+# the whole point of a limiter is that every serving task drains one bucket.
+mut resilience_mu := Mutex()
+mut next_handle := 1
+
+mut limiter_rate: Map[Int, Int] := {}
+mut limiter_burst_m: Map[Int, Int] := {}
+mut limiter_tokens_m: Map[Int, Int] := {}
+mut limiter_stamp: Map[Int, Int] := {}
+
+mut breaker_threshold: Map[Int, Int] := {}
+mut breaker_reset_ms: Map[Int, Int] := {}
+mut breaker_failures: Map[Int, Int] := {}
+mut breaker_open: Map[Int, Bool] := {}
+mut breaker_opened_at: Map[Int, Int] := {}
+mut breaker_probing: Map[Int, Bool] := {}
+
+fn allocate_handle() -> Int:
+    handle := next_handle
+    next_handle = next_handle + 1
+    return handle
+
+# ---------------------------------------------------------------
+# rate limiter — token bucket
+# ---------------------------------------------------------------
+
+# a token bucket: `per_second` tokens flow in continuously, up to a standing
+# reserve of `burst`. each allowed call spends one token, so sustained load
+# is held to per_second while short spikes up to burst pass untouched.
+pub struct Limiter:
+    handle: Int
+
+# build a limiter refilling `per_second` tokens with a reserve of `burst`.
+pub fn rate_limiter(per_second: Int, burst: Int) -> Limiter:
+    resilience_mu.lock()
+    handle := allocate_handle()
+    limiter_rate.insert(handle, per_second)
+    limiter_burst_m.insert(handle, burst * 1000)
+    limiter_tokens_m.insert(handle, burst * 1000)
+    limiter_stamp.insert(handle, time.mono_millis())
+    resilience_mu.unlock()
+    return Limiter(handle)
+
+impl Limiter:
+    # spend one token if the bucket has one. never waits: a denied caller
+    # decides what denial means — a 429, a drop, a fallback.
+    fn allow() -> Bool:
+        resilience_mu.lock()
+        now := time.mono_millis()
+        elapsed := now - limiter_stamp[self.handle]
+        # tokens are tracked in thousandths so integer math can meter
+        # fractional refill: per_second tokens/s is per_second m-tokens/ms.
+        mut tokens := limiter_tokens_m[self.handle] + elapsed * limiter_rate[self.handle]
+        burst := limiter_burst_m[self.handle]
+        if tokens > burst:
+            tokens = burst
+        mut allowed := false
+        if tokens >= 1000:
+            tokens = tokens - 1000
+            allowed = true
+        limiter_tokens_m.insert(self.handle, tokens)
+        limiter_stamp.insert(self.handle, now)
+        resilience_mu.unlock()
+        return allowed
+
+# ---------------------------------------------------------------
+# circuit breaker
+# ---------------------------------------------------------------
+
+# a circuit breaker: closed while things work, open after `failures`
+# consecutive failures, and half-open — exactly one probe allowed through —
+# once `reset_ms` has passed. the probe's outcome decides: success closes
+# the circuit, failure re-opens it for another reset_ms.
+pub struct Breaker:
+    handle: Int
+
+# build a breaker that trips after `failures` consecutive failures and
+# allows its half-open probe once `reset_ms` has passed.
+pub fn circuit_breaker(failures: Int, reset_ms: Int) -> Breaker:
+    resilience_mu.lock()
+    handle := allocate_handle()
+    breaker_threshold.insert(handle, failures)
+    breaker_reset_ms.insert(handle, reset_ms)
+    breaker_failures.insert(handle, 0)
+    breaker_open.insert(handle, false)
+    breaker_opened_at.insert(handle, 0)
+    breaker_probing.insert(handle, false)
+    resilience_mu.unlock()
+    return Breaker(handle)
+
+impl Breaker:
+    # true when the call may proceed. while open, every caller is refused
+    # until reset_ms has passed; then exactly one caller gets through as the
+    # probe and must report back through success() or failure().
+    fn allow() -> Bool:
+        resilience_mu.lock()
+        mut allowed := true
+        # the open flag is explicit state rather than a timestamp sentinel:
+        # the mono clock starts at zero with the process, so "opened at 0"
+        # is a perfectly real moment.
+        if breaker_open[self.handle]:
+            allowed = false
+            waited := time.mono_millis() - breaker_opened_at[self.handle]
+            if waited >= breaker_reset_ms[self.handle] and not breaker_probing[self.handle]:
+                breaker_probing.insert(self.handle, true)
+                allowed = true
+        resilience_mu.unlock()
+        return allowed
+
+    # report a success: the circuit closes and the failure count resets.
+    fn success():
+        resilience_mu.lock()
+        breaker_failures.insert(self.handle, 0)
+        breaker_open.insert(self.handle, false)
+        breaker_probing.insert(self.handle, false)
+        resilience_mu.unlock()
+
+    # report a failure: closed, it counts toward the threshold and trips the
+    # circuit when reached; half-open, the probe failed and the circuit
+    # re-opens for another reset_ms.
+    fn failure():
+        resilience_mu.lock()
+        if breaker_open[self.handle]:
+            breaker_opened_at.insert(self.handle, time.mono_millis())
+            breaker_probing.insert(self.handle, false)
+        else:
+            count := breaker_failures[self.handle] + 1
+            breaker_failures.insert(self.handle, count)
+            if count >= breaker_threshold[self.handle]:
+                breaker_open.insert(self.handle, true)
+                breaker_opened_at.insert(self.handle, time.mono_millis())
+                breaker_probing.insert(self.handle, false)
+        resilience_mu.unlock()
+
+    # "closed", "open", or "half_open" — for logs and dashboards; decisions
+    # belong to allow().
+    fn state() -> String:
+        resilience_mu.lock()
+        mut current := "closed"
+        if breaker_open[self.handle]:
+            current = "open"
+            if breaker_probing[self.handle]:
+                current = "half_open"
+        resilience_mu.unlock()
+        return current
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+mut test_calls := 0
+
+fn test_flaky() -> String!:
+    test_calls = test_calls + 1
+    if test_calls < 3:
+        fail "transient wobble"
+    return "recovered"
+
+fn test_permanent() -> Int!:
+    test_calls = test_calls + 1
+    fail "permanent: bad request"
+
+fn test_is_transient(err: String) -> Bool:
+    return err.starts_with("transient")
+
+test "the delay curve doubles from base and flattens at the cap":
+    policy := retries(9).base(100).cap(2_000)
+    assert_eq(policy.delay_ms(1), 100)
+    assert_eq(policy.delay_ms(2), 200)
+    assert_eq(policy.delay_ms(3), 400)
+    assert_eq(policy.delay_ms(5), 1_600)
+    assert_eq(policy.delay_ms(6), 2_000)
+    assert_eq(policy.delay_ms(9), 2_000)
+
+test "attempt returns the first success and stops calling":
+    test_calls = 0
+    got := attempt(retries(5).base(1), test_flaky)!
+    assert_eq(got, "recovered")
+    assert_eq(test_calls, 3)
+
+test "attempt exhausts its budget and propagates the last error":
+    test_calls = 0
+    result := attempt(retries(4).base(1), test_permanent)
+    assert(result.is_err)
+    assert_eq(result.err, "permanent: bad request")
+    assert_eq(test_calls, 4)
+
+test "attempt_if refuses to retry a permanent error":
+    test_calls = 0
+    result := attempt_if(retries(5).base(1), test_permanent, test_is_transient)
+    assert(result.is_err)
+    assert_eq(test_calls, 1)
+
+    test_calls = 0
+    got := attempt_if(retries(5).base(1), test_flaky, test_is_transient)!
+    assert_eq(got, "recovered")
+    assert_eq(test_calls, 3)
+
+test "the limiter spends its burst and refills over time":
+    limiter := rate_limiter(100, 3)
+    assert(limiter.allow())
+    assert(limiter.allow())
+    assert(limiter.allow())
+    assert(not limiter.allow())
+    # 100/s refills a token every 10 ms; wait comfortably past one.
+    sleep(30)
+    assert(limiter.allow())
+
+test "the breaker trips, refuses, probes, and recovers":
+    breaker := circuit_breaker(2, 40)
+    assert_eq(breaker.state(), "closed")
+    assert(breaker.allow())
+    breaker.failure()
+    assert(breaker.allow())
+    breaker.failure()
+    # two consecutive failures tripped it: everyone is refused.
+    assert_eq(breaker.state(), "open")
+    assert(not breaker.allow())
+    # after reset_ms, exactly one probe passes and the rest still wait.
+    sleep(60)
+    assert(breaker.allow())
+    assert_eq(breaker.state(), "half_open")
+    assert(not breaker.allow())
+    # the probe succeeded, so the circuit closes for everyone.
+    breaker.success()
+    assert_eq(breaker.state(), "closed")
+    assert(breaker.allow())
+
+test "a failed probe re-opens the circuit":
+    breaker := circuit_breaker(1, 40)
+    breaker.failure()
+    assert(not breaker.allow())
+    sleep(60)
+    assert(breaker.allow())
+    breaker.failure()
+    assert_eq(breaker.state(), "open")
+    assert(not breaker.allow())

@@ -143,6 +143,12 @@ impl ByteBuffer:
     fn get(index: Int) -> Int:
         return byte_buffer_get(self.handle, index)
 
+    ## append `len` bytes copied from `src` within this buffer — the
+    ## back-reference an lz-family decoder emits. an overlapping range
+    ## repeats, which is how a run costs one short match.
+    fn copy_within(src: Int, len: Int) -> Bool:
+        return byte_buffer_copy_within(self.handle, src, len)
+
     fn set(index: Int, value: Int) -> Bool:
         return byte_buffer_set(self.handle, index, value)
 

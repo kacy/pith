@@ -368,6 +368,39 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     1
 }
 
+/// Append `len` bytes copied from `src` within this same buffer — the
+/// back-reference every LZ-family decoder needs. The copy runs forward one
+/// byte at a time on purpose: when the source range overlaps the
+/// destination (offset < len), that repetition IS the encoding, which is
+/// how a run of bytes costs one short match. Returns 1, or 0 on a bad
+/// handle or a range that starts outside the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len: i64) -> i64 {
+    let Some(buffer) = pith_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    if src < 0 || len < 0 || (src as usize) >= buffer.data.len() {
+        return 0;
+    }
+    let src = src as usize;
+    let len = len as usize;
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, len);
+    buffer.data.reserve(len);
+    // a non-overlapping range is a straight extend; the overlapping case
+    // walks so each copied byte can feed the next.
+    if src + len <= buffer.data.len() {
+        buffer.data.extend_from_within(src..src + len);
+    } else {
+        for i in 0..len {
+            let byte = buffer.data[src + i];
+            buffer.data.push(byte);
+        }
+    }
+    1
+}
+
 /// Extract the accumulated bytes (moving the storage, no copy) and free
 /// the buffer in one step: the natural end of a build-then-extract
 /// buffer's life.

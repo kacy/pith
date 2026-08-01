@@ -541,6 +541,77 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
     builder.block_params(done)[0]
 }
 
+/// Inline bytes.read_word for the common case — a count of 1..=8 with a
+/// full 8-byte window inside the data — as one load and a mask, skipping
+/// the FFI call that dominates word-at-a-time scanners (the xxhash kernel,
+/// the bitstream refill). Everything else (null handle, reads within the
+/// last seven bytes, bad counts) falls back to pith_bytes_read_word for
+/// identical semantics. The checks mirror inline_bytes_get: the 8-byte
+/// load never reads past the allocation because the fast path requires
+/// off + 8 <= len.
+fn inline_bytes_read_word(
+    builder: &mut FunctionBuilder<'_>,
+    bytes: Value,
+    off: Value,
+    count: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+
+    let is_null = builder.ins().icmp_imm(IntCC::Equal, bytes, 0);
+    let after_null = builder.create_block();
+    builder.ins().brif(is_null, slow, &[], after_null, &[]);
+    builder.switch_to_block(after_null);
+
+    // count outside 1..=8: one unsigned compare on count - 1
+    let count_m1 = builder.ins().iadd_imm(count, -1);
+    let count_bad = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, count_m1, 8);
+    let after_count = builder.create_block();
+    builder.ins().brif(count_bad, slow, &[], after_count, &[]);
+    builder.switch_to_block(after_count);
+
+    // a negative offset must not reach the address arithmetic
+    let off_neg = builder.ins().icmp_imm(IntCC::SignedLessThan, off, 0);
+    let after_neg = builder.create_block();
+    builder.ins().brif(off_neg, slow, &[], after_neg, &[]);
+    builder.switch_to_block(after_neg);
+
+    // require the full window: off + 8 <= len. off is non-negative here, so
+    // the add can only wrap for absurd offsets, which the unsigned compare
+    // then routes to the slow path anyway.
+    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, 8);
+    let off_p8 = builder.ins().iadd_imm(off, 8);
+    let no_room = builder.ins().icmp(IntCC::UnsignedGreaterThan, off_p8, len);
+    let read = builder.create_block();
+    builder.ins().brif(no_room, slow, &[], read, &[]);
+    builder.switch_to_block(read);
+
+    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, 0);
+    let addr = builder.ins().iadd(data_ptr, off);
+    let word = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
+    // keep the low `count` bytes: all-ones shifted down by (8 - count) * 8,
+    // which is 0 for a full word — no shift-by-64 edge case.
+    let eight = builder.ins().iconst(types::I64, 8);
+    let spare = builder.ins().isub(eight, count);
+    let shift_bits = builder.ins().ishl_imm(spare, 3);
+    let all_ones = builder.ins().iconst(types::I64, -1);
+    let mask = builder.ins().ushr(all_ones, shift_bits);
+    let value = builder.ins().band(word, mask);
+    jump_with_i64_arg(builder, done, value);
+
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, &[bytes, off, count]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
 // The magic word every heap cstring carries at `ptr - 16`. This mirrors
 // `runtime_core::CSTRING_MAGIC` and must stay in sync with it. A drift is not a
 // safety problem — the fast path below simply stops matching and every access
@@ -1869,6 +1940,28 @@ fn compile_ir_function(
                     }
                     if fname == "bytes_get" && args.len() == 2 {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    if fname == "bytes_read_word" && args.len() == 3 {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "bytes_read_word",
+                        )?;
+                        let inlined = inline_bytes_read_word(
+                            &mut builder,
+                            args[0],
+                            args[1],
+                            args[2],
+                            fallback,
+                        );
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);

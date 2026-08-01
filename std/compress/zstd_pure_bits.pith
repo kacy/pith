@@ -1,0 +1,185 @@
+# std/compress/zstd_pure_bits — bitstreams for the pure-pith zstd codec.
+#
+# zstd uses two stream shapes. entropy-coded payloads (fse states, huffman
+# literals, sequence extra bits) are read BACKWARD: bits pack lsb-first into
+# bytes, the final byte carries a sentinel 1 above the last real bit, and the
+# reader starts just below the sentinel and consumes toward byte zero. table
+# descriptions (normalized counts) read FORWARD, plain lsb-first. the writer
+# builds a backward stream by recording reads in decode order and reversing.
+
+import std.bits as bits
+import std.bytes as bytes
+
+# ---------------------------------------------------------------
+# backward reader
+# ---------------------------------------------------------------
+
+## a backward bitstream over data[start..end). `pos` is an absolute bit index
+## (bit i lives at byte i/8, lsb-first); reads move it down toward start*8.
+pub struct BackReader:
+    data: Bytes
+    start_bit: Int
+    pos: Int
+    ok: Bool
+
+## open the stream: find the sentinel in the last byte and stand just below
+## it. an all-zero final byte has no sentinel and marks the stream corrupt.
+pub fn back_reader(data: Bytes, start: Int, end: Int) -> BackReader:
+    if end <= start or end > data.len():
+        return BackReader(data, 0, 0, false)
+    last := data[end - 1]
+    if last == 0:
+        return BackReader(data, 0, 0, false)
+    mut top := 7
+    while bits.band(bits.shr(last, top), 1) == 0:
+        top = top - 1
+    return BackReader(data, start * 8, (end - 1) * 8 + top, true)
+
+impl BackReader:
+    ## how many readable bits remain.
+    fn remaining() -> Int:
+        return self.pos - self.start_bit
+
+    ## read `n` bits (0 to 32), moving down. reading past the start returns
+    ## the bits that exist padded with zeros below, which mirrors the
+    ## reference decoder's tolerance for the final state reads; callers that
+    ## must not over-read check remaining() first.
+    fn read(n: Int) -> Int:
+        if n == 0:
+            return 0
+        self.pos = self.pos - n
+        mut floor_bit := self.pos
+        if floor_bit < self.start_bit:
+            floor_bit = self.start_bit
+        mut value := 0
+        mut i := self.pos + n - 1
+        while i >= floor_bit:
+            value = bits.bor(bits.shl(value, 1), bits.band(bits.shr(self.data[i / 8], i % 8), 1))
+            i = i - 1
+        # bits conceptually below the start read as zero
+        if self.pos < self.start_bit:
+            value = bits.shl(value, self.start_bit - self.pos)
+        return value
+
+# ---------------------------------------------------------------
+# forward reader (table descriptions)
+# ---------------------------------------------------------------
+
+## a forward lsb-first bitstream, for fse table descriptions.
+pub struct ForwardReader:
+    data: Bytes
+    limit_bit: Int
+    pos: Int
+
+## open a forward lsb-first reader over data[start..end).
+pub fn forward_reader(data: Bytes, start: Int, end: Int) -> ForwardReader:
+    return ForwardReader(data, end * 8, start * 8)
+
+impl ForwardReader:
+    fn remaining() -> Int:
+        return self.limit_bit - self.pos
+
+    ## bytes fully or partially consumed so far, relative to the stream start.
+    fn bytes_used(start: Int) -> Int:
+        return (self.pos - start * 8 + 7) / 8
+
+    fn read(n: Int) -> Int:
+        mut value := 0
+        mut i := 0
+        while i < n:
+            if self.pos < self.limit_bit:
+                value = bits.bor(value, bits.shl(bits.band(bits.shr(self.data[self.pos / 8], self.pos % 8), 1), i))
+            self.pos = self.pos + 1
+            i = i + 1
+        return value
+
+    ## look at `n` bits without consuming them.
+    fn peek(n: Int) -> Int:
+        saved := self.pos
+        value := self.read(n)
+        self.pos = saved
+        return value
+
+    ## give back `n` bits.
+    fn unread(n: Int):
+        self.pos = self.pos - n
+
+# ---------------------------------------------------------------
+# backward writer
+# ---------------------------------------------------------------
+
+## builds a stream the BackReader (and any zstd decoder) reads correctly:
+## record values in the order the decoder will read them, and finish()
+## reverses, packs lsb-first, and adds the sentinel.
+pub struct BackWriter:
+    values: List[Int]
+    widths: List[Int]
+
+## an empty backward writer; record reads with write(), pack with finish().
+pub fn back_writer() -> BackWriter:
+    return BackWriter([], [])
+
+impl BackWriter:
+    ## record the next value the decoder will read (n up to 32 bits).
+    fn write(value: Int, n: Int):
+        self.values.push(value)
+        self.widths.push(n)
+
+    ## pack everything into bytes: last-recorded lands deepest, first-recorded
+    ## sits just under the sentinel, so a backward reader yields the recorded
+    ## order. returns the byte list.
+    fn finish() -> List[Int]:
+        mut out: List[Int] := []
+        mut acc := 0
+        mut nbits := 0
+        mut i := self.values.len() - 1
+        while i >= 0:
+            acc = bits.bor(acc, bits.shl(bits.band(self.values[i], bits.shl(1, self.widths[i]) - 1), nbits))
+            nbits = nbits + self.widths[i]
+            while nbits >= 8:
+                out.push(bits.band(acc, 255))
+                acc = bits.shr(acc, 8)
+                nbits = nbits - 8
+            i = i - 1
+        # sentinel: a 1 above the last real bit
+        acc = bits.bor(acc, bits.shl(1, nbits))
+        out.push(bits.band(acc, 255))
+        return out
+
+test "the backward reader walks a hand-packed stream":
+    # bits (top to bottom): 5 (3 bits), 2 (2 bits), 9 (4 bits) → written
+    # reversed and sentineled by the writer, then read back in order.
+    w := back_writer()
+    w.write(5, 3)
+    w.write(2, 2)
+    w.write(9, 4)
+    packed := w.finish()
+    mut buf := bytes.buffer()
+    for b in packed:
+        buf.write_byte(b)
+    data := buf.take_bytes()
+    r := back_reader(data, 0, data.len())
+    assert(r.ok)
+    assert_eq(r.read(3), 5)
+    assert_eq(r.read(2), 2)
+    assert_eq(r.read(4), 9)
+    assert_eq(r.remaining(), 0)
+
+test "the forward reader is plain lsb-first":
+    mut buf := bytes.buffer()
+    buf.write_byte(0b10110100)
+    buf.write_byte(0b00000001)
+    data := buf.take_bytes()
+    r := forward_reader(data, 0, 2)
+    assert_eq(r.read(4), 4)
+    assert_eq(r.read(4), 11)
+    assert_eq(r.read(1), 1)
+    assert_eq(r.peek(2), 0)
+    assert_eq(r.remaining(), 7)
+
+test "an all-zero final byte is corrupt, not a stream":
+    mut buf := bytes.buffer()
+    buf.write_byte(7)
+    buf.write_byte(0)
+    data := buf.take_bytes()
+    assert(not back_reader(data, 0, 2).ok)

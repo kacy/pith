@@ -1,0 +1,37 @@
+# the compression family: gzip (rfc 1952, pure pith) and zstd (rfc 8878,
+# the reference codec in the runtime). the surfaces mirror each other —
+# compress, decompress, and a bounded decompress for untrusted input, where
+# the cap is enforced while decoding so a decompression bomb fails at the
+# limit instead of allocating its way there.
+
+import std.bytes as bytes
+import std.compress.gzip as gzip
+import std.compress.zstd as zstd
+
+fn main() -> Int!:
+    # a repetitive payload, the shape compression is for
+    mut buf := bytes.buffer()
+    mut i := 0
+    while i < 200:
+        buf.write_string_utf8("the quick brown fox jumps over the lazy dog. ")
+        i = i + 1
+    raw := buf.take_bytes()
+    print("raw: {raw.len()} bytes")
+
+    gz := gzip.compress(raw)
+    print("gzip: {gz.len()} bytes, round trips: {gzip.decompress(gz)!.len() == raw.len()}")
+
+    zs := zstd.compress(raw)
+    print("zstd: {zs.len()} bytes, round trips: {zstd.decompress(zs)!.len() == raw.len()}")
+
+    # levels trade effort for size; 3 is the default, 19 grinds harder
+    tight := zstd.compress_level(raw, 19)!
+    print("zstd -19: {tight.len()} bytes")
+
+    # untrusted input gets a ceiling: this 9000-byte payload will not fit
+    # into 1000, and the decode fails at the cap rather than after it
+    print("bounded refuses: {zstd.decompress_bounded(zs, 1000).is_err}")
+
+    # each format recognizes its own magic
+    print("magic routing: gzip={zstd.is_valid(gz)} zstd={zstd.is_valid(zs)}")
+    return 0

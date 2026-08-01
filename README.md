@@ -142,7 +142,7 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-84 modules, ~38,000 lines, all pith. the areas: io and filesystems
+85 modules, ~38,000 lines, all pith. the areas: io and filesystems
 (fs, glob, path, process), networking (tcp, dns, url, http, http2,
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling — plus db, a
@@ -152,7 +152,7 @@ toml, yaml, csv, config, table, see [docs/yaml.md](docs/yaml.md) for the
 yaml subset), bytes and crypto (hash, checksum, encoding,
 crypto, bits, binary — including argon2id password hashing and json web
 tokens, see [docs/auth.md](docs/auth.md)),
-compression and archives (gzip/zlib, tar, zip),
+compression and archives (gzip/zlib in pure pith, zstd on the reference codec, tar, zip),
 text (regex, scanner, fmt), app plumbing (log, metrics, cli, env, testing,
 diagnostic, time, datetime, rand, uuid, math), resilience (retry with
 backoff, rate limiting, circuit breaking — shared by the web middleware and

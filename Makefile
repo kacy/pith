@@ -1195,6 +1195,25 @@ gzip-interop-check:
 	gunzip -c "$$tmpdir/out.gz" | cmp - README.md && \
 	echo "system gunzip reads pith output byte-identical"
 
+# --- zstd interop check ---
+# both directions against the system tool: pith reads zstd's output at two
+# levels, and zstd reads pith's
+
+zstd-interop-check:
+	@echo "--- zstd interop check ---"
+	@tmpdir=$$(mktemp -d /tmp/pith-zstd-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'import std.fs as fs\nimport std.compress.zstd as zstd\n\nfn main() -> Int!:\n    raw := fs.read_bytes("README.md")!\n    fs.write_bytes("'"$$tmpdir"'/out.zst", zstd.compress(raw))!\n    return 0\n' > "$$tmpdir/pack.pith"; \
+	./target/release/pith run "$$tmpdir/pack.pith" > /dev/null 2>&1 && \
+	zstd -d -c "$$tmpdir/out.zst" | cmp - README.md && \
+	echo "system zstd reads pith output byte-identical"; \
+	zstd -3 -c README.md > "$$tmpdir/sys3.zst"; \
+	zstd -19 -c README.md > "$$tmpdir/sys19.zst"; \
+	printf 'import std.fs as fs\nimport std.compress.zstd as zstd\n\nfn main() -> Int!:\n    a := zstd.decompress(fs.read_bytes("'"$$tmpdir"'/sys3.zst")!)!\n    b := zstd.decompress(fs.read_bytes("'"$$tmpdir"'/sys19.zst")!)!\n    fs.write_bytes("'"$$tmpdir"'/back3", a)!\n    fs.write_bytes("'"$$tmpdir"'/back19", b)!\n    return 0\n' > "$$tmpdir/unpack.pith"; \
+	./target/release/pith run "$$tmpdir/unpack.pith" > /dev/null 2>&1 && \
+	cmp "$$tmpdir/back3" README.md && cmp "$$tmpdir/back19" README.md && \
+	echo "pith reads system zstd output at levels 3 and 19 byte-identical"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

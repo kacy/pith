@@ -56,6 +56,17 @@ impl Retry:
             return self.max_ms
         return delay
 
+    # the delay before retry `attempt` when the server stated its own
+    # minimum — an http Retry-After, a grpc retry-info — already converted
+    # to milliseconds. whichever is larger wins: the curve is this side's
+    # patience, the hint is the other side's, and ignoring the larger one
+    # either hammers a server that asked for room or waits for no reason.
+    fn delay_with_hint_ms(attempt: Int, server_hint_ms: Int) -> Int:
+        delay := self.delay_ms(attempt)
+        if server_hint_ms > delay:
+            return server_hint_ms
+        return delay
+
 # run `op` under the policy: return its first success, sleep the backoff
 # between failures, and propagate the last error once attempts are exhausted.
 pub fn attempt[T](policy: Retry, op: fn() -> T!) -> T!:
@@ -265,6 +276,13 @@ test "the delay curve doubles from base and flattens at the cap":
     assert_eq(policy.delay_ms(5), 1_600)
     assert_eq(policy.delay_ms(6), 2_000)
     assert_eq(policy.delay_ms(9), 2_000)
+
+test "a server hint overrides the curve only when it is larger":
+    policy := retries(5).base(100).cap(2_000)
+    assert_eq(policy.delay_with_hint_ms(1, 0), 100)
+    assert_eq(policy.delay_with_hint_ms(1, 50), 100)
+    assert_eq(policy.delay_with_hint_ms(1, 5_000), 5_000)
+    assert_eq(policy.delay_with_hint_ms(3, 250), 400)
 
 test "attempt returns the first success and stops calling":
     test_calls = 0

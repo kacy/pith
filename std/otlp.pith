@@ -487,21 +487,14 @@ fn prepare_body(cfg: Target, body: Bytes) -> (Bytes, String):
 pub fn is_retryable(status: Int) -> Bool:
     return status == 429 or status >= 500
 
-# the shared curve, shifted for this module's 0-indexed attempt counters.
-fn backoff_ms(attempt: Int) -> Int:
-    return EXPORT_RETRY.delay_ms(attempt + 1)
-
-# how long to wait before the next retry: the exponential backoff, unless the
-# collector sent a larger Retry-After (in seconds) we should honor instead.
-fn retry_delay_ms(resp: http.HttpResponse, attempt: Int) -> Int:
-    backoff := backoff_ms(attempt)
+# the collector's Retry-After header in milliseconds, or 0 when absent or
+# unreadable. parsing the header is this module's job; weighing it against
+# the backoff curve is the policy's (delay_with_hint_ms).
+fn retry_after_ms(resp: http.HttpResponse) -> Int:
     retry_after := resp.header_value("Retry-After")
     if retry_after == "":
-        return backoff
-    server_ms := (parse_int(retry_after) catch 0) * 1000
-    if server_ms > backoff:
-        return server_ms
-    return backoff
+        return 0
+    return (parse_int(retry_after) catch 0) * 1000
 
 # POST an encoded protobuf body to a signal path (e.g. /v1/traces) on the
 # collector, returning the response. sends the target's configured headers, the
@@ -538,7 +531,7 @@ fn post_with_retry(cfg: Target, signal_path: String, body: Bytes) -> Bool:
             # transport failure (connect/timeout/reset): retry while attempts remain.
             if last_attempt:
                 return false
-            time.delay(backoff_ms(attempt))
+            time.delay(EXPORT_RETRY.delay_ms(attempt + 1))
         else:
             status := result.ok.status
             if status >= 200 and status < 300:
@@ -548,7 +541,7 @@ fn post_with_retry(cfg: Target, signal_path: String, body: Bytes) -> Bool:
                 return false
             if last_attempt:
                 return false
-            time.delay(retry_delay_ms(result.ok, attempt))
+            time.delay(EXPORT_RETRY.delay_with_hint_ms(attempt + 1, retry_after_ms(result.ok)))
         attempt = attempt + 1
     return false
 
@@ -605,7 +598,7 @@ fn export_over_grpc(cfg: Target, full_method: String, body: Bytes) -> Bool!:
         last_attempt := attempt + 1 >= EXPORT_RETRY.attempts
         if last_attempt or not grpc_is_retryable(status):
             return false
-        time.delay(backoff_ms(attempt))
+        time.delay(EXPORT_RETRY.delay_ms(attempt + 1))
         attempt = attempt + 1
     return false
 
@@ -1112,17 +1105,12 @@ test "is_retryable retries 429 and 5xx but not other statuses":
     assert(is_retryable(503))
     assert(is_retryable(504))
 
-test "backoff doubles each attempt and caps at the maximum":
-    assert_eq(backoff_ms(0), 1000)          # first retry waits the base
-    assert_eq(backoff_ms(1), 2000)
-    assert_eq(backoff_ms(2), 4000)
-    assert_eq(backoff_ms(3), 8000)
-    # it is monotonic increasing until it saturates.
-    assert(backoff_ms(1) > backoff_ms(0))
-    assert(backoff_ms(2) > backoff_ms(1))
-    # a late attempt saturates at the cap and stays there.
-    assert_eq(backoff_ms(6), 30000)
-    assert_eq(backoff_ms(20), 30000)
+test "the export policy doubles from a second and caps at thirty":
+    assert_eq(EXPORT_RETRY.delay_ms(1), 1000)
+    assert_eq(EXPORT_RETRY.delay_ms(2), 2000)
+    assert_eq(EXPORT_RETRY.delay_ms(4), 8000)
+    assert_eq(EXPORT_RETRY.delay_ms(6), 30000)
+    assert_eq(EXPORT_RETRY.delay_ms(20), 30000)
 
 test "prepare_body compresses with the configured codec only":
     body := bytes.from_string_utf8("an otlp protobuf body")
@@ -1140,21 +1128,22 @@ test "prepare_body compresses with the configured codec only":
     assert_eq(zs.1, "zstd")
     assert_eq(zstd.decompress(zs.0)!.to_string_utf8()!, "an otlp protobuf body")
 
-test "retry_delay prefers a larger Retry-After over the backoff":
+test "Retry-After parses to milliseconds and weighs in through the policy":
     empty_headers: Map[String, String] := {}
-    # no Retry-After header: fall back to the exponential backoff.
+    # no header: no hint, the curve alone decides.
     without := http.HttpResponse(503, "", empty_headers, bytes.empty(), [], {})
-    assert_eq(retry_delay_ms(without, 0), backoff_ms(0))
+    assert_eq(retry_after_ms(without), 0)
+    assert_eq(EXPORT_RETRY.delay_with_hint_ms(1, retry_after_ms(without)), 1000)
 
-    # a Retry-After larger than the backoff wins (5s vs the 1s base backoff).
+    # a Retry-After larger than the backoff wins (5s vs the 1s base).
     big_headers: Map[String, String] := {"Retry-After": "5"}
     bigger := http.HttpResponse(503, "", big_headers, bytes.empty(), [], {})
-    assert_eq(retry_delay_ms(bigger, 0), 5000)
+    assert_eq(EXPORT_RETRY.delay_with_hint_ms(1, retry_after_ms(bigger)), 5000)
 
-    # a Retry-After smaller than the backoff is ignored in favor of the backoff.
+    # a Retry-After smaller than the backoff is ignored in favor of the curve.
     small_headers: Map[String, String] := {"Retry-After": "1"}
     smaller := http.HttpResponse(503, "", small_headers, bytes.empty(), [], {})
-    assert_eq(retry_delay_ms(smaller, 3), backoff_ms(3))
+    assert_eq(EXPORT_RETRY.delay_with_hint_ms(4, retry_after_ms(smaller)), 8000)
 
 test "grpc_method_for maps each signal path to its Export method":
     assert_eq(grpc_method_for("/v1/traces"), "/opentelemetry.proto.collector.trace.v1.TraceService/Export")

@@ -561,6 +561,16 @@ justifies a change), and a representation change must price the read
 side, not just the write (three parallel int lists beat a struct list on
 push and lost it all back reading the fields out).
 
+the encoder side exists too, pure pith end to end: stored, huffman, and
+full sequence blocks with repeat offsets, verified shape by shape against
+the system zstd binary (`make zstd-encode-check` — the system binary must
+decode every pith-compressed frame byte-identical, because a round trip
+through our own decoder proved nothing twice on this code). sizes land
+within 1.16x of `zstd -3` on text and at parity on runs and
+incompressible input; a megabyte of source compresses at 1.44x of -3's
+size while encoding at about 4 mb/s. custom fse table descriptions and
+lazy matching are the remaining size levers.
+
 `bench/cyclic_graph` — struct nodes wired into reference cycles
 (parent<->child) and dropped, 2m of them. refcounting alone cannot
 reclaim a cycle, so the strong version leaks; marking one edge of each

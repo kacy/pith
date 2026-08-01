@@ -61,6 +61,19 @@ impl BackReader:
             value = bits.shl(value, self.start_bit - self.pos)
         return value
 
+    ## look at the next `n` bits without consuming them. huffman decoding
+    ## needs this: it peeks a full table-log worth of bits to index the
+    ## table, then consumes only the code length the entry names.
+    fn peek(n: Int) -> Int:
+        saved := self.pos
+        value := self.read(n)
+        self.pos = saved
+        return value
+
+    ## consume `n` bits without decoding them.
+    fn skip(n: Int):
+        self.pos = self.pos - n
+
 # ---------------------------------------------------------------
 # forward reader (table descriptions)
 # ---------------------------------------------------------------

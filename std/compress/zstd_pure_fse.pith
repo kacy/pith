@@ -65,11 +65,17 @@ pub fn build_decode_table(counts: List[Int], log: Int) -> FseTable:
             n = n - 1
         s = s + 1
 
-    # per symbol, count occurrences so each slot's next-state math is set.
-    mut seen: List[Int] := []
+    # each symbol's running state starts at its own normalized count, not at
+    # one: that offset is what spreads a frequent symbol's states across the
+    # table's high half, where they cost fewer bits to reach. a
+    # low-probability symbol starts at 1.
+    mut next_state: List[Int] := []
     s = 0
     while s < counts.len():
-        seen.push(0)
+        if counts[s] < 0:
+            next_state.push(1)
+        else:
+            next_state.push(counts[s])
         s = s + 1
 
     mut entries: List[FseEntry] := []
@@ -81,13 +87,12 @@ pub fn build_decode_table(counts: List[Int], log: Int) -> FseTable:
     i = 0
     while i < size:
         sym := symbol_of[i]
-        occ := seen[sym] + 1
-        seen[sym] = occ
-        # the next state uses `log - floor(log2(occ))` bits; base is where
-        # this slot's states begin in the table.
-        nb := log - bit_length(occ - 1)
-        # guard: an unused symbol (count 0) never lands in a slot, so occ>=1.
-        base := bits.shl(occ, nb) - size
+        state := next_state[sym]
+        next_state[sym] = state + 1
+        # nb = log - floor(log2(state)); base is where this slot's reachable
+        # states begin.
+        nb := log - (bit_length(state) - 1)
+        base := bits.shl(state, nb) - size
         entries[i] = FseEntry(sym, nb, base)
         i = i + 1
 

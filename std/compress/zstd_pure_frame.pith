@@ -9,6 +9,8 @@
 import std.bits as bits
 import std.bytes as bytes
 import std.compress.zstd_pure_xxhash as xxhash
+import std.compress.zstd_pure_huffman as huffman
+import std.compress.zstd_pure_sequences as sequences
 
 ## the zstd frame magic, little-endian on the wire: 28 B5 2F FD.
 pub MAGIC := 0xFD2FB528
@@ -137,9 +139,49 @@ pub fn parse_block_header(data: Bytes, off: Int) -> BlockHeader!:
         fail "zstd: reserved block type"
     return BlockHeader(kind, size, off + 3, last)
 
-## decompress a frame built only from raw and rle blocks, holding output to
-## `max_output`. an entropy-compressed block fails with a clear message —
-## that layer lands next. the content checksum is verified when present.
+# decode one compressed block: a literals section, then a sequence section
+# that weaves those literals together with matches into earlier output.
+fn decode_compressed_block(data: Bytes, start: Int, end: Int, history: Bytes, budget: Int) -> Bytes!:
+    lit := huffman.parse_literals_header(data, start)!
+    mut pos := start + lit.header_len
+
+    mut literals := bytes.empty()
+    if lit.kind == huffman.LITERALS_RAW:
+        if pos + lit.regenerated_size > end:
+            fail "zstd: raw literals run past the block"
+        literals = data.slice(pos, pos + lit.regenerated_size)
+        pos = pos + lit.regenerated_size
+    elif lit.kind == huffman.LITERALS_RLE:
+        if pos >= end:
+            fail "zstd: truncated rle literals"
+        mut buf := bytes.buffer()
+        defer buf.free()
+        mut i := 0
+        while i < lit.regenerated_size:
+            buf.write_byte(data[pos])
+            i = i + 1
+        literals = buf.bytes()
+        pos = pos + 1
+    else:
+        fail "zstd: huffman-coded literals are not decoded yet"
+
+    # a block with no sequences is literals alone.
+    if pos >= end:
+        return literals
+
+    count := sequences.read_sequence_count(data, pos)!
+    pos = pos + count.bytes_used
+    if count.count == 0:
+        return literals
+
+    built := sequences.read_tables(data, pos, end)!
+    pos = pos + built.1
+    decoded := sequences.decode_sequences(data, pos, end, count.count, built.0)!
+    return sequences.execute(decoded, literals, history, budget)!
+
+## decompress a frame, holding output to `max_output`. raw, rle, and
+## compressed blocks all decode; huffman-coded literals are the remaining
+## gap. the content checksum is verified when present.
 pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     if max_output <= 0:
         fail "zstd: max_output must be positive"
@@ -173,7 +215,15 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
                 i = i + 1
             pos = block.body_start + 1
         else:
-            fail "zstd: compressed blocks are not decoded yet (entropy layer pending)"
+            if block.body_start + block.size > data.len():
+                fail "zstd: compressed block runs past the end of the frame"
+            history := out.bytes()
+            piece := decode_compressed_block(data, block.body_start, block.body_start + block.size, history, max_output - out.len())!
+            mut i := 0
+            while i < piece.len():
+                out.write_byte(piece[i])
+                i = i + 1
+            pos = block.body_start + block.size
         done = block.last
 
     result := out.bytes()

@@ -38,6 +38,7 @@ import std.metrics as metrics
 import std.net.http as http
 import std.net.grpc as grpc
 import std.compress.gzip as gzip
+import std.compress.zstd as zstd
 import std.net.tls as tls
 import std.net.url as url_mod
 import std.protobuf as protobuf
@@ -96,8 +97,9 @@ pub struct Target:
     pub headers: List[String]
     # per-request timeout in ms; 0 or less leaves the http client default.
     pub timeout_ms: Int
-    # when true, gzip-compress each export body and set Content-Encoding: gzip.
-    pub use_gzip: Bool
+    # "gzip" or "zstd" compresses each export body and sets the matching
+    # Content-Encoding; "" sends bodies uncompressed.
+    pub compression: String
 
 # build a Target from a service name, an endpoint like http://host:4318, and a
 # protocol. an https endpoint turns tls on; a missing port defaults to 4318. a
@@ -121,24 +123,25 @@ pub fn target_with_resource(service_name: String, service_version: String, servi
         base_path = ""
     if base_path.len() > 0 and base_path.ends_with("/"):
         base_path = base_path.substring(0, base_path.len() - 1)
-    # start with no extra headers, the default timeout, and gzip off; callers
+    # start with no extra headers, the default timeout, and compression off; callers
     # layer transport options on with the with_* setters below.
     no_headers: List[String] := []
-    return Target(service_name, service_version, service_instance_id, parsed.host, port, use_tls, base_path, protocol, no_headers, DEFAULT_TIMEOUT_MS, false)
+    return Target(service_name, service_version, service_instance_id, parsed.host, port, use_tls, base_path, protocol, no_headers, DEFAULT_TIMEOUT_MS, "")
 
 impl Target:
     # a copy of this target that sends `headers` (a flat [k1, v1, ...] list) on
     # every export request, carrying OTEL_EXPORTER_OTLP_HEADERS auth/tenant headers.
     fn with_headers(headers: List[String]) -> Target:
-        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, headers, self.timeout_ms, self.use_gzip)
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, headers, self.timeout_ms, self.compression)
 
     # a copy with a per-request timeout in ms; 0 or less leaves the client default.
     fn with_timeout(timeout_ms: Int) -> Target:
-        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, timeout_ms, self.use_gzip)
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, timeout_ms, self.compression)
 
-    # a copy that gzip-compresses each export body and sets Content-Encoding: gzip.
-    fn with_gzip(use_gzip: Bool) -> Target:
-        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, self.timeout_ms, use_gzip)
+    # a copy that compresses each export body with `name` — "gzip" or "zstd" —
+    # and sets the matching Content-Encoding. "" turns compression off.
+    fn with_compression(name: String) -> Target:
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, self.timeout_ms, name)
 
 # --- trace encoding ---------------------------------------------------------
 
@@ -466,14 +469,16 @@ pub fn encode_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bytes
 
 # --- export over OTLP/HTTP --------------------------------------------------
 
-# prepare the request body for a target: gzip it when compression is enabled,
-# otherwise pass it through unchanged. returns the bytes to send and whether they
-# are gzipped (so the caller can set Content-Encoding). factored out so the
-# compression path is unit-testable without a live collector.
-fn prepare_body(cfg: Target, body: Bytes) -> (Bytes, Bool):
-    if cfg.use_gzip:
-        return (gzip.compress(body), true)
-    return (body, false)
+# prepare the request body for a target: compress it with the configured
+# codec, or pass it through unchanged. returns the bytes to send and the
+# Content-Encoding to declare ("" for none). factored out so the compression
+# path is unit-testable without a live collector.
+fn prepare_body(cfg: Target, body: Bytes) -> (Bytes, String):
+    if cfg.compression == "gzip":
+        return (gzip.compress(body), "gzip")
+    if cfg.compression == "zstd":
+        return (zstd.compress(body), "zstd")
+    return (body, "")
 
 # whether an OTLP/HTTP response status should be retried. 429 (too many requests)
 # and any 5xx are transient, so we back off and retry; every other 4xx is a
@@ -507,8 +512,8 @@ fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> http.HttpRespon
     full_path := cfg.base_path + signal_path
     prepared := prepare_body(cfg, body)
     mut req := http.post_request(cfg.host, cfg.port, full_path).body_bytes(prepared.0).header("Content-Type", OTLP_CONTENT_TYPE)
-    if prepared.1:
-        req = req.header("Content-Encoding", "gzip")
+    if prepared.1 != "":
+        req = req.header("Content-Encoding", prepared.1)
     # layer on the configured auth/tenant headers (flat [k1, v1, ...] pairs).
     mut i := 0
     while i + 1 < cfg.headers.len():
@@ -1119,19 +1124,21 @@ test "backoff doubles each attempt and caps at the maximum":
     assert_eq(backoff_ms(6), 30000)
     assert_eq(backoff_ms(20), 30000)
 
-test "prepare_body gzips only when the target enables compression":
+test "prepare_body compresses with the configured codec only":
     body := bytes.from_string_utf8("an otlp protobuf body")
     plain_cfg := target("svc", "http://collector.local:4318", PROTOCOL_HTTP)
     off := prepare_body(plain_cfg, body)
-    # compression off: the body is passed through and not marked gzipped.
-    assert(not off.1)
+    # compression off: the body is passed through with no encoding declared.
+    assert_eq(off.1, "")
     assert_eq(off.0.to_string_utf8()!, "an otlp protobuf body")
 
-    gzip_cfg := plain_cfg.with_gzip(true)
-    on := prepare_body(gzip_cfg, body)
-    # compression on: the body is gzipped and decompresses back to the original.
-    assert(on.1)
-    assert_eq(gzip.decompress(on.0)!.to_string_utf8()!, "an otlp protobuf body")
+    gz := prepare_body(plain_cfg.with_compression("gzip"), body)
+    assert_eq(gz.1, "gzip")
+    assert_eq(gzip.decompress(gz.0)!.to_string_utf8()!, "an otlp protobuf body")
+
+    zs := prepare_body(plain_cfg.with_compression("zstd"), body)
+    assert_eq(zs.1, "zstd")
+    assert_eq(zstd.decompress(zs.0)!.to_string_utf8()!, "an otlp protobuf body")
 
 test "retry_delay prefers a larger Retry-After over the backoff":
     empty_headers: Map[String, String] := {}

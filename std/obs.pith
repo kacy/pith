@@ -139,10 +139,11 @@ fn resolve_instance_id(explicit: String) -> String:
 # configure the exporter in code rather than from OTEL_* variables. the version
 # and instance id enrich the OTLP resource (either may be "" to omit it). the
 # headers (a flat [k1, v1, ...] list) carry export auth, timeout_ms bounds each
-# POST, and use_gzip compresses the body. the sampler_name/sampler_arg pick the
+# POST, and compression ("gzip" or "zstd") compresses the body. the
+# sampler_name/sampler_arg pick the
 # head sampler (see std.trace, e.g. "parentbased_always_on" or "traceidratio"
 # with a probability). idempotent.
-pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, headers: List[String], timeout_ms: Int, use_gzip: Bool, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
+pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, headers: List[String], timeout_ms: Int, compression: String, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
     if endpoint == "":
         return
     obs_mu.lock()
@@ -153,7 +154,7 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
     running = true
     obs_mu.unlock()
 
-    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_gzip(use_gzip)
+    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_compression(compression)
     # install the sampler before turning tracing on so the first span already
     # sees the right decision.
     trace.set_sampler_from_name(sampler_name, sampler_arg)
@@ -177,12 +178,16 @@ pub fn init():
     protocol := env.str_or(OTEL_PROTOCOL, otlp.PROTOCOL_HTTP)
     headers := parse_headers(env.str_or(OTEL_HEADERS, ""))
     timeout_ms := env.int_or(OTEL_TIMEOUT, otlp.DEFAULT_TIMEOUT_MS)
-    use_gzip := env.str_or(OTEL_COMPRESSION, "") == "gzip"
+    # the spec names gzip; zstd is the extension collectors accept. anything
+    # else (including "none") sends uncompressed.
+    mut compression := env.str_or(OTEL_COMPRESSION, "")
+    if compression != "gzip" and compression != "zstd":
+        compression = ""
     metric_interval := env.int_or(OTEL_METRIC_INTERVAL, DEFAULT_METRIC_INTERVAL_MS)
     span_delay := env.int_or(OTEL_SPAN_DELAY, DEFAULT_SPAN_DELAY_MS)
     sampler := env.str_or(OTEL_SAMPLER, DEFAULT_SAMPLER)
     sampler_arg := env.float_or(OTEL_SAMPLER_ARG, 1.0)
-    start(service_name, service_version, service_instance_id, endpoint, protocol, headers, timeout_ms, use_gzip, metric_interval, span_delay, sampler, sampler_arg)
+    start(service_name, service_version, service_instance_id, endpoint, protocol, headers, timeout_ms, compression, metric_interval, span_delay, sampler, sampler_arg)
 
 # whether the exporter is currently running (init has run and shutdown has not).
 pub fn active() -> Bool:
@@ -216,7 +221,7 @@ test "the loop tick is the smaller interval and never zero":
 
 test "start with an empty endpoint is a no-op":
     no_headers: List[String] := []
-    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, no_headers, 10000, false, 60000, 5000, "parentbased_always_on", 1.0)
+    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, no_headers, 10000, "", 60000, 5000, "parentbased_always_on", 1.0)
     assert(not active())
     shutdown()
 

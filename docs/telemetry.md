@@ -215,7 +215,7 @@ follow the opentelemetry sdk names:
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` | `http/protobuf` |
 | `OTEL_EXPORTER_OTLP_HEADERS` | auth/tenant headers, `k1=v1,k2=v2` | — |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | per-request timeout (ms) | `10000` |
-| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` to compress request bodies | none |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd` to compress request bodies | none |
 | `OTEL_TRACES_SAMPLER` / `_ARG` | sampler + argument (see sampling) | `parentbased_always_on` |
 | `OTEL_METRIC_EXPORT_INTERVAL` | ms between metric flushes | `60000` |
 | `OTEL_BSP_SCHEDULE_DELAY` | ms between span flushes | `5000` |

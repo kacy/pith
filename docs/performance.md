@@ -524,6 +524,43 @@ constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
 
+`bench/zstd_decode` — the pure-pith zstd decoder against the crate-backed
+kernel, on a corpus built from the repo itself (2:1 to 11:1 — realistic
+content-encoding shapes; run it with `make zstd-pure-bench`). the decoder
+started at 129x the kernel and three optimization passes brought it to
+5.5-8x, with the run-heavy case now beating the kernel outright:
+
+| corpus | first measure | now | vs kernel |
+|---|---|---|---|
+| text 8kb | 3.4 mb/s | 56 | 8.0x |
+| prose 281kb | ~5 | 108 | 7.0x |
+| source 585kb | ~7 | 166 | 5.5x |
+| json 500kb | ~8 | 343 | 6.2x |
+| rle runs 78kb | 29 | 7,475 | **0.63x — faster** |
+
+the story generalized well beyond zstd. the early cost was per-byte
+runtime calls (raw blocks and matches copied a byte per call); bulk slice
+writes, `copy_within` for overlapping matches, and a cached 64-bit
+bitstream window fixed that. the rest was per-operation call overhead
+that the compiler now removes for every pith program, not just this one:
+`xs[i]` used to call into the runtime, heap-allocate an optional tuple,
+unpack it, and release it — the consumer now collapses that whole pattern
+to inline loads with the same loud bounds failure; `bits.band` used to
+cross two call layers and is now a single native instruction; a word
+load from bytes inlines to one 8-byte load and a mask. the decoder-side
+share was fusing sequence decode into execution (the intermediate list of
+sequence structs cost more than the arithmetic producing it) and packing
+every table entry into a plain int, since a struct read in a hot loop is
+a handle plus refcount traffic.
+
+two measurement lessons from the same work, recorded here because they
+will bite again: an operation's isolated microbenchmark cost overstates
+its marginal cost in a real loop by about 5x (the cpu overlaps
+independent calls — only differential measurement on the real loop
+justifies a change), and a representation change must price the read
+side, not just the write (three parallel int lists beat a struct list on
+push and lost it all back reading the fields out).
+
 `bench/cyclic_graph` — struct nodes wired into reference cycles
 (parent<->child) and dropped, 2m of them. refcounting alone cannot
 reclaim a cycle, so the strong version leaks; marking one edge of each

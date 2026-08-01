@@ -473,3 +473,32 @@ three caveats matter when reading this benchmark:
   with this full module mix currently exposes a checker symbol-collision bug,
   so the benchmark still times the larger csv/url/path/gzip/hash/fs pipeline
   while avoiding that unrelated compile failure.
+
+## zstd decode benchmark (pure-pith decoder)
+
+`bench/zstd_decode.pith` times the pure-pith zstd decoder
+(`std.compress.zstd_pure_*`) against the crate-backed kernel
+(`std.compress.zstd`). Both decode the same frames and the outputs are
+compared byte for byte before either is timed, so the numbers can't come
+from doing different work.
+
+The corpus is built at runtime from the repo itself — docs, std sources,
+and generated log lines, compressing between 2:1 and 11:1 — plus one
+deliberately degenerate run-heavy case, reported last and labelled. A
+frame that packs 80KB into 22 bytes decodes almost entirely through the
+match copy, so it measures memory bandwidth rather than entropy decoding;
+treating it as the headline would flatter the pure decoder by a factor
+of five.
+
+Each side runs to a wall-clock budget rather than a fixed rep count,
+because the kernel decodes some of these frames in tens of microseconds
+and a fixed count lands inside the millisecond clock's granularity.
+
+Run it:
+
+```
+make zstd-pure-bench
+```
+
+Current standing and the optimization history live in
+`docs/performance.md`.

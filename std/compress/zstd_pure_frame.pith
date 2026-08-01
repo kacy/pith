@@ -1,0 +1,281 @@
+# std/compress/zstd_pure_frame — zstd frame and block structure (rfc 8878).
+#
+# a frame is a magic number, a variable-length header, a run of blocks, and
+# an optional 4-byte content checksum. each block carries a 3-byte header
+# giving its type (raw, rle, or entropy-compressed) and size. this module
+# parses that structure and decodes the two literal block types; compressed
+# blocks are the entropy layers, which arrive next.
+
+import std.bits as bits
+import std.bytes as bytes
+import std.compress.zstd_pure_xxhash as xxhash
+
+## the zstd frame magic, little-endian on the wire: 28 B5 2F FD.
+pub MAGIC := 0xFD2FB528
+
+## block types from the block header's two type bits.
+pub BLOCK_RAW := 0
+pub BLOCK_RLE := 1
+pub BLOCK_COMPRESSED := 2
+pub BLOCK_RESERVED := 3
+
+## a parsed frame header. `content_size` is -1 when the frame does not
+## declare one (the field is optional), and `window_size` bounds how far
+## back a match may reach.
+pub struct FrameHeader:
+    pub window_size: Int
+    pub content_size: Int
+    pub dictionary_id: Int
+    pub has_checksum: Bool
+    pub header_len: Int
+
+fn read_le(data: Bytes, off: Int, count: Int) -> Int:
+    mut value := 0
+    mut i := count - 1
+    while i >= 0:
+        value = bits.bor(bits.shl(value, 8), data[off + i])
+        i = i - 1
+    return value
+
+## true when `data` starts with the zstd frame magic.
+pub fn has_magic(data: Bytes) -> Bool:
+    if data.len() < 4:
+        return false
+    return read_le(data, 0, 4) == MAGIC
+
+## parse the frame header that follows the magic. fails on a truncated
+## header, a set reserved bit, or a dictionary the decoder was not given.
+pub fn parse_header(data: Bytes) -> FrameHeader!:
+    if not has_magic(data):
+        fail "zstd: not a zstd frame"
+    if data.len() < 5:
+        fail "zstd: truncated frame header"
+
+    descriptor := data[4]
+    fcs_flag := bits.shr(descriptor, 6)
+    single_segment := bits.band(bits.shr(descriptor, 5), 1) == 1
+    has_checksum := bits.band(bits.shr(descriptor, 2), 1) == 1
+    dict_flag := bits.band(descriptor, 3)
+    if bits.band(bits.shr(descriptor, 3), 1) == 1:
+        fail "zstd: reserved frame header bit is set"
+
+    mut pos := 5
+
+    # the window descriptor is absent when the frame is a single segment:
+    # the content size then bounds the window instead.
+    mut window_size := 0
+    if not single_segment:
+        if pos >= data.len():
+            fail "zstd: truncated window descriptor"
+        window_byte := data[pos]
+        exponent := bits.shr(window_byte, 3)
+        mantissa := bits.band(window_byte, 7)
+        window_log := 10 + exponent
+        window_base := bits.shl(1, window_log)
+        window_size = window_base + bits.shr(window_base, 3) * mantissa
+        pos = pos + 1
+
+    mut dict_size := 0
+    if dict_flag == 1:
+        dict_size = 1
+    elif dict_flag == 2:
+        dict_size = 2
+    elif dict_flag == 3:
+        dict_size = 4
+    mut dictionary_id := 0
+    if dict_size > 0:
+        if pos + dict_size > data.len():
+            fail "zstd: truncated dictionary id"
+        dictionary_id = read_le(data, pos, dict_size)
+        pos = pos + dict_size
+
+    # the content-size field width comes from the flag, except that a
+    # single-segment frame always carries at least one byte of it.
+    mut fcs_size := 0
+    if fcs_flag == 0:
+        if single_segment:
+            fcs_size = 1
+    elif fcs_flag == 1:
+        fcs_size = 2
+    elif fcs_flag == 2:
+        fcs_size = 4
+    else:
+        fcs_size = 8
+
+    mut content_size := -1
+    if fcs_size > 0:
+        if pos + fcs_size > data.len():
+            fail "zstd: truncated content size"
+        content_size = read_le(data, pos, fcs_size)
+        # the two-byte form is stored biased by 256.
+        if fcs_size == 2:
+            content_size = content_size + 256
+        pos = pos + fcs_size
+
+    if single_segment:
+        window_size = content_size
+
+    return FrameHeader(window_size, content_size, dictionary_id, has_checksum, pos)
+
+## one block's header: where its body starts, how long it is, its type, and
+## whether it ends the frame.
+pub struct BlockHeader:
+    pub kind: Int
+    pub size: Int
+    pub body_start: Int
+    pub last: Bool
+
+## parse the 3-byte block header at `off`.
+pub fn parse_block_header(data: Bytes, off: Int) -> BlockHeader!:
+    if off + 3 > data.len():
+        fail "zstd: truncated block header"
+    word := read_le(data, off, 3)
+    last := bits.band(word, 1) == 1
+    kind := bits.band(bits.shr(word, 1), 3)
+    size := bits.shr(word, 3)
+    if kind == BLOCK_RESERVED:
+        fail "zstd: reserved block type"
+    return BlockHeader(kind, size, off + 3, last)
+
+## decompress a frame built only from raw and rle blocks, holding output to
+## `max_output`. an entropy-compressed block fails with a clear message —
+## that layer lands next. the content checksum is verified when present.
+pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
+    if max_output <= 0:
+        fail "zstd: max_output must be positive"
+    header := parse_header(data)!
+    mut out := bytes.buffer()
+    errdefer out.free()
+    mut pos := header.header_len
+
+    mut done := false
+    while not done:
+        block := parse_block_header(data, pos)!
+        if block.kind == BLOCK_RAW:
+            if block.body_start + block.size > data.len():
+                fail "zstd: raw block runs past the end of the frame"
+            if out.len() + block.size > max_output:
+                fail "zstd: output would exceed " + max_output.to_string() + " bytes"
+            mut i := 0
+            while i < block.size:
+                out.write_byte(data[block.body_start + i])
+                i = i + 1
+            pos = block.body_start + block.size
+        elif block.kind == BLOCK_RLE:
+            if block.body_start >= data.len():
+                fail "zstd: truncated rle block"
+            if out.len() + block.size > max_output:
+                fail "zstd: output would exceed " + max_output.to_string() + " bytes"
+            value := data[block.body_start]
+            mut i := 0
+            while i < block.size:
+                out.write_byte(value)
+                i = i + 1
+            pos = block.body_start + 1
+        else:
+            fail "zstd: compressed blocks are not decoded yet (entropy layer pending)"
+        done = block.last
+
+    result := out.bytes()
+    out.free()
+
+    if header.content_size >= 0 and result.len() != header.content_size:
+        fail "zstd: decoded size does not match the frame's declared content size"
+
+    if header.has_checksum:
+        if pos + 4 > data.len():
+            fail "zstd: truncated content checksum"
+        stated := read_le(data, pos, 4)
+        if xxhash.frame_checksum(result) != stated:
+            fail "zstd: content checksum mismatch"
+
+    return result
+
+test "the magic is recognized and rejected":
+    mut buf := bytes.buffer()
+    buf.write_byte(0x28)
+    buf.write_byte(0xB5)
+    buf.write_byte(0x2F)
+    buf.write_byte(0xFD)
+    assert(has_magic(buf.take_bytes()))
+    assert(not has_magic(bytes.from_string_utf8("not zstd")))
+    assert(not has_magic(bytes.empty()))
+
+test "a hand-built rle frame decodes":
+    # descriptor 0: no content size, not single-segment, no checksum, no dict.
+    mut buf := bytes.buffer()
+    buf.write_byte(0x28)
+    buf.write_byte(0xB5)
+    buf.write_byte(0x2F)
+    buf.write_byte(0xFD)
+    buf.write_byte(0)          # frame header descriptor
+    buf.write_byte(0)          # window descriptor: 1 KiB window
+    # block header: last=1, type=RLE(1), size=5 → (5<<3)|(1<<1)|1 = 43
+    buf.write_byte(43)
+    buf.write_byte(0)
+    buf.write_byte(0)
+    buf.write_byte(65)         # 'A'
+    frame := buf.take_bytes()
+
+    header := parse_header(frame)!
+    assert_eq(header.header_len, 6)
+    assert(not header.has_checksum)
+    assert_eq(header.content_size, -1)
+
+    out := decompress_bounded(frame, 1000)!
+    assert_eq(out.to_string_utf8()!, "AAAAA")
+
+test "a hand-built raw frame decodes":
+    mut buf := bytes.buffer()
+    buf.write_byte(0x28)
+    buf.write_byte(0xB5)
+    buf.write_byte(0x2F)
+    buf.write_byte(0xFD)
+    buf.write_byte(0)
+    buf.write_byte(0)
+    # last=1, type=RAW(0), size=4 → (4<<3)|0|1 = 33
+    buf.write_byte(33)
+    buf.write_byte(0)
+    buf.write_byte(0)
+    buf.write_string_utf8("pith")
+    frame := buf.take_bytes()
+    assert_eq(decompress_bounded(frame, 1000)!.to_string_utf8()!, "pith")
+
+test "malformed frames are refused":
+    assert(parse_header(bytes.from_string_utf8("nope")).is_err)
+    # magic with nothing after it
+    mut buf := bytes.buffer()
+    buf.write_byte(0x28)
+    buf.write_byte(0xB5)
+    buf.write_byte(0x2F)
+    buf.write_byte(0xFD)
+    assert(parse_header(buf.take_bytes()).is_err)
+
+    # reserved descriptor bit 3 set
+    mut bad := bytes.buffer()
+    bad.write_byte(0x28)
+    bad.write_byte(0xB5)
+    bad.write_byte(0x2F)
+    bad.write_byte(0xFD)
+    bad.write_byte(8)
+    bad.write_byte(0)
+    assert(parse_header(bad.take_bytes()).is_err)
+
+test "the output bound is enforced":
+    mut buf := bytes.buffer()
+    buf.write_byte(0x28)
+    buf.write_byte(0xB5)
+    buf.write_byte(0x2F)
+    buf.write_byte(0xFD)
+    buf.write_byte(0)
+    buf.write_byte(0)
+    # an rle block claiming 10000 bytes from one stored byte
+    size := 10000
+    word := bits.bor(bits.bor(bits.shl(size, 3), bits.shl(BLOCK_RLE, 1)), 1)
+    buf.write_byte(bits.band(word, 255))
+    buf.write_byte(bits.band(bits.shr(word, 8), 255))
+    buf.write_byte(bits.band(bits.shr(word, 16), 255))
+    buf.write_byte(90)
+    frame := buf.take_bytes()
+    assert(decompress_bounded(frame, 100).is_err)
+    assert_eq(decompress_bounded(frame, 20000)!.len(), 10000)

@@ -601,7 +601,12 @@ pub fn compile_from_ir(
                     } else if init_kind.starts_with("str:") {
                         0 // will be patched in __init_globals
                     } else {
-                        init_kind.parse().unwrap_or(0)
+                        // the same literal forms iconst accepts, and the same
+                        // refusal to coerce: this used to be a decimal-only
+                        // parse with unwrap_or(0), so a global initialized to
+                        // a hex or binary literal silently became zero while
+                        // the identical literal inline compiled correctly.
+                        parse_i64_operand(init_kind, "global initializer", line, &gname)?
                     };
                     desc.define(init_val.to_le_bytes().to_vec().into_boxed_slice());
                     codegen

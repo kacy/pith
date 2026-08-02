@@ -1,0 +1,84 @@
+# end-to-end grpc interceptors: a server composes an authorize interceptor over
+# its dispatch, and a real client calls it twice over h2c — once with no
+# credentials and once with a bearer token set on the channel. this exercises
+# the whole path the unit tests cannot reach: the interceptor runs inside the
+# real serve handler, reads metadata the client actually put on the wire, and
+# its refusal comes back as a grpc-status the client surfaces as an error.
+
+import std.net.grpc as grpc
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50079
+TOKEN := "s3cret-token"
+
+# read protobuf field 1 (a string) from a message.
+fn read_field1(data: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    mut name := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            name = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return name
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/echo.Echo/Ping":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_field1(request) catch ""
+    w := protobuf.writer()
+    w.write_string(1, "echo:" + name) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# the transport-level auth check: every method is covered by this one hook.
+fn check_token(metadata: Map[String, String]) -> Bool:
+    return grpc.bearer_token(metadata) == TOKEN
+
+fn run_server():
+    guarded := grpc.intercept(echo_dispatch, [grpc.authorize(check_token)])
+    grpc.serve("127.0.0.1", PORT, guarded) catch 0
+
+# call once, optionally presenting a credential. returns the reply text, or a
+# marker naming how it failed.
+fn call_once(present_token: Bool) -> String:
+    conn_r := grpc.dial_h2c("127.0.0.1", PORT)
+    if conn_r.is_err:
+        return "DIAL_ERR"
+    conn := conn_r.ok
+    if present_token:
+        conn.set_credentials(["authorization", "Bearer " + TOKEN])
+    w := protobuf.writer()
+    w.write_string(1, "hello") catch false
+    reply_r := conn.unary("/echo.Echo/Ping", w.bytes())
+    w.free()
+    if reply_r.is_err:
+        status := reply_r.err.status
+        conn.close()
+        return "status:" + status.to_string()
+    got := read_field1(reply_r.ok) catch "?"
+    conn.close()
+    return got
+
+# retry until the spawned server is listening; a dial failure is the readiness
+# signal, the same shape the other grpc round-trip cases use.
+fn call_when_ready(present_token: Bool, timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := call_once(present_token)
+        if got != "DIAL_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "DIAL_ERR"
+
+fn main():
+    spawn run_server()
+    # no credential: the interceptor refuses before the dispatch ever runs
+    print("anonymous: " + call_when_ready(false, 10000))
+    # with the credential: the call reaches the dispatch and comes back
+    print("credentialed: " + call_when_ready(true, 10000))

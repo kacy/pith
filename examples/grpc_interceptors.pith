@@ -1,0 +1,97 @@
+# grpc interceptors: cross-cutting rules that run before any method body.
+#
+# an interceptor wraps the dispatch the way a std.web middleware wraps a route
+# handler — it takes the rest of the chain plus the call, so it can inspect the
+# call, wrap the reply, or refuse outright and never reach the dispatch.
+# intercept() folds a list of them into a dispatch, which is what serve() takes,
+# so nothing about the service signature changes.
+#
+# this server carries two rules a real service wants and neither method knows
+# about: a bearer credential is required, and calls are capped. the client
+# presents its credential once, on the channel, rather than at every call site.
+
+import std.net.grpc as grpc
+import std.resilience as resilience
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+
+PORT := 50153
+TOKEN := "letmein"
+
+fn read_text(message: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(message)
+    mut text := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            text = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return text
+
+fn message_of(text: String) -> Bytes:
+    w := protobuf.writer()
+    w.write_string(1, text) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# the service itself: no auth code, no rate-limit code, no idea either exists.
+fn greeter(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    if path != "/demo.Greeter/Hello":
+        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
+    name := read_text(request) catch "world"
+    return message_of("hello, " + name)
+
+# the auth rule, checked against the metadata the caller put on the wire. a real
+# server would verify a jwt here — std.crypto.jwt.verify_hs256(token, secret) —
+# rather than compare a fixed string.
+fn check_token(metadata: Map[String, String]) -> Bool:
+    return grpc.bearer_token(metadata) == TOKEN
+
+# an interceptor of our own: count every call, whatever the outcome.
+mut served := 0
+
+fn count_calls(next: fn(String, Bytes) -> Bytes!grpc.GrpcError, path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    served = served + 1
+    return next(path, request)
+
+fn run_server():
+    # a reserve of two and a slow refill, so the third call in this run is
+    # refused rather than racing a token that trickles back in mid-run.
+    limiter := resilience.rate_limiter(1, 2)
+    # the first interceptor runs outermost, so calls are counted even when the
+    # credential check below refuses them.
+    guarded := grpc.intercept(greeter, [count_calls, grpc.authorize(check_token), grpc.rate_limit(limiter)])
+    grpc.serve("127.0.0.1", PORT, guarded) catch 0
+
+# call once and describe what came back.
+fn say_hello(conn: grpc.Conn, name: String) -> String:
+    reply := conn.unary("/demo.Greeter/Hello", message_of(name))
+    if reply.is_err:
+        return grpc.status_name(reply.err.status)
+    return read_text(reply.ok) catch "?"
+
+fn main() -> Int!:
+    spawn run_server()
+    time.delay(300)
+
+    # no credential: the authorize interceptor refuses before greeter runs
+    anon := grpc.dial_h2c("127.0.0.1", PORT)!
+    print("anonymous:    " + say_hello(anon, "ada"))
+    anon.close()
+
+    # the credential rides the channel, so every call over it carries the token
+    conn := grpc.dial_h2c("127.0.0.1", PORT)!
+    conn.set_credentials(["authorization", "Bearer " + TOKEN])
+    print("with token:   " + say_hello(conn, "ada"))
+    print("with token:   " + say_hello(conn, "grace"))
+
+    # the burst is spent, so the limiter refuses the next one
+    print("over the cap: " + say_hello(conn, "alan"))
+    conn.close()
+
+    # count_calls sat outside the other two, so it saw all four
+    print("calls seen:   {served}")
+    return 0

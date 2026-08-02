@@ -1,5 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// Global statistics for debugging
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -54,18 +53,33 @@ pub static PERF_MAP_INT_FALLBACK_GETS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_MAP_INT_FALLBACK_CONTAINS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_MAP_INT_FALLBACK_REMOVES: AtomicUsize = AtomicUsize::new(0);
 
-static PERF_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+// 0 = not probed yet, 1 = disabled, 2 = enabled. these hooks sit on the
+// hottest runtime entry points (list get, byte-buffer write, struct alloc),
+// so with stats off the check has to cost one relaxed load and a predictable
+// branch — a OnceLock here showed up as a measurable slice of a list index.
+static PERF_STATS_STATE: AtomicU8 = AtomicU8::new(0);
 static PERF_STATS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-pub fn perf_stats_enabled() -> bool {
-    *PERF_STATS_ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("PITH_PERF_STATS").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        )
-    })
+#[cold]
+fn perf_stats_probe() -> bool {
+    let enabled = matches!(
+        std::env::var("PITH_PERF_STATS").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    PERF_STATS_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    enabled
 }
 
+#[inline(always)]
+pub fn perf_stats_enabled() -> bool {
+    match PERF_STATS_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => perf_stats_probe(),
+    }
+}
+
+#[inline(always)]
 pub fn perf_count(counter: &AtomicUsize, delta: usize) {
     if perf_stats_enabled() {
         counter.fetch_add(delta, Ordering::Relaxed);
@@ -77,10 +91,16 @@ extern "C" fn pith_perf_dump_stats_at_exit() {
     dump_perf_stats();
 }
 
+#[inline(always)]
 pub fn ensure_perf_stats_registered() {
     if !perf_stats_enabled() {
         return;
     }
+    ensure_perf_stats_registered_slow();
+}
+
+#[cold]
+fn ensure_perf_stats_registered_slow() {
     if PERF_STATS_REGISTERED.swap(true, Ordering::Relaxed) {
         return;
     }

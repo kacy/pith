@@ -1,0 +1,519 @@
+# std/compress/zstd_pure_fse — finite state entropy (fse) for pure-pith zstd.
+#
+# fse is zstd's table-based arithmetic-adjacent coder. a decode table maps
+# (state, low bits) to a symbol plus the next state; the reference table-build
+# spreads each symbol across 2^log slots by a fixed stride so the layout is
+# reproducible from the normalized counts alone. this module builds the decode
+# table, reads a symbol stream, and — for the encoder — builds the matching
+# encode table and the normalized-count header.
+
+import std.bits as bits
+import std.compress.zstd_pure_bits as stream
+import std.bytes as bytes
+
+# the reference spread stride: (size >> 1) + (size >> 3) + 3, stepped modulo
+# the table size, visits every slot exactly once for any power-of-two size.
+fn spread_step(size: Int) -> Int:
+    return bits.shr(size, 1) + bits.shr(size, 3) + 3
+
+## one decode-table entry: the symbol emitted, how many bits to read next,
+## and the base state those bits add to.
+## a built fse decode table: its log2 size and its entries.
+##
+## an entry is one packed Int, not a three-field struct: symbol in the low
+## eight bits, bit count in the next eight, base above that. decoding a
+## sequence indexes these tables six times, and a struct entry means six
+## heap handles and six reference-count round trips per sequence. use
+## entry_symbol/entry_nbits/entry_base to read one.
+pub struct FseTable:
+    pub log: Int
+    pub entries: List[Int]
+
+## pack a symbol, bit count, and base into one table entry. read_ncount
+## caps the accuracy log at 22, so base stays under 2^22 and the three
+## fields never collide.
+pub fn fse_entry(symbol: Int, nbits: Int, base: Int) -> Int:
+    return symbol + bits.shl(nbits, 8) + bits.shl(base, 16)
+
+## the symbol a packed entry emits.
+pub fn entry_symbol(entry: Int) -> Int:
+    return bits.band(entry, 255)
+
+## how many bits a packed entry reads to reach the next state.
+pub fn entry_nbits(entry: Int) -> Int:
+    return bits.band(bits.shr(entry, 8), 255)
+
+## the state a packed entry's transition starts from.
+pub fn entry_base(entry: Int) -> Int:
+    return bits.shr(entry, 16)
+
+## build a decode table from normalized counts (one per symbol; -1 means the
+## "less than one" probability that occupies the top slots). this is the
+## reference algorithm: place symbols by the spread walk, then for each slot
+## derive its baseline and bit count from how many times its symbol appears.
+pub fn build_decode_table(counts: List[Int], log: Int) -> FseTable:
+    size := bits.shl(1, log)
+    mask := size - 1
+    mut symbol_of: List[Int] := []
+    mut i := 0
+    while i < size:
+        symbol_of.push(0)
+        i = i + 1
+
+    # low-probability (-1) symbols take the highest slots, one each.
+    mut high := size - 1
+    mut s := 0
+    while s < counts.len():
+        if counts[s] == -1:
+            symbol_of[high] = s
+            high = high - 1
+        s = s + 1
+
+    # everything else is spread by the stride walk, skipping the reserved
+    # high slots.
+    step := spread_step(size)
+    mut pos := 0
+    s = 0
+    while s < counts.len():
+        mut n := counts[s]
+        while n > 0:
+            symbol_of[pos] = s
+            pos = (pos + step) % size
+            while pos > high:
+                pos = (pos + step) % size
+            n = n - 1
+        s = s + 1
+
+    # each symbol's running state starts at its own normalized count, not at
+    # one: that offset is what spreads a frequent symbol's states across the
+    # table's high half, where they cost fewer bits to reach. a
+    # low-probability symbol starts at 1.
+    mut next_state: List[Int] := []
+    s = 0
+    while s < counts.len():
+        if counts[s] < 0:
+            next_state.push(1)
+        else:
+            next_state.push(counts[s])
+        s = s + 1
+
+    # the entry loop walks slots in order, so entries are pushed straight
+    # into the list — no zero-fill pass and no per-slot set on top of it.
+    mut entries: List[Int] := []
+    i = 0
+    while i < size:
+        sym := symbol_of[i]
+        state := next_state[sym]
+        next_state[sym] = state + 1
+        # nb = log - floor(log2(state)); base is where this slot's reachable
+        # states begin.
+        nb := log - (bit_length(state) - 1)
+        base := bits.shl(state, nb) - size
+        entries.push(fse_entry(sym, nb, base))
+        i = i + 1
+
+    return FseTable(log, entries)
+
+# floor(log2(v)) + 1 for v>=1, i.e. the number of significant bits; 0 for v=0.
+fn bit_length(v: Int) -> Int:
+    mut n := 0
+    mut x := v
+    while x > 0:
+        n = n + 1
+        x = bits.shr(x, 1)
+    return n
+
+## an fse decoder positioned in a backward stream. init reads `log` bits for
+## the starting state; each step emits the current state's symbol, then reads
+## that entry's bits to move to the next state.
+pub struct FseDecoder:
+    table: FseTable
+    state: Int
+
+## start a decoder by reading the initial state from the backward stream.
+pub fn fse_decoder(table: FseTable, reader: stream.BackReader) -> FseDecoder:
+    return FseDecoder(table, reader.read(table.log))
+
+impl FseDecoder:
+    ## the symbol at the current state (does not advance).
+    fn symbol() -> Int:
+        return entry_symbol(self.table.entries[self.state])
+
+    ## consume the current entry's bits and move to the next state.
+    fn advance(reader: stream.BackReader):
+        entry := self.table.entries[self.state]
+        self.state = entry_base(entry) + reader.read(entry_nbits(entry))
+
+# ---------------------------------------------------------------
+# encoder side
+# ---------------------------------------------------------------
+
+## build an encode table: for each symbol, the list of states (table slots)
+## that emit it, in the order the decoder assigns them. the encoder walks a
+## symbol backward and, at each step, picks the state that will decode to it
+## and records the low bits of the previous state.
+pub fn build_encode_states(counts: List[Int], log: Int) -> List[List[Int]]:
+    table := build_decode_table(counts, log)
+    mut by_symbol: List[List[Int]] := []
+    mut s := 0
+    while s < counts.len():
+        empty: List[Int] := []
+        by_symbol.push(empty)
+        s = s + 1
+    mut i := 0
+    while i < table.entries.len():
+        by_symbol[entry_symbol(table.entries[i])].push(i)
+        i = i + 1
+    return by_symbol
+
+# encode `symbols` into a backward bitstream using the table these counts
+# build. walks the sequence backward: fixes the final state (a slot for the
+# last symbol), and for each earlier symbol finds the slot whose base-range
+# reaches the next state, recording the low bits that bridge them. the init
+# state is written first so the decoder reads it first.
+pub fn fse_encode(symbols: List[Int], counts: List[Int], log: Int) -> List[Int]:
+    table := build_decode_table(counts, log)
+    slots := build_encode_states(counts, log)
+
+    n := symbols.len()
+    # the last symbol's state can be any of its slots; the lowest keeps the
+    # numbers small and is what the reference picks.
+    mut next_state := slots[symbols[n - 1]][0]
+
+    mut bit_values: List[Int] := []
+    mut bit_widths: List[Int] := []
+    mut k := n - 1
+    while k >= 1:
+        prev_sym := symbols[k - 1]
+        mut chosen := -1
+        for j in slots[prev_sym]:
+            base := entry_base(table.entries[j])
+            span := bits.shl(1, entry_nbits(table.entries[j]))
+            if next_state >= base and next_state < base + span:
+                chosen = j
+        bit_values.push(next_state - entry_base(table.entries[chosen]))
+        bit_widths.push(entry_nbits(table.entries[chosen]))
+        next_state = chosen
+        k = k - 1
+
+    # write init first, then the transition bits in decode order (reverse of
+    # how they were collected).
+    w := stream.back_writer()
+    w.write(next_state, log)
+    mut b := bit_values.len() - 1
+    while b >= 0:
+        w.write(bit_values[b], bit_widths[b])
+        b = b - 1
+    return w.finish()
+
+# decode `count` symbols from a backward stream built by fse_encode.
+pub fn fse_decode_all(data: Bytes, counts: List[Int], log: Int, count: Int) -> List[Int]:
+    table := build_decode_table(counts, log)
+    reader := stream.back_reader(data, 0, data.len())
+    dec := fse_decoder(table, reader)
+    mut out: List[Int] := []
+    mut i := 0
+    while i < count:
+        out.push(dec.symbol())
+        if i + 1 < count:
+            dec.advance(reader)
+        i = i + 1
+    return out
+
+## decode a stand-alone fse stream that carries two interleaved states —
+## the shape huffman weight descriptions use. symbols alternate between the
+## states, and the stream ends when the bits run out rather than at a
+## declared count: the two live states each contribute one final symbol.
+pub fn decompress_two_state(table: FseTable, reader: stream.BackReader, max_out: Int) -> List[Int]!:
+    mut states := [reader.read(table.log), reader.read(table.log)]
+    mut out: List[Int] := []
+    mut turn := 0
+    while out.len() < max_out:
+        entry := table.entries[states[turn]]
+        out.push(entry_symbol(entry))
+        states[turn] = entry_base(entry) + reader.read(entry_nbits(entry))
+        if reader.remaining() < 0:
+            # the read ran past the start of the stream, so this is the end.
+            # the other state still holds one symbol that was never emitted.
+            out.push(entry_symbol(table.entries[states[1 - turn]]))
+            return out
+        turn = 1 - turn
+    fail "zstd: fse stream produced more symbols than expected"
+
+# ---------------------------------------------------------------
+# table descriptions — the normalized counts on the wire
+# ---------------------------------------------------------------
+
+## a table description read off the wire: the normalized counts (a -1 marks
+## the "less than one" probability), the accuracy log, and how many bytes
+## the description occupied.
+pub struct NCount:
+    pub counts: List[Int]
+    pub log: Int
+    pub bytes_used: Int
+
+## read an fse table description. the field width shrinks as the remaining
+## probability space does, which is why this peeks a wide field and then
+## consumes only the width that field turned out to need. a zero count is
+## followed by a repeat field, so long runs of absent symbols cost little.
+pub fn read_ncount(data: Bytes, start: Int, end: Int, max_symbol: Int) -> NCount!:
+    if start >= end:
+        fail "zstd: empty fse table description"
+    reader := stream.forward_reader(data, start, end)
+    log := reader.read(4) + 5
+    if log > 22:
+        fail "zstd: fse accuracy log " + log.to_string() + " is out of range"
+
+    mut counts: List[Int] := []
+    mut remaining := bits.shl(1, log) + 1
+    mut threshold := bits.shl(1, log)
+    mut nbits := log + 1
+    mut previous0 := false
+
+    while remaining > 1 and counts.len() <= max_symbol:
+        if previous0:
+            # a run of absent symbols: 2 bits at a time, where 3 means
+            # "three more and keep reading".
+            mut skipped := 0
+            while reader.peek(2) == 3:
+                skipped = skipped + 3
+                reader.skip(2)
+            skipped = skipped + reader.peek(2)
+            reader.skip(2)
+            mut k := 0
+            while k < skipped and counts.len() <= max_symbol:
+                counts.push(0)
+                k = k + 1
+            previous0 = false
+            continue
+
+        max := (2 * threshold - 1) - remaining
+        value := reader.peek(nbits)
+        mut count := 0
+        if bits.band(value, threshold - 1) < max:
+            count = bits.band(value, threshold - 1)
+            reader.skip(nbits - 1)
+        else:
+            count = bits.band(value, 2 * threshold - 1)
+            if count >= threshold:
+                count = count - max
+            reader.skip(nbits)
+
+        # the stored value is biased by one so that 0 can mean -1.
+        count = count - 1
+        mut magnitude := count
+        if magnitude < 0:
+            magnitude = 0 - magnitude
+        remaining = remaining - magnitude
+        counts.push(count)
+        previous0 = count == 0
+
+        while remaining < threshold:
+            nbits = nbits - 1
+            threshold = bits.shr(threshold, 1)
+
+    if remaining != 1:
+        fail "zstd: fse table description does not sum to its accuracy log"
+    # the forward reader yields zeros past the end rather than refusing, so
+    # a truncated description would otherwise fabricate symbols out of
+    # imaginary bits and still balance. consuming past the data is the tell.
+    if reader.remaining() < 0:
+        fail "zstd: fse table description runs past the end of its data"
+    return NCount(counts, log, reader.bytes_used(start))
+
+## write a table description the reader accepts. the encoder needs it, and
+## it makes the reader testable without a reference frame.
+pub fn write_ncount(counts: List[Int], log: Int) -> List[Int]:
+    w := stream.forward_writer()
+    w.write(log - 5, 4)
+
+    mut remaining := bits.shl(1, log) + 1
+    mut threshold := bits.shl(1, log)
+    mut nbits := log + 1
+    mut i := 0
+    mut previous0 := false
+
+    while remaining > 1 and i < counts.len():
+        if previous0:
+            # emit the run length of absent symbols in the same 2-bit form
+            start := i
+            while i < counts.len() and counts[i] == 0:
+                i = i + 1
+            mut run := i - start
+            while run >= 3:
+                w.write(3, 2)
+                run = run - 3
+            w.write(run, 2)
+            previous0 = false
+            if i >= counts.len():
+                break
+            continue
+
+        count := counts[i]
+        i = i + 1
+        max := (2 * threshold - 1) - remaining
+        mut magnitude := count
+        if magnitude < 0:
+            magnitude = 0 - magnitude
+        remaining = remaining - magnitude
+        mut encoded := count + 1
+        if encoded >= threshold:
+            encoded = encoded + max
+        if encoded < max:
+            w.write(encoded, nbits - 1)
+        else:
+            w.write(encoded, nbits)
+        previous0 = encoded == 1
+        while remaining < threshold:
+            nbits = nbits - 1
+            threshold = bits.shr(threshold, 1)
+
+    return w.finish()
+
+# ---------------------------------------------------------------
+# tests — round trip through a table built from real counts
+# ---------------------------------------------------------------
+
+fn ncount_round_trip(counts: List[Int], log: Int, max_symbol: Int) -> NCount!:
+    packed := write_ncount(counts, log)
+    mut buf := bytes.buffer()
+    for byte in packed:
+        buf.write_byte(byte)
+    data := buf.take_bytes()
+    return read_ncount(data, 0, data.len(), max_symbol)!
+
+test "a table description round trips":
+    # counts summing to 2^5 = 32
+    counts := [10, 12, 10]
+    result := ncount_round_trip(counts, 5, 255)!
+    assert_eq(result.log, 5)
+    got := result.counts
+    assert_eq(got.len(), 3)
+    mut i := 0
+    while i < 3:
+        assert_eq(got[i], counts[i])
+        i = i + 1
+
+test "a description round trips low-probability and absent symbols":
+    # -1 is the "less than one" probability; zeros are absent symbols that
+    # travel as a run. 4 + 1 + 1 + 24 + 1 + 1 = 32 in magnitude.
+    counts := [4, -1, -1, 0, 0, 0, 24, -1, -1]
+    got := ncount_round_trip(counts, 5, 255)!.counts
+    mut i := 0
+    while i < counts.len():
+        assert_eq(got[i], counts[i])
+        i = i + 1
+
+test "a long run of absent symbols survives":
+    mut counts: List[Int] := [16]
+    mut i := 0
+    while i < 30:
+        counts.push(0)
+        i = i + 1
+    counts.push(16)
+    got := ncount_round_trip(counts, 5, 255)!.counts
+    assert_eq(got[0], 16)
+    assert_eq(got[31], 16)
+    mut k := 1
+    while k < 31:
+        assert_eq(got[k], 0)
+        k = k + 1
+
+test "a truncated or malformed description is refused":
+    assert(read_ncount(bytes.empty(), 0, 0, 255).is_err)
+
+    # two zero bytes would decode as thirty-two low-probability symbols,
+    # which balances — but only by reading bits that are not there.
+    mut short_desc := bytes.buffer()
+    short_desc.write_byte(0)
+    short_desc.write_byte(0)
+    assert(read_ncount(short_desc.take_bytes(), 0, 2, 255).is_err)
+
+    # an accuracy log past the format's ceiling
+    mut bad_log := bytes.buffer()
+    bad_log.write_byte(15)
+    bad_log.write_byte(0)
+    bad_log.write_byte(0)
+    bad_log.write_byte(0)
+    assert(read_ncount(bad_log.take_bytes(), 0, 4, 255).is_err)
+
+    # a well-formed description that stops short of balancing
+    packed := write_ncount([10, 12, 10], 5)
+    mut truncated := bytes.buffer()
+    truncated.write_byte(packed[0])
+    assert(read_ncount(truncated.take_bytes(), 0, 1, 255).is_err)
+
+test "fse round trips a symbol sequence through a real backward stream":
+    counts := [10, 12, 10]
+    symbols := [0, 1, 2, 1, 1, 0, 2, 2, 1, 0, 1, 2]
+    packed := fse_encode(symbols, counts, 5)
+    mut buf := bytes.buffer()
+    for byte in packed:
+        buf.write_byte(byte)
+    data := buf.take_bytes()
+    decoded := fse_decode_all(data, counts, 5, symbols.len())
+    assert_eq(decoded.len(), symbols.len())
+    mut i := 0
+    while i < symbols.len():
+        assert_eq(decoded[i], symbols[i])
+        i = i + 1
+
+test "fse round trips a skewed distribution":
+    # symbol 3 dominates; the rare symbols get few slots and wide bit reads.
+    counts := [2, 1, 1, 28]
+    symbols := [3, 3, 3, 0, 3, 3, 1, 3, 3, 3, 3, 2, 3, 3, 0, 3]
+    packed := fse_encode(symbols, counts, 5)
+    mut buf := bytes.buffer()
+    for byte in packed:
+        buf.write_byte(byte)
+    data := buf.take_bytes()
+    decoded := fse_decode_all(data, counts, 5, symbols.len())
+    mut i := 0
+    while i < symbols.len():
+        assert_eq(decoded[i], symbols[i])
+        i = i + 1
+
+test "a decode table places every slot and stays in range":
+    # counts summing to the table size (32): the stride is coprime to the
+    # size at realistic table logs, which is what the spread relies on.
+    counts := [10, 12, 10]
+    table := build_decode_table(counts, 5)
+    assert_eq(table.entries.len(), 32)
+    mut i := 0
+    mut seen0 := 0
+    while i < 32:
+        e := table.entries[i]
+        assert(entry_symbol(e) >= 0 and entry_symbol(e) < 3)
+        assert(entry_nbits(e) >= 0 and entry_nbits(e) <= 5)
+        if entry_symbol(e) == 0:
+            seen0 = seen0 + 1
+        i = i + 1
+    # symbol 0 has count 10, so it occupies exactly ten slots.
+    assert_eq(seen0, 10)
+
+test "the spread walk visits every slot once at realistic sizes":
+    for size in [32, 64, 256, 1024]:
+        step := spread_step(size)
+        mut hits: List[Int] := []
+        mut i := 0
+        while i < size:
+            hits.push(0)
+            i = i + 1
+        mut pos := 0
+        i = 0
+        while i < size:
+            hits[pos] = hits[pos] + 1
+            pos = (pos + step) % size
+            i = i + 1
+        i = 0
+        while i < size:
+            assert_eq(hits[i], 1)
+            i = i + 1
+
+test "bit_length matches floor-log2 plus one":
+    assert_eq(bit_length(0), 0)
+    assert_eq(bit_length(1), 1)
+    assert_eq(bit_length(2), 2)
+    assert_eq(bit_length(3), 2)
+    assert_eq(bit_length(7), 3)
+    assert_eq(bit_length(8), 4)

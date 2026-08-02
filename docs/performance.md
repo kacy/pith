@@ -524,6 +524,84 @@ constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
 
+`bench/zstd_decode` — the pure-pith zstd decoder against the crate-backed
+kernel, on a corpus built from the repo itself (2:1 to 11:1 — realistic
+content-encoding shapes; run it with `make zstd-pure-bench`). the decoder
+started at 129x the kernel and three optimization passes brought it to
+5.5-8x, with the run-heavy case now beating the kernel outright:
+
+| corpus | first measure | now | vs kernel |
+|---|---|---|---|
+| text 8kb | 3.4 mb/s | 56 | 8.0x |
+| prose 281kb | ~5 | 108 | 7.0x |
+| source 585kb | ~7 | 166 | 5.5x |
+| json 500kb | ~8 | 343 | 6.2x |
+| rle runs 78kb | 29 | 7,475 | **0.63x — faster** |
+
+the story generalized well beyond zstd. the early cost was per-byte
+runtime calls (raw blocks and matches copied a byte per call); bulk slice
+writes, `copy_within` for overlapping matches, and a cached 64-bit
+bitstream window fixed that. the rest was per-operation call overhead
+that the compiler now removes for every pith program, not just this one:
+`xs[i]` used to call into the runtime, heap-allocate an optional tuple,
+unpack it, and release it — the consumer now collapses that whole pattern
+to inline loads with the same loud bounds failure; `bits.band` used to
+cross two call layers and is now a single native instruction; a word
+load from bytes inlines to one 8-byte load and a mask. the decoder-side
+share was fusing sequence decode into execution (the intermediate list of
+sequence structs cost more than the arithmetic producing it) and packing
+every table entry into a plain int, since a struct read in a hot loop is
+a handle plus refcount traffic.
+
+two measurement lessons from the same work, recorded here because they
+will bite again: an operation's isolated microbenchmark cost overstates
+its marginal cost in a real loop by about 5x (the cpu overlaps
+independent calls — only differential measurement on the real loop
+justifies a change), and a representation change must price the read
+side, not just the write (three parallel int lists beat a struct list on
+push and lost it all back reading the fields out).
+
+the encoder side exists too, pure pith end to end: stored, huffman, and
+full sequence blocks with repeat offsets, verified shape by shape against
+the system zstd binary (`make zstd-encode-check` — the system binary must
+decode every pith-compressed frame byte-identical, because a round trip
+through our own decoder proved nothing twice on this code). one
+optimization pass in, it stands here:
+
+| corpus | encode mb/s | vs kernel | size vs kernel |
+|---|---|---|---|
+| text 8kb | 3 → **8** | 17x | 115% → **101%** |
+| prose 284kb | 4 → **15** | 9x | 139% → **106%** |
+| source 585kb | 6 → **20** | 12x | 140% → **107%** |
+| json 500kb | 11 → **26** | 22x | 188% → **119%** |
+| rle runs 78kb | 48 → **51** | 69x | 137% |
+
+both columns moved together; neither was traded for the other. the size
+win is mostly per-block fse tables — all three sequence streams used to
+emit the predefined distributions, which cost most on data whose
+histogram looks nothing like them, and json logs were the worst case at
+1.88x. the encoder now histograms what a block actually uses and sends a
+table description only when the estimated bits beat predefined by more
+than the description costs; the finder also prefers the previous offset
+(a repeat code is cheaper than an offset's magnitude) and holds a match
+until the next position has been checked for a longer one.
+
+the speed win is mostly writing bits forward instead of recording them.
+the backward bitstream writer pushed every field as a value and a width
+onto two lists and packed on a second pass; a packer flushing four bytes
+at a time into the buffer runs that loop once. that plus removing
+per-sequence scratch allocations moved the profile's largest cost from
+handle-registry hashing (23%) to the match finder (31%) — which is now
+where the next pass would start.
+
+the remaining size gap is not cheaper sequences but fewer of them: json
+spends 51,710 bytes on 19,134 sequences against only 3,986 bytes of
+literals, so a hash chain with several candidates per bucket is the
+untried lever. repeat mode for sequence tables is also unimplemented —
+later blocks re-send descriptions nearly identical to the previous
+block's, worth a few hundred bytes per multi-block frame at no
+throughput cost.
+
 `bench/cyclic_graph` — struct nodes wired into reference cycles
 (parent<->child) and dropped, 2m of them. refcounting alone cannot
 reclaim a cycle, so the strong version leaks; marking one edge of each

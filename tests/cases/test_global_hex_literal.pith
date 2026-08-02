@@ -1,0 +1,26 @@
+# a module constant initialized with a non-decimal literal.
+#
+# the emitter passes an integer literal's source text straight into the ir,
+# and the consumer parsed the global initializer with a decimal-only parse
+# that coerced failure to zero. so a global set to a hex or binary literal
+# silently became 0 while the identical literal inline compiled correctly —
+# the worst shape of bug, a wrong value with no diagnostic.
+
+HEX_SMALL := 0x10
+HEX_BIG := 0xFD2FB528
+HEX_SIGN_BIT := 0x80000000
+BINARY := 0b1010
+OCTAL := 0o17
+DECIMAL := 16
+NEGATIVE := -5
+
+fn main():
+    print("hex small: {HEX_SMALL}")
+    print("hex big: {HEX_BIG}")
+    print("hex sign bit: {HEX_SIGN_BIT}")
+    print("binary: {BINARY}")
+    print("octal: {OCTAL}")
+    print("decimal: {DECIMAL}")
+    print("negative: {NEGATIVE}")
+    # the global and the inline literal must agree
+    print("agree: {HEX_BIG == 0xFD2FB528}")

@@ -59,6 +59,10 @@ pub enum ListTypeTag {
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
 pub const LIST_IMPL_VALUES8_PTR_OFFSET: i32 = std::mem::offset_of!(ListImpl, values8_ptr) as i32;
 pub const LIST_IMPL_VALUES8_LEN_OFFSET: i32 = std::mem::offset_of!(ListImpl, values8_len) as i32;
+pub const LIST_IMPL_TYPE_TAG_OFFSET: i32 = std::mem::offset_of!(ListImpl, type_tag) as i32;
+/// The Primitive tag's discriminant, for the codegen fast path: primitive
+/// elements carry no counts, so an in-bounds store needs no retain/release.
+pub const LIST_TYPE_TAG_PRIMITIVE: i32 = ListTypeTag::Primitive as i32;
 
 impl ListImpl {
     fn new(elem_size: usize, type_tag: ListTypeTag) -> Self {

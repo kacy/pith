@@ -1601,15 +1601,31 @@ pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
 const STRUCT_POOL_MAX_TOTAL: usize = 256; // total bytes incl the 32-byte header
 const STRUCT_POOL_CAP: usize = 512; // max retained blocks per size bucket
 
+// 0 = not probed yet, 1 = disabled, 2 = enabled. this check runs on every
+// struct alloc and free, so the settled path must be one relaxed load and a
+// predictable branch, same as the perf-stats gate.
+static STRUCT_POOL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cold]
+fn struct_pool_probe() -> bool {
+    let enabled = !matches!(
+        std::env::var("PITH_STRUCT_FREELIST").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    );
+    STRUCT_POOL_STATE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    enabled
+}
+
+#[inline(always)]
 fn struct_pool_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("PITH_STRUCT_FREELIST").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
+    match STRUCT_POOL_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => struct_pool_probe(),
+    }
 }
 
 thread_local! {

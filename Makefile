@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check memcheck leak-check leak-check-only test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -1213,6 +1213,66 @@ zstd-interop-check:
 	./target/release/pith run "$$tmpdir/unpack.pith" > /dev/null 2>&1 && \
 	cmp "$$tmpdir/back3" README.md && cmp "$$tmpdir/back19" README.md && \
 	echo "pith reads system zstd output at levels 3 and 19 byte-identical"
+
+# --- pure-pith zstd decoder interop ---
+# the pure decoder (no libzstd) against frames the system tool produced,
+# across the shapes that exercise every block and literals type: raw blocks
+# from incompressible input, huffman literals from wide-alphabet text,
+# multi-block frames with carried repeat-offset state, and the edge sizes.
+
+# throughput of the pure decoder against the crate-backed kernel, on a
+# corpus built from the repo itself. see bench/zstd_codec.pith for why the
+# highly-compressible case is reported but not treated as the headline.
+zstd-pure-bench: build
+	@./target/release/pith run bench/zstd_codec.pith
+
+zstd-pure-check:
+	@echo "--- pure-pith zstd decoder interop ---"
+	@tmpdir=$$(mktemp -d /tmp/pith-zstdpure-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	cp README.md "$$tmpdir/text.bin"; \
+	head -c 120000 /dev/urandom > "$$tmpdir/random.bin"; \
+	python3 -c "import sys; sys.stdout.write(''.join(chr(32+(i*37)%95) for i in range(150000)))" > "$$tmpdir/spread.bin"; \
+	python3 -c "import sys; sys.stdout.write('ab'*40000)" > "$$tmpdir/repeat.bin"; \
+	printf '' > "$$tmpdir/empty.bin"; \
+	printf 'a' > "$$tmpdir/one.bin"; \
+	for f in text random spread repeat empty one; do \
+	  for lvl in 1 5 19; do zstd -$$lvl -c "$$tmpdir/$$f.bin" > "$$tmpdir/$$f.$$lvl.zst" 2>/dev/null; done; \
+	done; \
+	printf 'import std.fs as fs\nimport std.compress.zstd_pure_frame as zf\n\nfn main() -> Int!:\n    mut ok := 0\n    for name in ["text", "random", "spread", "repeat", "empty", "one"]:\n        raw := fs.read_bytes("'"$$tmpdir"'/" + name + ".bin")!\n        for lvl in ["1", "5", "19"]:\n            got := zf.decompress_bounded(fs.read_bytes("'"$$tmpdir"'/" + name + "." + lvl + ".zst")!, 4000000)!\n            if got != raw:\n                fail "mismatch: " + name + " -" + lvl\n            ok = ok + 1\n    print("{ok} system zstd frames decoded byte-identical by the pure decoder")\n    return 0\n' > "$$tmpdir/check.pith"; \
+	./target/release/pith run "$$tmpdir/check.pith"
+
+# --- pure-pith zstd encoder interop ---
+# the pure encoder against the system tool: pith compresses every corpus
+# shape (including the block-boundary and single-byte-run edges), the system
+# zstd binary decompresses each frame, and the result must byte-compare to
+# the input. the pure decoder must also read every frame back, and the size
+# table against `zstd -3` keeps the ratios honest.
+
+zstd-encode-check:
+	@echo "--- pure-pith zstd encoder interop ---"
+	@tmpdir=$$(mktemp -d /tmp/pith-zstdenc-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	cp README.md "$$tmpdir/text.bin"; \
+	head -c 120000 /dev/urandom > "$$tmpdir/random.bin"; \
+	python3 -c "import sys; sys.stdout.write(''.join(chr(32+(i*37)%95) for i in range(150000)))" > "$$tmpdir/spread.bin"; \
+	python3 -c "import sys; sys.stdout.write('ab'*40000)" > "$$tmpdir/repeat.bin"; \
+	printf '' > "$$tmpdir/empty.bin"; \
+	printf 'a' > "$$tmpdir/one.bin"; \
+	python3 -c "import sys; d=open('README.md','rb').read(); sys.stdout.buffer.write((d*(131073//len(d)+1))[:131072])" > "$$tmpdir/exact.bin"; \
+	python3 -c "import sys; d=open('README.md','rb').read(); sys.stdout.buffer.write((d*(131074//len(d)+1))[:131073])" > "$$tmpdir/over.bin"; \
+	head -c 200000 /dev/zero > "$$tmpdir/same.bin"; \
+	printf 'import std.fs as fs\nimport std.compress.zstd_pure_encode as ze\nimport std.compress.zstd_pure_frame as zf\n\nfn main() -> Int!:\n    dir := "'"$$tmpdir"'/"\n    for name in ["text", "random", "spread", "repeat", "empty", "one", "exact", "over", "same"]:\n        raw := fs.read_bytes(dir + name + ".bin")!\n        packed := ze.compress_checked(raw)!\n        back := zf.decompress_bounded(packed, 50000000)!\n        if back != raw:\n            fail "pure-decoder round-trip mismatch: " + name\n        fs.write_bytes(dir + name + ".zst", packed)!\n    print("9 shapes compressed; the pure decoder reads each back byte-identical")\n    return 0\n' > "$$tmpdir/pack.pith"; \
+	./target/release/pith run "$$tmpdir/pack.pith" && \
+	for f in text random spread repeat empty one exact over same; do \
+	  zstd -q -d -c "$$tmpdir/$$f.zst" | cmp - "$$tmpdir/$$f.bin" || { echo "FAIL system zstd mismatch: $$f"; exit 1; }; \
+	done && \
+	echo "system zstd decodes every pith-compressed frame byte-identical" && \
+	echo "--- size vs zstd -3 ---" && \
+	for f in text random spread repeat empty one exact over same; do \
+	  zstd -q -3 -c "$$tmpdir/$$f.bin" > "$$tmpdir/$$f.sys3.zst"; \
+	  printf '%-8s raw %8d  pith %8d  zstd-3 %8d\n' "$$f" "$$(wc -c < "$$tmpdir/$$f.bin")" "$$(wc -c < "$$tmpdir/$$f.zst")" "$$(wc -c < "$$tmpdir/$$f.sys3.zst")"; \
+	done
 
 # --- cli regressions ---
 

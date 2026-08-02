@@ -46,6 +46,14 @@ pub fn get(data: Bytes, index: Int) -> Int:
 pub fn slice(data: Bytes, start: Int, end: Int) -> Bytes:
     return bytes_slice(data, start, end)
 
+## read `count` bytes at `off` as one little-endian integer — the mirror
+## of ByteBuffer.write_word, so a word-at-a-time consumer pays one call
+## instead of a byte loop. 0 when the range falls outside the data or
+## `count` is outside 1..=8; callers relying on zero-past-the-end
+## tolerance must bounds-check first.
+pub fn read_word(data: Bytes, off: Int, count: Int) -> Int:
+    return bytes_read_word(data, off, count)
+
 # concatenate two byte slices.
 pub fn concat(left: Bytes, right: Bytes) -> Bytes:
     return bytes_concat(left, right)
@@ -143,6 +151,24 @@ impl ByteBuffer:
     fn get(index: Int) -> Int:
         return byte_buffer_get(self.handle, index)
 
+    ## append `len` bytes copied from `src` within this buffer — the
+    ## back-reference an lz-family decoder emits. an overlapping range
+    ## repeats, which is how a run costs one short match.
+    fn copy_within(src: Int, len: Int) -> Bool:
+        return byte_buffer_copy_within(self.handle, src, len)
+
+    ## append `len` bytes of `src` starting at `start` — slice-then-write
+    ## without the intermediate bytes allocation. false when the range
+    ## falls outside `src`.
+    fn write_range(src: Bytes, start: Int, len: Int) -> Bool:
+        return byte_buffer_write_range(self.handle, src, start, len)
+
+    ## append the low `count` bytes of `word`, least significant first —
+    ## lets a byte-at-a-time producer batch eight appends into one call.
+    ## false when `count` is outside 1..=8.
+    fn write_word(word: Int, count: Int) -> Bool:
+        return byte_buffer_write_word(self.handle, word, count)
+
     fn set(index: Int, value: Int) -> Bool:
         return byte_buffer_set(self.handle, index, value)
 
@@ -230,3 +256,29 @@ test "byte buffers write and reset":
     assert_eq(out.bytes().to_string_utf8()!, "hithere" + chr(10) + "!")
     out.reset()
     assert_eq(out.bytes().len(), 0)
+
+test "byte buffers append ranges and packed words":
+    src := from_string_utf8("abcdef")
+    out := buffer()
+    assert(out.write_range(src, 1, 3))
+    assert_eq(out.bytes().to_string_utf8()!, "bcd")
+    # a zero-length range is a legitimate no-op
+    assert(out.write_range(src, 6, 0))
+    # ranges outside the source are refused, not clamped
+    assert(not out.write_range(src, 4, 3))
+    assert(not out.write_range(src, -1, 2))
+
+    # little-endian read-back: 'b' is the low byte of the word at 1
+    assert_eq(read_word(src, 1, 2), 0x6362)
+    assert_eq(read_word(src, 0, 1), 0x61)
+    # out-of-range and bad widths read as zero, never partially
+    assert_eq(read_word(src, 5, 2), 0)
+    assert_eq(read_word(src, 0, 9), 0)
+    assert_eq(read_word(src, -1, 4), 0)
+
+    # "AB" packed little-endian: A is the low byte, so it lands first
+    assert(out.write_word(0x4241, 2))
+    assert_eq(out.bytes().to_string_utf8()!, "bcdAB")
+    assert(not out.write_word(0, 0))
+    assert(not out.write_word(0, 9))
+    out.free()

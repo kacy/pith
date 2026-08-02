@@ -368,6 +368,133 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     1
 }
 
+/// Append `len` bytes copied from `src` within this same buffer — the
+/// back-reference every LZ-family decoder needs. The copy runs forward one
+/// byte at a time on purpose: when the source range overlaps the
+/// destination (offset < len), that repetition IS the encoding, which is
+/// how a run of bytes costs one short match. Returns 1, or 0 on a bad
+/// handle or a range that starts outside the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len: i64) -> i64 {
+    let Some(buffer) = pith_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    if src < 0 || len < 0 || (src as usize) >= buffer.data.len() {
+        return 0;
+    }
+    let src = src as usize;
+    let len = len as usize;
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, len);
+    buffer.data.reserve(len);
+    // a non-overlapping range is a straight extend. an overlapping range
+    // means the output repeats with period (len - src): each chunk copied
+    // from src is a whole number of periods, so the region already written
+    // feeds the next chunk and the chunk size doubles — a byte-long run
+    // costs a logarithmic number of memcpys instead of a byte loop.
+    if src + len <= buffer.data.len() {
+        buffer.data.extend_from_within(src..src + len);
+    } else {
+        let mut remaining = len;
+        while remaining > 0 {
+            let avail = buffer.data.len() - src;
+            let n = avail.min(remaining);
+            buffer.data.extend_from_within(src..src + n);
+            remaining -= n;
+        }
+    }
+    1
+}
+
+/// Read `count` bytes at `off` as one little-endian integer — the mirror
+/// of `write_word`. A word-at-a-time consumer (the xxhash kernel, the
+/// bitstream refill) pays one call here instead of a byte loop. Returns 0
+/// on a bad handle, a count outside 1..=8, or a range outside the bytes —
+/// callers needing the zero-past-the-end tolerance check bounds first.
+///
+/// # Safety
+/// handle must be a valid PithBytes or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_read_word(handle: i64, off: i64, count: i64) -> i64 {
+    let Some(bytes) = pith_bytes_ref(handle) else {
+        return 0;
+    };
+    if off < 0 || !(1..=8).contains(&count) {
+        return 0;
+    }
+    let off = off as usize;
+    let count = count as usize;
+    let Some(end) = off.checked_add(count) else {
+        return 0;
+    };
+    if end > bytes.data.len() {
+        return 0;
+    }
+    let mut le = [0u8; 8];
+    le[..count].copy_from_slice(&bytes.data[off..end]);
+    u64::from_le_bytes(le) as i64
+}
+
+/// Append `len` bytes of `src` starting at `start` — a slice-then-write
+/// with the intermediate bytes allocation removed. The LZ execute loop
+/// appends one literal run per sequence; allocating a Bytes object per run
+/// just to feed `write` was a measurable share of decode. Returns 1, or 0
+/// on a bad handle or a range outside `src`.
+///
+/// # Safety
+/// handle must be a valid PithByteBuffer and src a valid PithBytes, or
+/// garbage (the magic checks reject garbage).
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_write_range(handle: i64, src: i64, start: i64, len: i64) -> i64 {
+    let Some(buffer) = pith_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    let Some(bytes) = pith_bytes_ref(src) else {
+        return 0;
+    };
+    if start < 0 || len < 0 {
+        return 0;
+    }
+    let start = start as usize;
+    let len = len as usize;
+    let Some(end) = start.checked_add(len) else {
+        return 0;
+    };
+    if end > bytes.data.len() {
+        return 0;
+    }
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, len);
+    buffer.data.extend_from_slice(&bytes.data[start..end]);
+    1
+}
+
+/// Append the low `count` bytes of `word`, least significant first. A hot
+/// byte-at-a-time producer (the huffman literals decoder) batches up to
+/// eight decoded bytes into one integer and pays one call here instead of
+/// eight `write_byte` calls. Returns 1, or 0 on a bad handle or a count
+/// outside 1..=8.
+///
+/// # Safety
+/// handle must be a valid PithByteBuffer or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, count: i64) -> i64 {
+    let Some(buffer) = pith_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    if !(1..=8).contains(&count) {
+        return 0;
+    }
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, count as usize);
+    let le = (word as u64).to_le_bytes();
+    buffer.data.extend_from_slice(&le[..count as usize]);
+    1
+}
+
 /// Extract the accumulated bytes (moving the storage, no copy) and free
 /// the buffer in one step: the natural end of a build-then-extract
 /// buffer's life.

@@ -1,0 +1,534 @@
+# std/compress/zstd_pure_huffman — huffman-coded literals for pure-pith zstd.
+#
+# zstd codes literals with a canonical huffman table described by per-symbol
+# *weights* rather than code lengths: a symbol of weight w gets a code of
+# (max_bits + 1 - w) bits, weight 0 means absent, and the final symbol's
+# weight is inferred from the gap left in the probability space. the decode
+# table is flat — 2^max_bits entries, each naming a symbol and its length —
+# so decoding is peek the table log, index, consume that entry's length.
+#
+# literals arrive in one backward stream or four (a jump table gives the
+# first three sizes). four streams exist so a decoder can run them in
+# parallel; here they decode in sequence and concatenate.
+
+import std.bits as bits
+import std.bytes as bytes
+import std.compress.zstd_pure_bits as stream
+import std.compress.zstd_pure_fse as fse
+
+## literals section block types, from the header's low two bits.
+pub LITERALS_RAW := 0
+pub LITERALS_RLE := 1
+pub LITERALS_COMPRESSED := 2
+pub LITERALS_TREELESS := 3
+
+## the largest huffman table log zstd allows for literals.
+pub MAX_TABLE_LOG := 11
+
+## a built huffman decode table: 2^log flat entries.
+##
+## an entry is one packed Int rather than a two-field struct — symbol in the
+## high bits, code length in the low eight. the decode loop indexes this
+## table once per output byte, and a struct there means a heap handle and a
+## reference-count round trip per byte; an Int is a plain load. use
+## entry_symbol/entry_nbits to read one.
+pub struct HuffTable:
+    pub log: Int
+    pub entries: List[Int]
+
+## pack a symbol and its code length into one table entry.
+pub fn huff_entry(symbol: Int, nbits: Int) -> Int:
+    return bits.shl(symbol, 8) + nbits
+
+## the symbol a packed entry decodes to.
+pub fn entry_symbol(entry: Int) -> Int:
+    return bits.shr(entry, 8)
+
+## the code length of a packed entry; 0 means no symbol is assigned here.
+pub fn entry_nbits(entry: Int) -> Int:
+    return bits.band(entry, 255)
+
+# floor(log2(v)) + 1 for v >= 1; 0 for v == 0.
+fn bit_length(v: Int) -> Int:
+    mut n := 0
+    mut x := v
+    while x > 0:
+        n = n + 1
+        x = bits.shr(x, 1)
+    return n
+
+## complete a weight list by inferring the last symbol's weight, then build
+## the decode table. `weights` holds the explicitly coded weights; the
+## inferred one is appended. fails when the weights overflow the space or
+## leave a gap that is not a power of two.
+pub fn build_table(weights: List[Int]) -> HuffTable!:
+    # the coded weights consume sum(2^(w-1)) of the probability space.
+    mut total := 0
+    for w in weights:
+        if w > 0:
+            total = total + bits.shl(1, w - 1)
+    if total == 0:
+        fail "zstd: huffman weights are all zero"
+
+    # the table log is the next power of two above the total, and the gap
+    # left over belongs to the final, uncoded symbol.
+    max_bits := bit_length(total)
+    if max_bits > MAX_TABLE_LOG:
+        fail "zstd: huffman table log " + max_bits.to_string() + " exceeds the maximum"
+    left := bits.shl(1, max_bits) - total
+    if left == 0 or bits.band(left, left - 1) != 0:
+        fail "zstd: huffman weights do not leave a power-of-two remainder"
+
+    mut all_weights: List[Int] := []
+    for w in weights:
+        all_weights.push(w)
+    all_weights.push(bit_length(left))
+
+    # rank starts: symbols are laid out by ascending weight, and a weight-w
+    # symbol occupies 2^(w-1) consecutive entries. lower weight means a
+    # longer code and fewer slots, so the longest codes come first.
+    mut rank_count: List[Int] := []
+    mut i := 0
+    while i <= max_bits:
+        rank_count.push(0)
+        i = i + 1
+    for w in all_weights:
+        if w > 0:
+            rank_count[w] = rank_count[w] + 1
+
+    mut rank_start: List[Int] := []
+    i = 0
+    while i <= max_bits:
+        rank_start.push(0)
+        i = i + 1
+    mut next_start := 0
+    mut w := 1
+    while w <= max_bits:
+        rank_start[w] = next_start
+        next_start = next_start + rank_count[w] * bits.shl(1, w - 1)
+        w = w + 1
+
+    size := bits.shl(1, max_bits)
+    mut entries: List[Int] := []
+    i = 0
+    while i < size:
+        entries.push(0)
+        i = i + 1
+
+    mut sym := 0
+    while sym < all_weights.len():
+        weight := all_weights[sym]
+        if weight > 0:
+            span := bits.shl(1, weight - 1)
+            nbits := max_bits + 1 - weight
+            start := rank_start[weight]
+            mut k := 0
+            while k < span:
+                entries[start + k] = huff_entry(sym, nbits)
+                k = k + 1
+            rank_start[weight] = start + span
+        sym = sym + 1
+
+    return HuffTable(max_bits, entries)
+
+## decode `count` symbols straight into `out`: peek the table log, index,
+## append the symbol, consume that entry's code length. writing into the
+## buffer as it goes avoids a second per-byte pass over an intermediate list.
+pub fn decode_stream_into(table: HuffTable, reader: stream.BackReader, count: Int, out: ByteBuffer) -> Int!:
+    # the loop runs once per literal byte, so the reader's window arithmetic
+    # is inlined here rather than paid as two method calls (peek, skip) per
+    # byte — the peek is a shift and a mask against a local window, and only
+    # a window miss or the stream tail goes back through the reader. the
+    # locals mirror BackReader's fields; pos is written back at every cold
+    # call and at the end so the reader stays coherent.
+    log := table.log
+    entries := table.entries
+    start_bit := reader.start_bit
+    mask := bits.shl(1, log) - 1
+    mut pos := reader.pos
+    mut window := reader.window
+    mut window_base := reader.window_base
+    # decoded symbols pack into an integer, low byte first, and flush eight
+    # at a time: one write_word call in place of eight write_byte calls,
+    # and the extern call was most of each byte's cost.
+    mut acc := 0
+    mut shift := 0
+    mut i := 0
+    while i < count:
+        at := pos - log
+        mut peeked := 0
+        if at >= start_bit:
+            if at < window_base or at + log > window_base + 64:
+                # cold: refill through the reader, then re-adopt its window
+                reader.refill(at, log)
+                window = reader.window
+                window_base = reader.window_base
+            peeked = bits.band(bits.shr(window, at - window_base), mask)
+        else:
+            # cold tail: bits below the stream's start read as zero
+            reader.pos = pos
+            peeked = reader.peek(log)
+        entry := entries[peeked]
+        nbits := bits.band(entry, 255)
+        if nbits == 0:
+            fail "zstd: huffman code has no symbol"
+        acc = bits.bor(acc, bits.shl(bits.shr(entry, 8), shift))
+        shift = shift + 8
+        if shift == 64:
+            out.write_word(acc, 8)
+            acc = 0
+            shift = 0
+        pos = pos - nbits
+        i = i + 1
+    if shift > 0:
+        out.write_word(acc, shift / 8)
+    reader.pos = pos
+    return count
+
+## the same, collected into a list — for tests and small callers.
+pub fn decode_stream(table: HuffTable, reader: stream.BackReader, count: Int) -> List[Int]!:
+    mut buf := bytes.buffer()
+    defer buf.free()
+    decode_stream_into(table, reader, count, buf)!
+    data := buf.bytes()
+    mut out: List[Int] := []
+    mut i := 0
+    while i < data.len():
+        out.push(data[i])
+        i = i + 1
+    return out
+
+## the code assigned to each symbol by `table`, as (code, nbits) pairs
+## indexed by symbol; nbits 0 means the symbol is absent. this is what an
+## encoder writes, and it is derived from the table so the two can never
+## disagree.
+pub fn build_codes(table: HuffTable) -> (List[Int], List[Int]) :
+    mut codes: List[Int] := []
+    mut lengths: List[Int] := []
+    mut i := 0
+    while i < 256:
+        codes.push(0)
+        lengths.push(0)
+        i = i + 1
+    mut index := 0
+    while index < table.entries.len():
+        symbol := entry_symbol(table.entries[index])
+        nbits := entry_nbits(table.entries[index])
+        if nbits > 0 and lengths[symbol] == 0:
+            lengths[symbol] = nbits
+            # every index sharing this prefix decodes to the symbol, so the
+            # code is the first such index shifted down to its own width.
+            codes[symbol] = bits.shr(index, table.log - nbits)
+        index = index + 1
+    return (codes, lengths)
+
+## the weights of the first `count` symbols, packed 4 bits each, high nibble
+## first — the "direct" tree description zstd uses when the weight list is
+## small enough not to be worth entropy-coding.
+pub fn read_direct_weights(data: Bytes, off: Int, count: Int) -> List[Int]!:
+    needed := (count + 1) / 2
+    if off + needed > data.len():
+        fail "zstd: truncated huffman weight table"
+    mut weights: List[Int] := []
+    mut i := 0
+    while i < count:
+        byte := data[off + i / 2]
+        if i % 2 == 0:
+            weights.push(bits.shr(byte, 4))
+        else:
+            weights.push(bits.band(byte, 15))
+        i = i + 1
+    return weights
+
+## the largest weight value a huffman description can carry.
+MAX_WEIGHT_SYMBOL := 12
+
+## a huffman tree description read off the wire, and the bytes it took.
+pub struct TreeDescription:
+    pub table: HuffTable
+    pub bytes_used: Int
+
+## read a huffman tree description. a leading byte of 128 or more means the
+## weights follow directly, 4 bits each; anything less is the byte length of
+## an fse-coded weight stream, whose table description comes first and whose
+## payload carries two interleaved states.
+pub fn read_tree_description(data: Bytes, off: Int, end: Int) -> TreeDescription!:
+    if off >= end:
+        fail "zstd: truncated huffman tree description"
+    header := data[off]
+    if header >= 128:
+        count := header - 127
+        weights := read_direct_weights(data, off + 1, count)!
+        return TreeDescription(build_table(weights)!, 1 + (count + 1) / 2)
+
+    # fse-coded weights: `header` is the byte length of the whole coded
+    # description, table and payload together.
+    coded_end := off + 1 + header
+    if coded_end > end:
+        fail "zstd: fse weight description runs past the literals section"
+    desc := fse.read_ncount(data, off + 1, coded_end, MAX_WEIGHT_SYMBOL)!
+    weight_table := fse.build_decode_table(desc.counts, desc.log)
+    payload_start := off + 1 + desc.bytes_used
+    if payload_start >= coded_end:
+        fail "zstd: fse weight description has no payload"
+    reader := stream.back_reader(data, payload_start, coded_end)
+    if not reader.ok:
+        fail "zstd: malformed fse weight stream"
+    weights := fse.decompress_two_state(weight_table, reader, 255)!
+    return TreeDescription(build_table(weights)!, 1 + header)
+
+fn read_le16(data: Bytes, off: Int) -> Int:
+    return bits.bor(data[off], bits.shl(data[off + 1], 8))
+
+## decode the huffman-coded literals in [start, end) against `table`,
+## producing exactly `regenerated` bytes. four-stream layouts open with a
+## six-byte jump table giving the first three stream lengths; the output
+## splits into four equal segments, the last taking the remainder.
+pub fn decode_literals(table: HuffTable, data: Bytes, start: Int, end: Int, regenerated: Int, streams: Int) -> Bytes!:
+    mut out := bytes.buffer()
+    errdefer out.free()
+
+    if streams == 1:
+        reader := stream.back_reader(data, start, end)
+        if not reader.ok:
+            fail "zstd: malformed literals stream"
+        decode_stream_into(table, reader, regenerated, out)!
+        result := out.bytes()
+        out.free()
+        return result
+
+    if start + 6 > end:
+        fail "zstd: truncated literals jump table"
+    size1 := read_le16(data, start)
+    size2 := read_le16(data, start + 2)
+    size3 := read_le16(data, start + 4)
+    body := start + 6
+    size4 := end - body - size1 - size2 - size3
+    if size1 < 0 or size2 < 0 or size3 < 0 or size4 < 0:
+        fail "zstd: literals jump table does not fit the section"
+
+    segment := (regenerated + 3) / 4
+    starts := [body, body + size1, body + size1 + size2, body + size1 + size2 + size3]
+    sizes := [size1, size2, size3, size4]
+    mut produced := 0
+    mut i := 0
+    while i < 4:
+        mut want := segment
+        if i == 3:
+            want = regenerated - 3 * segment
+        if want < 0:
+            fail "zstd: literals segment sizes do not add up"
+        reader := stream.back_reader(data, starts[i], starts[i] + sizes[i])
+        if not reader.ok:
+            fail "zstd: malformed literals stream " + i.to_string()
+        decode_stream_into(table, reader, want, out)!
+        produced = produced + want
+        i = i + 1
+
+    if produced != regenerated:
+        fail "zstd: literals streams produced the wrong length"
+    result := out.bytes()
+    out.free()
+    return result
+
+## a parsed literals section header.
+pub struct LiteralsHeader:
+    pub kind: Int
+    pub regenerated_size: Int
+    pub compressed_size: Int
+    pub streams: Int
+    pub header_len: Int
+
+fn read_le(data: Bytes, off: Int, count: Int) -> Int:
+    mut value := 0
+    mut i := count - 1
+    while i >= 0:
+        value = bits.bor(bits.shl(value, 8), data[off + i])
+        i = i - 1
+    return value
+
+## parse the literals section header at `off`. the size fields are packed at
+## bit offsets that depend on the block type and size format, which is why
+## this reads a little-endian word and shifts rather than taking bytes.
+pub fn parse_literals_header(data: Bytes, off: Int) -> LiteralsHeader!:
+    if off >= data.len():
+        fail "zstd: truncated literals header"
+    first := data[off]
+    kind := bits.band(first, 3)
+    size_format := bits.band(bits.shr(first, 2), 3)
+
+    if kind == LITERALS_RAW or kind == LITERALS_RLE:
+        # formats 0 and 2 are the one-bit form: a 5-bit size in one byte.
+        if size_format == 0 or size_format == 2:
+            return LiteralsHeader(kind, bits.shr(first, 3), 0, 0, 1)
+        if size_format == 1:
+            if off + 2 > data.len():
+                fail "zstd: truncated literals header"
+            return LiteralsHeader(kind, bits.shr(read_le(data, off, 2), 4), 0, 0, 2)
+        if off + 3 > data.len():
+            fail "zstd: truncated literals header"
+        return LiteralsHeader(kind, bits.shr(read_le(data, off, 3), 4), 0, 0, 3)
+
+    # compressed and treeless carry both a regenerated and a compressed size,
+    # and the format also picks one stream or four.
+    mut streams := 4
+    if size_format == 0:
+        streams = 1
+    if size_format == 0 or size_format == 1:
+        if off + 3 > data.len():
+            fail "zstd: truncated literals header"
+        word := read_le(data, off, 3)
+        regenerated := bits.band(bits.shr(word, 4), 1023)
+        compressed := bits.band(bits.shr(word, 14), 1023)
+        return LiteralsHeader(kind, regenerated, compressed, streams, 3)
+    if size_format == 2:
+        if off + 4 > data.len():
+            fail "zstd: truncated literals header"
+        word := read_le(data, off, 4)
+        regenerated := bits.band(bits.shr(word, 4), 16383)
+        compressed := bits.band(bits.shr(word, 18), 16383)
+        return LiteralsHeader(kind, regenerated, compressed, streams, 4)
+    if off + 5 > data.len():
+        fail "zstd: truncated literals header"
+    word := read_le(data, off, 5)
+    regenerated := bits.band(bits.shr(word, 4), 262143)
+    compressed := bits.band(bits.shr(word, 22), 262143)
+    return LiteralsHeader(kind, regenerated, compressed, streams, 5)
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# encode `symbols` with the table's codes into a backward stream, for the
+# round-trip tests: the decoder is the reference, so the encoder derives
+# everything it writes from the decode table itself.
+fn encode_symbols(table: HuffTable, symbols: List[Int]) -> Bytes:
+    pair := build_codes(table)
+    codes := pair.0
+    lengths := pair.1
+    w := stream.back_writer()
+    for s in symbols:
+        w.write(codes[s], lengths[s])
+    mut buf := bytes.buffer()
+    for byte in w.finish():
+        buf.write_byte(byte)
+    return buf.take_bytes()
+
+test "a table built from weights round trips a symbol stream":
+    # four symbols: weights 2,2,1,1 → total 2+2+1+1 = 6, next power 8,
+    # remainder 2 → the inferred fifth weight is 2.
+    weights := [2, 2, 1, 1]
+    table := build_table(weights)!
+    assert_eq(table.log, 3)
+    assert_eq(table.entries.len(), 8)
+
+    symbols := [0, 4, 2, 1, 3, 0, 4, 4, 1, 2]
+    data := encode_symbols(table, symbols)
+    reader := stream.back_reader(data, 0, data.len())
+    assert(reader.ok)
+    decoded := decode_stream(table, reader, symbols.len())!
+    assert_eq(decoded.len(), symbols.len())
+    mut i := 0
+    while i < symbols.len():
+        assert_eq(decoded[i], symbols[i])
+        i = i + 1
+
+test "a skewed table gives the common symbol the shortest code":
+    # 8 + 2 + 1 + 1 = 12, next power 16, remainder 4 → inferred weight 3.
+    # weight 4 dominates the space; the rare symbols get long codes.
+    weights := [4, 2, 1, 1]
+    table := build_table(weights)!
+    assert_eq(table.log, 4)
+    pair := build_codes(table)
+    lengths := pair.1
+    # higher weight → shorter code, and equal weights → equal lengths
+    assert(lengths[0] < lengths[1])
+    assert(lengths[1] < lengths[2])
+    assert_eq(lengths[2], lengths[3])
+
+    symbols := [0, 0, 0, 1, 0, 0, 2, 0, 3, 0, 0, 0]
+    data := encode_symbols(table, symbols)
+    reader := stream.back_reader(data, 0, data.len())
+    decoded := decode_stream(table, reader, symbols.len())!
+    mut i := 0
+    while i < symbols.len():
+        assert_eq(decoded[i], symbols[i])
+        i = i + 1
+
+test "malformed weight sets are refused":
+    empty: List[Int] := []
+    assert(build_table(empty).is_err)
+    all_zero := [0, 0, 0]
+    assert(build_table(all_zero).is_err)
+    # 4 + 1 = 5 leaves a remainder of 3, which no single weight can fill
+    ragged := [3, 1]
+    assert(build_table(ragged).is_err)
+    # a weight past the table-log ceiling
+    huge := [15, 15]
+    assert(build_table(huge).is_err)
+
+    # by contrast [1, 1] is legitimate: 1 + 1 = 2, remainder 2 → weight 2
+    fine := [1, 1]
+    ok_table := build_table(fine)!
+    assert_eq(ok_table.log, 2)
+
+test "direct weights unpack high nibble first":
+    mut buf := bytes.buffer()
+    buf.write_byte(0x21)
+    buf.write_byte(0x43)
+    data := buf.take_bytes()
+    w := read_direct_weights(data, 0, 4)!
+    assert_eq(w[0], 2)
+    assert_eq(w[1], 1)
+    assert_eq(w[2], 4)
+    assert_eq(w[3], 3)
+    # an odd count reads only the high nibble of the last byte
+    w3 := read_direct_weights(data, 0, 3)!
+    assert_eq(w3.len(), 3)
+    assert_eq(w3[2], 4)
+    assert(read_direct_weights(data, 0, 40).is_err)
+
+test "literals headers parse every size format":
+    # raw, one-byte form: size 5 → (5 << 3) | 0 = 40
+    mut a := bytes.buffer()
+    a.write_byte(40)
+    ha := parse_literals_header(a.take_bytes(), 0)!
+    assert_eq(ha.kind, LITERALS_RAW)
+    assert_eq(ha.regenerated_size, 5)
+    assert_eq(ha.header_len, 1)
+
+    # rle, two-byte form: format 1, size 300 → (300 << 4) | (1 << 2) | 1
+    word := bits.bor(bits.bor(bits.shl(300, 4), bits.shl(1, 2)), LITERALS_RLE)
+    mut b := bytes.buffer()
+    b.write_byte(bits.band(word, 255))
+    b.write_byte(bits.band(bits.shr(word, 8), 255))
+    hb := parse_literals_header(b.take_bytes(), 0)!
+    assert_eq(hb.kind, LITERALS_RLE)
+    assert_eq(hb.regenerated_size, 300)
+    assert_eq(hb.header_len, 2)
+
+    # compressed, single stream: format 0, regenerated 100, compressed 60
+    cword := bits.bor(bits.bor(bits.bor(bits.shl(60, 14), bits.shl(100, 4)), bits.shl(0, 2)), LITERALS_COMPRESSED)
+    mut c := bytes.buffer()
+    c.write_byte(bits.band(cword, 255))
+    c.write_byte(bits.band(bits.shr(cword, 8), 255))
+    c.write_byte(bits.band(bits.shr(cword, 16), 255))
+    hc := parse_literals_header(c.take_bytes(), 0)!
+    assert_eq(hc.kind, LITERALS_COMPRESSED)
+    assert_eq(hc.regenerated_size, 100)
+    assert_eq(hc.compressed_size, 60)
+    assert_eq(hc.streams, 1)
+    assert_eq(hc.header_len, 3)
+
+    # compressed, four streams, 14-bit sizes: format 2
+    dword := bits.bor(bits.bor(bits.bor(bits.shl(5000, 18), bits.shl(9000, 4)), bits.shl(2, 2)), LITERALS_COMPRESSED)
+    mut d := bytes.buffer()
+    mut i := 0
+    while i < 4:
+        d.write_byte(bits.band(bits.shr(dword, i * 8), 255))
+        i = i + 1
+    hd := parse_literals_header(d.take_bytes(), 0)!
+    assert_eq(hd.regenerated_size, 9000)
+    assert_eq(hd.compressed_size, 5000)
+    assert_eq(hd.streams, 4)
+    assert_eq(hd.header_len, 4)

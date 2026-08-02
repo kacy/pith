@@ -565,11 +565,29 @@ the encoder side exists too, pure pith end to end: stored, huffman, and
 full sequence blocks with repeat offsets, verified shape by shape against
 the system zstd binary (`make zstd-encode-check` — the system binary must
 decode every pith-compressed frame byte-identical, because a round trip
-through our own decoder proved nothing twice on this code). sizes land
-within 1.16x of `zstd -3` on text and at parity on runs and
-incompressible input; a megabyte of source compresses at 1.44x of -3's
-size while encoding at about 4 mb/s. custom fse table descriptions and
-lazy matching are the remaining size levers.
+through our own decoder proved nothing twice on this code). it has had no
+optimization pass at all, and both columns show it:
+
+| corpus | encode mb/s | vs kernel | size vs kernel |
+|---|---|---|---|
+| text 8kb | 3 | 40x | 115% |
+| prose 284kb | 4 | 33x | 139% |
+| source 585kb | 6 | 36x | 140% |
+| json 500kb | 11 | 52x | 188% |
+| rle runs 78kb | 48 | 65x | 137% |
+
+so: 30-65x slower than the reference encoder, producing frames 15-88%
+larger. the size gap is widest on json logs, where the reference codec's
+custom fse tables pay most and we still emit the predefined ones; the
+throughput gap is mostly the backward bitstream writer, which pushes each
+field onto a list and reverses at the end, plus a hash per input position.
+the levers in rough order: custom fse table descriptions for the three
+sequence streams, lazy matching, and a word-accumulating backward writer.
+
+worth stating plainly because the decoder numbers above are good: those
+took three passes to earn, and the encoder has had none. its guarantee
+today is correctness — nine shapes plus a sixty-shape seeded differential
+run, all read back byte-identical by the system binary — not speed.
 
 `bench/cyclic_graph` — struct nodes wired into reference cycles
 (parent<->child) and dropped, 2m of them. refcounting alone cannot

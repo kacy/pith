@@ -1221,10 +1221,10 @@ zstd-interop-check:
 # multi-block frames with carried repeat-offset state, and the edge sizes.
 
 # throughput of the pure decoder against the crate-backed kernel, on a
-# corpus built from the repo itself. see bench/zstd_decode.pith for why the
+# corpus built from the repo itself. see bench/zstd_codec.pith for why the
 # highly-compressible case is reported but not treated as the headline.
 zstd-pure-bench: build
-	@./target/release/pith run bench/zstd_decode.pith
+	@./target/release/pith run bench/zstd_codec.pith
 
 zstd-pure-check:
 	@echo "--- pure-pith zstd decoder interop ---"

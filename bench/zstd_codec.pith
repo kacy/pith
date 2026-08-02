@@ -1,4 +1,5 @@
-# zstd_decode — the pure-pith zstd decoder against the crate-backed kernel.
+# zstd_codec — the pure-pith zstd codec against the crate-backed kernel,
+# both directions: decode throughput and encode throughput.
 #
 # the corpus is built from the repo itself plus a generated log file, so
 # there are no binary fixtures to keep in tree and the shapes stay
@@ -21,6 +22,7 @@ import std.bytes as bytes
 import std.time as time
 import std.compress.zstd as kernel
 import std.compress.zstd_pure_frame as pure
+import std.compress.zstd_pure_encode as pure_encode
 
 BUDGET_MS := 400
 MAX_OUTPUT := 8000000
@@ -84,12 +86,43 @@ fn bench(label: String, raw: Bytes) -> Int!:
         pure_reps = pure_reps + 1
     pure_ms := time.mono_millis() - t1
 
-    # integer math throughout; the ratio is carried at x100 for two decimals
+    # encode: the pure frame must survive the kernel's decoder before it
+    # is timed — interop, not a round trip through our own code
+    pure_frame := pure_encode.compress_checked(raw)!
+    back := kernel.decompress(pure_frame)!
+    if back != raw:
+        fail "pure-encoded frame decodes wrong on " + label
+
+    mut enc_kernel_reps := 0
+    t2 := time.mono_millis()
+    while time.mono_millis() - t2 < BUDGET_MS:
+        e := kernel.compress(raw)
+        if e.len() == 0 and raw.len() > 0:
+            fail "empty encode"
+        enc_kernel_reps = enc_kernel_reps + 1
+    enc_kernel_ms := time.mono_millis() - t2
+
+    mut enc_pure_reps := 0
+    t3 := time.mono_millis()
+    while time.mono_millis() - t3 < BUDGET_MS:
+        e := pure_encode.compress_checked(raw)!
+        if e.len() == 0 and raw.len() > 0:
+            fail "empty encode"
+        enc_pure_reps = enc_pure_reps + 1
+    enc_pure_ms := time.mono_millis() - t3
+
+    # integer math throughout; ratios carried at x100 for two decimals
     kb := raw.len() * kernel_reps / (kernel_ms + 1)
     pb := raw.len() * pure_reps / (pure_ms + 1)
     ratio := kb * 100 / (pb + 1)
+    ekb := raw.len() * enc_kernel_reps / (enc_kernel_ms + 1)
+    epb := raw.len() * enc_pure_reps / (enc_pure_ms + 1)
+    eratio := ekb * 100 / (epb + 1)
+    size_ratio := pure_frame.len() * 100 / (frame.len() + 1)
     packed := raw.len() * 10 / frame.len()
-    print(label + ": {raw.len() / 1024}KB at {packed / 10}.{packed % 10}:1   kernel {kb * 1000 / 1048576} MB/s ({kernel_reps} reps)   pure {pb * 1000 / 1048576} MB/s ({pure_reps} reps)   ratio {ratio / 100}.{ratio % 100}x")
+    print(label + ": {raw.len() / 1024}KB at {packed / 10}.{packed % 10}:1")
+    print("  decode: kernel {kb * 1000 / 1048576} MB/s ({kernel_reps} reps)   pure {pb * 1000 / 1048576} MB/s ({pure_reps} reps)   ratio {ratio / 100}.{ratio % 100}x")
+    print("  encode: kernel {ekb * 1000 / 1048576} MB/s ({enc_kernel_reps} reps)   pure {epb * 1000 / 1048576} MB/s ({enc_pure_reps} reps)   ratio {eratio / 100}.{eratio % 100}x   size {size_ratio}% of kernel's")
     return 0
 
 fn main() -> Int!:

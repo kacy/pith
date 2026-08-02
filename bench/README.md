@@ -474,13 +474,19 @@ three caveats matter when reading this benchmark:
   so the benchmark still times the larger csv/url/path/gzip/hash/fs pipeline
   while avoiding that unrelated compile failure.
 
-## zstd decode benchmark (pure-pith decoder)
+## zstd codec benchmark (pure-pith encoder and decoder)
 
-`bench/zstd_decode.pith` times the pure-pith zstd decoder
+`bench/zstd_codec.pith` times the pure-pith zstd codec
 (`std.compress.zstd_pure_*`) against the crate-backed kernel
-(`std.compress.zstd`). Both decode the same frames and the outputs are
-compared byte for byte before either is timed, so the numbers can't come
-from doing different work.
+(`std.compress.zstd`), in both directions.
+
+Decode: both read the same frames and the outputs are compared byte for
+byte before either is timed, so the numbers can't come from doing
+different work. Encode: the pure encoder's frame is handed to the
+*kernel's* decoder and checked against the input before timing — interop,
+not a round trip through our own code — and the reported size is a
+percentage of the kernel's own output, so the throughput number can't be
+bought by compressing worse.
 
 The corpus is built at runtime from the repo itself — docs, std sources,
 and generated log lines, compressing between 2:1 and 11:1 — plus one
@@ -501,4 +507,6 @@ make zstd-pure-bench
 ```
 
 Current standing and the optimization history live in
-`docs/performance.md`.
+`docs/performance.md`. The decoder has been through three optimization
+passes; the encoder has had none, and its numbers should be read as a
+correctness baseline rather than a target.

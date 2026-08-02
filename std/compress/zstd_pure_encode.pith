@@ -6,11 +6,12 @@
 # gate feeds every frame produced here to `zstd -d` and byte-compares.
 #
 # encoding is tiered, and every tier keeps the one below as its fallback:
-# greedy lz77 sequences coded against the predefined fse tables (with
-# repeat-offset codes), huffman-coded literals under a direct or fse-coded
-# weight description, an rle block for a run of one byte, and a raw block
-# for anything the entropy tiers cannot shrink. a stored frame is always
-# valid, so compress() cannot fail — internal errors fall back to it.
+# lazy lz77 sequences that prefer the previous offset, coded against fse
+# tables built for the block where those beat the predefined ones,
+# huffman-coded literals under a direct or fse-coded weight description,
+# an rle block for a run of one byte, and a raw block for anything the
+# entropy tiers cannot shrink. a stored frame is always valid, so
+# compress() cannot fail — internal errors fall back to it.
 
 import std.bits as bits
 import std.bytes as bytes
@@ -23,6 +24,13 @@ import std.compress.zstd_pure_frame as frame
 
 ## the largest decompressed payload one block may carry (128 KiB).
 pub BLOCK_MAX := 131072
+
+# how a packed fse transition step splits: the low twenty bits are the
+# value the decoder reads, the rest its width. one Int per step rather
+# than two parallel lists — a sequence-heavy block produces one of these
+# per stream per sequence, so the second list was pure overhead.
+STEP_VALUE_MASK := 1048575
+STEP_WIDTH_SHIFT := 20
 
 # floor(log2(v)) + 1 for v >= 1; 0 for v == 0.
 fn bit_length(v: Int) -> Int:
@@ -205,15 +213,20 @@ fn write_plain_lit_header(out: ByteBuffer, kind: Int, size: Int):
     else:
         out.write_word(bits.bor(bits.bor(bits.shl(size, 4), 12), kind), 3)
 
-# huffman-encode lit[start..end) into a backward stream, one code per byte.
-fn encode_hstream(lit: Bytes, start: Int, end: Int, codes: List[Int], lengths: List[Int]) -> List[Int]:
-    w := stream.back_writer()
-    mut i := start
-    while i < end:
+# huffman-encode lit[start..end) into a backward stream appended to `out`,
+# one code per byte, and return how many bytes it took. the packer wants
+# the deepest field first, and the deepest field is the last literal, so
+# the walk runs backward — the bytes it lays down are identical either way.
+fn encode_hstream(lit: Bytes, start: Int, end: Int, codes: List[Int], lengths: List[Int], out: ByteBuffer) -> Int:
+    before := out.len()
+    p := stream.bit_packer(out)
+    mut i := end - 1
+    while i >= start:
         sym := lit[i]
-        w.write(codes[sym], lengths[sym])
-        i = i + 1
-    return w.finish()
+        p.push(codes[sym], lengths[sym])
+        i = i - 1
+    p.finish()
+    return out.len() - before
 
 # append a list of byte values to the buffer.
 fn write_byte_list(out: ByteBuffer, packed: List[Int]):
@@ -310,7 +323,6 @@ fn fse_weight_description(weights: List[Int]) -> Bytes!:
     log := 6
     counts := normalize_weight_counts(freq, log)
     desc := fse.write_ncount(counts, log)
-    table := fse.build_decode_table(counts, log)
     slots := fse.build_encode_states(counts, log)
 
     mut even: List[Int] := []
@@ -322,31 +334,44 @@ fn fse_weight_description(weights: List[Int]) -> Bytes!:
         else:
             odd.push(weights[i])
         i = i + 1
-    even_path := fse_path(even, table, slots)!
-    odd_path := fse_path(odd, table, slots)!
+    widths := slot_widths(slots, log)
+    even_path := fse_path(even, log, slots, widths)!
+    odd_path := fse_path(odd, log, slots, widths)!
 
-    w := stream.back_writer()
-    w.write(even_path.0, log)
-    w.write(odd_path.0, log)
+    # description then stream, packed into one body so its total length —
+    # which the one-byte header must carry — is just the body's length
+    mut body := bytes.buffer()
+    defer body.free()
+    write_byte_list(body, desc)
+    p := stream.bit_packer(body)
     # transitions interleave in emit order: the advance after weight k
-    # belongs to k's own chain, and the last weight's precursor over-reads
-    mut k := 0
-    while k < n - 2:
+    # belongs to k's own chain, and the last weight's precursor over-reads.
+    # the packer takes them deepest-first, so the walk runs backward and
+    # the two init states come last.
+    ne := even.len()
+    no := odd.len()
+    mut k := n - 3
+    while k >= 0:
+        # fse_path returns its steps back to front: step t is symbol index
+        # m - 2 - t, so a symbol index q reads at m - 2 - q
+        mut step := 0
         if k % 2 == 0:
-            w.write(even_path.1[k / 2], even_path.2[k / 2])
+            step = even_path.1[ne - 2 - k / 2]
         else:
-            w.write(odd_path.1[k / 2], odd_path.2[k / 2])
-        k = k + 1
-    packed := w.finish()
+            step = odd_path.1[no - 2 - k / 2]
+        p.push(bits.band(step, STEP_VALUE_MASK), bits.shr(step, STEP_WIDTH_SHIFT))
+        k = k - 1
+    p.push(odd_path.0, log)
+    p.push(even_path.0, log)
+    p.finish()
 
-    total := desc.len() + packed.len()
+    total := body.len()
     if total >= 128:
         return bytes.empty()
     mut out := bytes.buffer_with_capacity(1 + total)
     defer out.free()
     out.write_byte(total)
-    write_byte_list(out, desc)
-    write_byte_list(out, packed)
+    out.write(body.bytes())!
     return out.bytes()
 
 # build a huffman-compressed literals section: header, weight description
@@ -429,22 +454,26 @@ fn huffman_literals_section(lit: Bytes) -> Bytes!:
     if reg > 1023:
         streams = 4
     if streams == 1:
-        write_byte_list(payload, encode_hstream(lit, 0, reg, codes, code_lengths))
+        encode_hstream(lit, 0, reg, codes, code_lengths, payload)
     else:
+        # the six-byte jump table names the first three stream sizes, which
+        # are only known once they are packed. reserve it and patch it in
+        # place rather than packing each stream into a buffer of its own.
         seg := (reg + 3) / 4
-        s1 := encode_hstream(lit, 0, seg, codes, code_lengths)
-        s2 := encode_hstream(lit, seg, 2 * seg, codes, code_lengths)
-        s3 := encode_hstream(lit, 2 * seg, 3 * seg, codes, code_lengths)
-        s4 := encode_hstream(lit, 3 * seg, reg, codes, code_lengths)
-        if s1.len() > 65535 or s2.len() > 65535 or s3.len() > 65535:
+        jump := payload.len()
+        payload.write_word(0, 6)
+        n1 := encode_hstream(lit, 0, seg, codes, code_lengths, payload)
+        n2 := encode_hstream(lit, seg, 2 * seg, codes, code_lengths, payload)
+        n3 := encode_hstream(lit, 2 * seg, 3 * seg, codes, code_lengths, payload)
+        encode_hstream(lit, 3 * seg, reg, codes, code_lengths, payload)
+        if n1 > 65535 or n2 > 65535 or n3 > 65535:
             return bytes.empty()
-        payload.write_word(s1.len(), 2)
-        payload.write_word(s2.len(), 2)
-        payload.write_word(s3.len(), 2)
-        write_byte_list(payload, s1)
-        write_byte_list(payload, s2)
-        write_byte_list(payload, s3)
-        write_byte_list(payload, s4)
+        payload.set(jump, bits.band(n1, 255))
+        payload.set(jump + 1, bits.shr(n1, 8))
+        payload.set(jump + 2, bits.band(n2, 255))
+        payload.set(jump + 3, bits.shr(n2, 8))
+        payload.set(jump + 4, bits.band(n3, 255))
+        payload.set(jump + 5, bits.shr(n3, 8))
 
     comp := payload.len()
     mut header_len := 3
@@ -492,113 +521,444 @@ fn literals_section(lit: Bytes) -> Bytes!:
     return out.bytes()
 
 # ---------------------------------------------------------------
-# sequences — greedy lz77 over the frame, coded with the predefined tables
+# sequences — lazy lz77 over the frame, coded with per-block fse tables
 # ---------------------------------------------------------------
 
-# hash of a 4-byte little-endian prefix into the finder's table.
-fn hash4(word: Int) -> Int:
-    return bits.shr(bits.band(word * 2654435761, 4294967295), 16)
+# hash of a 4-byte little-endian prefix into the finder's table: the top
+# bits of a fibonacci-scaled product, `shift` of them discarded to land in
+# a table of 2^(32 - shift) buckets.
+fn hash4(word: Int, shift: Int) -> Int:
+    return bits.shr(bits.band(word * 2654435761, 4294967295), shift)
 
-# greedy match search over raw[start..end): a single-slot hash table over
-# 4-byte prefixes, candidates verified by word compare, matches extended
-# forward. `head` holds position + 1 per hash slot and persists across the
-# frame's blocks, which is what lets a match reach into an earlier block;
-# `window` caps how far back it may reach, in sync with the frame header.
-# sequences land in the three parallel lists (offsets as plain distances;
-# the repeat-code decision comes later), literal bytes in `lit`.
-fn find_sequences(raw: Bytes, start: Int, end: Int, window: Int, head: List[Int], lls: List[Int], mls: List[Int], ofs: List[Int], lit: ByteBuffer):
+# how many hash buckets the match finder gets, and so how many zeros the
+# table costs to build. a bucket per input byte finds as much as a fixed
+# sixteen bits does, and a small frame was spending more on clearing a
+# 65536-entry table than on searching it.
+fn hash_bits_for(content_size: Int) -> Int:
+    mut b := bit_length(content_size)
+    if b < 10:
+        b = 10
+    if b > 16:
+        b = 16
+    return b
+
+# a sequence field packed for the writer: its fse symbol in the low eight
+# bits, the width of its extra-bit field in the next eight, and the extra
+# bits themselves above those. one Int carries what three parallel lists
+# used to, and every list operation here is an extern call with a handle
+# lookup behind it — on a sequence-heavy block that traffic outweighed the
+# coding itself.
+#
+# the widest field is a match length's, whose extra bits run to sixteen at
+# a base of 65539, so nothing reaches past bit thirty-two.
+fn code_symbol(packed: Int) -> Int:
+    return bits.band(packed, 255)
+
+fn code_width(packed: Int) -> Int:
+    return bits.band(bits.shr(packed, 8), 255)
+
+fn code_extra(packed: Int) -> Int:
+    return bits.shr(packed, 16)
+
+# the literal-length field for a length. the first sixteen lengths code to
+# themselves and carry no extra bits, so the common one packs to itself —
+# which is also why a zero literal length is a packed zero, the test the
+# offset coder needs.
+fn ll_code_packed(value: Int) -> Int:
+    if value < 16:
+        return value
+    c := sequences.ll_code_for(value)
+    return c.0 + bits.shl(c.2, 8) + bits.shl(value - c.1, 16)
+
+# the match-length field for a length, on the same plan.
+fn ml_code_packed(value: Int) -> Int:
+    if value < 35:
+        return value - 3
+    c := sequences.ml_code_for(value)
+    return c.0 + bits.shl(c.2, 8) + bits.shl(value - c.1, 16)
+
+# the offset field for a coded offset value. its symbol is the position of
+# the value's high bit, and the bits below that high bit are the extras —
+# so the symbol doubles as the width.
+fn of_code_packed(value: Int) -> Int:
+    oc := bit_length(value) - 1
+    return oc + bits.shl(oc, 8) + bits.shl(value - bits.shl(1, oc), 16)
+
+# how far the bytes at `src` and `at` agree, given `have` already known to
+# match. the match may not run past `end`: sequences regenerate exactly
+# this block's bytes, no more.
+fn match_length(raw: Bytes, src: Int, at: Int, have: Int, end: Int) -> Int:
+    mut len := have
+    while at + len + 8 <= end and bytes.read_word(raw, src + len, 8) == bytes.read_word(raw, at + len, 8):
+        len = len + 8
+    while at + len < end and raw[src + len] == raw[at + len]:
+        len = len + 1
+    return len
+
+# how much longer a fresh offset must be before it is worth taking over a
+# repeat of the last one. a repeat costs one small code and no extra bits;
+# a fresh offset costs its own magnitude in extra bits, which on real
+# input runs to a dozen. four bytes of match is a fair price for that.
+REPEAT_BIAS := 4
+
+# how much longer the match one position later must be before the current
+# one is abandoned. the extra literal has to pay for itself, and moving on
+# also forfeits a repeat-offset match, so the bar is more than one byte.
+LAZY_BIAS := 2
+
+# match search over raw[start..end): a single-slot hash table over 4-byte
+# prefixes, candidates verified by word compare, matches extended forward.
+# `head` holds position + 1 per hash slot and persists across the frame's
+# blocks, which is what lets a match reach into an earlier block; `window`
+# caps how far back it may reach, in sync with the frame header. each
+# sequence lands as one packed field per stream, literal bytes in `lit`.
+#
+# two things lift this above plain greedy. the last offset used is tried
+# first at every position, because the format codes a repeat in a couple
+# of bits where a fresh offset costs its magnitude — on structured input
+# most matches want the previous distance anyway. and a match is not
+# emitted until the next position has been checked for a longer one, which
+# stops a short match from swallowing the start of a long one.
+fn find_sequences(raw: Bytes, start: Int, end: Int, window: Int, hash_shift: Int, head: List[Int], reps: List[Int], ll_codes: List[Int], ml_codes: List[Int], of_codes: List[Int], lit: ByteBuffer) -> Int!:
     mut i := start
     mut anchor := start
+    # the offset a repeat code would name. `reps` is this block's working
+    # copy of the decoder's repeat history, advanced here as each sequence
+    # is coded, so the finder's idea of the previous offset and the one the
+    # stream will carry are the same thing by construction.
+    mut rep := reps[0]
     while i + 4 <= end:
         word := bytes.read_word(raw, i, 4)
-        h := hash4(word)
+        h := hash4(word, hash_shift)
         cand := head[h] - 1
         head[h] = i + 1
+
+        mut best_len := 0
+        mut best_off := 0
+        # a repeat only codes cheaply when the sequence carries literals —
+        # with none, the codes shift up one and name a different slot
+        if i > anchor and i >= rep and rep <= window and bytes.read_word(raw, i - rep, 4) == word:
+            best_len = match_length(raw, i - rep, i, 4, end)
+            best_off = rep
         if cand >= 0 and i - cand <= window and bytes.read_word(raw, cand, 4) == word:
-            # extend the match forward, a word at a time while it lasts.
-            # the match may not run past the block: sequences regenerate
-            # exactly this block's bytes.
-            mut len := 4
-            while i + len + 8 <= end and bytes.read_word(raw, cand + len, 8) == bytes.read_word(raw, i + len, 8):
-                len = len + 8
-            while i + len < end and raw[cand + len] == raw[i + len]:
-                len = len + 1
-            lls.push(i - anchor)
-            mls.push(len)
-            ofs.push(i - cand)
-            if i > anchor:
-                lit.write_range(raw, anchor, i - anchor)
-            # index the skipped positions too, or a long match would leave
-            # a hole no later match can reach into
-            mut p := i + 1
-            stop := i + len
-            while p + 4 <= end and p < stop:
-                head[hash4(bytes.read_word(raw, p, 4))] = p + 1
-                p = p + 1
-            i = stop
-            anchor = stop
-        else:
+            fresh := match_length(raw, cand, i, 4, end)
+            if fresh > best_len + REPEAT_BIAS or best_len == 0:
+                best_len = fresh
+                best_off = i - cand
+        if best_len == 0:
             i = i + 1
+            continue
+
+        # lazy: if the next position starts a clearly longer match, drop
+        # this one and let the loop find that one from there. sliding one
+        # byte at a time terminates, and long matches are left alone
+        # because they almost never improve.
+        if best_len < 32 and i + 5 <= end:
+            ahead := bytes.read_word(raw, i + 1, 4)
+            acand := head[hash4(ahead, hash_shift)] - 1
+            if acand >= 0 and i + 1 - acand <= window and bytes.read_word(raw, acand, 4) == ahead:
+                if match_length(raw, acand, i + 1, 4, end) > best_len + LAZY_BIAS:
+                    i = i + 1
+                    continue
+
+        ll_codes.push(ll_code_packed(i - anchor))
+        ml_codes.push(ml_code_packed(best_len))
+        value := offset_value_for(best_off, i == anchor, reps)
+        # the history must now hold the offset this sequence actually used;
+        # anything else means the encoder and the decoder disagree about
+        # what a repeat code means, which is a bug, not a recoverable state
+        if reps[0] != best_off:
+            fail "zstd: offset value " + value.to_string() + " left the repeat history at " + reps[0].to_string() + ", wanted " + best_off.to_string()
+        of_codes.push(of_code_packed(value))
+        if i > anchor:
+            lit.write_range(raw, anchor, i - anchor)
+        rep = best_off
+        # index the skipped positions too, or a long match would leave
+        # a hole no later match can reach into
+        mut p := i + 1
+        stop := i + best_len
+        while p + 4 <= end and p < stop:
+            head[hash4(bytes.read_word(raw, p, 4), hash_shift)] = p + 1
+            p = p + 1
+        i = stop
+        anchor = stop
     if end > anchor:
         lit.write_range(raw, anchor, end - anchor)
+    return 0
 
 # walk one fse stream backward and pick the state path that will decode to
 # `symbols`: the last symbol takes its lowest slot, and each earlier symbol
 # takes the slot whose bit-window reaches the state after it. returns the
-# initial state plus the per-step transition bits in decode order.
-fn fse_path(symbols: List[Int], table: fse.FseTable, slots: List[List[Int]]) -> (Int, List[Int], List[Int])!:
+# initial state plus the packed transition steps.
+#
+# the steps come out back to front, which is the order the writer consumes
+# them in, so they are pushed as produced rather than pre-sized and
+# assigned: step `t` belongs to symbol index `n - 2 - t`.
+#
+# the slot is computed, not searched. build_decode_table hands a symbol's
+# t-th slot the running counter `c + t`, where c is how many slots the
+# symbol has, and gives that slot the window
+# [(counter << nb) - size, ((counter + 1) << nb) - size) with
+# nb = log - floor(log2(counter)). those windows tile [0, size) exactly,
+# so the counter covering a target state S is just (S + size) >> nb — two
+# candidate widths, since a counter in [c, 2c) straddles one power of two.
+# scanning every slot instead cost this loop a third of the encoder.
+fn fse_path(symbols: List[Int], log: Int, slots: List[List[Int]], widths: List[Int]) -> (Int, List[Int])!:
     n := symbols.len()
-    mut tv: List[Int] := []
-    mut tw: List[Int] := []
-    mut i := 0
-    while i + 1 < n:
-        tv.push(0)
-        tw.push(0)
-        i = i + 1
-    mut next_state := slots[symbols[n - 1]][0]
+    size := bits.shl(1, log)
+    mut steps: List[Int] := []
+    mut next_state := slots[code_symbol(symbols[n - 1])][0]
     mut k := n - 1
     while k >= 1:
-        sym := symbols[k - 1]
-        mut chosen := -1
-        for j in slots[sym]:
-            base := fse.entry_base(table.entries[j])
-            span := bits.shl(1, fse.entry_nbits(table.entries[j]))
-            if next_state >= base and next_state < base + span:
-                chosen = j
-        if chosen < 0:
-            fail "zstd: no state of symbol " + sym.to_string() + " reaches the decoder's next state"
-        tv[k - 1] = next_state - fse.entry_base(table.entries[chosen])
-        tw[k - 1] = fse.entry_nbits(table.entries[chosen])
-        next_state = chosen
+        sym := code_symbol(symbols[k - 1])
+        packed := widths[sym]
+        count := bits.shr(packed, 8)
+        if count == 0:
+            fail "zstd: symbol " + sym.to_string() + " has no state in the table coding it"
+        # the wider window first; a counter below the symbol's first one
+        # means the state belongs to the narrower half
+        mut nb := bits.band(packed, 255)
+        mut counter := bits.shr(next_state + size, nb)
+        if counter < count:
+            nb = nb - 1
+            counter = bits.shr(next_state + size, nb)
+        steps.push(next_state - bits.shl(counter, nb) + size + bits.shl(nb, STEP_WIDTH_SHIFT))
+        next_state = slots[sym][counter - count]
         k = k - 1
-    return (next_state, tv, tw)
+    return (next_state, steps)
+
+# per symbol, how many slots it owns and the wider of the two bit-widths
+# those slots use, packed as count << 8 | width. fse_path needs both for
+# every symbol it walks, and recomputing floor(log2(count)) per sequence
+# cost more than the walk itself once the tables reached nine bits.
+fn slot_widths(slots: List[List[Int]], log: Int) -> List[Int]:
+    mut out: List[Int] := []
+    for sl in slots:
+        c := sl.len()
+        out.push(bits.shl(c, 8) + log - (bit_length(c) - 1))
+    return out
 
 # the offset value that codes `offset` most cheaply: a repeat code (1-3)
 # when the history allows one, the literal form (offset + 3) otherwise.
-# candidates are tested by running the decoder's own resolve_offset over a
-# scratch history, so the encoder can never disagree with it about what a
-# repeat code means — the no-literals shift included.
-fn offset_value_for(offset: Int, ll: Int, reps: List[Int]) -> Int:
+# `reps` is advanced exactly as the decoder will advance it.
+#
+# this spells out resolve_offset's table rather than probing it — the same
+# index shift for a no-literals sequence, the same "one below the most
+# recent" meaning value 3 takes there. probing cost three scratch
+# histories and three failable calls per sequence, and sequences are the
+# hot loop; the caller checks reps[0] afterward, which is the invariant
+# that catches any drift between the two.
+fn offset_value_for(offset: Int, no_literals: Bool, reps: List[Int]) -> Int:
+    r0 := reps[0]
+    r1 := reps[1]
+    r2 := reps[2]
+    # a sequence with no literals shifts every repeat code up one slot
+    mut shift := 0
+    if no_literals:
+        shift = 1
     mut v := 1
     while v <= 3:
-        mut scratch := [reps[0], reps[1], reps[2]]
-        got := sequences.resolve_offset(v, ll, scratch) catch -1
-        if got == offset:
+        index := v + shift
+        mut cand := r0 - 1
+        if index == 1:
+            cand = r0
+        elif index == 2:
+            cand = r1
+        elif index == 3:
+            cand = r2
+        # index 4 keeps the r0 - 1 default, and underflows at r0 == 1
+        if cand == offset and cand >= 1:
+            if index == 2:
+                reps[0] = r1
+                reps[1] = r0
+            elif index >= 3:
+                reps[0] = cand
+                reps[1] = r0
+                reps[2] = r1
             return v
         v = v + 1
+    reps[0] = offset
+    reps[1] = r0
+    reps[2] = r1
     return offset + 3
 
-# the sequence section, coded entirely against the predefined tables: the
-# count, a zero modes byte (no table descriptions on the wire), and the
-# interleaved backward bitstream. write order mirrors decode_sequences
-# read order exactly: init states ll, of, ml; per sequence the extra bits
-# of, ml, ll; state transitions ll, ml, of between sequences only.
-# `ofs` holds literal offset values; the repeat history in `reps` is
-# advanced sequence by sequence exactly as the decoder will advance it.
-fn sequences_section(lls: List[Int], mls: List[Int], ofs: List[Int], reps: List[Int]) -> Bytes!:
-    count := lls.len()
+# ---------------------------------------------------------------
+# per-block fse tables for the sequence streams
+# ---------------------------------------------------------------
+
+# how one of the three sequence streams will be coded: the normalized
+# counts its tables are built from, the accuracy log, the description
+# bytes the block must carry (empty under the predefined tables), and the
+# mode the modes byte names.
+struct StreamPlan:
+    counts: List[Int]
+    log: Int
+    desc: List[Int]
+    mode: Int
+
+# the average cost, in 256ths of a bit, of one symbol whose normalized
+# count is `c` in a table of 2^log slots. a symbol owning c slots is
+# reached through counters c..2c-1; the ones below 2^(h+1) cost log - h
+# bits and the rest one fewer, which is exact given a flat spread of
+# states. a "less than one" symbol owns a single top slot and costs the
+# full width.
+fn symbol_cost256(c: Int, log: Int) -> Int:
+    if c <= 0:
+        return log * 256
+    h := bit_length(c) - 1
+    wide := bits.shl(1, h + 1) - c
+    narrow := c - wide
+    return (wide * (log - h) + narrow * (log - h - 1)) * 256 / c
+
+# what coding `hist` against `counts` costs, in 256ths of a bit. a symbol
+# the table cannot code at all is priced impossibly so the caller rejects
+# that table rather than failing deep inside the state walk.
+fn stream_bits256(hist: List[Int], last: Int, counts: List[Int], log: Int) -> Int:
+    mut total := log * 256
+    mut s := 0
+    while s <= last:
+        if hist[s] > 0:
+            if s >= counts.len() or counts[s] == 0:
+                return 1073741824
+            total = total + hist[s] * symbol_cost256(counts[s], log)
+        s = s + 1
+    return total
+
+# normalize `hist` over symbols 0..last so the counts sum to exactly
+# 2^log. a symbol too rare to earn a whole slot takes the -1 "less than
+# one" probability, which costs it one slot off the top — never 0, which
+# would leave the symbol uncodable. the leftover slots go to whoever the
+# flooring shortchanged most, one at a time, so the result stays close to
+# the true distribution instead of piling onto the largest symbol.
+fn normalize_seq_counts(hist: List[Int], last: Int, log: Int, total: Int) -> List[Int]:
+    size := bits.shl(1, log)
+    # anything at or below one slot's worth of probability rounds to -1
+    low := bits.shr(total, log)
+    mut counts: List[Int] := []
+    mut residual: List[Int] := []
+    mut sum := 0
+    mut s := 0
+    while s <= last:
+        h := hist[s]
+        mut c := 0
+        mut r := 0
+        if h > 0:
+            if h <= low:
+                c = -1
+                sum = sum + 1
+            else:
+                # sixteen fractional bits is plenty: size is at most 512 and
+                # a block holds at most 128 KiB of sequences, so the product
+                # stays far inside an Int
+                scaled := h * size * 65536 / total
+                c = bits.shr(scaled, 16)
+                if c < 1:
+                    c = 1
+                r = bits.band(scaled, 65535)
+                sum = sum + c
+        counts.push(c)
+        residual.push(r)
+        s = s + 1
+
+    while sum < size:
+        mut best := -1
+        s = 0
+        while s <= last:
+            if counts[s] > 0 and (best < 0 or residual[s] > residual[best]):
+                best = s
+            s = s + 1
+        counts[best] = counts[best] + 1
+        # charge the slot against the residual so one symbol cannot hog
+        residual[best] = residual[best] - 65536
+        sum = sum + 1
+    while sum > size:
+        mut best := -1
+        s = 0
+        while s <= last:
+            if counts[s] > 1 and (best < 0 or counts[s] > counts[best]):
+                best = s
+            s = s + 1
+        counts[best] = counts[best] - 1
+        sum = sum - 1
+    return counts
+
+# choose how one stream is coded. the predefined table is free — it costs
+# no description — so a per-block table has to beat it by more than its
+# own description, which for a block with few sequences it usually cannot.
+# the exception is a symbol the predefined table has no probability for at
+# all, where the custom table is the only legal choice.
+fn plan_stream(hist: List[Int], max_symbol: Int, max_log: Int, predef: List[Int], predef_log: Int, total: Int) -> StreamPlan:
+    mut last := -1
+    mut distinct := 0
+    mut s := 0
+    while s <= max_symbol:
+        if hist[s] > 0:
+            last = s
+            distinct = distinct + 1
+        s = s + 1
+    nothing: List[Int] := []
+    fallback := StreamPlan(predef, predef_log, nothing, 0)
+    # one symbol needs no table worth describing, and the state walk needs
+    # at least two to have anywhere to go
+    if distinct < 2:
+        return fallback
+
+    # accuracy: as fine as the stream can justify, floored so every used
+    # symbol still has room for a slot of its own
+    mut log := max_log
+    fitted := bit_length(total - 1) - 2
+    if fitted < log:
+        log = fitted
+    floor_log := bit_length(distinct) + 1
+    if log < floor_log:
+        log = floor_log
+    if log < 5:
+        log = 5
+    if log > max_log or bits.shl(1, log) < 2 * distinct:
+        return fallback
+
+    counts := normalize_seq_counts(hist, last, log, total)
+    desc := fse.write_ncount(counts, log)
+    plan := StreamPlan(counts, log, desc, 2)
+    # a description costs eight bits a byte; the comparison is in 256ths
+    custom := stream_bits256(hist, last, counts, log) + desc.len() * 2048
+    base := stream_bits256(hist, last, predef, predef_log)
+    if custom >= base:
+        return fallback
+    return plan
+
+# tally the symbols of one stream into a fresh histogram of `span` slots.
+fn histogram(codes: List[Int], span: Int) -> List[Int]:
+    mut hist: List[Int] := []
+    mut s := 0
+    while s < span:
+        hist.push(0)
+        s = s + 1
+    for v in codes:
+        hist[code_symbol(v)] = hist[code_symbol(v)] + 1
+    return hist
+
+# the sequence section: the count, the modes byte, any table descriptions,
+# and the interleaved backward bitstream. write order mirrors
+# decode_sequences read order exactly: init states ll, of, ml; per
+# sequence the extra bits of, ml, ll; state transitions ll, ml, of between
+# sequences only. every field arrives already packed by the finder.
+fn sequences_section(ll_codes: List[Int], ml_codes: List[Int], of_codes: List[Int]) -> Bytes!:
+    count := ll_codes.len()
+    mut i := 0
     mut out := bytes.buffer()
     defer out.free()
+
+    # a table shaped to this block's own distribution, where it earns its
+    # description; the predefined one otherwise. either way the encode
+    # states come from exactly the counts the decoder will rebuild, so the
+    # state paths cannot disagree with what it does.
+    ll_plan := plan_stream(histogram(ll_codes, 36), 35, 9, sequences.ll_default(), sequences.LL_DEFAULT_LOG, count)
+    of_plan := plan_stream(histogram(of_codes, 32), 31, 8, sequences.of_default(), sequences.OF_DEFAULT_LOG, count)
+    ml_plan := plan_stream(histogram(ml_codes, 53), 52, 9, sequences.ml_default(), sequences.ML_DEFAULT_LOG, count)
+
+    # the count, then the modes byte, then the descriptions in ll, of, ml
+    # order regardless of which of them are present
     if count < 128:
         out.write_byte(count)
     elif count < 32512:
@@ -607,68 +967,48 @@ fn sequences_section(lls: List[Int], mls: List[Int], ofs: List[Int], reps: List[
     else:
         out.write_byte(255)
         out.write_word(count - 32512, 2)
-    # modes byte: predefined for all three streams
-    out.write_byte(0)
+    out.write_byte(bits.bor(bits.bor(bits.shl(ll_plan.mode, 6), bits.shl(of_plan.mode, 4)), bits.shl(ml_plan.mode, 2)))
+    write_byte_list(out, ll_plan.desc)
+    write_byte_list(out, of_plan.desc)
+    write_byte_list(out, ml_plan.desc)
 
-    # per-sequence codes and extra bits
-    mut ll_syms: List[Int] := []
-    mut ml_syms: List[Int] := []
-    mut of_syms: List[Int] := []
-    mut ll_ev: List[Int] := []
-    mut ml_ev: List[Int] := []
-    mut of_ev: List[Int] := []
-    mut ll_ew: List[Int] := []
-    mut ml_ew: List[Int] := []
-    mut of_ew: List[Int] := []
-    mut i := 0
-    while i < count:
-        llc := sequences.ll_code_for(lls[i])
-        ll_syms.push(llc.0)
-        ll_ev.push(lls[i] - llc.1)
-        ll_ew.push(llc.2)
-        mlc := sequences.ml_code_for(mls[i])
-        ml_syms.push(mlc.0)
-        ml_ev.push(mls[i] - mlc.1)
-        ml_ew.push(mlc.2)
-        value := offset_value_for(ofs[i], lls[i], reps)
-        # advance the shared history through the decoder's own resolver;
-        # a disagreement here is an encoder bug, not a recoverable state
-        resolved := sequences.resolve_offset(value, lls[i], reps)!
-        if resolved != ofs[i]:
-            fail "zstd: offset value " + value.to_string() + " resolves to " + resolved.to_string() + ", wanted " + ofs[i].to_string()
-        oc := bit_length(value) - 1
-        of_syms.push(oc)
-        of_ev.push(value - bits.shl(1, oc))
-        of_ew.push(oc)
-        i = i + 1
+    ll_slots := fse.build_encode_states(ll_plan.counts, ll_plan.log)
+    of_slots := fse.build_encode_states(of_plan.counts, of_plan.log)
+    ml_slots := fse.build_encode_states(ml_plan.counts, ml_plan.log)
+    ll_path := fse_path(ll_codes, ll_plan.log, ll_slots, slot_widths(ll_slots, ll_plan.log))!
+    of_path := fse_path(of_codes, of_plan.log, of_slots, slot_widths(of_slots, of_plan.log))!
+    ml_path := fse_path(ml_codes, ml_plan.log, ml_slots, slot_widths(ml_slots, ml_plan.log))!
 
-    # the encode tables are built from the same distributions the decoder
-    # will assume, so the state paths cannot disagree with the spec
-    ll_table := fse.build_decode_table(sequences.ll_default(), sequences.LL_DEFAULT_LOG)
-    of_table := fse.build_decode_table(sequences.of_default(), sequences.OF_DEFAULT_LOG)
-    ml_table := fse.build_decode_table(sequences.ml_default(), sequences.ML_DEFAULT_LOG)
-    ll_slots := fse.build_encode_states(sequences.ll_default(), sequences.LL_DEFAULT_LOG)
-    of_slots := fse.build_encode_states(sequences.of_default(), sequences.OF_DEFAULT_LOG)
-    ml_slots := fse.build_encode_states(sequences.ml_default(), sequences.ML_DEFAULT_LOG)
-    ll_path := fse_path(ll_syms, ll_table, ll_slots)!
-    of_path := fse_path(of_syms, of_table, of_slots)!
-    ml_path := fse_path(ml_syms, ml_table, ml_slots)!
-
-    w := stream.back_writer()
-    w.write(ll_path.0, sequences.LL_DEFAULT_LOG)
-    w.write(of_path.0, sequences.OF_DEFAULT_LOG)
-    w.write(ml_path.0, sequences.ML_DEFAULT_LOG)
-    i = 0
-    while i < count:
-        w.write(of_ev[i], of_ew[i])
-        w.write(ml_ev[i], ml_ew[i])
-        w.write(ll_ev[i], ll_ew[i])
+    # the packer lays bytes down deepest-first, so the whole stream is
+    # emitted in reverse: last sequence first, and the three init states —
+    # which the decoder reads first — last of all
+    p := stream.bit_packer(out)
+    i = count - 1
+    while i >= 0:
         if i + 1 < count:
-            w.write(ll_path.1[i], ll_path.2[i])
-            w.write(ml_path.1[i], ml_path.2[i])
-            w.write(of_path.1[i], of_path.2[i])
-        i = i + 1
-    write_byte_list(out, w.finish())
+            t := count - 2 - i
+            of_step := of_path.1[t]
+            p.push(bits.band(of_step, STEP_VALUE_MASK), bits.shr(of_step, STEP_WIDTH_SHIFT))
+            ml_step := ml_path.1[t]
+            p.push(bits.band(ml_step, STEP_VALUE_MASK), bits.shr(ml_step, STEP_WIDTH_SHIFT))
+            ll_step := ll_path.1[t]
+            p.push(bits.band(ll_step, STEP_VALUE_MASK), bits.shr(ll_step, STEP_WIDTH_SHIFT))
+        # lengths under their first code carry no extra bits at all, so the
+        # common sequence pushes one field here instead of three
+        lc := ll_codes[i]
+        if code_width(lc) > 0:
+            p.push(code_extra(lc), code_width(lc))
+        mc := ml_codes[i]
+        if code_width(mc) > 0:
+            p.push(code_extra(mc), code_width(mc))
+        oc := of_codes[i]
+        if code_width(oc) > 0:
+            p.push(code_extra(oc), code_width(oc))
+        i = i - 1
+    p.push(ml_path.0, ml_plan.log)
+    p.push(of_path.0, of_plan.log)
+    p.push(ll_path.0, ll_plan.log)
+    p.finish()
     return out.bytes()
 
 # emit one block for raw[start..end): rle when the chunk is one repeated
@@ -677,29 +1017,33 @@ fn sequences_section(lls: List[Int], mls: List[Int], ofs: List[Int], reps: List[
 # cap. `reps` is the frame's repeat-offset history: it only advances when
 # the compressed form is actually emitted, because a raw or rle block
 # leaves the decoder's history untouched too.
-fn emit_block(raw: Bytes, start: Int, end: Int, last: Bool, window: Int, head: List[Int], reps: List[Int], out: ByteBuffer) -> Int!:
+fn emit_block(raw: Bytes, start: Int, end: Int, last: Bool, window: Int, hash_shift: Int, head: List[Int], reps: List[Int], out: ByteBuffer) -> Int!:
     if all_same(raw, start, end):
         write_block_header(out, frame.BLOCK_RLE, end - start, last)
         out.write_byte(raw[start])
         return 0
 
-    mut lls: List[Int] := []
-    mut mls: List[Int] := []
-    mut ofs: List[Int] := []
+    mut ll_codes: List[Int] := []
+    mut ml_codes: List[Int] := []
+    mut of_codes: List[Int] := []
     mut lit := bytes.buffer_with_capacity(end - start)
     defer lit.free()
-    find_sequences(raw, start, end, window, head, lls, mls, ofs, lit)
+    # the finder codes offsets as it goes, so it needs the repeat history —
+    # but only a working copy of it: a block that ends up raw or rle leaves
+    # the decoder's history untouched, so this one is committed at the end
+    # or thrown away
+    mut work_reps := [reps[0], reps[1], reps[2]]
+    find_sequences(raw, start, end, window, hash_shift, head, work_reps, ll_codes, ml_codes, of_codes, lit)!
 
     lit_section := literals_section(lit.bytes())!
-    mut work_reps := [reps[0], reps[1], reps[2]]
     mut seq_section := bytes.empty()
-    if lls.len() == 0:
+    if ll_codes.len() == 0:
         # a literals-only block: the sequence section is one zero count byte
         mut zero := bytes.buffer()
         zero.write_byte(0)
         seq_section = zero.take_bytes()
     else:
-        seq_section = sequences_section(lls, mls, ofs, work_reps)!
+        seq_section = sequences_section(ll_codes, ml_codes, of_codes)!
 
     body := lit_section.len() + seq_section.len()
     if body < end - start:
@@ -729,9 +1073,11 @@ pub fn compress_checked(raw: Bytes) -> Bytes!:
     # the match table lives for the whole frame — a match in one block may
     # reach into any earlier one, up to the advertised window
     window := bits.shl(1, window_log_for(raw.len()))
+    buckets := bits.shl(1, hash_bits_for(raw.len()))
+    hash_shift := 32 - hash_bits_for(raw.len())
     mut head: List[Int] := []
     mut z := 0
-    while z < 65536:
+    while z < buckets:
         head.push(0)
         z = z + 1
     # the repeat-offset history starts where every decoder starts it
@@ -742,7 +1088,7 @@ pub fn compress_checked(raw: Bytes) -> Bytes!:
         mut end := start + BLOCK_MAX
         if end > raw.len():
             end = raw.len()
-        emit_block(raw, start, end, end == raw.len(), window, head, reps, out)!
+        emit_block(raw, start, end, end == raw.len(), window, hash_shift, head, reps, out)!
         start = end
 
     out.write_word(xxhash.frame_checksum(raw), 4)
@@ -1005,17 +1351,31 @@ test "a long sequence run decodes back sequence for sequence":
     # 33000 sequences forces the three-byte count form, and every one is
     # checked against the decoder's own sequence reader — lengths, offsets,
     # and repeat-code resolution alike
+    # every eleventh sequence takes lengths past the codes that carry no
+    # extra bits, so the packed extra-bit fields are exercised too
     mut lls: List[Int] := []
     mut mls: List[Int] := []
+    mut ll_codes: List[Int] := []
+    mut ml_codes: List[Int] := []
     mut ofs: List[Int] := []
+    mut of_codes: List[Int] := []
+    mut reps := [1, 4, 8]
     mut i := 0
     while i < 33000:
-        lls.push(i % 3)
-        mls.push(4 + i % 5)
-        ofs.push(1 + i % 7)
+        mut ll := i % 3
+        mut ml := 4 + i % 5
+        if i % 11 == 0:
+            ll = 16 + i % 4000
+            ml = 35 + i % 9000
+        lls.push(ll)
+        mls.push(ml)
+        ll_codes.push(ll_code_packed(ll))
+        ml_codes.push(ml_code_packed(ml))
+        off := 1 + i % 7
+        ofs.push(off)
+        of_codes.push(of_code_packed(offset_value_for(off, ll == 0, reps)))
         i = i + 1
-    mut reps := [1, 4, 8]
-    data := sequences_section(lls, mls, ofs, reps)!
+    data := sequences_section(ll_codes, ml_codes, of_codes)!
     cnt := sequences.read_sequence_count(data, 0)!
     assert_eq(cnt.count, 33000)
     prev: List[sequences.SequenceTables] := []

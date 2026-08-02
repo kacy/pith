@@ -258,6 +258,51 @@ impl BackWriter:
         out.push(bits.band(acc, 255))
         return out
 
+# ---------------------------------------------------------------
+# backward packer
+# ---------------------------------------------------------------
+
+## the same stream shape BackWriter produces, packed straight into a byte
+## buffer instead of recorded and reversed. BackWriter costs two list
+## pushes per bit-field and a second pass; the encoder emits one field per
+## huffman symbol and six per sequence, so that dominated it.
+##
+## the price is that the caller emits in REVERSE of the decoder's read
+## order — deepest field first — because that is the order the bytes are
+## laid down in. `back_writer` remains for callers that would rather
+## record forward and pay for it.
+pub struct BitPacker:
+    out: ByteBuffer
+    acc: Int
+    nbits: Int
+
+## a packer appending to `out`. everything already in the buffer is left
+## alone; the stream starts at the current end.
+pub fn bit_packer(out: ByteBuffer) -> BitPacker:
+    return BitPacker(out, 0, 0)
+
+impl BitPacker:
+    ## append the low `n` bits of `value` (n up to 32), deepest field first.
+    fn push(value: Int, n: Int):
+        self.acc = bits.bor(self.acc, bits.shl(bits.band(value, bits.shl(1, n) - 1), self.nbits))
+        self.nbits = self.nbits + n
+        # flush four bytes at a time rather than one: a field is at most
+        # thirty-two bits, so the accumulator holds sixty-three worst case
+        # and one extern call covers four bytes of output
+        if self.nbits >= 32:
+            self.out.write_word(bits.band(self.acc, 4294967295), 4)
+            self.acc = bits.shr(self.acc, 32)
+            self.nbits = self.nbits - 32
+
+    ## close the stream: the sentinel 1 above the last real bit, then the
+    ## bytes still held in the accumulator. after this every byte of the
+    ## stream is in the buffer.
+    fn finish():
+        acc := bits.bor(self.acc, bits.shl(1, self.nbits))
+        self.out.write_word(acc, (self.nbits + 8) / 8)
+        self.acc = 0
+        self.nbits = 0
+
 test "the backward reader walks a hand-packed stream":
     # bits (top to bottom): 5 (3 bits), 2 (2 bits), 9 (4 bits) → written
     # reversed and sentineled by the writer, then read back in order.
@@ -288,6 +333,50 @@ test "the forward reader is plain lsb-first":
     assert_eq(r.read(1), 1)
     assert_eq(r.peek(2), 0)
     assert_eq(r.remaining(), 7)
+
+test "the packer and the writer agree byte for byte":
+    # a varied field sequence: widths from zero to thirty-two, values that
+    # exercise every accumulator flush boundary, and a length that leaves a
+    # partial byte. the packer takes the same fields in reverse.
+    mut values: List[Int] := []
+    mut widths: List[Int] := []
+    mut i := 0
+    while i < 400:
+        n := i % 33
+        widths.push(n)
+        mut v := 0
+        if n > 0:
+            v = bits.band(i * 2654435761 + i / 7, bits.shl(1, n) - 1)
+        values.push(v)
+        i = i + 1
+
+    w := back_writer()
+    mut k := 0
+    while k < values.len():
+        w.write(values[k], widths[k])
+        k = k + 1
+    mut recorded := bytes.buffer()
+    for b in w.finish():
+        recorded.write_byte(b)
+
+    mut packed := bytes.buffer()
+    p := bit_packer(packed)
+    k = values.len() - 1
+    while k >= 0:
+        p.push(values[k], widths[k])
+        k = k - 1
+    p.finish()
+    assert_eq(packed.bytes(), recorded.bytes())
+
+    # and the stream still reads back in the recorded order
+    data := packed.take_bytes()
+    r := back_reader(data, 0, data.len())
+    assert(r.ok)
+    k = 0
+    while k < values.len():
+        assert_eq(r.read(widths[k]), values[k])
+        k = k + 1
+    assert_eq(r.remaining(), 0)
 
 test "an all-zero final byte is corrupt, not a stream":
     mut buf := bytes.buffer()

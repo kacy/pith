@@ -7,6 +7,8 @@
 import std.bytes as bytes
 import std.compress.gzip as gzip
 import std.compress.zstd as zstd
+import std.compress.zstd_pure_encode as pure_encode
+import std.compress.zstd_pure_frame as pure_frame
 
 fn main() -> Int!:
     # a repetitive payload, the shape compression is for
@@ -31,6 +33,14 @@ fn main() -> Int!:
     # untrusted input gets a ceiling: this 9000-byte payload will not fit
     # into 1000, and the decode fails at the cap rather than after it
     print("bounded refuses: {zstd.decompress_bounded(zs, 1000).is_err}")
+
+    # the same format implemented entirely in pith: frames from the pure
+    # encoder are read back by the reference codec, and the pure decoder
+    # reads reference frames — interop in both directions, not just a
+    # round trip through our own code
+    pp := pure_encode.compress(raw)
+    print("pure pith: {pp.len()} bytes, reference codec reads it: {zstd.decompress(pp)!.len() == raw.len()}")
+    print("pure decoder reads reference frames: {pure_frame.decompress_bounded(zs, 100000)!.len() == raw.len()}")
 
     # each format recognizes its own magic
     print("magic routing: gzip={zstd.is_valid(gz)} zstd={zstd.is_valid(zs)}")

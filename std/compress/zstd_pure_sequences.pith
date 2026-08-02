@@ -1,0 +1,890 @@
+# std/compress/zstd_pure_sequences — the sequence section of a zstd block.
+#
+# a compressed block is literals plus *sequences*: each sequence says "copy
+# N literals, then copy M bytes from D back in the output". the three code
+# streams (literal length, match length, offset) are fse-coded and
+# interleaved into one backward bitstream with three live decoder states.
+#
+# two details carry most of the format's subtlety. the codes are not values:
+# each indexes a baseline table and names how many extra bits follow, which
+# is how a few dozen symbols cover lengths into the megabytes. and offsets
+# 1-3 are not offsets at all but references into a rolling history of the
+# last three real offsets, with an extra shift when the sequence has no
+# literals — the rule that makes repeated structure nearly free.
+
+import std.bits as bits
+import std.bytes as bytes
+import std.compress.zstd_pure_bits as stream
+import std.compress.zstd_pure_fse as fse
+
+## symbol compression modes, from the modes byte.
+pub MODE_PREDEFINED := 0
+pub MODE_RLE := 1
+pub MODE_FSE := 2
+pub MODE_REPEAT := 3
+
+# literal-length and match-length codes, each packed as baseline * 256 +
+# extra bits. one packed list costs the decode loop a single index per code
+# where a baseline list and a bits list cost two, and a list index is the
+# most expensive thing that loop does.
+#
+# codes 0-15 are their own literal length; past that the baselines climb
+# geometrically. the shortest match is 3 bytes, so match code 0 is 3.
+fn ll_codes() -> List[Int]:
+    return [0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4097, 4609, 5121, 5633, 6146, 7170, 8195, 10243, 12292, 16390, 32775, 65544, 131081, 262154, 524299, 1048588, 2097165, 4194318, 8388623, 16777232]
+
+fn ml_codes() -> List[Int]:
+    return [768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6400, 6656, 6912, 7168, 7424, 7680, 7936, 8192, 8448, 8704, 8961, 9473, 9985, 10497, 11010, 12034, 13059, 15107, 17156, 21252, 25349, 33543, 66312, 131849, 262922, 525067, 1049356, 2097933, 4195086, 8389391, 16778000]
+
+## the baseline a packed length code carries.
+fn code_base(packed: Int) -> Int:
+    return bits.shr(packed, 8)
+
+## how many extra bits a packed length code reads.
+fn code_bits(packed: Int) -> Int:
+    return bits.band(packed, 255)
+
+# the predefined distributions, used when a mode says so and as the reset
+# point for repeat mode. each sums to its accuracy log by construction.
+# they are pub because the encoder must build its encode states from the
+# very distributions the decoder will assume.
+
+## the predefined literal-length distribution (rfc 8878 table 6).
+pub fn ll_default() -> List[Int]:
+    return [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1]
+
+## the predefined match-length distribution (rfc 8878 table 8).
+pub fn ml_default() -> List[Int]:
+    return [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
+
+## the predefined offset-code distribution (rfc 8878 table 10).
+pub fn of_default() -> List[Int]:
+    return [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
+
+## the accuracy logs the predefined tables use.
+pub LL_DEFAULT_LOG := 6
+pub ML_DEFAULT_LOG := 6
+pub OF_DEFAULT_LOG := 5
+
+## the literal-length code for a length, with its baseline and extra-bit
+## width, as (code, base, bits) — the encoder's inverse of ll_codes, kept
+## beside the table it must match. extra bits are `value - base`.
+pub fn ll_code_for(value: Int) -> (Int, Int, Int):
+    if value < 16:
+        return (value, value, 0)
+    table := ll_codes()
+    mut i := table.len() - 1
+    while i > 16:
+        if code_base(table[i]) <= value:
+            return (i, code_base(table[i]), code_bits(table[i]))
+        i = i - 1
+    return (16, code_base(table[16]), code_bits(table[16]))
+
+## the match-length code for a length (minimum 3), with its baseline and
+## extra-bit width, as (code, base, bits) — the encoder's inverse of
+## ml_codes.
+pub fn ml_code_for(value: Int) -> (Int, Int, Int):
+    if value < 35:
+        return (value - 3, value, 0)
+    table := ml_codes()
+    mut i := table.len() - 1
+    while i > 32:
+        if code_base(table[i]) <= value:
+            return (i, code_base(table[i]), code_bits(table[i]))
+        i = i - 1
+    return (32, code_base(table[32]), code_bits(table[32]))
+
+## one decoded sequence.
+pub struct Sequence:
+    pub literal_length: Int
+    pub match_length: Int
+    pub offset: Int
+
+## how many sequences the section holds, and how many bytes the count took.
+pub struct SequenceCount:
+    pub count: Int
+    pub bytes_used: Int
+
+## read the sequence count, whose width depends on its own first byte.
+pub fn read_sequence_count(data: Bytes, off: Int) -> SequenceCount!:
+    if off >= data.len():
+        fail "zstd: truncated sequence count"
+    first := data[off]
+    if first < 128:
+        return SequenceCount(first, 1)
+    if first < 255:
+        if off + 2 > data.len():
+            fail "zstd: truncated sequence count"
+        return SequenceCount(bits.shl(first - 128, 8) + data[off + 1], 2)
+    if off + 3 > data.len():
+        fail "zstd: truncated sequence count"
+    return SequenceCount(data[off + 1] + bits.shl(data[off + 2], 8) + 0x7F00, 3)
+
+## the three tables a sequence section decodes against.
+pub struct SequenceTables:
+    pub ll: fse.FseTable
+    pub ml: fse.FseTable
+    pub of: fse.FseTable
+    pub ll_rle: Int
+    pub ml_rle: Int
+    pub of_rle: Int
+
+# the predefined tables are fixed by the format, but they were rebuilt from
+# their distributions for every block that named them — a measurable slice of
+# small-frame decode. build each once, under a lock so concurrent decoders
+# cannot interleave the first fill, and share the result: an fse table is
+# read-only after construction, so sharing is safe. order: ll, of, ml.
+mut predef_mu := Mutex()
+mut predef_tables: List[fse.FseTable] := []
+
+fn predefined_tables() -> List[fse.FseTable]:
+    predef_mu.lock()
+    if predef_tables.len() == 0:
+        predef_tables.push(fse.build_decode_table(ll_default(), LL_DEFAULT_LOG))
+        predef_tables.push(fse.build_decode_table(of_default(), OF_DEFAULT_LOG))
+        predef_tables.push(fse.build_decode_table(ml_default(), ML_DEFAULT_LOG))
+    predef_mu.unlock()
+    return predef_tables
+
+# build a table for one code stream given its mode, returning the table and
+# how many bytes of description it consumed. an rle mode carries a single
+# byte naming the only symbol, and needs no table — it borrows the shared
+# predefined table as a placeholder, the same way repeat mode borrows the
+# previous block's.
+fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse.FseTable, max_symbol: Int, prev: List[fse.FseTable], prev_rle: List[Int]) -> (fse.FseTable, Int, Int)!:
+    if mode == MODE_PREDEFINED:
+        return (default_table, 0, -1)
+    if mode == MODE_RLE:
+        if pos >= data.len():
+            fail "zstd: truncated rle symbol"
+        return (default_table, 1, data[pos])
+    if mode == MODE_FSE:
+        desc := fse.read_ncount(data, pos, end, max_symbol)!
+        return (fse.build_decode_table(desc.counts, desc.log), desc.bytes_used, -1)
+    # repeat mode: whatever this stream used in the previous block of the
+    # frame, carried forward rather than re-described.
+    if prev.len() == 0:
+        fail "zstd: repeat mode with no previous table in this frame"
+    return (prev[0], 0, prev_rle[0])
+
+## parse the modes byte and the table descriptions that follow it.
+pub fn read_tables(data: Bytes, off: Int, end: Int, previous: List[SequenceTables]) -> (SequenceTables, Int)!:
+    if off >= data.len():
+        fail "zstd: truncated sequence modes"
+    modes := data[off]
+    if bits.band(modes, 3) != 0:
+        fail "zstd: reserved bits set in the sequence modes byte"
+    ll_mode := bits.shr(modes, 6)
+    of_mode := bits.band(bits.shr(modes, 4), 3)
+    ml_mode := bits.band(bits.shr(modes, 2), 3)
+
+    # unpack the previous block's tables so repeat mode can name them
+    mut prev_ll: List[fse.FseTable] := []
+    mut prev_ml: List[fse.FseTable] := []
+    mut prev_of: List[fse.FseTable] := []
+    mut prev_ll_rle: List[Int] := []
+    mut prev_ml_rle: List[Int] := []
+    mut prev_of_rle: List[Int] := []
+    if previous.len() > 0:
+        prev_ll.push(previous[0].ll)
+        prev_ml.push(previous[0].ml)
+        prev_of.push(previous[0].of)
+        prev_ll_rle.push(previous[0].ll_rle)
+        prev_ml_rle.push(previous[0].ml_rle)
+        prev_of_rle.push(previous[0].of_rle)
+
+    mut pos := off + 1
+    predef := predefined_tables()
+    # the descriptions appear in this order regardless of the modes.
+    ll_built := build_for_mode(ll_mode, data, pos, end, predef[0], 35, prev_ll, prev_ll_rle)!
+    pos = pos + ll_built.1
+    of_built := build_for_mode(of_mode, data, pos, end, predef[1], 31, prev_of, prev_of_rle)!
+    pos = pos + of_built.1
+    ml_built := build_for_mode(ml_mode, data, pos, end, predef[2], 52, prev_ml, prev_ml_rle)!
+    pos = pos + ml_built.1
+
+    tables := SequenceTables(ll_built.0, ml_built.0, of_built.0, ll_built.2, ml_built.2, of_built.2)
+    return (tables, pos - off)
+
+## resolve an offset value against the repeat history: return the real
+## offset and update `reps` in place. values above 3 are literal offsets and
+## push the history down; 1-3 name a remembered offset, shifted by one more
+## when the sequence carries no literals.
+##
+## `reps` is updated rather than replaced because this runs once per
+## sequence, and returning a fresh three-element list each time cost more
+## than the rest of the sequence decode put together.
+pub fn resolve_offset(offset_value: Int, literal_length: Int, reps: List[Int]) -> Int!:
+    if offset_value > 3:
+        actual := offset_value - 3
+        reps[2] = reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
+    mut index := offset_value
+    if literal_length == 0:
+        index = index + 1
+    if index == 1:
+        return reps[0]
+    if index == 2:
+        actual := reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
+    if index == 3:
+        actual := reps[2]
+        reps[2] = reps[1]
+        reps[1] = reps[0]
+        reps[0] = actual
+        return actual
+    # index 4 only arises from value 3 with no literals: one before the most
+    # recent offset, which is the format's way of coding a near-repeat.
+    actual := reps[0] - 1
+    if actual < 1:
+        fail "zstd: repeat offset underflow"
+    reps[2] = reps[1]
+    reps[1] = reps[0]
+    reps[0] = actual
+    return actual
+
+## decode `count` sequences from the backward bitstream in [start, end).
+## the three fse states are initialized literal-length, offset, match-length
+## and updated in that same order after each sequence's extra bits are read.
+pub fn decode_sequences(data: Bytes, start: Int, end: Int, count: Int, tables: SequenceTables, reps: List[Int]) -> List[Sequence]!:
+    reader := stream.back_reader(data, start, end)
+    if not reader.ok:
+        fail "zstd: malformed sequence bitstream"
+
+    ll_c := ll_codes()
+    ml_c := ml_codes()
+    ll_max := ll_c.len()
+    ml_max := ml_c.len()
+
+    mut ll_state := 0
+    mut of_state := 0
+    mut ml_state := 0
+    if tables.ll_rle < 0:
+        ll_state = reader.read(tables.ll.log)
+    if tables.of_rle < 0:
+        of_state = reader.read(tables.of.log)
+    if tables.ml_rle < 0:
+        ml_state = reader.read(tables.ml.log)
+
+    # this loop is the decoder's hottest path — six to nine reader reads and
+    # as many table indexes per sequence — so the table entry lists, the rle
+    # modes, the reader's bit window, and the repeat history all live in
+    # locals here. each `read(n)` below is BackReader.read spelled out: pos
+    # moves down, the cached window serves the field, and only a window miss
+    # (about once per fifty bits) or the stream tail goes back through the
+    # reader. the offset resolution mirrors resolve_offset over the local
+    # history — keep the two in sync — because three list reads and writes
+    # per sequence cost more than the arithmetic they carry.
+    ll_rle := tables.ll_rle
+    ml_rle := tables.ml_rle
+    of_rle := tables.of_rle
+    ll_entries := tables.ll.entries
+    ml_entries := tables.ml.entries
+    of_entries := tables.of.entries
+    start_bit := reader.start_bit
+    mut pos := reader.pos
+    mut window := reader.window
+    mut window_base := reader.window_base
+    mut rep0 := reps[0]
+    mut rep1 := reps[1]
+    mut rep2 := reps[2]
+
+    mut out: List[Sequence] := []
+    mut i := 0
+    while i < count:
+        mut ll_code := ll_rle
+        if ll_code < 0:
+            ll_code = bits.band(ll_entries[ll_state], 255)
+        mut ml_code := ml_rle
+        if ml_code < 0:
+            ml_code = bits.band(ml_entries[ml_state], 255)
+        mut of_code := of_rle
+        if of_code < 0:
+            of_code = bits.band(of_entries[of_state], 255)
+
+        if ll_code >= ll_max or ml_code >= ml_max:
+            fail "zstd: sequence code out of range"
+
+        # extra bits are read offset first, then match length, then literal
+        # length — the reverse of how the codes were named.
+        ml_packed := ml_c[ml_code]
+        ll_packed := ll_c[ll_code]
+
+        pos = pos - of_code
+        mut of_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + of_code > window_base + 64:
+                reader.refill(pos, of_code)
+                window = reader.window
+                window_base = reader.window_base
+            of_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, of_code) - 1)
+        else:
+            reader.pos = pos + of_code
+            of_extra = reader.read(of_code)
+        offset_value := bits.shl(1, of_code) + of_extra
+
+        ml_bits := bits.band(ml_packed, 255)
+        pos = pos - ml_bits
+        mut ml_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + ml_bits > window_base + 64:
+                reader.refill(pos, ml_bits)
+                window = reader.window
+                window_base = reader.window_base
+            ml_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, ml_bits) - 1)
+        else:
+            reader.pos = pos + ml_bits
+            ml_extra = reader.read(ml_bits)
+        match_length := bits.shr(ml_packed, 8) + ml_extra
+
+        ll_bits := bits.band(ll_packed, 255)
+        pos = pos - ll_bits
+        mut ll_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + ll_bits > window_base + 64:
+                reader.refill(pos, ll_bits)
+                window = reader.window
+                window_base = reader.window_base
+            ll_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, ll_bits) - 1)
+        else:
+            reader.pos = pos + ll_bits
+            ll_extra = reader.read(ll_bits)
+        literal_length := bits.shr(ll_packed, 8) + ll_extra
+
+        # the repeat history lives for the whole frame, not the block; it is
+        # kept in locals and written back to the caller's list after the
+        # loop. a failure aborts the frame, so the lost writeback is moot.
+        mut offset := 0
+        if offset_value > 3:
+            offset = offset_value - 3
+            rep2 = rep1
+            rep1 = rep0
+            rep0 = offset
+        else:
+            mut index := offset_value
+            if literal_length == 0:
+                index = index + 1
+            if index == 1:
+                offset = rep0
+            elif index == 2:
+                offset = rep1
+                rep1 = rep0
+                rep0 = offset
+            elif index == 3:
+                offset = rep2
+                rep2 = rep1
+                rep1 = rep0
+                rep0 = offset
+            else:
+                # index 4 only arises from value 3 with no literals: one
+                # before the most recent offset — the coded near-repeat.
+                offset = rep0 - 1
+                if offset < 1:
+                    fail "zstd: repeat offset underflow"
+                rep2 = rep1
+                rep1 = rep0
+                rep0 = offset
+        out.push(Sequence(literal_length, match_length, offset))
+
+        # the states advance only between sequences, not after the last one.
+        if i + 1 < count:
+            if ll_rle < 0:
+                entry := ll_entries[ll_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                ll_state = bits.shr(entry, 16) + extra
+            if ml_rle < 0:
+                entry := ml_entries[ml_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                ml_state = bits.shr(entry, 16) + extra
+            if of_rle < 0:
+                entry := of_entries[of_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                of_state = bits.shr(entry, 16) + extra
+        i = i + 1
+
+    reader.pos = pos
+    reps[0] = rep0
+    reps[1] = rep1
+    reps[2] = rep2
+    return out
+
+## decode `count` sequences from [start, end) and execute each straight
+## into `out` as it decodes — the fused form of decode_sequences followed
+## by execute_into. fusing matters: a sequence struct pushed to a list and
+## read back once cost more than the arithmetic that produced it, and the
+## fused loop never materializes the list at all. the decode half mirrors
+## decode_sequences and the execute half mirrors execute_into — keep all
+## three in sync.
+pub fn decode_and_execute(data: Bytes, start: Int, end: Int, count: Int, tables: SequenceTables, reps: List[Int], literals: Bytes, out: ByteBuffer, max_output: Int) -> Int!:
+    reader := stream.back_reader(data, start, end)
+    if not reader.ok:
+        fail "zstd: malformed sequence bitstream"
+
+    ll_c := ll_codes()
+    ml_c := ml_codes()
+    ll_max := ll_c.len()
+    ml_max := ml_c.len()
+
+    mut ll_state := 0
+    mut of_state := 0
+    mut ml_state := 0
+    if tables.ll_rle < 0:
+        ll_state = reader.read(tables.ll.log)
+    if tables.of_rle < 0:
+        of_state = reader.read(tables.of.log)
+    if tables.ml_rle < 0:
+        ml_state = reader.read(tables.ml.log)
+
+    ll_rle := tables.ll_rle
+    ml_rle := tables.ml_rle
+    of_rle := tables.of_rle
+    ll_entries := tables.ll.entries
+    ml_entries := tables.ml.entries
+    of_entries := tables.of.entries
+    start_bit := reader.start_bit
+    mut pos := reader.pos
+    mut window := reader.window
+    mut window_base := reader.window_base
+    mut rep0 := reps[0]
+    mut rep1 := reps[1]
+    mut rep2 := reps[2]
+
+    # execute-side state: out_len mirrors out.len() so the per-sequence
+    # bounds checks cost arithmetic, not an extern call.
+    lit_len := literals.len()
+    mut lit_pos := 0
+    mut out_len := out.len()
+
+    mut i := 0
+    while i < count:
+        mut ll_code := ll_rle
+        if ll_code < 0:
+            ll_code = bits.band(ll_entries[ll_state], 255)
+        mut ml_code := ml_rle
+        if ml_code < 0:
+            ml_code = bits.band(ml_entries[ml_state], 255)
+        mut of_code := of_rle
+        if of_code < 0:
+            of_code = bits.band(of_entries[of_state], 255)
+
+        if ll_code >= ll_max or ml_code >= ml_max:
+            fail "zstd: sequence code out of range"
+
+        # extra bits are read offset first, then match length, then literal
+        # length — the reverse of how the codes were named.
+        ml_packed := ml_c[ml_code]
+        ll_packed := ll_c[ll_code]
+
+        pos = pos - of_code
+        mut of_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + of_code > window_base + 64:
+                reader.refill(pos, of_code)
+                window = reader.window
+                window_base = reader.window_base
+            of_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, of_code) - 1)
+        else:
+            reader.pos = pos + of_code
+            of_extra = reader.read(of_code)
+        offset_value := bits.shl(1, of_code) + of_extra
+
+        ml_bits := bits.band(ml_packed, 255)
+        pos = pos - ml_bits
+        mut ml_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + ml_bits > window_base + 64:
+                reader.refill(pos, ml_bits)
+                window = reader.window
+                window_base = reader.window_base
+            ml_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, ml_bits) - 1)
+        else:
+            reader.pos = pos + ml_bits
+            ml_extra = reader.read(ml_bits)
+        match_length := bits.shr(ml_packed, 8) + ml_extra
+
+        ll_bits := bits.band(ll_packed, 255)
+        pos = pos - ll_bits
+        mut ll_extra := 0
+        if pos >= start_bit:
+            if pos < window_base or pos + ll_bits > window_base + 64:
+                reader.refill(pos, ll_bits)
+                window = reader.window
+                window_base = reader.window_base
+            ll_extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, ll_bits) - 1)
+        else:
+            reader.pos = pos + ll_bits
+            ll_extra = reader.read(ll_bits)
+        literal_length := bits.shr(ll_packed, 8) + ll_extra
+
+        mut offset := 0
+        if offset_value > 3:
+            offset = offset_value - 3
+            rep2 = rep1
+            rep1 = rep0
+            rep0 = offset
+        else:
+            mut index := offset_value
+            if literal_length == 0:
+                index = index + 1
+            if index == 1:
+                offset = rep0
+            elif index == 2:
+                offset = rep1
+                rep1 = rep0
+                rep0 = offset
+            elif index == 3:
+                offset = rep2
+                rep2 = rep1
+                rep1 = rep0
+                rep0 = offset
+            else:
+                # index 4 only arises from value 3 with no literals: one
+                # before the most recent offset — the coded near-repeat.
+                offset = rep0 - 1
+                if offset < 1:
+                    fail "zstd: repeat offset underflow"
+                rep2 = rep1
+                rep1 = rep0
+                rep0 = offset
+
+        # run the sequence into the frame buffer right away
+        if lit_pos + literal_length > lit_len:
+            fail "zstd: sequence wants more literals than the block holds"
+        if out_len + literal_length + match_length > max_output:
+            fail "zstd: output would exceed the decode limit"
+        if literal_length > 0:
+            if not out.write_range(literals, lit_pos, literal_length):
+                fail "zstd: literal write out of range"
+            lit_pos = lit_pos + literal_length
+            out_len = out_len + literal_length
+        if offset > out_len:
+            fail "zstd: match offset reaches before the start of the frame"
+        if not out.copy_within(out_len - offset, match_length):
+            fail "zstd: match copy out of range"
+        out_len = out_len + match_length
+
+        # the states advance only between sequences, not after the last one.
+        if i + 1 < count:
+            if ll_rle < 0:
+                entry := ll_entries[ll_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                ll_state = bits.shr(entry, 16) + extra
+            if ml_rle < 0:
+                entry := ml_entries[ml_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                ml_state = bits.shr(entry, 16) + extra
+            if of_rle < 0:
+                entry := of_entries[of_state]
+                nb := bits.band(bits.shr(entry, 8), 255)
+                pos = pos - nb
+                mut extra := 0
+                if pos >= start_bit:
+                    if pos < window_base or pos + nb > window_base + 64:
+                        reader.refill(pos, nb)
+                        window = reader.window
+                        window_base = reader.window_base
+                    extra = bits.band(bits.shr(window, pos - window_base), bits.shl(1, nb) - 1)
+                else:
+                    reader.pos = pos + nb
+                    extra = reader.read(nb)
+                of_state = bits.shr(entry, 16) + extra
+        i = i + 1
+
+    reader.pos = pos
+    reps[0] = rep0
+    reps[1] = rep1
+    reps[2] = rep2
+
+    if out_len + (lit_len - lit_pos) > max_output:
+        fail "zstd: output would exceed the decode limit"
+    if lit_pos < lit_len:
+        if not out.write_range(literals, lit_pos, lit_len - lit_pos):
+            fail "zstd: trailing literal write out of range"
+    return out.len()
+
+## run the sequences into `out`, which already holds everything decoded so
+## far in the frame — matches reach back into it directly, so there is no
+## per-block history copy. literal runs are written in bulk; a match copies
+## byte-at-a-time because it may overlap itself, which is how zstd codes a
+## repeating run.
+pub fn execute_into(sequences: List[Sequence], literals: Bytes, out: ByteBuffer, max_output: Int) -> Int!:
+    mut lit_pos := 0
+    for seq in sequences:
+        if lit_pos + seq.literal_length > literals.len():
+            fail "zstd: sequence wants more literals than the block holds"
+        if out.len() + seq.literal_length + seq.match_length > max_output:
+            fail "zstd: output would exceed the decode limit"
+        if seq.literal_length > 0:
+            # write_range appends straight from the literals — the
+            # slice-then-write form allocated a bytes object per sequence
+            if not out.write_range(literals, lit_pos, seq.literal_length):
+                fail "zstd: literal write out of range"
+            lit_pos = lit_pos + seq.literal_length
+
+        total := out.len()
+        if seq.offset > total:
+            fail "zstd: match offset reaches before the start of the frame"
+        if not out.copy_within(total - seq.offset, seq.match_length):
+            fail "zstd: match copy out of range"
+
+    if out.len() + (literals.len() - lit_pos) > max_output:
+        fail "zstd: output would exceed the decode limit"
+    if lit_pos < literals.len():
+        if not out.write_range(literals, lit_pos, literals.len() - lit_pos):
+            fail "zstd: trailing literal write out of range"
+    return out.len()
+
+## the same, as a standalone call over a fresh buffer seeded with `history`.
+pub fn execute(sequences: List[Sequence], literals: Bytes, history: Bytes, max_output: Int) -> Bytes!:
+    mut out := bytes.buffer()
+    errdefer out.free()
+    if history.len() > 0:
+        out.write(history)!
+    execute_into(sequences, literals, out, max_output + history.len())!
+    whole := out.bytes()
+    out.free()
+    return whole.slice(history.len(), whole.len())
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+test "the predefined distributions have the right shape":
+    # the sum invariant is necessary but not sufficient — a distribution
+    # with the wrong number of low-probability symbols can still sum to the
+    # table size, and did, until a real frame disagreed. pin the counts and
+    # the low-probability boundaries too.
+    ll := ll_default()
+    ml := ml_default()
+    of := of_default()
+    assert_eq(ll.len(), 36)
+    assert_eq(ml.len(), 53)
+    assert_eq(of.len(), 29)
+    # the low-probability runs at the end of each table
+    assert_eq(ll[31], 1)
+    assert_eq(ll[32], -1)
+    assert_eq(ml[45], 1)
+    assert_eq(ml[46], -1)
+    assert_eq(of[23], 1)
+    assert_eq(of[24], -1)
+
+test "the predefined distributions sum to their accuracy logs":
+    # a normalized distribution must fill its table exactly: positive counts
+    # plus one slot per low-probability symbol.
+    for spec in [(ll_default(), LL_DEFAULT_LOG), (ml_default(), ML_DEFAULT_LOG), (of_default(), OF_DEFAULT_LOG)]:
+        mut total := 0
+        for c in spec.0:
+            if c > 0:
+                total = total + c
+            else:
+                total = total + 1
+        assert_eq(total, bits.shl(1, spec.1))
+
+test "the predefined tables build":
+    ll := fse.build_decode_table(ll_default(), LL_DEFAULT_LOG)
+    assert_eq(ll.entries.len(), 64)
+    ml := fse.build_decode_table(ml_default(), ML_DEFAULT_LOG)
+    assert_eq(ml.entries.len(), 64)
+    of := fse.build_decode_table(of_default(), OF_DEFAULT_LOG)
+    assert_eq(of.entries.len(), 32)
+
+test "the packed code tables carry the spec's baselines and widths":
+    # the tables are packed by hand, so this pins every value that the
+    # format fixes rather than trusting the packing arithmetic.
+    ll := ll_codes()
+    ml := ml_codes()
+    assert_eq(ll.len(), 36)
+    assert_eq(ml.len(), 53)
+
+    # literal-length codes below 16 are their own value and read no extra bits
+    mut i := 0
+    while i < 16:
+        assert_eq(code_base(ll[i]), i)
+        assert_eq(code_bits(ll[i]), 0)
+        i = i + 1
+    # and match codes below 32 are i+3, the shortest match being three bytes
+    i = 0
+    while i < 32:
+        assert_eq(code_base(ml[i]), i + 3)
+        assert_eq(code_bits(ml[i]), 0)
+        i = i + 1
+
+    # the top of each table, where a mispacked value would hide
+    assert_eq(code_base(ll[35]), 65536)
+    assert_eq(code_bits(ll[35]), 16)
+    assert_eq(code_base(ml[52]), 65539)
+    assert_eq(code_bits(ml[52]), 16)
+
+    # each baseline must sit exactly one past the span the previous code
+    # covers, or some length is unreachable and another is ambiguous
+    i = 1
+    while i < ll.len():
+        span := bits.shl(1, code_bits(ll[i - 1]))
+        assert_eq(code_base(ll[i]), code_base(ll[i - 1]) + span)
+        i = i + 1
+    i = 1
+    while i < ml.len():
+        span := bits.shl(1, code_bits(ml[i - 1]))
+        assert_eq(code_base(ml[i]), code_base(ml[i - 1]) + span)
+        i = i + 1
+
+test "the length-code lookups invert the code tables":
+    ll := ll_codes()
+    ml := ml_codes()
+    # every representable value must land in the code whose span holds it
+    for v in [0, 1, 15, 16, 17, 31, 32, 63, 64, 100, 1000, 65535, 65536, 131071]:
+        got := ll_code_for(v)
+        assert(got.1 <= v)
+        assert(v < got.1 + bits.shl(1, got.2))
+        assert_eq(got.1, code_base(ll[got.0]))
+        assert_eq(got.2, code_bits(ll[got.0]))
+    for v in [3, 4, 34, 35, 36, 37, 100, 4096, 65538, 65539, 131074]:
+        got := ml_code_for(v)
+        assert(got.1 <= v)
+        assert(v < got.1 + bits.shl(1, got.2))
+        assert_eq(got.1, code_base(ml[got.0]))
+        assert_eq(got.2, code_bits(ml[got.0]))
+
+test "sequence counts read at all three widths":
+    mut one := bytes.buffer()
+    one.write_byte(42)
+    c1 := read_sequence_count(one.take_bytes(), 0)!
+    assert_eq(c1.count, 42)
+    assert_eq(c1.bytes_used, 1)
+
+    # two-byte form: first byte 128 + high bits
+    mut two := bytes.buffer()
+    two.write_byte(128 + 2)
+    two.write_byte(5)
+    c2 := read_sequence_count(two.take_bytes(), 0)!
+    assert_eq(c2.count, 517)
+    assert_eq(c2.bytes_used, 2)
+
+    mut three := bytes.buffer()
+    three.write_byte(255)
+    three.write_byte(0x10)
+    three.write_byte(0x01)
+    c3 := read_sequence_count(three.take_bytes(), 0)!
+    assert_eq(c3.count, 0x10 + 256 + 0x7F00)
+    assert_eq(c3.bytes_used, 3)
+
+test "offset resolution walks the repeat history":
+    # a literal offset pushes the history down
+    mut reps := [1, 4, 8]
+    assert_eq(resolve_offset(10, 5, reps)!, 7)
+    assert_eq(reps[0], 7)
+    assert_eq(reps[1], 1)
+    assert_eq(reps[2], 4)
+
+    # value 1 with literals repeats the most recent offset and changes nothing
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(1, 5, reps)!, 1)
+    assert_eq(reps[0], 1)
+    assert_eq(reps[1], 4)
+
+    # value 2 promotes the second offset
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(2, 5, reps)!, 4)
+    assert_eq(reps[0], 4)
+    assert_eq(reps[1], 1)
+
+    # with no literals every reference shifts by one: value 1 now means the
+    # second offset, not the first
+    reps = [1, 4, 8]
+    assert_eq(resolve_offset(1, 0, reps)!, 4)
+
+    # value 3 with no literals is the one-before case
+    reps = [5, 9, 13]
+    assert_eq(resolve_offset(3, 0, reps)!, 4)
+    assert_eq(reps[0], 4)
+    assert_eq(reps[1], 5)
+
+    # and it refuses to underflow
+    reps = [1, 4, 8]
+    assert(resolve_offset(3, 0, reps).is_err)
+
+test "execution copies literals and matches, including overlap":
+    literals := bytes.from_string_utf8("abcXYZ")
+    # copy 3 literals ("abc"), then match 3 bytes at offset 3 → "abc" again
+    seqs := [Sequence(3, 3, 3)]
+    out := execute(seqs, literals, bytes.empty(), 1000)!
+    assert_eq(out.to_string_utf8()!, "abcabcXYZ")
+
+    # an overlapping match: offset 1 repeats the last byte, which is how
+    # zstd codes a run
+    run_literals := bytes.from_string_utf8("a")
+    run := [Sequence(1, 5, 1)]
+    out2 := execute(run, run_literals, bytes.empty(), 1000)!
+    assert_eq(out2.to_string_utf8()!, "aaaaaa")
+
+test "execution reaches into earlier blocks and refuses to reach past the frame":
+    history := bytes.from_string_utf8("earlier")
+    # no literals, match 7 bytes at offset 7 → the whole history repeats
+    seqs := [Sequence(0, 7, 7)]
+    out := execute(seqs, bytes.empty(), history, 1000)!
+    assert_eq(out.to_string_utf8()!, "earlier")
+
+    # an offset past everything decoded so far is malformed
+    bad := [Sequence(0, 3, 99)]
+    assert(execute(bad, bytes.empty(), history, 1000).is_err)
+    # and the output bound is enforced
+    assert(execute([Sequence(0, 500, 7)], bytes.empty(), history, 100).is_err)

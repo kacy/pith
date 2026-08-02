@@ -1,0 +1,143 @@
+# std/compress/zstd_pure_xxhash — xxhash64, the checksum zstd frames carry.
+#
+# a zstd frame optionally ends with the low 32 bits of the xxh64 of its
+# decompressed content, so a decoder needs the whole 64-bit hash to verify a
+# frame. the algorithm is four interleaved accumulator lanes over 32-byte
+# stripes, then a merge, a tail pass, and an avalanche finish.
+#
+# every operation here is wrapping 64-bit arithmetic. pith's Int is a 64-bit
+# two's-complement integer whose `*` and `+` wrap rather than trap, and
+# bits.shr is a logical shift, so the bit patterns match the reference
+# implementation exactly even though the values print as signed.
+
+import std.bits as bits
+import std.bytes as bytes
+
+# the xxh64 primes, built from hex halves because each exceeds the largest
+# positive Int and cannot be written as a decimal literal.
+fn prime1() -> Int:
+    return bits.bor(bits.shl(0x9E3779B1, 32), 0x85EBCA87)
+
+fn prime2() -> Int:
+    return bits.bor(bits.shl(0xC2B2AE3D, 32), 0x27D4EB4F)
+
+fn prime3() -> Int:
+    return bits.bor(bits.shl(0x165667B1, 32), 0x9E3779F9)
+
+fn prime4() -> Int:
+    return bits.bor(bits.shl(0x85EBCA77, 32), 0xC2B2AE63)
+
+fn prime5() -> Int:
+    return bits.bor(bits.shl(0x27D4EB2F, 32), 0x165667C5)
+
+# read a little-endian 64-bit word at `off`. the builtin is called
+# directly rather than through the std.bytes wrapper: the stripe loop pays
+# one call per eight bytes, and each wrapper layer showed up whole in the
+# checksum's share of frame decode. the callers' loop bounds keep the
+# range inside the data, so the read never sees the out-of-range zero.
+fn read64(data: Bytes, off: Int) -> Int:
+    return bytes_read_word(data, off, 8)
+
+# read a little-endian 32-bit word at `off`, zero-extended.
+fn read32(data: Bytes, off: Int) -> Int:
+    return bytes_read_word(data, off, 4)
+
+fn round(acc: Int, input: Int) -> Int:
+    return bits.rotl64(acc + input * prime2(), 31) * prime1()
+
+fn merge_round(acc: Int, val: Int) -> Int:
+    return bits.xor(acc, round(0, val)) * prime1() + prime4()
+
+## the 64-bit xxhash of `data` under `seed`.
+pub fn xxh64(data: Bytes, seed: Int) -> Int:
+    n := data.len()
+    mut h := 0
+    mut pos := 0
+
+    if n >= 32:
+        # the stripe loop is the whole cost of hashing a frame, so the
+        # primes live in locals and the round arithmetic is spelled out:
+        # a call per lane per stripe was most of the checksum's share of
+        # frame decode. keep this in sync with round().
+        p1 := prime1()
+        p2 := prime2()
+        mut v1 := seed + p1 + p2
+        mut v2 := seed + p2
+        mut v3 := seed
+        mut v4 := seed - p1
+        while pos + 32 <= n:
+            # rotl64 spelled as shifts: the rotate amount is fixed at 31,
+            # and the shl/shr/bor calls collapse to native instructions
+            # where the rotl64 wrapper stays a call
+            a1 := v1 + bytes_read_word(data, pos, 8) * p2
+            v1 = bits.bor(bits.shl(a1, 31), bits.shr(a1, 33)) * p1
+            a2 := v2 + bytes_read_word(data, pos + 8, 8) * p2
+            v2 = bits.bor(bits.shl(a2, 31), bits.shr(a2, 33)) * p1
+            a3 := v3 + bytes_read_word(data, pos + 16, 8) * p2
+            v3 = bits.bor(bits.shl(a3, 31), bits.shr(a3, 33)) * p1
+            a4 := v4 + bytes_read_word(data, pos + 24, 8) * p2
+            v4 = bits.bor(bits.shl(a4, 31), bits.shr(a4, 33)) * p1
+            pos = pos + 32
+        h = bits.rotl64(v1, 1) + bits.rotl64(v2, 7) + bits.rotl64(v3, 12) + bits.rotl64(v4, 18)
+        h = merge_round(h, v1)
+        h = merge_round(h, v2)
+        h = merge_round(h, v3)
+        h = merge_round(h, v4)
+    else:
+        h = seed + prime5()
+
+    h = h + n
+
+    while pos + 8 <= n:
+        h = bits.xor(h, round(0, read64(data, pos)))
+        h = bits.rotl64(h, 27) * prime1() + prime4()
+        pos = pos + 8
+
+    if pos + 4 <= n:
+        h = bits.xor(h, read32(data, pos) * prime1())
+        h = bits.rotl64(h, 23) * prime2() + prime3()
+        pos = pos + 4
+
+    while pos < n:
+        h = bits.xor(h, data[pos] * prime5())
+        h = bits.rotl64(h, 11) * prime1()
+        pos = pos + 1
+
+    # avalanche
+    h = bits.xor(h, bits.shr(h, 33))
+    h = h * prime2()
+    h = bits.xor(h, bits.shr(h, 29))
+    h = h * prime3()
+    h = bits.xor(h, bits.shr(h, 32))
+    return h
+
+## the low 32 bits of the xxh64, which is what a zstd frame stores.
+pub fn frame_checksum(data: Bytes) -> Int:
+    return bits.mask32(xxh64(data, 0))
+
+test "xxh64 matches the published vectors":
+    # the canonical vectors from the reference implementation, seed 0.
+    assert_eq(xxh64(bytes.empty(), 0), bits.bor(bits.shl(0xEF46DB37, 32), 0x51D8E999))
+    # the hash changes with the seed.
+    assert(xxh64(bytes.empty(), 1) != xxh64(bytes.empty(), 0))
+
+test "xxh64 covers every tail path":
+    # the tail handles 8-byte, 4-byte, and single-byte remainders, and the
+    # 32-byte stripe loop only engages at length 32. exercise each length
+    # class and require distinct hashes (a stuck path would collide).
+    mut seen: List[Int] := []
+    for size in [0, 1, 3, 4, 7, 8, 12, 16, 31, 32, 33, 64, 100]:
+        mut buf := bytes.buffer()
+        mut i := 0
+        while i < size:
+            buf.write_byte((i * 7 + 11) % 251)
+            i = i + 1
+        h := xxh64(buf.take_bytes(), 0)
+        assert(not seen.contains(h))
+        seen.push(h)
+
+test "the frame checksum is the low 32 bits":
+    data := bytes.from_string_utf8("checksummed content")
+    full := xxh64(data, 0)
+    assert_eq(frame_checksum(data), bits.mask32(full))
+    assert(frame_checksum(data) >= 0)

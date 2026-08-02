@@ -1,0 +1,386 @@
+# std/compress/zstd_pure_bits — bitstreams for the pure-pith zstd codec.
+#
+# zstd uses two stream shapes. entropy-coded payloads (fse states, huffman
+# literals, sequence extra bits) are read BACKWARD: bits pack lsb-first into
+# bytes, the final byte carries a sentinel 1 above the last real bit, and the
+# reader starts just below the sentinel and consumes toward byte zero. table
+# descriptions (normalized counts) read FORWARD, plain lsb-first. the writer
+# builds a backward stream by recording reads in decode order and reversing.
+
+import std.bits as bits
+import std.bytes as bytes
+
+# a window base no real bit index can reach, so the first read of a stream
+# always refills. it has to sit ABOVE any valid index rather than below:
+# the emptiness test is `at < window_base`, and a short stream's reads all
+# fit under sixty-four bits, so a negative sentinel would let them read an
+# all-zero window instead.
+WINDOW_UNSET := 1099511627776
+
+# extract `n` bits starting at absolute bit index `at`, lsb-first — bit `at`
+# becomes the result's low bit. this is the hot primitive of the whole
+# decoder, so it loads the two-to-five bytes the field spans as one word and
+# shifts, rather than walking bit by bit: a huffman symbol costs one of these
+# and used to cost eleven loop iterations, each with a divide and a modulo.
+# bytes past the end of the data read as zero.
+fn extract(data: Bytes, at: Int, n: Int) -> Int:
+    first := at / 8
+    shift := at % 8
+    need := (shift + n + 7) / 8
+    # the in-bounds span is one word read; the byte loop survives only for
+    # the tail, where bytes past the end must read as zero
+    if first + need <= data.len():
+        return bits.band(bits.shr(bytes.read_word(data, first, need), shift), bits.shl(1, n) - 1)
+    mut word := 0
+    mut k := need - 1
+    while k >= 0:
+        idx := first + k
+        mut b := 0
+        if idx < data.len():
+            b = data[idx]
+        word = bits.bor(bits.shl(word, 8), b)
+        k = k - 1
+    return bits.band(bits.shr(word, shift), bits.shl(1, n) - 1)
+
+# ---------------------------------------------------------------
+# backward reader
+# ---------------------------------------------------------------
+
+## a backward bitstream over data[start..end). `pos` is an absolute bit index
+## (bit i lives at byte i/8, lsb-first); reads move it down toward start*8.
+pub struct BackReader:
+    data: Bytes
+    start_bit: Int
+    pos: Int
+    ok: Bool
+    # a cached 64-bit window over the data, so a field read is a shift and a
+    # mask instead of a fresh multi-byte load. reads walk downward, so one
+    # window serves about fifty bits before it has to be refilled.
+    window: Int
+    window_base: Int
+
+## open the stream: find the sentinel in the last byte and stand just below
+## it. an all-zero final byte has no sentinel and marks the stream corrupt.
+pub fn back_reader(data: Bytes, start: Int, end: Int) -> BackReader:
+    if end <= start or end > data.len():
+        return BackReader(data, 0, 0, false, 0, WINDOW_UNSET)
+    last := data[end - 1]
+    if last == 0:
+        return BackReader(data, 0, 0, false, 0, WINDOW_UNSET)
+    mut top := 7
+    while bits.band(bits.shr(last, top), 1) == 0:
+        top = top - 1
+    return BackReader(data, start * 8, (end - 1) * 8 + top, true, 0, WINDOW_UNSET)
+
+impl BackReader:
+    ## how many readable bits remain.
+    fn remaining() -> Int:
+        return self.pos - self.start_bit
+
+    ## read `n` bits (0 to 32), moving down. reading past the start returns
+    ## the bits that exist padded with zeros below, which mirrors the
+    ## reference decoder's tolerance for the final state reads; callers that
+    ## must not over-read check remaining() first.
+    fn read(n: Int) -> Int:
+        if n == 0:
+            return 0
+        self.pos = self.pos - n
+        return self.at(self.pos, n)
+
+    # the bits at [at, at+n), with anything below the stream's start reading
+    # as zero — the tolerance the final state reads rely on.
+    fn at(at: Int, n: Int) -> Int:
+        if at >= self.start_bit:
+            if at < self.window_base or at + n > self.window_base + 64:
+                self.refill(at, n)
+            return bits.band(bits.shr(self.window, at - self.window_base), bits.shl(1, n) - 1)
+        available := at + n - self.start_bit
+        if available <= 0:
+            return 0
+        return bits.shl(extract(self.data, self.start_bit, available), self.start_bit - at)
+
+    # reload the window so [at, at+n) sits at its top, leaving the rest of
+    # the sixty-four bits below for the reads that follow.
+    fn refill(at: Int, n: Int):
+        mut byte_index := (at + n) / 8 - 7
+        if byte_index < 0:
+            byte_index = 0
+        self.window_base = byte_index * 8
+        # one word read when the window sits fully inside the data; the
+        # byte loop remains for the tail, whose missing bytes read as zero
+        if byte_index + 8 <= self.data.len():
+            self.window = bytes.read_word(self.data, byte_index, 8)
+            return
+        mut word := 0
+        mut k := 7
+        while k >= 0:
+            idx := byte_index + k
+            mut b := 0
+            if idx < self.data.len():
+                b = self.data[idx]
+            word = bits.bor(bits.shl(word, 8), b)
+            k = k - 1
+        self.window = word
+
+    ## look at the next `n` bits without consuming them. huffman decoding
+    ## needs this: it peeks a full table-log worth of bits to index the
+    ## table, then consumes only the code length the entry names.
+    fn peek(n: Int) -> Int:
+        if n == 0:
+            return 0
+        return self.at(self.pos - n, n)
+
+    ## consume `n` bits without decoding them.
+    fn skip(n: Int):
+        self.pos = self.pos - n
+
+# ---------------------------------------------------------------
+# forward reader (table descriptions)
+# ---------------------------------------------------------------
+
+## a forward lsb-first bitstream, for fse table descriptions.
+pub struct ForwardReader:
+    data: Bytes
+    limit_bit: Int
+    pos: Int
+
+## open a forward lsb-first reader over data[start..end).
+pub fn forward_reader(data: Bytes, start: Int, end: Int) -> ForwardReader:
+    return ForwardReader(data, end * 8, start * 8)
+
+impl ForwardReader:
+    fn remaining() -> Int:
+        return self.limit_bit - self.pos
+
+    ## bytes fully or partially consumed so far, relative to the stream start.
+    fn bytes_used(start: Int) -> Int:
+        return (self.pos - start * 8 + 7) / 8
+
+    fn read(n: Int) -> Int:
+        mut take := n
+        if self.pos + take > self.limit_bit:
+            take = self.limit_bit - self.pos
+        mut value := 0
+        if take > 0:
+            value = extract(self.data, self.pos, take)
+        self.pos = self.pos + n
+        return value
+
+    ## look at `n` bits without consuming them.
+    fn peek(n: Int) -> Int:
+        saved := self.pos
+        value := self.read(n)
+        self.pos = saved
+        return value
+
+    ## give back `n` bits.
+    fn unread(n: Int):
+        self.pos = self.pos - n
+
+    ## consume `n` bits without decoding them. the fse table description
+    ## peeks a wide field and then consumes only the width it turned out to
+    ## need, so peek/skip is its natural shape.
+    fn skip(n: Int):
+        self.pos = self.pos + n
+
+# ---------------------------------------------------------------
+# forward writer (table descriptions)
+# ---------------------------------------------------------------
+
+## packs bits lsb-first, forward — the mirror of ForwardReader, used to
+## build table descriptions the reader must accept.
+pub struct ForwardWriter:
+    out: List[Int]
+    acc: Int
+    nbits: Int
+
+## an empty forward writer.
+pub fn forward_writer() -> ForwardWriter:
+    return ForwardWriter([], 0, 0)
+
+impl ForwardWriter:
+    ## append the low `n` bits of `value`.
+    fn write(value: Int, n: Int):
+        self.acc = bits.bor(self.acc, bits.shl(bits.band(value, bits.shl(1, n) - 1), self.nbits))
+        self.nbits = self.nbits + n
+        while self.nbits >= 8:
+            self.out.push(bits.band(self.acc, 255))
+            self.acc = bits.shr(self.acc, 8)
+            self.nbits = self.nbits - 8
+
+    ## flush the partial byte and return the packed bytes.
+    fn finish() -> List[Int]:
+        if self.nbits > 0:
+            self.out.push(bits.band(self.acc, 255))
+            self.acc = 0
+            self.nbits = 0
+        return self.out
+
+# ---------------------------------------------------------------
+# backward writer
+# ---------------------------------------------------------------
+
+## builds a stream the BackReader (and any zstd decoder) reads correctly:
+## record values in the order the decoder will read them, and finish()
+## reverses, packs lsb-first, and adds the sentinel.
+pub struct BackWriter:
+    values: List[Int]
+    widths: List[Int]
+
+## an empty backward writer; record reads with write(), pack with finish().
+pub fn back_writer() -> BackWriter:
+    return BackWriter([], [])
+
+impl BackWriter:
+    ## record the next value the decoder will read (n up to 32 bits).
+    fn write(value: Int, n: Int):
+        self.values.push(value)
+        self.widths.push(n)
+
+    ## pack everything into bytes: last-recorded lands deepest, first-recorded
+    ## sits just under the sentinel, so a backward reader yields the recorded
+    ## order. returns the byte list.
+    fn finish() -> List[Int]:
+        mut out: List[Int] := []
+        mut acc := 0
+        mut nbits := 0
+        mut i := self.values.len() - 1
+        while i >= 0:
+            acc = bits.bor(acc, bits.shl(bits.band(self.values[i], bits.shl(1, self.widths[i]) - 1), nbits))
+            nbits = nbits + self.widths[i]
+            while nbits >= 8:
+                out.push(bits.band(acc, 255))
+                acc = bits.shr(acc, 8)
+                nbits = nbits - 8
+            i = i - 1
+        # sentinel: a 1 above the last real bit
+        acc = bits.bor(acc, bits.shl(1, nbits))
+        out.push(bits.band(acc, 255))
+        return out
+
+# ---------------------------------------------------------------
+# backward packer
+# ---------------------------------------------------------------
+
+## the same stream shape BackWriter produces, packed straight into a byte
+## buffer instead of recorded and reversed. BackWriter costs two list
+## pushes per bit-field and a second pass; the encoder emits one field per
+## huffman symbol and six per sequence, so that dominated it.
+##
+## the price is that the caller emits in REVERSE of the decoder's read
+## order — deepest field first — because that is the order the bytes are
+## laid down in. `back_writer` remains for callers that would rather
+## record forward and pay for it.
+pub struct BitPacker:
+    out: ByteBuffer
+    acc: Int
+    nbits: Int
+
+## a packer appending to `out`. everything already in the buffer is left
+## alone; the stream starts at the current end.
+pub fn bit_packer(out: ByteBuffer) -> BitPacker:
+    return BitPacker(out, 0, 0)
+
+impl BitPacker:
+    ## append the low `n` bits of `value` (n up to 32), deepest field first.
+    fn push(value: Int, n: Int):
+        self.acc = bits.bor(self.acc, bits.shl(bits.band(value, bits.shl(1, n) - 1), self.nbits))
+        self.nbits = self.nbits + n
+        # flush four bytes at a time rather than one: a field is at most
+        # thirty-two bits, so the accumulator holds sixty-three worst case
+        # and one extern call covers four bytes of output
+        if self.nbits >= 32:
+            self.out.write_word(bits.band(self.acc, 4294967295), 4)
+            self.acc = bits.shr(self.acc, 32)
+            self.nbits = self.nbits - 32
+
+    ## close the stream: the sentinel 1 above the last real bit, then the
+    ## bytes still held in the accumulator. after this every byte of the
+    ## stream is in the buffer.
+    fn finish():
+        acc := bits.bor(self.acc, bits.shl(1, self.nbits))
+        self.out.write_word(acc, (self.nbits + 8) / 8)
+        self.acc = 0
+        self.nbits = 0
+
+test "the backward reader walks a hand-packed stream":
+    # bits (top to bottom): 5 (3 bits), 2 (2 bits), 9 (4 bits) → written
+    # reversed and sentineled by the writer, then read back in order.
+    w := back_writer()
+    w.write(5, 3)
+    w.write(2, 2)
+    w.write(9, 4)
+    packed := w.finish()
+    mut buf := bytes.buffer()
+    for b in packed:
+        buf.write_byte(b)
+    data := buf.take_bytes()
+    r := back_reader(data, 0, data.len())
+    assert(r.ok)
+    assert_eq(r.read(3), 5)
+    assert_eq(r.read(2), 2)
+    assert_eq(r.read(4), 9)
+    assert_eq(r.remaining(), 0)
+
+test "the forward reader is plain lsb-first":
+    mut buf := bytes.buffer()
+    buf.write_byte(0b10110100)
+    buf.write_byte(0b00000001)
+    data := buf.take_bytes()
+    r := forward_reader(data, 0, 2)
+    assert_eq(r.read(4), 4)
+    assert_eq(r.read(4), 11)
+    assert_eq(r.read(1), 1)
+    assert_eq(r.peek(2), 0)
+    assert_eq(r.remaining(), 7)
+
+test "the packer and the writer agree byte for byte":
+    # a varied field sequence: widths from zero to thirty-two, values that
+    # exercise every accumulator flush boundary, and a length that leaves a
+    # partial byte. the packer takes the same fields in reverse.
+    mut values: List[Int] := []
+    mut widths: List[Int] := []
+    mut i := 0
+    while i < 400:
+        n := i % 33
+        widths.push(n)
+        mut v := 0
+        if n > 0:
+            v = bits.band(i * 2654435761 + i / 7, bits.shl(1, n) - 1)
+        values.push(v)
+        i = i + 1
+
+    w := back_writer()
+    mut k := 0
+    while k < values.len():
+        w.write(values[k], widths[k])
+        k = k + 1
+    mut recorded := bytes.buffer()
+    for b in w.finish():
+        recorded.write_byte(b)
+
+    mut packed := bytes.buffer()
+    p := bit_packer(packed)
+    k = values.len() - 1
+    while k >= 0:
+        p.push(values[k], widths[k])
+        k = k - 1
+    p.finish()
+    assert_eq(packed.bytes(), recorded.bytes())
+
+    # and the stream still reads back in the recorded order
+    data := packed.take_bytes()
+    r := back_reader(data, 0, data.len())
+    assert(r.ok)
+    k = 0
+    while k < values.len():
+        assert_eq(r.read(widths[k]), values[k])
+        k = k + 1
+    assert_eq(r.remaining(), 0)
+
+test "an all-zero final byte is corrupt, not a stream":
+    mut buf := bytes.buffer()
+    buf.write_byte(7)
+    buf.write_byte(0)
+    data := buf.take_bytes()
+    assert(not back_reader(data, 0, 2).ok)

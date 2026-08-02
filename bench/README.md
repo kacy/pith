@@ -508,5 +508,5 @@ make zstd-pure-bench
 
 Current standing and the optimization history live in
 `docs/performance.md`. The decoder has been through three optimization
-passes; the encoder has had none, and its numbers should be read as a
-correctness baseline rather than a target.
+passes and the encoder one, so the encode column still has the more
+obvious headroom — the match finder is now its largest cost.

@@ -565,29 +565,42 @@ the encoder side exists too, pure pith end to end: stored, huffman, and
 full sequence blocks with repeat offsets, verified shape by shape against
 the system zstd binary (`make zstd-encode-check` — the system binary must
 decode every pith-compressed frame byte-identical, because a round trip
-through our own decoder proved nothing twice on this code). it has had no
-optimization pass at all, and both columns show it:
+through our own decoder proved nothing twice on this code). one
+optimization pass in, it stands here:
 
 | corpus | encode mb/s | vs kernel | size vs kernel |
 |---|---|---|---|
-| text 8kb | 3 | 40x | 115% |
-| prose 284kb | 4 | 33x | 139% |
-| source 585kb | 6 | 36x | 140% |
-| json 500kb | 11 | 52x | 188% |
-| rle runs 78kb | 48 | 65x | 137% |
+| text 8kb | 3 → **8** | 17x | 115% → **101%** |
+| prose 284kb | 4 → **15** | 9x | 139% → **106%** |
+| source 585kb | 6 → **20** | 12x | 140% → **107%** |
+| json 500kb | 11 → **26** | 22x | 188% → **119%** |
+| rle runs 78kb | 48 → **51** | 69x | 137% |
 
-so: 30-65x slower than the reference encoder, producing frames 15-88%
-larger. the size gap is widest on json logs, where the reference codec's
-custom fse tables pay most and we still emit the predefined ones; the
-throughput gap is mostly the backward bitstream writer, which pushes each
-field onto a list and reverses at the end, plus a hash per input position.
-the levers in rough order: custom fse table descriptions for the three
-sequence streams, lazy matching, and a word-accumulating backward writer.
+both columns moved together; neither was traded for the other. the size
+win is mostly per-block fse tables — all three sequence streams used to
+emit the predefined distributions, which cost most on data whose
+histogram looks nothing like them, and json logs were the worst case at
+1.88x. the encoder now histograms what a block actually uses and sends a
+table description only when the estimated bits beat predefined by more
+than the description costs; the finder also prefers the previous offset
+(a repeat code is cheaper than an offset's magnitude) and holds a match
+until the next position has been checked for a longer one.
 
-worth stating plainly because the decoder numbers above are good: those
-took three passes to earn, and the encoder has had none. its guarantee
-today is correctness — nine shapes plus a sixty-shape seeded differential
-run, all read back byte-identical by the system binary — not speed.
+the speed win is mostly writing bits forward instead of recording them.
+the backward bitstream writer pushed every field as a value and a width
+onto two lists and packed on a second pass; a packer flushing four bytes
+at a time into the buffer runs that loop once. that plus removing
+per-sequence scratch allocations moved the profile's largest cost from
+handle-registry hashing (23%) to the match finder (31%) — which is now
+where the next pass would start.
+
+the remaining size gap is not cheaper sequences but fewer of them: json
+spends 51,710 bytes on 19,134 sequences against only 3,986 bytes of
+literals, so a hash chain with several candidates per bucket is the
+untried lever. repeat mode for sequence tables is also unimplemented —
+later blocks re-send descriptions nearly identical to the previous
+block's, worth a few hundred bytes per multi-block frame at no
+throughput cost.
 
 `bench/cyclic_graph` — struct nodes wired into reference cycles
 (parent<->child) and dropped, 2m of them. refcounting alone cannot

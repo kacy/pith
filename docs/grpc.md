@@ -308,6 +308,68 @@ what arrived, or bytes that were never framed at all — fails
 `INVALID_ARGUMENT` rather than decoding as an all-default message. a unary
 request carrying more than one message fails the same way.
 
+## interceptors
+
+an interceptor wraps the dispatch the way a `std.web` middleware wraps a route
+handler. it takes the rest of the chain plus the call, so it can run code
+before or after, or answer the call itself and never reach the dispatch:
+
+```pith
+fn log_calls(next: fn(String, Bytes) -> Bytes!grpc.GrpcError, path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    print(path)
+    return next(path, request)
+
+guarded := grpc.intercept(serve_Chat, [grpc.authorize(check_token), log_calls])
+grpc.serve("0.0.0.0", 50051, guarded)!
+```
+
+`intercept` returns a dispatch, so it drops into `serve`, `serve_tls`, or any
+other serve form without changing a signature — a generated `serve_<Svc>` router
+and a hand-written dispatch both compose the same way. the first interceptor in
+the list runs outermost, seeing the call first and the reply last.
+
+three come ready made:
+
+- `grpc.authorize(verify)` runs `verify` against the caller's metadata before
+  any method body, and answers `UNAUTHENTICATED` when it returns false. this is
+  the transport-level auth hook: one interceptor covers every rpc the server
+  exposes. `grpc.bearer_token(metadata)` pulls the token out of an
+  `authorization` header (matching the scheme case-insensitively, as rfc 7235
+  requires), so verifying a jwt is a one-liner against `std.crypto.jwt`.
+- `grpc.rate_limit(limiter)` spends a token per call and answers
+  `RESOURCE_EXHAUSTED` when the bucket is dry.
+- `grpc.circuit(breaker)` opens on repeated *server* faults — `INTERNAL`,
+  `UNAVAILABLE`, `DATA_LOSS`, an expired deadline — and answers `UNAVAILABLE`
+  while open. a caller's own error (`NOT_FOUND`, an invalid argument, a refused
+  credential) does not count against it: a client sending bad requests is not a
+  reason to stop serving good ones.
+
+the last two take the same `std.resilience` `Limiter` and `Breaker` that
+`web.rate_limit` and `web.circuit` take, so one limiter can cap an http surface
+and a grpc surface together.
+
+`examples/grpc_interceptors.pith` runs the whole shape end to end — a service
+that knows nothing about auth or rate limiting, guarded by both, called by a
+client that presents its credential once.
+
+writing your own: an interceptor that refuses a call returns
+`grpc.refuse(status, message)` rather than failing directly, because a pith
+lambda can neither `fail` nor use `!`. return `next(path, request)` to pass the
+call along.
+
+on the client, a credential belongs on the channel rather than on every call
+site:
+
+```pith
+conn := grpc.dial_h2c("localhost", 50051)!
+conn.set_credentials(["authorization", "Bearer " + token])
+reply := conn.unary("/chat.Chat/Send", req)!     # carries the credential
+```
+
+per-call metadata still works through the `*_with_headers` forms and is appended
+after the channel's, so a call can add to the credentials but not silently drop
+them.
+
 ## what isn't here yet
 
 - **generated streaming is server-side.** the generated *client* still collects
@@ -322,4 +384,9 @@ request carrying more than one message fails the same way.
   are enforced at the edges (client timeout, server expiry-on-arrival), not by
   cancelling a handler mid-flight.
 - **observability**: the client opens a trace span and records red metrics per
-  call automatically; the server side is your code, so instrument it yourself.
+  call automatically. the server side is your code — an interceptor is the
+  place to put it, since it sees every method.
+- **interceptors are server-side and unary.** the client has channel-wide
+  credentials but no interceptor chain of its own, and a server interceptor
+  wraps the unary dispatch; the streaming serve forms take their own dispatch
+  shapes and are not wrapped by `intercept`.

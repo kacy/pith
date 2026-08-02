@@ -129,8 +129,42 @@ pub fn status_name(status: Int) -> String:
 pub struct Conn:
     client: http2.Client
     authority: String
+    # metadata sent on every call over this channel — credentials, usually.
+    # set_credentials fills it; empty means the channel adds nothing.
+    credentials: List[String]
+
+# an empty credential list, typed for the Conn field.
+fn no_credentials() -> List[String]:
+    out: List[String] := []
+    return out
 
 impl Conn:
+    ## send `metadata` — flat key, value, key, value — on every call over this
+    ## channel, so a credential is attached once at dial instead of threaded
+    ## through every call site:
+    ##
+    ##   conn := grpc.dial_h2c("localhost", 50051)!
+    ##   conn.set_credentials(["authorization", "Bearer " + token])
+    ##
+    ## this mutates the channel rather than returning a configured copy: two
+    ## Conn values sharing one http/2 client would each close it. per-call
+    ## metadata still goes through the *_with_headers forms, and is appended
+    ## after these, so a call can add to them but not silently drop them.
+    pub fn set_credentials(metadata: List[String]):
+        self.credentials = metadata
+
+    # this channel's credentials followed by `extra`, which is what every call
+    # actually sends.
+    fn call_metadata(extra: List[String]) -> List[String]:
+        if self.credentials.len() == 0:
+            return extra
+        mut out: List[String] := []
+        for item in self.credentials:
+            out.push(item)
+        for item in extra:
+            out.push(item)
+        return out
+
     # run a unary rpc over this channel. `full_method` is "/package.Service/Method"
     # and `request` is the serialized protobuf request message; the returned bytes
     # are the serialized response message. fails with a GrpcError on a non-OK
@@ -178,7 +212,7 @@ impl Conn:
     pub fn unary_with_headers_and_deadline(full_method: String, request: Bytes, extra_headers: List[String], timeout_ms: Int) -> Bytes!GrpcError:
         if not trace.is_active():
             framed := frame_message(request)
-            fields := with_timeout_header(with_metadata(grpc_headers(), extra_headers), timeout_ms)
+            fields := with_timeout_header(with_metadata(grpc_headers(), self.call_metadata(extra_headers)), timeout_ms)
             resp := self.client.request_with_timeout("POST", self.authority, full_method, fields, framed, timeout_ms)
             if resp.is_err:
                 fail transport_error(resp.err)
@@ -189,7 +223,7 @@ impl Conn:
         span.set_attr("rpc.system", "grpc").set_attr("rpc.method", full_method)
         framed := frame_message(request)
         started := time.mono_nanos()
-        fields := with_timeout_header(with_metadata(headers_with_traceparent(span.context()), extra_headers), timeout_ms)
+        fields := with_timeout_header(with_metadata(headers_with_traceparent(span.context()), self.call_metadata(extra_headers)), timeout_ms)
         resp := self.client.request_with_timeout("POST", self.authority, full_method, fields, framed, timeout_ms)
         if resp.is_err:
             err := transport_error(resp.err)
@@ -211,7 +245,7 @@ impl Conn:
 # close() it when done.
 pub fn dial(host: String, port: Int) -> Conn!:
     client := http2.open(host, port)!
-    return Conn(client: client, authority: host)
+    return Conn(client: client, authority: host, credentials: no_credentials())
 
 # dial a grpc server using the caller's tls `config` (which must offer alpn
 # "h2") — for example one built with tls.client_config_with_ca_file to trust a
@@ -219,14 +253,14 @@ pub fn dial(host: String, port: Int) -> Conn!:
 # like dial.
 pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
     client := http2.open_with_config(host, port, config)!
-    return Conn(client: client, authority: host)
+    return Conn(client: client, authority: host, credentials: no_credentials())
 
 # dial a grpc server over plaintext http/2 (h2c) — no tls. matches a server
 # started with grpc.serve. use this for local or trusted-network endpoints; for
 # anything public, dial over tls. otherwise like dial.
 pub fn dial_h2c(host: String, port: Int) -> Conn!:
     client := http2.open_h2c(host, port)!
-    return Conn(client: client, authority: host)
+    return Conn(client: client, authority: host, credentials: no_credentials())
 
 # make a one-shot unary call: dial host:port, run the method, and close. this is
 # the simplest entry point; for several calls over one connection, dial() a
@@ -1294,6 +1328,139 @@ fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
     framed := frame_message(result.ok)
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(framed).with_trailers(grpc_ok_trailers())
 
+# --- interceptors -------------------------------------------------------------
+#
+# an interceptor wraps a dispatch the way a std.web middleware wraps a route
+# handler: it takes the rest of the chain (`next`) plus the call, so it can run
+# code before or after it, or answer the call itself without invoking next at
+# all. compose them with intercept() and hand the result to any serve form —
+# the dispatch signature does not change, so a generated <Svc> router or a
+# hand-written dispatch both drop straight in.
+#
+#   fn log_calls(next: fn(String, Bytes) -> Bytes!grpc.GrpcError, path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+#       print(path)
+#       return next(path, request)
+#
+#   guarded := grpc.intercept(serve_Chat, [grpc.authorize(check_token), log_calls])
+#   grpc.serve("0.0.0.0", 50051, guarded)!
+#
+# the first interceptor in the list runs outermost, so it sees the call first
+# and the reply last — the ordering std.web's use_mw promises.
+#
+# an interceptor that refuses a call returns refuse(status, message) instead of
+# failing directly: a pith lambda can neither `fail` nor use `!`, so the refusal
+# is built by a named helper and returned as a value. the ready-made
+# interceptors below are shaped that way for the same reason.
+
+## the refusal an interceptor returns instead of calling next: a failed result
+## carrying `status` and `message`, which the server sends back as the call's
+## grpc-status and grpc-message.
+##
+##   if not limiter.allow():
+##       return grpc.refuse(grpc.GRPC_RESOURCE_EXHAUSTED, "rate limited")
+pub fn refuse(status: Int, message: String) -> Bytes!GrpcError:
+    fail GrpcError(status, message)
+
+# the pieces the chain runner walks. bundling them in a struct lets the `next`
+# closure below capture one struct value and an index rather than the bare
+# interceptor and dispatch fn-values — the same reason std.web's Chain exists.
+struct Chain:
+    interceptors: List[fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError]
+    dispatch: fn(String, Bytes) -> Bytes!GrpcError
+
+# run the onion from `index` inward: call interceptors[index] with a `next` that
+# recurses one level deeper, and when we run past the end, call the dispatch.
+# the `next` lambda only forwards the result — it never unwraps one — because a
+# lambda cannot use `!`.
+fn run_chain(chain: Chain, index: Int, path: String, request: Bytes) -> Bytes!GrpcError:
+    if index >= chain.interceptors.len():
+        return chain.dispatch(path, request)!
+    interceptor := chain.interceptors[index]
+    next := fn(p: String, r: Bytes) => run_chain(chain, index + 1, p, r)
+    return interceptor(next, path, request)!
+
+## wrap `dispatch` in `interceptors` and return the composed dispatch. the
+## first interceptor in the list runs outermost. an empty list returns a
+## dispatch that behaves exactly like the one passed in.
+pub fn intercept(dispatch: fn(String, Bytes) -> Bytes!GrpcError, interceptors: List[fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError]) -> fn(String, Bytes) -> Bytes!GrpcError:
+    chain := Chain(interceptors, dispatch)
+    return fn(path: String, request: Bytes) => run_chain(chain, 0, path, request)
+
+# what authorize() carries: capturing the verifier inside a struct rather than
+# as a bare fn-value keeps the closure on the shape the compiler handles.
+struct Authorizer:
+    verify: fn(Map[String, String]) -> Bool
+
+## an interceptor that authorizes every call from its metadata. `verify` gets
+## the caller's metadata — the headers the client attached, minus the ones grpc
+## and the transport own — and returns whether the call may proceed; a refusal
+## is UNAUTHENTICATED and never reaches the dispatch.
+##
+## this is the transport-level hook: it runs before any method body, so one
+## interceptor covers every rpc a server exposes.
+##
+##   fn check_token(md: Map[String, String]) -> Bool:
+##       return jwt.verify_hs256(grpc.bearer_token(md), SECRET).is_ok
+##
+##   grpc.serve(host, port, grpc.intercept(serve_Chat, [grpc.authorize(check_token)]))!
+pub fn authorize(verify: fn(Map[String, String]) -> Bool) -> fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError:
+    guard := Authorizer(verify)
+    return fn(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes):
+        if not guard.verify(incoming_metadata()):
+            return refuse(GRPC_UNAUTHENTICATED, "unauthenticated")
+        return next(path, request)
+
+## the bearer token in `metadata`, or "" when the authorization entry is absent
+## or is not a bearer credential. the scheme is matched case-insensitively, as
+## rfc 7235 requires; the token itself is returned untouched.
+pub fn bearer_token(metadata: Map[String, String]) -> String:
+    value := metadata.get("authorization").unwrap_or("")
+    if value.len() < 7:
+        return ""
+    if value.substring(0, 7).to_lower() != "bearer ":
+        return ""
+    return value.substring(7, value.len())
+
+## an interceptor that spends one token from `limiter` per call and answers
+## RESOURCE_EXHAUSTED when the bucket is empty. build one limiter and share it:
+## every serving task drains the same bucket, so the cap holds for the whole
+## server no matter how many connections are open. the same limiter can guard
+## an http surface through web.rate_limit.
+##
+##   limiter := resilience.rate_limiter(100, 20)
+##   grpc.serve(host, port, grpc.intercept(serve_Chat, [grpc.rate_limit(limiter)]))!
+pub fn rate_limit(limiter: resilience.Limiter) -> fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError:
+    return fn(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes):
+        if not limiter.allow():
+            return refuse(GRPC_RESOURCE_EXHAUSTED, "rate limited")
+        return next(path, request)
+
+## an interceptor that runs calls through a circuit breaker. a dispatch failure
+## that is the server's own fault — INTERNAL, UNAVAILABLE, DATA_LOSS, or an
+## expired deadline — trips the breaker; a caller's fault (NOT_FOUND, an invalid
+## argument, a refused credential) does not, because a client sending bad
+## requests is not a reason to stop serving good ones. while the circuit is
+## open, callers get UNAVAILABLE immediately instead of waiting on a dependency
+## that is already drowning.
+##
+##   breaker := resilience.circuit_breaker(5, 10_000)
+##   grpc.serve(host, port, grpc.intercept(serve_Chat, [grpc.circuit(breaker)]))!
+pub fn circuit(breaker: resilience.Breaker) -> fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError:
+    return fn(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes):
+        if not breaker.allow():
+            return refuse(GRPC_UNAVAILABLE, "circuit open")
+        result := next(path, request)
+        if result.is_err and server_fault(result.err.status):
+            breaker.failure()
+        else:
+            breaker.success()
+        return result
+
+## whether `status` names a failure the server is responsible for, and so one
+## worth counting against a circuit breaker. a caller's own error is not.
+pub fn server_fault(status: Int) -> Bool:
+    return status == GRPC_INTERNAL or status == GRPC_UNAVAILABLE or status == GRPC_DATA_LOSS or status == GRPC_DEADLINE_EXCEEDED
+
 # serve grpc over plaintext http/2 (h2c). blocks, accepting connections. the
 # `dispatch` maps a full method path (/pkg.Service/Method) and the request
 # message bytes to the response message bytes, or a GrpcError.
@@ -1603,3 +1770,103 @@ test "only the transient status codes are retryable":
     assert(not retryable_code(GRPC_DEADLINE_EXCEEDED))
     assert(not retryable_code(GRPC_INVALID_ARGUMENT))
     assert(not retryable_code(GRPC_UNAUTHENTICATED))
+
+# --- interceptor tests --------------------------------------------------------
+#
+# the dispatches and interceptors these use are module-level functions because
+# a test block cannot declare one; they exist only for the tests below.
+
+fn echo_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
+    if path == "/x.T/Boom":
+        fail GrpcError(GRPC_INTERNAL, "boom")
+    if path == "/x.T/BadArg":
+        fail GrpcError(GRPC_INVALID_ARGUMENT, "bad argument")
+    return request
+
+fn tag_a(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes) -> Bytes!GrpcError:
+    inner := next(path, request)!
+    return bytes.from_string_utf8("a(" + (inner.to_string_utf8() catch "") + ")")
+
+fn tag_b(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes) -> Bytes!GrpcError:
+    inner := next(path, request)!
+    return bytes.from_string_utf8("b(" + (inner.to_string_utf8() catch "") + ")")
+
+fn deny_all(next: fn(String, Bytes) -> Bytes!GrpcError, path: String, request: Bytes) -> Bytes!GrpcError:
+    return refuse(GRPC_PERMISSION_DENIED, "nope")
+
+test "an empty interceptor list leaves the dispatch alone":
+    empty: List[fn(fn(String, Bytes) -> Bytes!GrpcError, String, Bytes) -> Bytes!GrpcError] := []
+    guarded := intercept(echo_dispatch, empty)
+    reply := guarded("/x.T/Echo", bytes.from_string_utf8("hi"))!
+    assert_eq(reply.to_string_utf8()!, "hi")
+
+test "the first interceptor registered runs outermost":
+    guarded := intercept(echo_dispatch, [tag_a, tag_b])
+    reply := guarded("/x.T/Echo", bytes.from_string_utf8("core"))!
+    # a wraps b wraps the dispatch, so a's mark is on the outside
+    assert_eq(reply.to_string_utf8()!, "a(b(core))")
+
+test "an interceptor can refuse a call without reaching the dispatch":
+    guarded := intercept(echo_dispatch, [deny_all, tag_b])
+    result := guarded("/x.T/Echo", bytes.from_string_utf8("hi"))
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_PERMISSION_DENIED)
+    # tag_b never ran, so nothing wrapped the reply
+    assert_eq(result.err.message, "nope")
+
+test "a dispatch error propagates out through the interceptors":
+    guarded := intercept(echo_dispatch, [tag_a])
+    result := guarded("/x.T/Boom", bytes.empty())
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_INTERNAL)
+
+test "the rate limit interceptor answers RESOURCE_EXHAUSTED when the bucket is dry":
+    limiter := resilience.rate_limiter(60, 2)
+    guarded := intercept(echo_dispatch, [rate_limit(limiter)])
+    assert(guarded("/x.T/Echo", bytes.empty()).is_ok)
+    assert(guarded("/x.T/Echo", bytes.empty()).is_ok)
+    refused := guarded("/x.T/Echo", bytes.empty())
+    assert(refused.is_err)
+    assert_eq(refused.err.status, GRPC_RESOURCE_EXHAUSTED)
+
+test "the circuit counts server faults and ignores caller faults":
+    breaker := resilience.circuit_breaker(2, 60_000)
+    guarded := intercept(echo_dispatch, [circuit(breaker)])
+    # a caller's own error must not trip the breaker, however often it repeats
+    mut i := 0
+    while i < 5:
+        assert(guarded("/x.T/BadArg", bytes.empty()).is_err)
+        i = i + 1
+    assert(guarded("/x.T/Echo", bytes.empty()).is_ok)
+    # two server faults reach the threshold and open the circuit
+    assert(guarded("/x.T/Boom", bytes.empty()).is_err)
+    assert(guarded("/x.T/Boom", bytes.empty()).is_err)
+    open := guarded("/x.T/Echo", bytes.empty())
+    assert(open.is_err)
+    assert_eq(open.err.status, GRPC_UNAVAILABLE)
+
+test "only the server's own failures count against a circuit":
+    assert(server_fault(GRPC_INTERNAL))
+    assert(server_fault(GRPC_UNAVAILABLE))
+    assert(server_fault(GRPC_DATA_LOSS))
+    assert(server_fault(GRPC_DEADLINE_EXCEEDED))
+    assert(not server_fault(GRPC_INVALID_ARGUMENT))
+    assert(not server_fault(GRPC_NOT_FOUND))
+    assert(not server_fault(GRPC_UNAUTHENTICATED))
+    assert(not server_fault(GRPC_OK))
+
+test "the bearer token is read case-insensitively, or not at all":
+    mut md: Map[String, String] := {}
+    md.insert("authorization", "Bearer abc.def")
+    assert_eq(bearer_token(md), "abc.def")
+    # rfc 7235 makes the scheme case-insensitive
+    md.insert("authorization", "bEaReR xyz")
+    assert_eq(bearer_token(md), "xyz")
+    # another scheme is not a bearer credential
+    md.insert("authorization", "Basic dXNlcjpwdw==")
+    assert_eq(bearer_token(md), "")
+    # and neither is a truncated header or none at all
+    md.insert("authorization", "Bear")
+    assert_eq(bearer_token(md), "")
+    mut none_set: Map[String, String] := {}
+    assert_eq(bearer_token(none_set), "")

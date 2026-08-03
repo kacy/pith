@@ -1,11 +1,24 @@
 # std.sql — the database abstraction shared across drivers.
 #
 # pith dispatches statically, so there is no runtime driver registry like Go's
-# database/sql. instead each driver (std.sql.sqlite, std.sql.postgres, ...)
-# ships concrete `open` / connection / rows types that implement the interfaces
-# below, and the shared `Value` / `Row` types unify results across all of them.
-# generic code binds on the interfaces to stay driver-agnostic; a result set is
-# an iterator, so `for row in rows:` and `to_list(rows)` work everywhere.
+# database/sql. instead each driver ships concrete `open` / connection / rows
+# types that implement the interfaces below, and the shared `Value` / `Row`
+# types unify results across all of them. generic code binds on the interfaces
+# to stay driver-agnostic; a result set is an iterator, so `for row in rows:`
+# and `to_list(rows)` work everywhere.
+#
+# the drivers live one level up from this module, not under it, in two layers:
+#
+#   std.postgres, std.mysql        the wire-protocol clients. connect with
+#                                  host/port/user/password/database and hold
+#                                  the connection yourself.
+#   std.db.postgres, std.db.mysql  pooled and opinionated, the way std.web sits
+#                                  above std.net.http: open a pool from a url
+#                                  and every query borrows a connection and
+#                                  returns it, so green tasks can share one.
+#
+# reach for std.db unless you need the raw connection; see std.db for the whole
+# high-level surface.
 
 import std.bytes as bytes
 

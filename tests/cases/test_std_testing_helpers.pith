@@ -1,5 +1,6 @@
 from std.testing import assert_eq, assert_ne, assert_true, assert_false
 from std.testing import assert_contains, done
+from std.testing import check, assert_err_contains, text_difference
 
 fn main():
     assert_eq(1 + 1, 2)
@@ -10,4 +11,15 @@ fn main():
     assert_contains("hello pith", "pith")
     assert_eq(false, true)
     assert_ne("same", "same")
+
+    # a labelled comparison names the case, which is what makes a table of
+    # vectors worth writing: a failure says which row, not just which assertion
+    check("a.example", "a.example", "host from vector 1")
+    check(8080, 8080, "port from vector 1")
+
+    # a failure carries the reason it failed, not merely that it failed
+    assert_err_contains("missing string field: host", "host")
+
+    # a text mismatch says where the two diverge
+    print("  diff: " + text_difference("abcdef", "abcXef"))
     done()

@@ -1,5 +1,12 @@
 # std.testing — lightweight testing helpers
 #
+# these belong in a `main()` that ends with done(), which prints the tally.
+# they are NOT the assertions a colocated `test "..."` block uses: those are
+# built in, and the two keep separate counts. calling testing.check inside a
+# test block records into this module's tally, which that block never prints,
+# so the assertion silently stops counting. use the built-in assert/assert_eq
+# inside test blocks, and these in a test script.
+#
 #   from std.testing import assert_eq, assert_ne, check_true, check_not, done
 #
 #   fn main():
@@ -67,20 +74,15 @@ pub fn assert_ne[T](left: T, right: T):
         record_fail("assert_ne", "values should differ: {left}")
 
 # two integers are equal
-pub fn check(got: Int, want: Int, name: String):
-    if got != want:
-        detail := "got " + got.to_string() + ", want " + want.to_string()
-        record_fail(name, detail)
+pub fn check[T](got: T, want: T, name: String):
+    if got == want:
+        record_pass(name)
         return
-    record_pass(name)
+    record_fail(name, "got {got}, want {want}")
 
 # two strings are equal
 pub fn check_str(got: String, want: String, name: String):
-    if got != want:
-        detail := "got " + chr(34) + got + chr(34) + ", want " + chr(34) + want + chr(34)
-        record_fail(name, detail)
-        return
-    record_pass(name)
+    check(got, want, name)
 
 # two integers differ
 pub fn check_ne(a: Int, b: Int, name: String):
@@ -128,8 +130,47 @@ pub fn assert_contains(text: String, part: String):
 pub fn assert_eq_text(got: String, want: String):
     if got == want:
         record_pass("assert_eq_text")
-    else:
-        record_fail("assert_eq_text", "got " + got.len().to_string() + " chars, want " + want.len().to_string() + " chars")
+        return
+    record_fail("assert_eq_text", text_difference(got, want))
+
+## assert that a failure carried the reason it was supposed to. pass the
+## error's message — `r.err` for a String error, `r.err.message` for a struct
+## one — and the text it should mention.
+##
+##   r := jwt.verify_hs256(tampered, key, options)
+##   assert(r.is_err)
+##   assert_err_contains(r.err, "signature")
+##
+## a negative test written as `assert(r.is_err)` alone passes just as happily
+## when the call fails for a reason nobody intended — a malformed fixture, a
+## renamed field, a check that ran before the one under test. naming the reason
+## is what makes it a test of the rejection rather than of any failure at all.
+pub fn assert_err_contains(message: String, part: String):
+    if message.contains(part):
+        record_pass("assert_err_contains")
+        return
+    record_fail("assert_err_contains", "error said " + chr(34) + message + chr(34) + ", expected it to mention " + chr(34) + part + chr(34))
+
+## where two strings first differ, with a little of each side for context.
+## reporting the two lengths — which is what this used to do — tells you
+## nothing about a mismatch four hundred characters in.
+pub fn text_difference(got: String, want: String) -> String:
+    mut i := 0
+    mut limit := got.len()
+    if want.len() < limit:
+        limit = want.len()
+    while i < limit and got[i] == want[i]:
+        i = i + 1
+    if i == limit:
+        return "identical for {limit} chars, then got {got.len()} chars total, want {want.len()}"
+    return "first differ at char {i}: got " + chr(34) + window(got, i) + chr(34) + ", want " + chr(34) + window(want, i) + chr(34)
+
+# up to sixteen characters of `text` from `at`, so a report stays readable.
+fn window(text: String, at: Int) -> String:
+    mut end := at + 16
+    if end > text.len():
+        end = text.len()
+    return text.substring(at, end)
 
 # assert that a file exists.
 pub fn assert_file_exists(path: String):

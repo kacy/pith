@@ -579,6 +579,36 @@ test "es256 verifies the rfc 7515 appendix a.3 vector":
     assert(verified.claims.contains("\"iss\":\"joe\""))
     assert(verify_es256(RFC7515_A3_TOKEN, public_key.slice(0, 64), rfc7515_options()).is_err)
 
+# the hmac tokens below were produced by this module and their signatures then
+# recomputed with `openssl dgst -sha{256,384,512} -mac HMAC` over the same
+# signing input, byte for byte. round-tripping a token through sign and verify
+# only shows the two halves agree; these pin the wire bytes to an outside
+# implementation, so a wrong digest size or a mis-assembled signing input shows
+# up here rather than at the first peer that tries to read our tokens.
+fn kat_key() -> Bytes:
+    return bytes.from_string_utf8("0123456789abcdef0123456789abcdef")
+
+KAT_CLAIMS := "{{\"sub\":\"kat\"}}"
+KAT_HS256 := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJrYXQifQ.TdikTdA4cf8r6S5LDLyiugmsKqcZkLn6ePLZyNYPDCU"
+KAT_HS384 := "eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJrYXQifQ.lbOrPsFeD0dpY5nDtn4k4akX7XohXae_jdMQBItZTMmvpr1ufmFeufn1gc4K3PUR"
+KAT_HS512 := "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJrYXQifQ.Tcp333ML1hlsZf5_P4dvS867sPbzslvrPESzzG_AoprMOO4zYYZ8cgiXXKP8zATYG68ACGL0LVL4QpQendCJ6w"
+
+test "hmac signatures match an outside implementation byte for byte":
+    assert_eq(sign_hs256(KAT_CLAIMS, kat_key())!, KAT_HS256)
+    assert_eq(sign_hs384(KAT_CLAIMS, kat_key())!, KAT_HS384)
+    assert_eq(sign_hs512(KAT_CLAIMS, kat_key())!, KAT_HS512)
+
+test "the hmac known-answer tokens verify, and only at their own size":
+    options := without_time_checks(default_options())
+    assert(verify_hs256(KAT_HS256, kat_key(), options).is_ok)
+    assert(verify_hs384(KAT_HS384, kat_key(), options).is_ok)
+    assert(verify_hs512(KAT_HS512, kat_key(), options).is_ok)
+    # a verifier must not accept a token signed at a different digest size,
+    # which is the confusion these three exist next to each other to rule out
+    assert(verify_hs256(KAT_HS384, kat_key(), options).is_err)
+    assert(verify_hs384(KAT_HS512, kat_key(), options).is_err)
+    assert(verify_hs512(KAT_HS256, kat_key(), options).is_err)
+
 test "hmac tokens round trip at every digest size":
     claims := "{{\"sub\":\"u-1\",\"iss\":\"pith\"}}"
     options := without_time_checks(default_options())

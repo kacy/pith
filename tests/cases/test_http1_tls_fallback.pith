@@ -47,15 +47,13 @@ fn serve_one(conn: tls.Conn) -> Int:
         conn.close()
     return 0
 
-# accept exactly one connection and serve it to completion.
-fn run_server(port: Int) -> Int!:
-    config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
-    listener := tls.listen("127.0.0.1", port, config)!
+# accept exactly one connection and serve it to completion. the listener is bound
+# by the caller, not here — see main.
+fn run_server(listener: tls.Listener) -> Int!:
     conn := listener.accept()!
     task := spawn serve_one(conn)
     await task
     listener.close()
-    config.close()
     return 0
 
 # send one raw http/1.1 request over the tls conn and read the framed response.
@@ -65,8 +63,13 @@ fn round_trip(conn: tls.Conn, raw: String) -> http.HttpResponse!:
 
 fn main() -> Int!:
     port := choose_port(18980)!
-    server_task := spawn run_server(port)
-    sleep(200)
+    # bind before spawning: a connect that beats accept() then waits in the
+    # kernel's backlog rather than being refused, so there is no startup window
+    # for a sleep to have to cover. see test_http2_tls_roundtrip, where the
+    # sleep this replaces lost about two runs in five under valgrind.
+    server_config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen("127.0.0.1", port, server_config)!
+    server_task := spawn run_server(listener)
 
     config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
     conn := tls.dial_with_config("127.0.0.1", port, "localhost", config)!
@@ -96,5 +99,6 @@ fn main() -> Int!:
 
     conn.close()
     await server_task
+    server_config.close()
     print("http/1.1-over-tls fallback: chunked and sized bodies correct across a keep-alive connection")
     return 0

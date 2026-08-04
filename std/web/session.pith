@@ -69,11 +69,15 @@ ID_BYTES := 32
 # strength than the mac it produces, so this is the floor.
 MIN_SECRET_BYTES := 32
 
-# a store cannot hold more sessions than this. an unauthenticated visitor
-# never creates one — an id is minted per request but only written to the
-# store when a handler actually stores something — so reaching this means
-# something is creating sessions in a loop, and the honest answer is to stop
-# rather than to grow until the process is killed.
+# how many sessions this process will hold, across every store in it. the cap
+# is process-wide rather than per-store because what it is protecting is the
+# process's memory, and two stores sharing it should not be able to ask for
+# twice as much between them.
+#
+# an unauthenticated visitor never occupies a row — an id is minted per
+# request but only written when a handler actually stores something — so
+# reaching this means something is creating sessions in a loop, and the honest
+# answer is to stop rather than to grow until the process is killed.
 MAX_SESSIONS := 100_000
 
 # how often ordinary traffic pauses to drop expired sessions, in seconds.
@@ -384,7 +388,7 @@ impl Store:
         full := session_key(self.handle, id)
         if not ensure_session(full, now, self.ttl_v):
             session_mu.unlock()
-            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("session store is full; not creating another")
+            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("this process is holding all the sessions it will; not creating another")
             return
         session_values.insert(value_key(self.handle, id, key), value)
         record_key(full, key)
@@ -440,7 +444,7 @@ impl Store:
         target := session_key(self.handle, fresh)
         if not ensure_session(target, now, self.ttl_v):
             session_mu.unlock()
-            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("session store is full; not rotating")
+            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("this process is holding all the sessions it will; not rotating")
             return
         if current.len() > 0:
             source := session_key(self.handle, current)

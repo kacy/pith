@@ -82,6 +82,7 @@ import std.net.tls as tls
 import std.trace as trace
 import std.metrics as metrics
 import std.time as time
+import std.shutdown as shutdown
 
 # grpc status codes (the grpc-status trailer). 0 is success; the rest are
 # errors. see https://grpc.io/docs/guides/status-codes/.
@@ -102,6 +103,18 @@ pub GRPC_INTERNAL := 13
 pub GRPC_UNAVAILABLE := 14
 pub GRPC_DATA_LOSS := 15
 pub GRPC_UNAUTHENTICATED := 16
+
+# the grpc-message a peer reads when a graceful shutdown closed its stream rather
+# than the handler doing so. it rides on GRPC_UNAVAILABLE, the code a grpc client
+# retries — exactly right during a rolling deploy, where the replacement instance
+# is already accepting. see the drain section near serve_stream.
+pub SHUTTING_DOWN := "grpc: server is shutting down"
+
+# how long a send onto an already-closed stream parks before reporting 0. it is
+# backpressure for a loop that has stopped listening, not a delay any working
+# handler ever pays: a stream is only closed underneath a handler that ignored
+# the shutdown flag, and by then the process is on its way out.
+CLOSED_STREAM_PARK_MS := 1
 
 # the status codes worth retrying: the ones that describe the service's
 # moment rather than the request's content. UNAVAILABLE is the transport
@@ -1586,8 +1599,12 @@ pub struct GrpcStream:
     # anchored when the request arrived rather than when the handler asks.
     deadline: Int
     mut request_done: Bool
-    mut sent_headers: Bool
-    mut finished: Bool
+    # atomics rather than plain flags, because the drain watchdog below can close
+    # a stream from another task at the same moment its handler is sending on it.
+    # two header blocks, or trailers twice, is a protocol error the peer fails on;
+    # a compare-and-set makes "who sends this" a decision exactly one task wins.
+    sent_headers: AtomicInt
+    finished: AtomicInt
 
 # the response headers of a streaming grpc reply.
 fn grpc_response_fields() -> List[hpack.HeaderField]:
@@ -1620,19 +1637,40 @@ impl GrpcStream:
     pub fn deadline_ms() -> Int:
         return self.deadline
 
+    # whether a graceful shutdown has begun. a long-lived handler polls this
+    # between messages and ends its own stream while it still can — that is the
+    # only way such a stream ends on the handler's terms. everything still open
+    # when the framework's half of the grace period starts is closed with
+    # UNAVAILABLE instead; see the drain section below.
+    pub fn closing() -> Bool:
+        return shutdown.requested()
+
     # pull the next request message: a StreamMessage with `done` false and the
     # message bytes, or `done` true once the client has finished sending. blocks
     # until a whole message has arrived. fails with GRPC_CANCELLED if the client
-    # reset the stream (or the connection dropped) — the handler should stop.
+    # reset the stream (or the connection dropped) — the handler should stop —
+    # and with GRPC_UNAVAILABLE once a drain has taken the stream over.
     pub fn recv_message() -> StreamMessage!GrpcError:
         while true:
             if self.deframer.ready():
                 return StreamMessage(false, self.deframer.next()!)
             if self.request_done:
                 return StreamMessage(true, bytes.empty())
+            # never park waiting on the peer once the framework's half of the
+            # grace period has begun: whatever the client has not sent by then is
+            # not going to arrive before the process goes, and a handler parked
+            # here is a handler that cannot notice the drain at all. already-
+            # buffered messages are served first, above, so nothing in hand is
+            # dropped.
+            if shutdown.stream_deadline_passed():
+                fail GrpcError(GRPC_UNAVAILABLE, SHUTTING_DOWN)
             ev := self.stream.recv_event()
             if ev.is_reset():
                 self.request_done = true
+                # a drain cancels the stream to wake exactly this parked recv, so
+                # during one the reset is the server's own doing, not the client's.
+                if shutdown.requested():
+                    fail GrpcError(GRPC_UNAVAILABLE, SHUTTING_DOWN)
                 fail GrpcError(GRPC_CANCELLED, "grpc: stream reset by the client")
             if ev.is_data():
                 if ev.data.len() > 0:
@@ -1645,10 +1683,22 @@ impl GrpcStream:
 
     # frame and send one response message, immediately — the client can read it
     # while this rpc's request stream is still open. the response headers go out
-    # before the first message. returns the bytes queued for the wire.
+    # before the first message. returns the bytes queued for the wire, and 0 once
+    # the rpc is over.
     pub fn send_message(message: Bytes) -> Int:
-        if not self.sent_headers:
-            self.sent_headers = true
+        # a stream a drain already closed takes no more messages: DATA after the
+        # trailers is a protocol error, and the peer already has its status. a
+        # handler that ignored the shutdown flag ends up here, and 0 is what tells
+        # it — loudly, if it looks — that its stream is gone.
+        #
+        # the short park is what happens when it does not look. a send is the only
+        # thing slowing down a loop like `while true: send(tick())`, and answering
+        # it instantly would turn a handler that used to sit on a flow-control
+        # window into one spinning a core through the rest of the shutdown.
+        if self.finished.load() != 0:
+            time.delay(CLOSED_STREAM_PARK_MS)
+            return 0
+        if self.sent_headers.compare_set(0, 1):
             self.stream.send_headers(grpc_response_fields(), false)
         return self.stream.send_data(frame_message(message), false)
 
@@ -1656,13 +1706,11 @@ impl GrpcStream:
     # a send_message this is the trailing HEADERS block; before any send it is a
     # trailers-only response, the compact error shape grpc clients expect.
     pub fn finish(status: Int, message: String):
-        if self.finished:
+        if not self.finished.compare_set(0, 1):
             return
-        self.finished = true
-        if self.sent_headers:
+        if not self.sent_headers.compare_set(0, 1):
             self.stream.send_trailers(grpc_status_fields(status, message))
             return
-        self.sent_headers = true
         mut fields := grpc_response_fields()
         for f in grpc_status_fields(status, message):
             fields.push(f)
@@ -1671,6 +1719,120 @@ impl GrpcStream:
     # end the rpc with grpc-status 0 (OK).
     pub fn finish_ok():
         self.finish(GRPC_OK, "")
+
+# --- closing endless streams on shutdown --------------------------------------
+#
+# a drain waits for work to finish, and a stream that never finishes outlasts any
+# grace period: a watch or a ticker rpc would be severed mid-message when the
+# process goes, and the peer would see a truncated body with no grpc-status —
+# indistinguishable from a crash.
+#
+# so the grace period is split. the first half is the handler's: closing() goes
+# true the moment a drain begins, and a handler that polls it ends its stream on
+# its own terms. the second half is the framework's: every rpc still open at
+# std.shutdown.stream_deadline() is finished here with UNAVAILABLE, which is the
+# code a grpc client retries on — exactly right during a rolling deploy, where
+# the replacement instance is already accepting. a handler that does nothing at
+# all therefore still leaves its peer with a clean status.
+#
+# a registry is what makes that reachable. a handler asleep between two sends is
+# not inside any framework call to intercept, so something else has to hold its
+# stream; and one process-wide watchdog task is far cheaper than a watcher per
+# rpc. the cost is a lock and a map slot per streaming rpc, on the serve_stream
+# path only — the buffered serve paths hand back a whole response and cannot be
+# endless.
+
+mut live_mu := Mutex()
+mut live_streams: Map[Int, GrpcStream] := {}
+mut next_live_id := 0
+mut closed_by_shutdown := 0
+mut stream_watch_started := false
+
+## how many rpcs a graceful shutdown had to close because their handler did not.
+##
+## a healthy service reports 0: every long-lived handler noticed
+## GrpcStream.closing() and ended its own stream. anything else names the
+## handlers to fix, and is the difference between a deploy that hands over and
+## one that only looks like it did.
+pub fn streams_closed_by_shutdown() -> Int:
+    live_mu.lock()
+    n := closed_by_shutdown
+    live_mu.unlock()
+    return n
+
+# hold a live rpc for the drain watchdog, returning the ticket that releases it.
+fn register_live_stream(call: GrpcStream) -> Int:
+    live_mu.lock()
+    id := next_live_id
+    next_live_id = next_live_id + 1
+    live_streams.insert(id, call)
+    live_mu.unlock()
+    return id
+
+# release a ticket. a no-op when the watchdog has already taken the stream, which
+# is what a handler that outlived the deadline finds on its way out.
+fn forget_live_stream(id: Int):
+    live_mu.lock()
+    if live_streams.contains_key(id):
+        live_streams.remove(id)
+    live_mu.unlock()
+
+# take every held rpc out of the registry and end it with `status`. taking them
+# out first means a second sweep finds nothing, and finishing them outside the
+# lock keeps a send that blocks on a flow-control window from wedging the
+# handlers still trying to register and release.
+fn close_live_streams(status: Int, message: String) -> Int:
+    live_mu.lock()
+    mut doomed: List[GrpcStream] := []
+    for id in live_streams.keys():
+        doomed.push(live_streams[id])
+    empty: Map[Int, GrpcStream] := {}
+    live_streams = empty
+    closed_by_shutdown = closed_by_shutdown + doomed.len()
+    live_mu.unlock()
+    for call in doomed:
+        call.finish(status, message)
+    return doomed.len()
+
+# park until a drain begins, leave the handlers their half of the grace period,
+# then close whatever is still open with a clean status. it keeps sweeping to the
+# end of the period, because a connection accepted just before the drain can
+# still open a stream after it.
+#
+# the outer loop is for a process that resets its shutdown state and restarts its
+# servers in place: a normal one exits long before the sweep is over, but one
+# that lives on has to get its watchdog back.
+fn stream_drain_watch():
+    while true:
+        mut requested := false
+        while not requested:
+            requested = shutdown.wait_requested(shutdown.WAKE_SLICE_MS)
+        deadline := shutdown.stream_deadline()
+        while time.mono_millis() < deadline:
+            time.delay(shutdown.POLL_INTERVAL_MS)
+        # the deadline is the midpoint, so the same distance again is the end of
+        # the grace period — past which the process is going whatever anyone
+        # thinks.
+        give_up := deadline + shutdown.drain_deadline() / 2
+        close_live_streams(GRPC_UNAVAILABLE, SHUTTING_DOWN)
+        while time.mono_millis() < give_up:
+            time.delay(shutdown.POLL_INTERVAL_MS)
+            close_live_streams(GRPC_UNAVAILABLE, SHUTTING_DOWN)
+        mut cleared := false
+        while not cleared:
+            time.delay(shutdown.WAKE_SLICE_MS)
+            cleared = not shutdown.requested()
+
+# start the one watchdog, once. both serve_stream entry points call it, and it
+# needs no lock for the same reason the dispatch slot needs none: it runs before
+# the listener exists, and the guard makes a second serve_stream a no-op.
+fn start_stream_drain_watch():
+    if stream_watch_started:
+        return
+    stream_watch_started = true
+    # a bare, unqualified call so `spawn` accepts it. the task parks on the
+    # shutdown flag, so under the green runtime it holds no worker.
+    spawn stream_drain_watch()
 
 # the stream dispatch lives in a module global for the same reason the unary
 # dispatch does: a pith closure cannot capture a fn-value, so there is one
@@ -1689,10 +1851,16 @@ fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:
 # called finish gets finish_ok.
 fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
     expired := begin_request_context(stream.request)
-    call := GrpcStream(stream, new_deframer(), current_deadline, false, false, false)
+    sent_headers := AtomicInt(0)
+    finished := AtomicInt(0)
+    call := GrpcStream(stream, new_deframer(), current_deadline, false, sent_headers, finished)
     if expired:
         call.finish(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL)
         return 0
+    # hold the rpc for the drain watchdog for exactly as long as it runs, so a
+    # shutdown can close it even if the handler never comes back.
+    live := register_live_stream(call)
+    defer forget_live_stream(live)
     result := grpc_stream_dispatch_fn(call.full_method(), call)
     if result.is_err:
         call.finish(result.err.status, result.err.message)
@@ -1705,15 +1873,18 @@ fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
 # incrementally. blocks, accepting connections.
 #
 # drains on shutdown like serve(). a long-lived dispatch should poll
-# std.shutdown.requested() between messages and finish its stream when it goes
-# true; see the note above serve_body about endless streams.
+# GrpcStream.closing() between messages and finish its stream when it goes true;
+# one that does not is closed with UNAVAILABLE at the midpoint of the grace
+# period rather than severed at the end of it — see the drain section above.
 pub fn serve_stream(host: String, port: Int, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
     grpc_stream_dispatch_fn = dispatch
+    start_stream_drain_watch()
     return h2server.listen_h2c_streaming(host, port, grpc_serve_stream_handler)!
 
 # like serve_stream, over http/2 with tls (alpn "h2").
 pub fn serve_stream_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
     grpc_stream_dispatch_fn = dispatch
+    start_stream_drain_watch()
     return h2server.listen_h2_tls_streaming(host, port, cert, key, grpc_serve_stream_handler)!
 
 # --- server request context --------------------------------------------------

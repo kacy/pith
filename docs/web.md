@@ -390,8 +390,8 @@ returns the work that was still unfinished when that period expired — `0` for 
 clean drain. a rolling deploy stops severing responses mid-flight. without the
 `on_signals()` call nothing changes and `listen` blocks forever, as before.
 
-[docs/signals.md](signals.md) covers the drain, the coordinator, and what a
-long-lived streaming handler has to do differently.
+[docs/signals.md](signals.md) covers the drain, the coordinator, and what
+becomes of a stream that would otherwise never end.
 
 ## a runnable example
 

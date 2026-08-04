@@ -1445,6 +1445,11 @@ fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
         out.push("    # the absolute deadline (a time.mono_millis() timestamp), 0 when none.")
         out.push("    pub fn deadline_ms() -> Int:")
         out.push("        return self.inner.deadline_ms()")
+        out.push("    # whether a graceful shutdown has begun. a handler that streams")
+        out.push("    # indefinitely polls this and ends its own stream; one that does")
+        out.push("    # not is closed with UNAVAILABLE partway through the grace period.")
+        out.push("    pub fn closing() -> Bool:")
+        out.push("        return self.inner.closing()")
         out.push("")
 
     out.push("# handler slots for the streaming rpcs; the unary rpcs share the buffered")

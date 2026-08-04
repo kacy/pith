@@ -128,6 +128,8 @@ the current concurrency story is strong enough for:
 - timeout and cancellation around task waits
 - bounded channel coordination with `select`
 - process timeout helpers through `std.os.process`
+- shared mutable state behind a `Mutex`, `AtomicInt`, or `Semaphore`
+- fan-out that fails as a unit, with `concurrent.group`
 
 ## sharing between tasks
 
@@ -144,6 +146,102 @@ it, so each task mutates its own. immutable values and independent
 copies (`std.collections.copy_list` and friends) are also safe to
 hand off. this rule is convention today, not yet enforced by the
 checker.
+
+when a channel is the wrong shape — a registry every request reads and a
+few requests write, a counter, a cap on how many things run at once — reach
+for a lock. the primitives below are built in: they need no import, and
+they are what the standard library itself uses.
+
+## locks, counters, and permits
+
+these four are language builtins, available in any pith program without an
+import. `std.log`, `std.metrics`, `std.trace`, `std.io`, `std.uuid`,
+`std.net.tls`, and both database drivers are built on them.
+
+`Mutex()` guards a section that must not run twice at once:
+
+```pith
+mut rooms: Map[String, Room] := {}
+mut rooms_mu := Mutex()
+
+fn join(name: String, member: String):
+    rooms_mu.lock()
+    room := rooms.get(name).unwrap_or(Room(name, []))
+    room.members.push(member)
+    rooms[name] = room
+    rooms_mu.unlock()
+```
+
+`examples/room_registry.pith` is this worked through: a registry several
+tasks read and write, a counter, a capped flush, and a group over the rooms.
+
+hold it for the shortest span that keeps the data consistent, and never
+across a channel receive or a socket read — a task parked inside a lock
+holds it for as long as it is parked. there is no reentrancy: locking a
+mutex a task already holds deadlocks it.
+
+`AtomicInt(n)` is a single integer several tasks can touch without a lock:
+
+- `counter.load()`
+- `counter.store(n)`
+- `counter.compare_set(expected, new)` — sets and returns `true` only if the
+  value was `expected`, which is how you elect exactly one winner among racing
+  tasks. `std.concurrent` uses it so a deadline and a manual cancel settle on
+  one reason rather than both writing.
+
+note that `load` then `store` is *two* operations and races between them;
+`counter.store(counter.load() + 1)` can lose an increment. use
+`compare_set` in a retry loop when the new value depends on the old one.
+
+`WaitGroup()` waits for a set of tasks without holding their handles:
+
+- `wg.add(n)` before starting them
+- `wg.done()` from each as it finishes
+- `wg.wait()` to block until the count reaches zero
+
+if you do hold the task handles, `await` each one instead — it is simpler
+and gives you their results. a wait group earns its place when the tasks
+are started somewhere that cannot keep the handles.
+
+`Semaphore(n)` caps how many tasks may be inside a region at once:
+`sem.acquire()` takes a permit and waits if none is free, `sem.release()`
+returns one. `std.prometheus` uses one to bound concurrent scrapes.
+
+all four park rather than spin, so a blocked green task frees its worker
+for other tasks instead of holding it.
+
+## groups
+
+a group fans work out and fails as a unit. it is the shape you want for
+"do this for every room, and if any of them fails, stop":
+
+```pith
+import std.concurrent as concurrent
+
+fn flush_room(room: Room) -> Int!:
+    return room.flush()
+
+fn flush_all(rooms: List[Room]) -> Int!:
+    g := concurrent.group(concurrent.background())
+    for room in rooms:
+        g.go(flush_room)
+    return g.wait()!
+```
+
+`group(parent)` derives a child context that the first failure cancels, so
+siblings can notice and stop early — pass `g.ctx` into work that runs long
+enough to care. `group_limited(parent, n)` does the same with at most `n`
+units running at once, for when the fan-out is wider than the resource
+behind it.
+
+`wait()` returns the first error and waits for *every* task regardless, so
+when it returns nothing from the group is still running. work that never
+consults the context still runs to completion: cancelling asks a task to
+stop, it does not kill it.
+
+the work is `fn() -> Int!` — a group cares which unit failed, not what the
+survivors returned. work with a value to report should write it to a
+channel or a slot it owns, the same as it would without a group.
 
 ## per-thread globals
 

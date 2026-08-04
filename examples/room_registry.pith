@@ -1,0 +1,134 @@
+# a stateful service: a chat room registry that many requests share.
+#
+# this is the shape channels alone do not answer well. a registry is read by
+# every request and written by a few, so handing it down a channel would mean
+# one owner task and a request/reply round trip for every read. a lock over the
+# map is both simpler and faster, and the primitives for it are built in — no
+# import, the same ones std.log and std.metrics use.
+#
+# it shows the four of them doing the job each is for:
+#
+#   Mutex       guards the registry map itself
+#   AtomicInt   counts joins without taking that lock
+#   Semaphore   caps how many rooms flush to "storage" at once
+#   Group       fans out over the rooms and fails as a unit
+#
+# the fan-out at the end is the part worth copying. flushing every room
+# concurrently and stopping on the first failure is what concurrent.group is
+# for, and doing it by hand means holding every task handle and remembering to
+# await them all even after one has failed.
+
+import std.concurrent as concurrent
+import std.time as time
+
+struct Room:
+    name: String
+    members: List[String]
+
+# the registry, and the lock that guards it. every read and every write of
+# `rooms` happens between a lock() and an unlock().
+mut rooms: Map[String, Room] := {}
+mut rooms_mu := Mutex()
+
+# a counter several tasks bump. it is deliberately not under rooms_mu: an
+# atomic needs no lock, so counting a join does not serialise against a
+# request that is only reading the registry.
+mut joins := AtomicInt(0)
+
+# "storage" here is slow and only tolerates two writers at a time, which is the
+# usual reason to cap a fan-out: the resource behind it is narrower than the
+# work in front of it.
+FLUSH_PERMITS := 2
+
+# join is the write path: it mutates a room inside the lock, then counts the
+# join outside it. the get-or-create is part of the same locked section as the
+# push, so two tasks joining a new room cannot both create it and lose one of
+# the two members.
+fn join(room_name: String, member: String):
+    rooms_mu.lock()
+    room := rooms.get(room_name).unwrap_or(Room(room_name, []))
+    room.members.push(member)
+    rooms[room_name] = room
+    rooms_mu.unlock()
+    # compare_set in a loop, not store(load() + 1): between a load and a store
+    # another task can bump the same counter, and that increment would be lost.
+    mut settled := false
+    while not settled:
+        current := joins.load()
+        settled = joins.compare_set(current, current + 1)
+
+# the read path. it copies the names out under the lock rather than handing the
+# list itself back, so a caller iterating it cannot race a later join.
+fn members_of(room_name: String) -> List[String]:
+    rooms_mu.lock()
+    room := rooms.get(room_name).unwrap_or(Room(room_name, []))
+    mut names: List[String] := []
+    for m in room.members:
+        names.push(m)
+    rooms_mu.unlock()
+    return names
+
+fn room_names() -> List[String]:
+    rooms_mu.lock()
+    mut names: List[String] := []
+    for name in rooms.keys():
+        names.push(name)
+    rooms_mu.unlock()
+    return names
+
+# one room's flush. the group calls this as fn() -> Int!, so each room gets its
+# own named function below rather than a closure — a pith lambda cannot fail.
+fn flush_room(name: String) -> Int!:
+    if name == "spam":
+        fail "room " + name + " rejected by storage"
+    time.delay(20)
+    return members_of(name).len()
+
+fn flush_general() -> Int!:
+    return flush_room("general")
+
+fn flush_random() -> Int!:
+    return flush_room("random")
+
+fn flush_spam() -> Int!:
+    return flush_room("spam")
+
+# a concurrent join, so the counter is exercised by more than one task.
+fn joiner(room_name: String, member: String) -> Int:
+    join(room_name, member)
+    return 0
+
+fn main() -> Int!:
+    # several tasks writing the registry at once
+    mut arrivals: List[Task[Int]] := []
+    arrivals.push(spawn joiner("general", "ada"))
+    arrivals.push(spawn joiner("general", "grace"))
+    arrivals.push(spawn joiner("random", "alan"))
+    arrivals.push(spawn joiner("spam", "bot"))
+    for t in arrivals:
+        await t
+
+    print("rooms:   {room_names().len()}")
+    print("general: {members_of("general").len()} members")
+    print("joins:   {joins.load()}")
+
+    # fan out over the rooms, capped at FLUSH_PERMITS at a time. the "spam" room
+    # fails, which cancels the group's context and makes wait() report it.
+    g := concurrent.group_limited(concurrent.background(), FLUSH_PERMITS)
+    g.go(flush_general)
+    g.go(flush_random)
+    g.go(flush_spam)
+
+    outcome := g.wait()
+    if outcome.is_err:
+        print("flush failed: " + outcome.err)
+    else:
+        print("flush ok")
+    print("group cancelled after the failure: {g.ctx.is_cancelled()}")
+
+    # a group whose work all succeeds reports success and leaves its context live
+    ok := concurrent.group(concurrent.background())
+    ok.go(flush_general)
+    ok.go(flush_random)
+    print("second flush ok: {ok.wait().is_ok}")
+    return 0

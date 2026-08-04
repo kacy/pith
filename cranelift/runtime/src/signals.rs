@@ -281,24 +281,27 @@ mod tests {
         assert_eq!(pith_getpid(), unsafe { libc::getpid() } as i64);
     }
 
-    // the round trip, end to end on a real thread: arm SIGUSR1, send it to this
-    // process, and read it back off the pipe. SIGUSR1 is used (not SIGTERM) so a
-    // stray delivery cannot kill the test process, and the wait carries a
-    // generous timeout so a slow ci box reports a real failure rather than
-    // hanging the suite.
+    // the timeout case and the delivery case share one queue, so they are one
+    // test rather than two. the self-pipe and the process's signal dispositions
+    // are process-global by construction, while cargo runs each `#[test]` on its
+    // own thread of a single process — as two tests, the delivery test's SIGUSR1
+    // was read by the timeout test's wait, and both failed. sequencing them here
+    // is the only ordering the shared queue actually permits.
     #[test]
-    fn a_raised_signal_is_delivered_to_a_waiter() {
+    fn a_wait_times_out_when_idle_and_reports_a_raised_signal() {
+        // nothing queued yet: the wait reports a timeout — distinct from a
+        // delivery (a positive signal number) and from an error (-1), so a drain
+        // loop can tell "no signal yet" from "this wait will never work".
+        assert_eq!(pith_signal_notify(1 << libc::SIGUSR2), 1);
+        assert_eq!(pith_signal_wait(10), 0);
+
+        // the round trip, end to end on a real thread: arm SIGUSR1, send it to
+        // this process, and read it back off the pipe. SIGUSR1 is used (not
+        // SIGTERM) so a stray delivery cannot kill the test process, and the
+        // wait carries a generous timeout so a slow ci box reports a real
+        // failure rather than hanging the suite.
         assert_eq!(pith_signal_notify(1 << libc::SIGUSR1), 1);
         assert_eq!(pith_signal_raise(libc::SIGUSR1 as i64), 1);
         assert_eq!(pith_signal_wait(5000), libc::SIGUSR1 as i64);
-    }
-
-    // a wait with nothing queued reports a timeout — distinct from a delivery
-    // (a positive signal number) and from an error (-1), so a drain loop can
-    // tell "no signal yet" from "this wait will never work".
-    #[test]
-    fn a_wait_with_nothing_queued_times_out() {
-        assert_eq!(pith_signal_notify(1 << libc::SIGUSR2), 1);
-        assert_eq!(pith_signal_wait(10), 0);
     }
 }

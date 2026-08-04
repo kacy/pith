@@ -55,6 +55,7 @@ import std.binary as binary
 import std.net.http as http
 import std.net.tcp as tcp
 import std.net.tls as tls
+import std.shutdown as shutdown
 # the request-side stream event and its constructors, plus the settings ids and
 # the default window, are shared as-is with the client — the server reads the
 # same events the client writes. imported by name because a Channel's element
@@ -1116,7 +1117,13 @@ pub fn serve_h2c_connection(fd: Int, handler: fn(http.HttpRequestBytes) -> http.
 
 # serve_h2c_connection with the accept loop's concurrency permit released when
 # the connection ends, however it ends.
+#
+# the same bracket doubles as the drain count: a graceful shutdown does not
+# finish until every connection that reached here has run out, so a rolling
+# deploy cannot sever a stream that is still exchanging frames.
 fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    shutdown.enter()
+    defer shutdown.leave()
     defer connection_slots.release()
     serve_h2c_connection(fd, handler)
 
@@ -1151,22 +1158,34 @@ fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.H
 # does; spawn it if you need to keep going. mirrors std.web's listen and
 # std.prometheus's serve.
 pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
-    fd := tcp_listen(host, port)!
+    # registering transfers the close to std.shutdown, so a drain and a normal
+    # teardown cannot both close the same fd number.
+    fd := shutdown.register_listener(tcp_listen(host, port)!)
     # close the listener if the accept loop ever gives up. a listening socket
     # nobody accepts from still answers a tcp health check, so leaving it open
     # is how a dead server keeps looking alive.
-    defer tcp_close(fd)
+    defer shutdown.close_listener(fd)
     mut failures := 0
-    while true:
+    while not shutdown.requested():
         accepted := tcp.accept(fd)
         if accepted.is_err:
+            # a shutdown closes the listener out from under this accept, which
+            # is what wakes the parked loop promptly. that error is the drain
+            # beginning, not a failure to back off from.
+            if shutdown.requested():
+                break
             failures = failures + 1
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
         connection_slots.acquire()
         spawn serve_h2c_slot(accepted.ok, handler)
-    return 0
+    # free the port before draining, not after: the replacement instance of a
+    # rolling deploy is waiting to bind it, and the drain can take the whole
+    # grace period. the defer above is then a no-op — close_listener closes at
+    # most once — and still covers the error exits.
+    shutdown.close_listener(fd)
+    return shutdown.drain_default()
 
 # serve one accepted tls connection as http/2 to completion. the tls handshake
 # (with its alpn negotiation) has already happened; this checks that the peer
@@ -1183,6 +1202,14 @@ pub fn serve_h2_tls_connection(tls_conn: tls.Conn, handler: fn(http.HttpRequestB
     serve_connection(conn, handler) catch false
     conn.close()
 
+# release a tls listener at the end of an accept loop, in the two halves a
+# graceful shutdown needs them: std.shutdown owns the socket (closing it is what
+# wakes a parked accept during a drain, and it closes at most once), and the tls
+# config bound to that socket is dropped here either way.
+fn release_tls_listener(listener: tls.Listener):
+    shutdown.close_listener(listener.handle)
+    tls.release_listener_config(listener)
+
 # handshake an accepted socket and serve it. split out from serve_h2_tls_slot so
 # the failure path is a plain `!` — a handshake that fails closes the socket and
 # leaves nothing for the caller to clean up.
@@ -1197,6 +1224,8 @@ fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handler: fn(http.Ht
 # connection stops the server accepting after MAX_CONNECTIONS attempts, which is
 # the same denial of service the accept loop was fixed for, only slower.
 fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    shutdown.enter()
+    defer shutdown.leave()
     defer connection_slots.release()
     handshake_and_serve_h2_tls(listener_handle, fd, handler) catch false
 
@@ -1214,18 +1243,23 @@ fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequest
 pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
-    defer listener.close()
+    shutdown.register_listener(listener.handle)
+    defer release_tls_listener(listener)
     mut failures := 0
-    while true:
+    while not shutdown.requested():
         accepted := tls.accept_socket(listener)
         if accepted.is_err:
+            if shutdown.requested():
+                break
             failures = failures + 1
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
         connection_slots.acquire()
         spawn serve_h2_tls_slot(listener.handle, accepted.ok, handler)
-    return 0
+    # free the port before draining (see listen_h2c above).
+    release_tls_listener(listener)
+    return shutdown.drain_default()
 
 # --- streaming entry points ---
 #
@@ -1249,6 +1283,8 @@ pub fn serve_h2c_streaming_connection(fd: Int):
 
 # serve_h2c_streaming_connection with the accept loop's permit released at the end.
 fn serve_h2c_streaming_slot(fd: Int):
+    shutdown.enter()
+    defer shutdown.leave()
     defer connection_slots.release()
     serve_h2c_streaming_connection(fd)
 
@@ -1256,19 +1292,26 @@ fn serve_h2c_streaming_slot(fd: Int):
 # stream to `handler` while it is still arriving. mirrors listen_h2c.
 pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
-    fd := tcp_listen(host, port)!
-    defer tcp_close(fd)
+    fd := shutdown.register_listener(tcp_listen(host, port)!)
+    defer shutdown.close_listener(fd)
     mut failures := 0
-    while true:
+    while not shutdown.requested():
         accepted := tcp.accept(fd)
         if accepted.is_err:
+            if shutdown.requested():
+                break
             failures = failures + 1
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
         connection_slots.acquire()
         spawn serve_h2c_streaming_slot(accepted.ok)
-    return 0
+    # free the port before draining, not after: the replacement instance of a
+    # rolling deploy is waiting to bind it, and the drain can take the whole
+    # grace period. the defer above is then a no-op — close_listener closes at
+    # most once — and still covers the error exits.
+    shutdown.close_listener(fd)
+    return shutdown.drain_default()
 
 # serve one accepted tls connection on the streaming path. mirrors
 # serve_h2_tls_connection, including the alpn "h2" check.
@@ -1289,6 +1332,8 @@ fn handshake_and_serve_h2_tls_streaming(listener_handle: Int, fd: Int) -> Bool!:
 # handshake_and_serve_h2_tls_streaming with the accept loop's permit released at
 # the end, on the failed-handshake path included. mirrors serve_h2_tls_slot.
 fn serve_h2_tls_streaming_slot(listener_handle: Int, fd: Int):
+    shutdown.enter()
+    defer shutdown.leave()
     defer connection_slots.release()
     handshake_and_serve_h2_tls_streaming(listener_handle, fd) catch false
 
@@ -1298,18 +1343,23 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
     stream_handler_fn = handler
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     listener := tls.listen(host, port, config)!
-    defer listener.close()
+    shutdown.register_listener(listener.handle)
+    defer release_tls_listener(listener)
     mut failures := 0
-    while true:
+    while not shutdown.requested():
         accepted := tls.accept_socket(listener)
         if accepted.is_err:
+            if shutdown.requested():
+                break
             failures = failures + 1
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
         connection_slots.acquire()
         spawn serve_h2_tls_streaming_slot(listener.handle, accepted.ok)
-    return 0
+    # free the port before draining (see listen_h2c above).
+    release_tls_listener(listener)
+    return shutdown.drain_default()
 
 # --- offline frame tests ---
 #

@@ -23,6 +23,8 @@ pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SIGNAL_WAITS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SIGNAL_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
@@ -155,6 +157,11 @@ pub fn dump_perf_stats() {
         PERF_BYTE_BUFFER_FREES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  signals: waits={} deliveries={}",
+        PERF_SIGNAL_WAITS.load(Ordering::Relaxed),
+        PERF_SIGNAL_DELIVERIES.load(Ordering::Relaxed)
     );
     eprintln!(
         "  lists: new={} free={} live={}",

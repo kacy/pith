@@ -1,0 +1,22 @@
+=== a real request ===
+from the app origin:  200, allow-origin https://app.example.com
+from anywhere else:   200, no allow-origin: the browser blocks the read
+no Origin at all:     200, same origin, nothing to allow
+
+=== the preflight a browser sends first ===
+from the app origin:  204, allow-origin https://app.example.com
+from anywhere else:   403, no allow-origin: the browser blocks the read
+
+=== what the preflight told the browser it may do ===
+methods:  GET, POST
+headers:  Content-Type
+max-age:  600
+vary:     Origin, Access-Control-Request-Method, Access-Control-Request-Headers
+
+=== headers page javascript may read off the real response ===
+expose:   X-Request-Id
+credentials header sent: false
+
+=== a plain OPTIONS, which is not a preflight ===
+status:   204
+allow:    GET, POST, OPTIONS

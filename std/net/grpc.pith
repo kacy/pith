@@ -1464,11 +1464,19 @@ pub fn server_fault(status: Int) -> Bool:
 # serve grpc over plaintext http/2 (h2c). blocks, accepting connections. the
 # `dispatch` maps a full method path (/pkg.Service/Method) and the request
 # message bytes to the response message bytes, or a GrpcError.
+#
+# every serve entry point below rides the http/2 server's accept loop, so they
+# all inherit its graceful shutdown: once std.shutdown.request() runs (from a
+# SIGTERM, say), the listener stops accepting and this returns after the
+# in-flight rpcs finish or the grace period expires. the return value is the
+# work still unfinished at that point, 0 for a clean drain. an rpc in progress
+# is never severed by the drain itself — which for a streaming method means the
+# stream runs to its trailers rather than dying mid-exchange.
 pub fn serve(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
     grpc_dispatch_fn = dispatch
     return h2server.listen_h2c(host, port, grpc_serve_handler)!
 
-# serve grpc over http/2 with tls (alpn "h2").
+# serve grpc over http/2 with tls (alpn "h2"). drains on shutdown like serve().
 pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
     grpc_dispatch_fn = dispatch
     return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_handler)!
@@ -1483,6 +1491,11 @@ pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: f
 # (unframe_messages / frame_messages below). the generated <Svc> router uses
 # this, deframing per method. buffered means the whole request and reply pass
 # through memory — the right tool for bounded streams, not endless ones.
+#
+# an endless stream and a graceful shutdown are in tension: the drain waits for
+# the connection to end, and a stream that never ends outlasts any grace period.
+# such a handler should watch std.shutdown.requested() and finish its stream
+# when it goes true, rather than relying on the deadline to cut it off.
 
 # installed by serve_body / serve_body_tls; see grpc_dispatch_fn above for why
 # this needs no lock.
@@ -1690,6 +1703,10 @@ fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
 # serve grpc over plaintext http/2 (h2c) with a stream-level dispatch: `dispatch`
 # receives the full method path and a live GrpcStream, and drives the rpc
 # incrementally. blocks, accepting connections.
+#
+# drains on shutdown like serve(). a long-lived dispatch should poll
+# std.shutdown.requested() between messages and finish its stream when it goes
+# true; see the note above serve_body about endless streams.
 pub fn serve_stream(host: String, port: Int, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
     grpc_stream_dispatch_fn = dispatch
     return h2server.listen_h2c_streaming(host, port, grpc_serve_stream_handler)!

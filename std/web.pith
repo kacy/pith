@@ -53,6 +53,7 @@ import std.metrics as metrics
 import std.prometheus as prometheus
 import std.time as time_mod
 import std.log as log
+import std.shutdown as shutdown
 
 # how long a connection may sit idle before the server hangs up on it, in
 # milliseconds. keeps a stalled client from tying up a task forever.
@@ -359,7 +360,15 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
 
 # serve one accepted connection to completion on its own task, then close it.
 # errors are swallowed so a broken client only ever affects its own connection.
+#
+# the enter/leave bracket is what a drain counts: listen() does not return until
+# every connection that got this far has finished, so a rolling deploy cannot
+# cut a response in half. `defer` releases the count on the error path too — a
+# connection that leaks its count holds the whole shutdown open for the full
+# grace period.
 fn handle_conn(app: App, fd: Int):
+    shutdown.enter()
+    defer shutdown.leave()
     tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     http.serve_connection_fd(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
 
@@ -383,7 +392,20 @@ fn handshake_and_serve_tls_conn(app: App, listener_handle: Int, fd: Int) -> Bool
     handle_tls_conn(app, tls.handshake(tls.listener_from_handle(listener_handle), fd)!)
     return true
 
+# release a tls listener at the end of an accept loop, in the two halves a
+# graceful shutdown needs them: std.shutdown owns the socket (closing it is what
+# wakes a parked accept during a drain, and it closes at most once), and the tls
+# config bound to that socket is dropped here either way.
+fn release_tls_listener(listener: tls.Listener):
+    shutdown.close_listener(listener.handle)
+    tls.release_listener_config(listener)
+
+# the drain bracket lives here rather than around the handshake alone, so a
+# connection counts as in flight from the moment it is accepted until it is
+# fully served — a handshake interrupted mid-shutdown is still a client waiting.
 fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
+    shutdown.enter()
+    defer shutdown.leave()
     handshake_and_serve_tls_conn(app, listener_handle, fd) catch false
 
 impl App:
@@ -434,24 +456,42 @@ impl App:
         out.push(Scoped(prefix, mw))
         return App(self.routes, self.middleware, out)
 
-    # bind host:port and serve forever, one task per connection. this blocks, so
-    # it is usually the last thing main does; spawn it if you need to keep going.
+    # bind host:port and serve, one task per connection. this blocks, so it is
+    # usually the last thing main does; spawn it if you need to keep going.
+    #
+    # it returns when a graceful shutdown is requested (see std.shutdown): the
+    # listener stops accepting, the in-flight connections are given the
+    # configured grace period to finish, and the return value is how much work
+    # was still unfinished when that period expired — 0 for a clean drain. with
+    # no shutdown ever requested this serves forever, as it always did.
     fn listen(host: String, port: Int) -> Int!:
         app := self
-        fd := tcp_listen(host, port)!
+        # registering transfers the close to std.shutdown, so a drain and a
+        # normal teardown cannot both close the same fd number.
+        fd := shutdown.register_listener(tcp_listen(host, port)!)
         # close the listener if the accept loop ever gives up: a listening socket
         # nobody accepts from still passes a tcp health check.
-        defer tcp_close(fd)
+        defer shutdown.close_listener(fd)
         mut failures := 0
-        while true:
+        while not shutdown.requested():
             accepted := tcp.accept(fd)
             if accepted.is_err:
+                # a shutdown closes the listener out from under this accept,
+                # which is how the parked loop is woken promptly. that error is
+                # the drain beginning, not a failure to back off from.
+                if shutdown.requested():
+                    break
                 failures = failures + 1
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
             spawn handle_conn(app, accepted.ok)
-        return 0
+        # free the port before draining, not after: the replacement instance of
+        # a rolling deploy is waiting to bind it, and the drain can take the
+        # whole grace period. the defer above is then a no-op — close_listener
+        # closes at most once — and still covers the error exits.
+        shutdown.close_listener(fd)
+        return shutdown.drain_default()
 
     # bind host:port and serve forever over cleartext http/2 (h2c), one task per
     # connection. the whole app runs unchanged — every request funnels through the
@@ -475,17 +515,22 @@ impl App:
         app := self
         config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
         listener := tls.listen(host, port, config)!
-        defer listener.close()
+        shutdown.register_listener(listener.handle)
+        defer release_tls_listener(listener)
         mut failures := 0
-        while true:
+        while not shutdown.requested():
             accepted := tls.accept_socket(listener)
             if accepted.is_err:
+                if shutdown.requested():
+                    break
                 failures = failures + 1
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
             spawn handle_tls_socket(app, listener.handle, accepted.ok)
-        return 0
+        # free the port before draining (see the plaintext listener above).
+        release_tls_listener(listener)
+        return shutdown.drain_default()
 
 # --- tests ---
 

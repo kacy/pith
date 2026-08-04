@@ -370,6 +370,29 @@ key. h2c needs neither, which makes it the easy choice behind a load balancer
 that terminates tls. reach for `listen_tls` when the pith server terminates tls
 itself.
 
+## graceful shutdown
+
+`listen` and `listen_tls` serve forever until a shutdown is requested. one call
+wires that to `SIGTERM`:
+
+```pith
+import std.shutdown as shutdown
+
+fn main() -> Int!:
+    shutdown.on_signals()!
+    web.new().get("/", home).listen("0.0.0.0", 8080)!
+    return 0
+```
+
+on `SIGTERM` (or `SIGINT`/`SIGHUP`) the listener stops accepting and releases its
+port, the in-flight requests are given a grace period to finish, and `listen`
+returns the work that was still unfinished when that period expired — `0` for a
+clean drain. a rolling deploy stops severing responses mid-flight. without the
+`on_signals()` call nothing changes and `listen` blocks forever, as before.
+
+[docs/signals.md](signals.md) covers the drain, the coordinator, and what a
+long-lived streaming handler has to do differently.
+
 ## a runnable example
 
 `examples/web_hello.pith` is a complete, self-checking server: it defines a couple of
@@ -378,4 +401,5 @@ replies. `examples/web_observability.pith` does the same and then scrapes `/metr
 show the request counter the framework kept on its own. `examples/web_h2.pith` serves
 the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.
 `bench/web_hello.pith` is the same idea as a real blocking server, wired up for
-`bench/http_bench.sh`.
+`bench/http_bench.sh`. `examples/graceful_shutdown.pith` serves, signals itself,
+and prints the drain outcome.

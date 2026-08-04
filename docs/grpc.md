@@ -370,6 +370,18 @@ per-call metadata still works through the `*_with_headers` forms and is appended
 after the channel's, so a call can add to the credentials but not silently drop
 them.
 
+## graceful shutdown
+
+every `serve*` entry point rides the http/2 accept loop, so they all drain on
+`SIGTERM` once `std.shutdown.on_signals()` has been called. the listener stops
+accepting, the rpcs already in progress run to their trailers, and `serve`
+returns the work left unfinished at the grace period — `0` for a clean drain. an
+rpc is never severed by the drain itself.
+
+a long-lived streaming handler is the exception: a stream that never ends
+outlasts any grace period, so it should poll `shutdown.requested()` between
+messages and finish itself. see [docs/signals.md](signals.md).
+
 ## what isn't here yet
 
 - **generated streaming is server-side.** the generated *client* still collects

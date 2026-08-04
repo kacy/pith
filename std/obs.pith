@@ -18,6 +18,9 @@
 import std.env as env
 import std.metrics as metrics
 import std.otlp as otlp
+# aliased to `lifecycle` because this module already has a `shutdown` of its own
+# — obs.shutdown() stops the exporter, std.shutdown coordinates the process.
+import std.shutdown as lifecycle
 import std.strings as strings
 import std.time as time
 import std.trace as trace
@@ -83,12 +86,42 @@ fn flush_spans(dest: otlp.Target):
 fn flush_metrics(dest: otlp.Target):
     otlp.export_metrics(dest, metrics.snapshot()) catch false
 
+# sleep out one tick, returning early once the exporter should stop — either
+# because obs.shutdown() cleared the running flag, or because a process-wide
+# graceful shutdown was requested (a SIGTERM, say).
+#
+# returns whether it should stop. sleeping the whole tick blind is what made the
+# old obs.shutdown() unable to flush: the default span delay is five seconds and
+# the metric interval a minute, so a shutdown that waited 50ms for a final flush
+# was asking a loop most of a minute into its sleep. that batch was simply lost.
+fn wait_for_tick_or_stop(tick: Int) -> Bool:
+    deadline := time.mono_millis() + tick
+    while true:
+        if not is_running():
+            return true
+        if lifecycle.requested():
+            return true
+        remaining := deadline - time.mono_millis()
+        if remaining <= 0:
+            return false
+        # slice the sleep so a shutdown is noticed within one slice rather than
+        # at the end of a whole export interval. each slice parks the task, so
+        # an idle exporter holds no worker between them.
+        mut slice := lifecycle.WAKE_SLICE_MS
+        if remaining < slice:
+            slice = remaining
+        time.delay(slice)
+    return false
+
 # the background loop: wake every `tick` ms to flush spans, and flush metrics
-# once every `metric_interval` ms. on shutdown it does one last flush of both.
+# once every `metric_interval` ms. on shutdown it does one last flush of both
+# and only then reports its flush done — std.shutdown's drain is waiting on
+# exactly that, which is what keeps a graceful shutdown from losing spans.
 fn run_exporter(dest: otlp.Target, tick: Int, metric_interval: Int):
     mut since_metrics := 0
     while is_running():
-        time.delay(tick)
+        if wait_for_tick_or_stop(tick):
+            break
         flush_spans(dest)
         since_metrics = since_metrics + tick
         if since_metrics >= metric_interval:
@@ -97,6 +130,10 @@ fn run_exporter(dest: otlp.Target, tick: Int, metric_interval: Int):
     # a clean shutdown drains whatever is left.
     flush_spans(dest)
     flush_metrics(dest)
+    # the loop is over either way, so clear the flag before releasing the drain:
+    # a caller that sees the flush finish must not then see active() lie.
+    set_running(false)
+    lifecycle.flush_done()
 
 # the smaller of two positive intervals, but never below 1ms so the loop cannot
 # busy-spin. the tick is min(span delay, metric interval) so neither signal is
@@ -161,6 +198,10 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
     trace.set_active(true)
     trace.set_sink(true)
     tick := loop_tick(span_delay_ms, metric_interval_ms)
+    # tell std.shutdown there is a subsystem with shutdown work of its own, so a
+    # graceful drain waits for the final export instead of exiting on top of it.
+    # run_exporter answers with flush_done() when that export has finished.
+    lifecycle.expect_flush()
     # a bare, unqualified call so `spawn` accepts it; the task detaches and runs
     # for the process lifetime (until shutdown()).
     spawn run_exporter(dest, tick, metric_interval_ms)
@@ -193,8 +234,18 @@ pub fn init():
 pub fn active() -> Bool:
     return is_running()
 
+# the longest shutdown() waits for the exporter's final export. two POSTs (spans
+# and metrics), each already bounded by the target's own request timeout, so this
+# only has to cover both plus the loop noticing the flag.
+FLUSH_DEADLINE_MS := 5000
+
 # stop the background exporter and let it flush one final time. safe to call
 # even if init() never ran. after shutdown, a later init() can start again.
+#
+# this waits for the final export to finish rather than guessing at how long it
+# takes, bounded by FLUSH_DEADLINE_MS. a server draining on SIGTERM does not
+# need to call this at all: std.shutdown's drain already waits for the same
+# flush, so the batch goes out either way.
 pub fn shutdown():
     obs_mu.lock()
     was_running := running
@@ -203,8 +254,7 @@ pub fn shutdown():
     obs_mu.unlock()
     if not was_running:
         return
-    # give the loop a moment to observe the flag, wake, and do its final flush.
-    time.delay(50)
+    lifecycle.wait_flushes(FLUSH_DEADLINE_MS)
 
 # --- tests ------------------------------------------------------------------
 
@@ -239,6 +289,37 @@ test "the header parser splits k=v pairs, trims, and skips junk":
     assert_eq(parsed[2], "x-tenant")     # surrounding spaces trimmed
     assert_eq(parsed[3], "acme")
     assert_eq(parse_headers("").len(), 0)
+
+test "a graceful shutdown waits for the exporter's final export":
+    lifecycle.reset()
+    no_headers: List[String] := []
+    # port 1 refuses instantly, so the two final POSTs fail fast and the test
+    # measures the flush accounting rather than a network timeout. the export
+    # is best effort by design — a collector being down must not wedge a drain.
+    start("svc", "1.0.0", "instance-1", "http://127.0.0.1:1", otlp.PROTOCOL_HTTP, no_headers, 500, "", 60000, 5000, "parentbased_always_on", 1.0)
+    assert(active())
+    # the exporter registered itself as shutdown work, so a drain now waits.
+    assert_eq(lifecycle.flushes_pending(), 1)
+
+    lifecycle.request()
+    # the loop wakes within a slice rather than at the end of its five second
+    # span delay, does its last export, and reports done.
+    assert_eq(lifecycle.wait_flushes(10000), 0)
+    assert(not active())
+
+    # and a whole-process drain is clean once that flush has landed.
+    assert_eq(lifecycle.drain(1000), 0)
+    lifecycle.reset()
+    shutdown()
+
+test "a drain is clean when observability was never turned on":
+    lifecycle.reset()
+    init()
+    assert(not active())
+    # nothing registered any shutdown work, so there is nothing to wait for.
+    assert_eq(lifecycle.flushes_pending(), 0)
+    assert_eq(lifecycle.drain(1000), 0)
+    lifecycle.reset()
 
 test "the header parser drops an entry with an empty key":
     parsed := parse_headers("=noKey,good=value")

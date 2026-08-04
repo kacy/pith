@@ -1,0 +1,103 @@
+# graceful shutdown: a server that survives a rolling deploy.
+#
+# an orchestrator ends a process by sending SIGTERM, waiting out a grace period,
+# and then sending SIGKILL. a server that ignores the first signal has its
+# in-flight requests cut off by the second. this example does the whole dance in
+# one process:
+#
+#   1. std.shutdown.on_signals() arms SIGTERM/SIGINT/SIGHUP and requests a drain
+#      when one arrives.
+#   2. a client starts a slow request, so there is real work in flight.
+#   3. the process sends itself a SIGTERM, standing in for the orchestrator.
+#   4. the listener stops accepting immediately — a new connection is refused —
+#      while the request already being served runs to completion.
+#   5. listen() returns only after the drain finishes, reporting what was left
+#      unfinished. 0 means nothing was lost.
+#
+# a "subsystem flush" task stands in for the telemetry exporter (std.obs
+# registers itself the same way), showing that a drain also waits for a pending
+# span batch to be exported before the process exits.
+#
+# Run:  pith run examples/graceful_shutdown.pith
+
+import std.net.http as http
+import std.shutdown as shutdown
+import std.signal as signal
+import std.time as time
+import std.web as web
+
+PORT := 50261
+
+# how long the slow handler takes. it must still be running when the SIGTERM
+# lands, which is the whole point: the drain has to wait for it. the delays
+# below are spaced with wide margins so the printed order is the same on a busy
+# machine as on an idle one.
+HANDLER_MS := 1500
+
+# a handler slow enough to still be in flight when the shutdown signal arrives.
+fn slow(req: web.Request) -> http.HttpResponse:
+    time.delay(HANDLER_MS)
+    return http.text(200, "finished")
+
+fn make_app() -> web.App:
+    return web.new().get("/slow", slow)
+
+# the client whose request is in flight across the shutdown. it starts before
+# the signal and finishes after it, so its success is the proof that a drain
+# does not sever work already accepted.
+fn slow_request():
+    body := http.get("127.0.0.1", PORT, "/slow") catch "<failed>"
+    print("  in-flight request finished: " + body)
+
+# stand-in for the telemetry exporter. std.obs registers itself with
+# expect_flush() when it starts and answers flush_done() once its final batch
+# has been exported; the drain waits for that, which is how a clean shutdown
+# loses no spans. here the "export" is a short delay.
+fn exporter():
+    # park until a shutdown is requested rather than polling a flag.
+    shutdown.wait_requested(30000)
+    time.delay(100)
+    print("  telemetry exporter flushed its final batch")
+    shutdown.flush_done()
+
+# drive the whole scenario from a task while main serves.
+fn drive():
+    time.delay(400)
+    print("server listening on 127.0.0.1:" + PORT.to_string())
+
+    print("client: GET /slow (the handler takes " + HANDLER_MS.to_string() + "ms)")
+    spawn slow_request()
+    # let the request reach the handler, so it is genuinely mid-flight.
+    time.delay(250)
+
+    print("orchestrator: sending SIGTERM")
+    signal.raise_self(signal.SIGTERM)
+
+    # the listener stops accepting and its port is released as soon as the
+    # signal is handled, so a new client is refused while the earlier one is
+    # still being served. the wait is long enough that the stand-in exporter
+    # above has certainly reported in first.
+    time.delay(600)
+    refused := http.get("127.0.0.1", PORT, "/slow") catch "<connection refused>"
+    print("client: a NEW request after SIGTERM -> " + refused)
+
+fn main():
+    # finish well inside a typical 30 second orchestrator grace period.
+    shutdown.set_drain_deadline(10000)
+
+    # arm SIGTERM/SIGINT/SIGHUP and drain when one lands. one call is the whole
+    # wiring; without it, SIGTERM keeps its default disposition and kills the
+    # process mid-request.
+    armed := shutdown.on_signals() catch 0
+    print("armed " + armed.to_string() + " shutdown signals")
+
+    # register the stand-in exporter as shutdown work the drain must wait for.
+    shutdown.expect_flush()
+    spawn exporter()
+    spawn drive()
+
+    # serves until the drain completes, then returns the work left unfinished.
+    left := make_app().listen("127.0.0.1", PORT) catch 0 - 1
+    print("listen returned; unfinished work at the deadline: " + left.to_string())
+    if left == 0:
+        print("clean shutdown: no request dropped, no telemetry lost")

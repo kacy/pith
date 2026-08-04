@@ -1,0 +1,189 @@
+## std.signal — receive posix signals as ordinary values.
+##
+## a server that cannot hear SIGTERM cannot be deployed. every orchestrator ends
+## a process the same way: send SIGTERM, wait a grace period, then SIGKILL. a
+## process that ignores the first one is killed by the second, mid-request, with
+## its telemetry batch still in memory.
+##
+## this module turns that signal into a value you can wait for:
+##
+##     import std.signal as signal
+##     import std.shutdown as shutdown
+##
+##     fn main():
+##         signal.notify_shutdown() catch 0
+##         spawn serve()
+##         signal.wait_forever()
+##         shutdown.request()
+##
+## the wait is a real park, not a poll: inside a green task it suspends the
+## coroutine on the epoll reactor and its worker runs other tasks meanwhile.
+##
+## ## the one sharp edge
+##
+## arming a signal replaces its default disposition. after `notify_shutdown()`
+## the process no longer dies on SIGTERM — something must wait for it and act.
+## arm signals only where you also handle them; std.shutdown's `on_signals()`
+## pairs the two so this cannot be got wrong by accident.
+
+import std.bits as bits
+
+## hangup — historically a lost terminal, conventionally "reload your config".
+pub SIGHUP := 1
+## interrupt — ctrl-c at a terminal.
+pub SIGINT := 2
+## quit — ctrl-\ at a terminal, conventionally with a core dump.
+pub SIGQUIT := 3
+## terminate — the polite "stop now" every orchestrator sends first.
+pub SIGTERM := 15
+
+## the highest signal number this module will arm. signals are encoded as bit
+## positions in an Int mask, so bit 63 is the ceiling.
+pub MAX_SIGNAL := 63
+
+## the standard shutdown trio: SIGTERM from an orchestrator, SIGINT from a
+## terminal, SIGHUP from a departing session. a server should treat all three
+## as "drain and exit".
+pub fn shutdown_signals() -> List[Int]:
+    return [SIGTERM, SIGINT, SIGHUP]
+
+## the conventional name of a signal number, or "SIG<n>" for one this module
+## does not name. for logs, so a drain line reads SIGTERM rather than 15.
+pub fn name(sig: Int) -> String:
+    if sig == SIGHUP:
+        return "SIGHUP"
+    if sig == SIGINT:
+        return "SIGINT"
+    if sig == SIGQUIT:
+        return "SIGQUIT"
+    if sig == SIGTERM:
+        return "SIGTERM"
+    return "SIG" + sig.to_string()
+
+## fold a list of signal numbers into the bitmask the runtime takes. fails on a
+## number outside the encodable range rather than silently dropping it — an
+## arm that quietly skipped SIGTERM is exactly the bug this module exists to
+## prevent.
+fn mask_of(signals: List[Int]) -> Int!:
+    mut mask := 0
+    for sig in signals:
+        if sig <= 0 or sig > MAX_SIGNAL:
+            fail "signal: {sig} is outside the encodable range 1..{MAX_SIGNAL}"
+        mask = bits.bor(mask, bits.shl(1, sig))
+    return mask
+
+## start queueing `signals`. returns how many were armed. idempotent: arming a
+## signal twice is harmless, and a later call may add more.
+##
+## fails if the list is empty, names an unencodable number, or names a signal
+## the kernel refuses (SIGKILL and SIGSTOP cannot be caught). a partial arm is
+## reported as a failure, never as a success over a subset.
+##
+## remember that this replaces the signal's default disposition — see the module
+## header.
+pub fn notify(signals: List[Int]) -> Int!:
+    if signals.len() == 0:
+        fail "signal: notify needs at least one signal"
+    armed := signal_notify(mask_of(signals)!)
+    if armed < 0:
+        fail "signal: the kernel refused to arm one of these signals"
+    return armed
+
+## arm the standard shutdown trio (SIGTERM, SIGINT, SIGHUP).
+pub fn notify_shutdown() -> Int!:
+    return notify(shutdown_signals())!
+
+## the next queued signal number, or 0 if `timeout_ms` passed with none. a
+## negative timeout waits indefinitely.
+##
+## returns -1 if no signal is armed — waiting for a signal that can never
+## arrive is a bug, and reporting it beats blocking forever.
+##
+## the wait parks: under the green runtime the calling task suspends and its
+## worker OS thread stays free for other work.
+pub fn wait(timeout_ms: Int) -> Int:
+    return signal_wait(timeout_ms)
+
+## wait indefinitely for the next queued signal. returns its number, or -1 if
+## nothing is armed.
+pub fn wait_forever() -> Int:
+    return signal_wait(-1)
+
+## send `sig` to this process, exactly as an orchestrator would (process
+## directed, not thread directed). returns false if the signal number is out of
+## range or the kernel refuses.
+##
+## this is how a signal path is tested honestly — the real handler, the real
+## queue, the real wait — and how a program can trigger its own drain.
+pub fn raise_self(sig: Int) -> Bool:
+    return signal_raise(sig) == 1
+
+## this process's id.
+pub fn pid() -> Int:
+    return os_pid()
+
+# --- tests ------------------------------------------------------------------
+
+test "signal names cover the shutdown trio and fall back for the rest":
+    assert_eq(name(SIGTERM), "SIGTERM")
+    assert_eq(name(SIGINT), "SIGINT")
+    assert_eq(name(SIGHUP), "SIGHUP")
+    assert_eq(name(SIGQUIT), "SIGQUIT")
+    assert_eq(name(9), "SIG9")
+
+test "the shutdown trio is the three signals an orchestrator sends":
+    trio := shutdown_signals()
+    assert_eq(trio.len(), 3)
+    assert_eq(trio[0], SIGTERM)
+    assert_eq(trio[1], SIGINT)
+    assert_eq(trio[2], SIGHUP)
+
+test "a signal mask sets one bit per signal":
+    single := mask_of([SIGTERM]) catch -1
+    assert_eq(single, bits.shl(1, 15))
+    pair := mask_of([SIGINT, SIGTERM]) catch -1
+    assert_eq(pair, bits.bor(bits.shl(1, 2), bits.shl(1, 15)))
+
+test "an unencodable signal number fails the whole mask":
+    assert((mask_of([SIGTERM, 99]) catch -1) == -1)
+    assert((mask_of([0]) catch -1) == -1)
+
+test "notify rejects an empty signal list":
+    empty: List[Int] := []
+    assert((notify(empty) catch -1) == -1)
+
+test "notify reports how many signals it armed":
+    # SIGUSR1 (10) and SIGUSR2 (12) are used throughout these tests instead of
+    # the shutdown trio: a stray delivery of one is harmless, whereas arming
+    # SIGTERM here would change how the test process itself can be stopped.
+    assert_eq(notify([10]) catch -1, 1)
+    assert_eq(notify([10, 12]) catch -1, 2)
+
+test "a signal sent to this process comes back from wait":
+    assert_eq(notify([10]) catch -1, 1)
+    assert(raise_self(10))
+    # a generous bound: a slow box should report a real failure, not hang.
+    assert_eq(wait(5000), 10)
+
+test "wait reports a timeout distinctly from a delivery":
+    assert_eq(notify([12]) catch -1, 1)
+    # nothing was raised, so this drains to empty and then times out at 0 —
+    # which a drain loop must be able to tell apart from a real signal.
+    assert_eq(wait(10), 0)
+
+test "signals queue, so none is lost between waits":
+    assert_eq(notify([10, 12]) catch -1, 2)
+    assert(raise_self(10))
+    assert(raise_self(12))
+    first := wait(5000)
+    second := wait(5000)
+    assert(first == 10 or first == 12)
+    assert(second == 10 or second == 12)
+    assert(first != second)
+
+test "raise_self rejects a signal outside the encodable range":
+    assert(not raise_self(0))
+    assert(not raise_self(MAX_SIGNAL + 1))
+
+test "pid reports a real process id":
+    assert(pid() > 0)

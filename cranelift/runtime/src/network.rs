@@ -481,6 +481,38 @@ pub extern "C" fn pith_tcp_close(fd: i64) {
     }
 }
 
+/// shut a socket down for both directions without closing it — the graceful
+/// shutdown primitive for a *listening* socket. returns 1 on success, 0 if the
+/// kernel refuses (an fd that is not a socket, or already shut down).
+///
+/// this exists because closing a listener is not enough to stop an accept loop.
+/// a green task parked on `accept` is woken by the close (the reactor's
+/// `on_close` resolves its wait), but an accept loop running on a thread with no
+/// green task behind it — `listen()` called straight from `main`, the shape
+/// every server example uses — is blocked inside `accept`/`poll`, and closing an
+/// fd does not wake a blocking call already waiting on it. `shutdown` does: the
+/// blocked `accept` returns `EINVAL` and a poll/epoll wait reports `HUP`.
+///
+/// it also removes the close race. the fd stays valid, so the accept loop that
+/// owns the listener closes it itself, once, on its own way out — rather than
+/// having it closed underneath by another task, which risks closing whatever the
+/// kernel has since handed that number to.
+#[no_mangle]
+pub extern "C" fn pith_tcp_shutdown(fd: i64) -> i64 {
+    if fd <= 0 {
+        return 0;
+    }
+    // SAFETY: `shutdown` on an fd pith owns. it does not free the descriptor, so
+    // it is safe to call while another task is blocked on the same fd — which is
+    // the entire point.
+    let rc = unsafe { libc::shutdown(fd as i32, libc::SHUT_RDWR) };
+    if rc == 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// DNS resolve — resolve hostname to IP address string
 ///
 /// under the green backend the lookup runs on the resolver pool and this task

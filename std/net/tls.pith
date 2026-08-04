@@ -1260,6 +1260,18 @@ pub fn handshake(listener: Listener, fd: Int) -> Conn!:
 pub fn listener_from_handle(handle: Int) -> Listener:
     return Listener(handle)
 
+# forget a listener's tls config without touching its socket.
+#
+# Listener.close() does both halves, which is right for a listener the caller
+# owns outright. during a graceful shutdown it is not: std.shutdown owns the
+# socket (it closes registered listeners itself, which is what wakes a parked
+# accept promptly), so the accept loop must release only the config half. doing
+# both would close an fd number the kernel may already have reused.
+#
+# safe to call on a listener whose config is already gone; it is a no-op then.
+pub fn release_listener_config(listener: Listener):
+    config_drop(native_listener_config, listener.handle)
+
 # how many server handshakes have failed since this process started.
 #
 # a handshake fails when a peer opens a connection and then hangs up, sends

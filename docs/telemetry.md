@@ -246,6 +246,46 @@ grpc client has no cleartext h2c — so a `grpc` target needs an `https://`
 endpoint; a plain `http://` grpc endpoint fails with a clear message rather than
 mis-dialing.
 
+## flushing on exit
+
+the exporter batches, so at any moment there is a span batch in memory that the
+collector has not seen. a process killed at that moment loses it — and the spans
+worth having are usually the ones from the minute a deploy went wrong.
+
+a graceful shutdown does not lose them. when `obs.start()` spawns its exporter it
+registers with `std.shutdown` as a subsystem with shutdown work of its own, and
+answers only once its final export has finished. so a server that drains on
+`SIGTERM` waits for that export before returning:
+
+```pith
+import std.obs as obs
+import std.shutdown as shutdown
+import std.web as web
+
+fn main() -> Int!:
+    obs.init()
+    shutdown.on_signals()!
+    # returns after the in-flight requests AND the final span batch are done
+    web.new().get("/", home).listen("0.0.0.0", 8080)!
+    return 0
+```
+
+no extra call is needed — `listen` already waits. the whole drain is bounded by
+`shutdown.set_drain_deadline(ms)` (15 seconds by default), so an unreachable
+collector delays a shutdown but cannot wedge it; the export is best effort, and a
+failed POST is dropped rather than retried past the deadline.
+
+the exporter notices a shutdown within about 100ms rather than at the end of its
+own interval. that matters: the span delay defaults to 5 seconds and the metric
+interval to a minute, so a batch that waited a full interval after `SIGTERM` is a
+batch the grace period has already spent.
+
+calling `obs.shutdown()` by hand does the same thing for a program with no
+server: it stops the exporter and waits (up to 5 seconds) for the final export
+rather than guessing at how long it takes.
+
+see [docs/signals.md](signals.md) for the drain itself.
+
 ## what isn't here yet
 
 - **OTLP logs** — logs aren't exported over OTLP. `std.log` records already carry

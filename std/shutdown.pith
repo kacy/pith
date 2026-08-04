@@ -1,0 +1,436 @@
+## std.shutdown — stop accepting, finish what is in flight, then exit.
+##
+## a rolling deploy sends SIGTERM, waits a grace period, and then sends SIGKILL.
+## everything still running when the second signal lands is lost: half-written
+## responses, severed streams, a telemetry batch that never left the process.
+## draining is what turns that into a clean handover.
+##
+##     import std.shutdown as shutdown
+##     import std.web as web
+##
+##     fn main():
+##         shutdown.on_signals() catch 0
+##         app := web.new().get("/", home)
+##         app.listen("0.0.0.0", 8080) catch 0
+##
+## `on_signals()` arms SIGTERM/SIGINT/SIGHUP and requests a drain when one
+## arrives. `listen` then returns instead of blocking forever, and returns only
+## after the in-flight requests have finished or the grace period has expired.
+##
+## ## the three moving parts
+##
+## - **listeners.** a server registers its listening fd here. `request()` calls
+##   `shutdown(2)` on each, which both stops new connections and wakes the
+##   waiting accept loop immediately — no polling for the flag. the loop still
+##   closes its own listener, so nothing closes an fd another task is using.
+## - **in-flight work.** each connection task brackets itself with
+##   `enter()`/`leave()`, so `drain()` knows when the last one is done.
+## - **flushes.** a subsystem with its own shutdown work — the telemetry
+##   exporter is the one in std — calls `expect_flush()` up front and
+##   `flush_done()` when it has finished. `drain()` waits for those too, which
+##   is what keeps a clean shutdown from losing spans.
+##
+## every count is a count, not a flag, so nested servers and several subsystems
+## compose without coordinating with each other.
+
+import std.signal as signal
+import std.time as time
+
+## how often a drain re-checks whether the last request has finished. small,
+## because it only runs during shutdown and only until the count reaches zero.
+pub POLL_INTERVAL_MS := 5
+
+## the longest a subsystem waiting on `wait_requested` sleeps before re-checking
+## the flag. this is the latency between a signal arriving and a background
+## subsystem noticing, and it is deliberately coarse: the cost is a handful of
+## short parks per second on an otherwise idle task.
+pub WAKE_SLICE_MS := 100
+
+## the default grace period for a drain, in milliseconds. kubernetes defaults to
+## a 30 second grace period before SIGKILL, so finishing well inside that leaves
+## room for the final telemetry flush.
+pub DEFAULT_DRAIN_MS := 15000
+
+# one lock over all of the state below. every access goes through it, so a
+# server registering a listener, a connection task incrementing the in-flight
+# count, and the signal task requesting a shutdown cannot interleave into a
+# state where a listener is closed but still registered, or the count is lost.
+# the tcp_close calls happen outside it — a syscall under a lock a connection
+# task also wants is how an accept loop and a request path deadlock.
+mut mu := Mutex()
+mut drain_deadline_ms := DEFAULT_DRAIN_MS
+mut requested_flag := false
+mut listener_fds: List[Int] := []
+mut inflight_count := 0
+mut pending_flushes := 0
+
+## whether a graceful shutdown has been requested. an accept loop tests this to
+## tell "the accept failed because we are shutting down" from "the accept failed
+## because something broke" — the first ends the loop, the second backs off and
+## retries. a long-lived handler polls it to finish its own work early.
+pub fn requested() -> Bool:
+    mu.lock()
+    r := requested_flag
+    mu.unlock()
+    return r
+
+## request a graceful shutdown: set the flag and shut down every registered
+## listener, so no new connection is accepted.
+##
+## `shutdown(2)` rather than `close(2)`, for two reasons. it wakes an accept loop
+## whichever way that loop is waiting — a green task parked on the epoll reactor
+## sees a hangup, and a plain thread blocked inside `accept` (which is what
+## `listen()` called straight from `main` is) gets an error back, where a close
+## would have left it blocked indefinitely. and the fd stays valid, so the accept
+## loop that owns the listener still closes it itself, exactly once, on its own
+## way out — nothing closes an fd another task is mid-syscall on.
+##
+## idempotent: the flag re-sets and a second shutdown of the same socket is a
+## harmless no-op.
+pub fn request():
+    mu.lock()
+    requested_flag = true
+    # snapshot under the lock, act outside it: a syscall while holding a lock a
+    # connection task also wants is how an accept loop and a request path
+    # deadlock. the registry is left intact — each listener is closed by the
+    # loop that owns it.
+    mut stopping: List[Int] := []
+    for fd in listener_fds:
+        stopping.push(fd)
+    mu.unlock()
+    for fd in stopping:
+        tcp_shutdown(fd)
+
+## register a listening fd so `request()` can stop it accepting. returns the fd,
+## so it reads naturally at a bind site. the accept loop still owns the close —
+## do it through `close_listener`, which unregisters at the same time.
+pub fn register_listener(fd: Int) -> Int:
+    mu.lock()
+    listener_fds.push(fd)
+    mu.unlock()
+    return fd
+
+# remove `fd` from the registry, reporting whether it was still there. only the
+# caller that gets `true` closes it, which is what makes the close exactly-once
+# when an accept loop both closes its listener explicitly (to free the port
+# before draining) and has a `defer` covering its error exits.
+fn take_listener(fd: Int) -> Bool:
+    mu.lock()
+    mut found := false
+    mut rest: List[Int] := []
+    for existing in listener_fds:
+        if existing == fd and not found:
+            found = true
+            continue
+        rest.push(existing)
+    listener_fds = rest
+    mu.unlock()
+    return found
+
+## close a registered listener, exactly once, and unregister it. a second call
+## is a no-op rather than a second `close(2)` — closing an fd twice risks closing
+## whatever unrelated socket the kernel handed that number to in between.
+pub fn close_listener(fd: Int):
+    if take_listener(fd):
+        tcp_close(fd)
+
+## how many listeners are currently registered.
+pub fn listeners() -> Int:
+    mu.lock()
+    n := listener_fds.len()
+    mu.unlock()
+    return n
+
+## mark one unit of in-flight work started. a server calls this as a connection
+## task begins; `drain()` will not report a clean shutdown until it leaves.
+pub fn enter():
+    mu.lock()
+    inflight_count = inflight_count + 1
+    mu.unlock()
+
+## mark one unit of in-flight work finished. pair it with `enter()` through
+## `defer`, so a handler that fails still releases its count.
+pub fn leave():
+    mu.lock()
+    inflight_count = inflight_count - 1
+    mu.unlock()
+
+## how many units of work are in flight right now.
+pub fn inflight() -> Int:
+    mu.lock()
+    n := inflight_count
+    mu.unlock()
+    return n
+
+## announce that this subsystem has shutdown work of its own to finish, so
+## `drain()` waits for it. std.obs calls this when its exporter starts.
+pub fn expect_flush():
+    mu.lock()
+    pending_flushes = pending_flushes + 1
+    mu.unlock()
+
+## report that this subsystem's shutdown work is done. pair with
+## `expect_flush()`; a subsystem that never calls this holds the drain open for
+## the whole grace period.
+pub fn flush_done():
+    mu.lock()
+    if pending_flushes > 0:
+        pending_flushes = pending_flushes - 1
+    mu.unlock()
+
+## how many subsystems have shutdown work still outstanding.
+pub fn flushes_pending() -> Int:
+    mu.lock()
+    n := pending_flushes
+    mu.unlock()
+    return n
+
+# the total work a drain is waiting on: connections still being served plus
+# subsystems still flushing.
+fn outstanding() -> Int:
+    mu.lock()
+    n := inflight_count + pending_flushes
+    mu.unlock()
+    return n
+
+## block until a shutdown is requested or `timeout_ms` elapses; returns whether
+## one was requested. a background subsystem waits here instead of sleeping its
+## full interval blind, so a SIGTERM is noticed within WAKE_SLICE_MS rather than
+## up to a minute later.
+##
+## a zero or negative timeout is a bare poll of the flag.
+pub fn wait_requested(timeout_ms: Int) -> Bool:
+    if requested():
+        return true
+    if timeout_ms <= 0:
+        return false
+    deadline := time.mono_millis() + timeout_ms
+    while not requested():
+        remaining := deadline - time.mono_millis()
+        if remaining <= 0:
+            return false
+        mut slice := WAKE_SLICE_MS
+        if remaining < slice:
+            slice = remaining
+        time.delay(slice)
+    return true
+
+## wait for subsystem flushes alone to finish, up to `deadline_ms`, ignoring
+## in-flight connections. returns how many are still outstanding — 0 means every
+## subsystem finished its shutdown work.
+##
+## this is the half a subsystem wants when it is shutting *itself* down while
+## the servers keep running; `drain()` is the whole-process version.
+pub fn wait_flushes(deadline_ms: Int) -> Int:
+    deadline := time.mono_millis() + deadline_ms
+    while flushes_pending() > 0:
+        if time.mono_millis() >= deadline:
+            return flushes_pending()
+        time.delay(POLL_INTERVAL_MS)
+    return 0
+
+## wait for in-flight work and subsystem flushes to finish, up to
+## `deadline_ms`. returns the amount of work still outstanding when it gave up —
+## 0 means everything finished cleanly, and anything else is what a rolling
+## deploy is about to cut off, which is worth logging.
+pub fn drain(deadline_ms: Int) -> Int:
+    deadline := time.mono_millis() + deadline_ms
+    while outstanding() > 0:
+        if time.mono_millis() >= deadline:
+            return outstanding()
+        time.delay(POLL_INTERVAL_MS)
+    return 0
+
+## the grace period every std server gives its in-flight requests, in
+## milliseconds. one knob rather than an argument on each of the nine listen
+## entry points, because the right value is a property of the deployment — it
+## has to fit inside the orchestrator's own grace period — not of one listener.
+pub fn drain_deadline() -> Int:
+    mu.lock()
+    ms := drain_deadline_ms
+    mu.unlock()
+    return ms
+
+## set the grace period every std server uses. call it once at startup, before
+## the servers begin. a non-positive value is ignored: draining with no grace at
+## all is indistinguishable from not draining, and is more likely a bug than an
+## intent.
+pub fn set_drain_deadline(ms: Int):
+    if ms <= 0:
+        return
+    mu.lock()
+    drain_deadline_ms = ms
+    mu.unlock()
+
+## drain using the configured grace period. this is what the std servers call
+## when their accept loop ends.
+pub fn drain_default() -> Int:
+    return drain(drain_deadline())
+
+## arm the shutdown signals (SIGTERM, SIGINT, SIGHUP) and request a graceful
+## shutdown when one arrives. returns immediately, having spawned a task that
+## parks on the signal queue; returns how many signals were armed.
+##
+## this is the one call a server needs. arming a signal replaces its default
+## disposition, so pairing the two here is what keeps a process from arming
+## SIGTERM and then ignoring it — see std.signal's header.
+pub fn on_signals() -> Int!:
+    armed := signal.notify_shutdown()!
+    # a bare, unqualified call so `spawn` accepts it. the task parks on the
+    # signal queue, so under the green runtime it holds no worker.
+    spawn await_signal()
+    return armed
+
+# park until a shutdown signal arrives, then request the drain. a negative
+# return means nothing is armed, which `on_signals` has already ruled out.
+fn await_signal() -> Int:
+    sig := signal.wait_forever()
+    if sig > 0:
+        request()
+    return sig
+
+## clear all shutdown state: the flag, the listener registry, the in-flight
+## count, and the pending flushes. for tests and for a process that restarts its
+## servers in-place; a normal program never needs it.
+##
+## registered listener fds are dropped without being closed, because a caller
+## resetting state has not necessarily finished with them.
+pub fn reset():
+    mu.lock()
+    requested_flag = false
+    listener_fds = []
+    inflight_count = 0
+    pending_flushes = 0
+    drain_deadline_ms = DEFAULT_DRAIN_MS
+    mu.unlock()
+
+# --- tests ------------------------------------------------------------------
+
+test "a fresh state is not shutting down and has nothing outstanding":
+    reset()
+    assert(not requested())
+    assert_eq(inflight(), 0)
+    assert_eq(flushes_pending(), 0)
+    assert_eq(listeners(), 0)
+
+test "request sets the flag and is idempotent":
+    reset()
+    request()
+    assert(requested())
+    request()
+    assert(requested())
+    reset()
+
+test "in-flight work counts up and down":
+    reset()
+    enter()
+    enter()
+    assert_eq(inflight(), 2)
+    leave()
+    assert_eq(inflight(), 1)
+    leave()
+    assert_eq(inflight(), 0)
+
+test "drain returns immediately when nothing is in flight":
+    reset()
+    assert_eq(drain(1000), 0)
+
+test "drain reports the work it gave up on":
+    reset()
+    enter()
+    # nothing will ever call leave(), so this must hit the deadline and report
+    # the one connection a rolling deploy is about to cut off.
+    assert_eq(drain(20), 1)
+    leave()
+    assert_eq(drain(100), 0)
+
+test "drain waits for a subsystem flush as well as for connections":
+    reset()
+    expect_flush()
+    assert_eq(flushes_pending(), 1)
+    assert_eq(drain(20), 1)
+    flush_done()
+    assert_eq(flushes_pending(), 0)
+    assert_eq(drain(100), 0)
+
+test "flush_done never drives the pending count negative":
+    reset()
+    flush_done()
+    flush_done()
+    assert_eq(flushes_pending(), 0)
+    expect_flush()
+    assert_eq(flushes_pending(), 1)
+    flush_done()
+    assert_eq(flushes_pending(), 0)
+
+test "a listener is closed exactly once":
+    reset()
+    # a real listening socket, so the close is a real close.
+    fd := tcp_listen("127.0.0.1", 0) catch -1
+    assert(fd > 0)
+    register_listener(fd)
+    assert_eq(listeners(), 1)
+    close_listener(fd)
+    assert_eq(listeners(), 0)
+    # the second close finds nothing registered and does not touch the fd
+    # number, which the kernel may already have handed to another socket.
+    close_listener(fd)
+    assert_eq(listeners(), 0)
+
+test "request stops every registered listener without closing it":
+    reset()
+    first := tcp_listen("127.0.0.1", 0) catch -1
+    second := tcp_listen("127.0.0.1", 0) catch -1
+    assert(first > 0 and second > 0)
+    register_listener(first)
+    register_listener(second)
+    assert_eq(listeners(), 2)
+    request()
+    assert(requested())
+    # the fds stay registered and valid: each accept loop closes its own
+    # listener on the way out, so nothing closes an fd another task is using.
+    assert_eq(listeners(), 2)
+    close_listener(first)
+    close_listener(second)
+    assert_eq(listeners(), 0)
+    reset()
+
+test "shutting a listener down twice is harmless":
+    reset()
+    fd := tcp_listen("127.0.0.1", 0) catch -1
+    assert(fd > 0)
+    register_listener(fd)
+    request()
+    # a second request finds the same listener and shuts it down again; the
+    # kernel refuses a redundant shutdown, which must not become an error here.
+    request()
+    assert(requested())
+    close_listener(fd)
+    reset()
+
+test "wait_requested returns false on timeout and true once requested":
+    reset()
+    assert(not wait_requested(20))
+    request()
+    assert(wait_requested(20))
+    assert(wait_requested(0))
+    reset()
+
+test "wait_requested with no timeout is a bare poll":
+    reset()
+    assert(not wait_requested(0))
+    reset()
+
+test "the drain deadline defaults, is settable, and rejects nonsense":
+    reset()
+    assert_eq(drain_deadline(), DEFAULT_DRAIN_MS)
+    set_drain_deadline(2500)
+    assert_eq(drain_deadline(), 2500)
+    # a zero or negative grace period is not a drain, so it is refused rather
+    # than silently turning every shutdown into a hard stop.
+    set_drain_deadline(0)
+    assert_eq(drain_deadline(), 2500)
+    set_drain_deadline(-1)
+    assert_eq(drain_deadline(), 2500)
+    reset()
+    assert_eq(drain_deadline(), DEFAULT_DRAIN_MS)

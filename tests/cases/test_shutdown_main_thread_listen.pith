@@ -1,0 +1,47 @@
+# listen() called straight from main, not from a spawned task — the shape every
+# doc and example uses, and the one no std test covers.
+#
+# this exists because that gap hid a real hang. waking the accept loop by
+# closing its listener works only when the acceptor is a green task, which is
+# what every colocated test does: they all `spawn` their server, so the accept
+# runs on a green stack and the reactor reports the close. called from main the
+# accept blocks in poll on the main thread, where closing a descriptor does not
+# wake a call already blocked on it, and the process hung until the harness
+# killed it. shutdown(2) wakes both shapes; this case is what keeps the
+# unspawned one honest.
+#
+# a timeout is the failure mode being guarded against, so the watchdog below
+# prints and exits rather than letting the case hang the suite.
+
+import std.web as web
+import std.net.http as http
+import std.signal as signal
+import std.shutdown as shutdown
+import std.time as time
+
+PORT := 50823
+
+fn home(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "ok")
+
+# ask for shutdown shortly after the server settles, from a task, so main is
+# genuinely blocked in listen() when the request arrives.
+fn ask_to_stop():
+    time.delay(250)
+    shutdown.request()
+
+# if listen() never returns, say so and leave rather than hanging the suite.
+fn watchdog():
+    time.delay(10000)
+    print("FAIL listen did not return")
+    exit(1)
+
+fn main() -> Int!:
+    spawn watchdog()
+    spawn ask_to_stop()
+    app := web.new().get("/", home)
+    # blocks here on the MAIN thread; the accept loop is not a green task
+    app.listen("127.0.0.1", PORT)!
+    print("listen returned from the main thread")
+    print("shutdown requested: {shutdown.requested()}")
+    return 0

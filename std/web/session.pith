@@ -464,6 +464,18 @@ impl Store:
                 drop_session(session_key(self.handle, id))
         session_mu.unlock()
 
+    # a cookie carrying this store's Path, SameSite, Secure and lifetime, but
+    # none of its meaning — the shape a companion cookie should take so that
+    # it travels exactly as far as the session it belongs to and expires with
+    # it. deliberately not HttpOnly: a companion cookie exists because
+    # something other than the server needs to read it, and the session
+    # cookie itself is the one that must stay out of reach.
+    fn companion_cookie(name: String, value: String) -> http.Cookie:
+        mut out := http.cookie(name, value).path(self.path_v).same_site(self.same_site_v).max_age(self.ttl_v)
+        if self.secure_v:
+            out = out.secure_only()
+        return out
+
     # how many sessions this store holds right now, expired ones included
     # until they are swept.
     fn count() -> Int:

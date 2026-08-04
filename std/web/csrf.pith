@@ -1,0 +1,404 @@
+# std.web.csrf - a synchroniser token, tied to the session
+#
+# a browser attaches a site's cookies to a request whatever page caused it,
+# which is what lets another site put a form on its own page, point it at
+# yours, and have it arrive fully authenticated. the defence is to require
+# something on every state-changing request that a cross-site page has no way
+# to read: a token that lives in the session and has to be sent back.
+#
+#   import std.web.csrf as csrf
+#
+#   protection := csrf.guard(sessions)
+#   app = app.use_mw(session.middleware(sessions))
+#   app = app.use_mw(csrf.middleware(protection))   # inside the session
+#
+# the guard lets GET, HEAD, OPTIONS and TRACE through untouched and demands a
+# token on everything else. the token comes from the `X-CSRF-Token` header,
+# or from a `csrf_token` field in a form body, and is compared against the
+# session's copy with `std.crypto.subtle`.
+#
+# a handler that renders a form asks for the token with `protection.token(req)`
+# and puts it in a hidden field. a request that has one already keeps it; one
+# that does not gets a fresh one, which is also what brings the session into
+# being. the middleware then mirrors it into a readable cookie on the way
+# out, so a fetch-based front end can read it from `document.cookie` and put
+# it in the header without a round trip to fetch it.
+#
+# ## why the mirror cookie is not the whole scheme
+#
+# handing out a readable cookie and comparing it against the header is the
+# "double submit" pattern, and on its own it leans on the attacker not being
+# able to write a cookie for your domain — which a sibling subdomain, or
+# anything that gets to set one, can do. here the cookie is a copy for
+# convenience and the session is the authority: the comparison is always
+# against what the store holds, so a cookie the attacker planted matches
+# nothing.
+#
+# SameSite=Lax on the session cookie (the default in `std.web.session`) turns
+# away most of this on its own. this is the layer underneath, for the cases
+# it does not cover: a top-level POST from another site, a browser that
+# ignores SameSite, and a session deliberately set to SameSite=None.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.net.http as http
+import std.net.url as url
+import std.crypto.random as random
+import std.crypto.subtle as subtle
+import std.web as web
+import std.web.session as session
+
+# 32 bytes, the same size as a session id and for the same reason: it is the
+# whole secret, and it is only ever compared, never decoded.
+TOKEN_BYTES := 32
+
+# where the token lives in the session. it shows up in `store.keys(req)`
+# alongside whatever the application put there, which is why it is spelled
+# with a prefix nothing else is likely to want.
+TOKEN_KEY := "csrf.token"
+
+# the defaults for where the token is looked for and mirrored to.
+DEFAULT_COOKIE := "csrf_token"
+DEFAULT_HEADER := "X-CSRF-Token"
+DEFAULT_FIELD := "csrf_token"
+
+# a urlencoded body larger than this is not scanned for the token. splitting
+# a ten megabyte body on "&" to find one field is work an attacker can ask
+# for over and over; a form that big should send the token in the header,
+# which costs nothing to read. multipart bodies are read by their own parser
+# and are not affected.
+MAX_FORM_BYTES := 65536
+
+# the methods that are not supposed to change anything, and so are let
+# through. rfc 7231 calls these safe, and a site whose GET handlers change
+# state has a problem this middleware cannot fix.
+fn is_safe(method: String) -> Bool:
+    return method == "GET" or method == "HEAD" or method == "OPTIONS" or method == "TRACE"
+
+# csrf protection bound to a session store: which store holds the token, and
+# what the header, form field and mirror cookie are called. build one with
+# `guard` and rename the pieces if your front end expects other names.
+pub struct Guard:
+    store: session.Store
+    cookie_v: String
+    header_v: String
+    field_v: String
+
+# protect the routes behind `store`'s sessions. the token lives in the
+# session, so the session middleware has to be registered outside this one.
+pub fn guard(store: session.Store) -> Guard:
+    return Guard(store, DEFAULT_COOKIE, DEFAULT_HEADER, DEFAULT_FIELD)
+
+impl Guard:
+    # the name of the readable cookie the token is mirrored into. the default
+    # is "csrf_token", which is what most front-end http clients look for.
+    fn cookie_name(name: String) -> Guard:
+        return Guard(self.store, name, self.header_v, self.field_v)
+
+    # the request header the token is read from. the default is
+    # "X-CSRF-Token".
+    fn header_name(name: String) -> Guard:
+        return Guard(self.store, self.cookie_v, name, self.field_v)
+
+    # the form field the token is read from when the request carries a form
+    # body. the default is "csrf_token".
+    fn field_name(name: String) -> Guard:
+        return Guard(self.store, self.cookie_v, self.header_v, name)
+
+    # this session's token, minting one — and with it the session — if there
+    # is none yet. a handler that renders a form calls this and writes the
+    # result into a hidden input; everything else can read it off the mirror
+    # cookie instead.
+    #
+    # it returns "" only when the os random source failed or the request
+    # never went through the session middleware. a form rendered with an
+    # empty token will be refused when it is submitted, which is the safe
+    # direction to fail in.
+    fn token(req: web.Request) -> String:
+        existing := self.store.get(req, TOKEN_KEY)
+        if existing.len() > 0:
+            return existing
+        minted := fresh_token() catch ""
+        if minted.len() == 0:
+            return ""
+        self.store.set(req, TOKEN_KEY, minted)
+        return self.store.get(req, TOKEN_KEY)
+
+fn fresh_token() -> String!:
+    return encoding.b64_url_raw_encode(random.bytes(TOKEN_BYTES)!)
+
+# find one field in an application/x-www-form-urlencoded body. the names are
+# percent-decoded before comparison, because a browser is free to encode them.
+fn form_field(body: String, name: String) -> String:
+    for pair in body.split("&"):
+        eq := pair.index_of("=")
+        if eq <= 0:
+            continue
+        if url.decode(pair.substring(0, eq)) == name:
+            return url.decode(pair.substring(eq + 1, pair.len()))
+    return ""
+
+# the token the request is offering, from wherever it put it. the header is
+# looked at first: it is the one place a cross-site form cannot reach, and it
+# costs nothing to read.
+fn offered_token(guard_v: Guard, req: web.Request) -> String:
+    header := req.header(guard_v.header_v)
+    if header.len() > 0:
+        return header
+    if req.raw.is_multipart() catch false:
+        return req.raw.multipart_text_or(guard_v.field_v, "")
+    if not req.header("Content-Type").contains("application/x-www-form-urlencoded"):
+        return ""
+    body := req.body()
+    if body.len() > MAX_FORM_BYTES:
+        return ""
+    return form_field(body, guard_v.field_v)
+
+# whether this request may change something. the comparison is against the
+# session's copy and nothing else, and goes through std.crypto.subtle — a
+# check that returns early tells the caller how much of the token it guessed,
+# one request at a time.
+fn accepted(guard_v: Guard, req: web.Request) -> Bool:
+    expected := guard_v.store.get(req, TOKEN_KEY)
+    if expected.len() == 0:
+        return false
+    offered := offered_token(guard_v, req)
+    if offered.len() == 0:
+        return false
+    return subtle.equal(bytes.from_string_utf8(offered), bytes.from_string_utf8(expected))
+
+fn run(guard_v: Guard, next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    if not is_safe(req.method()) and not accepted(guard_v, req):
+        # what failed — no session, no token sent, the wrong token — is worth
+        # a server-side log and is never worth telling the caller, who in the
+        # case that matters is a page on somebody else's site.
+        return http.forbidden_response().text_body("csrf token missing or invalid")
+    resp := next(req)
+    token := guard_v.store.get(req, TOKEN_KEY)
+    if token.len() == 0:
+        return resp
+    if req.raw.cookie_or(guard_v.cookie_v, "") == token:
+        # the browser already holds it; setting it again on every response is
+        # a header nobody reads.
+        return resp
+    return resp.set_cookie(guard_v.store.companion_cookie(guard_v.cookie_v, token))
+
+# the middleware. register it inside the session middleware, since the token
+# it compares against lives in the session:
+#
+#   app = app.use_mw(session.middleware(sessions))
+#   app = app.use_mw(csrf.middleware(csrf.guard(sessions)))
+#
+# a safe method passes through. anything else must present the session's
+# token, and gets a 403 if it does not.
+pub fn middleware(guard_v: Guard) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        return run(guard_v, next, req)
+
+# --- tests ---
+
+fn test_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret of at least thirty-two bytes")
+
+# a request built by hand, so the tests need no socket. `extra` carries the
+# Cookie, the token header, or a Content-Type, whichever the case is about.
+fn request_of(method: String, extra: Map[String, String], body: String) -> web.Request:
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/transfer", "", "HTTP/1.1", "", body, extra, {}, [])
+    return web.Request(raw, {}, "/transfer", {})
+
+fn cookie_pair(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if not line.starts_with(name + "="):
+            continue
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+fn cookie_line(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if line.starts_with(name + "="):
+            return line
+    return ""
+
+# a handler that hands the token out the way a form-rendering page would.
+fn minting_handler(protection: Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => http.text(200, protection.token(req))
+
+fn changed_handler(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "changed")
+
+# the csrf middleware and the handler under it, bundled so the closure below
+# captures one struct rather than two loose fn-values — the same reason
+# std.web's Chain exists.
+struct Inner:
+    guard_mw: fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse
+    handler: fn(web.Request) -> http.HttpResponse
+
+fn inner_chain(bundle: Inner) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => bundle.guard_mw(bundle.handler, req)
+
+SESSION_COOKIE := "pith_session"
+
+# run one request through the session middleware and then the csrf one, which
+# is the order an application registers them in.
+fn through_with(store: session.Store, protection: Guard, handler: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return session.middleware(store)(inner_chain(Inner(middleware(protection), handler)), req)
+
+fn through(store: session.Store, protection: Guard, req: web.Request) -> http.HttpResponse:
+    return through_with(store, protection, changed_handler, req)
+
+# open a session that holds a csrf token, and return what a browser would
+# then be holding: the session cookie, the mirrored token cookie, and the
+# token itself as the handler saw it.
+fn opened(store: session.Store, protection: Guard) -> List[String]:
+    resp := through_with(store, protection, minting_handler(protection), request_of("GET", {}, ""))
+    return [cookie_pair(resp, SESSION_COOKIE), cookie_pair(resp, DEFAULT_COOKIE), resp.body_text() catch ""]
+
+test "a safe method needs no token":
+    store := session.store(test_secret())!
+    protection := guard(store)
+
+    for method in ["GET", "HEAD", "OPTIONS", "TRACE"]:
+        assert_eq(through(store, protection, request_of(method, {}, "")).status, 200)
+
+test "an unsafe method with no session at all is refused":
+    store := session.store(test_secret())!
+    protection := guard(store)
+
+    for method in ["POST", "PUT", "PATCH", "DELETE"]:
+        resp := through(store, protection, request_of(method, {}, ""))
+        assert_eq(resp.status, 403)
+
+test "the token is minted on demand and mirrored into a readable cookie":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    # the handler got a token, and it is 32 bytes base64url.
+    assert_eq(held[2].len(), 43)
+    # the mirror cookie carries the same value and is readable by script,
+    # which is the whole point of it.
+    assert_eq(cookie_pair_value(held[1]), held[2])
+    line := cookie_line(through_with(store, protection, minting_handler(protection), request_of("GET", {}, "")), DEFAULT_COOKIE)
+    assert(not line.contains("HttpOnly"))
+    assert(line.contains("Secure"))
+    assert(line.contains("SameSite=Lax"))
+
+fn cookie_pair_value(pair: String) -> String:
+    cut := pair.index_of("=")
+    if cut < 0:
+        return ""
+    return pair.substring(cut + 1, pair.len())
+
+test "a post carrying the token in the header is accepted":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    accepted_req := request_of("POST", {"Cookie": held[0], DEFAULT_HEADER: held[2]}, "")
+    assert_eq(through(store, protection, accepted_req).status, 200)
+
+test "a post carrying the token in a form field is accepted":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    body := "amount=100&" + DEFAULT_FIELD + "=" + url.encode(held[2])
+    form := request_of("POST", {"Cookie": held[0], "Content-Type": "application/x-www-form-urlencoded"}, body)
+    assert_eq(through(store, protection, form).status, 200)
+
+test "the session cookie without the token is not enough":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    # this is exactly the cross-site post: the browser attached the session
+    # cookie because browsers do, and the other site had no way to read the
+    # token to send with it.
+    assert_eq(through(store, protection, request_of("POST", {"Cookie": held[0]}, "")).status, 403)
+
+test "a token from somewhere else is refused":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+    elsewhere := opened(store, protection)
+
+    # a real token, minted by this very store, for a different session.
+    forged := request_of("POST", {"Cookie": held[0], DEFAULT_HEADER: elsewhere[2]}, "")
+    assert_eq(through(store, protection, forged).status, 403)
+
+    # and a near miss: the right token with its last character changed.
+    nudged := held[2].substring(0, held[2].len() - 1) + "x"
+    assert_eq(through(store, protection, request_of("POST", {"Cookie": held[0], DEFAULT_HEADER: nudged}, "")).status, 403)
+    # and a prefix of it, which a length-blind comparison would take.
+    short := held[2].substring(0, 10)
+    assert_eq(through(store, protection, request_of("POST", {"Cookie": held[0], DEFAULT_HEADER: short}, "")).status, 403)
+
+test "the mirror cookie is not what the token is compared against":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    # a double-submit scheme would accept this: the attacker writes a cookie
+    # for the domain and sends the same value in the header, and the two
+    # match each other. here the comparison is against the session, so a pair
+    # the attacker chose matches nothing.
+    planted := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    both := request_of("POST", {"Cookie": held[0] + "; " + DEFAULT_COOKIE + "=" + planted, DEFAULT_HEADER: planted}, "")
+    assert_eq(through(store, protection, both).status, 403)
+
+test "the token survives a session rotation":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    # rotate is what a login does, and it must not strand the form the user
+    # is about to submit.
+    login := fn(req: web.Request):
+        store.rotate(req)
+        return http.text(200, "in")
+    resp := through_with(store, protection, login, request_of("POST", {"Cookie": held[0], DEFAULT_HEADER: held[2]}, ""))
+    assert_eq(resp.status, 200)
+
+    rotated := cookie_pair(resp, SESSION_COOKIE)
+    assert(rotated != held[0])
+    after := request_of("POST", {"Cookie": rotated, DEFAULT_HEADER: held[2]}, "")
+    assert_eq(through(store, protection, after).status, 200)
+
+test "the names of the header, field and cookie can be changed":
+    store := session.store(test_secret())!
+    protection := guard(store).header_name("X-Xsrf").field_name("_token").cookie_name("xsrf")
+
+    resp := through_with(store, protection, minting_handler(protection), request_of("GET", {}, ""))
+    held := cookie_pair(resp, SESSION_COOKIE)
+    token := resp.body_text()!
+    assert_eq(cookie_pair_value(cookie_pair(resp, "xsrf")), token)
+
+    assert_eq(through(store, protection, request_of("POST", {"Cookie": held, "X-Xsrf": token}, "")).status, 200)
+    # the default names no longer mean anything.
+    assert_eq(through(store, protection, request_of("POST", {"Cookie": held, DEFAULT_HEADER: token}, "")).status, 403)
+
+test "a form body larger than the scan limit must use the header":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    padding := "pad=" + "x".repeat(MAX_FORM_BYTES) + "&"
+    body := padding + DEFAULT_FIELD + "=" + url.encode(held[2])
+    oversized := request_of("POST", {"Cookie": held[0], "Content-Type": "application/x-www-form-urlencoded"}, body)
+    assert_eq(through(store, protection, oversized).status, 403)
+
+    # the same body with the token in the header is fine, which is the way
+    # out the limit leaves open.
+    with_header := request_of("POST", {"Cookie": held[0], "Content-Type": "application/x-www-form-urlencoded", DEFAULT_HEADER: held[2]}, body)
+    assert_eq(through(store, protection, with_header).status, 200)
+
+test "asking for the token twice returns the same one":
+    store := session.store(test_secret())!
+    protection := guard(store)
+    held := opened(store, protection)
+
+    again := through_with(store, protection, minting_handler(protection), request_of("GET", {"Cookie": held[0]}, ""))
+    assert_eq(again.body_text()!, held[2])

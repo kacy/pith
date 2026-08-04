@@ -333,6 +333,73 @@ store holds at most 100,000 sessions and refuses to grow past that rather than
 running the process out of memory; expired sessions are swept in the
 background of ordinary traffic.
 
+## csrf
+
+a browser attaches a site's cookies to a request whatever page caused it,
+which is what lets another site put a form on its own page, point it at
+yours, and have it arrive fully authenticated. `std.web.csrf` demands
+something on every state-changing request that a cross-site page has no way
+to read: a token that lives in the session and has to be sent back.
+
+```pith
+import std.web.csrf as csrf
+
+protection := csrf.guard(store)
+app = app.use_mw(session.middleware(store))
+app = app.use_mw(csrf.middleware(protection))   # inside the session
+```
+
+register it inside the session middleware, since the token it compares
+against lives in the session.
+
+`GET`, `HEAD`, `OPTIONS` and `TRACE` pass through untouched. everything else
+must present the token, in the `X-CSRF-Token` header or in a `csrf_token`
+form field — both a urlencoded and a multipart body are read — and gets a 403
+if it does not. the comparison goes through `std.crypto.subtle`, so it looks
+at every byte whether or not the first one matched.
+
+a handler that renders a form asks for the token:
+
+```pith
+fn render_form(req: web.Request) -> http.HttpResponse:
+    return http.html(200, "<input type=hidden name=csrf_token value=" + protection.token(req) + ">")
+```
+
+`protection.token(req)` returns the session's token, minting one — and with
+it the session — if there is none yet. asking twice returns the same token,
+and it survives `store.rotate(req)`, so a login in the middle of a form's
+life does not strand it. the middleware then mirrors the token into a
+readable cookie on the way out, so a fetch-based front end can read it from
+`document.cookie` and put it in the header without a round trip.
+
+`.header_name(n)`, `.field_name(n)` and `.cookie_name(n)` rename the three
+places, for a front end that expects other spellings.
+
+### why the mirror cookie is not the scheme
+
+handing out a readable cookie and comparing it against the header is the
+"double submit" pattern, and on its own it leans on the attacker not being
+able to write a cookie for your domain — which a sibling subdomain, or
+anything else that gets to set one, can do. here the cookie is a copy for
+convenience and the session is the authority: the comparison is always
+against what the store holds, so a cookie the attacker planted alongside a
+matching header matches nothing.
+
+`SameSite=Lax` on the session cookie — the default in `std.web.session` —
+turns away most of this on its own. the token is the layer underneath, for
+what it does not cover: a top-level POST from another site, a browser that
+ignores `SameSite`, and a session deliberately set to `SameSite=None`.
+
+a urlencoded body larger than 64 KiB is not scanned for the token, because
+splitting a ten megabyte body on `&` to find one field is work an attacker
+can ask for repeatedly. a form that big should send the token in the header,
+which costs nothing to read.
+
+`examples/web_csrf.pith` runs both halves: the honest post with the token in
+a header and in a form field, and then the cross-site version — session
+cookie attached, no token — plus a token borrowed from another session and a
+near miss.
+
 ## cors
 
 a browser will not let page javascript on one origin read a response from
@@ -561,7 +628,8 @@ routes, spawns the server, makes a few requests against itself, and prints the
 replies. `examples/web_cors.pith` puts a cors policy in front of an api and drives it
 from two origins, one allowed and one not. `examples/web_session.pith` runs the whole
 life of one session: an anonymous visit, a sign-in that rotates the id, a forged
-cookie, and a sign-out. `examples/web_observability.pith` does the
+cookie, and a sign-out. `examples/web_csrf.pith` posts a form the honest way and then
+the way another site would. `examples/web_observability.pith` does the
 same and then scrapes `/metrics` to show the request counter the framework kept on its
 own. `examples/web_h2.pith` serves
 the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.

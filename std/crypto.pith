@@ -19,6 +19,12 @@
 # verifier names the algorithm it accepts rather than reading it off the
 # token.
 #
+# `std.crypto.jwks` is for the tokens you did not mint: it reads a json web
+# key set, converts each key into the bytes the matching `jwt` verifier
+# takes, and keeps a fetched set cached. which algorithm a key verifies comes
+# from the key, so the token still never chooses, and a symmetric key in a
+# published set is refused rather than treated as an hmac secret.
+#
 # ## keys, macs and randomness
 #
 # `std.crypto.random` is the os random source. use it for keys, nonces, salts
@@ -62,7 +68,7 @@ import std.strings as strings
 
 # the submodules the index above describes. the test below reads the directory
 # and compares, so a new module cannot ship without a line in the index.
-INDEXED := "aead,ecdh,hmac,jwt,kdf,password,random,signature,subtle,x509"
+INDEXED := "aead,ecdh,hmac,jwks,jwt,kdf,password,random,signature,subtle,x509"
 
 test "the index covers every submodule that ships":
     mut found: List[String] := []

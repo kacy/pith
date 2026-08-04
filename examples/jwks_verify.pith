@@ -1,0 +1,103 @@
+# verifying tokens an issuer you do not control signed.
+#
+# when a single service both mints and checks its own tokens, a shared secret
+# and jwt.verify_hs256 is the whole story. when the tokens come from an
+# identity provider, you never see its private key: it publishes a json web
+# key set at a url and rotates what is in it when it likes. std.crypto.jwks
+# is that side — fetch the set, cache it, pick the key the token names, and
+# verify with the algorithm the key says rather than the one the token does.
+#
+# to keep this runnable offline, the "identity provider" is a std.web server
+# in the same process publishing a key set at /.well-known/jwks.json. from
+# the verifier's side there is no difference: it is a url that answers with a
+# key set.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
+import std.crypto.jwks as jwks
+import std.crypto.jwt as jwt
+
+PORT := 18105
+ISSUER := "example-idp"
+
+# the provider's signing key: the pkcs#8 private half stays with the issuer,
+# and the public point is what it publishes as the two jwk coordinates.
+IDP_PKCS8 := "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+IDP_PUBLIC := "04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+
+fn public_point() -> Bytes:
+    return encoding.from_hex(IDP_PUBLIC) catch bytes.empty()
+
+# the key set the provider publishes: kty and crv say what the key is, and
+# that is what decides which algorithm verifies with it.
+fn key_set() -> String:
+    x := encoding.b64_url_raw_encode(public_point().slice(1, 33))
+    y := encoding.b64_url_raw_encode(public_point().slice(33, 65))
+    return "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"kid\":\"idp-2024\",\"x\":\"" + x + "\",\"y\":\"" + y + "\"}}]}}"
+
+fn serve_bg(port: Int) -> Int:
+    return web.bare().get("/.well-known/jwks.json", fn(req: web.Request) => http.json(200, key_set())).listen("127.0.0.1", port) catch 0
+
+# connect until the accept loop answers, rather than sleeping a guess.
+fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false
+
+# what the identity provider does, from the other side of the network: mint a
+# token with its private key. your service never runs this.
+fn issue(subject: String) -> String!:
+    return jwt.claims().issuer(ISSUER).audience("reports").subject(subject).expires_in(3600).sign_es256(encoding.from_hex(IDP_PKCS8)!)!
+
+fn main() -> Int!:
+    port := PORT
+    spawn serve_bg(port)
+    if not wait_for_port(port):
+        print("the identity provider never came up")
+        return 1
+
+    # build the cache once at startup and share it. it fetches on first use
+    # and then once an hour, so an issuer is asked for its keys on a timer
+    # rather than on a request.
+    keys := jwks.cache("http://127.0.0.1:" + port.to_string() + "/.well-known/jwks.json").ttl(3600).timeout_ms(2000)
+
+    print("=== what the issuer published ===")
+    published := keys.keys()!
+    print("keys:      " + published.keys.len().to_string())
+    print("kid:       " + published.keys[0].kid)
+    # nothing in the document said "ES256"; the key type and curve did.
+    print("algorithm: " + published.keys[0].algorithm)
+
+    print("")
+    print("=== a token it signed ===")
+    token := issue("u-1024")!
+    expected := jwt.with_audience(jwt.with_issuer(jwt.default_options(), ISSUER), "reports")
+    session := keys.verify(token, expected)!
+    print("subject:   " + session.subject())
+
+    print("")
+    print("=== what gets turned away ===")
+    print("wrong audience:  " + keys.verify(token, jwt.with_audience(jwt.default_options(), "billing")).is_err.to_string())
+    print("wrong issuer:    " + keys.verify(token, jwt.with_issuer(jwt.default_options(), "somebody-else")).is_err.to_string())
+
+    # the classic forgery: re-sign the claims as HS256 using the issuer's
+    # published public key as the hmac secret. a verifier that picked its
+    # algorithm from the token header would reach for hmac and accept it.
+    # here the key set says the key is a p-256 one, so ES256 is the only
+    # algorithm ever tried and the token is refused on its header.
+    forged := jwt.sign_hs256("{{\"sub\":\"admin\"}}", public_point())!
+    print("hs256 forgery:   " + keys.verify(forged, jwt.without_time_checks(jwt.default_options())).is_err.to_string())
+
+    # and a token naming a key the issuer does not publish.
+    unknown := token.substring(0, token.index_of(".")) + "x" + token.substring(token.index_of("."), token.len())
+    print("unreadable token: " + keys.verify(unknown, expected).is_err.to_string())
+    return 0

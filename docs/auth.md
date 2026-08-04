@@ -1,10 +1,12 @@
 # passwords and tokens
 
-authentication in pith is two modules. `std.crypto.password` handles the
-password at rest, and `std.crypto.jwt` handles the session that follows.
-`examples/auth.pith` runs the whole flow end to end, and
-`examples/web_auth.pith` wires it into a `std.web` server — a login route
-that issues tokens and a middleware that guards everything else.
+authentication in pith is three modules. `std.crypto.password` handles the
+password at rest, `std.crypto.jwt` handles the session that follows, and
+`std.crypto.jwks` handles the tokens somebody else signed.
+`examples/auth.pith` runs the first two end to end,
+`examples/web_auth.pith` wires them into a `std.web` server — a login route
+that issues tokens and a middleware that guards everything else — and
+`examples/jwks_verify.pith` verifies against a key set an issuer publishes.
 
 ## hashing a password
 
@@ -170,6 +172,89 @@ the builders compose, each returning a new `Options`:
 - `at_time` — validate against a fixed unix timestamp rather than the clock
 - `without_time_checks` — turn off `exp`, `nbf` and `iat`, for replaying a
   fixed vector and not for traffic
+
+## tokens you did not mint
+
+`jwt.verify_*` wants the key in hand. an identity provider does not hand you
+one: it publishes a json web key set at a url and rotates what is in it when
+it likes. `std.crypto.jwks` is that side of the story.
+
+```pith
+import std.crypto.jwks as jwks
+
+keys := jwks.cache("https://issuer.example.com/.well-known/jwks.json")
+expected := jwt.with_issuer(jwt.default_options(), "https://issuer.example.com")
+session := keys.verify(token, expected)!
+```
+
+build the cache once at startup and share it. it fetches on first use and
+again when its ttl has passed (`.ttl(seconds)`, an hour by default), so an
+issuer is asked for its keys on a timer rather than on a request. the fetch
+has a timeout (`.timeout_ms`) and a response size cap (`.max_bytes`), and the
+lock is never held across it.
+
+with a document you already have — vendored, or read from disk at startup —
+skip the cache:
+
+```pith
+set := jwks.parse(document)!
+session := set.verify(token, expected)!
+```
+
+`set.keys` is the parsed list. each `Key` carries its `kid`, the algorithm it
+verifies, and the `material` in the form the matching `jwt.verify_*` takes:
+the pkcs#1 rsapublickey der for RS256 and PS256, the uncompressed point for
+ES256, the raw 32 bytes for EdDSA. so a caller who wants to do the
+verification itself can, without redoing the jwk conversion.
+
+### the algorithm comes from the key
+
+which algorithm a key verifies is a property of the key: an RSA key verifies
+RS256 (or PS256 if it says so), a P-256 key verifies ES256, an Ed25519 key
+verifies EdDSA. `jwks` reads that off the key material — the jwk's own `alg`
+when it states one, `kty` and `crv` otherwise — and hands the answer to the
+matching `jwt.verify_*`, which then compares the token's `alg` header against
+that name and refuses the token if they differ.
+
+so the token's header selects nothing. its `kid` picks which key to try, and
+that is all it does. this is the same shape `std.crypto.jwt` already has,
+extended one step out, so a rotated key set cannot introduce an algorithm
+either.
+
+a symmetric key in a key set (`kty: oct`) is refused outright, and the whole
+parse fails rather than skipping it. a key set is a public document; a shared
+secret in one hands every reader the ability to sign. a jwk that claims an
+algorithm its key type cannot verify — `kty: RSA` with `alg: ES256` — is
+refused for the same reason: it is describing something that does not exist,
+and the interesting question is who wrote it.
+
+keys of a type this module does not implement, and keys marked `use: enc`,
+are skipped rather than fatal: an issuer publishing one key you can use and
+one you cannot is publishing a set you can still use.
+
+### rotation
+
+a token naming a `kid` the cached set does not hold is what a rotation looks
+like from here, so it is worth one refetch — but no more than one per
+cooldown (`.refresh_cooldown(seconds)`, a minute by default), or a stream of
+invented `kid`s becomes a stream of requests at the issuer. `refresh()`
+fetches now, whatever the ttl says, for when something outside told you the
+keys moved.
+
+a token with no `kid` is tried against every key in the set, which is what a
+single-key issuer needs; a set with exactly one key reports that key's own
+refusal rather than a generic one, so an expired token still says "expired".
+
+### https
+
+the key set is the root of trust for every token you accept. over plain http
+anyone on the path replaces it with keys of their own and mints whatever they
+like. `jwks.cache` allows an `http` url for a key set served by a sidecar on
+loopback, and refuses any other scheme; everything else should be `https`.
+
+`examples/jwks_verify.pith` runs the whole thing against an issuer in the
+same process: the published set, a token it signed, and the forgeries that
+get turned away.
 
 ## interoperability
 

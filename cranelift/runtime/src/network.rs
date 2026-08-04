@@ -178,6 +178,11 @@ fn close_raw(fd: RawFd) {
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpListener;
 
+    // the first socket of the process is where SIGPIPE stops being fatal: a peer
+    // that hangs up mid-response must give this server an EPIPE to handle, not a
+    // signal that kills it. see signals::ignore_sigpipe.
+    crate::signals::ignore_sigpipe();
+
     let host = cstr_str_or_empty(addr);
     let host = if host.is_empty() { "0.0.0.0" } else { host };
     let bind_addr = format!("{}:{}", host, port);
@@ -200,6 +205,10 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpStream;
+
+    // as in pith_tcp_listen: a client writing to a server that closed first must
+    // see EPIPE rather than be killed.
+    crate::signals::ignore_sigpipe();
 
     let host = cstr_str_or_empty(addr);
     let host = if host.is_empty() { "127.0.0.1" } else { host };

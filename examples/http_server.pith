@@ -3,39 +3,59 @@
 # Demonstrates: request parsing, header/query access, response builders,
 # routing, and the read_request/send_response helpers.
 #
+# Anything the caller controls — a query parameter, a header — goes through
+# std.html before it reaches a page and through std.json's builder before it
+# reaches a json body. Building either format by pasting strings together is
+# how a server ends up serving the caller's script to the next visitor.
+#
 # Run:  pith run examples/http_server.pith
 # Test: curl http://localhost:8080
 #       curl http://localhost:8080/api
 #       curl http://localhost:8080/greet?name=world
+#       curl 'http://localhost:8080/greet?name=<script>alert(1)</script>'
+import std.html as html
+import std.json as json
 import std.net.http as http
 import std.net.websocket as websocket
 from std.net.http import HttpRequestBytes
 fn handle(fd: Int) -> Int!:
+    # this loop is its own accept loop rather than http.serve_connection, so
+    # nothing brackets the json node pool for us. one scope per request keeps a
+    # long-lived server from accumulating every node it ever built.
+    scope := json.open_scope()
+    defer json.close_scope(scope)
     tcp_set_timeout(fd, 1000)
     req := http.read_request_bytes(fd)!
     if websocket.route_echo(fd, req, "/ws", "connected", "echo:", "quit")!:
         return 0
     if req.is_get("/")!:
-        html := [
-            "<!DOCTYPE html><html><body>",
+        page := [
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>",
             "<h1>Hello from Pith!</h1>",
-            "<p><a href=/api>JSON API</a></p>",
-            "<p><a href=/greet?name=world>Greet</a></p>",
+            "<p><a href=\"/api\">JSON API</a></p>",
+            "<p><a href=\"/greet?name=world\">Greet</a></p>",
             "<p>websocket route: /ws</p>",
             "</body></html>",
         ].join("")
-        return http.send_response(fd, http.html_response(200, html))
+        return http.send_response(fd, http.html_response(200, page))
     elif req.is_get("/api")!:
         ua := req.header("User-Agent")!
-        body := "{{\"status\":\"ok\",\"agent\":\"{ua}\"}}"
-        return http.send_response(fd, http.json_response(200, body))
+        body := json.make_object()
+        json.object_set(body, "status", json.make_string("ok"))
+        json.object_set(body, "agent", json.make_string(ua))
+        return http.send_response(fd, http.json_response(200, json.encode(body)))
     elif req.is_get("/greet")!:
         name := req.query_param("name") catch ""
         if name == "":
             return http.send_response(fd, http.html_response(200, "<h1>Hello, stranger!</h1>"))
         else:
-            greeting := "<h1>Hello, {name}!</h1>"
+            greeting := "<h1>Hello, " + html.escape(name) + "!</h1>"
             return http.send_response(fd, http.html_response(200, greeting))
+    elif req.is_get("/link")!:
+        # a url in an href needs more than escaping: there is nothing to escape
+        # in "javascript:alert(1)". escape_url filters the scheme first.
+        target := req.query_param("to") catch "/"
+        return http.send_response(fd, http.html_response(200, "<a href=\"" + html.escape_url(target) + "\">go</a>"))
     elif req.is_get("/redirect")!:
         return http.send_response(fd, http.redirect("/"))
     else:

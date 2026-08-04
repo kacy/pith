@@ -403,3 +403,22 @@ the same kind of app over http/2 (h2c) and drives it with a small built-in h2c c
 `bench/web_hello.pith` is the same idea as a real blocking server, wired up for
 `bench/http_bench.sh`. `examples/graceful_shutdown.pith` serves, signals itself,
 and prints the drain outcome.
+
+## rendering html
+
+`http.html(200, body)` will send whatever body you hand it, so what goes into
+that body is the whole of your xss story. anything the caller controls — a
+query parameter, a path parameter, a header, a stored value that arrived from a
+request once — goes through `std.html` on the way in:
+
+```pith
+import std.html as html
+
+fn greet(req: web.Request) -> http.HttpResponse:
+    return http.html(200, "<h1>hello, " + html.escape(req.param("name")) + "</h1>")
+```
+
+[docs/html.md](html.md) is the full account: the five characters, why there is
+no separate attribute escaper, why a url in an `href` needs `html.escape_url`
+rather than `html.escape`, and the contexts — inside `<script>`, inside
+`<style>`, an unquoted attribute — where escaping is not the fix.

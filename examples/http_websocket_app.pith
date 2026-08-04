@@ -1,5 +1,10 @@
 # http + websocket app routing over buffered io
+#
+# the greet route renders a query parameter into a page, so it escapes it with
+# std.html first. the second greet request in main() is the proof: a name
+# carrying a script tag comes back as text, not as markup.
 import std.bytes as bytes
+import std.html as html
 import std.io as io
 import std.net.http as http
 import std.net.websocket as websocket
@@ -13,7 +18,7 @@ fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: Buffer
         mut name := req.query_param("name")!
         if name == "":
             name = "stranger"
-        http.send_buffered(writer, http.html(200, "<h1>Hello, {name}!</h1>"))!
+        http.send_buffered(writer, http.html(200, "<h1>Hello, " + html.escape(name) + "!</h1>"))!
         return "http:{name}"
     http.send_buffered(writer, http.not_found_response())!
     return "http:404"
@@ -23,6 +28,17 @@ fn main() -> Int!:
     greet_out := bytes.buffer()
     print(handle_app(greet, io.bytes_reader(bytes.empty()).buffered_chunked(2), greet_out.buffered_chunked(4))!)
     print(greet_out.bytes().to_string_utf8()!.contains("Hello, pith!").to_string())
+
+    # the same route with a hostile name. the response carries the text and not
+    # the tag, so a browser renders it instead of running it.
+    attack_req := io.bytes_reader(bytes.from_string_utf8("GET /greet?name=<script>alert(1)</script> HTTP/1.1\r\nHost: example.com\r\n\r\n")).buffered_chunked(5)
+    attack := http.read_request_buffered_bytes(attack_req)!
+    attack_out := bytes.buffer()
+    handle_app(attack, io.bytes_reader(bytes.empty()).buffered_chunked(2), attack_out.buffered_chunked(4))!
+    attack_body := attack_out.bytes().to_string_utf8()!
+    print("escaped: {attack_body.contains("&lt;script&gt;alert(1)&lt;/script&gt;")}")
+    print("raw tag served: {attack_body.contains("<script>")}")
+
     mut headers: Map[String, String] := {}
     ws_req_bytes := websocket.client_request("example.com", "/ws", headers)!
     ws_req := http.read_request_buffered_bytes(io.bytes_reader(ws_req_bytes).buffered_chunked(5))!

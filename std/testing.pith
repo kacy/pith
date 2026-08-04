@@ -1,11 +1,8 @@
 # std.testing — lightweight testing helpers
 #
-# these belong in a `main()` that ends with done(), which prints the tally.
-# they are NOT the assertions a colocated `test "..."` block uses: those are
-# built in, and the two keep separate counts. calling testing.check inside a
-# test block records into this module's tally, which that block never prints,
-# so the assertion silently stops counting. use the built-in assert/assert_eq
-# inside test blocks, and these in a test script.
+# these belong in a `main()` that ends with done(), which prints the tally. a
+# check that fails prints a line and lets the run continue, so one broken case
+# does not hide the next twenty.
 #
 #   from std.testing import assert_eq, assert_ne, check_true, check_not, done
 #
@@ -15,6 +12,14 @@
 #       assert_ne(2 + 2, 5)
 #       check_true(10 > 5, "comparison")
 #       done()
+#
+# inside a colocated `test "..."` block, reach for the built-in assert/assert_eq
+# instead: they read better and they say where they failed. these still work
+# there — a check that fails fails the block, because a recorded failure sets
+# the same process verdict a built-in assertion does. that used to be two
+# separate counts, and a check made inside a block landed in the one the block
+# never printed, which turned a failing assertion into a line of output nobody
+# was reading.
 
 import std.fs as fs
 
@@ -29,12 +34,17 @@ mut pass_count: Int := 0
 mut fail_count: Int := 0
 mut silent: Bool := false
 
+# clear the tally and, with it, the process verdict. the only caller is a test
+# of the tally itself, which provokes failures on purpose; clearing the verdict
+# it just set is how those failures stay the subject rather than becoming the
+# result. anything else that resets counts is saying the same thing.
 fn reset_counts():
     counts_mu.lock()
     pass_count = 0
     fail_count = 0
     silent = false
     counts_mu.unlock()
+    set_test_failed(false)
 
 fn silence_output():
     counts_mu.lock()
@@ -55,6 +65,10 @@ fn record_fail(name: String, detail: String):
     fail_count = fail_count + 1
     quiet := silent
     counts_mu.unlock()
+    # the run has failed whether or not anyone is listening. marking it here,
+    # rather than only counting it, is what makes a failed check inside a `test`
+    # block fail that block instead of vanishing into a tally it never prints.
+    set_test_failed(true)
     if quiet:
         return
     print("  FAIL " + name + " -- " + detail)
@@ -249,6 +263,11 @@ test "testing helpers count failing checks":
 
     assert(pass_count == 0)
     assert(fail_count == 11)
+
+    # those eleven failures are what this test is about, not what it reports.
+    # without this the block would end on a failed verdict and be counted, quite
+    # correctly, as a failing test.
+    reset_counts()
 
 test "testing helpers inspect files and temp dirs":
     reset_counts()

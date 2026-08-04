@@ -2757,11 +2757,19 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
 
     if callee_node.kind == "ident":
         name := callee_node.value
-        # special case: assert_eq / assert_ne
-        if checking_test_decl and name == "assert_eq":
-            return check_assertion_equality(arg_indices, scope_id)
-        if checking_test_decl and name == "assert_ne":
-            return check_assertion_equality(arg_indices, scope_id)
+        # assert_eq / assert_ne take two values of any one type, which no fixed
+        # builtin signature describes, so they are resolved by name here rather
+        # than registered in checker_builtins.
+        #
+        # they are deliberately not restricted to a `test` block. a table of
+        # cases checked by a shared helper is the ordinary way to write
+        # exhaustive coverage, and while these only existed inside the block
+        # every case had to be spelled out inline instead. a module that defines
+        # or imports its own assert_eq still wins: the builtin only fills a name
+        # nothing else has claimed.
+        if name == "assert_eq" or name == "assert_ne":
+            if lookup_binding(scope_id, name) < 0:
+                return check_assertion_equality(name, arg_indices, scope_id)
         if name == "map":
             return check_list_map_builtin(arg_indices, scope_id)
         if name == "filter":
@@ -3087,9 +3095,9 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
         return TID_ERR
     return check_struct_constructor(get_type_name(struct_tid), struct_tid, get_type_info(struct_tid), arg_indices, scope_id)
 
-fn check_assertion_equality(arg_indices: List[Int], scope_id: Int) -> Int:
+fn check_assertion_equality(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 2:
-        report_error("E207", "assert_eq expects 2 arguments, got " + arg_indices.len().to_string())
+        report_error("E207", name + " expects 2 arguments, got " + arg_indices.len().to_string())
         return TID_VOID
     first_idx := arg_indices[0]
     second_idx := arg_indices[1]
@@ -3108,7 +3116,7 @@ fn check_assertion_equality(arg_indices: List[Int], scope_id: Int) -> Int:
     if is_error_type(t1) == false:
         if is_error_type(t2) == false:
             if t1 != t2 and types_structurally_equal(t1, t2) == false:
-                report_error("E219", "assert_eq arguments must be the same type: " + get_type_name(t1) + " vs " + get_type_name(t2))
+                report_error("E219", name + " arguments must be the same type: " + get_type_name(t1) + " vs " + get_type_name(t2))
     return TID_VOID
 
 fn call_arg_expr_index(arg_idx: Int) -> Int:

@@ -68,6 +68,20 @@ signals only where you also handle them. `shutdown.on_signals()` pairs the two i
 one call so this cannot be got wrong by accident; reach for `signal.notify()`
 directly only when you are writing the waiting side yourself.
 
+## the one signal pith disarms for you
+
+`SIGPIPE`. writing to a socket whose peer has gone raises it, and its default
+disposition is to terminate — so a server answering a client that hung up a
+moment early would die, silently, taking every other connection on the process
+with it. the runtime sets it to ignore from the first socket onwards, and the
+failing write reports an error instead, the same answer a reset already gives.
+
+this is what every server runtime does; pith needed to say so explicitly because
+a pith binary's `main` is generated code linking the runtime as a static library,
+so it never runs rust's own startup path. a program that genuinely wants to die
+on a broken pipe can arm `SIGPIPE` through `signal.notify()`, which runs later
+and replaces the disposition.
+
 ## std.signal
 
 ```pith

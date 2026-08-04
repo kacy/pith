@@ -107,6 +107,37 @@ fn ensure_pipe() -> bool {
     PIPE_READ_FD.load(Ordering::Acquire) >= 0
 }
 
+/// stop SIGPIPE from killing this process, once, for the life of it.
+///
+/// writing to a socket whose peer has gone raises SIGPIPE, whose default
+/// disposition is to terminate — so a server that answers a client which hung up
+/// a moment early dies, silently, with no diagnostic and no chance to log. every
+/// server runtime turns this off (rust's own `lang_start` does it, and go and
+/// nginx do the equivalent); pith never saw that, because a pith binary's `main`
+/// is generated code that links this runtime as a static library and never runs
+/// rust's startup path.
+///
+/// with the signal ignored the failing `write` returns `EPIPE` instead, which
+/// every caller in the runtime already treats as "the connection is gone" — the
+/// same answer it gets from a reset. a process that genuinely wants to die on a
+/// broken pipe can still say so: arming SIGPIPE through `pith_signal_notify`
+/// replaces this disposition, since it runs later.
+///
+/// called from the socket entry points rather than at startup because a static
+/// library has no startup hook of its own, and a program that never opens a
+/// socket cannot raise SIGPIPE.
+pub fn ignore_sigpipe() {
+    static SIGPIPE_ONCE: Once = Once::new();
+    SIGPIPE_ONCE.call_once(|| {
+        // SAFETY: `signal` with SIG_IGN on a catchable signal, before any thread
+        // of ours can be writing to a socket — this runs on the path that
+        // creates the first one.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+    });
+}
+
 /// install `handle_signal` as the disposition for `sig`. returns false if the
 /// kernel rejects it — SIGKILL and SIGSTOP cannot be caught, and a signal
 /// number outside the platform's range is invalid.

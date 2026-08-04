@@ -1,0 +1,56 @@
+# a peer that hangs up mid-response must not take the process with it.
+#
+# writing to a socket whose peer has gone raises SIGPIPE, and its default
+# disposition is to terminate. a server that answers a client which hung up a
+# moment early would therefore die — silently, with no diagnostic, nothing
+# logged, and every other connection on the process cut with it. it looks exactly
+# like a crash because it is one.
+#
+# so the runtime ignores SIGPIPE from the first socket onwards, and the failing
+# write reports an error instead. this drives that: the client connects and
+# closes at once, and the server then writes until the kernel tells it the pipe
+# is broken. reaching the last line at all is the assertion — without the
+# disposition the process is gone before it prints anything.
+
+import std.net.tcp as tcp
+import std.time as time
+
+PORT := 50347
+
+# connect and hang up immediately, which is what a client that gave up looks
+# like from the server's side.
+fn hangup_client():
+    fd := tcp.connect("127.0.0.1", PORT) catch 0
+    if fd > 0:
+        tcp.close(fd)
+
+fn main():
+    listener := tcp.listen("127.0.0.1", PORT) catch -1
+    if listener <= 0:
+        print("could not listen")
+        return
+    spawn hangup_client()
+    accepted := tcp.accept(listener)
+    if accepted.is_err:
+        print("could not accept")
+        return
+    conn := accepted.ok
+    # give the client's hangup time to reach this side. the first write after it
+    # still succeeds — it goes into the send buffer — and draws the reset that
+    # makes the second one fail, which is the write that used to be fatal.
+    time.delay(200)
+    chunk := "x".repeat(4096)
+    mut writes := 0
+    mut failed := false
+    while writes < 200 and not failed:
+        sent := tcp.write(conn, chunk)
+        if sent.is_err or sent.ok <= 0:
+            failed = true
+        writes = writes + 1
+    tcp.close(conn)
+    tcp.close(listener)
+    if failed:
+        print("broken pipe reported as an error")
+    else:
+        print("peer never rejected the writes")
+    print("process survived")

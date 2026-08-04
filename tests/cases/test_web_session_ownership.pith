@@ -1,0 +1,81 @@
+# sessions churned hard, so the ownership of what they hold is checked under
+# valgrind rather than only by whether the answers came out right.
+#
+# every session is a handful of heap strings in three shared maps, reached
+# through a struct that also carries the secret as Bytes, and rotate and
+# destroy move and free those entries while other requests are reading them.
+# this creates, reads, rotates and destroys in a loop and prints a summary
+# that says nothing was lost along the way.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+import std.web.session as session
+
+fn request_with_cookie(cookie: String) -> web.Request:
+    mut headers: Map[String, String] := {}
+    if cookie.len() > 0:
+        headers.insert("Cookie", cookie)
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), "GET", "/", "", "HTTP/1.1", "", "", headers, {}, [])
+    return web.Request(raw, {}, "/", {})
+
+# the name=value pair a browser would send back, out of a Set-Cookie line.
+fn cookie_pair(resp: http.HttpResponse) -> String:
+    for line in resp.cookies():
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+fn writer_for(store: session.Store, tag: String) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        store.set(req, "user", tag)
+        store.set(req, "theme", "dark-" + tag)
+        return http.text(200, "written")
+
+fn rotator_for(store: session.Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        store.rotate(req)
+        store.set(req, "role", "admin")
+        return http.text(200, "rotated")
+
+fn destroyer_for(store: session.Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        store.destroy(req)
+        return http.text(200, "gone")
+
+fn reader_for(store: session.Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => http.text(200, store.get(req, "user") + "/" + store.get_or(req, "role", "-") + "/" + store.keys(req).join("+"))
+
+fn main() -> Int!:
+    store := session.store(bytes.from_string_utf8("a session secret of at least thirty-two bytes"))!
+    guard := session.middleware(store)
+
+    mut rotated_bodies := 0
+    mut i := 0
+    while i < 200:
+        tag := "u-" + i.to_string()
+        opened := cookie_pair(guard(writer_for(store, tag), request_with_cookie("")))
+        read := guard(reader_for(store), request_with_cookie(opened))
+        if (read.body_text() catch "") != tag + "/-/user+theme":
+            print("unexpected read at " + i.to_string())
+            return 1
+
+        moved := cookie_pair(guard(rotator_for(store), request_with_cookie(opened)))
+        after := guard(reader_for(store), request_with_cookie(moved))
+        if (after.body_text() catch "") == tag + "/admin/user+theme+role":
+            rotated_bodies = rotated_bodies + 1
+        # the id it arrived with is retired, so it reads as nobody.
+        stale := guard(reader_for(store), request_with_cookie(opened))
+        if (stale.body_text() catch "") != "/-/":
+            print("stale id still resolved at " + i.to_string())
+            return 1
+
+        guard(destroyer_for(store), request_with_cookie(moved))
+        i = i + 1
+
+    print("rotated and read back: " + rotated_bodies.to_string())
+    print("sessions left: " + store.count().to_string())
+    print("swept: " + store.sweep().to_string())
+    return 0

@@ -1,0 +1,27 @@
+=== an anonymous visitor ===
+body:            visit 1
+got a cookie:    true
+cookie flags:    Path=/; Max-Age=3600; HttpOnly; SameSite=Lax
+sessions held:   1
+
+=== the browser sends it back ===
+body:            visit 2
+who am i:        nobody, visits 2, keys visits
+set again:       false
+
+=== signing in rotates the id ===
+body:            signed in
+a new cookie:    true
+contents kept:   ada, visits 2, keys visits+user
+old id refused:  nobody, no session
+sessions held:   1
+
+=== a cookie nobody signed ===
+forged mac:      nobody, no session
+no mac at all:   nobody, no session
+
+=== signing out ===
+body:            signed out
+cookie cleared:  true
+id now means:    nobody, no session
+sessions held:   0

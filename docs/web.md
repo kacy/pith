@@ -245,6 +245,94 @@ fn handle_me(req: web.Request) -> http.HttpResponse:
 `examples/web_auth.pith` runs this exact shape end to end — login, group
 guard, and the requests a bad token gets back.
 
+## sessions
+
+`std.web.session` keeps the state a request carries about who is on the other
+end of it. the browser holds an id and nothing else; everything real lives on
+the server, so revoking a session is a delete rather than a hope that a token
+expires soon.
+
+```pith
+import std.web.session as session
+
+fn main() -> Int!:
+    store := session.store(bytes.from_string_utf8(env("SESSION_SECRET")))!
+    app := web.new().use_mw(session.middleware(store)).post("/login", log_in)
+    app.listen("0.0.0.0", 8080)!
+    return 0
+```
+
+a handler only ever takes the request, so the store it reads and writes is
+closed over — build it once in `main` and capture it in the handlers, the way
+`examples/web_session.pith` does.
+
+```pith
+store.set(req, "user", "u-7")
+store.get(req, "user")                  # "" when there is no session
+store.get_or(req, "theme", "dark")
+store.has(req, "user")
+store.remove(req, "theme")              # one key; the session stays
+store.keys(req)
+store.active(req)
+store.rotate(req)                       # a new id, same contents
+store.destroy(req)                      # the session ends here
+```
+
+`store.count()` and `store.sweep()` are the housekeeping: how many sessions
+are live, and dropping the expired ones now instead of waiting for traffic to
+do it.
+
+### the cookie
+
+the cookie carries the id and a mac over it, and nothing else. a session
+cookie that carries data is a session cookie whose data the browser can be
+talked into replaying. the id is 32 bytes from the os random source
+(`std.crypto.random`), base64url encoded; the mac is hmac-sha256 under the
+store's secret and is compared with `std.crypto.subtle`. the mac buys nothing
+against guessing — 256 bits already handles that — but a forged or truncated
+cookie is thrown out on arithmetic before it becomes a store lookup, so a
+flood of made-up cookies cannot be used to probe the store.
+
+it is `HttpOnly`, `Secure` and `SameSite=Lax`, at `Path=/`, with a `Max-Age`
+of the store's ttl. the builder moves each of those:
+
+- `.ttl(seconds)` — the idle timeout, one day by default. a request that
+  arrives with a live session slides the window forward
+- `.cookie_name(name)` — defaults to `pith_session`
+- `.path(value)`, `.same_site(value)`
+- `.insecure_over_http()` — drops the `Secure` flag, for local development,
+  and is the only way to drop it
+
+the secret must be at least 32 bytes and belongs in the environment, not the
+source. `store()` refuses anything shorter. changing it invalidates every
+cookie already issued, which is the blunt way to sign everybody out.
+
+### rotate, and why a login needs it
+
+call `store.rotate(req)` at the top of a successful login, before writing who
+the caller is. without it, an attacker plants a session id in a victim's
+browser — a crafted link, an injected cookie — waits for them to sign in, and
+finds the id they already hold has become an authenticated one. rotating
+retires that id at the exact moment it would become worth having, and carries
+the session's contents across to a fresh one.
+
+### what one process holds
+
+the store is this process's memory behind one mutex, shared by every serving
+task — green or os thread, one store, as many tasks as you like. what it is
+not is shared between processes. two instances behind a load balancer each
+hold their own sessions, so a request that lands on the other one finds a
+signature it accepts and an id it has never heard of, and treats the caller as
+signed out. run one instance, pin sessions to it with a sticky load balancer,
+or put the state somewhere both can reach.
+
+a visitor who never signs in never occupies a row: an id is minted per request
+but only written to the store when a handler actually stores something, and a
+request that reads nothing and writes nothing gets no `Set-Cookie` back. the
+store holds at most 100,000 sessions and refuses to grow past that rather than
+running the process out of memory; expired sessions are swept in the
+background of ordinary traffic.
+
 ## cors
 
 a browser will not let page javascript on one origin read a response from
@@ -471,7 +559,9 @@ becomes of a stream that would otherwise never end.
 `examples/web_hello.pith` is a complete, self-checking server: it defines a couple of
 routes, spawns the server, makes a few requests against itself, and prints the
 replies. `examples/web_cors.pith` puts a cors policy in front of an api and drives it
-from two origins, one allowed and one not. `examples/web_observability.pith` does the
+from two origins, one allowed and one not. `examples/web_session.pith` runs the whole
+life of one session: an anonymous visit, a sign-in that rotates the id, a forged
+cookie, and a sign-out. `examples/web_observability.pith` does the
 same and then scrapes `/metrics` to show the request counter the framework kept on its
 own. `examples/web_h2.pith` serves
 the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.

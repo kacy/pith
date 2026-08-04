@@ -70,10 +70,9 @@ fn serve_one(conn: tls.Conn) -> Int:
     return 0
 
 # accept exactly `count` tls connections, serving each on its own task, then wait
-# for them all to finish before tearing the listener down.
-fn run_server(port: Int, count: Int) -> Int!:
-    config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
-    listener := tls.listen("127.0.0.1", port, config)!
+# for them all to finish before tearing the listener down. the listener is bound
+# by the caller, not here — see main.
+fn run_server(listener: tls.Listener, count: Int) -> Int!:
     mut tasks: List[Task[Int]] := []
     mut i := 0
     while i < count:
@@ -83,7 +82,6 @@ fn run_server(port: Int, count: Int) -> Int!:
     for t in tasks:
         await t
     listener.close()
-    config.close()
     return 0
 
 # a concurrent fetch worker over the shared multiplexed client. it checks the
@@ -116,9 +114,17 @@ fn client_config() -> tls.Config!:
 fn main() -> Int!:
     authority := "localhost"
     port := choose_port(18760)!
+    # bind before spawning, so the dial below cannot outrun the server. binding
+    # inside the task meant the client's connect raced the scheduler, and a fixed
+    # sleep was the only thing standing between them — one this case lost roughly
+    # two runs in five under valgrind, which slows the server far more than it
+    # slows the sleep. once the socket is listening, a connect that arrives ahead
+    # of accept() waits in the kernel's backlog instead of being refused, so there
+    # is no window left to time.
+    config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen("127.0.0.1", port, config)!
     # one connection for the multiplexed client, three for the pool below.
-    server_task := spawn run_server(port, 4)
-    sleep(200)
+    server_task := spawn run_server(listener, 4)
 
     # --- case 1: concurrent streams over one multiplexed client ---
     client := http2.open_with_config("127.0.0.1", port, client_config()!)!
@@ -172,5 +178,6 @@ fn main() -> Int!:
     pool.close()
 
     await server_task
+    config.close()
     print("pith h2 client <-> pith h2 server over tls: gets, post echoes, and a >window body all correct")
     return 0

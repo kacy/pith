@@ -1,0 +1,26 @@
+=== before signing in ===
+GET /app/me:        401
+
+=== loading the login page ===
+csrf token:         true
+anonymous session:  true
+
+=== the ways a login is refused ===
+no csrf token:      403
+wrong password:     401
+unknown user:       401
+
+=== signing in ===
+status:             200
+id was rotated:     true
+
+=== the protected page ===
+with the session:   hello ada
+without it:         401
+with the old id:    401
+with a forged mac:  401
+
+=== signing out ===
+status:             200
+sessions held:      0
+GET /app/me:        401

@@ -333,6 +333,75 @@ store holds at most 100,000 sessions and refuses to grow past that rather than
 running the process out of memory; expired sessions are swept in the
 background of ordinary traffic.
 
+## signing in
+
+`std.web.auth` is the binding between a session and an identity: the three
+moments of signing in, guarding, and signing out.
+
+```pith
+import std.web.auth as auth
+
+guard := auth.guard(store)
+
+app = app.use_mw(session.middleware(store))
+app = app.post("/login", log_in)
+app = app.group("/app", auth.require(guard))
+app = app.get("/app/me", me)
+```
+
+```pith
+fn log_in(req: web.Request) -> http.HttpResponse:
+    if not password.verify(submitted, stored_hash):
+        return http.unauthorized_response()
+    guard.sign_in(req, "u-7")
+    return http.text(200, "welcome")
+
+fn me(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "hello " + guard.user(req))
+```
+
+- `guard.sign_in(req, subject)` — rotate the session id, then record who the
+  caller is. this is what a successful password check ends with
+- `guard.sign_out(req)` — end the session on the server
+- `guard.user(req)` — the subject, or `""`
+- `guard.signed_in(req)` — whether anybody is
+- `auth.require(guard)` — the middleware. it must sit inside the session
+  middleware, since what it reads is the session
+
+`require` also attaches the subject to the request, so a handler that already
+says `req.value("user")` — the shape the token guard above uses — works
+unchanged when it moves onto sessions.
+
+an unauthenticated caller gets a 401. `guard.redirect_to("/login")` changes
+that to a 303 at the login page, which is what a browser app wants and what a
+`fetch()` caller cannot do anything useful with — leave it alone for a json
+api.
+
+`sign_in` rotates before it writes, which is the session fixation defence
+spelled once in the one place every login goes through. having a session is
+not being signed in: an anonymous visitor with a shopping cart has one, and
+the guard turns them away all the same.
+
+### what it deliberately is not
+
+it is not a user database and it does not check passwords. where the
+credentials live, what a subject means, and how a password is checked belong
+to the application, and `std.crypto.password` already does the last one
+properly — see [docs/auth.md](auth.md). an api that took a password here
+would have to take a user lookup with it, and would be wrong for every
+application that keeps its users somewhere other than where it guessed.
+
+put a rate limiter in front of the login route. the argon2id cost makes each
+attempt expensive; the limiter is what bounds how many are made:
+
+```pith
+app = app.group("/login", web.rate_limit(resilience.rate_limiter(5, 10)))
+```
+
+`examples/web_login.pith` runs the whole stack end to end: the login page
+with its csrf token, a wrong password, a right one, the rotation, the
+protected page, three ways of faking the cookie, and a sign-out.
+
 ## csrf
 
 a browser attaches a site's cookies to a request whatever page caused it,
@@ -629,7 +698,9 @@ replies. `examples/web_cors.pith` puts a cors policy in front of an api and driv
 from two origins, one allowed and one not. `examples/web_session.pith` runs the whole
 life of one session: an anonymous visit, a sign-in that rotates the id, a forged
 cookie, and a sign-out. `examples/web_csrf.pith` posts a form the honest way and then
-the way another site would. `examples/web_observability.pith` does the
+the way another site would. `examples/web_login.pith` puts the whole stack together —
+argon2id, a session, a csrf token and a guard — and drives a login, a protected page
+and a sign-out through it. `examples/web_observability.pith` does the
 same and then scrapes `/metrics` to show the request counter the framework kept on its
 own. `examples/web_h2.pith` serves
 the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.

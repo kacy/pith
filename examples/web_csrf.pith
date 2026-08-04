@@ -12,6 +12,7 @@
 
 import std.bytes as bytes
 import std.net.http as http
+import std.net.tcp as tcp
 import std.web as web
 import std.web.csrf as csrf
 import std.web.session as session
@@ -88,6 +89,18 @@ fn post_transfer(port: Int, cookie: String, header_token: String, field_token: S
         return "no response"
     return resp.status.to_string()
 
+# connect until the accept loop answers, rather than sleeping a guess.
+fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false
+
 fn main() -> Int!:
     # insecure_over_http() because this example talks plain http to itself.
     store := session.store(session_secret())!.insecure_over_http()
@@ -95,7 +108,9 @@ fn main() -> Int!:
 
     port := PORT
     spawn serve_bg(store, protection, port)
-    sleep(200)   # give the listener a moment to bind
+    if not wait_for_port(port):
+        print("the server never came up")
+        return 1
 
     print("=== loading the form ===")
     held := load_form(port)

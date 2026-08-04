@@ -657,21 +657,53 @@ test "an alg none token is rejected":
     upper := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"NONE\"}}"))
     assert(verify_hs256(upper + "." + payload + ".AAAA", secret(), options).is_err)
 
-test "a tampered token does not verify":
-    token := sign_hs256("{{\"sub\":\"u-1\"}}", secret())!
-    options := without_time_checks(default_options())
-    cut := token.len() - 1
-    mut last := "A"
-    if token[cut] == "A":
-        last = "B"
+# rebuild `token` with the first character of segment `which` changed. the FIRST
+# character, never the last: a 32-byte hmac base64urls to 43 characters whose
+# final one carries four meaningful bits and two spare ones, so some edits there
+# decode to the very same signature and the "tampered" token verifies exactly as
+# the original did.
+fn tamper_segment(token: String, which: Int) -> String:
+    mut out := ""
+    for field, i in strings.split_n(token, ".", MAX_FIELDS):
+        mut part := field
+        if i == which:
+            mut swapped := "A"
+            if field[0] == "A":
+                swapped = "B"
+            part = swapped + field.substring(1, field.len())
+        if i > 0:
+            out = out + "."
+        out = out + part
+    return out
 
-    swapped_signature := token.substring(0, cut) + last
+# a token that must be refused, and the reason it must be refused for. rejection
+# alone is not evidence: a fixture that fell apart for some unrelated reason is
+# refused just as firmly as a forgery, and reads as a passing test forever.
+fn assert_token_refused(token: String, reason: String):
+    r := verify_hs256(token, secret(), without_time_checks(default_options()))
+    assert(r.is_err)
+    assert(r.err.contains(reason))
+
+test "a tampered token does not verify, whichever segment was touched":
+    token := sign_hs256("{{\"sub\":\"u-1\"}}", secret())!
+
+    # header, claims and signature in turn. the version this replaced forged the
+    # claims and nudged the signature, which left the header — the segment an
+    # attacker rewrites to change the algorithm — never tampered with at all.
+    # each segment fails for its own reason, and each reason is named.
+    reasons := ["token header is not a json object", "token signature does not verify", "token signature does not verify"]
+    mut which := 0
+    while which < reasons.len():
+        forged := tamper_segment(token, which)
+        assert(forged != token)
+        assert_token_refused(forged, reasons[which])
+        which = which + 1
+
+    # and a segment replaced wholesale rather than nudged: real claims, honestly
+    # encoded, saying something their signature never covered.
     fields := strings.split_n(token, ".", MAX_FIELDS)
     forged_claims := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"sub\":\"admin\"}}"))
-    swapped_payload := fields[0] + "." + forged_claims + "." + fields[2]
-
-    assert(verify_hs256(swapped_signature, secret(), options).is_err)
-    assert(verify_hs256(swapped_payload, secret(), options).is_err)
+    assert_token_refused(fields[0] + "." + forged_claims + "." + fields[2], "token signature does not verify")
 
 test "the system clock compares in seconds, not milliseconds":
     # every other time test pins the clock with at_time, so this is the only

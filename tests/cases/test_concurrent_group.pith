@@ -1,0 +1,66 @@
+# concurrent.Group end to end, through main rather than test blocks.
+#
+# the colocated tests in std/concurrent.pith assert the semantics; this case
+# exists to put a group on the cranelift path and under valgrind, where the
+# things that break are ownership rather than logic: a group holds a list of
+# result-carrying task handles, hands fn-values across a spawn, and drops the
+# lot at scope exit.
+#
+# the counts printed below are what makes a silent miscompile visible — a
+# dropped task or a lost failure changes them.
+
+import std.concurrent as concurrent
+import std.time as time
+
+mut completed := AtomicInt(0)
+
+# compare_set in a loop, not store(load() + 1): those are two operations, and a
+# sibling that bumps the counter between them makes this one write back a value
+# computed from the stale read, losing an increment. the first draft of this
+# case used the short form and printed 4 instead of 5 about one run in five.
+fn bump(cell: AtomicInt):
+    mut settled := false
+    while not settled:
+        current := cell.load()
+        settled = cell.compare_set(current, current + 1)
+
+fn unit_ok() -> Int!:
+    bump(completed)
+    return 1
+
+fn unit_slow() -> Int!:
+    time.delay(30)
+    bump(completed)
+    return 1
+
+fn unit_fails() -> Int!:
+    fail "unit refused"
+
+fn main() -> Int!:
+    all_ok := concurrent.group(concurrent.background())
+    all_ok.go(unit_ok)
+    all_ok.go(unit_ok)
+    all_ok.go(unit_slow)
+    print("all ok: {all_ok.wait().is_ok}")
+    print("cancelled: {all_ok.ctx.is_cancelled()}")
+
+    mixed := concurrent.group(concurrent.background())
+    mixed.go(unit_slow)
+    mixed.go(unit_fails)
+    mixed.go(unit_slow)
+    outcome := mixed.wait()
+    print("mixed err: " + outcome.err)
+    print("mixed cancelled: {mixed.ctx.is_cancelled()}")
+
+    # wait() awaits every task even after one fails, so both slow units in the
+    # mixed group finished before it returned: 3 + 2 completions.
+    print("completed: {completed.load()}")
+
+    capped := concurrent.group_limited(concurrent.background(), 2)
+    mut i := 0
+    while i < 5:
+        capped.go(unit_ok)
+        i = i + 1
+    print("capped ok: {capped.wait().is_ok}")
+    print("completed: {completed.load()}")
+    return 0

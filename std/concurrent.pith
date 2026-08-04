@@ -37,6 +37,26 @@ pub enum RecvResult[T]:
     Value(T)
     Closed
 
+# a set of tasks that fan out from one context and fail as a unit: the first
+# failure cancels the group's context, so the others can stop early instead of
+# finishing work whose answer is already unwanted.
+#
+# the tasks are held as results rather than plain values because a group cares
+# about which one failed, not what the survivors returned. work that has a value
+# to report should write it where the caller can find it — a channel, or a slot
+# it owns — exactly as it would without a group.
+pub struct Group:
+    pub ctx: Context
+    token: CancelToken
+    tasks: List[Task[Int!]]
+    slots: Semaphore
+
+# the cap a group runs under when the caller asks for no limit. it is a number
+# no fan-out reaches rather than a special case, which keeps one code path for
+# limited and unlimited groups; a semaphore stores a counter, so a large cap
+# costs no more than a small one.
+GROUP_UNLIMITED := 1000000
+
 fn error_code_to_wait(code: Int) -> WaitError:
     if code == 2:
         return WaitError.DeadlineExceeded
@@ -73,6 +93,22 @@ fn watch_deadline(done_ch: Channel[Bool], err: AtomicInt, at_ms: Int):
             mark_context(done_ch, err, 2)
             return
         time.delay(1)
+
+# one unit of group work. the permit is taken here rather than in go() so that
+# submitting to a full group does not block the submitting task — a group holds
+# its backlog instead of pushing it back onto the caller.
+#
+# a failure cancels the group's context before the error is reported, so the
+# siblings learn about it while this task is still unwinding rather than after
+# wait() has collected everything.
+fn run_group_task(work: fn() -> Int!, token: CancelToken, slots: Semaphore) -> Int!:
+    slots.acquire()
+    outcome := work()
+    slots.release()
+    if outcome.is_err:
+        token.cancel()
+        fail outcome.err
+    return outcome.ok
 
 fn after_worker(ch: Channel[Int], ms: Int):
     time.delay(ms)
@@ -117,6 +153,26 @@ pub fn ticker(ms: Int) -> Ticker:
     stop_ch := Channel[Bool](1)
     spawn ticker_worker(tick_ch, stop_ch, ms)
     return Ticker(tick_ch, stop_ch)
+
+## start a group whose context is cancelled by the first failure.
+##
+## the returned group carries a child of `parent`, so cancelling the parent also
+## stops the group, and a failure inside the group does not reach back up to it.
+pub fn group(parent: Context) -> Group:
+    return group_limited(parent, GROUP_UNLIMITED)
+
+## start a group that runs at most `limit` units of work at once.
+##
+## use this when the fan-out is wider than the resource behind it — a hundred
+## rooms sharing ten connections. submitting never blocks; work waits for a
+## permit inside its own task.
+pub fn group_limited(parent: Context, limit: Int) -> Group:
+    pair := with_cancel(parent)
+    pending: List[Task[Int!]] := []
+    mut permits := limit
+    if permits < 1:
+        permits = 1
+    return Group(pair.0, pair.1, pending, Semaphore(permits))
 
 # wait for a task unless the context is cancelled first.
 pub fn await_ctx[T](task: Task[T], ctx: Context) -> T!WaitError:
@@ -183,6 +239,43 @@ impl Context:
             return none
         return self.deadline_ms
 
+impl Group:
+    ## add one unit of work to the group. returns immediately; the work runs on
+    ## its own task.
+    ##
+    ## `work` should consult `group.ctx` if it is long-running, so a sibling's
+    ## failure can stop it. work that never looks at the context still runs to
+    ## completion — cancelling a context asks a task to stop, it does not kill it.
+    fn go(work: fn() -> Int!):
+        # the fields are read into locals first: a spawn argument cannot load
+        # from `self` (the ir consumer rejects it), so the method hands the
+        # task plain values rather than a receiver to walk.
+        token := self.token
+        slots := self.slots
+        self.tasks.push(spawn run_group_task(work, token, slots))
+
+    ## wait for every unit of work, then report the first failure.
+    ##
+    ## every task is awaited even after one has failed, so when this returns
+    ## nothing from the group is still running — which is what makes it safe to
+    ## release whatever the work borrowed. the first error is the one reported;
+    ## later ones are discarded, as they are usually the cancellation that the
+    ## first one caused.
+    fn wait() -> Int!:
+        mut first := ""
+        for task in self.tasks:
+            outcome := await task
+            if outcome.is_err and first == "":
+                first = outcome.err
+        if first != "":
+            fail first
+        return 0
+
+    ## cancel the group's context without waiting. the caller still has to
+    ## `wait()` to be sure the work has stopped.
+    fn cancel():
+        self.token.cancel()
+
 impl CancelToken:
     fn cancel():
         mark_context(self.done_ch, self.err, 1)
@@ -203,6 +296,115 @@ impl BlockingError:
 
     fn is_failed() -> Bool:
         return self.kind == 3
+
+# --- group test fixtures ---
+#
+# the work a group runs is `fn() -> Int!`, and a pith lambda can neither fail
+# nor use `!`, so each unit below is a named function. the counters they share
+# are module-level for the same reason: a named function has no closure to
+# capture them from.
+
+mut group_test_ran := AtomicInt(0)
+mut group_test_live := AtomicInt(0)
+mut group_test_peak := AtomicInt(0)
+mut group_test_peak_mu := Mutex()
+
+# compare_set in a loop, not store(load() + 1): those are two operations, and a
+# sibling bumping the counter between them costs an increment. these units run
+# concurrently by construction, so the short form makes the count assertions
+# below flake rather than fail honestly.
+fn group_test_bump(cell: AtomicInt):
+    mut settled := false
+    while not settled:
+        current := cell.load()
+        settled = cell.compare_set(current, current + 1)
+
+fn group_test_quick() -> Int!:
+    group_test_bump(group_test_ran)
+    return 1
+
+fn group_test_fails() -> Int!:
+    fail "unit failed"
+
+# slow enough that its siblings are still running when another unit fails.
+fn group_test_slow() -> Int!:
+    time.delay(60)
+    return 1
+
+# record the concurrency this unit observed, so a limit can be asserted rather
+# than assumed.
+fn group_test_tracked() -> Int!:
+    # the whole read-modify-write of the live count and the high-water mark sits
+    # under one lock, so the observed peak is a value that really existed rather
+    # than two racing updates blended together.
+    group_test_peak_mu.lock()
+    now := group_test_live.load() + 1
+    group_test_live.store(now)
+    if now > group_test_peak.load():
+        group_test_peak.store(now)
+    group_test_peak_mu.unlock()
+
+    time.delay(20)
+
+    group_test_peak_mu.lock()
+    group_test_live.store(group_test_live.load() - 1)
+    group_test_peak_mu.unlock()
+    return 1
+
+test "a group of successful work reports success":
+    group_test_ran.store(0)
+    g := group(background())
+    g.go(group_test_quick)
+    g.go(group_test_quick)
+    g.go(group_test_quick)
+
+    assert(g.wait().is_ok)
+    assert_eq(group_test_ran.load(), 3)
+    # nothing failed, so the group's context is still live
+    assert(not g.ctx.is_cancelled())
+
+test "a group reports the first failure and cancels its context":
+    g := group(background())
+    g.go(group_test_slow)
+    g.go(group_test_fails)
+    g.go(group_test_slow)
+
+    outcome := g.wait()
+    assert(outcome.is_err)
+    assert_eq(outcome.err, "unit failed")
+    # the siblings were told to stop, whether or not they were looking
+    assert(g.ctx.is_cancelled())
+
+test "an empty group succeeds without waiting for anything":
+    assert(group(background()).wait().is_ok)
+
+test "cancelling a group's parent cancels the group":
+    pair := with_cancel(background())
+    g := group(pair.0)
+    pair.1.cancel()
+    # the watcher task has to observe the parent, so give it a moment
+    time.delay(50)
+    assert(g.ctx.is_cancelled())
+    assert(g.wait().is_ok)
+
+test "a limited group runs no more than its permits at once":
+    group_test_live.store(0)
+    group_test_peak.store(0)
+    g := group_limited(background(), 2)
+    mut i := 0
+    while i < 6:
+        g.go(group_test_tracked)
+        i = i + 1
+
+    assert(g.wait().is_ok)
+    assert(group_test_peak.load() <= 2)
+    # and it really did overlap, rather than serialising by accident
+    assert(group_test_peak.load() >= 1)
+
+test "a group limit below one is clamped rather than deadlocking":
+    g := group_limited(background(), 0)
+    g.go(group_test_quick)
+    assert(g.wait().is_ok)
 
 test "concurrent contexts can be cancelled":
     parent := background()

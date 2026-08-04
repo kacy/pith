@@ -32,6 +32,13 @@
 ##
 ## every count is a count, not a flag, so nested servers and several subsystems
 ## compose without coordinating with each other.
+##
+## ## streams that never end
+##
+## a drain waits for work to finish, and a stream that never finishes would
+## outlast any grace period. `stream_deadline()` splits the period in half: the
+## first half is the handler's, the second is the framework's, and both halves
+## read the same timestamp so they cannot drift apart. see docs/signals.md.
 
 import std.signal as signal
 import std.time as time
@@ -60,6 +67,10 @@ pub DEFAULT_DRAIN_MS := 15000
 mut mu := Mutex()
 mut drain_deadline_ms := DEFAULT_DRAIN_MS
 mut requested_flag := false
+# when the first request() landed, on the monotonic clock. paired with the flag
+# rather than used as its own sentinel: the monotonic clock starts at 0, so a
+# drain requested in the first millisecond of the process would read as "never".
+mut requested_at_ms := 0
 mut listener_fds: List[Int] := []
 mut inflight_count := 0
 mut pending_flushes := 0
@@ -88,7 +99,12 @@ pub fn requested() -> Bool:
 ## idempotent: the flag re-sets and a second shutdown of the same socket is a
 ## harmless no-op.
 pub fn request():
+    now := time.mono_millis()
     mu.lock()
+    # the first request wins the clock: a second one must not push the stream
+    # deadline out and hand an endless stream another half grace period.
+    if not requested_flag:
+        requested_at_ms = now
     requested_flag = true
     # snapshot under the lock, act outside it: a syscall while holding a lock a
     # connection task also wants is how an accept loop and a request path
@@ -267,6 +283,39 @@ pub fn set_drain_deadline(ms: Int):
 pub fn drain_default() -> Int:
     return drain(drain_deadline())
 
+## the moment a long-lived stream has to be closed by, as a `time.mono_millis()`
+## timestamp; 0 when no drain has begun.
+##
+## it is the midpoint of the grace period, and the whole reason it is a single
+## process-wide number rather than a per-stream one: the handler-facing side (a
+## streaming send that force-closes its rpc) and the transport side (a connection
+## that cancels its streams and stops waiting on the peer) both read it, so they
+## agree on the instant without coordinating, and neither can drift past the
+## other. the first half of the period is for handlers to finish on their own,
+## the second is for the framework to close what they did not, send a clean
+## status, and tear the connections down — all inside the deadline the
+## orchestrator gave.
+pub fn stream_deadline() -> Int:
+    mu.lock()
+    requested := requested_flag
+    at := requested_at_ms
+    ms := drain_deadline_ms
+    mu.unlock()
+    if not requested:
+        return 0
+    return at + ms / 2
+
+## whether the moment above has arrived. false whenever no drain has begun, so a
+## handler can poll it on every message without first asking `requested()`.
+##
+## it re-reads the flag rather than testing `stream_deadline()` against 0,
+## because the monotonic clock starts at 0 and a drain requested in the process's
+## first millisecond would otherwise never look overdue.
+pub fn stream_deadline_passed() -> Bool:
+    if not requested():
+        return false
+    return time.mono_millis() >= stream_deadline()
+
 ## arm the shutdown signals (SIGTERM, SIGINT, SIGHUP) and request a graceful
 ## shutdown when one arrives. returns immediately, having spawned a task that
 ## parks on the signal queue; returns how many signals were armed.
@@ -298,6 +347,7 @@ fn await_signal() -> Int:
 pub fn reset():
     mu.lock()
     requested_flag = false
+    requested_at_ms = 0
     listener_fds = []
     inflight_count = 0
     pending_flushes = 0
@@ -420,6 +470,46 @@ test "wait_requested with no timeout is a bare poll":
     reset()
     assert(not wait_requested(0))
     reset()
+
+test "there is no stream deadline until a drain begins":
+    reset()
+    assert_eq(stream_deadline(), 0)
+    assert(not stream_deadline_passed())
+    reset()
+
+test "the stream deadline is the midpoint of the grace period":
+    reset()
+    set_drain_deadline(1000)
+    before := time.mono_millis()
+    request()
+    at := stream_deadline()
+    # anchored on the request, not on the call, so every reader of it agrees:
+    # it sits half a grace period after the moment the drain began.
+    assert(at >= before + 500)
+    assert(at <= time.mono_millis() + 500)
+    assert(not stream_deadline_passed())
+    reset()
+
+test "a second request does not push the stream deadline out":
+    reset()
+    set_drain_deadline(1000)
+    request()
+    first := stream_deadline()
+    time.delay(20)
+    request()
+    # a repeated signal must not hand an endless stream another half period.
+    assert_eq(stream_deadline(), first)
+    reset()
+
+test "the stream deadline passes once the first half of the grace is spent":
+    reset()
+    set_drain_deadline(20)
+    request()
+    time.delay(40)
+    assert(stream_deadline_passed())
+    reset()
+    # and it is gone again once the state is cleared.
+    assert(not stream_deadline_passed())
 
 test "the drain deadline defaults, is settable, and rejects nonsense":
     reset()

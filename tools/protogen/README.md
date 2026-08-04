@@ -206,8 +206,11 @@ gets a typed `Foo<Rpc>ServerCall` and its handler drives the stream itself:
 - bidi → `fn(FooBidiServerCall) -> Int!` — recv and send interleave freely
 
 a `ServerCall` carries `send(reply: Resp) -> Int` (framed and sent
-immediately), `finish(status, message)` / `finish_ok()`, `metadata()`, and
-`deadline_ms()`. client-streaming and bidi calls add
+immediately), `finish(status, message)` / `finish_ok()`, `metadata()`,
+`deadline_ms()`, and `closing()` — true once a graceful shutdown has begun, so a
+handler that streams indefinitely can end its own stream rather than have it
+closed with `UNAVAILABLE` partway through the grace period (see
+[docs/signals.md](../../docs/signals.md)). client-streaming and bidi calls add
 `recv() -> Foo<Rpc>Recv!` — a small struct with `done` (the client
 half-closed) and the decoded `message`; a message that fails to decode fails
 recv with `INVALID_ARGUMENT`.

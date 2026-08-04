@@ -2792,6 +2792,12 @@ fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
             ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r
 
+# a violated assertion ends the process. under the test runner that process is
+# the child running one test, so the parent records a failure and the remaining
+# tests still run; in an ordinary build it is the program, because carrying on
+# past an invariant the code just declared is the silent-wrong this language
+# refuses. the two cases lower the same way, which is what lets an assertion sit
+# in a helper called from either.
 fn ir_test_assert_fail():
     one_r := ir_reg()
     ir_emit("iconst " + one_r.to_string() + " 1")
@@ -2860,7 +2866,12 @@ fn ir_assert_eq_kind_code(kind: String) -> Int:
         return 6
     return 0
 
-fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
+# assert_eq and assert_ne share every line but which branch of the comparison
+# is the failing one and which reporter decodes it. keeping them together is
+# what stops the pair drifting apart: assert_ne used to lower to a bare runtime
+# call that compared handles and did not exit, so it passed on equal strings and
+# failed on equal-content ones, in silence either way.
+fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> Int:
     cmp_r := ir_reg()
     kind := ir_assert_eq_kind(ir_assert_eq_operand_type(node, 1), ir_assert_eq_operand_type(node, 2))
     # compare by value: bytes and lists otherwise compare heap handles, so two
@@ -2878,12 +2889,18 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
         ir_emit_simple_binary(cmp_r, "eq", arg_regs[0], arg_regs[1])
     ok_l := ir_label()
     fail_l := ir_label()
-    ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
+    if want_equal:
+        ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
+    else:
+        ir_emit("brif " + cmp_r.to_string() + " " + fail_l + " " + ok_l)
     ir_emit_label(fail_l)
     kind_r := ir_reg()
     ir_emit("iconst " + kind_r.to_string() + " " + ir_assert_eq_kind_code(kind).to_string())
+    mut reporter := "pith_assert_ne_fail"
+    if want_equal:
+        reporter = "pith_assert_eq_fail"
     fail_r := ir_reg()
-    ir_emit_call3(fail_r, "pith_assert_eq_fail", "unknown", arg_regs[0], arg_regs[1], kind_r)
+    ir_emit_call3(fail_r, reporter, "unknown", arg_regs[0], arg_regs[1], kind_r)
     ir_test_assert_fail()
     ir_emit_label(ok_l)
     r := ir_reg()
@@ -3425,10 +3442,17 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         ir_emit("iconst " + zero_r.to_string() + " 0")
         arg_regs.push(zero_r)
 
-    if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
+    # the built-in assertions lower the same way in every build, not only under
+    # the test runner: a helper holding a table's assertions is compiled once
+    # and may be reached from a test block or from ordinary code, and it has to
+    # mean the same thing on both paths. a module that declares its own function
+    # by one of these names keeps it — ir_is_declared_callable is that check.
+    if callee.name == "assert" and arg_regs.len() >= 1 and not ir_is_declared_callable("assert"):
         return ir_emit_test_assert(arg_regs)
-    if ir_emit_tests and callee.name == "assert_eq" and arg_regs.len() >= 2:
-        return ir_emit_test_assert_eq(node, arg_regs)
+    if callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
+        return ir_emit_test_assert_eq(node, arg_regs, true)
+    if callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
+        return ir_emit_test_assert_eq(node, arg_regs, false)
 
     r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)

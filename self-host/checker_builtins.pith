@@ -35,7 +35,15 @@ pub fn register_builtin_types(scope_id: Int):
     define_builtin_function("input", create_function_type([], TID_STRING))
     define_builtin_function("args", create_function_type([], list_string))
 
+    # assert_eq and assert_ne are missing on purpose: they take two values of
+    # any one type, which no fixed signature here describes, so the call checker
+    # resolves them by name instead. see check_assertion_equality.
     define_builtin_function("assert", create_function_type([TID_BOOL], TID_VOID))
+
+    # std.testing records a failed check through this. a check that fails has
+    # failed the run whether or not anything is printing a tally, and this is
+    # what makes one inside a `test` block fail the block.
+    define_builtin_function("set_test_failed", create_function_type([TID_BOOL], TID_VOID))
 
     int_to_void := create_function_type([TID_INT], TID_VOID)
     define_builtin_function("exit", int_to_void)
@@ -235,6 +243,7 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("input", [], tid_string)
     fix_builtin_binding("args", [], list_string)
     fix_builtin_binding("assert", [tid_bool], tid_void)
+    fix_builtin_binding("set_test_failed", [tid_bool], tid_void)
     fix_builtin_binding("exit", [tid_int], tid_void)
     fix_builtin_binding("sleep", [tid_int], tid_void)
     fix_builtin_binding("random_seed", [tid_int], tid_void)

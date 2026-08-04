@@ -35,13 +35,13 @@ from a fresh copy of the process.
 
 ## assertions
 
-inside a `test` block, use the built-in `assert` and `assert_eq`:
+the built-in assertions are `assert`, `assert_eq` and `assert_ne`:
 
-- `assert(cond)` fails the test when `cond` is false.
-- `assert_eq(a, b)` fails when the two values differ, and compares by value:
-  integers, floats, strings, bytes, integer lists, and string lists all compare
-  their contents, not their heap identity. the failure message shows both sides
-  decoded:
+- `assert(cond)` fails when `cond` is false.
+- `assert_eq(a, b)` fails when the two values differ, and `assert_ne(a, b)` when
+  they do not. both compare by value: integers, floats, strings, bytes, integer
+  lists, and string lists all compare their contents, not their heap identity.
+  the failure message shows both sides decoded:
 
   ```
   assertion failed: [1, 2] != [1, 3]
@@ -51,6 +51,39 @@ inside a `test` block, use the built-in `assert` and `assert_eq`:
 maps, sets, and structs still compare by identity — `assert_eq` on those checks
 whether they are the same value, not whether their contents match. compare their
 fields or elements directly when you need a deep check.
+
+a failed assertion ends the process on the spot. under `pith test` that process
+is the forked child running one test, so the runner records one failure and
+carries on with the rest.
+
+### assertions in helpers
+
+the assertions are ordinary calls, not a `test` block dialect, so they work in
+any function. that is what makes a table of cases worth writing: the check goes
+in a helper and the test body feeds it rows.
+
+```pith
+struct Case:
+    input: String
+    want: Int
+
+fn assert_parses(c: Case):
+    assert_eq(parse(c.input), c.want)
+
+test "the parser handles every documented form":
+    for c in cases():
+        assert_parses(c)
+```
+
+a loop that stopped iterating passes as loudly as one that checked everything,
+so assert the row count too:
+
+```pith
+    assert_eq(checked, 7)
+```
+
+if a module defines or imports its own function called `assert_eq`, that one
+wins; the built-in only fills a name nothing else has claimed.
 
 ## skipping a test
 
@@ -90,10 +123,11 @@ handy when you drive the tests through a wrapper script.
 
 ## std.testing
 
-`std.testing` is a separate helper library, not the assertion surface for `test`
-blocks. its checks (`assert_eq`, `assert_ne`, `check_true`, and friends) count
-passes and failures and print them, then you call `done()` to print a summary —
-a counting model meant for a standalone `fn main()` test program:
+`std.testing` is a helper library for a different shape of test: a standalone
+`fn main()` that checks a great many things and reports them all. its checks
+(`assert_eq`, `assert_ne`, `check_true`, and friends) count passes and failures
+and print them as they go, then `done()` prints a summary. a failure does not
+stop the run, so one broken case does not hide the next twenty:
 
 ```pith
 from std.testing import assert_eq, done
@@ -103,13 +137,13 @@ fn main():
     done()
 ```
 
-one sharp edge to know about: because those checks only tally, a failing
-`std.testing.assert_eq` **does not fail a `test` block**. the block still exits
-cleanly and the runner marks it `ok`. so inside a `test` block, always reach for
-the built-in `assert` / `assert_eq`.
+these also work inside a `test` block: a check that fails there fails the block,
+because recording a failure sets the same process verdict a built-in assertion
+does. prefer the built-ins anyway — they read better and they print both sides
+of the comparison.
 
-what `std.testing` is genuinely good for is the utilities the built-ins do not
-cover: `assert_contains(text, part)`, `assert_file_exists(path)`,
+what `std.testing` adds beyond the built-ins is the utilities they do not cover:
+`assert_contains(text, part)`, `assert_file_exists(path)`,
 `assert_dir_exists(path)`, and `with_temp_dir(prefix, run)` for a scoped
 filesystem sandbox.
 

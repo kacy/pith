@@ -829,30 +829,27 @@ pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
     ptr
 }
 
+// one verdict for the whole process. a built-in assertion ends the process at
+// the point it fails, so it never needs to consult this; std.testing's checks
+// report and carry on, and this is how one of them that failed still reaches
+// the exit code. the test runner forks per test, so "the process" is the child
+// running a single test and the flag cannot leak into the next one.
 static TEST_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[no_mangle]
 pub extern "C" fn pith_assert(cond: i64) {
     if cond == 0 {
         TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("Assertion failed");
+        eprintln!("assertion failed");
     }
 }
 
+/// Set or clear the process verdict. `std.testing` records a failure through
+/// here so a check it counted still fails the run; clearing is for the tally's
+/// own tests, which provoke failures deliberately.
 #[no_mangle]
-pub extern "C" fn pith_assert_eq(a: i64, b: i64) {
-    if a != b {
-        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("Assertion failed: {} != {}", a, b);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn pith_assert_ne(a: i64, b: i64) {
-    if a == b {
-        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("Assertion failed: {} == {}", a, b);
-    }
+pub extern "C" fn pith_test_set_failed(failed: i64) {
+    TEST_FAILED.store(failed != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 // --- test value equality ----------------------------------------------------
@@ -934,26 +931,40 @@ unsafe fn list_display(handle: i64, string_elems: bool) -> String {
     s
 }
 
-/// Report an assert_eq failure with both sides decoded per `kind`
+/// One side of an assertion failure, decoded per `kind`
 /// (0 int, 1 float, 2 string, 3 bytes, 4 bool, 5 int-list, 6 string-list).
+unsafe fn assert_operand(v: i64, kind: i64) -> String {
+    match kind {
+        1 => f64::from_bits(v as u64).to_string(),
+        2 => format!("\"{}\"", cstr_to_display(v as *const i8)),
+        3 => bytes_hex(v),
+        4 => if v != 0 { "true".to_string() } else { "false".to_string() },
+        5 => list_display(v, false),
+        6 => list_display(v, true),
+        _ => v.to_string(),
+    }
+}
+
+/// Report an assert_eq failure with both sides decoded per `kind`.
 ///
 /// # Safety
 /// `a`/`b` must be valid values of the given `kind` for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
     TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-    let show = |v: i64| -> String {
-        match kind {
-            1 => f64::from_bits(v as u64).to_string(),
-            2 => format!("\"{}\"", cstr_to_display(v as *const i8)),
-            3 => bytes_hex(v),
-            4 => if v != 0 { "true".to_string() } else { "false".to_string() },
-            5 => list_display(v, false),
-            6 => list_display(v, true),
-            _ => v.to_string(),
-        }
-    };
-    eprintln!("assertion failed: {} != {}", show(a), show(b));
+    eprintln!("assertion failed: {} != {}", assert_operand(a, kind), assert_operand(b, kind));
+}
+
+/// Report an assert_ne failure. Both sides are shown even though they compared
+/// equal: which of two supposedly different values the pair collapsed to is the
+/// first thing anyone reading the failure wants to know.
+///
+/// # Safety
+/// `a`/`b` must be valid values of the given `kind` for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_assert_ne_fail(a: i64, b: i64, kind: i64) {
+    TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("assertion failed: {} == {}", assert_operand(a, kind), assert_operand(b, kind));
 }
 
 // --- test runner ------------------------------------------------------------
@@ -1035,13 +1046,19 @@ pub extern "C" fn pith_test_fork() -> i64 {
     unsafe { libc::fork() as i64 }
 }
 
-/// Called at the end of a test in the child process: flush and exit cleanly.
-/// A test that failed an assert has already exited(1) before reaching here.
+/// Called at the end of a test in the child process: flush and exit with the
+/// process verdict. A built-in assertion that failed has already exited(1)
+/// before reaching here; a `std.testing` check that failed only recorded it,
+/// and this is where that recording becomes a failed test rather than a line
+/// of output nobody counts.
 #[no_mangle]
 pub extern "C" fn pith_test_child_ok() -> i64 {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+    if TEST_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::exit(1);
+    }
     std::process::exit(0);
 }
 

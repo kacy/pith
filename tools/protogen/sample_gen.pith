@@ -769,6 +769,11 @@ impl GeometryCornersServerCall:
     # the absolute deadline (a time.mono_millis() timestamp), 0 when none.
     pub fn deadline_ms() -> Int:
         return self.inner.deadline_ms()
+    # whether a graceful shutdown has begun. a handler that streams
+    # indefinitely polls this and ends its own stream; one that does
+    # not is closed with UNAVAILABLE partway through the grace period.
+    pub fn closing() -> Bool:
+        return self.inner.closing()
 
 # one received Geometry.Assemble request message. done means the client
 # has finished sending (message is then an all-default Point).
@@ -804,6 +809,11 @@ impl GeometryAssembleServerCall:
     # the absolute deadline (a time.mono_millis() timestamp), 0 when none.
     pub fn deadline_ms() -> Int:
         return self.inner.deadline_ms()
+    # whether a graceful shutdown has begun. a handler that streams
+    # indefinitely polls this and ends its own stream; one that does
+    # not is closed with UNAVAILABLE partway through the grace period.
+    pub fn closing() -> Bool:
+        return self.inner.closing()
 
 # one received Geometry.Reflect request message. done means the client
 # has finished sending (message is then an all-default Point).
@@ -839,6 +849,11 @@ impl GeometryReflectServerCall:
     # the absolute deadline (a time.mono_millis() timestamp), 0 when none.
     pub fn deadline_ms() -> Int:
         return self.inner.deadline_ms()
+    # whether a graceful shutdown has begun. a handler that streams
+    # indefinitely polls this and ends its own stream; one that does
+    # not is closed with UNAVAILABLE partway through the grace period.
+    pub fn closing() -> Bool:
+        return self.inner.closing()
 
 # handler slots for the streaming rpcs; the unary rpcs share the buffered
 # serve_Geometry slots above. module globals, because grpc's dispatch is

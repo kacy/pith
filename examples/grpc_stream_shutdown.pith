@@ -1,0 +1,133 @@
+# a rolling deploy against a server whose streams never end.
+#
+# a drain waits for work to finish. a server-streaming or bidi rpc that loops
+# forever never finishes, so it would outlast any grace period and be cut off
+# when the process goes — leaving its peer a truncated body with no grpc-status,
+# indistinguishable from a crash.
+#
+# the grace period is split in half to fix that. the first half is the handler's:
+# GrpcStream.closing() goes true the moment a drain starts, and a handler that
+# polls it ends its own stream with its own status. the second half is the
+# framework's: whatever is still open is finished with UNAVAILABLE, the
+# connections are wound down, and the drain completes.
+#
+# this example runs both handlers side by side over one connection and then
+# sends itself a SIGTERM, exactly as an orchestrator would:
+#
+#   /demo.Feed/Polite  polls closing() and finishes itself  -> the stream ends OK
+#   /demo.Feed/Naive   ticks forever and never looks        -> UNAVAILABLE, cleanly
+#
+# the naive one is the point. it is the shape you get by accident, and it now
+# degrades instead of being severed.
+#
+# Run:  pith run examples/grpc_stream_shutdown.pith
+
+import std.bytes as bytes
+import std.net.grpc as grpc
+import std.net.tcp as tcp
+import std.shutdown as shutdown
+import std.signal as signal
+import std.time as time
+
+PORT := 50263
+
+# short enough to keep the example quick, and still the same two halves a real
+# deployment gets: handlers own the first, the framework owns the second.
+GRACE_MS := 1200
+
+# how long a tick takes. small enough that both streams are visibly flowing
+# before the signal lands.
+TICK_MS := 25
+
+fn route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if path == "/demo.Feed/Polite":
+        # the pattern a long-lived handler should follow: one flag, checked
+        # between messages, and the stream ends on the handler's own terms.
+        while not call.closing():
+            call.send_message(bytes.from_string_utf8("tick"))
+            time.delay(TICK_MS)
+        call.finish_ok()
+        return 0
+    if path == "/demo.Feed/Naive":
+        # and the pattern you get without thinking about it. no exit at all.
+        while true:
+            call.send_message(bytes.from_string_utf8("tick"))
+            time.delay(TICK_MS)
+        return 0
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+# serve until the drain completes, then report what was left unfinished.
+fn run_server() -> Int:
+    return grpc.serve_stream("127.0.0.1", PORT, route) catch 0 - 1
+
+# wait until the server is accepting before dialing. a flat sleep is a race the
+# server loses on a busy machine.
+fn wait_for_port(timeout_ms: Int) -> Bool:
+    mut waited := 0
+    while waited < timeout_ms:
+        probe := tcp.connect("127.0.0.1", PORT)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        time.delay(25)
+        waited = waited + 25
+    return false
+
+# read a stream to its end and say how it ended. "the deploy closed this" and
+# "the socket died" are both UNAVAILABLE, so the message is what separates them.
+fn report(label: String, stream: grpc.ServerStream):
+    while true:
+        step := stream.recv()
+        if step.is_err:
+            print("  " + label + ": " + grpc.status_name(step.err.status) + " — " + step.err.message)
+            return
+        if step.ok.done:
+            print("  " + label + ": stream ended OK")
+            return
+
+fn main():
+    shutdown.set_drain_deadline(GRACE_MS)
+    armed := shutdown.on_signals() catch 0
+    print("armed " + armed.to_string() + " shutdown signals")
+
+    server := spawn run_server()
+    if not wait_for_port(10000):
+        print("server never started listening")
+        return
+    print("serving grpc on 127.0.0.1:" + PORT.to_string())
+
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+    opened_polite := conn.server_stream("/demo.Feed/Polite", bytes.empty())
+    opened_naive := conn.server_stream("/demo.Feed/Naive", bytes.empty())
+    if opened_polite.is_err or opened_naive.is_err:
+        print("could not open the streams")
+        return
+    polite := opened_polite.ok
+    naive := opened_naive.ok
+
+    # read one tick off each, so neither ends merely because it never began.
+    first := polite.recv()
+    second := naive.recv()
+    if first.is_err or second.is_err:
+        print("neither stream started")
+        return
+    print("both streams flowing")
+
+    print("orchestrator: sending SIGTERM")
+    signal.raise_self(signal.SIGTERM)
+
+    print("what each peer reads:")
+    report("polite", polite)
+    report("naive ", naive)
+
+    closed := grpc.streams_closed_by_shutdown()
+    print("rpcs the framework had to close: " + closed.to_string())
+    conn.close()
+
+    # 0 means every connection left the in-flight count inside the grace period —
+    # the naive handler is still looping, and the drain finished anyway.
+    print("unfinished work at the deadline: " + (await server).to_string())

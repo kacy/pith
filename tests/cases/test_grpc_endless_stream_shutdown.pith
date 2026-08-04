@@ -1,0 +1,116 @@
+# what a graceful shutdown does to a stream that never ends.
+#
+# two server-streaming rpcs run at once over one connection, and then a drain
+# starts. one handler polls closing() and ends its own stream; the other is
+# deliberately naive — it ticks forever and never looks at the flag, which is the
+# shape that used to be severed at the grace deadline with no grpc-status at all.
+#
+# the proof is in the status each peer reads. "closed by the deploy" and
+# "the socket died under us" are both UNAVAILABLE, so the message is what
+# separates them: a truncated stream reports "connection closed mid-stream",
+# and only a stream the server closed on purpose reports "server is shutting
+# down". the naive one has to report the second.
+
+import std.net.grpc as grpc
+import std.shutdown as shutdown
+import std.bytes as bytes
+import std.time as time
+import std.net.tcp as tcp
+
+PORT := 50341
+
+# a grace period short enough for a test and long enough for the wind-down: the
+# handlers get the first half, and the framework closes what is left and tears
+# the connections down in the second.
+GRACE_MS := 1200
+
+fn route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if path == "/t.Svc/Polite":
+        # the pattern a long-lived handler is supposed to follow.
+        while not call.closing():
+            call.send_message(bytes.from_string_utf8("polite"))
+            time.delay(20)
+        call.finish_ok()
+        return 0
+    if path == "/t.Svc/Naive":
+        # and the pattern it is not. no exit condition at all.
+        while true:
+            call.send_message(bytes.from_string_utf8("naive"))
+            time.delay(20)
+        return 0
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+# the drain result comes back through the task handle: 0 means every connection
+# left the in-flight count inside the grace period.
+fn run_server() -> Int:
+    return grpc.serve_stream("127.0.0.1", PORT, route) catch -1
+
+# wait until the spawned server is accepting before dialing it: a flat sleep is a
+# race the server loses whenever the machine is busy.
+fn wait_for_port(port: Int, timeout_ms: Int) -> Bool:
+    mut waited := 0
+    while waited < timeout_ms:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        time.delay(25)
+        waited = waited + 25
+    return false
+
+# read messages until the stream ends, and report how it ended. the tick count is
+# timing-dependent, so it is deliberately not part of the answer.
+fn drain_stream(label: String, stream: grpc.ServerStream):
+    while true:
+        step := stream.recv()
+        if step.is_err:
+            print(label + ": status " + step.err.status.to_string() + " " + step.err.message)
+            return
+        if step.ok.done:
+            print(label + ": done")
+            return
+
+fn main():
+    shutdown.set_drain_deadline(GRACE_MS)
+    server := spawn run_server()
+    if not wait_for_port(PORT, 10000):
+        print("server never started listening")
+        return
+    dialed := grpc.dial_h2c("127.0.0.1", PORT)
+    if dialed.is_err:
+        print("dial failed")
+        return
+    conn := dialed.ok
+
+    polite := conn.server_stream("/t.Svc/Polite", bytes.from_string_utf8("go"))
+    naive := conn.server_stream("/t.Svc/Naive", bytes.from_string_utf8("go"))
+    if polite.is_err or naive.is_err:
+        print("open failed")
+        return
+
+    # both streams are live before the drain: read one tick off each, so neither
+    # ends because it never really started.
+    first := polite.ok.recv()
+    if first.is_err or first.ok.done:
+        print("polite never ticked")
+        return
+    second := naive.ok.recv()
+    if second.is_err or second.ok.done:
+        print("naive never ticked")
+        return
+    print("both streams ticking")
+
+    # exactly what a SIGTERM does, without needing one.
+    shutdown.request()
+
+    # the polite handler ends its stream itself, so this reports done. the naive
+    # one is closed for it at the midpoint of the grace period, and must report a
+    # real status rather than a dead socket.
+    drain_stream("polite", polite.ok)
+    drain_stream("naive", naive.ok)
+    print("closed by shutdown: " + grpc.streams_closed_by_shutdown().to_string())
+    conn.close()
+    # and the server is not still waiting on a peer that was never going to hang
+    # up: the connection leaves the in-flight count even though the naive handler
+    # is still looping, so the drain finishes well inside the grace period.
+    print("drain left " + (await server).to_string())

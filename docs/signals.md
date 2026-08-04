@@ -107,6 +107,7 @@ and several subsystems compose without knowing about each other.
 | `expect_flush()` / `flush_done()` | a subsystem with shutdown work of its own |
 | `drain(deadline_ms)` | wait for both, returning what was left unfinished |
 | `set_drain_deadline(ms)` | the grace period every std server uses |
+| `stream_deadline()` / `stream_deadline_passed()` | the midpoint of the period, where a stream stops being the handler's problem |
 
 `set_drain_deadline` is one knob rather than an argument on each of the nine
 listen entry points, because the right value is a property of the deployment —
@@ -123,21 +124,48 @@ all of them, and through the same coordinator:
 - `std.net.grpc` — `serve`, `serve_tls`, `serve_body`, `serve_body_tls`,
   `serve_stream`, `serve_stream_tls`, which ride the http/2 accept loop and so
   inherit its drain. an rpc in progress is never severed by the drain itself,
-  which for a streaming method means the stream runs to its trailers.
+  which for a streaming method means the stream runs to its trailers — and, for
+  one that would otherwise never get there, to a `UNAVAILABLE` status rather than
+  a cut connection.
 
-## endless streams
+## streams that never end
 
-a drain waits for a connection to end, and a stream that never ends outlasts any
-grace period. a long-lived handler should poll `shutdown.requested()` between
-messages and finish its stream when it goes true, rather than relying on the
-deadline to cut it off:
+a drain waits for work to finish, and a stream that never finishes would outlast
+any grace period. so the period is split in half, and both halves read the same
+timestamp — `stream_deadline()` — so they cannot drift apart.
+
+**the first half is the handler's.** a long-lived handler polls the flag between
+messages and ends its stream on its own terms:
 
 ```pith
-while not shutdown.requested():
+while not stream.closing():
     message := stream.recv_message()!
-    stream.send_message(reply_to(message))!
+    stream.send_message(reply_to(message))
 stream.finish_ok()
 ```
+
+**the second half is the framework's**, and it needs nothing from the handler.
+at the midpoint:
+
+1. every gRPC rpc still open is finished with `UNAVAILABLE` and the message
+   `grpc: server is shutting down`. it is done from a watchdog rather than from
+   inside a send, because a handler asleep between two ticks is not in any call
+   the framework could intercept.
+2. each connection cancels the streams still on it. that wakes a handler parked
+   on a receive, and — unlike tearing the stream table down — leaves it a writer
+   to send its own trailers through.
+3. the socket is stopped with `shutdown(2)`, which unblocks the reader task. an
+   http/2 connection is long-lived by design: a client reading an endless stream,
+   or just holding a pool entry, has no reason to hang up, and until the reader
+   returns that connection never leaves the in-flight count.
+
+the result is that a handler that does nothing special still degrades gracefully:
+its peer reads a real status and retries against the replacement instance, and
+the drain finishes rather than running out the clock.
+
+that is the safety net, not the design. `grpc.streams_closed_by_shutdown()`
+counts the rpcs the framework had to close; anything but `0` names a handler that
+should be polling `closing()`.
 
 ## telemetry
 
@@ -151,3 +179,7 @@ waits for the final span and metric export before the process exits. see
 starts a slow request, sends itself a `SIGTERM`, shows a new connection being
 refused while the earlier one is still being served, and prints the drain
 outcome.
+
+`examples/grpc_stream_shutdown.pith` is the streaming half: two endless rpcs run
+side by side while a `SIGTERM` lands, one polling `closing()` and one ignoring it
+completely, and it prints the status each peer ends up with.

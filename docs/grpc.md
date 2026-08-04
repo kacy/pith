@@ -376,11 +376,35 @@ every `serve*` entry point rides the http/2 accept loop, so they all drain on
 `SIGTERM` once `std.shutdown.on_signals()` has been called. the listener stops
 accepting, the rpcs already in progress run to their trailers, and `serve`
 returns the work left unfinished at the grace period — `0` for a clean drain. an
-rpc is never severed by the drain itself.
+rpc is never severed by the drain itself, and every peer reads a grpc-status.
 
-a long-lived streaming handler is the exception: a stream that never ends
-outlasts any grace period, so it should poll `shutdown.requested()` between
-messages and finish itself. see [docs/signals.md](signals.md).
+### streams that never end
+
+a stream that never ends would outlast any grace period, so the period is split
+in half. the first half is the handler's:
+
+```pith
+while not call.closing():
+    call.send(next_tick())
+call.finish_ok()
+```
+
+`closing()` is on the live `GrpcStream` and on every generated typed
+`ServerCall`, and goes true the moment a drain starts. a handler that polls it
+ends its stream on its own terms, with its own status.
+
+the second half is the framework's. every rpc still open at the midpoint is
+finished for it with `UNAVAILABLE` and the message `grpc: server is shutting
+down`, and then the connection is wound down: a GOAWAY, a cancel for any handler
+parked on a receive, and finally the socket. so a handler that ignores `closing()`
+entirely — even one asleep between two sends — still leaves its peer a real
+grpc-status to act on rather than a truncated body, and still lets the drain
+finish instead of burning the whole period waiting on a peer that had no reason
+to hang up.
+
+that is a fallback, not a design. `grpc.streams_closed_by_shutdown()` counts the
+rpcs the framework had to close; anything but `0` names a handler to fix. see
+[docs/signals.md](signals.md) for the shared machinery.
 
 ## what isn't here yet
 

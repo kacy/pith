@@ -56,6 +56,7 @@ import std.net.http as http
 import std.net.tcp as tcp
 import std.net.tls as tls
 import std.shutdown as shutdown
+import std.time as time
 # the request-side stream event and its constructors, plus the settings ids and
 # the default window, are shared as-is with the client — the server reads the
 # same events the client writes. imported by name because a Channel's element
@@ -317,6 +318,20 @@ impl ServerConn:
             done = cont.end_headers
         return out.bytes()
 
+    # stop the underlying socket in both directions without closing it, waking the
+    # reader task blocked on it.
+    #
+    # the drain needs this and a close will not do: a peer holding an idle — or
+    # endlessly streaming — connection open is exactly the case, and closing an fd
+    # does not wake a read already blocked on it. shutdown(2) does, and it leaves
+    # the descriptor valid so the connection's own close still runs exactly once.
+    # offline connections have no socket, so this is a no-op for them.
+    fn shutdown_transport():
+        if self.transport == TRANSPORT_TCP:
+            tcp_shutdown(self.fd)
+        elif self.transport == TRANSPORT_TLS:
+            tls.conn_from_handle(self.tls_handle).shutdown_transport()
+
     # close the underlying transport.
     fn close():
         if self.transport == TRANSPORT_TCP:
@@ -460,6 +475,35 @@ impl Server:
         if not rst.is_err:
             self.enqueue_frame(rst.ok)
         self.forget(stream_id)
+
+    # stop the socket, unless this connection has already wound down.
+    #
+    # the test and the syscall are one step under the stream-table lock because
+    # `closed` is set under that same lock, and the connection's own close(2)
+    # strictly follows it: shutting an fd number down after its owner closed it
+    # would land on whatever socket the kernel handed that number to next. the
+    # syscall does not block, so it is safe to hold the lock across it.
+    fn shutdown_transport_if_live():
+        self.mu.lock()
+        if self.closed.load() == 0:
+            self.conn.shutdown_transport()
+        self.mu.unlock()
+
+    # hand every open stream a cancel event, so a handler parked on recv_event()
+    # wakes and can end its rpc itself.
+    #
+    # deliberately not shutdown_streams(): that clears the table and closes the
+    # outbound queue, which would leave the handler nothing to send its trailers
+    # through. here the stream stays registered and the writer stays running, so
+    # a handler that reacts to the cancel still gets a clean status onto the wire.
+    fn cancel_active_streams():
+        self.mu.lock()
+        mut ids: List[Int] := []
+        for stream_id in self.active:
+            ids.push(stream_id)
+        self.mu.unlock()
+        for stream_id in ids:
+            self.deliver(stream_id, reset_event(frames.ERROR_CANCEL))
 
     # close every open stream's inbox so handlers blocked on recv() unblock, then
     # clear the table. called when the connection winds down.
@@ -1134,6 +1178,76 @@ fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpRespon
 fn serve_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Bool!:
     return run_connection(conn, handler, false)!
 
+# the share of the grace period the wind-down keeps back for its own last step:
+# cancelling the streams a drain caught mid-flight and letting the trailers those
+# handlers send reach the wire before the socket stops. a tenth of the period,
+# with a floor, because the work is a queue flush rather than anything that
+# scales with the deadline — and a deadline set small for a test must still leave
+# room for it.
+FLUSH_WINDOW_FLOOR_MS := 50
+
+fn flush_window_ms() -> Int:
+    share := shutdown.drain_deadline() / 10
+    if share < FLUSH_WINDOW_FLOOR_MS:
+        return FLUSH_WINDOW_FLOOR_MS
+    return share
+
+# poll until this connection has no open stream left, it has wound down on its
+# own, or `deadline_ms` (a time.mono_millis() timestamp) passes.
+fn wait_for_idle_streams(server: Server, deadline_ms: Int):
+    while server.closed.load() == 0 and server.active_count() > 0:
+        if time.mono_millis() >= deadline_ms:
+            return
+        time.delay(shutdown.POLL_INTERVAL_MS)
+
+# wait for the writer to drain the outbound queue, so the frames the wind-down
+# just caused — the GOAWAY, and the trailers a cancelled handler sent on its way
+# out — are on the socket before it is stopped under them.
+#
+# an empty queue means the writer has taken the last item, not that it has
+# written it, so one more interval follows. this is the difference between a peer
+# reading a status and a peer reading a dead socket, and it costs a few
+# milliseconds once per connection at shutdown.
+fn wait_for_flush(server: Server, deadline_ms: Int):
+    while server.closed.load() == 0 and server.outbound.len() > 0:
+        if time.mono_millis() >= deadline_ms:
+            return
+        time.delay(shutdown.POLL_INTERVAL_MS)
+    if server.closed.load() == 0:
+        time.delay(shutdown.POLL_INTERVAL_MS)
+
+# wind this connection down when a graceful shutdown starts.
+#
+# without this a drain waits on the peer's goodwill. an http/2 connection is
+# long-lived by design: a client with an idle pool entry, or one reading an
+# endless server stream, has no reason to close it, and the reader task stays
+# parked on the socket until it does — so the connection never leaves the
+# in-flight count and the drain burns the whole grace period before giving up on
+# a connection that had nothing left to do.
+#
+# the phases mirror std.shutdown's split of the period. GOAWAY first, so the peer
+# opens no new streams here while the ones already running finish. at the shared
+# stream deadline, cancel whatever is left: that wakes a handler parked on
+# recv_event() and, unlike tearing the stream table down, leaves it a writer to
+# send its own trailers through — which is how a peer gets a real status instead
+# of a truncated body. then the socket stops, the reader unblocks, and the
+# connection leaves the count.
+fn drain_watch(server: Server):
+    mut requested := false
+    while not requested:
+        if server.closed.load() != 0:
+            return
+        requested = shutdown.wait_requested(shutdown.WAKE_SLICE_MS)
+    if server.closed.load() != 0:
+        return
+    send_goaway(server, frames.ERROR_NO_ERROR)
+    wait_for_idle_streams(server, shutdown.stream_deadline())
+    if server.closed.load() == 0 and server.active_count() > 0:
+        server.cancel_active_streams()
+        wait_for_idle_streams(server, time.mono_millis() + flush_window_ms())
+    wait_for_flush(server, time.mono_millis() + flush_window_ms())
+    server.shutdown_transport_if_live()
+
 # serve_connection with the streaming switch explicit: `streaming` true routes
 # every stream to the process-wide streaming handler instead of `handler`.
 fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Bool!:
@@ -1149,6 +1263,9 @@ fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.H
     # the send side starts at http/2's defaults; the client's SETTINGS (its first
     # frame) revises the initial window and max frame size before any stream opens.
     server := Server(conn, handler, streaming, outbound, Mutex(), streams, ids, 0, closed, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
+    # the wind-down watches the shutdown flag for this connection's whole life and
+    # stops when the connection does, so it is spawned rather than awaited.
+    spawn drain_watch(server)
     run_reader(server)
     await writer
     return true

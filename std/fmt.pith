@@ -147,14 +147,27 @@ fn left_brace() -> String:
 fn right_brace() -> String:
     return chr(125)
 
+# braces are ascii, so the pattern is scanned a byte at a time. reading the
+# byte rather than slicing a one-byte string keeps this correct on a pattern
+# that contains multi-byte characters, where slicing would have cut one in
+# half, and saves an allocation per character besides.
+fn pattern_byte(pattern: String, index: Int) -> Int:
+    if index < 0 or index >= pattern.len():
+        return - 1
+    return bit_and(ord(pattern[index]), 255)
+
+fn is_brace_at(pattern: String, index: Int) -> Bool:
+    b := pattern_byte(pattern, index)
+    return b == 123 or b == 125
+
 fn is_placeholder_at(pattern: String, index: Int) -> Bool:
-    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == left_brace() and pattern.substring(index + 1, index + 2) == right_brace()
+    return pattern_byte(pattern, index) == 123 and pattern_byte(pattern, index + 1) == 125
 
 fn is_left_escape_at(pattern: String, index: Int) -> Bool:
-    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == left_brace() and pattern.substring(index + 1, index + 2) == left_brace()
+    return pattern_byte(pattern, index) == 123 and pattern_byte(pattern, index + 1) == 123
 
 fn is_right_escape_at(pattern: String, index: Int) -> Bool:
-    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == right_brace() and pattern.substring(index + 1, index + 2) == right_brace()
+    return pattern_byte(pattern, index) == 125 and pattern_byte(pattern, index + 1) == 125
 
 fn format_values(pattern: String, values: List[String]) -> String:
     mut parts: List[String] := []
@@ -175,8 +188,20 @@ fn format_values(pattern: String, values: List[String]) -> String:
                 append_format_segment(parts, left_brace() + right_brace())
             i = i + 2
         else:
-            append_format_segment(parts, pattern.substring(i, i + 1))
-            i = i + 1
+            # copy the whole run up to the next brace in one piece. the cut
+            # lands on a brace or the end of the pattern, both of which are
+            # character boundaries whatever the text in between is.
+            mut run_end := i
+            while run_end < pattern.len() and not is_brace_at(pattern, run_end):
+                run_end = run_end + 1
+            if run_end == i:
+                # a brace that paired with nothing: keep it as written, and
+                # step past it so the scan always makes progress
+                append_format_segment(parts, chr(pattern_byte(pattern, i)))
+                i = i + 1
+            else:
+                append_format_segment(parts, pattern.substring(i, run_end))
+                i = run_end
     return parts.join("")
 
 # Fills `{}` placeholders in order using the provided string values.
@@ -225,6 +250,21 @@ test "map display helpers render key value pairs":
     assert(count_text.contains("blue: 3"))
     assert(name_text.contains("lang: pith"))
     assert(name_text.contains("backend: cranelift"))
+
+test "formats a pattern containing non-ascii text":
+    # the scanner used to slice out one byte at a time, which cut every
+    # multi-byte character in the pattern in half
+    # the braces are built rather than written: a literal "{}" in pith source
+    # is string interpolation, not two characters
+    hole := chr(123) + chr(125)
+    assert_eq(format("Ärger " + hole + " ünïcode", ["x"]), "Ärger x ünïcode")
+    assert_eq(format("Ä" + hole + "Ö", ["x"]), "ÄxÖ")
+    assert_eq(format("日本語", []), "日本語")
+    # a brace that pairs with nothing is still passed through, and the scan
+    # still makes progress past it
+    assert_eq(format("lone " + chr(123) + " brace", []), "lone " + chr(123) + " brace")
+    assert_eq(format("Ä" + chr(123), []), "Ä" + chr(123))
+    assert_eq(format("trailing " + chr(125), []), "trailing " + chr(125))
 
 test "format fills placeholders in order":
     slot := chr(123) + chr(125)

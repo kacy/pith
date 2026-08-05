@@ -1,0 +1,353 @@
+# std.html — escaping untrusted text for html output
+#
+# a server that pastes a query parameter into a page without escaping it has
+# handed the visitor's browser to whoever wrote the query parameter. `escape`
+# is the one call that stops that, and it is deliberately the only thing this
+# module does: it escapes, it does not sanitize. there is no "clean this html
+# for me" function here, because a function like that is wrong more often than
+# it is right and it is impossible to tell from the call site which time it is.
+#
+#   import std.html as html
+#
+#   html.escape("<script>alert(1)</script>")
+#   # "&lt;script&gt;alert(1)&lt;/script&gt;"
+#
+#   body := "<p>hello, " + html.escape(name) + "</p>"
+#
+# ## where escaping is enough
+#
+# `escape` covers the two contexts that make up nearly all of a page:
+#
+#   - element text — `<p>HERE</p>`, `<title>HERE</title>`
+#   - a quoted attribute value — `<input value="HERE">` or `value='HERE'`
+#
+# both quote characters are escaped, so one function serves both; see the note
+# on `escape` for why there is no separate attribute variant.
+#
+# ## where escaping is not enough
+#
+# these are the contexts where `escape` will not save you, and calling it
+# anyway buys nothing but false confidence:
+#
+#   - **inside `<script>`** — html entities are not decoded in a script block,
+#     so escaping does nothing at all there and the value stays live javascript.
+#     serialize the value as json and read it from a `<script type="application/json">`
+#     block or a data attribute instead of pasting it into code.
+#   - **inside `<style>`** — same story: entities are not decoded, and css has
+#     its own injection surface (`url(...)`, `expression(...)`).
+#   - **a url attribute** — `href`, `src`, `action`, `formaction`. escaping
+#     leaves `javascript:alert(1)` intact and perfectly clickable, because there
+#     is nothing in it to escape. use `escape_url`.
+#   - **an unquoted attribute** — `<a class=HERE>`. a space, a tab, or a newline
+#     ends the attribute and starts a new one, and none of those are escaped.
+#     quote your attributes; this module assumes you did.
+#   - **inside an html comment**, inside a tag name, or inside an attribute
+#     *name*. none of those are text and none of them are handled here.
+#
+# ## encoding
+#
+# the five characters escaped here are ascii, and the scan is byte-wise, so
+# multi-byte utf-8 passes through untouched — its bytes are all >= 0x80 and
+# never collide with an ascii delimiter. the output is only safe in a document
+# that is actually served as utf-8; declare it, either in the `Content-Type`
+# header or with `<meta charset="utf-8">`. a page whose charset the browser is
+# left to guess can be pushed into an encoding where other byte sequences mean
+# `<`, and no amount of escaping helps.
+
+import std.strings as strings
+
+# ---------------------------------------------------------------
+# text and attribute escaping
+# ---------------------------------------------------------------
+
+# the entity for one byte, or "" when the byte needs no escaping.
+#
+# `&` is in the table alongside the others rather than being handled in a
+# separate first pass, which is what makes double-escaping structurally
+# impossible: every input byte is looked at exactly once and produces exactly
+# one output, so the `&` in the `&lt;` this function just emitted is never
+# examined again. escaping `&` in a second pass over the output is the classic
+# way to turn `<` into `&amp;lt;` by accident.
+fn entity_for(byte: Int) -> String:
+    if byte == 38:
+        return "&amp;"
+    if byte == 60:
+        return "&lt;"
+    if byte == 62:
+        return "&gt;"
+    if byte == 34:
+        return "&quot;"
+    if byte == 39:
+        return "&#39;"
+    return ""
+
+# Escapes text for html element content and for quoted attribute values.
+#
+# replaces `&` `<` `>` `"` `'` with their entities and leaves everything else
+# alone. an input with nothing to escape is returned as-is rather than rebuilt.
+#
+# `'` becomes the numeric `&#39;` and not `&apos;`, because `&apos;` is an xml
+# entity that html 4 never defined — a browser in quirks mode can render it
+# literally, which puts the quote back.
+#
+# there is deliberately no separate `escape_attr`. escaping both quote
+# characters means this one function is already correct inside `attr="..."`
+# and `attr='...'`, and a second function that did the same thing would only
+# raise the question of which one the call site should have used. the contexts
+# an attribute escaper is usually invented for — urls and unquoted attributes —
+# are not solved by escaping more characters; see `escape_url` and the module
+# header.
+#
+# there is no length cap and no truncation here. an escaper that silently
+# returns a prefix of what you gave it is a worse problem than the memory it
+# saves; bound the input where it arrives — `std.net.http` already caps request
+# bodies — and let this be a total function.
+#
+# the scan is over bytes, and every byte of a multi-byte utf-8 sequence is
+# >= 0x80, so no character is ever split by an entity and non-ascii text is
+# copied through whole.
+pub fn escape(input: String) -> String:
+    length := input.len()
+    mut out := ""
+    mut copied := 0
+    mut position := 0
+    while position < length:
+        entity := entity_for(ord(input[position]))
+        if entity != "":
+            if position > copied:
+                out = out + input.substring(copied, position)
+            out = out + entity
+            copied = position + 1
+        position = position + 1
+    if copied == 0:
+        return input
+    if copied < length:
+        out = out + input.substring(copied, length)
+    return out
+
+# Whether `input` contains a character `escape` would rewrite.
+#
+# useful for a caller that wants to reject rather than escape — a username
+# field, say, where the presence of a bracket is itself the bug.
+pub fn needs_escape(input: String) -> Bool:
+    mut position := 0
+    while position < input.len():
+        if entity_for(ord(input[position])) != "":
+            return true
+        position = position + 1
+    return false
+
+# ---------------------------------------------------------------
+# url attributes
+# ---------------------------------------------------------------
+
+# the schemes allowed to appear in an `href` or `src` built from untrusted
+# input. everything else — `javascript:`, `data:`, `vbscript:`, `file:`, and
+# any scheme invented after this list was written — is refused.
+fn scheme_allowed(scheme: String) -> Bool:
+    if scheme == "http" or scheme == "https":
+        return true
+    if scheme == "mailto" or scheme == "tel":
+        return true
+    return false
+
+# the url as a browser sees it for the purpose of finding the scheme: with
+# every c0 control byte, space, and delete removed.
+#
+# this is the step that closes a scheme split by a control character: `java`,
+# a tab byte, then `script:alert(1)`. a browser strips tab, newline, and
+# carriage return from a url before it parses the scheme, so a
+# naive `starts_with("javascript:")` test passes a string the browser will
+# happily run. stripping first means the allowlist sees the same scheme the
+# browser will.
+fn strip_url_noise(input: String) -> String:
+    mut out := ""
+    mut position := 0
+    while position < input.len():
+        byte := ord(input[position])
+        if byte > 32 and byte != 127:
+            out = out + input[position]
+        position = position + 1
+    return out
+
+# true when `input` begins with a sequence a browser may read as the start of
+# a protocol-relative url, which navigates off-site under the current scheme.
+fn is_protocol_relative(input: String) -> Bool:
+    if input.len() < 2:
+        return false
+    first := ord(input[0])
+    second := ord(input[1])
+    if first != 47 and first != 92:
+        return false
+    return second == 47 or second == 92
+
+# Returns `url` unchanged if it is safe to navigate to, or `"about:blank"`.
+#
+# the contract is deliberately narrow: this function either hands back exactly
+# what you gave it or hands back `about:blank`. it never rewrites, never
+# encodes, and never "fixes" a url, so nothing downstream has to wonder whether
+# the string changed shape.
+#
+# accepted: an absolute url whose scheme is `http`, `https`, `mailto`, or
+# `tel`, and a relative url with no scheme at all. refused: every other scheme,
+# and a protocol-relative url (`//evil.example`, and the backslash spellings
+# browsers also accept) — the latter is not script execution but it is an open
+# redirect, and an attacker-supplied `href` is exactly where that matters.
+#
+# this does not escape. put the result through `escape` before it lands in an
+# attribute, or call `escape_url`, which does both.
+pub fn safe_url(url: String) -> String:
+    probe := strip_url_noise(url)
+    if probe == "":
+        return "about:blank"
+    if is_protocol_relative(probe):
+        return "about:blank"
+    mut position := 0
+    while position < probe.len():
+        byte := ord(probe[position])
+        if byte == 58:
+            if scheme_allowed(probe.substring(0, position).to_lower()):
+                return url
+            return "about:blank"
+        if byte == 47 or byte == 63 or byte == 35:
+            return url
+        position = position + 1
+    return url
+
+# Returns `url` filtered by `safe_url` and then escaped for a quoted attribute.
+#
+# this is what belongs in `href="..."` and `src="..."` when the url came from
+# outside. `escape` alone is not enough there: there is nothing to escape in
+# `javascript:alert(1)`, so escaping leaves it word for word and clickable.
+pub fn escape_url(url: String) -> String:
+    return escape(safe_url(url))
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+test "escape rewrites each of the five characters":
+    assert_eq(escape("&"), "&amp;")
+    assert_eq(escape("<"), "&lt;")
+    assert_eq(escape(">"), "&gt;")
+    assert_eq(escape("\""), "&quot;")
+    assert_eq(escape("'"), "&#39;")
+
+test "escape rewrites all five together and keeps their order":
+    assert_eq(escape("&<>\"'"), "&amp;&lt;&gt;&quot;&#39;")
+    assert_eq(escape("'\">&<"), "&#39;&quot;&gt;&amp;&lt;")
+
+test "escape leaves harmless input alone":
+    assert_eq(escape(""), "")
+    assert_eq(escape("plain text"), "plain text")
+    assert_eq(escape("a-b_c.d/e:f?g=h"), "a-b_c.d/e:f?g=h")
+    assert_eq(escape("héllo wörld"), "héllo wörld")
+    assert_eq(escape("日本語"), "日本語")
+
+test "escape carries multi-byte characters through the escaping path":
+    assert_eq(escape("<日本語>"), "&lt;日本語&gt;")
+    assert_eq(escape("é&é"), "é&amp;é")
+    assert_eq(escape("a<é>b"), "a&lt;é&gt;b")
+    assert_eq(escape("<é"), "&lt;é")
+    assert_eq(escape("é>"), "é&gt;")
+
+test "escape keeps runs of ordinary text between the escaped ones":
+    assert_eq(escape("a<b>c"), "a&lt;b&gt;c")
+    assert_eq(escape("<a>"), "&lt;a&gt;")
+    assert_eq(escape("ab<"), "ab&lt;")
+    assert_eq(escape("<ab"), "&lt;ab")
+
+test "escape does not double escape its own output":
+    once := escape("<b>")
+
+    assert_eq(once, "&lt;b&gt;")
+    assert_eq(escape(once), "&amp;lt;b&amp;gt;")
+    assert_eq(escape("&lt;"), "&amp;lt;")
+    assert_eq(escape("&amp;"), "&amp;amp;")
+
+test "escape defuses real payloads":
+    assert_eq(escape("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;")
+    assert_eq(escape("\" onmouseover=\"alert(1)"), "&quot; onmouseover=&quot;alert(1)")
+    assert_eq(escape("' onmouseover='alert(1)"), "&#39; onmouseover=&#39;alert(1)")
+    assert_eq(escape("'><img src=x onerror=alert(1)>"), "&#39;&gt;&lt;img src=x onerror=alert(1)&gt;")
+    assert_eq(escape("</textarea><svg onload=alert(1)>"), "&lt;/textarea&gt;&lt;svg onload=alert(1)&gt;")
+    assert_eq(escape("</script><script>alert(1)</script>"), "&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;")
+
+test "escaped payloads survive being placed in a page":
+    name := "<script>alert(1)</script>"
+    page := "<h1>hello, " + escape(name) + "</h1>"
+
+    assert_eq(page, "<h1>hello, &lt;script&gt;alert(1)&lt;/script&gt;</h1>")
+    assert_eq(page.contains("<script>"), false)
+
+test "escaped payloads cannot break out of either quote style":
+    double := "<input value=\"" + escape("\" autofocus onfocus=\"alert(1)") + "\">"
+    single := "<input value='" + escape("' autofocus onfocus='alert(1)") + "'>"
+
+    assert_eq(double, "<input value=\"&quot; autofocus onfocus=&quot;alert(1)\">")
+    assert_eq(single, "<input value='&#39; autofocus onfocus=&#39;alert(1)'>")
+
+test "needs_escape reports what escape would rewrite":
+    assert_eq(needs_escape(""), false)
+    assert_eq(needs_escape("plain"), false)
+    assert_eq(needs_escape("a&b"), true)
+    assert_eq(needs_escape("a<b"), true)
+    assert_eq(needs_escape("say \"hi\""), true)
+    assert_eq(needs_escape("it's"), true)
+
+test "safe_url keeps the urls a page actually needs":
+    assert_eq(safe_url("https://example.com/a?b=c#d"), "https://example.com/a?b=c#d")
+    assert_eq(safe_url("http://example.com"), "http://example.com")
+    assert_eq(safe_url("HTTPS://EXAMPLE.COM"), "HTTPS://EXAMPLE.COM")
+    assert_eq(safe_url("mailto:someone@example.com"), "mailto:someone@example.com")
+    assert_eq(safe_url("tel:+15550100"), "tel:+15550100")
+    assert_eq(safe_url("/relative/path"), "/relative/path")
+    assert_eq(safe_url("relative/path"), "relative/path")
+    assert_eq(safe_url("?q=pith"), "?q=pith")
+    assert_eq(safe_url("#anchor"), "#anchor")
+
+test "safe_url refuses scripting schemes":
+    assert_eq(safe_url("javascript:alert(1)"), "about:blank")
+    assert_eq(safe_url("JaVaScRiPt:alert(1)"), "about:blank")
+    assert_eq(safe_url("data:text/html,<script>alert(1)</script>"), "about:blank")
+    assert_eq(safe_url("vbscript:msgbox(1)"), "about:blank")
+    assert_eq(safe_url("file:///etc/passwd"), "about:blank")
+
+test "safe_url refuses a scheme hidden behind control characters":
+    assert_eq(safe_url("java\tscript:alert(1)"), "about:blank")
+    assert_eq(safe_url("java\nscript:alert(1)"), "about:blank")
+    assert_eq(safe_url("java\rscript:alert(1)"), "about:blank")
+    assert_eq(safe_url("  javascript:alert(1)"), "about:blank")
+    assert_eq(safe_url("javascript:alert(1)"), "about:blank")
+
+test "safe_url refuses protocol-relative urls and empty input":
+    assert_eq(safe_url("//evil.example/path"), "about:blank")
+    assert_eq(safe_url("/\\evil.example"), "about:blank")
+    assert_eq(safe_url("\\\\evil.example"), "about:blank")
+    assert_eq(safe_url(""), "about:blank")
+    assert_eq(safe_url("   "), "about:blank")
+
+test "escape_url filters the scheme and then escapes for an attribute":
+    assert_eq(escape_url("https://example.com/?a=1&b=2"), "https://example.com/?a=1&amp;b=2")
+    assert_eq(escape_url("javascript:alert(1)"), "about:blank")
+    assert_eq(escape_url("/search?q=\"x\""), "/search?q=&quot;x&quot;")
+    assert_eq(escape_url("https://example.com/\" onmouseover=\"alert(1)"), "https://example.com/&quot; onmouseover=&quot;alert(1)")
+
+test "escape_url output cannot escape its attribute":
+    link := "<a href=\"" + escape_url("javascript:alert(1)") + "\">click</a>"
+
+    assert_eq(link, "<a href=\"about:blank\">click</a>")
+
+test "escape handles a long input without losing bytes":
+    mut source := ""
+    mut round := 0
+    while round < 200:
+        source = source + "ab<c>d&e"
+        round = round + 1
+    escaped := escape(source)
+
+    assert_eq(source.len(), 1600)
+    assert_eq(escaped.len(), 1600 + 200 * (3 + 3 + 4))
+    assert_eq(escaped.contains("<"), false)
+    assert_eq(escaped.contains(">"), false)
+    assert_eq(strings.count(escaped, "&amp;"), 200)

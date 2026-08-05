@@ -1,0 +1,157 @@
+# fetching a key set over the network, caching it, and picking up a rotation.
+#
+# the colocated tests in std/crypto/jwks.pith cover the parsing and the key
+# conversion against outside vectors. what they cannot cover is the half that
+# needs a socket: fetching, caching, the caps on what comes back, and the
+# refetch a token naming an unknown kid forces. this stands up a small server
+# that publishes a key set and counts how often it is asked for it.
+#
+# the token is signed here rather than pasted in, because it has to carry a
+# `kid` and jwt's own header has no room for one — the signature is assembled
+# from std.crypto.signature directly, which is all a compact jws is.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
+import std.crypto.jwks as jwks
+import std.crypto.jwt as jwt
+import std.crypto.signature as signature
+
+PORT := 18104
+
+# a throwaway p-256 key: the pkcs#8 private half and the uncompressed public
+# point. the same pair tests/cases/test_jwt_asymmetric.pith signs with.
+EC_PKCS8 := "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+EC_PUBLIC := "04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+
+# rfc 7515 appendix a.3's key, which stands in for the one the issuer was
+# already publishing before it rotated.
+OLD_X := "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"
+OLD_Y := "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+
+INSTANT := 1800000000
+
+# how many times the key set has been asked for, and whether the issuer has
+# rotated yet. module state, because every serving task must see it.
+mut fetch_count := AtomicInt(0)
+mut rotated := false
+
+# an atomic increment that does not lose one under concurrency. a load
+# followed by a store drops whatever landed in between.
+fn bump():
+    mut current := fetch_count.load()
+    while not fetch_count.compare_set(current, current + 1):
+        current = fetch_count.load()
+
+fn jwk_of(kid: String, x: String, y: String) -> String:
+    return "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"" + kid + "\",\"x\":\"" + x + "\",\"y\":\"" + y + "\"}}"
+
+# the two coordinates of the signing key, out of its uncompressed point.
+fn new_x() -> String:
+    return encoding.b64_url_raw_encode((encoding.from_hex(EC_PUBLIC) catch bytes.empty()).slice(1, 33))
+
+fn new_y() -> String:
+    return encoding.b64_url_raw_encode((encoding.from_hex(EC_PUBLIC) catch bytes.empty()).slice(33, 65))
+
+# what the issuer publishes right now: one key before the rotation, two after.
+fn document() -> String:
+    if rotated:
+        return "{{\"keys\":[" + jwk_of("ec-old", OLD_X, OLD_Y) + "," + jwk_of("ec-new", new_x(), new_y()) + "]}}"
+    return "{{\"keys\":[" + jwk_of("ec-old", OLD_X, OLD_Y) + "]}}"
+
+fn handle_jwks(req: web.Request) -> http.HttpResponse:
+    bump()
+    return http.json(200, document())
+
+fn build_app() -> web.App:
+    mut app := web.bare()
+    app = app.get("/jwks.json", handle_jwks)
+    return app
+
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen("127.0.0.1", port) catch 0
+
+# a compact jws whose header names `kid`. jwt's own signing writes a fixed
+# header with no room for one, so the three fields are assembled here: this
+# is the whole of the format.
+fn signed_token(kid: String) -> String!:
+    header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"ES256\",\"kid\":\"" + kid + "\",\"typ\":\"JWT\"}}"))
+    payload := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"iss\":\"issuer\",\"sub\":\"u-9\",\"exp\":1900000000}}"))
+    unsigned := header + "." + payload
+    sig := signature.sign_ecdsa_p256_sha256_pkcs8(encoding.from_hex(EC_PKCS8)!, bytes.from_string_utf8(unsigned))!
+    return unsigned + "." + encoding.b64_url_raw_encode(sig)
+
+fn url_for(path: String) -> String:
+    return "http://127.0.0.1:" + PORT.to_string() + path
+
+fn options() -> jwt.Options:
+    return jwt.at_time(jwt.default_options(), INSTANT)
+
+# wait for the accept loop to come up by connecting to it, rather than
+# sleeping a guessed interval and hoping. listen() binds inside the spawned
+# task, so there is nothing to bind first.
+fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false
+
+fn main() -> Int!:
+    port := PORT
+    spawn serve_bg(port)
+    if not wait_for_port(port):
+        print("the server never came up")
+        return 1
+
+    token := signed_token("ec-new")!
+    keys := jwks.cache(url_for("/jwks.json")).ttl(3600).refresh_cooldown(0)
+
+    print("=== before the rotation ===")
+    # the issuer publishes one key, and it is not the one that signed this.
+    first := keys.verify(token, options())
+    print("verifies: " + first.is_ok.to_string())
+    print("named the missing kid: " + first.err.contains("ec-new").to_string())
+    # one fetch for the miss, and one more because an unknown kid is worth
+    # asking again in case the set moved on.
+    print("fetches: " + fetch_count.load().to_string())
+
+    print("")
+    print("=== the issuer rotates ===")
+    rotated = true
+    verified := keys.verify(token, options())!
+    print("subject: " + verified.subject())
+    print("fetches: " + fetch_count.load().to_string())
+
+    print("")
+    print("=== and then the set is cached ===")
+    mut i := 0
+    while i < 5:
+        keys.verify(token, options())!
+        i = i + 1
+    print("fetches after five more verifies: " + fetch_count.load().to_string())
+    print("keys after an explicit refresh: " + (keys.refresh()!.keys.len()).to_string())
+    print("fetches: " + fetch_count.load().to_string())
+
+    print("")
+    print("=== what the cache refuses ===")
+    capped := jwks.cache(url_for("/jwks.json")).max_bytes(10)
+    print("over the size cap: " + capped.keys().err.contains("over the").to_string())
+    missing := jwks.cache(url_for("/nowhere"))
+    print("a 404 from the issuer: " + missing.keys().err.contains("404").to_string())
+    print("an unreachable issuer: " + jwks.cache("http://127.0.0.1:1/jwks.json").timeout_ms(500).keys().is_err.to_string())
+    print("a scheme that is not http: " + jwks.cache("ftp://issuer.test/jwks.json").keys().is_err.to_string())
+
+    print("")
+    print("=== the algorithm still comes from the key ===")
+    # the same claims re-signed as HS256 with the public point as the secret.
+    # the key set says ES256, so the token is refused on its header.
+    forged := jwt.sign_hs256("{{\"sub\":\"admin\"}}", encoding.from_hex(EC_PUBLIC)!)!
+    print("an hs256 forgery: " + keys.verify(forged, options()).is_err.to_string())
+    return 0

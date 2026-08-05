@@ -1,0 +1,337 @@
+# std.web.cors - cross-origin resource sharing for a std.web app
+#
+# a browser will not let page javascript read a response from another origin
+# unless the server says it may. this is the middleware that says so, and the
+# preflight handler that answers the OPTIONS request the browser sends first.
+#
+#   import std.web.cors as cors
+#
+#   policy := cors.origins(["https://app.example.com"]).max_age(600)
+#   app := web.new().use_mw(cors.middleware(policy)).get("/api/items", list_items)
+#
+# ## the hole this api is shaped to close
+#
+# the classic cors mistake is to reflect whatever `Origin` the request carried
+# back in `Access-Control-Allow-Origin` and send `Allow-Credentials: true`
+# alongside it. that combination tells every browser in the world that any site
+# may read this one's responses with the user's cookies attached, which is the
+# whole same-origin policy switched off.
+#
+# it cannot be written here. credentials come only from
+# `credentialed_origins(list)`, which matches an origin against an explicit
+# allowlist and has no wildcard to set; `any_origin()` answers `*` and has no
+# credential switch. the two are separate constructors rather than two
+# builder methods, so there is no way to combine them by accident.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+
+# the header names, spelled once.
+ORIGIN := "Origin"
+ALLOW_ORIGIN := "Access-Control-Allow-Origin"
+ALLOW_METHODS := "Access-Control-Allow-Methods"
+ALLOW_HEADERS := "Access-Control-Allow-Headers"
+ALLOW_CREDENTIALS := "Access-Control-Allow-Credentials"
+EXPOSE_HEADERS := "Access-Control-Expose-Headers"
+MAX_AGE := "Access-Control-Max-Age"
+REQUEST_METHOD := "Access-Control-Request-Method"
+REQUEST_HEADERS := "Access-Control-Request-Headers"
+VARY := "Vary"
+
+# what a preflight is allowed to ask for when the policy does not say.
+DEFAULT_METHODS := ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+DEFAULT_HEADERS := ["Content-Type", "Authorization"]
+
+# what a browser may do across origins, and from where. build one with
+# `origins`, `credentialed_origins` or `any_origin`, narrow it with the
+# builder methods, and hand it to `middleware`.
+#
+# the fields carry a `_v` suffix so the builder methods can take the plain
+# names, the same shape `std.crypto.jwt`'s claims builder uses.
+pub struct Policy:
+    origins_v: List[String]
+    any_origin_v: Bool
+    credentials_v: Bool
+    methods_v: List[String]
+    headers_v: List[String]
+    expose_v: List[String]
+    max_age_v: Int
+
+# allow these exact origins, with no credentials. an origin is compared whole
+# — scheme, host and port — because that is what the browser sends and what
+# the same-origin policy is defined over. "https://app.example.com" does not
+# match "https://app.example.com:8443" or any subdomain of it.
+pub fn origins(allowed: List[String]) -> Policy:
+    return Policy(allowed, false, false, DEFAULT_METHODS, DEFAULT_HEADERS, [], 0)
+
+# allow these exact origins and let the browser attach credentials — cookies,
+# tls client certificates, an `Authorization` header it stored. there is
+# deliberately no wildcard here: the origins are matched literally, so an
+# entry of "*" allows an origin spelled exactly "*", which no browser sends.
+#
+# reach for this only when the browser needs to send a session cookie, and
+# keep the list short: every origin on it can act as the signed-in user.
+pub fn credentialed_origins(allowed: List[String]) -> Policy:
+    return Policy(allowed, true, true, DEFAULT_METHODS, DEFAULT_HEADERS, [], 0)
+
+# allow every origin, with no credentials — the policy for a public read-only
+# api. it answers `Access-Control-Allow-Origin: *`, which browsers refuse to
+# combine with credentials, and this policy has no way to ask for them.
+pub fn any_origin() -> Policy:
+    return Policy([], true, false, DEFAULT_METHODS, DEFAULT_HEADERS, [], 0)
+
+impl Policy:
+    # the methods a preflight may ask for. defaults to the common seven.
+    fn methods(names: List[String]) -> Policy:
+        return Policy(self.origins_v, self.any_origin_v, self.credentials_v, names, self.headers_v, self.expose_v, self.max_age_v)
+
+    # the request headers a preflight may ask for. defaults to Content-Type
+    # and Authorization. cors does not need the headers a browser sends
+    # without being asked (Accept, Content-Language and the like) listed.
+    fn headers(names: List[String]) -> Policy:
+        return Policy(self.origins_v, self.any_origin_v, self.credentials_v, self.methods_v, names, self.expose_v, self.max_age_v)
+
+    # the response headers page javascript is allowed to read. without this
+    # a cross-origin caller sees only the handful cors exposes by default,
+    # so a custom `X-Request-Id` or `Link` header has to be named here.
+    fn expose(names: List[String]) -> Policy:
+        return Policy(self.origins_v, self.any_origin_v, self.credentials_v, self.methods_v, self.headers_v, names, self.max_age_v)
+
+    # how long a browser may cache the preflight answer, in seconds. zero
+    # (the default) sends no max-age, so the browser uses its own short
+    # default and every cross-origin call pays a round trip first.
+    fn max_age(seconds: Int) -> Policy:
+        return Policy(self.origins_v, self.any_origin_v, self.credentials_v, self.methods_v, self.headers_v, self.expose_v, seconds)
+
+    # true when `origin` may read responses under this policy.
+    fn allows(origin: String) -> Bool:
+        if origin.len() == 0:
+            return false
+        if self.any_origin_v and not self.credentials_v:
+            return true
+        for allowed in self.origins_v:
+            if allowed == origin:
+                return true
+        return false
+
+    # what to put in Access-Control-Allow-Origin for an allowed origin: the
+    # wildcard for a public policy, and the origin itself when the answer
+    # genuinely differs per caller.
+    fn allow_origin_value(origin: String) -> String:
+        if self.any_origin_v and not self.credentials_v:
+            return "*"
+        return origin
+
+# join a header list the way http spells one.
+fn joined(values: List[String]) -> String:
+    mut out := ""
+    for value in values:
+        if out.len() > 0:
+            out = out + ", "
+        out = out + value
+    return out
+
+# add `name` to the response's Vary header without dropping what is already
+# there. a cached response that varies by origin and does not say so is
+# handed to the next origin that asks, which is a cache poisoning bug rather
+# than a cors one, so the merge matters.
+fn vary_with(resp: http.HttpResponse, name: String) -> http.HttpResponse:
+    existing := resp.header_value(VARY)
+    if existing.len() == 0:
+        return resp.header(VARY, name)
+    for part in existing.split(","):
+        if part.trim().to_lower() == name.to_lower():
+            return resp
+    return resp.header(VARY, existing + ", " + name)
+
+# the headers every cors answer carries, preflight or not.
+fn with_origin_headers(policy: Policy, origin: String, resp: http.HttpResponse) -> http.HttpResponse:
+    mut out := resp.header(ALLOW_ORIGIN, policy.allow_origin_value(origin))
+    if policy.credentials_v:
+        out = out.header(ALLOW_CREDENTIALS, "true")
+    if not policy.any_origin_v or policy.credentials_v:
+        out = vary_with(out, ORIGIN)
+    return out
+
+# the answer to a preflight: 204, the origin headers, and what the browser
+# may then send. the handler is never reached — a preflight asks about a
+# request that has not happened yet.
+fn preflight_response(policy: Policy, origin: String) -> http.HttpResponse:
+    mut out := with_origin_headers(policy, origin, http.no_content())
+    out = out.header(ALLOW_METHODS, joined(policy.methods_v))
+    if policy.headers_v.len() > 0:
+        out = out.header(ALLOW_HEADERS, joined(policy.headers_v))
+    if policy.max_age_v > 0:
+        out = out.header(MAX_AGE, policy.max_age_v.to_string())
+    out = vary_with(out, REQUEST_METHOD)
+    return vary_with(out, REQUEST_HEADERS)
+
+# the cors headers on a real response, once the handler has produced one.
+fn actual_response(policy: Policy, origin: String, resp: http.HttpResponse) -> http.HttpResponse:
+    out := with_origin_headers(policy, origin, resp)
+    if policy.expose_v.len() > 0:
+        return out.header(EXPOSE_HEADERS, joined(policy.expose_v))
+    return out
+
+# true when this request is the OPTIONS a browser sends ahead of a
+# cross-origin call it is not sure about. an OPTIONS request without
+# Access-Control-Request-Method is somebody asking what the route supports,
+# which is not this middleware's business.
+fn is_preflight(req: web.Request) -> Bool:
+    return req.method() == "OPTIONS" and req.header(REQUEST_METHOD).len() > 0
+
+# the whole decision, in one place. `middleware` wraps this in a closure so
+# the policy rides along.
+fn apply(policy: Policy, next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    origin := req.header(ORIGIN)
+    if origin.len() == 0:
+        # same-origin, or a client that is not a browser. cors has nothing to
+        # say about it, and a preflight without an Origin is malformed.
+        return next(req)
+    if not policy.allows(origin):
+        if is_preflight(req):
+            return http.forbidden_response()
+        # the request itself still runs — the server has no standing to refuse
+        # it, and every same-origin form post would break if it did. what is
+        # withheld is permission to read the answer, and without the header
+        # the browser withholds it.
+        return next(req)
+    if is_preflight(req):
+        return preflight_response(policy, origin)
+    return actual_response(policy, origin, next(req))
+
+# the middleware. register it app-wide with `use_mw`, or bind it to the
+# routes that need it with `group`:
+#
+#   app := web.new().use_mw(cors.middleware(cors.any_origin()))
+#
+# register it outermost — before any guard that can answer 401 — so a
+# rejected request still carries the headers that let the browser read the
+# rejection. a 401 without them shows up in the console as a cors error and
+# sends whoever is debugging it looking in the wrong place.
+pub fn middleware(policy: Policy) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        return apply(policy, next, req)
+
+# --- tests ---
+
+# a request carrying the given headers, built without standing up a server.
+fn request_with_headers(method: String, headers: Map[String, String]) -> web.Request:
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/api/items", "", "HTTP/1.1", "", "", headers, {}, [])
+    return web.Request(raw, {}, "/api/items", {})
+
+fn ok_handler(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "items")
+
+fn cross_origin(method: String, origin: String) -> web.Request:
+    return request_with_headers(method, {"Origin": origin})
+
+fn preflight_for(origin: String, wanted: String) -> web.Request:
+    return request_with_headers("OPTIONS", {"Origin": origin, "Access-Control-Request-Method": wanted})
+
+APP_ORIGIN := "https://app.example.com"
+OTHER_ORIGIN := "https://evil.example.com"
+
+test "an allowed origin gets the headers a browser needs":
+    guard := middleware(origins([APP_ORIGIN]))
+    resp := guard(ok_handler, cross_origin("GET", APP_ORIGIN))
+
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body_text()!, "items")
+    assert_eq(resp.header_value(ALLOW_ORIGIN), APP_ORIGIN)
+    assert(resp.header_value(VARY).contains("Origin"))
+    assert_eq(resp.header_value(ALLOW_CREDENTIALS), "")
+
+test "an origin that is not on the list gets no cors headers":
+    guard := middleware(origins([APP_ORIGIN]))
+    resp := guard(ok_handler, cross_origin("GET", OTHER_ORIGIN))
+
+    # the handler still ran; what the caller did not get is permission to read
+    # the answer, which is the browser's half of the contract.
+    assert_eq(resp.status, 200)
+    assert_eq(resp.header_value(ALLOW_ORIGIN), "")
+
+test "a same-origin request is passed straight through":
+    guard := middleware(origins([APP_ORIGIN]))
+    resp := guard(ok_handler, request_with_headers("GET", {}))
+
+    assert_eq(resp.status, 200)
+    assert_eq(resp.header_value(ALLOW_ORIGIN), "")
+    assert_eq(resp.header_value(VARY), "")
+
+test "a preflight is answered without reaching the handler":
+    guard := middleware(origins([APP_ORIGIN]).methods(["GET", "POST"]).headers(["Content-Type"]).max_age(600))
+    resp := guard(ok_handler, preflight_for(APP_ORIGIN, "POST"))
+
+    assert_eq(resp.status, 204)
+    assert_eq(resp.body_text()!, "")
+    assert_eq(resp.header_value(ALLOW_ORIGIN), APP_ORIGIN)
+    assert_eq(resp.header_value(ALLOW_METHODS), "GET, POST")
+    assert_eq(resp.header_value(ALLOW_HEADERS), "Content-Type")
+    assert_eq(resp.header_value(MAX_AGE), "600")
+
+test "a preflight from an origin that is not allowed is refused":
+    guard := middleware(origins([APP_ORIGIN]))
+    resp := guard(ok_handler, preflight_for(OTHER_ORIGIN, "POST"))
+
+    assert_eq(resp.status, 403)
+    assert_eq(resp.header_value(ALLOW_ORIGIN), "")
+
+test "an OPTIONS that is not a preflight falls through to the app":
+    guard := middleware(any_origin())
+    resp := guard(ok_handler, cross_origin("OPTIONS", APP_ORIGIN))
+
+    # no Access-Control-Request-Method, so it is a plain OPTIONS and the app
+    # answers it — std.web replies with the methods the route accepts.
+    assert_eq(resp.status, 200)
+
+test "a public policy answers the wildcard and never credentials":
+    guard := middleware(any_origin())
+    resp := guard(ok_handler, cross_origin("GET", OTHER_ORIGIN))
+
+    assert_eq(resp.header_value(ALLOW_ORIGIN), "*")
+    assert_eq(resp.header_value(ALLOW_CREDENTIALS), "")
+    # the answer is the same for everyone, so there is nothing to vary on.
+    assert_eq(resp.header_value(VARY), "")
+
+test "credentials are only ever paired with a named origin":
+    guard := middleware(credentialed_origins([APP_ORIGIN]))
+    allowed := guard(ok_handler, cross_origin("GET", APP_ORIGIN))
+
+    assert_eq(allowed.header_value(ALLOW_ORIGIN), APP_ORIGIN)
+    assert_eq(allowed.header_value(ALLOW_CREDENTIALS), "true")
+    assert(allowed.header_value(VARY).contains("Origin"))
+
+    # the wildcard is not reachable from the credentialed constructor: a "*"
+    # entry is compared literally, so it allows nothing a browser can send.
+    wildcarded := middleware(credentialed_origins(["*"]))
+    refused := wildcarded(ok_handler, cross_origin("GET", OTHER_ORIGIN))
+    assert_eq(refused.header_value(ALLOW_ORIGIN), "")
+    assert_eq(refused.header_value(ALLOW_CREDENTIALS), "")
+
+test "exposed headers are named on the real response, not the preflight":
+    guard := middleware(origins([APP_ORIGIN]).expose(["X-Request-Id"]))
+
+    actual := guard(ok_handler, cross_origin("GET", APP_ORIGIN))
+    assert_eq(actual.header_value(EXPOSE_HEADERS), "X-Request-Id")
+
+    pre := guard(ok_handler, preflight_for(APP_ORIGIN, "GET"))
+    assert_eq(pre.header_value(EXPOSE_HEADERS), "")
+
+# a handler that already varies on something else, so the merge is visible.
+fn varying_handler(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "items").header(VARY, "Accept-Encoding")
+
+test "vary is merged rather than overwritten":
+    guard := middleware(origins([APP_ORIGIN]))
+    resp := guard(varying_handler, cross_origin("GET", APP_ORIGIN))
+
+    assert_eq(resp.header_value(VARY), "Accept-Encoding, Origin")
+
+test "an origin is matched whole, not by prefix or suffix":
+    guard := middleware(origins([APP_ORIGIN]))
+
+    for spoofed in ["https://app.example.com.evil.test", "https://evil.test/https://app.example.com", "http://app.example.com", "https://app.example.com:8443", "https://sub.app.example.com"]:
+        resp := guard(ok_handler, cross_origin("GET", spoofed))
+        assert_eq(resp.header_value(ALLOW_ORIGIN), "")

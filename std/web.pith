@@ -329,10 +329,6 @@ fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String
             params.insert(name, req.path_param(pattern, name) catch "")
     return params
 
-# find the first route whose method and path match, wrap its handler in the
-# middleware onion, run it, and return the response. a request that matches
-# nothing gets a 404 and skips middleware entirely. this is the single place
-# every request funnels through, and where the middleware chain wraps in.
 # true when `path` lives under `prefix`: the prefix itself, or anything
 # below it. "/api" scopes "/api" and "/api/me" but not "/apiary".
 fn path_in_scope(path: String, prefix: String) -> Bool:
@@ -340,22 +336,82 @@ fn path_in_scope(path: String, prefix: String) -> Bool:
         return true
     return path.starts_with(prefix + "/")
 
+# the middleware onion for `path`: app-wide first, then any group middleware
+# whose prefix covers it — so a group guard runs inside the logging and
+# metrics that wrap everything.
+fn chain_for(app: App, path: String) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
+    mut chain := app.middleware
+    for scope in app.scoped:
+        if path_in_scope(path, scope.prefix):
+            chain = with_mw(chain, scope.mw)
+    return chain
+
+# the methods registered for a path, in registration order, as an `Allow`
+# header value. empty when no route matches the path at all.
+fn allowed_methods(app: App, req: http.HttpRequestBytes) -> String:
+    mut out := ""
+    mut seen: List[String] := []
+    for route in app.routes:
+        matched := req.matches_path(route.pattern) catch false
+        if not matched:
+            continue
+        mut already := false
+        for method in seen:
+            if method == route.method:
+                already = true
+        if already:
+            continue
+        seen.push(route.method)
+        if out.len() > 0:
+            out = out + ", "
+        out = out + route.method
+    if out.len() > 0:
+        return out + ", OPTIONS"
+    return out
+
+# the pattern of the first route that matches this path under any method, so
+# a synthesized OPTIONS answer is labeled with the route it is about rather
+# than the raw path — the observability middleware uses it as a metric label.
+fn pattern_for_path(app: App, req: http.HttpRequestBytes) -> String:
+    for route in app.routes:
+        matched := req.matches_path(route.pattern) catch false
+        if matched:
+            return route.pattern
+    return ""
+
+# what an OPTIONS request is answered with: 204 and the methods the path
+# accepts. capturing a struct rather than the bare string is the same
+# workaround Chain exists for.
+struct Options:
+    allow: String
+
+fn options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
+    return fn(req: Request) => http.no_content().header("Allow", options.allow)
+
+# find the first route whose method and path match, wrap its handler in the
+# middleware onion, run it, and return the response. a request that matches
+# nothing gets a 404 and skips middleware entirely. this is the single place
+# every request funnels through, and where the middleware chain wraps in.
 fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     method := req.method() catch "GET"
     path := req.path() catch "/"
+    empty_values: Map[String, String] := {}
     for route in app.routes:
         matched := req.matches_path(route.pattern) catch false
         if route.method == method and matched:
-            # app-wide middleware first, then any group middleware whose
-            # prefix covers this path — so a group guard runs inside the
-            # logging and metrics that wrap everything.
-            mut chain := app.middleware
-            for scope in app.scoped:
-                if path_in_scope(path, scope.prefix):
-                    chain = with_mw(chain, scope.mw)
-            handler := wrap_middleware(chain, route.handler)
-            empty_values: Map[String, String] := {}
+            handler := wrap_middleware(chain_for(app, path), route.handler)
             return handler(Request(req, params_for(route.pattern, req), route.pattern, empty_values))
+    # an OPTIONS request to a path that exists under some other method is not
+    # a miss. it is either a client asking what the route supports, which
+    # deserves an Allow header, or the preflight a browser sends before a
+    # cross-origin call — and a preflight that 404s before the middleware runs
+    # can never be answered by cors middleware at all.
+    if method == "OPTIONS":
+        allow := allowed_methods(app, req)
+        if allow.len() > 0:
+            pattern := pattern_for_path(app, req)
+            handler := wrap_middleware(chain_for(app, path), options_handler(Options(allow)))
+            return handler(Request(req, params_for(pattern, req), pattern, empty_values))
     return http.not_found_response()
 
 # serve one accepted connection to completion on its own task, then close it.
@@ -845,6 +901,47 @@ test "a web.App served over h2c returns a 404 body for an unmatched path":
     spawn serve_h2c_bg(app, port)
     sleep(200)
     assert(h2c_get_body(port, "/missing").contains("404"))
+
+# a bare request for dispatch, so the routing tests below need no socket at
+# all. only the method and path are read on this path.
+fn request_for(method: String, path: String) -> http.HttpRequestBytes:
+    return http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, path, "", "HTTP/1.1", "", "", {}, {}, [])
+
+fn show_user(req: Request) -> http.HttpResponse:
+    return http.text(200, "user " + req.param("id"))
+
+fn create_user(req: Request) -> http.HttpResponse:
+    return http.text(201, "created")
+
+test "OPTIONS on a known path answers with the methods that path accepts":
+    app := bare().get("/users/:id", show_user).post("/users/:id", create_user)
+    resp := dispatch(app, request_for("OPTIONS", "/users/42"))
+
+    assert_eq(resp.status, 204)
+    assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+
+test "OPTIONS on a path no route claims is still a 404":
+    app := bare().get("/users/:id", show_user)
+    resp := dispatch(app, request_for("OPTIONS", "/orders/42"))
+
+    assert_eq(resp.status, 404)
+
+test "the synthesized OPTIONS answer runs through the middleware chain":
+    # this is what makes cors preflight reachable: without it an OPTIONS
+    # request would 404 before any middleware got to look at it.
+    app := bare().use_mw(bracket_a).get("/about", show_user)
+    resp := dispatch(app, request_for("OPTIONS", "/about"))
+
+    assert_eq(resp.body_text()!, "a()")
+
+test "a group guard also wraps the synthesized OPTIONS answer":
+    app := bare().group("/api", bracket_b).get("/api/items", show_user)
+    resp := dispatch(app, request_for("OPTIONS", "/api/items"))
+
+    assert_eq(resp.body_text()!, "b()")
+    # a path outside the group is not wrapped by it.
+    outside := dispatch(bare().group("/api", bracket_b).get("/items", show_user), request_for("OPTIONS", "/items"))
+    assert_eq(outside.status, 204)
 
 fn always_pong(req: Request) -> http.HttpResponse:
     return http.text(200, "pong")

@@ -1,0 +1,143 @@
+# server-side sessions behind a signed cookie.
+#
+# the browser holds an id and nothing else; everything real lives in the
+# store. this runs the whole life of one session in a single process: an
+# anonymous visit that stores something, a sign-in that rotates the id, a
+# couple of reads, a forged cookie, and a sign-out that makes the id stop
+# meaning anything.
+#
+# the parts worth copying are the two calls around a login. rotate() retires
+# the id the caller arrived with, so an attacker who planted one in the
+# victim's browser does not end up holding an authenticated session. and
+# destroy() deletes on the server rather than waiting for a token to expire,
+# which is the difference between logging out and hoping.
+#
+# the store is built once in main and closed over by the handlers, which is
+# how a handler gets at anything: it only ever takes the request.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+import std.web.session as session
+
+PORT := 18102
+
+# the secret keys the mac over the cookie. it belongs in the environment, and
+# it must be at least 32 bytes — store() refuses anything shorter.
+fn session_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret kept out of the repo, 32+ bytes of it")
+
+fn next_visit(store: session.Store, req: web.Request) -> Int:
+    return (parse_int(store.get_or(req, "visits", "0")) catch 0) + 1
+
+fn describe(store: session.Store, req: web.Request) -> String:
+    keys := store.keys(req)
+    if keys.len() == 0:
+        return "nobody, no session"
+    return store.get_or(req, "user", "nobody") + ", visits " + store.get_or(req, "visits", "0") + ", keys " + keys.join("+")
+
+fn build_app(store: session.Store) -> web.App:
+    # count the visits this session has made, so there is state to watch
+    # survive a rotation.
+    visit := fn(req: web.Request):
+        seen := next_visit(store, req)
+        store.set(req, "visits", seen.to_string())
+        return http.text(200, "visit " + seen.to_string())
+
+    # sign in: rotate first, then record who it is. rotating before the write
+    # is the whole session fixation defence.
+    login := fn(req: web.Request):
+        store.rotate(req)
+        store.set(req, "user", "ada")
+        return http.text(200, "signed in")
+
+    logout := fn(req: web.Request):
+        store.destroy(req)
+        return http.text(200, "signed out")
+
+    mut app := web.bare()
+    app = app.use_mw(session.middleware(store))
+    app = app.get("/visit", visit)
+    app = app.post("/login", login)
+    app = app.get("/me", fn(req: web.Request) => http.text(200, describe(store, req)))
+    app = app.post("/logout", logout)
+    return app
+
+fn serve_bg(store: session.Store, port: Int) -> Int:
+    return build_app(store).listen("127.0.0.1", port) catch 0
+
+# what the browser would hold: the name=value pair out of a Set-Cookie line.
+fn cookie_pair(resp: http.HttpResponse) -> String:
+    for line in resp.cookies():
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+# everything after the name=value, which is where the flags live.
+fn cookie_flags(resp: http.HttpResponse) -> String:
+    for line in resp.cookies():
+        cut := line.index_of(";")
+        if cut < 0:
+            return ""
+        return line.substring(cut + 2, line.len())
+    return ""
+
+# one request carrying whatever cookie we are holding.
+fn call(method: String, path: String, cookie: String) -> http.HttpResponse!:
+    mut req := http.request(method, "127.0.0.1", PORT, path)
+    if cookie.len() > 0:
+        cut := cookie.index_of("=")
+        req = req.cookie(cookie.substring(0, cut), cookie.substring(cut + 1, cookie.len()))
+    return req.send()!
+
+fn main() -> Int!:
+    # insecure_over_http() is here because this example talks plain http to
+    # itself. a real server leaves the Secure flag on, and that is the only
+    # way to take it off.
+    store := session.store(session_secret())!.insecure_over_http().ttl(3600)
+
+    port := PORT
+    spawn serve_bg(store, port)
+    sleep(200)   # give the listener a moment to bind
+
+    print("=== an anonymous visitor ===")
+    first := call("GET", "/visit", "")!
+    held := cookie_pair(first)
+    print("body:            " + first.body_text()!)
+    print("got a cookie:    " + (held.len() > 0).to_string())
+    print("cookie flags:    " + cookie_flags(first))
+    print("sessions held:   " + store.count().to_string())
+
+    print("")
+    print("=== the browser sends it back ===")
+    print("body:            " + call("GET", "/visit", held)!.body_text()!)
+    print("who am i:        " + call("GET", "/me", held)!.body_text()!)
+    # nothing about the session changed, so nothing is set again.
+    print("set again:       " + (cookie_pair(call("GET", "/me", held)!).len() > 0).to_string())
+
+    print("")
+    print("=== signing in rotates the id ===")
+    login := call("POST", "/login", held)!
+    rotated := cookie_pair(login)
+    print("body:            " + login.body_text()!)
+    print("a new cookie:    " + (rotated.len() > 0 and rotated != held).to_string())
+    print("contents kept:   " + call("GET", "/me", rotated)!.body_text()!)
+    print("old id refused:  " + call("GET", "/me", held)!.body_text()!)
+    print("sessions held:   " + store.count().to_string())
+
+    print("")
+    print("=== a cookie nobody signed ===")
+    id := rotated.substring(rotated.index_of("=") + 1, rotated.index_of("."))
+    print("forged mac:      " + call("GET", "/me", "pith_session=" + id + ".AAAA")!.body_text()!)
+    print("no mac at all:   " + call("GET", "/me", "pith_session=" + id)!.body_text()!)
+
+    print("")
+    print("=== signing out ===")
+    out := call("POST", "/logout", rotated)!
+    print("body:            " + out.body_text()!)
+    print("cookie cleared:  " + cookie_flags(out).contains("Max-Age=0").to_string())
+    print("id now means:    " + call("GET", "/me", rotated)!.body_text()!)
+    print("sessions held:   " + store.count().to_string())
+    return 0

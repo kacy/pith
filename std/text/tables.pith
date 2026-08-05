@@ -32,11 +32,16 @@ fn digit(b: Int) -> Int:
 fn raw_digit(table: String, at: Int) -> Int:
     return digit(bit_and(ord(table[at]), 255))
 
+# read a 4-character field starting at a character offset. use this when the
+# data is not a uniform grid of records -- the packed break tests interleave a
+# marker character between fields.
+pub fn field_at(table: String, at: Int) -> Int:
+    return (raw_digit(table, at) * 262144) + (raw_digit(table, at + 1) * 4096) + (raw_digit(table, at + 2) * 64) + raw_digit(table, at + 3)
+
 # read one field of one record. `arity` is how many fields a record has, which
 # the caller knows from the table it is reading.
 pub fn field(table: String, record: Int, index: Int, arity: Int) -> Int:
-    base := ((record * arity) + index) * 4
-    return (raw_digit(table, base) * 262144) + (raw_digit(table, base + 1) * 4096) + (raw_digit(table, base + 2) * 64) + raw_digit(table, base + 3)
+    return field_at(table, ((record * arity) + index) * 4)
 
 # find the record whose first field equals `key`, or -1 when there is none.
 pub fn find(table: String, arity: Int, count: Int, key: Int) -> Int:
@@ -89,6 +94,12 @@ pub fn find_pair(table: String, arity: Int, count: Int, first: Int, second: Int)
         else:
             high = middle - 1
     return - 1
+
+test "reads a field at a character offset":
+    table := "AAABAAEsARFwAAA/"
+    assert_eq(field_at(table, 0), 1)
+    assert_eq(field_at(table, 4), 300)
+    assert_eq(field_at(table, 8), 70000)
 
 test "reads packed fields":
     # two records of two fields: (1, 300) and (70000, 63)

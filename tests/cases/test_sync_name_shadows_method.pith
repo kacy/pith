@@ -1,0 +1,53 @@
+# a variable named after the method called on it must still call the method.
+#
+# `done := WaitGroup(); done.done()` used to segfault. the emitter named the
+# method by its bare key, `done`, and the ir consumer resolves a call whose
+# name matches a local variable as a closure call — so it read the waitgroup
+# handle as a closure, loaded a function pointer out of it, and jumped there.
+#
+# nothing in the standard library happened to name a variable after its own
+# method, which is why it survived; docs/concurrency.md documents the
+# `wg.done()`-from-each-task shape, so a reader following it lands here.
+#
+# the four sync primitives now emit their full runtime symbols, the way
+# channels and atomics already did, and a local can no longer capture them.
+
+fn hold_the_lock(lock: Mutex) -> Int:
+    lock.lock()
+    lock.unlock()
+    return 1
+
+fn count_down(done: WaitGroup) -> Int:
+    done.done()
+    return 1
+
+fn main() -> Int!:
+    # a local named after each of its own methods
+    done := WaitGroup()
+    done.add(1)
+    done.done()
+    done.wait()
+    print("waitgroup: ok")
+
+    lock := Mutex()
+    lock.lock()
+    lock.unlock()
+    print("mutex: ok")
+
+    acquire := Semaphore(2)
+    acquire.acquire()
+    acquire.release()
+    print("semaphore: ok")
+
+    # an atomic named after its methods, which already worked — kept so the
+    # case covers all four primitives rather than only the three that broke
+    load := AtomicInt(7)
+    load.store(load.load() + 1)
+    print("atomic: {load.load()}")
+
+    # the same collision through a parameter rather than a local
+    other := WaitGroup()
+    other.add(1)
+    print("through a parameter: {hold_the_lock(Mutex()) + count_down(other)}")
+    other.wait()
+    return 0

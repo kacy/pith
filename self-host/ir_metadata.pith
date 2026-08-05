@@ -370,4 +370,26 @@ pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
             emit_name = "pith_atomic_int_set"
         elif mname == "compare_set":
             emit_name = "pith_atomic_int_compare_set"
+    # the remaining sync primitives emit their full runtime symbols for the
+    # same reason atomics and channels do: a bare name like `done` is also a
+    # legal variable name, and the consumer resolves a call through a local
+    # of that name as a closure call. `done := WaitGroup(); done.done()`
+    # jumped through a waitgroup handle and crashed until these were mapped.
+    elif obj_type == "Mutex" or obj_type == "opaque:Mutex":
+        if mname == "lock":
+            emit_name = "pith_mutex_lock"
+        elif mname == "unlock":
+            emit_name = "pith_mutex_unlock"
+    elif obj_type == "WaitGroup" or obj_type == "opaque:WaitGroup":
+        if mname == "add":
+            emit_name = "pith_waitgroup_add"
+        elif mname == "done":
+            emit_name = "pith_waitgroup_done"
+        elif mname == "wait":
+            emit_name = "pith_waitgroup_wait"
+    elif obj_type == "Semaphore" or obj_type == "opaque:Semaphore":
+        if mname == "acquire":
+            emit_name = "pith_semaphore_acquire"
+        elif mname == "release":
+            emit_name = "pith_semaphore_release"
     return emit_name

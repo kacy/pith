@@ -1,0 +1,128 @@
+# turning away a request another site made on the user's behalf.
+#
+# a browser attaches this site's cookies to a form post whatever page the
+# form was on, so the session cookie alone proves nothing about who asked.
+# the csrf guard demands something a cross-site page cannot read: a token
+# that lives in the session and has to come back with every unsafe request.
+#
+# the client below plays both parts. first the honest one — load the form,
+# read the token, post it back — and then the attack: the same post with the
+# session cookie attached and no token, and with a token belonging to
+# somebody else's session.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+import std.web.csrf as csrf
+import std.web.session as session
+
+PORT := 18103
+
+fn session_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret kept out of the repo, 32+ bytes of it")
+
+fn build_app(store: session.Store, protection: csrf.Guard) -> web.App:
+    # what a page rendering a form does: ask for the token and put it in a
+    # hidden input. asking is also what brings the session into being, so a
+    # visitor who never sees a form never costs the store a row.
+    form := fn(req: web.Request) => http.html(200, "<input type=hidden name=csrf_token value=" + protection.token(req) + ">")
+
+    transfer := fn(req: web.Request) => http.text(200, "transferred")
+
+    mut app := web.bare()
+    app = app.use_mw(session.middleware(store))
+    # inside the session middleware, since the token it compares against
+    # lives in the session.
+    app = app.use_mw(csrf.middleware(protection))
+    app = app.get("/form", form)
+    app = app.post("/transfer", transfer)
+    return app
+
+fn serve_bg(store: session.Store, protection: csrf.Guard, port: Int) -> Int:
+    return build_app(store, protection).listen("127.0.0.1", port) catch 0
+
+# the name=value pair a browser would send back for `name`.
+fn cookie_pair(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if not line.starts_with(name + "="):
+            continue
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+fn cookie_flags(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if not line.starts_with(name + "="):
+            continue
+        cut := line.index_of(";")
+        if cut < 0:
+            return ""
+        return line.substring(cut + 2, line.len())
+    return ""
+
+fn with_cookie(req: http.ClientRequest, pair: String) -> http.ClientRequest:
+    if pair.len() == 0:
+        return req
+    cut := pair.index_of("=")
+    return req.cookie(pair.substring(0, cut), pair.substring(cut + 1, pair.len()))
+
+# load the form and come back with the session cookie and the token in it.
+fn load_form(port: Int) -> List[String]:
+    resp := http.get_request("127.0.0.1", port, "/form").send() catch:
+        return ["", ""]
+    body := resp.body_text() catch ""
+    token := body.substring(body.index_of("value=") + 6, body.len() - 1)
+    return [cookie_pair(resp, "pith_session"), token, cookie_flags(resp, "csrf_token")]
+
+# post the transfer with whatever the caller wants attached, and report the
+# status the server answered with.
+fn post_transfer(port: Int, cookie: String, header_token: String, field_token: String) -> String:
+    mut req := with_cookie(http.post_request("127.0.0.1", port, "/transfer"), cookie)
+    if header_token.len() > 0:
+        req = req.header("X-CSRF-Token", header_token)
+    if field_token.len() > 0:
+        req = req.form_body({"amount": "1000", "csrf_token": field_token})
+    resp := req.send() catch:
+        return "no response"
+    return resp.status.to_string()
+
+fn main() -> Int!:
+    # insecure_over_http() because this example talks plain http to itself.
+    store := session.store(session_secret())!.insecure_over_http()
+    protection := csrf.guard(store)
+
+    port := PORT
+    spawn serve_bg(store, protection, port)
+    sleep(200)   # give the listener a moment to bind
+
+    print("=== loading the form ===")
+    held := load_form(port)
+    print("session cookie:   " + (held[0].len() > 0).to_string())
+    print("token in form:    " + (held[1].len() == 43).to_string())
+    print("mirror cookie:    " + held[2])
+
+    print("")
+    print("=== the honest post ===")
+    print("token in header:  " + post_transfer(port, held[0], held[1], ""))
+    print("token in form:    " + post_transfer(port, held[0], "", held[1]))
+
+    print("")
+    print("=== the post another site made ===")
+    # the browser attached the session cookie because browsers do. what the
+    # other site had no way to read is the token.
+    print("cookie, no token: " + post_transfer(port, held[0], "", ""))
+    print("no cookie at all: " + post_transfer(port, "", held[1], ""))
+
+    # a real token, minted by this very server, for a different session.
+    other := load_form(port)
+    print("somebody else's:  " + post_transfer(port, held[0], other[1], ""))
+
+    # and a near miss, to show the comparison is not a prefix check.
+    print("near miss:        " + post_transfer(port, held[0], held[1].substring(0, 42), ""))
+
+    print("")
+    print("=== a safe method is left alone ===")
+    print("GET /form:        " + (http.get_request("127.0.0.1", port, "/form").send()!.status).to_string())
+    return 0

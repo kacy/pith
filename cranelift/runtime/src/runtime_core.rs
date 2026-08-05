@@ -1709,8 +1709,7 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_STRUCT_ALLOCS, 1);
+    crate::perf_stats!(PERF_STRUCT_ALLOCS += 1);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;

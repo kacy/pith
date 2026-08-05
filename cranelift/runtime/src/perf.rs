@@ -88,6 +88,77 @@ pub fn perf_count(counter: &AtomicUsize, delta: usize) {
     }
 }
 
+/// Record one, two, or three counters off the hot path.
+///
+/// These are `#[cold]` and never inlined on purpose. Folding the counter
+/// updates into the caller costs far more than the updates themselves: the
+/// address materialisation and the atomic add need callee-saved registers, so
+/// every hooked entry point — including ones that are otherwise leaf functions
+/// — was pushing registers and building a stack frame on every call, whether
+/// or not stats were on. Behind a call, the caller keeps its frameless fast
+/// path and pays only the enabled-check.
+#[cold]
+#[inline(never)]
+pub fn perf_record1(a: &AtomicUsize, da: usize) {
+    ensure_perf_stats_registered_slow();
+    a.fetch_add(da, Ordering::Relaxed);
+}
+
+#[cold]
+#[inline(never)]
+pub fn perf_record2(a: &AtomicUsize, da: usize, b: &AtomicUsize, db: usize) {
+    ensure_perf_stats_registered_slow();
+    a.fetch_add(da, Ordering::Relaxed);
+    b.fetch_add(db, Ordering::Relaxed);
+}
+
+#[cold]
+#[inline(never)]
+pub fn perf_record3(
+    a: &AtomicUsize,
+    da: usize,
+    b: &AtomicUsize,
+    db: usize,
+    c: &AtomicUsize,
+    dc: usize,
+) {
+    ensure_perf_stats_registered_slow();
+    a.fetch_add(da, Ordering::Relaxed);
+    b.fetch_add(db, Ordering::Relaxed);
+    c.fetch_add(dc, Ordering::Relaxed);
+}
+
+/// Record one group of perf counters, but only when `PITH_PERF_STATS` asked
+/// for them.
+///
+/// The runtime's counter hooks sit on its hottest entry points, and each one
+/// used to pay for its own `perf_stats_enabled()` load: the registration hook
+/// plus one per counter, none of which LLVM can merge because they read a
+/// relaxed atomic. Grouping them behind a single check leaves the disabled
+/// path — every run that is not explicitly profiling — costing one relaxed
+/// load and a perfectly predicted branch for the whole group. That matters
+/// because of the volumes involved: type-checking the self-hosted compiler
+/// indexes lists over 185 million times in about a second, so a couple of
+/// redundant loads per index is a measurable slice of the run.
+#[macro_export]
+macro_rules! perf_stats {
+    ($a:ident += $da:expr $(,)?) => {
+        if $crate::perf_stats_enabled() {
+            $crate::perf_record1(&$crate::$a, $da);
+        }
+    };
+    ($a:ident += $da:expr, $b:ident += $db:expr $(,)?) => {
+        if $crate::perf_stats_enabled() {
+            $crate::perf_record2(&$crate::$a, $da, &$crate::$b, $db);
+        }
+    };
+    ($a:ident += $da:expr, $b:ident += $db:expr, $c:ident += $dc:expr $(,)?) => {
+        if $crate::perf_stats_enabled() {
+            $crate::perf_record3(&$crate::$a, $da, &$crate::$b, $db, &$crate::$c, $dc);
+        }
+    };
+}
+
 extern "C" fn pith_perf_dump_stats_at_exit() {
     crate::runtime_core::report_leaked_cstrings();
     dump_perf_stats();

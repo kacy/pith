@@ -1,5 +1,3 @@
-use crate::{ensure_perf_stats_registered, perf_count, PERF_BYTES_ALLOCS, PERF_BYTES_ALLOC_BYTES};
-use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITES, PERF_BYTE_BUFFER_WRITE_BYTES};
 use std::io::Read;
 
 #[repr(C)]
@@ -50,9 +48,7 @@ unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer
 }
 
 pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTES_ALLOCS, 1);
-    perf_count(&PERF_BYTES_ALLOC_BYTES, data.len());
+    crate::perf_stats!(PERF_BYTES_ALLOCS += 1, PERF_BYTES_ALLOC_BYTES += data.len());
     let data_ptr = data.as_ptr();
     let data_len = data.len();
     let ptr = Box::into_raw(Box::new(PithBytes {
@@ -300,8 +296,7 @@ pub unsafe extern "C" fn pith_byte_buffer_free(handle: i64) {
 /// Allocate a fresh byte buffer.
 #[no_mangle]
 pub extern "C" fn pith_byte_buffer_new() -> i64 {
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
+    crate::perf_stats!(PERF_BYTE_BUFFER_NEWS += 1);
     let ptr = Box::into_raw(Box::new(PithByteBuffer {
         data: Vec::new(),
         magic: BYTE_BUFFER_MAGIC,
@@ -312,8 +307,7 @@ pub extern "C" fn pith_byte_buffer_new() -> i64 {
 #[no_mangle]
 pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
     let cap = if capacity > 0 { capacity as usize } else { 0 };
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
+    crate::perf_stats!(PERF_BYTE_BUFFER_NEWS += 1);
     let ptr = Box::into_raw(Box::new(PithByteBuffer {
         data: Vec::with_capacity(cap),
         magic: BYTE_BUFFER_MAGIC,
@@ -329,9 +323,10 @@ pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> i64 {
     let Some(bytes) = pith_bytes_ref(data) else {
         return 0;
     };
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, bytes.data.len());
+    crate::perf_stats!(
+        PERF_BYTE_BUFFER_WRITES += 1,
+        PERF_BYTE_BUFFER_WRITE_BYTES += bytes.data.len(),
+    );
     buffer.data.extend_from_slice(&bytes.data);
     bytes.data.len() as i64
 }
@@ -346,9 +341,7 @@ pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *con
     }
     let len = crate::string::pith_cstring_len(s) as usize;
     let bytes = std::slice::from_raw_parts(s as *const u8, len);
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, bytes.len());
+    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += bytes.len());
     buffer.data.extend_from_slice(bytes);
     bytes.len() as i64
 }
@@ -361,9 +354,7 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     if !(0..=255).contains(&value) {
         return 0;
     }
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, 1);
+    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += 1);
     buffer.data.push(value as u8);
     1
 }
@@ -384,9 +375,7 @@ pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len
     }
     let src = src as usize;
     let len = len as usize;
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, len);
+    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += len);
     buffer.data.reserve(len);
     // a non-overlapping range is a straight extend. an overlapping range
     // means the output repeats with period (len - src): each chunk copied
@@ -464,9 +453,7 @@ pub unsafe extern "C" fn pith_byte_buffer_write_range(handle: i64, src: i64, sta
     if end > bytes.data.len() {
         return 0;
     }
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, len);
+    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += len);
     buffer.data.extend_from_slice(&bytes.data[start..end]);
     1
 }
@@ -487,9 +474,10 @@ pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, cou
     if !(1..=8).contains(&count) {
         return 0;
     }
-    ensure_perf_stats_registered();
-    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
-    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, count as usize);
+    crate::perf_stats!(
+        PERF_BYTE_BUFFER_WRITES += 1,
+        PERF_BYTE_BUFFER_WRITE_BYTES += count as usize,
+    );
     let le = (word as u64).to_le_bytes();
     buffer.data.extend_from_slice(&le[..count as usize]);
     1

@@ -57,8 +57,7 @@ pub fn pith_from_str(text: &str) -> PithString {
     if text.is_empty() {
         return EMPTY_STRING;
     }
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
+    crate::perf_stats!(PERF_STRING_ALLOCS += 1);
     crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, text.len());
 
     let len = text.len();

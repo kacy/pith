@@ -1,0 +1,302 @@
+# std.web.auth - who the caller is, kept in the session
+#
+# the last piece between an argon2id hash in a database and a route that only
+# signed-in people reach. it owns three moments: signing in, guarding, and
+# signing out.
+#
+#   import std.web.auth as auth
+#
+#   sessions := session.store(secret)!
+#   guard := auth.guard(sessions)
+#
+#   app = app.use_mw(session.middleware(sessions))
+#   app = app.post("/login", log_in)
+#   app = app.group("/app", auth.require(guard))     # everything under /app
+#   app = app.get("/app/me", me)
+#
+#   fn log_in(req: web.Request) -> http.HttpResponse:
+#       if not password.verify(submitted, stored_hash):
+#           return http.unauthorized_response()
+#       guard.sign_in(req, "u-7")
+#       return http.redirect_response("/app/me")
+#
+#   fn me(req: web.Request) -> http.HttpResponse:
+#       return http.text(200, "hello " + guard.user(req))
+#
+# ## what it is, and what it deliberately is not
+#
+# it is the binding between a session and an identity: `sign_in` writes the
+# subject into the session (rotating the id first), `user` reads it back, and
+# `require` turns away anyone the session does not name.
+#
+# it is not a user database and does not check passwords. which store the
+# credentials live in, what a subject means, and how a password is checked
+# are the application's, and `std.crypto.password` already does the last one
+# properly. an api that took a password here would have to take a user lookup
+# with it, and would be wrong for every application that keeps users anywhere
+# but where it guessed.
+#
+# ## against a session cookie alone
+#
+# `sign_in` rotates the session id before it writes anything, so a session id
+# planted in a victim's browser is retired at the moment it would become an
+# authenticated one. pair the guard with `std.web.csrf` for state-changing
+# routes, and put a `std.resilience` rate limiter in front of the login route
+# — `web.rate_limit` — so a stolen password list cannot be tried at line
+# rate. the argon2id cost makes each attempt expensive; the limiter is what
+# bounds how many are made.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+import std.web.session as session
+
+# where the subject lives in the session, and the name the guard attaches it
+# to the request under. the session key is prefixed so it does not collide
+# with the application's own keys; the request value is the plain "user" that
+# the token-guard shape in docs/web.md already uses, so a handler written
+# against one works unchanged against the other.
+SUBJECT_KEY := "auth.subject"
+pub REQUEST_VALUE := "user"
+
+# authentication bound to a session store: which store holds the subject, and
+# what an unauthenticated caller is answered with. build one with `guard`.
+pub struct Guard:
+    store: session.Store
+    redirect_v: String
+
+# authentication over `store`'s sessions. an unauthenticated caller gets a
+# 401; `redirect_to` changes that to a redirect, which is what a browser app
+# with a login page wants.
+pub fn guard(store: session.Store) -> Guard:
+    return Guard(store, "")
+
+impl Guard:
+    # send an unauthenticated caller here instead of answering 401. the
+    # redirect is a 303, so a browser that was posting a form follows it with
+    # a GET rather than replaying the post at the login page.
+    #
+    # a json api should leave this alone: a 303 to a login page is not an
+    # answer a fetch() caller can do anything with, and 401 is.
+    fn redirect_to(path: String) -> Guard:
+        return Guard(self.store, path)
+
+    # record who the caller is. this is what a successful password check ends
+    # with, and it rotates the session id before writing anything: an
+    # attacker who planted a session id in the victim's browser holds one
+    # that was retired at the exact moment it became worth having.
+    fn sign_in(req: web.Request, subject: String):
+        self.store.rotate(req)
+        self.store.set(req, SUBJECT_KEY, subject)
+
+    # end the session on the server. the response clears the cookie, so the
+    # id stops meaning anything immediately rather than when a token would
+    # have expired.
+    fn sign_out(req: web.Request):
+        self.store.destroy(req)
+
+    # who the caller is, or "" when nobody is signed in.
+    fn user(req: web.Request) -> String:
+        return self.store.get(req, SUBJECT_KEY)
+
+    # true when this request carries a session that names somebody.
+    fn signed_in(req: web.Request) -> Bool:
+        return self.user(req).len() > 0
+
+    # what an unauthenticated caller is answered with.
+    fn refusal() -> http.HttpResponse:
+        if self.redirect_v.len() > 0:
+            # 303 rather than 301: a browser follows it with a GET, and the
+            # answer is about this request rather than about the url.
+            return http.response(303).header("Location", self.redirect_v)
+        return http.unauthorized_response()
+
+fn run(guard_v: Guard, next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    subject := guard_v.user(req)
+    if subject.len() == 0:
+        return guard_v.refusal()
+    return next(req.with_value(REQUEST_VALUE, subject))
+
+# the guard. bind it to the routes that need it with `group`, so the public
+# handful — the login page, health, metrics — stay open without an allowlist
+# inside the guard:
+#
+#   app = app.group("/app", auth.require(guard))
+#
+# it must sit inside the session middleware, since what it reads is the
+# session. the caller's subject rides on to the handlers as `req.value("user")`
+# as well as being readable with `guard.user(req)`.
+pub fn require(guard_v: Guard) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        return run(guard_v, next, req)
+
+# --- tests ---
+
+fn test_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret of at least thirty-two bytes")
+
+fn request_with_cookie(method: String, cookie: String) -> web.Request:
+    mut headers: Map[String, String] := {}
+    if cookie.len() > 0:
+        headers.insert("Cookie", cookie)
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/app/me", "", "HTTP/1.1", "", "", headers, {}, [])
+    return web.Request(raw, {}, "/app/me", {})
+
+fn cookie_pair(resp: http.HttpResponse) -> String:
+    for line in resp.cookies():
+        if not line.starts_with("pith_session="):
+            continue
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+# the guard and the handler under it, bundled so the closure below captures
+# one struct rather than two loose fn-values — the same reason std.web's
+# Chain exists.
+struct Inner:
+    guard_mw: fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse
+    handler: fn(web.Request) -> http.HttpResponse
+
+fn inner_chain(bundle: Inner) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => bundle.guard_mw(bundle.handler, req)
+
+# run a request through the session middleware and then the guard, which is
+# the order an application registers them in.
+fn guarded(store: session.Store, guard_v: Guard, handler: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return session.middleware(store)(inner_chain(Inner(require(guard_v), handler)), req)
+
+# run a request through the session middleware only, for the routes that sit
+# outside the guard — the login and logout endpoints.
+fn open_route(store: session.Store, handler: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return session.middleware(store)(handler, req)
+
+fn login_handler(guard_v: Guard, subject: String) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        guard_v.sign_in(req, subject)
+        return http.text(200, "signed in")
+
+fn logout_handler(guard_v: Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        guard_v.sign_out(req)
+        return http.text(200, "signed out")
+
+# reports what the guard let through: the subject it attached to the request,
+# and the one it reads back out of the session.
+fn me_handler(guard_v: Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => http.text(200, req.value(REQUEST_VALUE) + "/" + guard_v.user(req))
+
+# sign in and return the cookie a browser would then be holding.
+fn signed_in_cookie(store: session.Store, guard_v: Guard, subject: String) -> String:
+    return cookie_pair(open_route(store, login_handler(guard_v, subject), request_with_cookie("POST", "")))
+
+test "a request with no session is turned away":
+    store := session.store(test_secret())!
+    protected := guard(store)
+    resp := guarded(store, protected, me_handler(protected), request_with_cookie("GET", ""))
+
+    assert_eq(resp.status, 401)
+    # the handler was never reached, so no session was created for a caller
+    # who has not signed in.
+    assert_eq(store.count(), 0)
+
+test "signing in gets you through, and the subject reaches the handler":
+    store := session.store(test_secret())!
+    protected := guard(store)
+    held := signed_in_cookie(store, protected, "ada")
+    assert(held.len() > 0)
+
+    resp := guarded(store, protected, me_handler(protected), request_with_cookie("GET", held))
+    assert_eq(resp.status, 200)
+    # the guard attaches it to the request and it is also readable from the
+    # session, and both say the same thing.
+    assert_eq(resp.body_text()!, "ada/ada")
+
+test "a session that exists but names nobody is not signed in":
+    store := session.store(test_secret())!
+    protected := guard(store)
+
+    # a session with a shopping cart in it and no user. this is the anonymous
+    # visitor, and the guard must not mistake having a session for having
+    # signed in.
+    opener := fn(req: web.Request):
+        store.set(req, "cart", "2 items")
+        return http.text(200, "browsing")
+    held := cookie_pair(open_route(store, opener, request_with_cookie("GET", "")))
+
+    assert_eq(store.count(), 1)
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", held)).status, 401)
+
+test "signing in rotates the id, so a planted one cannot be inherited":
+    store := session.store(test_secret())!
+    protected := guard(store)
+
+    # what the attack looks like: the victim's browser is holding a session
+    # id the attacker also knows, from before they signed in.
+    opener := fn(req: web.Request):
+        store.set(req, "cart", "2 items")
+        return http.text(200, "browsing")
+    planted := cookie_pair(open_route(store, opener, request_with_cookie("GET", "")))
+
+    after := cookie_pair(open_route(store, login_handler(protected, "ada"), request_with_cookie("POST", planted)))
+    assert(after.len() > 0)
+    assert(after != planted)
+
+    # the id the attacker holds is not an authenticated session; it is not a
+    # session at all.
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", planted)).status, 401)
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", after)).status, 200)
+
+test "signing out ends it on the server, not just in the browser":
+    store := session.store(test_secret())!
+    protected := guard(store)
+    held := signed_in_cookie(store, protected, "ada")
+
+    resp := open_route(store, logout_handler(protected), request_with_cookie("POST", held))
+    assert(cookie_pair(resp) == "" or resp.cookies()[0].contains("Max-Age=0"))
+    assert_eq(store.count(), 0)
+
+    # a browser that kept sending the cookie anyway gets nowhere.
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", held)).status, 401)
+
+test "a forged cookie is not a sign-in":
+    store := session.store(test_secret())!
+    protected := guard(store)
+    held := signed_in_cookie(store, protected, "ada")
+    id := held.substring(held.index_of("=") + 1, held.index_of("."))
+
+    for forged in ["pith_session=" + id, "pith_session=" + id + ".AAAA", "pith_session=nonsense.AAAA"]:
+        assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", forged)).status, 401)
+
+test "redirect_to answers a browser with a login page instead of a 401":
+    store := session.store(test_secret())!
+    protected := guard(store).redirect_to("/login")
+
+    resp := guarded(store, protected, me_handler(protected), request_with_cookie("GET", ""))
+    assert_eq(resp.status, 303)
+    assert_eq(resp.header_value("Location"), "/login")
+
+    # and a signed-in caller is not redirected anywhere.
+    held := signed_in_cookie(store, protected, "ada")
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", held)).status, 200)
+
+test "signing in again as somebody else replaces the subject":
+    store := session.store(test_secret())!
+    protected := guard(store)
+    first := signed_in_cookie(store, protected, "ada")
+
+    second := cookie_pair(open_route(store, login_handler(protected, "grace"), request_with_cookie("POST", first)))
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", second)).body_text()!, "grace/grace")
+    # and the id ada was holding is not a way back in.
+    assert_eq(guarded(store, protected, me_handler(protected), request_with_cookie("GET", first)).status, 401)
+    assert_eq(store.count(), 1)
+
+test "two guards over one store see the same sign-in":
+    store := session.store(test_secret())!
+    api := guard(store)
+    site := guard(store).redirect_to("/login")
+    held := signed_in_cookie(store, api, "ada")
+
+    assert_eq(guarded(store, api, me_handler(api), request_with_cookie("GET", held)).status, 200)
+    assert_eq(guarded(store, site, me_handler(site), request_with_cookie("GET", held)).status, 200)

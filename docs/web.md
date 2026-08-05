@@ -583,7 +583,23 @@ fn greet(req: web.Request) -> http.HttpResponse:
     return http.html(200, "<h1>hello, " + html.escape(req.param("name")) + "</h1>")
 ```
 
-[docs/html.md](html.md) is the full account: the five characters, why there is
-no separate attribute escaper, why a url in an `href` needs `html.escape_url`
-rather than `html.escape`, and the contexts — inside `<script>`, inside
-`<style>`, an unquoted attribute — where escaping is not the fix.
+for a whole page rather than a fragment, `std.template` renders from a context
+and escapes every interpolated value on the way out, so the safe thing is what
+happens when you do not think about it:
+
+```pith
+import std.template as template
+
+fn greet(req: web.Request) -> http.HttpResponse:
+    ctx := template.context().set("name", req.param("name"))
+    return http.html(200, template.render_string("<h1>hello, <%= name %></h1>", ctx) catch "")
+```
+
+a page served per request should be `compile`d once at startup rather than on
+every call, so that a syntax error is a failure to boot instead of a 500.
+
+[docs/html.md](html.md) is the full account of both: the five characters, why
+there is no separate attribute escaper, why a url in an `href` needs
+`html.escape_url` rather than `html.escape`, the contexts — inside `<script>`,
+inside `<style>`, an unquoted attribute — where escaping is not the fix, and
+the template syntax with its one greppable opt-out.

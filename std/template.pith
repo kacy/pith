@@ -1,0 +1,748 @@
+# std.template — html templates that escape by default
+#
+# the point of this module is one decision: an interpolated value is escaped
+# unless you say otherwise. a helper you have to remember to call protects the
+# pages you remembered on; a renderer that escapes by default protects the
+# ones you forgot, which are the ones that get exploited.
+#
+#   import std.template as template
+#
+#   page := template.compile("<h1>hello, <%= name %></h1>")!
+#   ctx := template.context().set("name", "<script>alert(1)</script>")
+#   template.render(page, ctx)!
+#   # "<h1>hello, &lt;script&gt;alert(1)&lt;/script&gt;</h1>"
+#
+# the escape hatch is spelled `<%raw value %>`, in words rather than in
+# punctuation, so that it is greppable. `grep -rn '<%raw' templates/` is a
+# complete audit of every place your templates trust a value, which is a
+# property a `<%== %>` or a `{{{ }}}` spelling does not give you.
+#
+# ## why `<% %>` and not `{{ }}`
+#
+# pith owns `{` and `}` inside string literals — they are its own
+# interpolation, and a literal brace has to be doubled. a mustache-style
+# template written inline would need `{{{{name}}}}` to mean `{{name}}`, in
+# every template and in every test. `<% %>` cannot collide with pith's syntax,
+# so a template reads the same in a `.html` file and in a pith string.
+#
+# ## the syntax, in full
+#
+#   <%= path %>            escaped output — the default
+#   <%raw path %>          unescaped output — you are asserting it is safe html
+#   <% if path %> … <% end %>
+#   <% if not path %> … <% end %>
+#   <% if path %> … <% else %> … <% end %>
+#   <% for item in path %> … <% end %>
+#   <%# a comment %>       dropped from the output
+#
+# that is the entire language. a `path` is a name, or names joined by dots
+# (`user.name`), and nothing else: no function calls, no arithmetic, no
+# comparisons, no filters, no `and`/`or`, no template inheritance, no partials
+# or includes, no whitespace control. if you need a comparison, do it in pith
+# and put a boolean in the context. this is a renderer, not a second language
+# to debug.
+#
+# ## the data
+#
+# a context is a `std.json` node under the hood, so a value that arrived as
+# json can be rendered directly, and the node pool's scoping rules apply — see
+# the json node pool section of `docs/web.md`. inside a request handler the
+# pool is already scoped for you and there is nothing to do.
+#
+# a path that does not resolve renders as empty and is falsy. that is a
+# deliberate choice for a page renderer: a missing field should leave a hole,
+# not take the response down. if a missing field is a bug for you, check the
+# context before you render it.
+#
+# ## what this does not make safe
+#
+# escaping is correct for element text and quoted attribute values. it is not
+# correct inside `<script>` or `<style>`, in a url attribute, or in an unquoted
+# attribute — the module header of `std.html` explains why, and the same limits
+# apply here, because this module escapes with `html.escape`. for a link built
+# from untrusted input, put the value through `html.escape_url` in pith and
+# emit it with `<%raw %>`, or accept that `<%= %>` will escape the quotes but
+# will not stop `javascript:`.
+
+import std.fs as fs
+import std.html as html
+import std.json as json
+
+# the largest template source that will be compiled or loaded.
+MAX_SOURCE_BYTES := 1_048_576
+
+# the largest rendered output; a page that exceeds it fails rather than
+# growing until the process dies. nested loops over attacker-sized lists are
+# the way this gets hit.
+MAX_OUTPUT_BYTES := 8_388_608
+
+# how deeply `if` and `for` may nest. bounded so a pathological template
+# cannot drive the renderer's recursion into the stack guard.
+MAX_NESTING := 32
+
+NODE_TEXT := 0
+NODE_ESCAPED := 1
+NODE_RAW := 2
+NODE_IF := 3
+NODE_ELSE := 4
+NODE_FOR := 5
+NODE_END := 6
+
+# ---------------------------------------------------------------
+# types
+# ---------------------------------------------------------------
+
+# what went wrong, and the byte offset in the template source where it was
+# noticed. render-time failures report the offset of the node being rendered.
+pub struct TemplateError:
+    pub message: String
+    pub offset: Int
+
+# one compiled instruction. `text` carries literal output, `path` the dotted
+# lookup, `name` the loop variable. `alt` is the index of the matching `else`
+# and `close` the index of the matching `end`, both resolved at compile time so
+# rendering never rescans.
+struct Node:
+    kind: Int
+    text: String
+    path: String
+    name: String
+    negate: Bool
+    alt: Int
+    close: Int
+    offset: Int
+
+# a parsed template. compile once, render many times; a `Template` holds no
+# per-render state and is safe to share.
+pub struct Template:
+    nodes: List[Node]
+
+# the values a template renders. a thin, typed front for a `std.json` object
+# node, so a context can be built by hand or adopted from parsed json.
+pub struct Ctx:
+    pub node: Int
+
+# ---------------------------------------------------------------
+# building a context
+# ---------------------------------------------------------------
+
+# A new, empty context to fill in with `set`.
+pub fn context() -> Ctx:
+    return Ctx(json.make_object())
+
+# A new, empty list to fill in with `push` and hand to `set_child`.
+#
+# a `for` loop iterates one of these:
+#
+#   rows := template.list()
+#   rows.push(template.context().set("title", title))
+#   ctx.set_child("rows", rows)
+pub fn list() -> Ctx:
+    return Ctx(json.make_array())
+
+# Adopts an existing `std.json` node as a context.
+#
+# the node should be an object for a template's root context. this borrows the
+# handle; it stays owned by the json node pool and by whatever scope opened it.
+pub fn from_json(handle: Int) -> Ctx:
+    return Ctx(handle)
+
+impl Ctx:
+    # Sets a string field, and returns the context so calls chain.
+    fn set(key: String, value: String) -> Ctx:
+        json.object_set(self.node, key, json.make_string(value))
+        return self
+
+    # Sets an integer field.
+    fn set_int(key: String, value: Int) -> Ctx:
+        json.object_set(self.node, key, json.make_int(value))
+        return self
+
+    # Sets a float field.
+    fn set_float(key: String, value: Float) -> Ctx:
+        json.object_set(self.node, key, json.make_float(value))
+        return self
+
+    # Sets a boolean field, which `if` reads directly.
+    fn set_bool(key: String, value: Bool) -> Ctx:
+        json.object_set(self.node, key, json.make_bool(value))
+        return self
+
+    # Sets a field to a nested context or list.
+    fn set_child(key: String, child: Ctx) -> Ctx:
+        json.object_set(self.node, key, child.node)
+        return self
+
+    # Appends a nested context or list to a list context.
+    fn push(child: Ctx) -> Ctx:
+        json.array_push(self.node, child.node)
+        return self
+
+    # Appends a string to a list context, for `for tag in tags`.
+    fn push_text(value: String) -> Ctx:
+        json.array_push(self.node, json.make_string(value))
+        return self
+
+    # Appends an integer to a list context.
+    fn push_int(value: Int) -> Ctx:
+        json.array_push(self.node, json.make_int(value))
+        return self
+
+    # The underlying `std.json` handle, for code that wants to read or encode
+    # the same data as json.
+    fn handle() -> Int:
+        return self.node
+
+# ---------------------------------------------------------------
+# compiling
+# ---------------------------------------------------------------
+
+# the index of the two-byte sequence `first``second` at or after `start`, or -1.
+fn find_pair(source: String, start: Int, first: Int, second: Int) -> Int:
+    mut position := start
+    limit := source.len() - 1
+    while position < limit:
+        if ord(source[position]) == first and ord(source[position + 1]) == second:
+            return position
+        position = position + 1
+    return 0 - 1
+
+# true when `path` is a name, or dot-joined names, made of letters, digits, and
+# underscores. rejecting anything else at compile time is what keeps the
+# renderer from having to be an expression evaluator.
+fn is_path(path: String) -> Bool:
+    if path == "":
+        return false
+    mut segment_length := 0
+    mut position := 0
+    while position < path.len():
+        byte := ord(path[position])
+        if byte == 46:
+            if segment_length == 0:
+                return false
+            segment_length = 0
+        else:
+            letter := (byte >= 97 and byte <= 122) or (byte >= 65 and byte <= 90)
+            digit := byte >= 48 and byte <= 57
+            if not letter and not digit and byte != 95:
+                return false
+            segment_length = segment_length + 1
+        position = position + 1
+    return segment_length > 0
+
+fn node_text(text: String, offset: Int) -> Node:
+    return Node(NODE_TEXT, text, "", "", false, 0 - 1, 0 - 1, offset)
+
+fn node_output(kind: Int, path: String, offset: Int) -> Node:
+    return Node(kind, "", path, "", false, 0 - 1, 0 - 1, offset)
+
+fn fail_at(message: String, offset: Int) -> Node!TemplateError:
+    fail TemplateError(message, offset)
+
+# parse the inside of one `<% … %>` into a node.
+fn parse_tag(body: String, offset: Int) -> Node!TemplateError:
+    trimmed := body.trim()
+    if trimmed == "":
+        return fail_at("empty tag", offset)!
+    if trimmed.starts_with("#"):
+        return node_text("", offset)
+    if trimmed.starts_with("="):
+        path := trimmed.substring(1, trimmed.len()).trim()
+        if not is_path(path):
+            return fail_at("expected a name or dotted path after '=', got '{path}'", offset)!
+        return node_output(NODE_ESCAPED, path, offset)
+    if trimmed.starts_with("raw "):
+        path := trimmed.substring(4, trimmed.len()).trim()
+        if not is_path(path):
+            return fail_at("expected a name or dotted path after 'raw', got '{path}'", offset)!
+        return node_output(NODE_RAW, path, offset)
+    if trimmed == "end":
+        return Node(NODE_END, "", "", "", false, 0 - 1, 0 - 1, offset)
+    if trimmed == "else":
+        return Node(NODE_ELSE, "", "", "", false, 0 - 1, 0 - 1, offset)
+    if trimmed.starts_with("if "):
+        mut condition := trimmed.substring(3, trimmed.len()).trim()
+        mut negate := false
+        if condition.starts_with("not "):
+            condition = condition.substring(4, condition.len()).trim()
+            negate = true
+        if not is_path(condition):
+            return fail_at("expected a name or dotted path after 'if', got '{condition}'", offset)!
+        return Node(NODE_IF, "", condition, "", negate, 0 - 1, 0 - 1, offset)
+    if trimmed.starts_with("for "):
+        rest := trimmed.substring(4, trimmed.len())
+        parts := rest.split(" in ")
+        if parts.len() != 2:
+            return fail_at("expected 'for <name> in <path>', got '{trimmed}'", offset)!
+        name := parts[0].trim()
+        source := parts[1].trim()
+        if not is_path(name) or name.contains("."):
+            return fail_at("'{name}' is not a usable loop variable name", offset)!
+        if not is_path(source):
+            return fail_at("expected a name or dotted path to loop over, got '{source}'", offset)!
+        return Node(NODE_FOR, "", source, name, false, 0 - 1, 0 - 1, offset)
+    return fail_at("unknown tag '{trimmed}'", offset)!
+
+# Compiles template source into a `Template`.
+#
+# every tag is checked here — an unknown tag, an unbalanced `end`, an
+# expression that is not a plain dotted path, or nesting deeper than 32 all
+# fail at compile time rather than rendering as something surprising. compile
+# your templates at startup and a malformed one takes the process down before
+# it takes a request down.
+pub fn compile(source: String) -> Template!TemplateError:
+    if source.len() > MAX_SOURCE_BYTES:
+        fail TemplateError("template source is larger than {MAX_SOURCE_BYTES} bytes", 0)
+    mut nodes: List[Node] := []
+    mut open_blocks: List[Int] := []
+    mut position := 0
+    while position < source.len():
+        open := find_pair(source, position, 60, 37)
+        if open < 0:
+            nodes.push(node_text(source.substring(position, source.len()), position))
+            position = source.len()
+        else:
+            if open > position:
+                nodes.push(node_text(source.substring(position, open), position))
+            close := find_pair(source, open + 2, 37, 62)
+            if close < 0:
+                fail TemplateError("unclosed '<%' tag", open)
+            node := parse_tag(source.substring(open + 2, close), open)!
+            if node.kind == NODE_END:
+                if open_blocks.len() == 0:
+                    fail TemplateError("'end' with no open 'if' or 'for'", open)
+                opener := open_blocks[open_blocks.len() - 1]
+                open_blocks = open_blocks.slice(0, open_blocks.len() - 1)
+                nodes.push(node)
+                nodes = close_block(nodes, opener, nodes.len() - 1)
+            elif node.kind == NODE_ELSE:
+                if open_blocks.len() == 0:
+                    fail TemplateError("'else' with no open 'if'", open)
+                opener := open_blocks[open_blocks.len() - 1]
+                if nodes[opener].kind != NODE_IF:
+                    fail TemplateError("'else' is only allowed inside an 'if'", open)
+                if nodes[opener].alt >= 0:
+                    fail TemplateError("an 'if' may have only one 'else'", open)
+                nodes.push(node)
+                nodes = set_alt(nodes, opener, nodes.len() - 1)
+            elif node.kind == NODE_IF or node.kind == NODE_FOR:
+                if open_blocks.len() >= MAX_NESTING:
+                    fail TemplateError("blocks nested deeper than {MAX_NESTING}", open)
+                nodes.push(node)
+                open_blocks.push(nodes.len() - 1)
+            else:
+                nodes.push(node)
+            position = close + 2
+    if open_blocks.len() > 0:
+        fail TemplateError("missing 'end'", nodes[open_blocks[open_blocks.len() - 1]].offset)
+    return Template(nodes)
+
+# record the matching `end` on the node that opened the block.
+fn close_block(nodes: List[Node], opener: Int, closer: Int) -> List[Node]:
+    old := nodes[opener]
+    mut out := nodes
+    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, old.alt, closer, old.offset)
+    return out
+
+# record the matching `else` on the node that opened the block.
+fn set_alt(nodes: List[Node], opener: Int, alt: Int) -> List[Node]:
+    old := nodes[opener]
+    mut out := nodes
+    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, alt, old.close, old.offset)
+    return out
+
+# ---------------------------------------------------------------
+# loading from a file
+# ---------------------------------------------------------------
+
+# Compiles a template read from `path`.
+#
+# the size is checked before the read rather than after, so pointing this at
+# something enormous costs a stat and not the memory. `path` is used exactly as
+# given and is joined with nothing, so it must come from your own code or your
+# own configuration — never from a request. for a name that came from outside,
+# use `load_in`.
+pub fn load(path: String) -> Template!TemplateError:
+    size := fs.size(path) catch:
+        fail TemplateError("could not read template '{path}'", 0)
+    if size > MAX_SOURCE_BYTES:
+        fail TemplateError("template '{path}' is larger than {MAX_SOURCE_BYTES} bytes", 0)
+    source := fs.read(path) catch:
+        fail TemplateError("could not read template '{path}'", 0)
+    return compile(source)!
+
+# Compiles the template named `name` from inside `dir`.
+#
+# this is the one to reach for when the name came from a request. `name` must
+# be a plain file name: no `/`, no `\`, no `..`, and no leading `.`. that rule
+# is checked on the name as written rather than on a resolved path, so there is
+# no window between the check and the read and no symlink to race — a name that
+# cannot express a traversal cannot become one.
+pub fn load_in(dir: String, name: String) -> Template!TemplateError:
+    if name == "":
+        fail TemplateError("empty template name", 0)
+    if name.contains("/") or name.contains("\\"):
+        fail TemplateError("template name '{name}' may not contain a path separator", 0)
+    if name.starts_with("."):
+        fail TemplateError("template name '{name}' may not start with '.'", 0)
+    mut position := 0
+    while position < name.len():
+        if ord(name[position]) < 32:
+            fail TemplateError("template name contains a control character", 0)
+        position = position + 1
+    mut prefix := dir
+    if not prefix.ends_with("/"):
+        prefix = prefix + "/"
+    return load(prefix + name)!
+
+# ---------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------
+
+# resolve a dotted path against the loop variables in scope, innermost first,
+# then against the root context. returns -1 when nothing matches.
+fn resolve(root: Int, names: List[String], values: List[Int], path: String) -> Int:
+    segments := path.split(".")
+    mut handle := root
+    mut start := 0
+    mut frame := names.len() - 1
+    while frame >= 0:
+        if names[frame] == segments[0]:
+            handle = values[frame]
+            start = 1
+            frame = 0 - 1
+        else:
+            frame = frame - 1
+    mut index := start
+    while index < segments.len():
+        if handle < 0:
+            return 0 - 1
+        handle = json.object_get(handle, segments[index])
+        index = index + 1
+    return handle
+
+# the text a node renders to, before escaping. containers render empty: a page
+# that prints `[object Object]` is a bug that should look like a hole instead.
+fn stringify(handle: Int) -> String:
+    kind := json.type_of(handle)
+    if kind == "string":
+        return json.get_string(handle)
+    if kind == "int":
+        return json.get_int(handle).to_string()
+    if kind == "float":
+        return json.get_float(handle).to_string()
+    if kind == "bool":
+        return json.get_bool(handle).to_string()
+    return ""
+
+# whether `if` takes its branch. empty is false in every shape it comes in:
+# missing, null, false, 0, "", and the empty list.
+fn truthy(handle: Int) -> Bool:
+    kind := json.type_of(handle)
+    if kind == "bool":
+        return json.get_bool(handle)
+    if kind == "int":
+        return json.get_int(handle) != 0
+    if kind == "float":
+        return json.get_float(handle) != 0.0
+    if kind == "string":
+        return json.get_string(handle) != ""
+    if kind == "array":
+        return json.array_len(handle) > 0
+    if kind == "object":
+        return true
+    return false
+
+# a copy of the loop-variable scope with one more binding on top. copying keeps
+# the scope stack immutable across the recursive call, so an early return can
+# never leave a stale binding behind.
+fn extend_names(names: List[String], name: String) -> List[String]:
+    mut out: List[String] := []
+    mut index := 0
+    while index < names.len():
+        out.push(names[index])
+        index = index + 1
+    out.push(name)
+    return out
+
+fn extend_values(values: List[Int], value: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut index := 0
+    while index < values.len():
+        out.push(values[index])
+        index = index + 1
+    out.push(value)
+    return out
+
+fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[String], values: List[Int]) -> String!TemplateError:
+    mut out := ""
+    mut index := start
+    while index < stop:
+        node := t.nodes[index]
+        if node.kind == NODE_TEXT:
+            out = out + node.text
+            index = index + 1
+        elif node.kind == NODE_ESCAPED:
+            out = out + html.escape(stringify(resolve(root, names, values, node.path)))
+            index = index + 1
+        elif node.kind == NODE_RAW:
+            out = out + stringify(resolve(root, names, values, node.path))
+            index = index + 1
+        elif node.kind == NODE_IF:
+            mut taken := truthy(resolve(root, names, values, node.path))
+            if node.negate:
+                taken = not taken
+            if taken:
+                mut body_end := node.close
+                if node.alt >= 0:
+                    body_end = node.alt
+                out = out + render_range(t, index + 1, body_end, root, names, values)!
+            elif node.alt >= 0:
+                out = out + render_range(t, node.alt + 1, node.close, root, names, values)!
+            index = node.close + 1
+        elif node.kind == NODE_FOR:
+            items := resolve(root, names, values, node.path)
+            count := json.array_len(items)
+            mut item_index := 0
+            while item_index < count:
+                inner_names := extend_names(names, node.name)
+                inner_values := extend_values(values, json.array_get(items, item_index))
+                out = out + render_range(t, index + 1, node.close, root, inner_names, inner_values)!
+                item_index = item_index + 1
+            index = node.close + 1
+        else:
+            index = index + 1
+        if out.len() > MAX_OUTPUT_BYTES:
+            fail TemplateError("rendered output is larger than {MAX_OUTPUT_BYTES} bytes", node.offset)
+    return out
+
+# Renders `t` with `data`, escaping every `<%= %>` value.
+#
+# a value interpolated with `<%= %>` goes through `html.escape` on the way out,
+# always, with no way to turn that off for the template as a whole. the only
+# unescaped path is a `<%raw %>` tag that somebody wrote on purpose.
+pub fn render(t: Template, data: Ctx) -> String!TemplateError:
+    mut names: List[String] := []
+    mut values: List[Int] := []
+    return render_range(t, 0, t.nodes.len(), data.node, names, values)!
+
+# Compiles `source` and renders it in one step.
+#
+# convenient for a one-off fragment and for tests. a template that is rendered
+# per request should be compiled once with `compile` and kept, so a syntax
+# error is a startup failure and not a 500.
+pub fn render_string(source: String, data: Ctx) -> String!TemplateError:
+    return render(compile(source)!, data)!
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# the two tests that matter: what happens by default, and what the opt-out
+# does. if either of these ever changes, every page rendered by this module
+# changes its security posture with it.
+
+test "an interpolated value is escaped by default":
+    ctx := context().set("name", "<script>alert(1)</script>")
+
+    assert_eq(render_string("<h1>hello, <%= name %></h1>", ctx)!, "<h1>hello, &lt;script&gt;alert(1)&lt;/script&gt;</h1>")
+
+test "raw is the only way out, and it is unescaped":
+    ctx := context().set("body", "<b>bold</b>")
+
+    assert_eq(render_string("<%= body %>", ctx)!, "&lt;b&gt;bold&lt;/b&gt;")
+    assert_eq(render_string("<%raw body %>", ctx)!, "<b>bold</b>")
+
+test "escaping applies in every position a value can appear":
+    payload := "\" onmouseover=\"alert(1)"
+    ctx := context().set("q", payload)
+
+    assert_eq(render_string("<input value=\"<%= q %>\">", ctx)!, "<input value=\"&quot; onmouseover=&quot;alert(1)\">")
+    assert_eq(render_string("<p><%= q %></p>", ctx)!, "<p>&quot; onmouseover=&quot;alert(1)</p>")
+
+test "escaping applies inside a loop and inside a branch":
+    rows := list()
+    rows.push(context().set("title", "<one>"))
+    rows.push(context().set("title", "&two"))
+    ctx := context().set_child("rows", rows).set_bool("show", true).set("note", "<em>hi</em>")
+
+    assert_eq(render_string("<% for row in rows %>[<%= row.title %>]<% end %>", ctx)!, "[&lt;one&gt;][&amp;two]")
+    assert_eq(render_string("<% if show %><%= note %><% end %>", ctx)!, "&lt;em&gt;hi&lt;/em&gt;")
+    assert_eq(render_string("<% if show %><%raw note %><% end %>", ctx)!, "<em>hi</em>")
+
+test "a value is never re-read as template syntax":
+    ctx := context().set("name", "<%raw secret %>").set("secret", "leaked")
+
+    assert_eq(render_string("<%= name %>", ctx)!, "&lt;%raw secret %&gt;")
+    assert_eq(render_string("<%raw name %>", ctx)!, "<%raw secret %>")
+
+test "text passes through untouched":
+    ctx := context()
+
+    assert_eq(render_string("", ctx)!, "")
+    assert_eq(render_string("<h1>plain</h1>", ctx)!, "<h1>plain</h1>")
+    assert_eq(render_string("a <%# note %> b", ctx)!, "a  b")
+
+test "values render by their type":
+    ctx := context().set("s", "text").set_int("n", 42).set_bool("b", true).set_float("f", 1.5)
+
+    assert_eq(render_string("<%= s %>|<%= n %>|<%= b %>|<%= f %>", ctx)!, "text|42|true|1.5")
+
+test "a missing path renders empty and is falsy":
+    ctx := context().set("here", "yes")
+
+    assert_eq(render_string("[<%= missing %>]", ctx)!, "[]")
+    assert_eq(render_string("[<%= here.deeper %>]", ctx)!, "[]")
+    assert_eq(render_string("<% if missing %>yes<% else %>no<% end %>", ctx)!, "no")
+
+test "dotted paths walk nested contexts":
+    ctx := context().set_child("user", context().set("name", "ada").set_child("role", context().set("label", "admin")))
+
+    assert_eq(render_string("<%= user.name %>", ctx)!, "ada")
+    assert_eq(render_string("<%= user.role.label %>", ctx)!, "admin")
+
+test "if takes the branch its value asks for":
+    filled := context().set("v", "x").set_int("n", 1).set_bool("b", true)
+    empty := context().set("v", "").set_int("n", 0).set_bool("b", false)
+
+    assert_eq(render_string("<% if v %>y<% else %>n<% end %>", filled)!, "y")
+    assert_eq(render_string("<% if v %>y<% else %>n<% end %>", empty)!, "n")
+    assert_eq(render_string("<% if n %>y<% else %>n<% end %>", filled)!, "y")
+    assert_eq(render_string("<% if n %>y<% else %>n<% end %>", empty)!, "n")
+    assert_eq(render_string("<% if b %>y<% else %>n<% end %>", filled)!, "y")
+    assert_eq(render_string("<% if b %>y<% else %>n<% end %>", empty)!, "n")
+
+test "if not inverts the test":
+    ctx := context().set("v", "")
+
+    assert_eq(render_string("<% if not v %>empty<% end %>", ctx)!, "empty")
+    assert_eq(render_string("<% if not missing %>gone<% end %>", ctx)!, "gone")
+
+test "an empty list is falsy and loops zero times":
+    ctx := context().set_child("rows", list())
+
+    assert_eq(render_string("<% if rows %>some<% else %>none<% end %>", ctx)!, "none")
+    assert_eq(render_string("<% for row in rows %>x<% end %>", ctx)!, "")
+    assert_eq(render_string("<% for row in missing %>x<% end %>", ctx)!, "")
+
+test "loops iterate lists of scalars and of contexts":
+    tags := list().push_text("a").push_text("b").push_text("c")
+    ctx := context().set_child("tags", tags)
+
+    assert_eq(render_string("<% for tag in tags %><li><%= tag %></li><% end %>", ctx)!, "<li>a</li><li>b</li><li>c</li>")
+
+test "loops nest and inner names shadow outer ones":
+    inner_a := list().push_int(1).push_int(2)
+    inner_b := list().push_int(3)
+    groups := list()
+    groups.push(context().set("label", "a").set_child("items", inner_a))
+    groups.push(context().set("label", "b").set_child("items", inner_b))
+    ctx := context().set_child("groups", groups)
+
+    assert_eq(render_string("<% for g in groups %><%= g.label %>:<% for i in g.items %><%= i %><% end %>;<% end %>", ctx)!, "a:12;b:3;")
+
+test "a loop variable does not leak past its loop":
+    rows := list().push_text("x")
+    ctx := context().set_child("rows", rows).set("row", "outer")
+
+    assert_eq(render_string("<% for row in rows %><%= row %><% end %><%= row %>", ctx)!, "xouter")
+
+test "an if nests inside a for":
+    rows := list()
+    rows.push(context().set("name", "on").set_bool("live", true))
+    rows.push(context().set("name", "off").set_bool("live", false))
+    ctx := context().set_child("rows", rows)
+
+    assert_eq(render_string("<% for r in rows %><% if r.live %>[<%= r.name %>]<% end %><% end %>", ctx)!, "[on]")
+
+test "whitespace inside a tag is optional":
+    ctx := context().set("x", "v")
+
+    assert_eq(render_string("<%=x%>", ctx)!, "v")
+    assert_eq(render_string("<%=   x   %>", ctx)!, "v")
+    assert_eq(render_string("<%  if  x  %>y<%  end  %>", ctx)!, "y")
+
+test "a compiled template renders more than once":
+    page := compile("<%= n %>")!
+
+    assert_eq(render(page, context().set("n", "first"))!, "first")
+    assert_eq(render(page, context().set("n", "second"))!, "second")
+
+test "from_json renders a parsed document":
+    scope := json.open_scope()
+    root := json.parse("{{\"name\": \"<b>\", \"tags\": [\"x\", \"y\"]}}")
+    out := render_string("<%= name %><% for t in tags %>-<%= t %><% end %>", from_json(root))!
+    json.close_scope(scope)
+
+    assert_eq(out, "&lt;b&gt;-x-y")
+
+# a template that fails to compile, reported as a bool. `catch` has no error
+# binding, so outcome is what a test can assert on — and a rejection is the
+# whole contract here, not the wording of the message.
+fn compile_rejects(source: String) -> Bool:
+    compile(source) catch:
+        return true
+    return false
+
+# the same, for a template name that should never reach the filesystem.
+fn load_in_rejects(dir: String, name: String) -> Bool:
+    load_in(dir, name) catch:
+        return true
+    return false
+
+test "compile rejects a malformed template":
+    assert_eq(compile_rejects("<% if x %>no end"), true)
+    assert_eq(compile_rejects("<%= x"), true)
+    assert_eq(compile_rejects("<% end %>"), true)
+    assert_eq(compile_rejects("<% else %>"), true)
+    assert_eq(compile_rejects("<% if x %><% else %><% else %><% end %>"), true)
+    assert_eq(compile_rejects("<% for x in y %><% else %><% end %>"), true)
+    assert_eq(compile_rejects("<% while x %><% end %>"), true)
+    assert_eq(compile_rejects("<%= %>"), true)
+    assert_eq(compile_rejects("<%  %>"), true)
+    assert_eq(compile_rejects("<%= a b %>"), true)
+    assert_eq(compile_rejects("<%= a() %>"), true)
+    assert_eq(compile_rejects("<%= a.. %>"), true)
+    assert_eq(compile_rejects("<%raw %>"), true)
+    assert_eq(compile_rejects("<% for x %><% end %>"), true)
+    assert_eq(compile_rejects("<% if %><% end %>"), true)
+
+test "compile accepts the whole syntax":
+    ok := compile("<% if a %><%= b %><% else %><%raw c %><% end %><% for d in e %><%# note %><% end %>")!
+
+    assert_eq(compile_rejects("<% if a %><%= b %><% else %><%raw c %><% end %>"), false)
+    assert_eq(ok.nodes.len() > 0, true)
+
+test "load_in refuses a name that could escape its directory":
+    assert_eq(load_in_rejects("templates", "../secret.html"), true)
+    assert_eq(load_in_rejects("templates", "a/b.html"), true)
+    assert_eq(load_in_rejects("templates", "a\\b.html"), true)
+    assert_eq(load_in_rejects("templates", ".hidden"), true)
+    assert_eq(load_in_rejects("templates", ".."), true)
+    assert_eq(load_in_rejects("templates", ""), true)
+
+test "compile refuses runaway nesting":
+    mut deep := ""
+    mut level := 0
+    while level < MAX_NESTING + 1:
+        deep = deep + "<% if a %>"
+        level = level + 1
+    while level > 0:
+        deep = deep + "<% end %>"
+        level = level - 1
+
+    assert_eq(compile_rejects(deep), true)
+
+test "load reads a template off disk and load_in joins a safe name":
+    dir := fs.make_temp_dir("pith-template-")!
+    fs.write(dir + "/page.html", "<h1><%= name %></h1>")!
+    ctx := context().set("name", "<b>")
+    from_path := render(load(dir + "/page.html")!, ctx)!
+    from_name := render(load_in(dir, "page.html")!, ctx)!
+    missing := load_in_rejects(dir, "missing.html")
+    fs.remove(dir + "/page.html")
+    fs.remove_empty_dir(dir)
+
+    assert_eq(from_path, "<h1>&lt;b&gt;</h1>")
+    assert_eq(from_name, "<h1>&lt;b&gt;</h1>")
+    assert_eq(missing, true)

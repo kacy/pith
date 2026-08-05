@@ -1,4 +1,4 @@
-# html escaping
+# html escaping and templates
 
 `std.html` is the module that stands between a request and a page. a server
 that renders `req.query_param("name")` into `<h1>hello, {name}</h1>` is not
@@ -143,6 +143,125 @@ json.object_set(body, "status", json.make_string("ok"))
 json.object_set(body, "agent", json.make_string(ua))
 return http.json_response(200, json.encode(body))
 ```
+
+## templates
+
+`std.html` is the call you have to remember. `std.template` is the one you do
+not: it renders a page from a context and escapes every interpolated value on
+the way out, unless a human wrote the opt-out.
+
+```pith
+import std.template as template
+
+page := template.compile("<h1>hello, <%= name %></h1>")!
+ctx := template.context().set("name", "<script>alert(1)</script>")
+template.render(page, ctx)!
+# "<h1>hello, &lt;script&gt;alert(1)&lt;/script&gt;</h1>"
+```
+
+that default is the entire point. a helper you have to call protects the pages
+you remembered on; a renderer that escapes by default protects the ones you
+forgot, and the ones you forgot are the ones that get exploited.
+
+`examples/templating.pith` renders a page from hostile input and prints what
+survived.
+
+### the syntax
+
+| tag | does |
+| --- | ---- |
+| `<%= path %>` | escaped output — the default |
+| `<%raw path %>` | unescaped output |
+| `<% if path %> … <% end %>` | conditional |
+| `<% if not path %> … <% end %>` | negated conditional |
+| `<% if path %> … <% else %> … <% end %>` | with an alternative |
+| `<% for item in path %> … <% end %>` | loop |
+| `<%# … %>` | comment, dropped |
+
+that is all of it. a `path` is a name or dot-joined names (`user.name`) and
+nothing else: no function calls, no arithmetic, no comparisons, no filters, no
+`and`/`or`, no inheritance, no partials or includes, no whitespace control. if
+you need a comparison, do it in pith and put a boolean in the context. this is
+a renderer, not a second language to debug.
+
+### why `<% %>` and not `{{ }}`
+
+pith already owns `{` and `}` inside a string literal — they are its own
+interpolation, and a literal brace has to be doubled. a mustache-style tag
+written inline would be `"{{{{name}}}}"` to mean `{{name}}`, in every template
+and in every test. `<% %>` cannot collide with pith syntax, so a template reads
+the same in a `.html` file and in a pith string.
+
+### the opt-out
+
+`<%raw value %>` emits a value untouched. it is spelled in words rather than in
+punctuation on purpose: `grep -rn '<%raw' templates/` is a complete audit of
+every place your templates trust a value, which is a property `<%== %>` and
+`{{{ }}}` do not give you.
+
+use it for markup your own program produced, and for a value you have already
+escaped by hand — a url that went through `html.escape_url`, for instance,
+where a second pass of `escape` would corrupt the `&amp;` it just wrote:
+
+```pith
+fn note(title: String, link: String) -> template.Ctx:
+    return template.context().set("title", title).set("link", html.escape_url(link))
+```
+
+```
+<a href="<%raw note.link %>"><%= note.title %></a>
+```
+
+### the context
+
+a context is a `std.json` object node behind a typed front, so a value that
+arrived as json can be rendered directly with `template.from_json(handle)`, and
+the node pool's scoping rules apply — see the json node pool section of
+[docs/web.md](web.md). inside a request handler the pool is already scoped for
+you and there is nothing to do.
+
+```pith
+rows := template.list()
+rows.push(template.context().set("title", "first"))
+rows.push(template.context().set("title", "second"))
+
+ctx := template.context()
+ctx.set("heading", heading)
+ctx.set_int("count", 2)
+ctx.set_bool("admin", false)
+ctx.set_child("rows", rows)
+```
+
+a path that does not resolve renders as empty and is falsy. that is deliberate
+for a page renderer: a missing field should leave a hole, not take the response
+down. if a missing field is a bug for you, check the context before rendering.
+
+`if` treats missing, null, `false`, `0`, `""`, and the empty list as false.
+`for` over anything that is not a list runs zero times.
+
+### compiling, and files
+
+`compile` checks everything: an unknown tag, an unbalanced `end`, an expression
+that is not a plain dotted path, nesting deeper than 32. compile your pages at
+startup and a broken template fails the boot rather than a request.
+
+`load(path)` compiles a template from a file, capped at 1 MiB. the path is used
+exactly as given, so it has to come from your own code or configuration.
+`load_in(dir, name)` is the one for a name that came from a request: `name` must
+be a plain file name with no `/`, no `\`, no `..`, and no leading `.`. the rule
+is checked on the name as written rather than on a resolved path, so there is no
+window between the check and the read and no symlink to race — a name that
+cannot express a traversal cannot become one.
+
+### what the escaping does not cover
+
+the renderer escapes with `html.escape`, so it inherits exactly the limits
+above. a `<%= %>` inside a `<script>` block is not safe, and a `<%= %>` in an
+`href` escapes the quotes but does not stop `javascript:`. put the url through
+`html.escape_url` in pith and emit it with `<%raw %>`.
+
+rendered output is capped at 8 MiB; a page that exceeds it fails rather than
+growing until the process does.
 
 ## see also
 

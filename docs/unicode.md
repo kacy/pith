@@ -103,6 +103,91 @@ text.truncate_with(s, 20, "...")  # at most 20 characters, and say it was cut
 `varchar(255)`, a header size cap, a log field budget. it never returns a
 partial character, so the result is always valid utf-8.
 
+## fold to compare, to_lower to display
+
+`to_lower` and `to_upper` on `String` are ascii-only. `"Ärger".to_lower()` is
+`"Ärger"`, unchanged. `"ПРИВЕТ".to_lower()` is `"ПРИВЕТ"`, unchanged.
+
+that matters more than it looks, because most `to_lower()` calls in auth,
+routing and header code are not lowercasing at all — they are caseless
+comparisons, written with the only tool that was there:
+
+```pith
+if header.to_lower() == "content-type":   # fine, headers are ascii
+if username.to_lower() == stored:         # broken the moment a name is not
+```
+
+the second one is the bug. use `fold`:
+
+```pith
+text.fold("Ärger")              # "ärger"
+text.eq_fold("Ärger", "ärger")  # true
+```
+
+folding is not lowercasing, and the difference is not pedantic. greek final
+sigma lowercases to itself but folds to a plain sigma, so `"ΣΣ"` and `"σς"`
+are the same word and only folding says so. folding produces a comparison key;
+lowercasing produces text for a reader. keep `to_lower` for the second job.
+
+this is **simple** folding: every character folds to exactly one character.
+`"ß"` folds to itself rather than to `"ss"`, so `fold("straße")` and
+`fold("STRASSE")` are not equal. full folding would close that gap with a
+mapping that changes length; it is not implemented, and the tests pin the
+current behaviour so it cannot drift by accident.
+
+## normalize so equal-looking text is equal
+
+`"é"` can be one code point or an `"e"` followed by a combining acute accent.
+they render identically, a user cannot tell them apart, and they are different
+bytes — so they hash differently, compare unequal, and land in a database as
+two rows.
+
+```pith
+text.normalize(input)   # NFC, the composed form
+```
+
+normalize at the edge, where text arrives, and store the result. for an
+identifier a user typed, you usually want both operations:
+
+```pith
+text.eq_fold_normalized(typed, stored)
+```
+
+only NFC is implemented. NFD, NFKC and NFKD are not. NFC is the form to store
+and compare; the compatibility forms discard information — they flatten a
+fullwidth letter and its ascii form into the same string — which is the wrong
+default for text you are keeping.
+
+## the tables
+
+the case folding and normalization data is generated from the unicode
+character database, pinned at **15.1.0**, by `tools/unicodegen/generate.py`:
+
+```
+python3 tools/unicodegen/generate.py
+```
+
+the generated modules are checked in, so building pith never needs the
+network. to move to a new unicode release, change `UNICODE_VERSION` in that
+script, rerun it, and commit the diff. the version is recorded in
+`text.unicode_version()` and in the header of every generated file.
+
+the generator checks every table it emits against python's `unicodedata`
+before writing, and refuses to run if that module's version does not match the
+pin — a generator that only parses the UCD files can confirm it read them
+consistently, not that it read them correctly.
+
+the tables are packed into string constants rather than list literals, and
+binary-searched in place. that is not premature cleverness: compiling a
+module-level pith list of N integers is superlinear in N — 500 entries take
+2s, 1000 take 33s, and 3000 do not finish in two minutes — while a 60KB string
+constant compiles in about a second and costs nothing at startup.
+
+| table | records | size |
+| --- | --- | --- |
+| case folding | 205 runs (from 1457 pairs) | 4.0 KB |
+| combining classes, decompositions, compositions | 388 + 2061 + 941 | 42.0 KB |
+
 ## what is not here
 
 `std.text` carries no locale. tags, message catalogs, plural rules, and
@@ -110,6 +195,6 @@ locale-aware number and date formatting belong in `std.intl`, which builds on
 this module. `std.text` never depends on `std.intl`, so a program that only
 needs correct text does not pull in locale data.
 
-`to_lower` and `to_upper` on `String` remain ascii-only. they are a display
-convenience, not a correctness tool; see the case-folding section once it
-lands for the comparison story.
+also not implemented, deliberately: full and special case mapping (`ß` → `SS`,
+turkish dotted and dotless i), NFD/NFKC/NFKD, word and sentence segmentation,
+and bidirectional text.

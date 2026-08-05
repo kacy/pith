@@ -1,0 +1,790 @@
+# std.web.session - server-side sessions behind a signed cookie
+#
+# the state a request carries about who is on the other end of it, kept on
+# the server and referred to by a cookie that holds nothing but an
+# unguessable id. build a store, register its middleware, and read and write
+# the session through the store from any handler:
+#
+#   import std.web.session as session
+#
+#   fn main() -> Int!:
+#       sessions := session.store(bytes.from_string_utf8(env("SESSION_SECRET")))!
+#       app := web.new().use_mw(session.middleware(sessions)).post("/login", log_in)
+#       app.listen("0.0.0.0", 8080)!
+#       return 0
+#
+#   fn log_in(req: web.Request) -> http.HttpResponse:
+#       sessions.rotate(req)              # a fresh id, so nobody can fixate one
+#       sessions.set(req, "user", "u-7")
+#       return http.text(200, "welcome")
+#
+# ## what is in the cookie
+#
+# the id and a mac over it, and nothing else. no claims, no expiry, no user
+# name — a session cookie that carries data is a session cookie whose data
+# the browser can be talked into replaying. everything real lives in the
+# store, so revoking a session is a delete rather than a hope that the token
+# expires soon.
+#
+# the id is 32 bytes from the os random source, base64url encoded. the mac is
+# hmac-sha256 under the store's secret and is compared with
+# `std.crypto.subtle`. the mac buys nothing against guessing — 256 bits
+# already handles that — but it lets a forged or truncated cookie be thrown
+# out on arithmetic, before it becomes a lookup, so a flood of made-up
+# cookies cannot be used to probe the store.
+#
+# the cookie is HttpOnly (script cannot read it), Secure (it never travels
+# over plain http) and SameSite=Lax by default. `insecure_over_http()` drops
+# the Secure flag for local development, and is the only way to drop it.
+#
+# ## what one process holds
+#
+# the store lives in this process's memory, behind one mutex, shared by every
+# serving task — green or os thread, one store, as many tasks as you like.
+# what it is not is shared between processes. two instances behind a load
+# balancer each hold their own sessions, so a request that lands on the other
+# one finds a signature it accepts and an id it has never heard of, and
+# treats the caller as signed out. run one instance, pin sessions to it, or
+# put the state somewhere both can reach.
+#
+# sessions expire, and expired ones are swept in the background of ordinary
+# traffic rather than by a timer. `sweep()` forces one; `count()` says how
+# many are live.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.log as log
+import std.net.http as http
+import std.time as time
+import std.crypto.hmac as hmac
+import std.crypto.random as random
+import std.crypto.subtle as subtle
+import std.web as web
+
+# 32 bytes of os randomness, which is the id an attacker would otherwise have
+# to guess. base64url encodes it to 43 characters, all cookie-safe.
+ID_BYTES := 32
+
+# an hmac secret shorter than the digest it keys is a secret with less
+# strength than the mac it produces, so this is the floor.
+MIN_SECRET_BYTES := 32
+
+# how many sessions this process will hold, across every store in it. the cap
+# is process-wide rather than per-store because what it is protecting is the
+# process's memory, and two stores sharing it should not be able to ask for
+# twice as much between them.
+#
+# an unauthenticated visitor never occupies a row — an id is minted per
+# request but only written when a handler actually stores something — so
+# reaching this means something is creating sessions in a loop, and the honest
+# answer is to stop rather than to grow until the process is killed.
+MAX_SESSIONS := 100_000
+
+# how often ordinary traffic pauses to drop expired sessions, in seconds.
+SWEEP_INTERVAL := 60
+
+# the defaults a store starts with: one day, the name below, site-wide, and
+# every flag a session cookie should carry.
+DEFAULT_TTL := 86_400
+DEFAULT_COOKIE := "pith_session"
+DEFAULT_PATH := "/"
+DEFAULT_SAME_SITE := "Lax"
+
+# the request values the middleware attaches. handlers never read these —
+# they go through the store — but they are what lets a handler's writes find
+# their way to the right session without module state per request.
+ID_KEY := "session.id"
+FRESH_KEY := "session.fresh"
+
+# a session store: which shared table it owns, the secret its cookies are
+# signed with, and how the cookie is written. build one with `store` and
+# narrow it with the builder methods; each returns a new value pointing at
+# the same table, so configuring is pure and the sessions are shared.
+pub struct Store:
+    handle: Int
+    secret: Bytes
+    cookie_v: String
+    ttl_v: Int
+    path_v: String
+    same_site_v: String
+    secure_v: Bool
+
+# ---------------------------------------------------------------
+# shared state — one mutex over every store's sessions
+# ---------------------------------------------------------------
+#
+# the maps are keyed by a composite string rather than nested, because the
+# first two segments (a store number and a base64url id) can hold no "|" and
+# so the split is never ambiguous however the caller spells a key.
+
+mut session_mu := Mutex()
+mut next_store_handle := 1
+
+# "<store>|<id>|<key>" -> the value a handler stored
+mut session_values: Map[String, String] := {}
+# "<store>|<id>" -> the keys that session holds, newline separated
+mut session_keys: Map[String, String] := {}
+# "<store>|<id>" -> the unix second it stops being valid
+mut session_expiry: Map[String, Int] := {}
+mut session_count := 0
+mut last_sweep := 0
+
+fn session_key(handle: Int, id: String) -> String:
+    return handle.to_string() + "|" + id
+
+fn value_key(handle: Int, id: String, key: String) -> String:
+    return session_key(handle, id) + "|" + key
+
+# a store's sessions live in their own key space, so two stores in one
+# process — an app and its admin console, say — never see each other's.
+#
+# `secret` keys the mac over the cookie. it must be at least 32 bytes and
+# must not be a literal in the source: read it from the environment or a
+# secrets file. changing it invalidates every cookie already issued, which is
+# the blunt way to sign everybody out.
+pub fn store(secret: Bytes) -> Store!:
+    if secret.len() < MIN_SECRET_BYTES:
+        fail "a session secret must be at least " + MIN_SECRET_BYTES.to_string() + " bytes"
+    session_mu.lock()
+    handle := next_store_handle
+    next_store_handle = next_store_handle + 1
+    session_mu.unlock()
+    return Store(handle, secret, DEFAULT_COOKIE, DEFAULT_TTL, DEFAULT_PATH, DEFAULT_SAME_SITE, true)
+
+impl Store:
+    # how long a session lives without being used, in seconds. every request
+    # that arrives with a live session slides the window forward, so this is
+    # an idle timeout rather than an absolute one.
+    fn ttl(seconds: Int) -> Store:
+        return Store(self.handle, self.secret, self.cookie_v, seconds, self.path_v, self.same_site_v, self.secure_v)
+
+    # the cookie name. the default is "pith_session".
+    fn cookie_name(name: String) -> Store:
+        return Store(self.handle, self.secret, name, self.ttl_v, self.path_v, self.same_site_v, self.secure_v)
+
+    # the cookie's Path. the default is "/", which is what you want unless
+    # two apps share a hostname — a cookie set at "/" is sent to both.
+    fn path(value: String) -> Store:
+        return Store(self.handle, self.secret, self.cookie_v, self.ttl_v, value, self.same_site_v, self.secure_v)
+
+    # the cookie's SameSite. "Lax" (the default) sends the cookie on
+    # top-level navigation to the site but not on a cross-site form post or
+    # fetch, which turns away most csrf on its own. "Strict" withholds it on
+    # navigation too, so a link from an email arrives signed out. "None"
+    # sends it everywhere and is only meaningful with a cross-origin front
+    # end; it needs Secure, which is on unless you turned it off.
+    fn same_site(value: String) -> Store:
+        return Store(self.handle, self.secret, self.cookie_v, self.ttl_v, self.path_v, value, self.secure_v)
+
+    # drop the Secure flag, so the cookie also travels over plain http. this
+    # is for local development. in production it means any network between
+    # the browser and the server can lift the session id off the wire.
+    fn insecure_over_http() -> Store:
+        return Store(self.handle, self.secret, self.cookie_v, self.ttl_v, self.path_v, self.same_site_v, false)
+
+# ---------------------------------------------------------------
+# the table, under the lock
+# ---------------------------------------------------------------
+#
+# every helper below assumes session_mu is already held. the public surface
+# takes it once at its own boundary; none of this ever blocks, so the section
+# is always short.
+
+fn expired_at(now: Int, key: String) -> Bool:
+    if not session_expiry.contains_key(key):
+        return true
+    return session_expiry[key] <= now
+
+fn drop_session(key: String):
+    if not session_expiry.contains_key(key):
+        return
+    for name in stored_keys(key):
+        session_values.remove(key + "|" + name)
+    session_keys.remove(key)
+    session_expiry.remove(key)
+    session_count = session_count - 1
+
+fn stored_keys(key: String) -> List[String]:
+    if not session_keys.contains_key(key):
+        return []
+    joined := session_keys[key]
+    if joined.len() == 0:
+        return []
+    return joined.split("\n")
+
+fn record_key(key: String, name: String):
+    for existing in stored_keys(key):
+        if existing == name:
+            return
+    if session_keys.contains_key(key) and session_keys[key].len() > 0:
+        session_keys.insert(key, session_keys[key] + "\n" + name)
+        return
+    session_keys.insert(key, name)
+
+fn forget_key(key: String, name: String):
+    mut out := ""
+    for existing in stored_keys(key):
+        if existing == name:
+            continue
+        if out.len() > 0:
+            out = out + "\n"
+        out = out + existing
+    session_keys.insert(key, out)
+
+# drop every expired session. returns how many went.
+fn sweep_expired(now: Int) -> Int:
+    mut doomed: List[String] := []
+    for key in session_expiry:
+        if session_expiry[key] <= now:
+            doomed.push(key)
+    for key in doomed:
+        drop_session(key)
+    last_sweep = now
+    return doomed.len()
+
+# sweep if it has been a while. called on the paths that are about to grow
+# the table, so expiry costs nothing until there is traffic to pay for it.
+fn maybe_sweep(now: Int):
+    if now - last_sweep >= SWEEP_INTERVAL:
+        sweep_expired(now)
+
+fn live(now: Int, key: String) -> Bool:
+    return not expired_at(now, key)
+
+# create the session if it is not there, and slide its window either way.
+# returns false when the table is full, which is the only way it refuses.
+fn ensure_session(key: String, now: Int, ttl: Int) -> Bool:
+    if session_expiry.contains_key(key):
+        if session_expiry[key] <= now:
+            drop_session(key)
+        else:
+            session_expiry.insert(key, now + ttl)
+            return true
+    maybe_sweep(now)
+    if session_count >= MAX_SESSIONS:
+        return false
+    session_expiry.insert(key, now + ttl)
+    session_keys.insert(key, "")
+    session_count = session_count + 1
+    return true
+
+# ---------------------------------------------------------------
+# the cookie
+# ---------------------------------------------------------------
+
+fn sign(secret: Bytes, id: String) -> String:
+    return encoding.b64_url_raw_encode(hmac.sha256(secret, bytes.from_string_utf8(id)))
+
+fn cookie_value(secret: Bytes, id: String) -> String:
+    return id + "." + sign(secret, id)
+
+# the id inside a presented cookie, or "" when the cookie is absent,
+# misshapen, or carries a mac this store did not write. the comparison goes
+# through std.crypto.subtle: a mac check that returns early tells the caller
+# how many bytes it got right, one request at a time.
+fn opened_cookie(secret: Bytes, presented: String) -> String:
+    cut := presented.index_of(".")
+    if cut <= 0 or cut >= presented.len() - 1:
+        return ""
+    id := presented.substring(0, cut)
+    mac := presented.substring(cut + 1, presented.len())
+    expected := sign(secret, id)
+    if not subtle.equal(bytes.from_string_utf8(mac), bytes.from_string_utf8(expected)):
+        return ""
+    return id
+
+fn fresh_id() -> String!:
+    return encoding.b64_url_raw_encode(random.bytes(ID_BYTES)!)
+
+fn dressed(store: Store, item: http.Cookie) -> http.Cookie:
+    mut out := item.path(store.path_v).http_only().same_site(store.same_site_v)
+    if store.secure_v:
+        out = out.secure_only()
+    return out
+
+fn session_cookie(store: Store, id: String) -> http.Cookie:
+    return dressed(store, http.cookie(store.cookie_v, cookie_value(store.secret, id))).max_age(store.ttl_v)
+
+fn cleared_cookie(store: Store) -> http.Cookie:
+    return dressed(store, http.cookie(store.cookie_v, "")).max_age(0).expires("Thu, 01 Jan 1970 00:00:00 GMT")
+
+# ---------------------------------------------------------------
+# which session a handler is talking about
+# ---------------------------------------------------------------
+#
+# the middleware attaches two ids to the request: the one the cookie
+# presented (empty when there was none), and a freshly minted one nothing has
+# used yet. which of the two is live is decided by looking in the table, so a
+# handler that rotates or destroys a session needs no other bookkeeping.
+
+fn existing_id(store: Store, req: web.Request, now: Int) -> String:
+    fresh := req.value(FRESH_KEY)
+    if fresh.len() > 0 and live(now, session_key(store.handle, fresh)):
+        return fresh
+    presented := req.value(ID_KEY)
+    if presented.len() > 0 and live(now, session_key(store.handle, presented)):
+        return presented
+    return ""
+
+# where a write goes: the live session if there is one, otherwise the fresh
+# id, which the write itself brings into being.
+fn write_id(store: Store, req: web.Request, now: Int) -> String:
+    id := existing_id(store, req, now)
+    if id.len() > 0:
+        return id
+    return req.value(FRESH_KEY)
+
+fn warn_unattached():
+    log.root().target("web.session").error().msg("session used on a request the session middleware never saw")
+
+impl Store:
+    # the value stored under `key`, or "" when this request has no session or
+    # the session has no such key.
+    fn get(req: web.Request, key: String) -> String:
+        session_mu.lock()
+        id := existing_id(self, req, time.unix())
+        mut out := ""
+        if id.len() > 0:
+            full := value_key(self.handle, id, key)
+            if session_values.contains_key(full):
+                out = session_values[full]
+        session_mu.unlock()
+        return out
+
+    # the value stored under `key`, or `fallback` when it is missing or empty.
+    fn get_or(req: web.Request, key: String, fallback: String) -> String:
+        value := self.get(req, key)
+        if value.len() == 0:
+            return fallback
+        return value
+
+    # true when this request's session holds `key`.
+    fn has(req: web.Request, key: String) -> Bool:
+        session_mu.lock()
+        id := existing_id(self, req, time.unix())
+        mut out := false
+        if id.len() > 0:
+            out = session_values.contains_key(value_key(self.handle, id, key))
+        session_mu.unlock()
+        return out
+
+    # store `value` under `key`, creating the session if this request had
+    # none — which is also what makes the middleware send a cookie back.
+    #
+    # `key` must not contain a newline, which is the separator the key list
+    # is kept in; a key that does is refused and logged rather than silently
+    # corrupting the session next to it.
+    fn set(req: web.Request, key: String, value: String):
+        if key.len() == 0 or key.contains("\n"):
+            log.root().target("web.session").error().msg("a session key must be non-empty and hold no newline")
+            return
+        session_mu.lock()
+        now := time.unix()
+        id := write_id(self, req, now)
+        if id.len() == 0:
+            session_mu.unlock()
+            warn_unattached()
+            return
+        full := session_key(self.handle, id)
+        if not ensure_session(full, now, self.ttl_v):
+            session_mu.unlock()
+            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("this process is holding all the sessions it will; not creating another")
+            return
+        session_values.insert(value_key(self.handle, id, key), value)
+        record_key(full, key)
+        session_mu.unlock()
+
+    # drop one key from this request's session, leaving the rest of it alone.
+    fn remove(req: web.Request, key: String):
+        session_mu.lock()
+        id := existing_id(self, req, time.unix())
+        if id.len() > 0:
+            session_values.remove(value_key(self.handle, id, key))
+            forget_key(session_key(self.handle, id), key)
+        session_mu.unlock()
+
+    # the keys this request's session holds, in the order they were first
+    # written.
+    fn keys(req: web.Request) -> List[String]:
+        session_mu.lock()
+        id := existing_id(self, req, time.unix())
+        mut out: List[String] := []
+        if id.len() > 0:
+            out = stored_keys(session_key(self.handle, id))
+        session_mu.unlock()
+        return out
+
+    # true when this request already has a session on the server.
+    fn active(req: web.Request) -> Bool:
+        session_mu.lock()
+        id := existing_id(self, req, time.unix())
+        session_mu.unlock()
+        return id.len() > 0
+
+    # move this request's session to a brand new id, keeping its contents,
+    # and send the new id back in the cookie. call it the moment a caller's
+    # privileges change — at the top of a successful login above all.
+    #
+    # without it an attacker plants a session id in a victim's browser (a
+    # link, an injected cookie), waits for them to sign in, and finds the id
+    # they already hold is now an authenticated one. rotating means the id
+    # they planted was retired at the exact moment it became worth having.
+    fn rotate(req: web.Request):
+        session_mu.lock()
+        now := time.unix()
+        fresh := req.value(FRESH_KEY)
+        if fresh.len() == 0:
+            session_mu.unlock()
+            warn_unattached()
+            return
+        current := existing_id(self, req, now)
+        if current == fresh:
+            session_mu.unlock()
+            return
+        target := session_key(self.handle, fresh)
+        if not ensure_session(target, now, self.ttl_v):
+            session_mu.unlock()
+            log.root().target("web.session").error().int("limit", MAX_SESSIONS).msg("this process is holding all the sessions it will; not rotating")
+            return
+        if current.len() > 0:
+            source := session_key(self.handle, current)
+            for name in stored_keys(source):
+                session_values.insert(value_key(self.handle, fresh, name), session_values[value_key(self.handle, current, name)])
+                record_key(target, name)
+            drop_session(source)
+        session_mu.unlock()
+
+    # end this request's session: the server forgets it and the response
+    # clears the cookie. this is what logout is — the id stops meaning
+    # anything the instant it is called, rather than when a token expires.
+    fn destroy(req: web.Request):
+        session_mu.lock()
+        for id in [req.value(FRESH_KEY), req.value(ID_KEY)]:
+            if id.len() > 0:
+                drop_session(session_key(self.handle, id))
+        session_mu.unlock()
+
+    # how many sessions this store holds right now, expired ones included
+    # until they are swept.
+    fn count() -> Int:
+        session_mu.lock()
+        mut total := 0
+        prefix := self.handle.to_string() + "|"
+        for key in session_expiry:
+            if key.starts_with(prefix):
+                total = total + 1
+        session_mu.unlock()
+        return total
+
+    # drop every expired session now rather than waiting for traffic to do
+    # it, and return how many went. sweeping is shared across stores, so this
+    # clears expired sessions in every store in the process.
+    fn sweep() -> Int:
+        session_mu.lock()
+        dropped := sweep_expired(time.unix())
+        session_mu.unlock()
+        return dropped
+
+# ---------------------------------------------------------------
+# the middleware
+# ---------------------------------------------------------------
+
+# read the cookie, hand the request down the chain, and write the cookie back
+# if what happened in between changed which session the caller holds.
+fn run(store: Store, next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    fresh := fresh_id() catch:
+        # the os random source is the only thing that can fail here, and
+        # without it there is no id worth minting. failing the request is the
+        # only honest answer; carrying on would hand somebody a guessable one.
+        log.root().target("web.session").error().msg("the os random source failed; refusing to mint a session id")
+        return http.server_error_response()
+    offered := req.raw.cookie_or(store.cookie_v, "")
+    presented := opened_cookie(store.secret, offered)
+
+    session_mu.lock()
+    now := time.unix()
+    mut carried := ""
+    if presented.len() > 0 and live(now, session_key(store.handle, presented)):
+        # slide the idle window forward: this session is being used.
+        session_expiry.insert(session_key(store.handle, presented), now + store.ttl_v)
+        carried = presented
+    session_mu.unlock()
+
+    scoped := req.with_value(ID_KEY, carried).with_value(FRESH_KEY, fresh)
+    resp := next(scoped)
+
+    session_mu.lock()
+    after := existing_id(store, scoped, time.unix())
+    session_mu.unlock()
+
+    if after.len() == 0:
+        # the handler destroyed the session, or the cookie named one that had
+        # already expired or was never real. either way the browser is holding
+        # a cookie that means nothing and should stop sending it.
+        if offered.len() == 0:
+            return resp
+        return resp.set_cookie(cleared_cookie(store))
+    if after == carried:
+        return resp
+    return resp.set_cookie(session_cookie(store, after))
+
+# the session middleware. register it once, app-wide and outside any guard
+# that reads the session:
+#
+#   app := web.new().use_mw(session.middleware(sessions))
+#
+# it reads the cookie on the way in and writes one on the way out, but only
+# when the session changed — a request that reads nothing and writes nothing
+# gets no Set-Cookie, and a visitor who never signs in never occupies a row
+# in the store.
+pub fn middleware(store: Store) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        return run(store, next, req)
+
+# --- tests ---
+
+fn test_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret of at least thirty-two bytes")
+
+# a request carrying `cookie` as its Cookie header, so the tests can drive
+# the middleware without a socket.
+fn request_with_cookie(cookie: String) -> web.Request:
+    mut headers: Map[String, String] := {}
+    if cookie.len() > 0:
+        headers.insert("Cookie", cookie)
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), "GET", "/", "", "HTTP/1.1", "", "", headers, {}, [])
+    return web.Request(raw, {}, "/", {})
+
+# the Set-Cookie header a response carries for `name`, or "" when it sets none.
+fn set_cookie_for(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if line.starts_with(name + "="):
+            return line
+    return ""
+
+# the cookie value a browser would send back, pulled out of a Set-Cookie line.
+fn cookie_pair(line: String) -> String:
+    cut := line.index_of(";")
+    if cut < 0:
+        return line
+    return line.substring(0, cut)
+
+fn ok(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "ok")
+
+test "a request that touches no session gets no cookie":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+    resp := guard(ok, request_with_cookie(""))
+
+    assert_eq(resp.status, 200)
+    assert_eq(resp.cookies().len(), 0)
+    assert_eq(sessions.count(), 0)
+
+# a handler that writes one value, so the middleware has a session to send a
+# cookie back for. a handler only ever takes the request, so the store it
+# writes to is closed over — which is what an application does too, with a
+# store built once at startup.
+fn writer_for(target: Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        target.set(req, "user", "ada")
+        return http.text(200, "written")
+
+# rotate then write, which is the shape of a login.
+fn login_for(target: Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        target.rotate(req)
+        target.set(req, "user", "ada")
+        return http.text(200, "in")
+
+fn logout_for(target: Store) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        target.destroy(req)
+        return http.text(200, "out")
+
+test "writing a session sets a signed cookie the next request is known by":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    first := guard(writer_for(sessions), request_with_cookie(""))
+    line := set_cookie_for(first, DEFAULT_COOKIE)
+    assert(line.len() > 0)
+    assert(line.contains("HttpOnly"))
+    assert(line.contains("Secure"))
+    assert(line.contains("SameSite=Lax"))
+    assert(line.contains("Path=/"))
+    assert(line.contains("Max-Age=" + DEFAULT_TTL.to_string()))
+    assert_eq(sessions.count(), 1)
+
+    # the browser sends it back, and the value is there.
+    returning := request_with_cookie(cookie_pair(line))
+    reader := fn(req: web.Request) => http.text(200, sessions.get(req, "user"))
+    second := guard(reader, returning)
+    assert_eq(second.body_text()!, "ada")
+    # nothing changed, so nothing is set again.
+    assert_eq(second.cookies().len(), 0)
+
+test "a cookie whose mac does not check out is not a session":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    line := set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
+    good := cookie_pair(line)
+    id := good.substring(good.index_of("=") + 1, good.index_of("."))
+
+    reader := fn(req: web.Request) => http.text(200, sessions.get(req, "user") + "/" + sessions.active(req).to_string())
+    # the right id with a mac from somewhere else, and the id with no mac at
+    # all. the id is genuine in both, so this is the mac doing the work.
+    for forged in [DEFAULT_COOKIE + "=" + id + ".AAAA", DEFAULT_COOKIE + "=" + id, DEFAULT_COOKIE + "=" + id + "."]:
+        resp := guard(reader, request_with_cookie(forged))
+        assert_eq(resp.body_text()!, "/false")
+
+test "a cookie signed with another secret is refused":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    line := set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
+    good := cookie_pair(line)
+    id := good.substring(good.index_of("=") + 1, good.index_of("."))
+    elsewhere := bytes.from_string_utf8("a different secret, also thirty-two bytes long")
+
+    reader := fn(req: web.Request) => http.text(200, sessions.active(req).to_string())
+    forged := DEFAULT_COOKIE + "=" + cookie_value(elsewhere, id)
+    assert_eq(guard(reader, request_with_cookie(forged)).body_text()!, "false")
+
+test "rotate moves a session to a new id and retires the old one":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    # an anonymous session with something in it, the way a shopping cart or a
+    # csrf token would be there before anyone signs in.
+    anon := set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
+    before := cookie_pair(anon)
+    assert_eq(sessions.count(), 1)
+
+    after_login := guard(login_for(sessions), request_with_cookie(before))
+    after := cookie_pair(set_cookie_for(after_login, DEFAULT_COOKIE))
+    assert(after.len() > 0)
+    assert(after != before)
+    # the contents came across, and the old id did not survive alongside it.
+    assert_eq(sessions.count(), 1)
+
+    reader := fn(req: web.Request) => http.text(200, sessions.get(req, "user") + "/" + sessions.active(req).to_string())
+    assert_eq(guard(reader, request_with_cookie(after)).body_text()!, "ada/true")
+    assert_eq(guard(reader, request_with_cookie(before)).body_text()!, "/false")
+
+test "destroy forgets the session and clears the cookie":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    line := cookie_pair(set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE))
+    assert_eq(sessions.count(), 1)
+
+    resp := guard(logout_for(sessions), request_with_cookie(line))
+    cleared := set_cookie_for(resp, DEFAULT_COOKIE)
+    assert(cleared.contains("Max-Age=0"))
+    assert(cleared.starts_with(DEFAULT_COOKIE + "=;"))
+    assert_eq(sessions.count(), 0)
+
+    reader := fn(req: web.Request) => http.text(200, sessions.active(req).to_string())
+    assert_eq(guard(reader, request_with_cookie(line)).body_text()!, "false")
+
+test "an expired session is not honored, and is swept":
+    sessions := store(test_secret())!.ttl(1)
+    guard := middleware(sessions)
+
+    line := cookie_pair(set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE))
+    assert_eq(sessions.count(), 1)
+    # the ttl is in seconds and the check is `expiry <= now`, so a second
+    # and a bit puts this one over the line without a long wait.
+    sleep(1200)
+
+    reader := fn(req: web.Request) => http.text(200, sessions.active(req).to_string())
+    resp := guard(reader, request_with_cookie(line))
+    assert_eq(resp.body_text()!, "false")
+    # the cookie named a session that is gone, so the browser is told to drop it.
+    assert(set_cookie_for(resp, DEFAULT_COOKIE).contains("Max-Age=0"))
+    assert_eq(sessions.sweep() >= 1, true)
+    assert_eq(sessions.count(), 0)
+
+test "keys, remove and get_or read what set wrote":
+    sessions := store(test_secret())!
+    guard := middleware(sessions)
+
+    line := cookie_pair(set_cookie_for(guard(writer_for(sessions), request_with_cookie("")), DEFAULT_COOKIE))
+    req := request_with_cookie(line)
+
+    # the middleware is what attaches the ids, so drive these through it.
+    inspect := fn(r: web.Request) => http.text(200, sessions.keys(r).join(",") + "/" + sessions.get_or(r, "theme", "dark") + "/" + sessions.has(r, "user").to_string())
+    assert_eq(guard(inspect, req).body_text()!, "user/dark/true")
+
+    adder := fn(r: web.Request):
+        sessions.set(r, "theme", "light")
+        return http.text(200, "")
+    guard(adder, req)
+    assert_eq(guard(inspect, req).body_text()!, "user,theme/light/true")
+
+    dropper := fn(r: web.Request):
+        sessions.remove(r, "user")
+        return http.text(200, "")
+    guard(dropper, req)
+    # the key is gone and the one beside it is untouched.
+    assert_eq(guard(inspect, req).body_text()!, "theme/light/false")
+    # the session itself is still there, which is what makes remove different
+    # from destroy.
+    assert_eq(sessions.count(), 1)
+
+# create one session on `target`, so a concurrency test can pile tasks onto
+# one store. spawn wants a plain call, so this is a named function.
+fn create_one(target: Store, group: WaitGroup) -> Int:
+    resp := middleware(target)(writer_for(target), request_with_cookie(""))
+    group.done()
+    return resp.status
+
+test "many tasks writing at once each get their own session":
+    sessions := store(test_secret())!
+    group := WaitGroup()
+    mut i := 0
+    while i < 32:
+        group.add(1)
+        spawn create_one(sessions, group)
+        i = i + 1
+    group.wait()
+
+    # one mutex over the table, so 32 tasks racing to create sessions leave
+    # 32 of them rather than some number the interleaving decided.
+    assert_eq(sessions.count(), 32)
+
+test "two stores in one process do not see each other's sessions":
+    left := store(test_secret())!
+    right := store(test_secret())!
+
+    line := cookie_pair(set_cookie_for(middleware(left)(writer_for(left), request_with_cookie("")), DEFAULT_COOKIE))
+    # the same cookie, the same secret, the same mac — and a different table.
+    reader := fn(r: web.Request) => http.text(200, right.active(r).to_string())
+    assert_eq(middleware(right)(reader, request_with_cookie(line)).body_text()!, "false")
+
+test "a store refuses a secret too short to key its mac":
+    assert(store(bytes.from_string_utf8("too short")).is_err)
+    assert(store(bytes.from_string_utf8("x".repeat(MIN_SECRET_BYTES))).is_ok)
+
+test "insecure_over_http is the only way to drop the Secure flag":
+    sessions := store(test_secret())!.insecure_over_http().same_site("Strict").cookie_name("sid").path("/app")
+
+    line := set_cookie_for(middleware(sessions)(writer_for(sessions), request_with_cookie("")), "sid")
+    assert(line.len() > 0)
+    assert(not line.contains("Secure"))
+    assert(line.contains("HttpOnly"))
+    assert(line.contains("SameSite=Strict"))
+    assert(line.contains("Path=/app"))
+
+test "a session id is 32 bytes of os randomness and never repeats":
+    mut seen: Map[String, Int] := {}
+    mut i := 0
+    while i < 64:
+        id := fresh_id()!
+        # base64url of 32 bytes, unpadded.
+        assert_eq(id.len(), 43)
+        assert(not seen.contains_key(id))
+        seen.insert(id, i)
+        i = i + 1

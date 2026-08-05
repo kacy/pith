@@ -26,7 +26,15 @@ fn main():
         i = i + 1
     print(cancelled.to_string())
 
+    # a deadline is enforced by a watcher task that polls, so how soon it
+    # notices depends on when that task next gets scheduled. waiting a fixed
+    # 15ms for a 3ms deadline lost about one run in six on a loaded box. wait
+    # for the state instead of guessing at a duration: a generous ceiling that
+    # a working deadline never reaches, and that a broken one still fails at.
     dpair := conc.with_deadline(root, time.now() + 3)
     dctx := dpair.0
-    time.delay(15)
+    mut waited := 0
+    while waited < 5000 and not dctx.is_cancelled():
+        time.delay(5)
+        waited = waited + 5
     print(dctx.is_cancelled().to_string())

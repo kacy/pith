@@ -1,0 +1,61 @@
+# a lambda or spawn inside an impl method may read `self`.
+#
+# `self` is its own ast node kind rather than an ident, and the free-variable
+# walk that decides what a closure captures only recognised idents. so `self`
+# fell through to the generic child walk, was never captured, and the thunk
+# emitted a bare `load self` into a function with no such local. the ir
+# consumer rejected it: "unknown load source 'self'".
+#
+# the reported symptom was the spawn case; the lambda case was broken the same
+# way and is covered here too.
+
+struct Counter:
+    base: Int
+    label: String
+
+fn add(a: Int, b: Int) -> Int:
+    return a + b
+
+fn tag(prefix: String, n: Int) -> String:
+    return prefix + ":" + n.to_string()
+
+impl Counter:
+    # a lambda reading a field of self
+    fn adder() -> fn(Int) -> Int:
+        return fn(n: Int) => add(self.base, n)
+
+    # a lambda reading a heap field of self, so the capture has to keep the
+    # string alive past the method's return
+    fn labeller() -> fn(Int) -> String:
+        return fn(n: Int) => tag(self.label, n)
+
+    # spawn reading self: the shape that was reported
+    fn spawned() -> Task[Int]:
+        return spawn add(self.base, 1)
+
+    # self alongside an ordinary captured local, so both land in one env
+    fn combined(extra: Int) -> Task[Int]:
+        return spawn add(self.base, extra)
+
+fn main() -> Int!:
+    c := Counter(10, "count")
+
+    f := c.adder()
+    print("lambda field:    {f(5)}")
+    print("lambda twice:    {f(1)} {f(2)}")
+
+    g := c.labeller()
+    print("lambda string:   {g(7)}")
+
+    print("spawn field:     {await c.spawned()}")
+    print("spawn with local:{await c.combined(30)}")
+
+    # the closures outlive the method they were built in
+    mut fs: List[fn(Int) -> Int] := []
+    fs.push(Counter(100, "a").adder())
+    fs.push(Counter(200, "b").adder())
+    mut total := 0
+    for h in fs:
+        total = total + h(1)
+    print("escaped closures:{total}")
+    return 0

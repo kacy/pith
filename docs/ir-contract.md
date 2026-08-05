@@ -211,6 +211,17 @@ end regardless: the consumer inlines `bytes_get`, `byte_at`, `string_len`, and
 falling back to the runtime helper. inlining is the back end's job; the *name
 rewrites and type dispatch* above are not.
 
+`pith_list_get_value_strict` — what `xs[i]` actually lowers to, and the single
+hottest call in the language — is deliberately **not** inlined. it looks like the
+obvious next candidate and it has been measured: an inline fast path removes about
+30% of all instructions executed and half of all memory references when
+type-checking the self-hosted compiler, and still comes out 1-3% *slower* on wall
+clock. the shared runtime function is a hot micro-kernel that stays resident in
+L1i with perfectly trained branches, and spreading it across thousands of call
+sites costs more in instruction fetch and branch-predictor pressure than the call
+saves. trimming the shared kernel instead was worth 11%. do not re-litigate this
+without an interleaved A/B on a real workload — the instruction count will lie.
+
 ## the robustness contract
 
 the consumer rejects malformed function bodies loudly, with a `CompileError` that

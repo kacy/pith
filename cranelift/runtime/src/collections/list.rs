@@ -450,8 +450,7 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
     let Some(impl_ref) = list_mut(*list) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
+    crate::perf_stats!(PERF_LIST_PUSHES += 1);
 
     // Verify element size matches
     if impl_ref.elem_size != elem_size as usize {
@@ -498,8 +497,7 @@ unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool)
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
+    crate::perf_stats!(PERF_LIST_PUSHES += 1);
     if !takes_caller_count {
         retain_element(impl_ref.type_tag, value);
     }
@@ -514,8 +512,7 @@ pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, valu
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_INSERTS, 1);
+    crate::perf_stats!(PERF_LIST_INSERTS += 1);
     retain_element(impl_ref.type_tag, value);
     impl_ref.insert_value_at(index.max(0) as usize, value);
 }
@@ -538,8 +535,7 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_SETS, 1);
+    crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
         return;
@@ -693,8 +689,7 @@ pub unsafe extern "C" fn pith_list_get_opt(list: PithList, index: i64) -> i64 {
     if impl_ref.elem_size != 8 {
         return optional_tuple(false, 0);
     }
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_stats!(PERF_LIST_GETS += 1);
     optional_tuple(true, impl_ref.get_value_unchecked(index as usize))
 }
 
@@ -711,8 +706,7 @@ pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
     if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
         return optional_tuple(false, 0);
     }
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_stats!(PERF_LIST_GETS += 1);
     optional_tuple(true, impl_ref.get_value_unchecked(0))
 }
 
@@ -729,8 +723,7 @@ pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
     if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
         return optional_tuple(false, 0);
     }
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_stats!(PERF_LIST_GETS += 1);
     optional_tuple(true, impl_ref.get_value_unchecked(impl_ref.len() - 1))
 }
 
@@ -740,28 +733,50 @@ pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
 ///
 /// # Safety
 /// * `list` must be a valid `PithList` handle or all-zero.
+// The three ways `list[i]` can fail, each behind a `#[cold]` call that never
+// returns. Formatting a diagnostic needs stack for the format arguments, and
+// leaving that inline made every successful index — the overwhelming majority,
+// hundreds of millions per compiler run — build a stack frame for a message it
+// was never going to print.
+#[cold]
+#[inline(never)]
+fn strict_index_bad_handle() -> ! {
+    eprintln!("pith runtime error: list indexing on invalid list handle");
+    std::process::exit(1);
+}
+
+#[cold]
+#[inline(never)]
+fn strict_index_out_of_bounds(index: i64, len: i64) -> ! {
+    eprintln!(
+        "pith runtime error: list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
+        index, len
+    );
+    std::process::exit(1);
+}
+
+#[cold]
+#[inline(never)]
+fn strict_index_bad_elem_size(elem_size: usize) -> ! {
+    eprintln!(
+        "pith runtime error: list index requires 8-byte element (elem_size={})",
+        elem_size
+    );
+    std::process::exit(1);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_get_value_strict(list: PithList, index: i64) -> i64 {
     let Some(impl_ref) = list_ref(list) else {
-        eprintln!("pith runtime error: list indexing on invalid list handle");
-        std::process::exit(1);
+        strict_index_bad_handle();
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_stats!(PERF_LIST_GETS += 1);
     let len = impl_ref.len() as i64;
     if index < 0 || index >= len {
-        eprintln!(
-            "pith runtime error: list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
-            index, len
-        );
-        std::process::exit(1);
+        strict_index_out_of_bounds(index, len);
     }
     if impl_ref.elem_size != 8 {
-        eprintln!(
-            "pith runtime error: list index requires 8-byte element (elem_size={})",
-            impl_ref.elem_size
-        );
-        std::process::exit(1);
+        strict_index_bad_elem_size(impl_ref.elem_size);
     }
     impl_ref.get_value_unchecked(index as usize)
 }
@@ -773,10 +788,11 @@ pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 
     let Some(impl_ref) = list_ref(list) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
-    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
-    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CHECKED_CALLS, 1);
+    crate::perf_stats!(
+        PERF_LIST_GETS += 1,
+        PERF_LIST_GET_VALUE_CALLS += 1,
+        PERF_LIST_GET_VALUE_CHECKED_CALLS += 1,
+    );
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return 0;
@@ -802,10 +818,11 @@ pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i6
     let Some(impl_ref) = list_ref(list) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
-    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
-    crate::perf_count(&crate::PERF_LIST_GET_VALUE_UNCHECKED_CALLS, 1);
+    crate::perf_stats!(
+        PERF_LIST_GETS += 1,
+        PERF_LIST_GET_VALUE_CALLS += 1,
+        PERF_LIST_GET_VALUE_UNCHECKED_CALLS += 1,
+    );
 
     if impl_ref.elem_size != 8 {
         crate::perf_count(&crate::PERF_LIST_GET_ELEM_OTHER, 1);
@@ -836,9 +853,7 @@ pub unsafe extern "C" fn pith_list_get(
     let Some(impl_ref) = list_ref(list) else {
         return false;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_GETS, 1);
-    crate::perf_count(&crate::PERF_LIST_GET_BYTES_CALLS, 1);
+    crate::perf_stats!(PERF_LIST_GETS += 1, PERF_LIST_GET_BYTES_CALLS += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -889,8 +904,7 @@ pub unsafe extern "C" fn pith_list_set(
     let Some(impl_ref) = list_mut(list) else {
         return false;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_SETS, 1);
+    crate::perf_stats!(PERF_LIST_SETS += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -931,8 +945,7 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
     let Some(impl_ref) = list_mut(*list) else {
         return false;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
+    crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -957,8 +970,7 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
     let Some(impl_ref) = list_mut(list) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
+    crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return 0;

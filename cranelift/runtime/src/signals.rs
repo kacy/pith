@@ -40,7 +40,7 @@
 //! resume instead of failing with `EINTR`.
 
 use crate::fdio;
-use crate::{ensure_perf_stats_registered, perf_count, PERF_SIGNAL_DELIVERIES, PERF_SIGNAL_WAITS};
+use crate::{perf_count, PERF_SIGNAL_DELIVERIES};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Once;
 
@@ -206,8 +206,7 @@ pub extern "C" fn pith_signal_wait(timeout_ms: i64) -> i64 {
     if fd < 0 {
         return -1;
     }
-    ensure_perf_stats_registered();
-    perf_count(&PERF_SIGNAL_WAITS, 1);
+    crate::perf_stats!(PERF_SIGNAL_WAITS += 1);
     loop {
         let mut byte = 0u8;
         // SAFETY: reading one byte from our own non-blocking pipe read end into

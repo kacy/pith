@@ -309,8 +309,7 @@ pub unsafe extern "C" fn pith_map_insert_int(
     let Some(impl_ref) = map_mut(*map) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
+    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
 
     // Verify value size matches
     if impl_ref.val_size != val_size as usize {
@@ -529,8 +528,7 @@ unsafe fn insert_cstr_inner(
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
     let map_key = cstr_to_map_key(key);
     // the map retains the incoming value when it owns heap values, and
     // drops its count on whatever that displaces. an owned value arrives
@@ -567,8 +565,7 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
 
     match impl_ref.get(&map_key) {
@@ -602,8 +599,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) 
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return optional_tuple(false, 0);
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => optional_tuple(
@@ -632,8 +628,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i
         eprintln!("pith runtime error: map indexing on invalid map handle");
         std::process::exit(1);
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
@@ -667,8 +662,7 @@ pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8)
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_CONTAINS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_CONTAINS += 1);
     let map_key = cstr_to_map_key(key);
 
     if impl_ref.contains_key(&map_key) {
@@ -691,8 +685,7 @@ pub unsafe extern "C" fn pith_map_get_default_cstr(
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return default;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
@@ -708,8 +701,7 @@ pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, de
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return default;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
         impl_ref.get_int_value(key).unwrap_or(default)
@@ -739,8 +731,7 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
+    crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
     let map_key = cstr_to_map_key(key);
     if let Some(old) = impl_ref.remove(&map_key) {
         impl_ref.release_value(&old);
@@ -775,8 +766,7 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
+    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
         impl_ref.insert_int_value(key, value);
@@ -801,8 +791,7 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
 
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
@@ -828,8 +817,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return optional_tuple(false, 0);
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
         match impl_ref.get_int_value(key) {
@@ -859,8 +847,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
         eprintln!("pith runtime error: map indexing on invalid map handle");
         std::process::exit(1);
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
     let found = if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
         impl_ref.get_int_value(key)
@@ -894,8 +881,7 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_CONTAINS, 1);
+    crate::perf_stats!(PERF_MAP_INT_CONTAINS += 1);
 
     let contains = if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_CONTAINS, 1);
@@ -921,8 +907,7 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_MAP_INT_REMOVES, 1);
+    crate::perf_stats!(PERF_MAP_INT_REMOVES += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_REMOVES, 1);
         impl_ref.remove_int_value(key);

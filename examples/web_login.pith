@@ -1,0 +1,196 @@
+# a login, end to end: argon2id, a session, a csrf token, and a guard.
+#
+# the four pieces that sit between a password in a database and a page only
+# signed-in people reach, wired together the way an application wires them:
+#
+#   session.middleware   remembers who the browser is
+#   csrf.middleware      refuses a state-changing request another site made
+#   auth.require         turns away anyone the session does not name
+#   password.verify      checks the password itself
+#
+# the client below plays the browser. it loads the login page for a csrf
+# token, tries the wrong password, tries the right one, reaches the protected
+# page, is refused without the cookie, and signs out — plus the two attacks
+# each layer exists for.
+
+import std.bytes as bytes
+import std.json as json
+import std.net.http as http
+import std.net.tcp as tcp
+import std.crypto.password as password
+import std.web as web
+import std.web.auth as auth
+import std.web.csrf as csrf
+import std.web.session as session
+
+PORT := 18106
+USERNAME := "ada"
+SECRET := "correct horse battery staple"
+
+# in a real service this is a database row. the phc string carries its own
+# salt and parameters, so one column holds everything verify needs.
+mut stored_hash := ""
+
+fn session_secret() -> Bytes:
+    return bytes.from_string_utf8("a session secret kept out of the repo, 32+ bytes of it")
+
+# the login page. asking for the csrf token is what mints it, and with it the
+# session, so a visitor who never loads this page costs the store nothing.
+fn login_page(protection: csrf.Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => http.html(200, "<form method=post><input type=hidden name=csrf_token value=" + protection.token(req) + "></form>")
+
+# the login itself. the password check is the application's — std.web.auth
+# deliberately does not own a user table — and sign_in is the one line that
+# turns a checked password into a session.
+fn check_login(guard: auth.Guard, req: web.Request) -> http.HttpResponse:
+    body := req.raw.body_json() catch:
+        return http.bad_request_response()
+    user := json.get_string(json.object_get(body, "username"))
+    attempt := json.get_string(json.object_get(body, "password"))
+    # the same answer for an unknown user and a wrong password: which of the
+    # two it was is not the caller's business.
+    if user != USERNAME or not password.verify(attempt, stored_hash):
+        return http.unauthorized_response()
+    guard.sign_in(req, USERNAME)
+    return http.text(200, "signed in")
+
+fn login(guard: auth.Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => check_login(guard, req)
+
+fn logout(guard: auth.Guard) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request):
+        guard.sign_out(req)
+        return http.text(200, "signed out")
+
+fn build_app(store: session.Store, protection: csrf.Guard, guard: auth.Guard) -> web.App:
+    mut app := web.bare()
+    # outermost first: the session has to exist before csrf can find its
+    # token in it, and before the guard can read who the caller is.
+    app = app.use_mw(session.middleware(store))
+    app = app.use_mw(csrf.middleware(protection))
+    app = app.get("/login", login_page(protection))
+    app = app.post("/login", login(guard))
+    app = app.post("/logout", logout(guard))
+    # everything under /app needs a signed-in session; the two routes above
+    # and /healthz stay open, without an allowlist buried inside a guard.
+    app = app.group("/app", auth.require(guard))
+    app = app.get("/app/me", fn(req: web.Request) => http.text(200, "hello " + req.value(auth.REQUEST_VALUE)))
+    return app
+
+fn serve_bg(store: session.Store, protection: csrf.Guard, guard: auth.Guard, port: Int) -> Int:
+    return build_app(store, protection, guard).listen("127.0.0.1", port) catch 0
+
+# connect until the accept loop answers, rather than sleeping a guess.
+fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false
+
+# the value of the hidden csrf input in a rendered login page.
+fn token_in(body: String) -> String:
+    start := body.index_of("value=") + 6
+    mut i := start
+    while i < body.len() and body[i] != ">":
+        i = i + 1
+    return body.substring(start, i)
+
+fn cookie_for(resp: http.HttpResponse, name: String) -> String:
+    for line in resp.cookies():
+        if not line.starts_with(name + "="):
+            continue
+        cut := line.index_of(";")
+        if cut < 0:
+            return line
+        return line.substring(0, cut)
+    return ""
+
+fn with_cookie(req: http.ClientRequest, pair: String) -> http.ClientRequest:
+    if pair.len() == 0:
+        return req
+    cut := pair.index_of("=")
+    return req.cookie(pair.substring(0, cut), pair.substring(cut + 1, pair.len()))
+
+fn get(path: String, cookie: String) -> http.HttpResponse!:
+    return with_cookie(http.get_request("127.0.0.1", PORT, path), cookie).send()!
+
+fn post(path: String, cookie: String, token: String) -> http.HttpResponse!:
+    mut req := with_cookie(http.post_request("127.0.0.1", PORT, path), cookie)
+    if token.len() > 0:
+        req = req.header("X-CSRF-Token", token)
+    return req.send()!
+
+fn attempt_login(cookie: String, token: String, user: String, secret: String) -> http.HttpResponse!:
+    mut req := with_cookie(http.post_request("127.0.0.1", PORT, "/login"), cookie)
+    req = req.json_body(json.of_map({"username": user, "password": secret}))
+    if token.len() > 0:
+        req = req.header("X-CSRF-Token", token)
+    return req.send()!
+
+fn main() -> Int!:
+    # "register" the one user before serving: about 30 ms of argon2id, once.
+    stored_hash = password.hash(SECRET)!
+
+    store := session.store(session_secret())!.insecure_over_http().ttl(3600)
+    protection := csrf.guard(store)
+    guard := auth.guard(store)
+
+    port := PORT
+    spawn serve_bg(store, protection, guard, port)
+    if not wait_for_port(port):
+        print("the server never came up")
+        return 1
+
+    print("=== before signing in ===")
+    print("GET /app/me:        " + (get("/app/me", "")!.status).to_string())
+
+    print("")
+    print("=== loading the login page ===")
+    page := get("/login", "")!
+    token := token_in(page.body_text()!)
+    anonymous := cookie_for(page, "pith_session")
+    print("csrf token:         " + (token.len() == 43).to_string())
+    print("anonymous session:  " + (anonymous.len() > 0).to_string())
+
+    print("")
+    print("=== the ways a login is refused ===")
+    print("no csrf token:      " + (attempt_login(anonymous, "", USERNAME, SECRET)!.status).to_string())
+    print("wrong password:     " + (attempt_login(anonymous, token, USERNAME, "guess")!.status).to_string())
+    print("unknown user:       " + (attempt_login(anonymous, token, "mallory", SECRET)!.status).to_string())
+
+    print("")
+    print("=== signing in ===")
+    done := attempt_login(anonymous, token, USERNAME, SECRET)!
+    signed_in := cookie_for(done, "pith_session")
+    print("status:             " + done.status.to_string())
+    # sign_in rotates the id, so the one the browser arrived with is retired
+    # at the moment it would have become an authenticated session.
+    print("id was rotated:     " + (signed_in.len() > 0 and signed_in != anonymous).to_string())
+
+    print("")
+    print("=== the protected page ===")
+    print("with the session:   " + (get("/app/me", signed_in)!.body_text()!))
+    print("without it:         " + (get("/app/me", "")!.status).to_string())
+    print("with the old id:    " + (get("/app/me", anonymous)!.status).to_string())
+    # a genuine id with a mac nobody wrote.
+    forged := "pith_session=" + signed_in.substring(signed_in.index_of("=") + 1, signed_in.index_of(".")) + ".AAAA"
+    print("with a forged mac:  " + (get("/app/me", forged)!.status).to_string())
+
+    print("")
+    print("=== signing out ===")
+    fresh_token := csrf_token_for(signed_in)!
+    out := post("/logout", signed_in, fresh_token)!
+    print("status:             " + out.status.to_string())
+    print("sessions held:      " + store.count().to_string())
+    print("GET /app/me:        " + (get("/app/me", signed_in)!.status).to_string())
+    return 0
+
+# the csrf token belonging to whatever session `cookie` names, read the way a
+# page rendering a form reads it.
+fn csrf_token_for(cookie: String) -> String!:
+    return token_in(get("/login", cookie)!.body_text()!)

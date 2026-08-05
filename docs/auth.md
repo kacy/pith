@@ -8,6 +8,13 @@ password at rest, `std.crypto.jwt` handles the session that follows, and
 that issues tokens and a middleware that guards everything else — and
 `examples/jwks_verify.pith` verifies against a key set an issuer publishes.
 
+for a browser rather than an api, the session is the better carrier: a token
+in a cookie cannot be revoked before it expires, and a server-side session
+can. `std.web.session`, `std.web.csrf` and `std.web.auth` are that path —
+`docs/web.md` covers them, and `examples/web_login.pith` runs a password
+login through all three. this file stays about the two crypto modules
+underneath.
+
 ## hashing a password
 
 `hash` takes a password and returns a phc string. `verify` takes the password

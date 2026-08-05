@@ -14,6 +14,7 @@
 # this api can be asked to do.
 
 import std.net.http as http
+import std.net.tcp as tcp
 import std.web as web
 import std.web.cors as cors
 
@@ -56,10 +57,24 @@ fn call(method: String, origin: String, preflight_for: String) -> String!:
         return resp.status.to_string() + ", same origin, nothing to allow"
     return resp.status.to_string() + ", no allow-origin: the browser blocks the read"
 
+# connect until the accept loop answers, rather than sleeping a guess.
+fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false
+
 fn main() -> Int!:
     port := PORT
     spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    if not wait_for_port(port):
+        print("the server never came up")
+        return 1
 
     print("=== a real request ===")
     print("from the app origin:  " + call("GET", APP_ORIGIN, "")!)

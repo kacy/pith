@@ -31,6 +31,17 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
             updated.push(name)
             return updated
         return free
+    # the receiver of an impl method is its own node kind rather than an ident,
+    # so it used to fall through to the generic child walk and never be
+    # captured. a spawn or lambda body that read it then emitted a bare
+    # `load self` into a thunk that has no such local, and the ir consumer
+    # rejected it with "unknown load source 'self'".
+    if node.kind == "self":
+        if ir_should_capture_name("self", bound, free, blocked_names, locals):
+            mut updated := ir_copy_names(free)
+            updated.push("self")
+            return updated
+        return free
     if node.kind == "lambda":
         inner_bound := ir_copy_names(bound)
         for child in node.children:

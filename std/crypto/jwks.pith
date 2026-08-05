@@ -1,0 +1,701 @@
+# std.crypto.jwks - verifying tokens somebody else signed
+#
+# `std.crypto.jwt` verifies a token when you already hold the key. an issuer
+# you do not control does not hand you a key; it publishes a json web key set
+# at a url and rotates what is in it whenever it likes. this module is the
+# rest of that story: fetch the set, cache it, pick the key the token names,
+# convert it into the bytes the jwt verifier takes, and verify.
+#
+#   import std.crypto.jwks as jwks
+#
+#   keys := jwks.cache("https://issuer.example.com/.well-known/jwks.json")
+#   session := keys.verify(token, jwt.with_issuer(jwt.default_options(), "https://issuer.example.com"))!
+#   print(session.subject())
+#
+# offline, with a document you already have:
+#
+#   set := jwks.parse(document)!
+#   session := set.verify(token, jwt.default_options())!
+#
+# ## the algorithm comes from the key
+#
+# a jwks holds asymmetric public keys, and which algorithm each one verifies
+# is a property of the key: an RSA key verifies RS256 or PS256, a P-256 key
+# verifies ES256, an Ed25519 key verifies EdDSA. this module reads that off
+# the key material — the jwk's own `alg` when it states one, and otherwise
+# `kty` and `crv` — and hands the answer to the matching `jwt.verify_*`.
+#
+# the token's `alg` header is used for exactly one thing: nothing. its `kid`
+# selects which key to try, and `jwt.verify_*` then compares the header's
+# `alg` against the name this module chose, refusing the token if they
+# differ. that is the same shape `std.crypto.jwt` already has — every
+# verifier names the algorithm it accepts and the token never picks the path
+# — extended one step further out, so a rotated key set cannot smuggle in a
+# different algorithm either.
+#
+# a symmetric key in a key set (`kty: oct`) is refused outright. it is the
+# algorithm confusion attack written down as a document: hand a verifier a
+# public value and tell it that value is an hmac secret, and any holder of
+# the published key set can mint tokens.
+#
+# ## fetching
+#
+# `cache(url)` fetches on first use and again when its ttl has passed. a
+# token naming a `kid` the cached set does not hold triggers at most one
+# refetch per cooldown, so a key rotation is picked up promptly and a flood
+# of invented `kid`s cannot be turned into a flood of requests at the issuer.
+# the fetch has a timeout and a response size cap, and the mutex is never
+# held across it.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.json as json
+import std.net.http as http
+import std.net.url as url
+import std.time as time
+import std.crypto.jwt as jwt
+
+# a key set is a handful of keys, not a directory. anything past this is
+# either a mistake at the issuer or somebody making us do work.
+MAX_KEYS := 32
+MAX_DOCUMENT_BYTES := 262144
+
+# an rsa modulus outside this range is not a key anyone should be verifying
+# with: below the floor it is forgeable, and above the ceiling it is a way to
+# make the verifier do arithmetic all day.
+MIN_MODULUS_BYTES := 128
+MAX_MODULUS_BYTES := 1024
+MAX_EXPONENT_BYTES := 8
+
+# a p-256 coordinate and an ed25519 public key are both fixed width.
+P256_COORDINATE_LEN := 32
+ED25519_KEY_LEN := 32
+
+# how long a fetched set is used before it is fetched again, and how long
+# after a fetch a token with an unknown kid may force another one.
+DEFAULT_TTL := 3600
+DEFAULT_REFRESH_COOLDOWN := 60
+DEFAULT_TIMEOUT_MS := 5000
+
+# one key from a set, already converted to the bytes the matching
+# `jwt.verify_*` takes: the pkcs#1 rsapublickey der for RS256 and PS256, the
+# uncompressed point for ES256, and the raw 32 bytes for EdDSA.
+pub struct Key:
+    pub kid: String
+    pub algorithm: String
+    pub material: Bytes
+
+# the keys an issuer publishes. `parse` builds one from a jwks document;
+# `Cache` keeps one fetched and current.
+pub struct KeySet:
+    pub keys: List[Key]
+
+# ---------------------------------------------------------------
+# der
+# ---------------------------------------------------------------
+
+# a der length: the short form under 128, otherwise a byte count followed by
+# the big-endian length. every length this module writes fits in two bytes,
+# but the loop is general because a wrong length is a silent wire bug.
+fn der_length(into: ByteBuffer, length: Int):
+    if length < 128:
+        into.write_byte(length) catch 0
+        return
+    mut width := 0
+    mut probe := length
+    while probe > 0:
+        width = width + 1
+        probe = probe / 256
+    into.write_byte(128 + width) catch 0
+    mut shift := width - 1
+    while shift >= 0:
+        into.write_byte((length / pow_256(shift)) % 256) catch 0
+        shift = shift - 1
+
+fn pow_256(exponent: Int) -> Int:
+    mut out := 1
+    mut i := 0
+    while i < exponent:
+        out = out * 256
+        i = i + 1
+    return out
+
+# one der INTEGER holding a big-endian unsigned value. der wants the shortest
+# form, so leading zero bytes go; and a leading bit of 1 would read as
+# negative, so a zero byte goes back in front of it.
+fn der_unsigned_integer(value: Bytes) -> Bytes:
+    mut start := 0
+    while start + 1 < value.len() and value[start] == 0:
+        start = start + 1
+    body := value.slice(start, value.len())
+    pad := body[0] >= 128
+
+    out := bytes.buffer_with_capacity(body.len() + 6)
+    defer out.free()
+    out.write_byte(2) catch 0
+    if pad:
+        der_length(out, body.len() + 1)
+        out.write_byte(0) catch 0
+    else:
+        der_length(out, body.len())
+    out.write(body) catch 0
+    return out.bytes()
+
+# SEQUENCE { INTEGER modulus, INTEGER publicExponent } — the pkcs#1
+# rsapublickey der, which is what `jwt.verify_rs256` and `verify_ps256` take.
+fn rsa_public_key_der(modulus: Bytes, exponent: Bytes) -> Bytes:
+    body := der_unsigned_integer(modulus).concat(der_unsigned_integer(exponent))
+    out := bytes.buffer_with_capacity(body.len() + 6)
+    defer out.free()
+    out.write_byte(48) catch 0
+    der_length(out, body.len())
+    out.write(body) catch 0
+    return out.bytes()
+
+# ---------------------------------------------------------------
+# parsing
+# ---------------------------------------------------------------
+
+fn decode_member(node: Int, name: String, kid: String) -> Bytes!:
+    text := json.object_get_string(node, name)
+    if text.len() == 0:
+        fail "jwks key '" + kid + "' has no " + name
+    decoded := encoding.b64_url_raw_decode(text)
+    if decoded.is_err:
+        fail "jwks key '" + kid + "' has a " + name + " that is not base64url"
+    return decoded.ok
+
+# left-pad to a fixed width. rfc 7518 says a coordinate is written at the
+# curve's full length, but a leading zero byte trimmed somewhere upstream is
+# common enough that padding it back is worth more than refusing.
+fn padded(value: Bytes, width: Int) -> Bytes!:
+    if value.len() == width:
+        return value
+    if value.len() > width:
+        fail "jwks key coordinate is longer than " + width.to_string() + " bytes"
+    out := bytes.buffer_with_capacity(width)
+    defer out.free()
+    mut i := value.len()
+    while i < width:
+        out.write_byte(0) catch 0
+        i = i + 1
+    out.write(value) catch 0
+    return out.bytes()
+
+# which algorithm a key verifies. the jwk's own `alg` decides when it states
+# one — and is checked against the key type, because a document that says
+# `kty: RSA, alg: ES256` is describing something that cannot exist — and
+# otherwise the key type and curve decide.
+fn algorithm_for(kty: String, crv: String, stated: String, kid: String) -> String!:
+    if kty == "RSA":
+        if stated.len() == 0 or stated == jwt.RS256:
+            return jwt.RS256
+        if stated == jwt.PS256:
+            return jwt.PS256
+        fail "jwks key '" + kid + "' is an rsa key claiming " + stated
+    if kty == "EC":
+        if crv != "P-256":
+            fail "jwks key '" + kid + "' uses the unsupported curve " + crv
+        if stated.len() > 0 and stated != jwt.ES256:
+            return fail_alg(kid, stated)!
+        return jwt.ES256
+    if kty == "OKP":
+        if crv != "Ed25519":
+            fail "jwks key '" + kid + "' uses the unsupported curve " + crv
+        if stated.len() > 0 and stated != jwt.EDDSA:
+            return fail_alg(kid, stated)!
+        return jwt.EDDSA
+    if kty == "oct":
+        # the whole point of a published key set is that holding it lets you
+        # verify and not sign. a symmetric key in one hands every reader the
+        # ability to mint tokens, which is algorithm confusion delivered as a
+        # document rather than as a re-signed header.
+        fail "jwks key '" + kid + "' is symmetric; a key set is public, and a shared secret in one lets anyone who reads it sign"
+    fail "jwks key '" + kid + "' has the unsupported key type " + kty
+
+fn fail_alg(kid: String, stated: String) -> String!:
+    fail "jwks key '" + kid + "' claims the algorithm " + stated + ", which its key type does not verify"
+
+fn read_key(node: Int) -> Key!:
+    kid := json.object_get_string(node, "kid")
+    kty := json.object_get_string(node, "kty")
+    crv := json.object_get_string(node, "crv")
+    algorithm := algorithm_for(kty, crv, json.object_get_string(node, "alg"), kid)!
+
+    if algorithm == jwt.RS256 or algorithm == jwt.PS256:
+        modulus := decode_member(node, "n", kid)!
+        if modulus.len() < MIN_MODULUS_BYTES or modulus.len() > MAX_MODULUS_BYTES:
+            fail "jwks key '" + kid + "' has a modulus of " + modulus.len().to_string() + " bytes, outside what this verifier accepts"
+        exponent := decode_member(node, "e", kid)!
+        if exponent.len() == 0 or exponent.len() > MAX_EXPONENT_BYTES:
+            fail "jwks key '" + kid + "' has an out-of-range exponent"
+        return Key(kid, algorithm, rsa_public_key_der(modulus, exponent))
+    if algorithm == jwt.ES256:
+        x := padded(decode_member(node, "x", kid)!, P256_COORDINATE_LEN)!
+        y := padded(decode_member(node, "y", kid)!, P256_COORDINATE_LEN)!
+        return Key(kid, algorithm, bytes.from_string_utf8(chr(4)).concat(x).concat(y))
+    ed := decode_member(node, "x", kid)!
+    if ed.len() != ED25519_KEY_LEN:
+        fail "jwks key '" + kid + "' is not a " + ED25519_KEY_LEN.to_string() + " byte ed25519 key"
+    return Key(kid, algorithm, ed)
+
+# read a jwks document. keys this module cannot verify with are skipped
+# rather than fatal — an issuer publishing one RSA key and one key for an
+# algorithm we do not implement is publishing a set we can still use — but a
+# key that is malformed for the type it claims fails the whole parse, since a
+# document nobody can read is a configuration error rather than a rotation.
+#
+# a key marked `use: enc` is skipped: it is published for encryption, and
+# verifying a signature with it is a category error however well the bytes
+# happen to line up.
+pub fn parse(document: String) -> KeySet!:
+    if document.len() == 0 or document.len() > MAX_DOCUMENT_BYTES:
+        fail "a jwks document is empty or longer than " + MAX_DOCUMENT_BYTES.to_string() + " bytes"
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+
+    root := json.parse(document)
+    if json.type_of(root) != "object":
+        fail "a jwks document is a json object"
+    array := json.object_get(root, "keys")
+    if json.type_of(array) != "array":
+        fail "a jwks document has a keys array"
+    count := json.array_len(array)
+    if count > MAX_KEYS:
+        fail "a jwks document with more than " + MAX_KEYS.to_string() + " keys is refused"
+
+    mut out: List[Key] := []
+    mut i := 0
+    while i < count:
+        node := json.array_get(array, i)
+        i = i + 1
+        if json.type_of(node) != "object":
+            fail "a jwks key is a json object"
+        use := json.object_get_string(node, "use")
+        if use.len() > 0 and use != "sig":
+            continue
+        kty := json.object_get_string(node, "kty")
+        if kty != "RSA" and kty != "EC" and kty != "OKP" and kty != "oct":
+            continue
+        out.push(read_key(node)!)
+    if out.len() == 0:
+        fail "a jwks document with no key this verifier can use is refused"
+    return KeySet(out)
+
+# the `kid` in a token's header, or "" when it names none. this is the only
+# thing the header is read for: it picks which key to try, and the algorithm
+# still comes from that key.
+fn token_kid(token: String) -> String:
+    cut := token.index_of(".")
+    if cut <= 0:
+        return ""
+    decoded := encoding.b64_url_raw_decode(token.substring(0, cut))
+    if decoded.is_err:
+        return ""
+    text := decoded.ok.to_string_utf8() catch ""
+    if text.len() == 0:
+        return ""
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    node := json.parse(text)
+    if json.type_of(node) != "object":
+        return ""
+    return json.object_get_string(node, "kid")
+
+fn verify_with(key: Key, token: String, options: jwt.Options) -> jwt.Verified!:
+    # each branch names its own algorithm, so the token's `alg` header is
+    # compared against what the key says rather than choosing the path.
+    if key.algorithm == jwt.RS256:
+        return jwt.verify_rs256(token, key.material, options)!
+    if key.algorithm == jwt.PS256:
+        return jwt.verify_ps256(token, key.material, options)!
+    if key.algorithm == jwt.ES256:
+        return jwt.verify_es256(token, key.material, options)!
+    return jwt.verify_eddsa(token, key.material, options)!
+
+impl KeySet:
+    # the key with this `kid`. an empty `kid` matches nothing, so a caller
+    # asking for one always means it.
+    fn key(kid: String) -> Key!:
+        if kid.len() == 0:
+            fail "a jwks lookup needs a kid"
+        for candidate in self.keys:
+            if candidate.kid == kid:
+                return candidate
+        fail "this key set holds no key with kid '" + kid + "'"
+
+    # true when this set holds a key by that name.
+    fn has(kid: String) -> Bool:
+        return self.key(kid).is_ok
+
+    # verify `token` against this set. when the token names a `kid` the key
+    # with that name is the only one tried, and a token naming one the set
+    # does not hold is refused rather than quietly checked against the
+    # others. a token with no `kid` is tried against every key, which is what
+    # a single-key issuer needs and what a rotating one is not supposed to
+    # leave you doing.
+    fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
+        kid := token_kid(token)
+        if kid.len() > 0:
+            return verify_with(self.key(kid)!, token, options)!
+        # a set with one key is the common case, and there the reason it
+        # refused — expired, wrong algorithm, bad signature — is the answer
+        # the caller wants. with several keys there is no single reason, so
+        # the message says only what is actually known.
+        if self.keys.len() == 1:
+            return verify_with(self.keys[0], token, options)!
+        for candidate in self.keys:
+            attempt := verify_with(candidate, token, options)
+            if attempt.is_ok:
+                return attempt.ok
+        fail "no key in this set verifies the token"
+
+# ---------------------------------------------------------------
+# the cache
+# ---------------------------------------------------------------
+#
+# the document text is what is cached, and it is parsed per use. a key set is
+# a handful of keys and the parse is a small json read; keeping the text
+# rather than the parsed keys means the shared table holds nothing but
+# strings and integers, which is one fewer thing to get wrong about who owns
+# what across tasks.
+
+mut jwks_mu := Mutex()
+mut next_cache_handle := 1
+mut cached_document: Map[Int, String] := {}
+mut cached_at: Map[Int, Int] := {}
+mut refreshed_at: Map[Int, Int] := {}
+
+# a key set fetched from `url` and kept for a while. build one at startup and
+# share it: every verify goes through the same cached document, so an issuer
+# is asked for its keys once an hour rather than once a request.
+pub struct Cache:
+    handle: Int
+    url_v: String
+    ttl_v: Int
+    timeout_v: Int
+    max_bytes_v: Int
+    cooldown_v: Int
+
+# a cache over the key set published at `url`. https is what an issuer
+# publishes over and what you want: the document is the root of trust for
+# every token you accept, and over plain http anyone on the path can replace
+# it with keys of their own. http is allowed for a key set served by a
+# sidecar on the loopback interface, and for nothing else.
+pub fn cache(jwks_url: String) -> Cache:
+    jwks_mu.lock()
+    handle := next_cache_handle
+    next_cache_handle = next_cache_handle + 1
+    jwks_mu.unlock()
+    return Cache(handle, jwks_url, DEFAULT_TTL, DEFAULT_TIMEOUT_MS, MAX_DOCUMENT_BYTES, DEFAULT_REFRESH_COOLDOWN)
+
+impl Cache:
+    # how long a fetched document is used before it is fetched again, in
+    # seconds. one hour by default.
+    fn ttl(seconds: Int) -> Cache:
+        return Cache(self.handle, self.url_v, seconds, self.timeout_v, self.max_bytes_v, self.cooldown_v)
+
+    # how long the fetch may take, in milliseconds. it runs on the request
+    # path the first time, so this is a bound on how long one caller waits
+    # for an issuer that has stopped answering.
+    fn timeout_ms(ms: Int) -> Cache:
+        return Cache(self.handle, self.url_v, self.ttl_v, ms, self.max_bytes_v, self.cooldown_v)
+
+    # the largest document that will be accepted, in bytes.
+    fn max_bytes(limit: Int) -> Cache:
+        return Cache(self.handle, self.url_v, self.ttl_v, self.timeout_v, limit, self.cooldown_v)
+
+    # the shortest gap between two refetches forced by an unknown kid, in
+    # seconds. a minute by default: long enough that a flood of invented
+    # kids cannot be turned into a flood of requests at the issuer, short
+    # enough that a real rotation is picked up while people are still
+    # complaining about it.
+    fn refresh_cooldown(seconds: Int) -> Cache:
+        return Cache(self.handle, self.url_v, self.ttl_v, self.timeout_v, self.max_bytes_v, seconds)
+
+    # the current key set, fetching it if there is none or the ttl has passed.
+    fn keys() -> KeySet!:
+        return parse(self.document(false)!)!
+
+    # fetch now, whatever the ttl says, and return what came back. reach for
+    # it when something outside told you the issuer rotated.
+    fn refresh() -> KeySet!:
+        return parse(self.document(true)!)!
+
+    # verify `token` against the published key set. a token naming a `kid`
+    # the cached set does not hold is worth one refetch — that is what a key
+    # rotation looks like from here — but no more than one per cooldown, so
+    # a stream of invented `kid`s becomes a stream of refusals rather than a
+    # stream of requests at the issuer.
+    fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
+        set := self.keys()!
+        kid := token_kid(token)
+        if kid.len() == 0 or set.has(kid):
+            return set.verify(token, options)!
+        if not self.may_refresh():
+            fail "this key set holds no key with kid '" + kid + "'"
+        return self.refresh()!.verify(token, options)!
+
+    # whether a kid we have never seen may force a fetch right now. taking
+    # the stamp and deciding under one lock is what keeps a burst of unknown
+    # kids to one fetch between them.
+    fn may_refresh() -> Bool:
+        jwks_mu.lock()
+        now := time.unix()
+        mut allowed := true
+        if refreshed_at.contains_key(self.handle) and now - refreshed_at[self.handle] < self.cooldown_v:
+            allowed = false
+        if allowed:
+            refreshed_at.insert(self.handle, now)
+        jwks_mu.unlock()
+        return allowed
+
+    # the cached document, fetching when it is missing, stale, or `force`.
+    # the lock is taken to read the cache and again to write it, and is never
+    # held across the fetch — a parked task holding this would stall every
+    # other verify in the process behind one slow issuer.
+    fn document(force: Bool) -> String!:
+        jwks_mu.lock()
+        now := time.unix()
+        mut held := ""
+        if not force and cached_document.contains_key(self.handle) and now - cached_at[self.handle] < self.ttl_v:
+            held = cached_document[self.handle]
+        jwks_mu.unlock()
+        if held.len() > 0:
+            return held
+
+        fetched := fetch(self.url_v, self.timeout_v, self.max_bytes_v)!
+        jwks_mu.lock()
+        cached_document.insert(self.handle, fetched)
+        cached_at.insert(self.handle, time.unix())
+        jwks_mu.unlock()
+        return fetched
+
+fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
+    target := url.parse(jwks_url)
+    if target.host.len() == 0:
+        fail "a jwks url needs a host: " + jwks_url
+    path := target.path
+    mut request_path := path
+    if request_path.len() == 0:
+        request_path = "/"
+    if target.query.len() > 0:
+        request_path = request_path + "?" + target.query
+
+    resp := send_jwks_request(target, request_path, wait_ms)!
+    if resp.status != 200:
+        fail "the jwks endpoint answered " + resp.status.to_string()
+    body := resp.body_bytes()
+    if body.len() > limit:
+        fail "the jwks endpoint answered with " + body.len().to_string() + " bytes, over the " + limit.to_string() + " byte cap"
+    text := body.to_string_utf8()
+    if text.is_err:
+        fail "the jwks endpoint answered with something that is not utf-8"
+    return text.ok
+
+fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> http.HttpResponse!:
+    if target.scheme == "https":
+        port := target.port
+        if port <= 0:
+            return http.https_request("GET", target.host, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
+        return http.https_request_port("GET", target.host, port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
+    if target.scheme != "http":
+        fail "a jwks url must be https, or http for a loopback sidecar: " + target.scheme
+    port := target.port
+    mut plain_port := port
+    if plain_port <= 0:
+        plain_port = 80
+    return http.get_request(target.host, plain_port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send()!
+
+# --- tests ---
+#
+# the keys and tokens below came from somewhere else. the rsa key is the
+# certificate `tests/live/fixtures/localhost.crt` carries and the token was
+# signed with its private half by openssl; the p-256 key and token are rfc
+# 7515 appendix a.3 verbatim; the ed25519 key and token are the ones
+# `tests/cases/test_jwt_asymmetric.pith` already verifies against openssl. a
+# jwks parser that only round trips against a document this module wrote
+# would prove nothing about reading anyone else's.
+
+RSA_N := "y8gaB-C0ItZMg182JOG1dYHcSS-0p-scpYAe5WdcATwoBkzNRhustmc91ICOPSnhUVRJTpXAArXX7n_fVPKsWzvcwjkySl-qZzDCPMu61fPwRUPtKSpLQTpG_ZzMSoBKkDK-I111da0amlz8PyLHNlK8aZempRxWGLl_bDx8MIeSrZqkECS8j0YcESEOUaXM2mo-oD6JxRN_C0PWpj9SXCYErsVGXjWvHDK89bPCbbHMpUUuJchGrcz9Bm_eB2uIEyNwYAJ70vT6VtLPvI7vPLa6OMDnsVb0Dpx2AdflqBBtG7LlJLxsCazfzllO4H47-BsCN_SzJty2aRXurw5RDQ"
+RSA_E := "AQAB"
+
+# what `openssl rsa -RSAPublicKey_out -outform DER` writes for that key,
+# byte for byte. the token below already proves the der parses; this proves
+# the encoder agrees with an outside one about the length forms and the sign
+# padding, which is where a hand-rolled der goes wrong quietly.
+RSA_PKCS1_DER := "3082010a0282010100cbc81a07e0b422d64c835f3624e1b57581dc492fb4a7eb1ca5801ee5675c013c28064ccd461bacb6673dd4808e3d29e15154494e95c002b5d7ee7fdf54f2ac5b3bdcc239324a5faa6730c23ccbbad5f3f04543ed292a4b413a46fd9ccc4a804a9032be235d7575ad1a9a5cfc3f22c73652bc6997a6a51c5618b97f6c3c7c308792ad9aa41024bc8f461c11210e51a5ccda6a3ea03e89c5137f0b43d6a63f525c2604aec5465e35af1c32bcf5b3c26db1cca5452e25c846adccfd066fde076b8813237060027bd2f4fa56d2cfbc8eef3cb6ba38c0e7b156f40e9c7601d7e5a8106d1bb2e524bc6c09acdfce594ee07e3bf81b0237f4b326dcb66915eeaf0e510d0203010001"
+
+RS256_TOKEN := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N1ZXIiLCJzdWIiOiJ1LTQyIiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.PUnc4hVzxTmUdMsqUeg1cOiFjNal3YkpWIin1I9So4W6rhCpJWINCG1nuxmkk-DknncDj6YmJQlvsp_bnyZ7AVd_XTI1JPQPublSn5g1IdkmsSincob7rOhcYePFtpvkHP8v7YsMIT3OZOWnW3V4S4gXXXso8gRB1ZXiOLyfPjEK9oGA6DJO2xSkq2gpAmYtHJTYgwtaZkrpOBr55DTuemllumPylCj1rhaRUMEHDLE21s-FCBtiVxIiQWwNTBBvShF_XIgg33PoM_thCrnxPL6_SS8lq4Kr-5BnzXxLYZyajTusyc9jhhaN7SSoORJKI7z5Z0wkukDUr2ksYP_7hQ"
+
+# rfc 7515 appendix a.3: an ES256 token and the p-256 public key as the two
+# jwk coordinates the rfc prints.
+ES256_TOKEN := "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"
+ES256_X := "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"
+ES256_Y := "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+
+EDDSA_TOKEN := "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJleHRlcm5hbC1pc3N1ZXIiLCJzdWIiOiJ1LTQyIiwiYXVkIjoiY2hhdCIsImV4cCI6MTkwMDAwMDAwMH0.lCrCeRMDoOAJWgCygsdIgpg9c2lWHIOaZfTCf786EC7nHZzduYXvp-rF55-IVZfXTYd7wG-f1ScWXBKTgz_NDA"
+EDDSA_X := "GrNm5rFt9_W11D9DZrmZz2LZtwAUOWILIWnlW1RSD9w"
+
+# the rsa and ed25519 tokens expire in 2030 and the rfc one expired in 2011,
+# so each is validated at an instant it was good at.
+INSTANT := 1800000000
+RFC7515_INSTANT := 1300819000
+
+# json in a pith string literal needs doubled braces, since a single one
+# starts an interpolation.
+fn rsa_document(kid: String) -> String:
+    return "{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"" + kid + "\",\"n\":\"" + RSA_N + "\",\"e\":\"" + RSA_E + "\"}}]}}"
+
+fn es256_document() -> String:
+    return "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"ec-1\",\"x\":\"" + ES256_X + "\",\"y\":\"" + ES256_Y + "\"}}]}}"
+
+fn eddsa_document() -> String:
+    return "{{\"keys\":[{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ed-1\",\"x\":\"" + EDDSA_X + "\"}}]}}"
+
+fn at(instant: Int) -> jwt.Options:
+    return jwt.at_time(jwt.default_options(), instant)
+
+test "an rsa jwk becomes the pkcs#1 der openssl writes":
+    set := parse(rsa_document("rsa-1"))!
+
+    assert_eq(set.keys.len(), 1)
+    assert_eq(set.keys[0].algorithm, jwt.RS256)
+    assert_eq(set.keys[0].kid, "rsa-1")
+    assert_eq(encoding.to_hex(set.keys[0].material), RSA_PKCS1_DER)
+
+test "a token signed elsewhere verifies against the published key":
+    # the token names no kid, and the set holds one key.
+    assert_eq(parse(rsa_document("rsa-1"))!.verify(RS256_TOKEN, at(INSTANT))!.subject(), "u-42")
+    assert_eq(parse(es256_document())!.verify(ES256_TOKEN, at(RFC7515_INSTANT))!.claim("iss"), "joe")
+    assert_eq(parse(eddsa_document())!.verify(EDDSA_TOKEN, at(INSTANT))!.subject(), "u-42")
+
+test "an ec jwk becomes the uncompressed point, and an okp jwk the raw key":
+    ec := parse(es256_document())!.keys[0]
+    assert_eq(ec.algorithm, jwt.ES256)
+    assert_eq(ec.material.len(), 1 + P256_COORDINATE_LEN * 2)
+    assert_eq(ec.material[0], 4)
+
+    ed := parse(eddsa_document())!.keys[0]
+    assert_eq(ed.algorithm, jwt.EDDSA)
+    assert_eq(ed.material.len(), ED25519_KEY_LEN)
+
+test "the registered claims are still checked":
+    set := parse(rsa_document("rsa-1"))!
+    assert(set.verify(RS256_TOKEN, jwt.with_issuer(at(INSTANT), "external-issuer")).is_ok)
+    assert(set.verify(RS256_TOKEN, jwt.with_issuer(at(INSTANT), "somebody-else")).is_err)
+    assert(set.verify(RS256_TOKEN, jwt.with_audience(at(INSTANT), "chat")).is_ok)
+    assert(set.verify(RS256_TOKEN, jwt.with_audience(at(INSTANT), "billing")).is_err)
+    # a decade on it has expired, and nothing about coming from a key set
+    # changes that.
+    assert(set.verify(RS256_TOKEN, at(2100000000)).is_err)
+
+test "a token names which key by kid, and an unknown one is refused":
+    document := "{{\"keys\":[" + es256_key("ec-1") + "," + es256_key("ec-2") + "]}}"
+    set := parse(document)!
+
+    assert_eq(set.keys.len(), 2)
+    assert(set.has("ec-1"))
+    assert(not set.has("ec-9"))
+    assert(set.key("ec-9").is_err)
+    # the rfc token carries no kid, so it is tried against both and the one
+    # that verifies wins.
+    assert(set.verify(ES256_TOKEN, at(RFC7515_INSTANT)).is_ok)
+
+    # the same token with a kid the set does not hold is refused without
+    # falling back to the keys it does hold.
+    kidded := with_kid(ES256_TOKEN, "ec-9")
+    assert(set.verify(kidded, at(RFC7515_INSTANT)).is_err)
+
+fn es256_key(kid: String) -> String:
+    return "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"" + kid + "\",\"x\":\"" + ES256_X + "\",\"y\":\"" + ES256_Y + "\"}}"
+
+# rewrite a token's header to name `kid`. the signature no longer covers the
+# header, so such a token can never verify — which is the point when the test
+# is about selection failing before verification is reached.
+fn with_kid(token: String, kid: String) -> String:
+    rest := token.substring(token.index_of("."), token.len())
+    header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"ES256\",\"kid\":\"" + kid + "\"}}"))
+    return header + rest
+
+test "a symmetric key in a key set is refused":
+    # the attack: publish the hmac secret as a key, or talk an issuer into
+    # doing it, and every reader of the set can sign as the issuer.
+    secret := encoding.b64_url_raw_encode(bytes.from_string_utf8("a shared secret nobody else knows"))
+    document := "{{\"keys\":[{{\"kty\":\"oct\",\"kid\":\"hs-1\",\"k\":\"" + secret + "\"}}]}}"
+    refused := parse(document)
+    assert(refused.is_err)
+    assert(refused.err.contains("symmetric"))
+
+test "the algorithm comes from the key, not from the token":
+    set := parse(rsa_document("rsa-1"))!
+    # an HS256 token whose hmac secret is the rsa modulus, which is public.
+    # a verifier that dispatched on the header would reach for hmac and this
+    # would be a valid token; the key says RS256, so it never gets there.
+    forged := jwt.sign_hs256("{{\"sub\":\"admin\"}}", set.keys[0].material)!
+    attempt := set.verify(forged, jwt.without_time_checks(jwt.default_options()))
+    assert(attempt.is_err)
+    assert(attempt.err.contains("HS256"))
+
+test "a jwk that claims an algorithm its key type cannot verify is refused":
+    mismatched := "{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"rsa-1\",\"alg\":\"ES256\",\"n\":\"" + RSA_N + "\",\"e\":\"" + RSA_E + "\"}}]}}"
+    assert(parse(mismatched).is_err)
+    ec_as_eddsa := "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"ec-1\",\"alg\":\"EdDSA\",\"x\":\"" + ES256_X + "\",\"y\":\"" + ES256_Y + "\"}}]}}"
+    assert(parse(ec_as_eddsa).is_err)
+
+test "an rsa key may state PS256 and is then verified as PS256":
+    document := "{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"rsa-1\",\"alg\":\"PS256\",\"n\":\"" + RSA_N + "\",\"e\":\"" + RSA_E + "\"}}]}}"
+    set := parse(document)!
+
+    assert_eq(set.keys[0].algorithm, jwt.PS256)
+    # the token is an RS256 one, so the PS256 key refuses it on the header
+    # rather than trying an rsa-pss verification against a pkcs#1 signature.
+    attempt := set.verify(RS256_TOKEN, at(INSTANT))
+    assert(attempt.is_err)
+    assert(attempt.err.contains("RS256"))
+
+test "a key published for encryption is not used for signatures":
+    document := "{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"enc-1\",\"use\":\"enc\",\"n\":\"" + RSA_N + "\",\"e\":\"" + RSA_E + "\"}}," + es256_key("ec-1") + "]}}"
+    set := parse(document)!
+
+    assert_eq(set.keys.len(), 1)
+    assert_eq(set.keys[0].kid, "ec-1")
+
+test "a key of a type this verifier does not implement is skipped, not fatal":
+    document := "{{\"keys\":[{{\"kty\":\"XYZ\",\"kid\":\"future\"}}," + es256_key("ec-1") + "]}}"
+    set := parse(document)!
+
+    assert_eq(set.keys.len(), 1)
+    assert_eq(set.keys[0].kid, "ec-1")
+
+test "malformed documents fail cleanly":
+    assert(parse("").is_err)
+    assert(parse("not json").is_err)
+    assert(parse("{{\"keys\":\"nope\"}}").is_err)
+    assert(parse("{{\"keys\":[]}}").is_err)
+    assert(parse("[1,2,3]").is_err)
+    # an rsa key with no modulus, and one whose modulus is not base64url.
+    assert(parse("{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"a\",\"e\":\"AQAB\"}}]}}").is_err)
+    assert(parse("{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"a\",\"n\":\"!!!\",\"e\":\"AQAB\"}}]}}").is_err)
+    # a modulus far too short to be an rsa key.
+    tiny := encoding.b64_url_raw_encode(bytes.from_string_utf8("short"))
+    assert(parse("{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"a\",\"n\":\"" + tiny + "\",\"e\":\"AQAB\"}}]}}").is_err)
+    # an ed25519 key that is not 32 bytes.
+    assert(parse("{{\"keys\":[{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"a\",\"x\":\"" + tiny + "\"}}]}}").is_err)
+    # a curve this module does not implement.
+    assert(parse("{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-521\",\"kid\":\"a\",\"x\":\"" + ES256_X + "\",\"y\":\"" + ES256_Y + "\"}}]}}").is_err)
+
+test "a document with too many keys is refused before they are read":
+    mut document := "{{\"keys\":["
+    mut i := 0
+    while i <= MAX_KEYS:
+        if i > 0:
+            document = document + ","
+        document = document + es256_key("ec-" + i.to_string())
+        i = i + 1
+    assert(parse(document + "]}}").is_err)
+
+test "a cache url must be https, or http on a port we can reach":
+    # nothing is fetched here; the scheme is checked before a socket is opened.
+    assert(cache("ftp://issuer.test/jwks.json").keys().is_err)
+    assert(cache("not a url").keys().is_err)

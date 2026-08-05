@@ -1,0 +1,41 @@
+# character-aware text handling with std.text.
+#
+# a String is utf-8 bytes, so `len()` and `substring()` count and cut bytes.
+# that is fine until the text leaves ascii. std.text is the layer that counts
+# and cuts characters instead.
+
+import std.text as text
+
+fn main():
+    name := "Ärger"
+
+    # bytes and characters are not the same number
+    print("bytes:      {name.len()}")
+    print("characters: {text.char_count(name)}")
+
+    # cutting by character keeps the text intact. the byte-indexed version of
+    # this -- name.substring(0, 1) -- would split "Ä" in half, and now aborts
+    # rather than handing back a string that is no longer valid utf-8.
+    print("first char: {text.truncate(name, 1)}")
+    print("valid:      {text.is_valid(text.truncate(name, 1))}")
+
+    # a byte budget, for a column or header limit, backs off to a boundary
+    print("<=3 bytes:  {text.truncate_bytes(name, 3)}")
+
+    # walking the characters
+    mut shown := ""
+    for piece in text.chars("héllo"):
+        shown = shown + "[" + piece + "]"
+    print("chars:      {shown}")
+
+    # code points, for when you need the numbers
+    print("code points: {text.code_points("A€")}")
+
+    # marking a cut for a reader
+    print("cut:        {text.truncate_with("a long message here", 10, "...")}")
+
+    # bytes from somewhere you do not control may not be text at all.
+    # sanitize() makes them safe to store or log.
+    broken := "ok" + chr(255)
+    print("valid:      {text.is_valid(broken)}")
+    print("sanitized:  {text.sanitize(broken)}")

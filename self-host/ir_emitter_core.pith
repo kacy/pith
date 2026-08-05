@@ -1058,7 +1058,7 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
 # loop iteration's zero-stored previous value hands in.
 fn ir_emit_tuple_cascade_helpers():
     for sig in ir_tuple_cascade_sigs:
-        ok_kind := ir_tuple_dtor_code_kind(sig.substring(0, 1))
+        ok_kind := ir_tuple_dtor_code_kind(sig[0])
         err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
         ir_emit_func_header(ir_tuple_cascade_helper_name(sig), 1, "void")
         ir_emit("param p")
@@ -3715,7 +3715,7 @@ fn ir_tuple_dtor_name(sig: String) -> String:
 fn ir_tuple_sig_has_rc(sig: String) -> Bool:
     mut i := 0
     while i < sig.len():
-        if sig.substring(i, i + 1) != "0":
+        if sig[i] != "0":
             return true
         i = i + 1
     return false
@@ -7528,7 +7528,7 @@ fn ir_emit_tuple_dtors():
         ir_emit("load " + pr.to_string() + " p")
         mut i := 0
         while i < sig.len():
-            kind := ir_tuple_dtor_code_kind(sig.substring(i, i + 1))
+            kind := ir_tuple_dtor_code_kind(sig[i])
             if kind.len() > 0:
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())

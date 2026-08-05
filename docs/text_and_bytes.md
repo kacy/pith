@@ -8,6 +8,11 @@ that means most code should stay in one of two lanes:
 
 cross the boundary explicitly when you need to.
 
+`std.strings` works in bytes, which is the same thing as characters only while
+the text is ascii. when the text is not — a name, a chat message, anything a
+user typed — counting, slicing and truncating belong in `std.text`. see
+[unicode.md](unicode.md).
+
 ## text helpers
 
 `std.strings` already had the lower-level pieces like `split_lines`,

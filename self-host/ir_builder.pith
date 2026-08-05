@@ -29,7 +29,7 @@ fn ir_push_line(items: List[String], value: String) -> List[String]:
 fn ir_strip_quotes(s: String) -> String:
     mut result := s
     if result.len() >= 2:
-        if result.substring(0, 1) == chr(34):
+        if result[0] == chr(34):
             result = result.substring(1, result.len())
         if result.len() > 0 and result.substring(result.len() - 1, result.len()) == chr(34):
             # a final quote is only a delimiter when it is not itself escaped.
@@ -38,7 +38,7 @@ fn ir_strip_quotes(s: String) -> String:
             # orphan the backslash and corrupt the literal.
             mut backslashes := 0
             mut j := result.len() - 2
-            while j >= 0 and result.substring(j, j + 1) == chr(92):
+            while j >= 0 and result[j] == chr(92):
                 backslashes = backslashes + 1
                 j = j - 1
             if backslashes % 2 == 0:

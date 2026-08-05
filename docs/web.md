@@ -245,6 +245,79 @@ fn handle_me(req: web.Request) -> http.HttpResponse:
 `examples/web_auth.pith` runs this exact shape end to end — login, group
 guard, and the requests a bad token gets back.
 
+## cors
+
+a browser will not let page javascript on one origin read a response from
+another unless the server says it may. `std.web.cors` is the middleware that
+says so, and the preflight handler that answers the `OPTIONS` request the
+browser sends first.
+
+```pith
+import std.web.cors as cors
+
+policy := cors.origins(["https://app.example.com"]).max_age(600)
+app := web.new().use_mw(cors.middleware(policy)).get("/api/items", list_items)
+```
+
+there are three constructors, and which one you pick is the whole security
+decision:
+
+- `cors.any_origin()` — answers `Access-Control-Allow-Origin: *`. the policy
+  for a public, read-only api. no credentials.
+- `cors.origins(list)` — an explicit allowlist, compared whole: scheme, host
+  and port. `https://app.example.com` does not match a subdomain of itself,
+  a different port, or the same host over http. no credentials.
+- `cors.credentialed_origins(list)` — the same allowlist, and the browser may
+  attach the user's cookies. every origin on the list can act as the signed-in
+  user, so keep it short.
+
+the classic cors hole is to reflect whatever `Origin` arrived back in
+`Access-Control-Allow-Origin` and send `Access-Control-Allow-Credentials:
+true` next to it, which tells every site on the internet that it may read this
+one's responses with the user's session attached. that cannot be written here:
+credentials come only from `credentialed_origins`, which has no wildcard, and
+`any_origin` has no credential switch. they are separate constructors rather
+than two builder methods so there is no way to combine them by accident. an
+entry of `"*"` in a credentialed list is compared literally, so it matches an
+origin spelled exactly `*`, which no browser sends — it allows nothing.
+
+the builder narrows the rest:
+
+- `.methods(names)` — what a preflight may ask for. defaults to `GET`, `HEAD`,
+  `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`
+- `.headers(names)` — which request headers a preflight may ask for. defaults
+  to `Content-Type` and `Authorization`
+- `.expose(names)` — which response headers page javascript is allowed to read
+- `.max_age(seconds)` — how long the browser may cache the preflight answer
+
+register it outermost, before any guard that can answer 401, so a rejected
+request still carries the headers that let the browser read the rejection —
+otherwise a plain 401 shows up in the console as a cors error and sends
+whoever is debugging it looking in the wrong place.
+
+what happens to a request from an origin that is not allowed depends on which
+one it is. a preflight is refused with 403: it exists only to ask permission,
+and the answer is no. a real request still runs — the server has no standing
+to refuse it, and the same request without an `Origin` header would be served
+— but the response carries no `Access-Control-Allow-Origin`, so the browser
+withholds the body from the page. that is the same-origin policy working as
+designed.
+
+`examples/web_cors.pith` runs the whole thing: a real request from an allowed
+origin and from somewhere else, the preflight for each, and the headers that
+come back.
+
+### OPTIONS
+
+`use_mw` middleware only wraps a route the router matched, and a preflight
+arrives as `OPTIONS` on a path registered for `GET` or `POST` — so before cors
+existed those requests fell straight through to a 404 with no middleware in
+sight. `std.web` now answers an `OPTIONS` request to any path some route
+claims with `204` and an `Allow` header listing that path's methods, and runs
+it through the middleware chain like any other request. cors middleware
+intercepts the preflight ones; the rest get the honest `Allow` answer. an
+`OPTIONS` to a path no route claims is still a 404.
+
 ## observability
 
 a server built with `web.new()` is observable out of the box. every route is wrapped
@@ -397,8 +470,10 @@ becomes of a stream that would otherwise never end.
 
 `examples/web_hello.pith` is a complete, self-checking server: it defines a couple of
 routes, spawns the server, makes a few requests against itself, and prints the
-replies. `examples/web_observability.pith` does the same and then scrapes `/metrics` to
-show the request counter the framework kept on its own. `examples/web_h2.pith` serves
+replies. `examples/web_cors.pith` puts a cors policy in front of an api and drives it
+from two origins, one allowed and one not. `examples/web_observability.pith` does the
+same and then scrapes `/metrics` to show the request counter the framework kept on its
+own. `examples/web_h2.pith` serves
 the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.
 `bench/web_hello.pith` is the same idea as a real blocking server, wired up for
 `bench/http_bench.sh`. `examples/graceful_shutdown.pith` serves, signals itself,

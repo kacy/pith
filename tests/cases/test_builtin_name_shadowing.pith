@@ -1,0 +1,46 @@
+# a user function may share a builtin's name, and neither may capture the other.
+#
+# three of the consumer's inline fast paths matched on the bare name and jumped
+# past name resolution, so a user function called `byte_at` or `bytes_get` was
+# bypassed and its arguments handed to the builtin instead. that is silent:
+# `byte_at(Reader, 1)` read a byte out of the struct's own memory and returned
+# it — an out-of-bounds read with a different offset, which is the segfault this
+# was first reported as.
+#
+# the fast paths now decline when the name is user-declared, and the emitter
+# names its own lowering of `ord(s[i])` by the runtime symbol rather than the
+# short key, so the fix cannot capture the builtin in the other direction —
+# which the first attempt at it did, silently turning every `ord(s[i])` in the
+# tree into a call to the user's function.
+
+struct Reader:
+    data: String
+
+fn byte_at(s: String, i: Int) -> Int:
+    return 42
+
+fn bytes_get(b: Bytes, i: Int) -> Int:
+    return 7
+
+fn bytes_read_word(b: Bytes, at: Int, width: Int) -> Int:
+    return 5
+
+# the shape that read out of bounds: the builtin would treat the struct handle
+# as a string and index into it
+fn reader_byte(r: Reader, i: Int) -> Int:
+    return r.data.len() + i
+
+fn main() -> Int!:
+    # the user's definitions win
+    print("user byte_at:        {byte_at("abc", 0)}")
+    print("user bytes_get:      {bytes_get(bytes_from_string_utf8("abc"), 0)}")
+    print("user bytes_read_word:{bytes_read_word(bytes_from_string_utf8("abcd"), 0, 2)}")
+    print("struct receiver:     {reader_byte(Reader("abc"), 1)}")
+
+    # and the builtins they shadow still work through their own syntax
+    s := "abc"
+    print("ord(s[0]):           {ord(s[0])}")
+    print("ord(s[2]):           {ord(s[2])}")
+    b := bytes_from_string_utf8("xyz")
+    print("bytes index b[1]:    {b[1]}")
+    return 0

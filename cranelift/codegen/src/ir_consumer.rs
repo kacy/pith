@@ -1892,6 +1892,20 @@ fn compile_ir_function(
                             args.push(get_reg(&regs, parts[j + arg_start])?);
                         }
                     }
+                    // the inline fast paths below stand in for a builtin, and
+                    // each one `continue`s before the name is resolved. so a
+                    // user-defined function -- or a local holding a closure --
+                    // that happens to share a builtin's short name would be
+                    // bypassed entirely and its arguments handed to the builtin
+                    // instead. that is silent: `fn byte_at(r: Reader, i: Int)`
+                    // was reading a byte out of the struct's own memory.
+                    //
+                    // the bit-operation path below already guarded against this;
+                    // the rest did not. the user's definition always wins, and
+                    // the fast path only applies to the builtin it replaces.
+                    let name_is_shadowed =
+                        declared_funcs.contains_key(fname) || named_vars.contains_key(fname);
+
                     // a call to a verified bit wrapper (or to a bit builtin
                     // directly) is one native instruction. a local variable
                     // shadowing the name keeps its call, same as below.
@@ -1938,7 +1952,7 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
-                    if fname == "bytes_get" && args.len() == 2 {
+                    if fname == "bytes_get" && args.len() == 2 && !name_is_shadowed {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
@@ -1947,7 +1961,7 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
-                    if fname == "bytes_read_word" && args.len() == 3 {
+                    if fname == "bytes_read_word" && args.len() == 3 && !name_is_shadowed {
                         let fallback = runtime_func_ref(
                             codegen,
                             &mut builder,
@@ -1973,7 +1987,10 @@ fn compile_ir_function(
                     // path (header read instead of an FFI call per character),
                     // falling back to the runtime helper for literals. these
                     // names are emitted only for strings (bytes use bytes_get).
-                    if fname == "byte_at" && args.len() == 2 {
+                    if (fname == "byte_at" || fname == "pith_cstring_byte_at")
+                        && args.len() == 2
+                        && !name_is_shadowed
+                    {
                         let fallback = runtime_func_ref(
                             codegen,
                             &mut builder,

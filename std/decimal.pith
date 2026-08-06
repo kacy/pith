@@ -169,26 +169,31 @@ pub fn parse(text: String) -> Decimal!:
         fail "decimal: cannot parse an empty string"
     mut index := 0
     mut negative := false
-    if text[0] == "-":
+    # `ord(text[i])` compiles to a byte load, where comparing against a
+    # one-character string allocates one per character. that difference is most
+    # of what it costs to parse a short number, and this runs once per NUMERIC
+    # column a query returns.
+    lead := ord(text[0])
+    if lead == 45:
         negative = true
         index = 1
-    elif text[0] == "+":
+    elif lead == 43:
         index = 1
 
     integer_start := index
     while index < text.len():
-        if not is_ascii_digit(text[index]):
+        if not is_digit_code(ord(text[index])):
             break
         index = index + 1
     integer_end := index
 
     mut fraction_start := index
     mut fraction_end := index
-    if index < text.len() and text[index] == ".":
+    if index < text.len() and ord(text[index]) == 46:
         index = index + 1
         fraction_start = index
         while index < text.len():
-            if not is_ascii_digit(text[index]):
+            if not is_digit_code(ord(text[index])):
                 break
             index = index + 1
         fraction_end = index
@@ -200,17 +205,17 @@ pub fn parse(text: String) -> Decimal!:
         fail "decimal: '{digit_count}' digits exceeds the maximum of {DECIMAL_MAX_DIGITS}"
 
     mut exponent := 0
-    if index < text.len() and (text[index] == "e" or text[index] == "E"):
+    if index < text.len() and (ord(text[index]) == 101 or ord(text[index]) == 69):
         index = index + 1
         mut exponent_negative := false
-        if index < text.len() and text[index] == "-":
+        if index < text.len() and ord(text[index]) == 45:
             exponent_negative = true
             index = index + 1
-        elif index < text.len() and text[index] == "+":
+        elif index < text.len() and ord(text[index]) == 43:
             index = index + 1
         exponent_start := index
         while index < text.len():
-            if not is_ascii_digit(text[index]):
+            if not is_digit_code(ord(text[index])):
                 break
             index = index + 1
         if index == exponent_start:
@@ -224,7 +229,15 @@ pub fn parse(text: String) -> Decimal!:
     if index != text.len():
         fail "decimal: '{text}' is not a decimal number"
 
-    digits := text.substring(integer_start, integer_end) + text.substring(fraction_start, fraction_end)
+    # skip the join when the number has only one of the two parts, which most
+    # of them do.
+    mut digits := ""
+    if fraction_end == fraction_start:
+        digits = text.substring(integer_start, integer_end)
+    elif integer_end == integer_start:
+        digits = text.substring(fraction_start, fraction_end)
+    else:
+        digits = text.substring(integer_start, integer_end) + text.substring(fraction_start, fraction_end)
     mut unscaled := bigint.parse(digits)!
     if negative:
         unscaled = bigint.negate(unscaled)
@@ -568,8 +581,9 @@ fn check_scale(scale: Int) -> Bool!:
         fail "decimal: scale {scale} exceeds the maximum of {DECIMAL_MAX_SCALE}"
     return true
 
-fn is_ascii_digit(character: String) -> Bool:
-    code := ord(character)
+# true for the character code of an ascii digit. taking the code rather than a
+# one-character String is what lets the caller's `ord(text[i])` stay a byte load.
+fn is_digit_code(code: Int) -> Bool:
     return code >= 48 and code <= 57
 
 # does the dropped remainder push the magnitude one step further from zero?

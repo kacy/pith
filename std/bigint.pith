@@ -122,19 +122,27 @@ pub fn parse(text: String) -> BigInt!:
         fail "bigint: cannot parse an empty string"
     mut start := 0
     mut sign := 1
-    first := text[0]
-    if first == "-":
+    # `ord(text[i])` compiles to a byte load; comparing against the character
+    # codes rather than one-character strings keeps the scan from allocating a
+    # String per digit, which is the whole cost of parsing a short number.
+    first := ord(text[0])
+    if first == 45:
         sign = -1
         start = 1
-    elif first == "+":
+    elif first == 43:
         start = 1
     if start >= text.len():
         fail "bigint: '{text}' has a sign but no digits"
     mut index := start
     while index < text.len():
-        if not is_ascii_digit(text[index]):
+        code := ord(text[index])
+        if code < 48 or code > 57:
             fail "bigint: '{text}' is not a decimal integer"
         index = index + 1
+    if start == 0:
+        # the overwhelmingly common shape, and slicing it would copy the string
+        # for nothing.
+        return from_digits(sign, text)
     return from_digits(sign, text.substring(start, text.len()))
 
 # --- inspection ---
@@ -713,19 +721,17 @@ fn divmod_limbs(dividend: List[Int], divisor: List[Int]) -> LimbPair:
 
 # --- internals: text and small helpers ---
 
-fn is_ascii_digit(character: String) -> Bool:
-    code := ord(character)
-    return code >= 48 and code <= 57
-
 # build a value from a validated run of decimal digits, regrouping from the
 # right so every chunk is one limb.
 fn from_digits(sign: Int, digits: String) -> BigInt:
     mut begin := 0
     while begin < digits.len() - 1:
-        if digits[begin] != "0":
+        if ord(digits[begin]) != 48:
             break
         begin = begin + 1
-    body := digits.substring(begin, digits.len())
+    mut body := digits
+    if begin > 0:
+        body = digits.substring(begin, digits.len())
     if body == "0":
         return zero()
     mut raw: List[Int] := []

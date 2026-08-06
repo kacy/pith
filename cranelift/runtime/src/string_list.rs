@@ -20,8 +20,91 @@ pub unsafe extern "C" fn pith_args() -> PithList {
     list
 }
 
+/// Report whether a byte offset lands strictly inside a well-formed multi-byte
+/// utf-8 character.
+///
+/// The test deliberately requires the surrounding bytes to *decode*, not merely
+/// to look like a continuation. A String is a byte string, and code that keeps
+/// binary data in one is entitled to slice it wherever it likes; only text gets
+/// a character boundary. Requiring a valid sequence means this answers "this cut
+/// would corrupt a character that was really there" rather than "this byte has
+/// the high bits of a continuation".
+fn splits_a_character(bytes: &[u8], index: usize) -> bool {
+    if index == 0 || index >= bytes.len() {
+        return false;
+    }
+    if (bytes[index] & 0xC0) != 0x80 {
+        return false;
+    }
+
+    // walk back to the byte that could have started this sequence. a utf-8
+    // character is at most 4 bytes, so this stops after at most 3 steps.
+    let mut lead = index;
+    while lead > 0 && (bytes[lead] & 0xC0) == 0x80 && index - lead < 3 {
+        lead -= 1;
+    }
+
+    let width = match bytes[lead] {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        // not a lead byte: these bytes are not a character, so there is
+        // nothing here to split.
+        _ => return false,
+    };
+
+    if lead + width > bytes.len() {
+        return false;
+    }
+    if std::str::from_utf8(&bytes[lead..lead + width]).is_err() {
+        return false;
+    }
+    index < lead + width
+}
+
+/// Abort with a diagnostic naming the cut that would have corrupted a
+/// character.
+fn report_split(bytes: &[u8], index: usize, start: i64, end: i64) -> ! {
+    let mut lead = index;
+    while lead > 0 && (bytes[lead] & 0xC0) == 0x80 {
+        lead -= 1;
+    }
+    let width = match bytes[lead] {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    };
+    let character = std::str::from_utf8(&bytes[lead..lead + width])
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    eprintln!(
+        "pith runtime error: substring({}, {}) would split the character '{}' \
+         at byte {} (it occupies bytes {}..{})",
+        start,
+        end,
+        character,
+        index,
+        lead,
+        lead + width
+    );
+    eprintln!(
+        "  a String is indexed in bytes, so a byte offset can land inside a \
+         multi-byte character. use std.text for character-aware work:"
+    );
+    eprintln!("    text.slice(s, a, b)         slice by character index");
+    eprintln!("    text.truncate(s, n)         keep n characters");
+    eprintln!("    text.truncate_bytes(s, n)   keep n bytes, ending on a boundary");
+    std::process::exit(1);
+}
+
 /// Extract substring from C string (start inclusive, end exclusive)
 /// Returns newly allocated C string
+///
+/// Aborts when either bound would cut a well-formed utf-8 character in half.
+/// That cut used to succeed and hand back a string that no longer round-trips
+/// through utf-8, which is silent corruption of user text; failing loudly
+/// matches `pith_cstring_char_at_strict` and the other strict accessors.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
@@ -32,15 +115,21 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
     };
 
     let len = bytes.len() as i64;
-    let start = start.max(0).min(len) as usize;
-    let end = end.max(start as i64).min(len) as usize;
-    let sub_len = end - start;
+    let lo = start.max(0).min(len) as usize;
+    let hi = end.max(lo as i64).min(len) as usize;
 
-    if sub_len == 0 {
+    if splits_a_character(bytes, lo) {
+        report_split(bytes, lo, start, end);
+    }
+    if splits_a_character(bytes, hi) {
+        report_split(bytes, hi, start, end);
+    }
+
+    if hi - lo == 0 {
         return crate::pith_cstring_empty();
     }
 
-    crate::pith_copy_bytes_to_cstring(&bytes[start..end])
+    crate::pith_copy_bytes_to_cstring(&bytes[lo..hi])
 }
 
 /// Split a string by delimiter and return as a PithList of strings

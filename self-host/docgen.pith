@@ -51,9 +51,7 @@ fn trim_whitespace(s: String) -> String:
 
 # check if a string starts with a prefix.
 fn string_starts_with(s: String, prefix: String) -> Bool:
-    if s.len() < prefix.len():
-        return false
-    return s.substring(0, prefix.len()) == prefix
+    return matches_at(s, 0, prefix)
 
 # convert a character to lowercase.
 fn char_to_lowercase(ch: String) -> String:
@@ -61,6 +59,23 @@ fn char_to_lowercase(ch: String) -> String:
     if c >= 65 and c <= 90:
         return chr(c + 32)
     return ch
+
+# does `needle` appear at this byte offset in `s`?
+#
+# compares bytes rather than slicing out a window. a window taken at an
+# arbitrary offset can start or end inside a multi-byte character, and asking
+# for that slice is asking to cut a character in half -- which is exactly what
+# these scans were doing every time they stepped past a space before an em
+# dash. comparing bytes gives the same answer without the cut.
+fn matches_at(s: String, pos: Int, needle: String) -> Bool:
+    if pos < 0 or pos + needle.len() > s.len():
+        return false
+    mut k := 0
+    while k < needle.len():
+        if ord(s[pos + k]) != ord(needle[k]):
+            return false
+        k = k + 1
+    return true
 
 # case-insensitive substring search.
 fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
@@ -78,7 +93,7 @@ fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
     # scan for match
     mut j := 0
     while j + lower_n.len() <= lower_h.len():
-        if lower_h.substring(j, j + lower_n.len()) == lower_n:
+        if matches_at(lower_h, j, lower_n):
             return true
         j = j + 1
     return false
@@ -195,16 +210,16 @@ fn find_doc_separator(s: String) -> Int:
     mut j := 0
     while j < s.len():
         if s[j] == " ":
-            if j + 3 <= s.len() and s.substring(j, j + 3) == " - ":
+            if matches_at(s, j, " - "):
                 return j
-            if j + 5 <= s.len() and s.substring(j + 1, j + 4) == emdash:
+            if j + 5 <= s.len() and matches_at(s, j + 1, emdash):
                 return j
         j = j + 1
     return 0 - 1
 
 # return the byte length of the separator at position pos.
 fn get_separator_length(s: String, pos: Int) -> Int:
-    if pos + 3 <= s.len() and s.substring(pos, pos + 3) == " - ":
+    if matches_at(s, pos, " - "):
         return 3
     return 5
 

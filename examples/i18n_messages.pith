@@ -1,0 +1,54 @@
+# answering in the reader's language, with the right plural form.
+#
+# english has two plural forms, so code grows an "if count == 1" and every
+# other language is wrong. polish needs four and picks between them on the
+# last two digits; japanese has one form for everything. std.intl carries
+# CLDR's rules so the code does not have to guess.
+
+import std.intl as intl
+
+fn show_counts(messages: intl.Catalog, locale: String):
+    empty: Map[String, String] := {}
+    mut line := locale + ":"
+    for n in [0, 1, 2, 5, 22, 25]:
+        line = line + "  " + intl.plural(messages, locale, "files", n, empty)
+    print(line)
+
+fn main():
+    messages := intl.catalog("en")
+
+    # "{{count}}" in pith source is a literal "{count}"
+    intl.add_plural(messages, "en", "files", "one", "{{count}} file")
+    intl.add_plural(messages, "en", "files", "other", "{{count}} files")
+
+    intl.add_plural(messages, "pl", "files", "one", "{{count}} plik")
+    intl.add_plural(messages, "pl", "files", "few", "{{count}} pliki")
+    intl.add_plural(messages, "pl", "files", "many", "{{count}} plików")
+
+    intl.add_plural(messages, "ja", "files", "other", "{{count}} 件")
+
+    show_counts(messages, "en")
+    show_counts(messages, "pl")
+    show_counts(messages, "ja")
+
+    # the categories behind those choices
+    print("")
+    print("polish categories: 1=" + intl.plural_category("pl", 1) + " 2=" + intl.plural_category("pl", 2) + " 5=" + intl.plural_category("pl", 5) + " 22=" + intl.plural_category("pl", 22))
+    print("arabic categories: 0=" + intl.plural_category("ar", 0) + " 1=" + intl.plural_category("ar", 1) + " 2=" + intl.plural_category("ar", 2) + " 3=" + intl.plural_category("ar", 3))
+
+    # picking a locale for a request
+    print("")
+    intl.add(messages, "en", "greeting", "Hello, {{name}}")
+    intl.add(messages, "de", "greeting", "Hallo, {{name}}")
+
+    mut who: Map[String, String] := {}
+    who.insert("name", "Ärger")
+
+    wanted := intl.parse_accept_language("da, de;q=0.9, en;q=0.8")
+    print("accept-language order: {wanted}")
+    chosen := intl.best_match(wanted, ["en", "de"]).unwrap_or("en")
+    print("serving: " + chosen)
+    print(intl.message(messages, chosen, "greeting", who))
+
+    # a locale nobody translated falls back to the catalog default
+    print(intl.message(messages, "fr", "greeting", who))

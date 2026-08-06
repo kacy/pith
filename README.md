@@ -156,7 +156,9 @@ compression and archives (gzip/zlib in pure pith, zstd on the reference codec, t
 text (regex, scanner, fmt, html, template — escaping untrusted values into a
 page, and templates that escape by default, see
 [docs/html.md](docs/html.md), plus std.text for character-aware utf-8 work,
-see [docs/unicode.md](docs/unicode.md)), app plumbing (log, metrics, cli, env, testing,
+see [docs/unicode.md](docs/unicode.md)), internationalization (locales,
+message catalogs and cldr plural rules, see [docs/i18n.md](docs/i18n.md)),
+app plumbing (log, metrics, cli, env, testing,
 diagnostic, time, datetime, rand, uuid, math), resilience (retry with
 backoff, rate limiting, circuit breaking — shared by the web middleware and
 the protocol clients, see [docs/resilience.md](docs/resilience.md)),

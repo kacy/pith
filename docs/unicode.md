@@ -255,10 +255,10 @@ touched by a program that does not call into these functions.
 
 ## what is not here
 
-`std.text` carries no locale. tags, message catalogs, plural rules, and
-locale-aware number and date formatting belong in `std.intl`, which builds on
-this module. `std.text` never depends on `std.intl`, so a program that only
-needs correct text does not pull in locale data.
+`std.text` carries no locale. tags, message catalogs and plural rules belong
+in `std.intl` — see [i18n.md](i18n.md) — which builds on this module.
+`std.text` never depends on `std.intl`, so a program that only needs correct
+text does not pull in locale data.
 
 also not implemented, deliberately: full and special case mapping (`ß` → `SS`,
 turkish dotted and dotless i), NFD/NFKC/NFKD, word and sentence segmentation,

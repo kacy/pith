@@ -21,8 +21,14 @@
 # a query returns a plain List[std.sql.Row]. that keeps the result a builtin
 # collection (which crosses the driver/caller module boundary cleanly) while
 # still giving iteration, len, and indexing for free; each row carries the typed
-# accessors from std.sql (int/text/float/bool, opt_ variants, by name or index),
-# so they read the same whichever driver you picked.
+# accessors from std.sql (int/text/float/decimal/bool, opt_ variants, by name or
+# index), so they read the same whichever driver you picked.
+#
+# a NUMERIC or DECIMAL column reads with `row.decimal(name)` and comes back
+# exact — every digit and every trailing zero the database stored. never read
+# one with `row.float`: a Float cannot hold most decimal fractions, so a balance
+# would arrive quietly wrong. bind one back with `decimal.to_string(amount)`.
+# see docs/numbers.md.
 
 import std.sql as sql
 

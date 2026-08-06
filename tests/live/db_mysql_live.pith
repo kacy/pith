@@ -5,6 +5,14 @@
 
 import std.mysql as mysql
 import std.sql as sql
+import std.decimal as decimal
+
+# run a statement that returns no rows through a prepared execute, which is the
+# only exec surface std.mysql exposes.
+fn run(conn: mysql.Conn, text: String) -> Bool!:
+    stmt := mysql.prepare(conn, text)!
+    mysql.exec_prepared(conn, stmt, [])!
+    return true
 
 fn open_or_skip() -> mysql.Conn:
     attempt := mysql.connect("127.0.0.1", 3306, "pith", "pith_pw", "pithtest")
@@ -49,3 +57,29 @@ test "a query against a missing table surfaces the server error":
     result := mysql.query(conn, "select 1 from no_such_table_pith_xyz")
     conn.close()
     assert(result.is_err)
+
+test "a decimal column round-trips through the wire without losing a digit":
+    conn := open_or_skip()
+    mut got: List[String] := []
+    for row in mysql.query(conn, "select cast('12345678901234567.89' as decimal(30,2)) as balance, cast('1.10' as decimal(10,2)) as price")!:
+        got.push(decimal.to_string(row.decimal("balance")))
+        got.push(decimal.to_string(row.decimal("price")))
+    conn.close()
+    assert_eq(got, ["12345678901234567.89", "1.10"])
+
+test "a decimal survives a write and a read back, in both protocols":
+    conn := open_or_skip()
+    run(conn, "drop table if exists pith_numeric_probe")!
+    run(conn, "create table pith_numeric_probe (id int primary key, amount decimal(30,10))")!
+    run(conn, "insert into pith_numeric_probe values (1, '12345678901234567.8900000000'), (2, '-0.0000000001')")!
+    mut text_protocol: List[String] := []
+    for row in mysql.query(conn, "select amount from pith_numeric_probe order by id")!:
+        text_protocol.push(decimal.to_string(row.decimal("amount")))
+    stmt := mysql.prepare(conn, "select amount from pith_numeric_probe order by id")!
+    mut binary_protocol: List[String] := []
+    for row in mysql.query_prepared(conn, stmt, [])!:
+        binary_protocol.push(decimal.to_string(row.decimal("amount")))
+    run(conn, "drop table pith_numeric_probe")!
+    conn.close()
+    assert_eq(text_protocol, ["12345678901234567.8900000000", "-0.0000000001"])
+    assert_eq(binary_protocol, ["12345678901234567.8900000000", "-0.0000000001"])

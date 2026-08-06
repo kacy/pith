@@ -12,6 +12,7 @@
 # text protocol, so values arrive as strings and are decoded by column type.
 
 import std.sql as sql
+import std.decimal as decimal
 import std.bytes as bytes
 import std.bits as bits
 import std.hash as hash
@@ -459,14 +460,37 @@ pub fn query(conn: Conn, text: String) -> Rows!:
         rows.push(sql.row(values, names))
 
 # decode a text value by its mysql column type.
+#
+# a value that does not parse falls back to its raw text rather than to a zero.
+# a fabricated 0 for an amount is a wrong number that nothing downstream can
+# tell from a real one.
 fn decode_value(raw: String, mysql_type: Int) -> sql.Value:
     # tiny, short, long, longlong, int24, year
     if mysql_type == 1 or mysql_type == 2 or mysql_type == 3 or mysql_type == 8 or mysql_type == 9 or mysql_type == 13:
-        return sql.integer(parse_int(raw) catch 0)
-    # float, double, decimal, newdecimal
-    if mysql_type == 4 or mysql_type == 5 or mysql_type == 0 or mysql_type == 246:
-        return sql.real(parse_float(raw) catch 0.0)
+        parsed := parse_int(raw)
+        if parsed.is_err:
+            return sql.text(raw)
+        return sql.integer(parsed.ok)
+    # decimal, newdecimal: exact by definition, so they decode to an exact
+    # Decimal. mysql's DECIMAL is what money columns are declared as, and a
+    # Float would round it on the way in.
+    if mysql_type == 0 or mysql_type == 246:
+        return decode_decimal(raw)
+    # float, double — these genuinely are floats
+    if mysql_type == 4 or mysql_type == 5:
+        parsed := parse_float(raw)
+        if parsed.is_err:
+            return sql.text(raw)
+        return sql.real(parsed.ok)
     return sql.text(raw)
+
+# a DECIMAL column's text as an exact value, or the raw text when it is not a
+# number this driver can hold.
+fn decode_decimal(raw: String) -> sql.Value:
+    decoded := decimal.parse(raw)
+    if decoded.is_err:
+        return sql.text(raw)
+    return sql.numeric(decoded.ok)
 
 # --- prepared statements (binary protocol) ---
 
@@ -562,6 +586,10 @@ fn decode_binary(r: Reader, mysql_type: Int) -> sql.Value!:
         return sql.real(float_from_bits(r.le(8)))
     if mysql_type == 4:
         return sql.real(f32_to_f64(r.le(4)))
+    # the binary protocol sends a decimal as its text form too, so it decodes
+    # exactly the same way as in a text result set rather than as a string.
+    if mysql_type == 0 or mysql_type == 246:
+        return decode_decimal(r.lenenc_str()!)
     return sql.text(r.lenenc_str()!)
 
 # build a COM_STMT_EXECUTE payload, binding every parameter as a string (the
@@ -818,3 +846,16 @@ test "value decode honors mysql types":
     assert_eq(row.as_int(0), 42)
     assert_eq(row.as_text(1), "hi")
     assert_eq(row.as_real(2), 9.5)
+
+test "a decimal column decodes exactly rather than through a float":
+    # type 246 is NEWDECIMAL, what a DECIMAL(20,2) money column reports.
+    row := sql.row([decode_value("12345678901234567.89", 246), decode_value("1.10", 246), decode_value("-0.05", 0)], ["balance", "price", "delta"])
+    assert_eq(decimal.to_string(row.decimal("balance")), "12345678901234567.89")
+    assert_eq(decimal.to_string(row.decimal("price")), "1.10")
+    assert_eq(decimal.to_string(row.decimal("delta")), "-0.05")
+
+test "an unparseable number keeps its text rather than fabricating a zero":
+    row := sql.row([decode_value("nonsense", 3), decode_value("nonsense", 5), decode_value("nonsense", 246)], ["i", "f", "d"])
+    assert_eq(row.as_text(0), "nonsense")
+    assert_eq(row.as_text(1), "nonsense")
+    assert_eq(row.as_text(2), "nonsense")

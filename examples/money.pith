@@ -1,0 +1,126 @@
+# money.pith — a small ledger, run twice: once through Float and once through
+# Decimal, so the difference is visible rather than described.
+#
+# every amount here is one a NUMERIC(20,2) column would hold without complaint.
+#
+# run: pith run examples/money.pith
+
+import std.decimal as decimal
+
+# one posting in the ledger: what it was for and how much it moved.
+struct Entry:
+    memo: String
+    amount: String
+
+fn ledger() -> List[Entry]:
+    return [
+        Entry(memo: "opening balance", amount: "12345678901234567.89"),
+        Entry(memo: "coffee", amount: "-4.55"),
+        Entry(memo: "refund", amount: "4.55"),
+        Entry(memo: "interest", amount: "0.01"),
+]
+
+# --- the float version, which is what most languages give you by default ---
+
+fn float_total(entries: List[Entry]) -> Float:
+    mut total := 0.0
+    for entry in entries:
+        total = total + (parse_float(entry.amount) catch 0.0)
+    return total
+
+# --- the decimal version ---
+
+fn decimal_total(entries: List[Entry]) -> decimal.Decimal!:
+    mut total := decimal.zero()
+    for entry in entries:
+        total = decimal.add(total, decimal.parse(entry.amount)!)
+    return total
+
+# a hundred dimes. exact in decimal; not in binary.
+fn hundred_dimes() -> decimal.Decimal!:
+    dime := decimal.parse("0.10")!
+    mut total := decimal.zero()
+    mut count := 0
+    while count < 100:
+        total = decimal.add(total, dime)
+        count = count + 1
+    return total
+
+fn hundred_dimes_as_float() -> Float:
+    mut total := 0.0
+    mut count := 0
+    while count < 100:
+        total = total + 0.1
+        count = count + 1
+    return total
+
+fn main() -> Int!:
+    entries := ledger()
+
+    print("-- the ledger --")
+    for entry in entries:
+        print("  {entry.amount}  {entry.memo}")
+
+    print("")
+    print("-- totals --")
+    print("  float:   {float_total(entries)}")
+    print("  decimal: {decimal.to_string(decimal_total(entries)!)}")
+
+    # printed at full precision, because the default 15 significant digits are
+    # exactly enough to hide the error.
+    print("")
+    print("-- a hundred dimes --")
+    print("  float:   {fmt_float(hundred_dimes_as_float(), 17)}")
+    print("  decimal: {decimal.to_string(hundred_dimes()!)}")
+
+    # splitting a bill: rounding each share independently loses a cent, so the
+    # leftover minor units are handed out one at a time instead.
+    print("")
+    print("-- splitting 10.00 three ways --")
+    shares := decimal.allocate(decimal.parse("10.00")!, [1, 1, 1])!
+    mut parts: List[String] := []
+    for share in shares:
+        parts.push(decimal.to_string(share))
+    print("  shares: {parts.join(" + ")}")
+    print("  sum:    {decimal.to_string(decimal.sum(shares))}")
+
+    # tax at 8.25%, rounded the way money is rounded.
+    print("")
+    print("-- 8.25% tax on 19.99, rounded to cents --")
+    price := decimal.parse("19.99")!
+    exact := decimal.mul(price, decimal.parse("0.0825")!)
+    print("  exact:     {decimal.to_string(exact)}")
+    print("  to cents:  {decimal.to_string(decimal.rescale(exact, 2, decimal.half_even())!)}")
+    print("  total:     {decimal.to_string(decimal.add(price, decimal.rescale(exact, 2, decimal.half_even())!))}")
+
+    # where the modes differ: an exact midpoint. half_up always goes away from
+    # zero, so a run of midpoints drifts upward; half_even sends each one to the
+    # even neighbour, and the drift cancels out.
+    print("")
+    print("-- rounding an exact midpoint to cents --")
+    print("  value      half_up   half_even")
+    mut exact_total := decimal.zero()
+    mut up_total := decimal.zero()
+    mut even_total := decimal.zero()
+    for text in ["0.125", "0.135", "0.145", "0.155"]:
+        value := decimal.parse(text)!
+        up := decimal.rescale(value, 2, decimal.half_up())!
+        even := decimal.rescale(value, 2, decimal.half_even())!
+        print("  {text}      {decimal.to_string(up)}      {decimal.to_string(even)}")
+        exact_total = decimal.add(exact_total, value)
+        up_total = decimal.add(up_total, up)
+        even_total = decimal.add(even_total, even)
+    print("  summed exactly:   {decimal.to_string(exact_total)}")
+    print("  summed half_up:   {decimal.to_string(up_total)}")
+    print("  summed half_even: {decimal.to_string(even_total)}")
+
+    # a division that does not come out even is an error, not a rounding.
+    print("")
+    print("-- division --")
+    print("  10.00 / 4 exactly: {decimal.to_string(decimal.div_exact(decimal.parse("10.00")!, decimal.from_int(4))!)}")
+    thirds := decimal.div_exact(decimal.parse("10.00")!, decimal.from_int(3))
+    if thirds.is_err:
+        print("  10.00 / 3 exactly: refused, it does not terminate")
+    print("  10.00 / 3 to cents: {decimal.to_string(decimal.div(decimal.parse("10.00")!, decimal.from_int(3), 2, decimal.half_even())!)}")
+
+    return 0

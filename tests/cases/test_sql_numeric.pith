@@ -1,0 +1,64 @@
+# std.sql's Numeric variant end to end: an exact decimal crossing the driver
+# boundary and coming back with every digit.
+#
+# this also pins a compiler behaviour it depends on. `sql.Value.Numeric` carries
+# a struct declared in another module, and an enum variant built from a
+# temporary of such a type used to store it without taking a reference — the
+# payload's own fields were freed underneath it, so a balance read back as
+# garbage. building the values inline below is what exercises that path.
+
+import std.sql as sql
+import std.decimal as decimal
+import std.bigint as bigint
+
+fn ledger_row() -> sql.Row!:
+    names := ["id", "memo", "amount", "rate"]
+    return sql.row([
+        sql.integer(1),
+        sql.text("opening"),
+        sql.numeric(decimal.parse("12345678901234567.89")!),
+        sql.real(0.5),
+], names)
+
+fn churn():
+    # allocate enough to reuse any block a premature free would have handed back
+    mut i := 0
+    while i < 300:
+        junk := decimal.parse("123456789.{i}") catch decimal.zero()
+        i = i + 1
+
+fn main() -> Int!:
+    row := ledger_row()!
+    churn()
+
+    print("amount: {decimal.to_string(row.decimal("amount"))}")
+    print("amount at 2: {decimal.to_string(row.decimal_at(2))}")
+    print("as a float:  {row.float("amount")}")
+    print("as an int:   {row.int("amount")}")
+
+    # an integer column widens into a decimal losslessly; a float column does
+    # not, so it reads as zero rather than pretending.
+    print("id as decimal:   {decimal.to_string(row.decimal("id"))}")
+    print("rate as decimal: {decimal.to_string(row.decimal("rate"))}")
+
+    # a null or missing column is none, never a zero in disguise
+    with_null := sql.row([sql.null_value()], ["amount"])
+    print("null is none:    {with_null.opt_decimal("amount") == none}")
+    print("missing is none: {row.opt_decimal("nope") == none}")
+
+    # summing exact amounts stays exact
+    dime := sql.numeric(decimal.parse("0.10")!)
+    rows := [sql.row([dime], ["a"]), sql.row([dime], ["a"]), sql.row([dime], ["a"])]
+    mut total := decimal.zero()
+    for entry in rows:
+        total = decimal.add(total, entry.decimal("a"))
+    print("three dimes: {decimal.to_string(total)}")
+
+    # the scale survives the round trip, trailing zero and all
+    priced := sql.row([sql.numeric(decimal.parse("1.10")!)], ["price"])
+    print("price: {decimal.to_string(priced.decimal("price"))} scale {decimal.scale_of(priced.decimal("price"))}")
+
+    # and the underlying big integer is reachable
+    unscaled := decimal.unscaled_of(row.decimal("amount"))
+    print("unscaled: {bigint.to_string(unscaled)} digits {bigint.digit_count(unscaled)}")
+    return 0

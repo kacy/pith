@@ -1,0 +1,818 @@
+# std.decimal — exact fixed-point decimal numbers.
+#
+# a Float cannot hold 0.1. it holds the nearest binary fraction, and a hundred
+# of those added together is not 10. that is fine for a physics tick and wrong
+# for money, tax, and anything a person will later reconcile against a
+# statement. this module is the type for those: every value is an exact decimal
+# fraction, and every operation is either exact or refuses to guess.
+#
+#   import std.decimal as decimal
+#
+#   price := decimal.parse("19.99")!
+#   tax := decimal.mul(price, decimal.parse("0.0825")!)
+#   total := decimal.add(price, decimal.rescale(tax, 2, decimal.half_even())!)
+#   print(decimal.to_string(total))     # 21.64
+#
+# ## representation
+#
+# a Decimal is an arbitrary-precision integer and a scale: the value is
+# `unscaled / 10^scale`. this is java's BigDecimal, and it is also exactly what
+# SQL `NUMERIC(p, s)` means, which is why a postgres NUMERIC round-trips
+# through this type without losing a digit or a trailing zero. `1.10` parses to
+# an unscaled 110 at scale 2 and prints back as `1.10`, not `1.1`.
+#
+# the scale is never negative, so `to_string` always writes a plain number and
+# never exponent notation. that is what makes the database round-trip
+# byte-identical.
+#
+# ## there is no conversion from Float
+#
+# on purpose. `new BigDecimal(0.1)` in java gives
+# 0.1000000000000000055511151231257827021181583404541015625, and the shortest
+# alternative — pretending the Float was the decimal it was printed as — hides
+# the error instead of removing it. neither is a conversion worth offering by
+# default. if you genuinely have a Float and want a Decimal, format it
+# yourself and parse the text, so the lossy step is the one you wrote:
+#
+#   approximate := decimal.parse(fmt_float(measurement, 4))!
+#
+# `to_float` goes the other way and is documented as lossy, because printing
+# and plotting are real needs.
+#
+# ## division is the only inexact operation
+#
+# 1/3 has no exact decimal form, so `div` takes the scale and the rounding mode
+# at the call site — there is no default, because a default is how a fraction
+# of a cent goes missing. when you expect the division to come out exactly,
+# `div_exact` computes it and fails if it does not terminate, so an assumption
+# that stops holding shows up as an error rather than a rounding.
+#
+# `half_even` is the mode to reach for with money. it rounds a midpoint to the
+# nearest even digit, so a long run of transactions does not drift upward the
+# way `half_up` does.
+#
+# ## limits
+#
+# the scale is capped, and parsing rejects anything past it rather than letting
+# an exponent in untrusted input turn into an allocation. this is a type for
+# money and measurements, not for computing a constant to a million places.
+
+import std.bigint as bigint
+
+# the largest scale this module will build. 16383 is postgres's own ceiling on
+# a numeric's display scale, which makes it the natural limit for a type whose
+# job is to round-trip one.
+DECIMAL_MAX_SCALE := 16383
+
+# the most digits `parse` will read out of one number, mantissa and expanded
+# exponent together. postgres tops out around 147000, so this leaves room while
+# still bounding what a hostile string can allocate.
+DECIMAL_MAX_DIGITS := 1000000
+
+# an exact decimal number: `unscaled / 10^scale`, with a scale of at least
+# zero. build one with `parse`, `from_int`, or `from_int_scaled` rather than
+# naming the fields.
+pub struct Decimal:
+    unscaled: bigint.BigInt
+    scale: Int
+
+# how a division or a reduction in scale resolves the digits it drops. these
+# are the modes java's RoundingMode offers, minus the ones that only restate
+# another; build one with the constructor functions below.
+pub enum Rounding:
+    Down
+    Up
+    Floor
+    Ceiling
+    HalfUp
+    HalfDown
+    HalfEven
+
+# --- rounding modes ---
+#
+# call these rather than naming the enum variants: they build the value inside
+# std.decimal, which keeps callers in other modules working.
+
+# truncate toward zero, dropping the digits without looking at them.
+pub fn down() -> Rounding:
+    return Rounding.Down
+
+# round away from zero whenever anything is dropped.
+pub fn up() -> Rounding:
+    return Rounding.Up
+
+# round toward negative infinity: down for a positive value, away for a
+# negative one.
+pub fn floor() -> Rounding:
+    return Rounding.Floor
+
+# round toward positive infinity: away for a positive value, down for a
+# negative one.
+pub fn ceiling() -> Rounding:
+    return Rounding.Ceiling
+
+# round to the nearest, with an exact midpoint going away from zero. this is
+# the rounding taught in school, and it biases a long run of midpoints upward.
+pub fn half_up() -> Rounding:
+    return Rounding.HalfUp
+
+# round to the nearest, with an exact midpoint going toward zero.
+pub fn half_down() -> Rounding:
+    return Rounding.HalfDown
+
+# round to the nearest, with an exact midpoint going to whichever neighbour
+# ends in an even digit. this is banker's rounding, and it is the mode to use
+# for money: midpoints go up and down equally often, so a ledger does not
+# drift.
+pub fn half_even() -> Rounding:
+    return Rounding.HalfEven
+
+# --- construction ---
+
+# the value zero, at scale zero.
+pub fn zero() -> Decimal:
+    return Decimal(unscaled: bigint.zero(), scale: 0)
+
+# the whole number `value`, at scale zero. exact for every Int.
+pub fn from_int(value: Int) -> Decimal:
+    return Decimal(unscaled: bigint.from_int(value), scale: 0)
+
+# the value `unscaled / 10^scale` — the natural way to spell an amount already
+# held in minor units, as `from_int_scaled(1999, 2)` is 19.99. fails on a
+# negative scale or one past the maximum.
+pub fn from_int_scaled(unscaled: Int, scale: Int) -> Decimal!:
+    check_scale(scale)!
+    return Decimal(unscaled: bigint.from_int(unscaled), scale: scale)
+
+# the value `unscaled / 10^scale` for an unscaled value too large for an Int.
+# fails on a negative scale or one past the maximum.
+pub fn from_bigint(unscaled: bigint.BigInt, scale: Int) -> Decimal!:
+    check_scale(scale)!
+    return Decimal(unscaled: unscaled, scale: scale)
+
+# parse a decimal number, exactly. the grammar is an optional sign, then digits
+# with an optional decimal point, then an optional `e`/`E` exponent:
+#
+#   42      -7.5      +0.001      1.10      1e10      2.5E-4
+#
+# the scale comes from the text, so `1.10` keeps its trailing zero and prints
+# back unchanged. an exponent is folded into the scale, so `1e10` is the whole
+# number 10000000000 and `2.5E-4` is 0.00025 — `to_string` never writes an
+# exponent back out.
+#
+# `-0` and `-0.0` parse to zero with the sign dropped, which is how postgres
+# stores them too. anything else — an empty string, surrounding whitespace, a
+# bare sign, `NaN`, a second decimal point, an exponent past the scale limit —
+# fails rather than producing a number.
+pub fn parse(text: String) -> Decimal!:
+    if text.len() == 0:
+        fail "decimal: cannot parse an empty string"
+    mut index := 0
+    mut negative := false
+    # `ord(text[i])` compiles to a byte load, where comparing against a
+    # one-character string allocates one per character. that difference is most
+    # of what it costs to parse a short number, and this runs once per NUMERIC
+    # column a query returns.
+    lead := ord(text[0])
+    if lead == 45:
+        negative = true
+        index = 1
+    elif lead == 43:
+        index = 1
+
+    integer_start := index
+    while index < text.len():
+        if not is_digit_code(ord(text[index])):
+            break
+        index = index + 1
+    integer_end := index
+
+    mut fraction_start := index
+    mut fraction_end := index
+    if index < text.len() and ord(text[index]) == 46:
+        index = index + 1
+        fraction_start = index
+        while index < text.len():
+            if not is_digit_code(ord(text[index])):
+                break
+            index = index + 1
+        fraction_end = index
+
+    digit_count := (integer_end - integer_start) + (fraction_end - fraction_start)
+    if digit_count == 0:
+        fail "decimal: '{text}' has no digits"
+    if digit_count > DECIMAL_MAX_DIGITS:
+        fail "decimal: '{digit_count}' digits exceeds the maximum of {DECIMAL_MAX_DIGITS}"
+
+    mut exponent := 0
+    if index < text.len() and (ord(text[index]) == 101 or ord(text[index]) == 69):
+        index = index + 1
+        mut exponent_negative := false
+        if index < text.len() and ord(text[index]) == 45:
+            exponent_negative = true
+            index = index + 1
+        elif index < text.len() and ord(text[index]) == 43:
+            index = index + 1
+        exponent_start := index
+        while index < text.len():
+            if not is_digit_code(ord(text[index])):
+                break
+            index = index + 1
+        if index == exponent_start:
+            fail "decimal: '{text}' has an exponent with no digits"
+        if index - exponent_start > 7:
+            fail "decimal: the exponent in '{text}' is too large"
+        exponent = parse_int(text.substring(exponent_start, index))!
+        if exponent_negative:
+            exponent = 0 - exponent
+
+    if index != text.len():
+        fail "decimal: '{text}' is not a decimal number"
+
+    # skip the join when the number has only one of the two parts, which most
+    # of them do.
+    mut digits := ""
+    if fraction_end == fraction_start:
+        digits = text.substring(integer_start, integer_end)
+    elif integer_end == integer_start:
+        digits = text.substring(fraction_start, fraction_end)
+    else:
+        digits = text.substring(integer_start, integer_end) + text.substring(fraction_start, fraction_end)
+    mut unscaled := bigint.parse(digits)!
+    if negative:
+        unscaled = bigint.negate(unscaled)
+    mut scale := (fraction_end - fraction_start) - exponent
+    if scale < 0:
+        # a positive exponent past the fraction widens the integer instead. the
+        # check comes first so the multiply cannot be the thing that allocates.
+        if digit_count - scale > DECIMAL_MAX_DIGITS:
+            fail "decimal: '{text}' expands past the {DECIMAL_MAX_DIGITS} digit maximum"
+        unscaled = bigint.mul_pow10(unscaled, 0 - scale)
+        scale = 0
+    if scale > DECIMAL_MAX_SCALE:
+        fail "decimal: '{text}' needs a scale of {scale}, past the maximum of {DECIMAL_MAX_SCALE}"
+    return Decimal(unscaled: unscaled, scale: scale)
+
+# --- inspection ---
+
+# the number of digits kept after the decimal point. `1.10` has scale 2 even
+# though the last digit is a zero, which is what makes it print back as `1.10`.
+pub fn scale_of(value: Decimal) -> Int:
+    return value.scale
+
+# the integer the value is `10^scale` times, as a BigInt. together with the
+# scale this is the whole value, and it is how you reach the amount in minor
+# units: rescale to 2 and read the unscaled integer for cents.
+pub fn unscaled_of(value: Decimal) -> bigint.BigInt:
+    return value.unscaled
+
+# -1, 0, or 1 as the value is negative, zero, or positive.
+pub fn sign_of(value: Decimal) -> Int:
+    return bigint.sign_of(value.unscaled)
+
+# true when the value is zero, at any scale. `0.00` is zero.
+pub fn is_zero(value: Decimal) -> Bool:
+    return bigint.is_zero(value.unscaled)
+
+# --- comparison ---
+
+# -1, 0, or 1 as `left` is less than, equal to, or greater than `right`. this
+# compares numbers, not representations: `1.0` and `1.00` compare equal.
+pub fn compare(left: Decimal, right: Decimal) -> Int:
+    if left.scale == right.scale:
+        return bigint.compare(left.unscaled, right.unscaled)
+    target := max(left.scale, right.scale)
+    return bigint.compare(
+        bigint.mul_pow10(left.unscaled, target - left.scale),
+        bigint.mul_pow10(right.unscaled, target - right.scale))
+
+# true when the two values are numerically equal, whatever their scales. to ask
+# the narrower question of whether two values are written the same way, compare
+# their `to_string` or their `scale_of`.
+pub fn equals(left: Decimal, right: Decimal) -> Bool:
+    return compare(left, right) == 0
+
+# whichever of the two is smaller, keeping its own scale.
+pub fn min_of(left: Decimal, right: Decimal) -> Decimal:
+    if compare(left, right) <= 0:
+        return left
+    return right
+
+# whichever of the two is larger, keeping its own scale.
+pub fn max_of(left: Decimal, right: Decimal) -> Decimal:
+    if compare(left, right) >= 0:
+        return left
+    return right
+
+# --- exact arithmetic ---
+
+# the magnitude, keeping the scale.
+pub fn abs(value: Decimal) -> Decimal:
+    return Decimal(unscaled: bigint.abs(value.unscaled), scale: value.scale)
+
+# the value with its sign flipped, keeping the scale.
+pub fn negate(value: Decimal) -> Decimal:
+    return Decimal(unscaled: bigint.negate(value.unscaled), scale: value.scale)
+
+# the sum, exactly. the result takes the wider of the two scales, so no digit
+# of either operand is dropped.
+pub fn add(left: Decimal, right: Decimal) -> Decimal:
+    if left.scale == right.scale:
+        return Decimal(unscaled: bigint.add(left.unscaled, right.unscaled), scale: left.scale)
+    target := max(left.scale, right.scale)
+    return Decimal(
+        unscaled: bigint.add(
+            bigint.mul_pow10(left.unscaled, target - left.scale),
+            bigint.mul_pow10(right.unscaled, target - right.scale)),
+        scale: target)
+
+# the difference, exactly, on the same widening rule as `add`.
+pub fn sub(left: Decimal, right: Decimal) -> Decimal:
+    return add(left, negate(right))
+
+# the product, exactly. a product needs the sum of the two scales to stay
+# exact, so `1.05 * 1.05` is `1.1025` at scale 4 — rescale it afterwards if you
+# want it back at scale 2, and say how it should round.
+pub fn mul(left: Decimal, right: Decimal) -> Decimal:
+    return Decimal(
+        unscaled: bigint.mul(left.unscaled, right.unscaled),
+        scale: left.scale + right.scale)
+
+# the sum of a list of values, exactly. an empty list sums to zero.
+pub fn sum(values: List[Decimal]) -> Decimal:
+    mut total := zero()
+    for value in values:
+        total = add(total, value)
+    return total
+
+# --- scale and rounding ---
+
+# the value at a different scale. widening is exact; narrowing drops digits and
+# resolves them with `mode`, which is also how you round to a number of decimal
+# places. fails on a negative scale or one past the maximum.
+pub fn rescale(value: Decimal, target: Int, mode: Rounding) -> Decimal!:
+    check_scale(target)!
+    if target == value.scale:
+        return value
+    if target > value.scale:
+        return Decimal(unscaled: bigint.mul_pow10(value.unscaled, target - value.scale), scale: target)
+    dropped := value.scale - target
+    parts := bigint.divmod_pow10(value.unscaled, dropped)!
+    mut quotient := parts.quotient
+    if rounds_away(mode, sign_of(value), quotient, parts.remainder, bigint.ten_pow(dropped)!):
+        quotient = step_away(quotient, sign_of(value))
+    return Decimal(unscaled: quotient, scale: target)
+
+# the value at a different scale, with no rounding permitted. widening is
+# always exact; narrowing fails rather than dropping a nonzero digit, which is
+# the check to reach for before storing into a NUMERIC(p, s) column.
+pub fn rescale_exact(value: Decimal, target: Int) -> Decimal!:
+    check_scale(target)!
+    if target >= value.scale:
+        return rescale(value, target, down())!
+    parts := bigint.divmod_pow10(value.unscaled, value.scale - target)!
+    if not bigint.is_zero(parts.remainder):
+        fail "decimal: {to_string(value)} does not fit at scale {target} without rounding"
+    return Decimal(unscaled: parts.quotient, scale: target)
+
+# the same number with the trailing zeros of its fraction removed, so `1.2300`
+# becomes `1.23` and `100.00` becomes `100`. the value does not change; only
+# how it prints does. zero normalizes to scale 0.
+pub fn strip_trailing_zeros(value: Decimal) -> Decimal:
+    if bigint.is_zero(value.unscaled):
+        return zero()
+    if value.scale == 0:
+        return value
+    removable := min(bigint.trailing_zeros(value.unscaled), value.scale)
+    if removable == 0:
+        return value
+    return Decimal(
+        unscaled: bigint.mul_pow10(value.unscaled, 0 - removable),
+        scale: value.scale - removable)
+
+# --- division ---
+
+# `left / right` at exactly `target` decimal places, resolving the digits it
+# cannot keep with `mode`. there is no default for either: a quotient is the
+# one operation here that has to discard something, so the call site says what
+# happens to it. fails on a zero divisor, and on a scale outside the allowed
+# range.
+pub fn div(left: Decimal, right: Decimal, target: Int, mode: Rounding) -> Decimal!:
+    if is_zero(right):
+        fail "decimal: division by zero"
+    check_scale(target)!
+    # left/right at scale `target` is (lu * 10^(rs + target - ls)) / ru, with a
+    # negative shift moving onto the divisor instead so nothing is truncated.
+    shift := right.scale + target - left.scale
+    mut numerator := left.unscaled
+    mut denominator := right.unscaled
+    if shift >= 0:
+        numerator = bigint.mul_pow10(numerator, shift)
+    else:
+        denominator = bigint.mul_pow10(denominator, 0 - shift)
+    parts := bigint.divmod(numerator, denominator)!
+    result_sign := sign_of(left) * sign_of(right)
+    mut quotient := parts.quotient
+    if rounds_away(mode, result_sign, quotient, parts.remainder, denominator):
+        quotient = step_away(quotient, result_sign)
+    return Decimal(unscaled: quotient, scale: target)
+
+# `left / right` computed exactly. fails when the quotient does not terminate —
+# `1 / 3` has no decimal form, so it is an error here rather than a silent
+# rounding. use it wherever you believe a division comes out even, and let it
+# tell you when that stops being true.
+#
+# the result keeps at least as many places as `left` had beyond `right`, so
+# `10.00 / 2` is `5.00` rather than `5`, and no more than it needs, so
+# `1.00 / 8` is `0.125`.
+pub fn div_exact(left: Decimal, right: Decimal) -> Decimal!:
+    if is_zero(right):
+        fail "decimal: division by zero"
+    preferred := max(0, left.scale - right.scale)
+    if is_zero(left):
+        return Decimal(unscaled: bigint.zero(), scale: preferred)
+    # left/right is lu / (ru * 10^(ls - rs)); work on magnitudes and put the
+    # sign back at the end.
+    shift := left.scale - right.scale
+    mut numerator := bigint.abs(left.unscaled)
+    mut denominator := bigint.abs(right.unscaled)
+    if shift >= 0:
+        denominator = bigint.mul_pow10(denominator, shift)
+    else:
+        numerator = bigint.mul_pow10(numerator, 0 - shift)
+
+    # a fraction terminates in base ten exactly when its reduced denominator is
+    # a product of twos and fives. strip those out and whatever is left has to
+    # divide the numerator, or there is no exact answer.
+    mut twos := 0
+    mut fives := 0
+    zeros := bigint.trailing_zeros(denominator)
+    if zeros > 0:
+        # each trailing zero is one two and one five; taking them in bulk keeps
+        # a denominator like 10^4000 from costing four thousand divisions.
+        twos = zeros
+        fives = zeros
+        denominator = bigint.mul_pow10(denominator, 0 - zeros)
+    # each loop below stops once the exponent passes the scale ceiling, so a
+    # denominator like 2^100000 fails on the bound rather than grinding through
+    # a hundred thousand divisions on the way to the same answer.
+    mut stripping := true
+    while stripping:
+        if twos > DECIMAL_MAX_SCALE:
+            fail "decimal: the exact quotient of {to_string(left)} / {to_string(right)} needs a scale past the maximum of {DECIMAL_MAX_SCALE}"
+        if bigint.is_even(denominator):
+            denominator = bigint.divmod_int(denominator, 2)!.quotient
+            twos = twos + 1
+        else:
+            stripping = false
+    stripping = true
+    while stripping:
+        if fives > DECIMAL_MAX_SCALE:
+            fail "decimal: the exact quotient of {to_string(left)} / {to_string(right)} needs a scale past the maximum of {DECIMAL_MAX_SCALE}"
+        parts := bigint.divmod_int(denominator, 5)!
+        if bigint.is_zero(parts.remainder):
+            denominator = parts.quotient
+            fives = fives + 1
+        else:
+            stripping = false
+
+    if not bigint.equals(denominator, bigint.one()):
+        parts := bigint.divmod(numerator, denominator)!
+        if not bigint.is_zero(parts.remainder):
+            fail "decimal: {to_string(left)} / {to_string(right)} does not terminate; use div with an explicit scale and rounding mode"
+        numerator = parts.quotient
+
+    needed := max(twos, fives)
+    if needed > DECIMAL_MAX_SCALE:
+        fail "decimal: the exact quotient needs a scale of {needed}, past the maximum of {DECIMAL_MAX_SCALE}"
+    # 10^needed / (2^twos * 5^fives) is the integer 2^(needed-twos) * 5^(needed-fives).
+    numerator = bigint.mul(numerator, bigint.pow(bigint.from_int(2), needed - twos)!)
+    numerator = bigint.mul(numerator, bigint.pow(bigint.from_int(5), needed - fives)!)
+    if sign_of(left) * sign_of(right) < 0:
+        numerator = bigint.negate(numerator)
+
+    mut result := Decimal(unscaled: numerator, scale: needed)
+    # the cancellation above can leave zeros the answer does not need; trim
+    # them, but never past the scale the operands imply.
+    removable := min(bigint.trailing_zeros(result.unscaled), result.scale - preferred)
+    if removable > 0:
+        result = Decimal(
+            unscaled: bigint.mul_pow10(result.unscaled, 0 - removable),
+            scale: result.scale - removable)
+    if result.scale < preferred:
+        return rescale(result, preferred, down())!
+    return result
+
+# split `total` into parts in the given proportions, losing nothing. the parts
+# sum back to exactly `total` at its own scale: the division's leftover minor
+# units are handed out one at a time to the largest shares first, which is how
+# an invoice splits a bill three ways without a cent going missing. fails on an
+# empty weight list, a negative weight, or weights that are all zero.
+pub fn allocate(total: Decimal, weights: List[Int]) -> List[Decimal]!:
+    if weights.len() == 0:
+        fail "decimal: allocate needs at least one weight"
+    mut divisor := 0
+    for weight in weights:
+        if weight < 0:
+            fail "decimal: allocate needs non-negative weights, got {weight}"
+        divisor = divisor + weight
+    if divisor == 0:
+        fail "decimal: allocate needs at least one nonzero weight"
+    unit := bigint.from_int(1)
+    mut shares: List[Decimal] := []
+    mut handed_out := bigint.zero()
+    for weight in weights:
+        parts := bigint.divmod(bigint.mul(total.unscaled, bigint.from_int(weight)), bigint.from_int(divisor))!
+        shares.push(Decimal(unscaled: parts.quotient, scale: total.scale))
+        handed_out = bigint.add(handed_out, parts.quotient)
+    mut leftover := bigint.sub(total.unscaled, handed_out)
+    mut index := 0
+    while index < shares.len():
+        if bigint.is_zero(leftover):
+            return shares
+        if bigint.sign_of(leftover) > 0:
+            shares[index] = Decimal(unscaled: bigint.add(shares[index].unscaled, unit), scale: total.scale)
+            leftover = bigint.sub(leftover, unit)
+        else:
+            shares[index] = Decimal(unscaled: bigint.sub(shares[index].unscaled, unit), scale: total.scale)
+            leftover = bigint.add(leftover, unit)
+        index = index + 1
+    return shares
+
+# --- conversion ---
+
+# the value written out in full, with the scale's worth of digits after the
+# point and no exponent. a value parsed from a database comes back byte for
+# byte, trailing zeros and all.
+pub fn to_string(value: Decimal) -> String:
+    digits := bigint.to_string(bigint.abs(value.unscaled))
+    mut body := digits
+    if value.scale > 0:
+        if body.len() <= value.scale:
+            body = "0".repeat(value.scale + 1 - body.len()) + body
+        point := body.len() - value.scale
+        body = body.substring(0, point) + "." + body.substring(point, body.len())
+    if bigint.sign_of(value.unscaled) < 0:
+        return "-" + body
+    return body
+
+# the integer part as a machine Int, truncated toward zero, or none when it
+# does not fit in 64 bits. to round rather than truncate, `rescale` to scale 0
+# first and say how.
+pub fn to_int(value: Decimal) -> Int?:
+    return bigint.to_int(bigint.mul_pow10(value.unscaled, 0 - value.scale))
+
+# the integer part as a BigInt, rounded by `mode` rather than truncated.
+pub fn to_bigint(value: Decimal, mode: Rounding) -> bigint.BigInt!:
+    return rescale(value, 0, mode)!.unscaled
+
+# the nearest Float. lossy past 15 significant digits and infinite past a
+# Float's range — for display and estimation, never for a value that has to
+# reconcile.
+pub fn to_float(value: Decimal) -> Float:
+    return parse_float(to_string(value)) catch 0.0
+
+# --- internals ---
+
+fn check_scale(scale: Int) -> Bool!:
+    if scale < 0:
+        fail "decimal: scale must be non-negative, got {scale}"
+    if scale > DECIMAL_MAX_SCALE:
+        fail "decimal: scale {scale} exceeds the maximum of {DECIMAL_MAX_SCALE}"
+    return true
+
+# true for the character code of an ascii digit. taking the code rather than a
+# one-character String is what lets the caller's `ord(text[i])` stay a byte load.
+fn is_digit_code(code: Int) -> Bool:
+    return code >= 48 and code <= 57
+
+# does the dropped remainder push the magnitude one step further from zero?
+# `sign` is the sign of the whole result, which is what floor and ceiling turn
+# on; `quotient` is the kept magnitude, which is what half-even turns on.
+fn rounds_away(mode: Rounding, sign: Int, quotient: bigint.BigInt, remainder: bigint.BigInt, divisor: bigint.BigInt) -> Bool:
+    if bigint.is_zero(remainder):
+        return false
+    doubled := bigint.mul(bigint.abs(remainder), bigint.from_int(2))
+    order := bigint.compare(doubled, bigint.abs(divisor))
+    return match mode:
+        Rounding.Down => false
+        Rounding.Up => true
+        Rounding.Floor => sign < 0
+        Rounding.Ceiling => sign > 0
+        Rounding.HalfUp => order >= 0
+        Rounding.HalfDown => order > 0
+        Rounding.HalfEven => order > 0 or (order == 0 and not bigint.is_even(quotient))
+
+# move the kept magnitude one step away from zero, in the direction the whole
+# result sits — a quotient of zero still rounds to -1 when the value was
+# negative.
+fn step_away(quotient: bigint.BigInt, sign: Int) -> bigint.BigInt:
+    if sign < 0:
+        return bigint.sub(quotient, bigint.one())
+    return bigint.add(quotient, bigint.one())
+
+# --- tests ---
+
+test "parsing keeps the scale the text was written with":
+    assert_eq(to_string(parse("1.10")!), "1.10")
+    assert_eq(to_string(parse("1.1")!), "1.1")
+    assert_eq(to_string(parse("0.00")!), "0.00")
+    assert_eq(to_string(parse("100")!), "100")
+    assert_eq(to_string(parse("-0.001")!), "-0.001")
+    assert_eq(scale_of(parse("1.10")!), 2)
+    assert_eq(scale_of(parse("100")!), 0)
+
+test "parsing accepts signs, leading zeros, and a bare point-led fraction":
+    assert_eq(to_string(parse("+1.5")!), "1.5")
+    assert_eq(to_string(parse("-1.5")!), "-1.5")
+    assert_eq(to_string(parse("007.50")!), "7.50")
+    assert_eq(to_string(parse(".5")!), "0.5")
+    assert_eq(to_string(parse("5.")!), "5")
+
+test "negative zero loses its sign, the way a database stores it":
+    assert_eq(to_string(parse("-0")!), "0")
+    assert_eq(to_string(parse("-0.0")!), "0.0")
+    assert_eq(to_string(parse("-0.00")!), "0.00")
+    assert_eq(sign_of(parse("-0.00")!), 0)
+
+test "an exponent folds into the scale and never comes back out":
+    assert_eq(to_string(parse("1e10")!), "10000000000")
+    assert_eq(to_string(parse("1E+10")!), "10000000000")
+    assert_eq(to_string(parse("2.5E-4")!), "0.00025")
+    assert_eq(to_string(parse("1.5e3")!), "1500")
+    assert_eq(to_string(parse("-1.25e-2")!), "-0.0125")
+    assert_eq(to_string(parse("12345e-3")!), "12.345")
+
+test "parse refuses everything that is not a number":
+    assert(parse("").is_err)
+    assert(parse("-").is_err)
+    assert(parse(".").is_err)
+    assert(parse("+.").is_err)
+    assert(parse(" 1").is_err)
+    assert(parse("1 ").is_err)
+    assert(parse("1.2.3").is_err)
+    assert(parse("1,5").is_err)
+    assert(parse("NaN").is_err)
+    assert(parse("Infinity").is_err)
+    assert(parse("1e").is_err)
+    assert(parse("1e+").is_err)
+    assert(parse("0x10").is_err)
+    assert(parse("1e99999999").is_err)
+    assert(parse("1e-99999").is_err)
+
+test "addition is exact where a float is not":
+    mut total := zero()
+    dime := parse("0.10")!
+    mut count := 0
+    while count < 10:
+        total = add(total, dime)
+        count = count + 1
+    assert_eq(to_string(total), "1.00")
+    assert(equals(total, parse("1")!))
+
+test "mixed scales widen rather than round":
+    assert_eq(to_string(add(parse("1.5")!, parse("2.25")!)), "3.75")
+    assert_eq(to_string(sub(parse("1.5")!, parse("2.25")!)), "-0.75")
+    assert_eq(to_string(add(parse("100")!, parse("0.001")!)), "100.001")
+    assert_eq(to_string(sub(parse("0.001")!, parse("0.001")!)), "0.000")
+
+test "multiplication adds the scales and stays exact":
+    assert_eq(to_string(mul(parse("1.05")!, parse("1.05")!)), "1.1025")
+    assert_eq(to_string(mul(parse("-2.5")!, parse("4")!)), "-10.0")
+    assert_eq(to_string(mul(parse("0.00")!, parse("123.456")!)), "0.00000")
+
+test "comparison reads numbers, not the way they are written":
+    assert(equals(parse("1.0")!, parse("1.00")!))
+    assert(equals(parse("0")!, parse("-0.000")!))
+    assert_eq(compare(parse("1.10")!, parse("1.9")!), -1)
+    assert_eq(compare(parse("-1.10")!, parse("-1.9")!), 1)
+    assert_eq(compare(parse("10")!, parse("9.99999")!), 1)
+    assert_eq(to_string(min_of(parse("1.0")!, parse("0.50")!)), "0.50")
+    assert_eq(to_string(max_of(parse("1.0")!, parse("0.50")!)), "1.0")
+
+test "every rounding mode resolves the exact midpoint its own way":
+    positive := parse("2.5")!
+    negative := parse("-2.5")!
+    assert_eq(to_string(rescale(positive, 0, down())!), "2")
+    assert_eq(to_string(rescale(positive, 0, up())!), "3")
+    assert_eq(to_string(rescale(positive, 0, floor())!), "2")
+    assert_eq(to_string(rescale(positive, 0, ceiling())!), "3")
+    assert_eq(to_string(rescale(positive, 0, half_up())!), "3")
+    assert_eq(to_string(rescale(positive, 0, half_down())!), "2")
+    assert_eq(to_string(rescale(positive, 0, half_even())!), "2")
+    assert_eq(to_string(rescale(negative, 0, down())!), "-2")
+    assert_eq(to_string(rescale(negative, 0, up())!), "-3")
+    assert_eq(to_string(rescale(negative, 0, floor())!), "-3")
+    assert_eq(to_string(rescale(negative, 0, ceiling())!), "-2")
+    assert_eq(to_string(rescale(negative, 0, half_up())!), "-3")
+    assert_eq(to_string(rescale(negative, 0, half_down())!), "-2")
+    assert_eq(to_string(rescale(negative, 0, half_even())!), "-2")
+
+test "half-even picks the even neighbour on either side":
+    assert_eq(to_string(rescale(parse("0.5")!, 0, half_even())!), "0")
+    assert_eq(to_string(rescale(parse("1.5")!, 0, half_even())!), "2")
+    assert_eq(to_string(rescale(parse("2.5")!, 0, half_even())!), "2")
+    assert_eq(to_string(rescale(parse("3.5")!, 0, half_even())!), "4")
+    assert_eq(to_string(rescale(parse("2.675")!, 2, half_even())!), "2.68")
+    assert_eq(to_string(rescale(parse("2.665")!, 2, half_even())!), "2.66")
+
+test "rounding a value below one still moves away from zero":
+    assert_eq(to_string(rescale(parse("0.4")!, 0, up())!), "1")
+    assert_eq(to_string(rescale(parse("-0.4")!, 0, up())!), "-1")
+    assert_eq(to_string(rescale(parse("-0.4")!, 0, floor())!), "-1")
+    assert_eq(to_string(rescale(parse("-0.4")!, 0, ceiling())!), "0")
+    assert_eq(to_string(rescale(parse("0.4")!, 0, ceiling())!), "1")
+
+test "widening a scale is exact and narrowing needs permission":
+    assert_eq(to_string(rescale(parse("1.5")!, 4, down())!), "1.5000")
+    assert_eq(to_string(rescale_exact(parse("1.5")!, 4)!), "1.5000")
+    assert_eq(to_string(rescale_exact(parse("1.500")!, 1)!), "1.5")
+    assert(rescale_exact(parse("1.55")!, 1).is_err)
+    assert(rescale(parse("1.5")!, -1, down()).is_err)
+    assert(rescale(parse("1.5")!, 20000, down()).is_err)
+
+test "stripping trailing zeros changes how a number reads, not what it is":
+    assert_eq(to_string(strip_trailing_zeros(parse("1.2300")!)), "1.23")
+    assert_eq(to_string(strip_trailing_zeros(parse("100.00")!)), "100")
+    assert_eq(to_string(strip_trailing_zeros(parse("0.000")!)), "0")
+    assert_eq(to_string(strip_trailing_zeros(parse("1.0001")!)), "1.0001")
+    assert(equals(strip_trailing_zeros(parse("1.2300")!), parse("1.23")!))
+
+test "division takes its scale and mode at the call site":
+    third := div(parse("1")!, parse("3")!, 5, half_even())!
+    assert_eq(to_string(third), "0.33333")
+    assert_eq(to_string(div(parse("2")!, parse("3")!, 5, half_even())!), "0.66667")
+    assert_eq(to_string(div(parse("2")!, parse("3")!, 5, down())!), "0.66666")
+    assert_eq(to_string(div(parse("-2")!, parse("3")!, 5, floor())!), "-0.66667")
+    assert_eq(to_string(div(parse("-2")!, parse("3")!, 5, ceiling())!), "-0.66666")
+    assert_eq(to_string(div(parse("10.00")!, parse("4")!, 2, half_even())!), "2.50")
+    assert(div(parse("1")!, parse("0.00")!, 2, half_even()).is_err)
+
+test "exact division refuses to round rather than doing it quietly":
+    assert_eq(to_string(div_exact(parse("10.00")!, parse("2")!)!), "5.00")
+    assert_eq(to_string(div_exact(parse("1.00")!, parse("8")!)!), "0.125")
+    assert_eq(to_string(div_exact(parse("1")!, parse("2")!)!), "0.5")
+    assert_eq(to_string(div_exact(parse("-1.5")!, parse("0.5")!)!), "-3")
+    assert_eq(to_string(div_exact(parse("6")!, parse("3")!)!), "2")
+    assert_eq(to_string(div_exact(parse("0.00")!, parse("7")!)!), "0.00")
+    assert(div_exact(parse("1")!, parse("3")!).is_err)
+    assert(div_exact(parse("1")!, parse("7")!).is_err)
+    assert(div_exact(parse("1")!, parse("0")!).is_err)
+
+test "an exact quotient past the scale ceiling fails instead of grinding":
+    # 2^-40000 terminates in decimal, but not within the scale this module
+    # will build, so it is refused rather than computed at length.
+    tiny := from_bigint(bigint.pow(bigint.from_int(2), 40000)!, 0)!
+    assert(div_exact(from_int(1), tiny).is_err)
+    assert_eq(to_string(div_exact(from_int(1), from_int(1024))!), "0.0009765625")
+
+test "allocation splits a total without losing a minor unit":
+    thirds := allocate(parse("10.00")!, [1, 1, 1])!
+    assert_eq(to_string(thirds[0]), "3.34")
+    assert_eq(to_string(thirds[1]), "3.33")
+    assert_eq(to_string(thirds[2]), "3.33")
+    assert_eq(to_string(sum(thirds)), "10.00")
+
+    weighted := allocate(parse("0.05")!, [3, 7])!
+    assert_eq(to_string(weighted[0]), "0.02")
+    assert_eq(to_string(weighted[1]), "0.03")
+    assert_eq(to_string(sum(weighted)), "0.05")
+
+    owed := allocate(parse("-0.05")!, [3, 7])!
+    assert_eq(to_string(sum(owed)), "-0.05")
+
+    assert(allocate(parse("1")!, []).is_err)
+    assert(allocate(parse("1")!, [0, 0]).is_err)
+    assert(allocate(parse("1")!, [1, -1]).is_err)
+
+test "conversions out are explicit about what they lose":
+    assert_eq(to_int(parse("12.9")!).unwrap_or(0), 12)
+    assert_eq(to_int(parse("-12.9")!).unwrap_or(0), -12)
+    assert_eq(to_int(parse("12")!).unwrap_or(0), 12)
+    assert(to_int(parse("1e30")!) == none)
+    assert_eq(bigint.to_string(to_bigint(parse("12.9")!, half_even())!), "13")
+    assert_eq(bigint.to_string(to_bigint(parse("-12.5")!, half_even())!), "-12")
+    assert_eq(to_float(parse("1.5")!), 1.5)
+
+test "values too large for an int keep every digit":
+    huge := parse("123456789012345678901234567890.12345")!
+    assert_eq(to_string(huge), "123456789012345678901234567890.12345")
+    assert_eq(to_string(add(huge, huge)), "246913578024691357802469135780.24690")
+    assert_eq(scale_of(huge), 5)
+
+test "a numeric ledger balance survives what a float would ruin":
+    # the exact value from the feedback that started this module: a float turns
+    # 12345678901234567.89 into 12345678901234568.
+    balance := parse("12345678901234567.89")!
+    assert_eq(to_string(balance), "12345678901234567.89")
+    assert_eq(to_string(add(balance, parse("0.01")!)), "12345678901234567.90")
+    assert_eq(to_string(sub(balance, balance)), "0.00")
+
+test "constructors cover the minor-unit and bigint entry points":
+    assert_eq(to_string(from_int_scaled(1999, 2)!), "19.99")
+    assert_eq(to_string(from_int_scaled(-1, 4)!), "-0.0001")
+    assert_eq(to_string(from_int(0)), "0")
+    assert_eq(to_string(from_bigint(bigint.parse("-1234567890123456789012")!, 6)!), "-1234567890123456.789012")
+    assert(from_int_scaled(1, -1).is_err)
+    assert(from_bigint(bigint.one(), 20000).is_err)
+    assert_eq(to_string(sum([])), "0")

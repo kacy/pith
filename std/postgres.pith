@@ -22,6 +22,7 @@
 #   conn := postgres.connect_tls("db.internal", 5432, "me", "pw", "mydb", "db.internal", cfg)!
 
 import std.sql as sql
+import std.decimal as decimal
 import std.bytes as bytes
 import std.bits as bits
 import std.encoding as encoding
@@ -594,13 +595,32 @@ impl Pool:
             conn.close()
 
 # decode a text-format value by its column type oid.
+#
+# every branch falls back to the raw text rather than to a zero when the value
+# does not parse. postgres sends `NaN`, `Infinity` and `-Infinity` for a
+# numeric, and none of those is a number this driver can hold — handing back
+# the text keeps them intact, where a fabricated 0 would be a wrong balance
+# that no one ever sees fail.
 fn decode_value(raw: String, oid: Int) -> sql.Value:
     # int2, int4, int8, oid
     if oid == 21 or oid == 23 or oid == 20 or oid == 26:
-        return sql.integer(parse_int(raw) catch 0)
-    # float4, float8, numeric
-    if oid == 700 or oid == 701 or oid == 1700:
-        return sql.real(parse_float(raw) catch 0.0)
+        parsed := parse_int(raw)
+        if parsed.is_err:
+            return sql.text(raw)
+        return sql.integer(parsed.ok)
+    # numeric: exact by definition, so it decodes to an exact Decimal. routing
+    # it through a Float would round a NUMERIC(20,2) balance on the way in.
+    if oid == 1700:
+        decoded := decimal.parse(raw)
+        if decoded.is_err:
+            return sql.text(raw)
+        return sql.numeric(decoded.ok)
+    # float4, float8 — these genuinely are floats
+    if oid == 700 or oid == 701:
+        parsed := parse_float(raw)
+        if parsed.is_err:
+            return sql.text(raw)
+        return sql.real(parsed.ok)
     # bool
     if oid == 16:
         if raw == "t":
@@ -627,6 +647,26 @@ test "value decode honors column type oids":
     assert_eq(row.as_text(1), "hi")
     assert_eq(row.as_real(2), 9.5)
     assert_eq(row.as_int(3), 1)
+
+test "a numeric column decodes exactly, digits and trailing zeros intact":
+    row := sql.row([decode_value("12345678901234567.89", 1700), decode_value("1.10", 1700), decode_value("-0.00", 1700)], ["balance", "price", "zero"])
+    assert_eq(decimal.to_string(row.decimal("balance")), "12345678901234567.89")
+    assert_eq(decimal.to_string(row.decimal("price")), "1.10")
+    assert_eq(decimal.to_string(row.decimal("zero")), "0.00")
+
+test "a numeric postgres cannot express keeps its text instead of becoming zero":
+    # postgres sends these for a numeric since version 14. decoding them as a
+    # float would have produced 0.0 and looked like a real balance.
+    row := sql.row([decode_value("NaN", 1700), decode_value("Infinity", 1700), decode_value("-Infinity", 1700)], ["a", "b", "c"])
+    assert_eq(row.as_text(0), "NaN")
+    assert_eq(row.as_text(1), "Infinity")
+    assert_eq(row.as_text(2), "-Infinity")
+
+test "an unparseable number keeps its text rather than fabricating a zero":
+    row := sql.row([decode_value("nonsense", 23), decode_value("nonsense", 701)], ["i", "f"])
+    assert_eq(row.as_text(0), "nonsense")
+    assert_eq(row.as_text(1), "nonsense")
+    assert_eq(row.as_int(0), 0)
 
 test "error text extracts the message field":
     payload := bytes.concat(bytes.from_string_utf8("SERROR"), bytes.concat(bytes.from_string_utf8(chr(0)), bytes.concat(bytes.from_string_utf8("Mrole does not exist"), bytes.from_string_utf8(chr(0)))))

@@ -340,6 +340,38 @@ fn resolve_type_name_module_scoped(name: String) -> Int:
         return lookup_qualified_type_id(current_checker_module_path, name)
     return - 1
 
+# last resort for an `alias.Type` whose alias is not one of ours. it happens
+# when a type crosses two module boundaries: std.sql returns a
+# `decimal.Decimal`, spelled with std.sql's own alias for std.decimal, and that
+# spelling reaches a caller who imported std.decimal under a different name.
+# by then the defining module's alias table is gone, so fall back to reading
+# the alias as a module basename and looking the member up there.
+#
+# only reached where the name would otherwise be an unknown-type error, so it
+# can turn a failure into a success but never change a program that compiles.
+# a basename shared by two modules is resolved by which of them declares the
+# member; if both do, the caller had no alias to disambiguate with anyway.
+#
+# the cost is a little permissiveness: writing `decimal.Decimal` in a file that
+# imported the module under another name, or under none, now resolves instead of
+# erroring. requiring the file to import the module under some alias would close
+# that, but it would also stop a caller from holding a value whose type it never
+# names — reading a `row.decimal(...)` without importing std.decimal at all —
+# which is the more common of the two.
+fn resolve_type_by_module_basename(name: String) -> Int:
+    parts := split_qualified_name(name)
+    alias := parts.0
+    member := parts.1
+    if member == "":
+        return - 1
+    suffix := "." + alias
+    for module_path in checked_module_paths.keys():
+        if module_path == alias or module_path.ends_with(suffix):
+            found := lookup_qualified_type_id(module_path, member)
+            if found >= 0:
+                return found
+    return - 1
+
 fn resolve_named_type(name: String) -> Int:
     # an associated type name resolves to the binding of the impl currently
     # being processed (e.g. `Item` -> `Int` inside `impl Container for IntBox`)
@@ -364,6 +396,9 @@ fn resolve_named_type(name: String) -> Int:
         # dispatch will re-resolve them with substitution
         if suppress_unknown_type_for.contains_key(resolved_name):
             return TID_ERR
+        recovered := resolve_type_by_module_basename(name)
+        if recovered >= 0:
+            return recovered
         report_error("E202", "unknown type: " + name)
         return TID_ERR
     return tid

@@ -1,0 +1,84 @@
+# std.decimal against an outside reference.
+#
+# the expected values in tests/data/decimal_vectors.txt were not produced by
+# this implementation. add, sub, mul and cmp come from python's `decimal` — the
+# same IBM General Decimal Arithmetic standard, with the context precision
+# raised so nothing rounds — and every rounding decision was derived
+# independently from an exact `Fraction`, so a shared mistake in two versions of
+# the same algorithm cannot hide behind agreement.
+#
+# the operands are chosen where implementations break: zero and negative zero,
+# exact midpoints, both sides of 2^53 and 2^63, values that straddle the
+# base-10^9 limb boundary, and scales from 0 to 18.
+#
+# run: pith run tests/cases/test_decimal_vectors.pith
+
+import std.decimal as decimal
+import std.fs as fs
+
+fn rounding_named(name: String) -> decimal.Rounding!:
+    if name == "down":
+        return decimal.down()
+    if name == "up":
+        return decimal.up()
+    if name == "floor":
+        return decimal.floor()
+    if name == "ceiling":
+        return decimal.ceiling()
+    if name == "half_up":
+        return decimal.half_up()
+    if name == "half_down":
+        return decimal.half_down()
+    if name == "half_even":
+        return decimal.half_even()
+    fail "unknown rounding mode '{name}'"
+
+# evaluate one vector. `fields` is the whole row minus its operation, so the
+# arity differs per operation: div carries a scale as well as a divisor.
+fn evaluate(op: String, fields: List[String]) -> String!:
+    left := decimal.parse(fields[0])!
+    if op == "add":
+        return decimal.to_string(decimal.add(left, decimal.parse(fields[1])!))
+    if op == "sub":
+        return decimal.to_string(decimal.sub(left, decimal.parse(fields[1])!))
+    if op == "mul":
+        return decimal.to_string(decimal.mul(left, decimal.parse(fields[1])!))
+    if op == "cmp":
+        return "{decimal.compare(left, decimal.parse(fields[1])!)}"
+    if op.starts_with("rescale"):
+        mode := rounding_named(op.substring(7, op.len()))!
+        return decimal.to_string(decimal.rescale(left, parse_int(fields[1])!, mode)!)
+    if op.starts_with("div"):
+        mode := rounding_named(op.substring(3, op.len()))!
+        right := decimal.parse(fields[1])!
+        return decimal.to_string(decimal.div(left, right, parse_int(fields[2])!, mode)!)
+    fail "unknown operation '{op}'"
+
+fn main() -> Int!:
+    body := fs.read_file("tests/data/decimal_vectors.txt")!
+    mut checked := 0
+    mut failures := 0
+    for line in body.split("\n"):
+        if line.len() == 0:
+            continue
+        parts := line.split("|")
+        if parts.len() < 4:
+            failures = failures + 1
+            print("MALFORMED {line}")
+            continue
+        op := parts[0]
+        want := parts[parts.len() - 1]
+        mut arguments: List[String] := []
+        mut index := 1
+        while index < parts.len() - 1:
+            arguments.push(parts[index])
+            index = index + 1
+        actual := evaluate(op, arguments) catch "ERROR"
+        checked = checked + 1
+        if actual != want:
+            failures = failures + 1
+            if failures <= 10:
+                print("FAIL {line} -> {actual}")
+    print("checked {checked} vectors")
+    print("failures {failures}")
+    return 0

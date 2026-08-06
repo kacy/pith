@@ -53,8 +53,20 @@ pub fn ir_rc_kind(type_hint: String) -> String:
     # hints carry the struct: prefix.
     if type_hint.starts_with("struct:"):
         return "struct"
-    if ir_struct_names.contains_key(ir_struct_base_name(type_hint)):
+    base := ir_struct_base_name(type_hint)
+    if ir_struct_names.contains_key(base):
         return "struct"
+    # a type named through its module — `decimal.Decimal` in an enum payload —
+    # arrives qualified, and the registry keys structs by their bare name. the
+    # only question here is whether the value is a heap struct that has to be
+    # retained and released, and two modules with a same-named struct both
+    # answer yes, so the suffix decides it without having to know which one it
+    # is. getting this wrong is silent: the payload is stored without a count
+    # and the enum's destructor skips it, so it dangles.
+    dot := base.last_index_of(".")
+    if dot >= 0:
+        if ir_struct_names.contains_key(base.substring(dot + 1, base.len())):
+            return "struct"
     return ""
 
 # every rc kind releases: strings via their header count, collections via

@@ -57,7 +57,7 @@ match what a reader sees:
 | --- | --- | --- |
 | byte | `s.len()`, `s[i]`, `substring` | protocol framing, storage limits, ascii parsing |
 | character | `text.char_count`, `text.slice` | anything that must not corrupt text |
-| grapheme | see below | text a person reads |
+| grapheme | `graphemes.count`, `graphemes.truncate` | text a person reads |
 
 a "character" here is a unicode scalar value — the unit Go's `for range` and
 Rust's `chars()` yield. it is not always one mark on screen: `e` followed by a
@@ -158,6 +158,36 @@ and compare; the compatibility forms discard information — they flatten a
 fullwidth letter and its ascii form into the same string — which is the wrong
 default for text you are keeping.
 
+## graphemes, for anything a person reads
+
+a scalar value is still not what a reader counts. `"é"` written as an `e` plus
+a combining accent is two scalar values and one mark on screen. a family emoji
+is five. a flag is two. truncating by scalar value can strip an accent off its
+letter, take the skin tone off a person, or leave half a flag.
+
+`std.text.graphemes` splits on what a reader would call a character:
+
+```pith
+import std.text.graphemes as graphemes
+
+graphemes.count("👨‍👩‍👧")            # 1, where text.char_count is 5
+graphemes.truncate(name, 20)     # never cuts a cluster in half
+graphemes.split(message)
+```
+
+use graphemes when the number or the cut is user-visible — a display name, a
+chat message, a character counter next to an input box. use the scalar
+functions in `std.text` when you are working with the text itself: parsing,
+validating, encoding. graphemes cost a table lookup per code point and a small
+amount of state, which is worth paying for a truncation and not for a parser.
+
+these are the extended grapheme cluster rules from unicode annex 29, the same
+definition Swift's `Character` and a text editor's arrow keys use. the
+implementation is checked against the standard's own test file: all 1187 cases
+of `GraphemeBreakTest.txt` run as a colocated test, from data the generator
+packs into the tables, so regenerating for a new unicode release re-verifies
+the segmenter rather than just replacing its data.
+
 ## the tables
 
 the case folding and normalization data is generated from the unicode
@@ -187,6 +217,10 @@ constant compiles in about a second and costs nothing at startup.
 | --- | --- | --- |
 | case folding | 205 runs (from 1457 pairs) | 4.0 KB |
 | combining classes, decompositions, compositions | 388 + 2061 + 941 | 42.0 KB |
+| grapheme break properties, plus the conformance cases | 733 ranges + 3009 | 25.0 KB |
+
+71 KB in total, all of it compiled in rather than loaded, and none of it
+touched by a program that does not call into these functions.
 
 ## what is not here
 

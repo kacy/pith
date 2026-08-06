@@ -1,0 +1,44 @@
+# counting and cutting text the way a reader sees it.
+#
+# std.text counts unicode scalar values, which is the right unit for parsing
+# and encoding. it is not the unit a person counts: an accented letter, a
+# family emoji and a flag are each one thing on screen and several scalar
+# values underneath.
+
+import std.text as text
+import std.text.graphemes as graphemes
+
+fn show(label: String, s: String):
+    print("{label}: bytes={s.len()} chars={text.char_count(s)} clusters={graphemes.count(s)}")
+
+fn main():
+    # a letter with a combining accent
+    show("e + accent", "e" + chr(204) + chr(129))
+
+    # a family emoji, joined by zero-width joiners
+    show("family    ", "👨" + chr(226) + chr(128) + chr(141) + "👩" + chr(226) + chr(128) + chr(141) + "👧")
+
+    # a flag is a pair of regional indicators
+    show("flag      ", "🇩🇪")
+
+    # a person with a skin tone modifier
+    show("wave      ", "👋🏾")
+
+    # truncation is where the difference bites. cutting by scalar value drops
+    # the accent off the last letter; cutting by cluster keeps it whole.
+    name := "Jos" + "e" + chr(204) + chr(129) + " Ramírez"
+    print("")
+    print("name: {name}")
+    print("  text.truncate(name, 4)      = {text.truncate(name, 4)}")
+    print("  graphemes.truncate(name, 4) = {graphemes.truncate(name, 4)}")
+
+    # and a character counter next to an input box should agree with the user
+    message := "hi 👋🏾 🇩🇪"
+    print("")
+    print("message: {message}")
+    print("  a user counts: {graphemes.count(message)}")
+    print("  scalar values: {text.char_count(message)}")
+    print("  bytes:         {message.len()}")
+
+    print("")
+    print("split: {graphemes.split("a🇩🇪👋🏾")}")

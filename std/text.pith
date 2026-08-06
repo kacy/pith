@@ -29,6 +29,36 @@
 # pith Strings are null-terminated, so the null character has no
 # representation. `encode(0)` fails rather than handing back a string that
 # would silently measure as empty.
+#
+# ## which parts of unicode are implemented
+#
+# unicode is large, and most of it does not earn its weight in a server
+# runtime. this module implements the parts that text handling is wrong
+# without:
+#
+# - simple case folding, for caseless comparison
+# - NFC normalization, so text that looks identical compares identical
+#
+# and deliberately does not implement:
+#
+# - full and special case mapping. "ß" does not become "SS", and the turkish
+#   dotted/dotless i keeps its unicode-default behaviour rather than a
+#   locale-specific one. both are locale decisions; see std.intl.
+# - NFD, NFKC and NFKD. NFC is the form to store and compare. the compatibility
+#   forms discard information -- they flatten a fullwidth letter and its ascii
+#   form into the same string -- which is the wrong default for text you keep.
+# - word and sentence segmentation, and bidirectional text.
+#
+# the unicode version the tables were built from is recorded in
+# `unicode_version()` and in the header of every generated table.
+
+import std.text.tables as tables
+import std.text.case_tables as case_tables
+import std.text.norm_tables as norm_tables
+
+# the unicode release the generated tables were built from.
+pub fn unicode_version() -> String:
+    return "15.1.0"
 
 # a decoded character and the number of bytes it occupied.
 pub struct Decoded:
@@ -377,6 +407,271 @@ pub fn sanitize(s: String) -> String:
     return out
 
 # ---------------------------------------------------------------------------
+# case folding
+# ---------------------------------------------------------------------------
+
+# fold one code point for caseless comparison.
+#
+# folding is not lowercasing. lowercasing produces text for a reader; folding
+# produces a key for comparison, and the two genuinely differ. greek final
+# sigma is the clearest case: "ς" lowercases to itself but folds to "σ", so
+# "ΣΣ" and "σς" compare equal folded and unequal lowercased.
+pub fn fold_code_point(code_point: Int) -> Int:
+    if code_point < 128:
+        if code_point >= 65 and code_point <= 90:
+            return code_point + 32
+        return code_point
+
+    run := tables.find_containing(case_tables.FOLD_RUNS, 4, case_tables.fold_runs_count(), code_point)
+    if run < 0:
+        return code_point
+
+    start := tables.field(case_tables.FOLD_RUNS, run, 0, 4)
+    count := tables.field(case_tables.FOLD_RUNS, run, 1, 4)
+    stride := tables.field(case_tables.FOLD_RUNS, run, 2, 4)
+    offset := code_point - start
+    if offset > ((count - 1) * stride):
+        return code_point
+    if (offset % stride) != 0:
+        return code_point
+    return code_point + (tables.field(case_tables.FOLD_RUNS, run, 3, 4) - 2097152)
+
+# fold a string for caseless comparison.
+#
+# this is the function to reach for when you are comparing rather than
+# displaying: usernames, email local parts, header names, routing keys, tags.
+# `to_lower` is ascii-only and does nothing to "Ä" or "Σ", so a caseless
+# comparison written with it silently stops working on the first non-english
+# input. use `fold` there and keep `to_lower` for text a person will read.
+#
+# this is simple folding: every character folds to exactly one character, and
+# the result has the same character count as the input. "ß" therefore folds to
+# itself rather than to "ss", so `fold("straße") != fold("STRASSE")`. full
+# folding would close that gap, at the cost of a mapping that changes length;
+# see the module header.
+pub fn fold(s: String) -> String:
+    mut out := ""
+    mut position := 0
+    while position < s.len():
+        step := decode_step(s, position)
+        if step.code_point < 0:
+            out = out + replacement_char()
+        else:
+            folded := fold_code_point(step.code_point)
+            if folded == step.code_point:
+                out = out + s.substring(position, position + step.size)
+            else:
+                out = out + encode(folded).unwrap_or(replacement_char())
+        position = position + step.size
+    return out
+
+# compare two strings ignoring case, the whole way up unicode rather than just
+# through ascii.
+pub fn eq_fold(a: String, b: String) -> Bool:
+    return fold(a) == fold(b)
+
+# compare two strings ignoring both case and composition differences. this is
+# the strictest sameness test here, and the right one for an identifier a user
+# typed: it treats "é" and "e" plus a combining acute as the same, and "Ä" and
+# "ä" as the same.
+pub fn eq_fold_normalized(a: String, b: String) -> Bool:
+    return fold(normalize(a)) == fold(normalize(b))
+
+# ---------------------------------------------------------------------------
+# normalization (NFC)
+# ---------------------------------------------------------------------------
+#
+# the same text can be spelled more than one way: "é" is either one code point
+# or an "e" followed by a combining acute accent. they render identically and
+# a user cannot tell them apart, but they are different bytes, so they hash
+# differently, compare unequal, and land in a database as two distinct rows.
+#
+# NFC picks one spelling -- the composed one -- so equal-looking text is equal
+# bytes. normalize at the edge, when text arrives, and store the result.
+
+fn hangul_syllable_base() -> Int:
+    return 44032
+
+fn hangul_lead_base() -> Int:
+    return 4352
+
+fn hangul_vowel_base() -> Int:
+    return 4449
+
+fn hangul_trail_base() -> Int:
+    return 4519
+
+# hangul syllables decompose and recompose by arithmetic rather than by table
+# lookup: there are 11172 of them and the standard defines the mapping as a
+# formula, so none of them appear in the generated tables.
+fn decompose_hangul(code_point: Int, out: List[Int]) -> Bool:
+    index := code_point - hangul_syllable_base()
+    if index < 0 or index >= 11172:
+        return false
+    out.push(hangul_lead_base() + (index / 588))
+    out.push(hangul_vowel_base() + ((index % 588) / 28))
+    trail := index % 28
+    if trail != 0:
+        out.push(hangul_trail_base() + trail)
+    return true
+
+fn compose_hangul(first: Int, second: Int) -> Int:
+    lead := first - hangul_lead_base()
+    if lead >= 0 and lead < 19:
+        vowel := second - hangul_vowel_base()
+        if vowel >= 0 and vowel < 21:
+            return hangul_syllable_base() + (((lead * 21) + vowel) * 28)
+
+    syllable := first - hangul_syllable_base()
+    if syllable >= 0 and syllable < 11172 and (syllable % 28) == 0:
+        trail := second - hangul_trail_base()
+        if trail > 0 and trail < 28:
+            return first + trail
+    return - 1
+
+# the canonical combining class of a code point. 0 means a starter, which is
+# any character that a following mark attaches to.
+pub fn combining_class(code_point: Int) -> Int:
+    run := tables.find_containing(norm_tables.CCC_RUNS, 3, norm_tables.ccc_runs_count(), code_point)
+    if run < 0:
+        return 0
+    start := tables.field(norm_tables.CCC_RUNS, run, 0, 3)
+    count := tables.field(norm_tables.CCC_RUNS, run, 1, 3)
+    if (code_point - start) >= count:
+        return 0
+    return tables.field(norm_tables.CCC_RUNS, run, 2, 3)
+
+# expand a code point to its full canonical decomposition. decompositions
+# nest -- a character can decompose to another that decomposes further -- so
+# this recurses until it reaches characters that do not decompose.
+fn decompose_into(code_point: Int, out: List[Int]):
+    if decompose_hangul(code_point, out):
+        return
+
+    record := tables.find(norm_tables.DECOMPOSITIONS, 3, norm_tables.decompositions_count(), code_point)
+    if record < 0:
+        out.push(code_point)
+        return
+
+    decompose_into(tables.field(norm_tables.DECOMPOSITIONS, record, 1, 3), out)
+    second := tables.field(norm_tables.DECOMPOSITIONS, record, 2, 3)
+    if second != 0:
+        decompose_into(second, out)
+
+# put combining marks into canonical order.
+#
+# marks that attach to the same base in different ways have different
+# combining classes, and the standard fixes an order for them so that two
+# spellings of the same text agree. only adjacent marks with different
+# non-zero classes may swap, which makes this a stable sort -- and since runs
+# of marks are almost always one or two long, an insertion pass is the right
+# shape.
+fn canonical_order(points: List[Int]):
+    mut index := 1
+    while index < points.len():
+        current := points[index]
+        current_class := combining_class(current)
+        if current_class != 0:
+            mut at := index
+            mut moving := true
+            while moving:
+                if at <= 0:
+                    moving = false
+                else:
+                    previous_class := combining_class(points[at - 1])
+                    if previous_class == 0 or previous_class <= current_class:
+                        moving = false
+                    else:
+                        points[at] = points[at - 1]
+                        at = at - 1
+            points[at] = current
+        index = index + 1
+
+# the code point that this pair composes to, or -1 when the pair does not
+# compose.
+fn compose_pair(first: Int, second: Int) -> Int:
+    hangul := compose_hangul(first, second)
+    if hangul >= 0:
+        return hangul
+    record := tables.find_pair(norm_tables.COMPOSITIONS, 3, norm_tables.compositions_count(), first, second)
+    if record < 0:
+        return - 1
+    return tables.field(norm_tables.COMPOSITIONS, record, 2, 3)
+
+# recombine a decomposed, canonically ordered sequence.
+#
+# a mark composes onto the last starter before it unless something blocks it:
+# an intervening mark of the same or higher combining class means the mark
+# belongs to that one, not to the starter.
+fn compose_all(points: List[Int]) -> List[Int]:
+    mut out: List[Int] := []
+    if points.len() == 0:
+        return out
+
+    out.push(points[0])
+    mut starter := - 1
+    if combining_class(points[0]) == 0:
+        starter = 0
+    mut previous_class := combining_class(points[0])
+
+    mut index := 1
+    while index < points.len():
+        current := points[index]
+        current_class := combining_class(current)
+
+        mut composed := - 1
+        if starter >= 0 and (previous_class == 0 or previous_class < current_class):
+            composed = compose_pair(out[starter], current)
+
+        if composed >= 0:
+            out[starter] = composed
+        else:
+            out.push(current)
+            if current_class == 0:
+                starter = out.len() - 1
+            previous_class = current_class
+        index = index + 1
+    return out
+
+# return true when every byte is ascii. ascii is already normalized and folds
+# without a table, so both paths can skip their work entirely.
+fn is_ascii(s: String) -> Bool:
+    mut position := 0
+    while position < s.len():
+        if raw_byte(s, position) >= 128:
+            return false
+        position = position + 1
+    return true
+
+# normalize to NFC, the composed form.
+#
+# this is what to apply to text as it arrives -- a form field, a header, a
+# message -- so that everything downstream compares, hashes and stores
+# consistently. undecodable bytes become U+FFFD, since normalizing something
+# that is not text has no meaning.
+pub fn normalize(s: String) -> String:
+    if is_ascii(s):
+        return s
+
+    mut expanded: List[Int] := []
+    mut position := 0
+    while position < s.len():
+        step := decode_step(s, position)
+        if step.code_point < 0:
+            expanded.push(65533)
+        else:
+            decompose_into(step.code_point, expanded)
+        position = position + step.size
+
+    canonical_order(expanded)
+    return from_code_points(compose_all(expanded)).unwrap_or(s)
+
+# return true when the string is already in NFC, without building the
+# normalized form to find out.
+pub fn is_normalized(s: String) -> Bool:
+    return normalize(s) == s
+
+# ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
 
@@ -528,6 +823,98 @@ test "marks text it had to cut":
     assert_eq(truncate_with("Ärger", 10, "..."), "Ärger")
     assert_eq(truncate_with("Ärger", 4, "..."), "Ä...")
     assert_eq(truncate_with("hello world", 8, "..."), "hello...")
+
+test "folds across the scripts, not just ascii":
+    assert_eq(fold("ABC"), "abc")
+    assert_eq(fold("abc"), "abc")
+    assert_eq(fold(""), "")
+    # latin-1: to_lower leaves this untouched, which is the bug fold exists for
+    assert_eq(fold("Ä"), "ä")
+    assert_eq(fold("Ärger"), "ärger")
+    assert_eq("Ärger".to_lower(), "Ärger")
+    # cyrillic
+    assert_eq(fold("А"), "а")
+    assert_eq(fold("ПРИВЕТ"), "привет")
+    # greek
+    assert_eq(fold("Σ"), "σ")
+    assert_eq(fold("σ"), "σ")
+
+test "folding and lowercasing genuinely differ":
+    # greek final sigma lowercases to itself but folds to a plain sigma, so
+    # these two strings are the same word and only folding says so.
+    assert_eq(fold("ς"), "σ")
+    assert_eq(fold("ΣΣ"), "σσ")
+    assert_eq(fold("σς"), "σσ")
+    assert_eq(eq_fold("ΣΣ", "σς"), true)
+    assert_eq(eq_fold("Ärger", "ärger"), true)
+    assert_eq(eq_fold("Ärger", "arger"), false)
+
+test "simple folding leaves the length-changing cases alone":
+    # these need full folding, which this module does not implement. the point
+    # of the test is that the behaviour is pinned rather than accidental.
+    assert_eq(fold("ß"), "ß")
+    assert_eq(eq_fold("straße", "STRASSE"), false)
+    # turkish dotted capital i folds to itself under the default rules; a
+    # turkish-locale fold would map it to "i", and that belongs in std.intl.
+    assert_eq(fold("İ"), "İ")
+    assert_eq(fold("ı"), "ı")
+    # the title-case form of a digraph folds to the lowercase digraph
+    assert_eq(fold("ǅ"), "ǆ")
+
+test "composes decomposed text":
+    # "e" followed by a combining acute accent is three bytes; NFC turns it
+    # into the two-byte precomposed "é"
+    decomposed := "e" + chr(204) + chr(129)
+    assert_eq(decomposed.len(), 3)
+    assert_eq(char_count(decomposed), 2)
+    assert_eq(normalize(decomposed), "é")
+    assert_eq(normalize(decomposed).len(), 2)
+    assert_eq(char_count(normalize(decomposed)), 1)
+
+test "leaves already-composed text alone":
+    assert_eq(normalize("é"), "é")
+    assert_eq(normalize("hello"), "hello")
+    assert_eq(normalize(""), "")
+    assert_eq(normalize("Ärger"), "Ärger")
+    assert_eq(is_normalized("é"), true)
+    assert_eq(is_normalized("e" + chr(204) + chr(129)), false)
+
+test "composes hangul by formula":
+    # hangul syllables are not in the decomposition table; they are built and
+    # taken apart arithmetically
+    jamo := "ᄀ" + "ᅡ"
+    assert_eq(char_count(jamo), 2)
+    assert_eq(normalize(jamo), "가")
+    assert_eq(char_count(normalize(jamo)), 1)
+    # with a trailing consonant
+    assert_eq(normalize("ᄒ" + "ᅡ" + "ᆫ"), "한")
+    assert_eq(normalize("한"), "한")
+
+test "reorders combining marks into canonical order":
+    # a base with two marks written in the wrong order normalizes to the same
+    # string as the right order. U+0323 (below, class 220) must precede
+    # U+0301 (above, class 230) whichever way they were typed.
+    below_first := "a" + chr(204) + chr(163) + chr(204) + chr(129)
+    above_first := "a" + chr(204) + chr(129) + chr(204) + chr(163)
+    assert_eq(normalize(above_first), normalize(below_first))
+    assert_eq(normalize(above_first).len(), normalize(below_first).len())
+    # and it composes what it can: a-with-dot-below plus the acute
+    assert_eq(char_count(normalize(below_first)), 2)
+
+test "reports combining classes":
+    assert_eq(combining_class(97), 0)
+    assert_eq(combining_class(769), 230)
+    assert_eq(combining_class(803), 220)
+    assert_eq(combining_class(8364), 0)
+
+test "folds and normalizes together for identifier comparison":
+    typed := "E" + chr(204) + chr(129)
+    stored := "é"
+    assert_eq(eq_fold(typed, stored), false)
+    assert_eq(eq_fold_normalized(typed, stored), true)
+
+test "records the unicode version it was built from":
+    assert_eq(unicode_version(), "15.1.0")
 
 test "repairs undecodable bytes":
     assert_eq(sanitize("Ärger"), "Ärger")

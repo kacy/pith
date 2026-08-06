@@ -2544,7 +2544,10 @@ fn ir_emit_byte_operand(idx: Int) -> Int:
             obj_r := ir_expr(node.children[0])
             idx_r := ir_expr(node.children[1])
             r := ir_reg()
-            ir_emit_call2(r, "byte_at", "int", obj_r, idx_r)
+            # by its runtime symbol, not the short `byte_at` key: this is the
+            # emitter's own lowering of `ord(s[i])`, and a user function named
+            # `byte_at` must not be able to capture it — nor be captured by it.
+            ir_emit_call2(r, "pith_cstring_byte_at", "int", obj_r, idx_r)
             return r
         return 0 - 1
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":

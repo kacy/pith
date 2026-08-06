@@ -204,6 +204,27 @@ string. it is never turned into a zero.
 
 see [docs/db.md](db.md) for the rest of the database surface.
 
+## a note on lists in hot loops
+
+Unrelated to these types but easy to hit while using them: a freshly built
+`List` handed straight to a function is not released today, so
+
+```pith
+row := sql.row([sql.integer(id), sql.numeric(amount)], ["id", "amount"])
+```
+
+leaks both literals once per call. Binding them first does not:
+
+```pith
+values := [sql.integer(id), sql.numeric(amount)]
+names := ["id", "amount"]
+row := sql.row(values, names)
+```
+
+It costs nothing outside a loop, and it is worth knowing about inside one. Both
+`std.bigint` and `std.decimal` bind their own list temporaries for this reason,
+so nothing here leaks per value.
+
 ## limits
 
 `Decimal` caps its scale at 16383, which is postgres's own ceiling on a numeric's

@@ -104,7 +104,8 @@ pub fn from_int(value: Int) -> BigInt:
     if value > 0:
         if value <= BIGINT_SMALL_MAX:
             return BigInt(sign: 1, small: value, limbs: [])
-        return from_limbs(1, split_magnitude(value))
+        wide := split_magnitude(value)
+        return from_limbs(1, wide)
     # negating first would overflow at the minimum Int, so peel limbs off the
     # negative value directly: `%` keeps the sign, and `/` shrinks toward zero.
     mut raw: List[Int] := []
@@ -252,7 +253,10 @@ pub fn mul(left: BigInt, right: BigInt) -> BigInt:
         # cannot itself overflow.
         if left.small <= BIGINT_SMALL_MAX / right.small:
             return BigInt(sign: sign, small: left.small * right.small, limbs: [])
-    return from_limbs(sign, mul_limbs(magnitude_limbs(left), magnitude_limbs(right)))
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    product := mul_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, product)
 
 # the quotient and remainder of `dividend / divisor`. the quotient truncates
 # toward zero and the remainder takes the sign of the dividend, so
@@ -270,7 +274,9 @@ pub fn divmod(dividend: BigInt, divisor: BigInt) -> DivMod!:
         return DivMod(
             quotient: signed_small(quotient_sign, dividend.small / divisor.small),
             remainder: signed_small(dividend.sign, dividend.small % divisor.small))
-    parts := divmod_limbs(magnitude_limbs(dividend), magnitude_limbs(divisor))
+    dividend_limbs := magnitude_limbs(dividend)
+    divisor_limbs := magnitude_limbs(divisor)
+    parts := divmod_limbs(dividend_limbs, divisor_limbs)
     return DivMod(
         quotient: from_limbs(quotient_sign, parts.quotient),
         remainder: from_limbs(dividend.sign, parts.remainder))
@@ -468,7 +474,8 @@ fn from_limbs(sign: Int, raw: List[Int]) -> BigInt:
         return BigInt(sign: sign, small: magnitude, limbs: [])
     if top == raw.len():
         return BigInt(sign: sign, small: 0, limbs: raw)
-    return BigInt(sign: sign, small: 0, limbs: raw.slice(0, top))
+    trimmed := raw.slice(0, top)
+    return BigInt(sign: sign, small: 0, limbs: trimmed)
 
 # a signed value from a machine-sized magnitude, normalizing zero's sign.
 fn signed_small(sign: Int, magnitude: Int) -> BigInt:
@@ -476,9 +483,14 @@ fn signed_small(sign: Int, magnitude: Int) -> BigInt:
         return zero()
     if magnitude <= BIGINT_SMALL_MAX:
         return BigInt(sign: sign, small: magnitude, limbs: [])
-    return from_limbs(sign, split_magnitude(magnitude))
+    wide := split_magnitude(magnitude)
+    return from_limbs(sign, wide)
 
-# the magnitude in limb form, whichever form it is stored in.
+# the magnitude in limb form, whichever form it is stored in. for a value in
+# the small form this builds a fresh list, and the result has to be bound to a
+# name before it is passed anywhere: a freshly produced List handed straight to
+# a call is never released, so `f(magnitude_limbs(x))` leaks one list per call.
+# every caller in this module binds first for that reason.
 fn magnitude_limbs(value: BigInt) -> List[Int]:
     if value.limbs.len() > 0:
         return value.limbs
@@ -538,7 +550,10 @@ fn add_magnitudes(sign: Int, left: BigInt, right: BigInt) -> BigInt:
         # two 18-digit magnitudes sum to at most 19 digits, comfortably inside
         # an Int, so the fast path only has to decide where the result lives.
         return signed_small(sign, left.small + right.small)
-    return from_limbs(sign, add_limbs(magnitude_limbs(left), magnitude_limbs(right)))
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    total := add_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, total)
 
 # the difference of two magnitudes, which the caller has ordered so that
 # `left` is the larger.
@@ -546,7 +561,10 @@ fn sub_magnitudes(sign: Int, left: BigInt, right: BigInt) -> BigInt:
     if left.limbs.len() == 0:
         # `right` is no larger, so it is in the small form too.
         return signed_small(sign, left.small - right.small)
-    return from_limbs(sign, sub_limbs(magnitude_limbs(left), magnitude_limbs(right)))
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    difference := sub_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, difference)
 
 fn add_limbs(left: List[Int], right: List[Int]) -> List[Int]:
     mut out: List[Int] := []
@@ -649,7 +667,8 @@ fn divmod_limb(source: List[Int], divisor: Int) -> LimbPair:
         quotient[index] = current / divisor
         rest = current % divisor
         index = index - 1
-    return LimbPair(quotient: quotient, remainder: [rest])
+    leftover := [rest]
+    return LimbPair(quotient: quotient, remainder: leftover)
 
 # knuth's algorithm D, in base 10^9. the divisor is normalized so its top limb
 # is at least half the base, which bounds the trial quotient at one too large
@@ -717,7 +736,8 @@ fn divmod_limbs(dividend: List[Int], divisor: List[Int]) -> LimbPair:
     while index < width:
         scaled_remainder.push(working[index])
         index = index + 1
-    return LimbPair(quotient: quotient, remainder: divmod_limb(scaled_remainder, scale).quotient)
+    remainder := divmod_limb(scaled_remainder, scale).quotient
+    return LimbPair(quotient: quotient, remainder: remainder)
 
 # --- internals: text and small helpers ---
 

@@ -1,0 +1,55 @@
+# an exact decimal crossing the sql boundary and coming back. the enum variant
+# owns its payload, so it takes a count on the way in and its destructor drops
+# one on the way out; if either half were missing the row would leak a BigInt
+# and its limb list per value — which is once per numeric column of every row a
+# query returns.
+#
+# the arithmetic is here too, because add and rescale build fresh values and
+# discard their operands, and a bigint that is never released leaks its limbs
+# with it.
+import leakprobe as probe
+import std.sql as sql
+import std.decimal as decimal
+
+# a row shaped like a ledger read: an exact amount alongside the columns that
+# usually travel with one.
+#
+# the two lists are bound before the call on purpose. a freshly built List
+# handed straight to a function is not released today — `sql.row([a], [b])`
+# leaks both literals, with or without a decimal in them — and this case is
+# here to measure the numeric path, not that.
+fn ledger_row(nth: Int) -> sql.Row!:
+    amount := decimal.parse("12345678901234567.{nth % 89}")!
+    values := [sql.integer(nth), sql.numeric(amount), sql.text("memo")]
+    names := ["id", "amount", "memo"]
+    return sql.row(values, names)
+
+# build a row, read the decimal back out, and do the arithmetic a caller would
+# do with it. nothing here is kept past the round.
+fn churn_round(nth: Int, running: decimal.Decimal) -> decimal.Decimal!:
+    row := ledger_row(nth)!
+    amount := row.decimal("amount")
+    scaled := decimal.rescale(amount, 2, decimal.half_even())!
+    doubled := decimal.mul(scaled, decimal.from_int(2))
+    text := decimal.to_string(doubled)
+    reparsed := decimal.parse(text)!
+    # the optional accessor and the miss path allocate too
+    present := row.opt_decimal("amount")
+    missing := row.opt_decimal("nope")
+    if missing != none:
+        return running
+    if present == none:
+        return running
+    return decimal.add(running, decimal.sub(reparsed, scaled))
+
+fn main():
+    n := probe.rounds()
+    mut running := decimal.zero()
+    mut i := 0
+    while i < n:
+        running = churn_round(i, running) catch running
+        i = i + 1
+    if decimal.sign_of(running) == 0:
+        print("0")
+    kb := probe.peak_kb()
+    print("{kb}")

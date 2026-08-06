@@ -225,7 +225,10 @@ pub fn encode(input: String) -> String:
         if is_unreserved(character):
             result = result + character
         if not is_unreserved(character):
-            char_value := ord(character)
+            # a bare ord() sign-extends, so every byte above 0x7F came back
+            # negative and indexed off the front of the digit table. percent
+            # encoding is defined over bytes, so mask it back to 0-255.
+            char_value := bit_and(ord(character), 255)
             result = result + "%" + hex_digits[char_value / 16] + hex_digits[char_value % 16]
         position = position + 1
     return result
@@ -246,22 +249,43 @@ pub fn decode(input: String) -> String:
     mut result := ""
     mut position := 0
     while position < input.len():
+        # these were three sequential ifs. after the escape branch consumed a
+        # "%XX" that ended the string, the last one still read input[position]
+        # with position now past the end and took the process down -- so any
+        # query string or form body ending in an escape crashed the decoder.
         if input[position] == "%" and position + 2 < input.len():
             high_nibble := hex_digit(input[position + 1])
             low_nibble := hex_digit(input[position + 2])
             if high_nibble >= 0 and low_nibble >= 0:
                 result = result + chr(high_nibble * 16 + low_nibble)
                 position = position + 3
-            if high_nibble < 0 or low_nibble < 0:
+            else:
                 result = result + input[position]
                 position = position + 1
-        if input[position] != "%" or position + 2 >= input.len():
-            if input[position] == "+":
-                result = result + " "
-            if input[position] != "+":
-                result = result + input[position]
+        elif input[position] == "+":
+            result = result + " "
+            position = position + 1
+        else:
+            result = result + input[position]
             position = position + 1
     return result
+
+test "percent coding survives non-ascii and a trailing escape":
+    # a bare ord() sign-extends, so every byte above 0x7F indexed off the
+    # front of the hex table and took the process down
+    assert_eq(encode("Ä"), "%c3%84")
+    assert_eq(encode("Ärger"), "%c3%84rger")
+    assert_eq(decode(encode("Ärger 日本")), "Ärger 日本")
+
+    # a string ending in an escape used to read one byte past the end, which
+    # meant most query strings and form bodies
+    assert_eq(decode("a%41"), "aA")
+    assert_eq(decode("%41"), "A")
+    assert_eq(decode("a+b%20c"), "a b c")
+    # an escape that is not valid hex, and one cut short, are passed through
+    assert_eq(decode("a%zz"), "a%zz")
+    assert_eq(decode("a%4"), "a%4")
+    assert_eq(decode("100%"), "100%")
 
 test "url parse splits full urls":
     u := parse("https://example.com:8443/api/v1?q=pith#docs")

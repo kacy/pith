@@ -135,6 +135,37 @@ this is **simple** folding: every character folds to exactly one character.
 mapping that changes length; it is not implemented, and the tests pin the
 current behaviour so it cannot drift by accident.
 
+### but do not fold a protocol token
+
+`fold` is for text a person typed. It is the wrong tool for an identifier a
+specification defines, and reaching for it there is a security regression
+rather than a fix.
+
+Two non-ASCII code points fold *into* ASCII:
+
+| code point | folds to |
+| --- | --- |
+| U+017F LATIN SMALL LETTER LONG S `ſ` | `s` |
+| U+212A KELVIN SIGN `K` | `k` |
+
+So `text.eq_fold("cloſe", "close")` is **true**, and so is
+`text.eq_fold("websocKet", "websocket")` with a Kelvin sign. HTTP, WebSocket
+and TLS all define their keywords as ASCII case-insensitive and nothing wider;
+folding them would accept values the RFC says are different, which is exactly
+the shape a header-smuggling or filter-bypass bug takes.
+
+For those, `strings.equals_ignore_case` and `to_lower` are correct, and this
+is why the standard library's own `Connection: close`, `Upgrade: websocket`,
+`Bearer ` and header-name comparisons were deliberately left alone:
+
+```pith
+strings.equals_ignore_case(header_name, "content-type")   # protocol token
+text.eq_fold(display_name, stored_name)                   # text a user typed
+```
+
+The rule is about where the value came from, not how it looks. A specification
+wrote the token; a person wrote the text.
+
 ## normalize so equal-looking text is equal
 
 `"é"` can be one code point or an `"e"` followed by a combining acute accent.

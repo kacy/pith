@@ -1,0 +1,46 @@
+# comparing text that users typed.
+#
+# most `to_lower()` calls in auth, routing and header code are not really
+# lowercasing -- they are caseless comparisons written with the only tool that
+# was available. that works until the input leaves ascii, and then it silently
+# stops working. std.text has the right tools.
+
+import std.text as text
+
+fn main():
+    # to_lower is ascii-only. it does nothing at all to these.
+    print("to_lower('Ärger')  = {"Ärger".to_lower()}")
+    print("fold('Ärger')      = {text.fold("Ärger")}")
+    print("to_lower('ПРИВЕТ') = {"ПРИВЕТ".to_lower()}")
+    print("fold('ПРИВЕТ')     = {text.fold("ПРИВЕТ")}")
+
+    # so a caseless comparison built on to_lower quietly gets it wrong
+    print("")
+    print("to_lower says 'Ärger' == 'ärger': {"Ärger".to_lower() == "ärger".to_lower()}")
+    print("fold says the same:               {text.eq_fold("Ärger", "ärger")}")
+
+    # folding is not lowercasing. greek final sigma is the same letter as a
+    # regular sigma, but only folding treats them as the same.
+    print("")
+    print("'ΣΣ' and 'σς' are the same word")
+    print("  lowercased equal: {"ΣΣ".to_lower() == "σς".to_lower()}")
+    print("  folded equal:     {text.eq_fold("ΣΣ", "σς")}")
+
+    # the other half of the problem: the same text spelled two ways. "é" is
+    # either one code point or an "e" with a combining accent. they look
+    # identical and compare unequal.
+    print("")
+    composed := "é"
+    decomposed := "e" + chr(204) + chr(129)
+    print("both render as: {composed} and {decomposed}")
+    print("  raw bytes equal:  {composed == decomposed}")
+    print("  normalized equal: {text.normalize(composed) == text.normalize(decomposed)}")
+
+    # for an identifier a user typed, you want both at once
+    print("")
+    print("eq_fold_normalized('E' + accent, 'é'): {text.eq_fold_normalized("E" + chr(204) + chr(129), "é")}")
+
+    # what simple folding does not do, so you are not surprised by it
+    print("")
+    print("fold('ß') = {text.fold("ß")}  (simple folding never changes length)")
+    print("so 'straße' and 'STRASSE' do not compare equal: {text.eq_fold("straße", "STRASSE")}")

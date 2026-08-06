@@ -1,0 +1,599 @@
+# std.intl - locales, message catalogs and plural rules
+#
+# std.text handles text correctly for everyone. this module handles it
+# differently for different people: which language to answer in, which of a
+# message's forms to use for a count, and how to fall back when the exact
+# locale asked for is not one you have.
+#
+# the split is deliberate and one-directional. std.text never depends on this
+# module, so a program that only needs correct text does not pull in locale
+# data. this module depends on std.text, because deciding what to say does not
+# excuse getting the characters wrong.
+#
+# ## the model
+#
+# this follows gettext and Rust's fluent rather than ICU: messages live in a
+# catalog keyed by locale, a lookup walks a fallback chain until something
+# answers, and plural forms are selected by CLDR category rather than by an
+# english-shaped "one or many" guess. ICU's approach -- one message string
+# carrying its own embedded select/plural grammar -- is more expressive, and
+# it also means every translator has to learn a small programming language.
+# keeping the plural choice in the catalog structure keeps the strings
+# translatable by people who translate.
+#
+# ## what is here, and what is not
+#
+# here: BCP-47 locale tags, matching and fallback, Accept-Language parsing,
+# CLDR cardinal plural categories for 224 languages, and message catalogs that
+# use them.
+#
+# not here: locale-aware number and date formatting, ordinal plurals ("1st",
+# "2nd"), currency, and collation. those need CLDR's per-locale data, which is
+# hundreds of files rather than the one this module's tables come from; adding
+# them is a data-pipeline job, not an API design job. `plural_category` is the
+# piece that programs get wrong without a table, which is why it is the piece
+# that is here.
+
+import std.strings as strings
+import std.text as text
+import std.intl.plural_tables as plural_tables
+
+# a parsed BCP-47 locale tag. an absent subtag is the empty string rather than
+# an optional, because every use here is "compare it or print it".
+pub struct Locale:
+    pub language: String
+    pub script: String
+    pub region: String
+
+# ---------------------------------------------------------------------------
+# locale tags
+# ---------------------------------------------------------------------------
+
+# parse a BCP-47 tag such as "en", "en-US", "zh-Hant-TW" or "pt_BR".
+#
+# subtags are canonicalised by shape, the way BCP-47 recommends: language
+# lowercase, script title case, region uppercase. that means "EN-us" and
+# "en-US" parse to the same locale, which is what makes tags from a browser,
+# a config file and a database comparable.
+pub fn parse_locale(tag: String) -> Locale:
+    cleaned := tag.replace("_", "-").trim()
+    if cleaned == "":
+        return Locale("", "", "")
+
+    mut language := ""
+    mut script := ""
+    mut region := ""
+
+    for part, index in cleaned.split("-"):
+        if part == "":
+            continue
+        if index == 0:
+            language = part.to_lower()
+        elif part.len() == 4 and script == "":
+            script = strings.capitalize(part)
+        elif part.len() == 2 or part.len() == 3:
+            if region == "":
+                region = part.to_upper()
+    return Locale(language, script, region)
+
+# the canonical tag for a locale, as "en", "en-US" or "zh-Hant-TW".
+pub fn locale_tag(locale: Locale) -> String:
+    mut out := locale.language
+    if locale.script != "":
+        out = out + "-" + locale.script
+    if locale.region != "":
+        out = out + "-" + locale.region
+    return out
+
+# the tags to try, most specific first, ending at the bare language.
+#
+# a catalog with only "en" answers a request for "en-GB"; a catalog with
+# "pt-BR" and "pt" answers "pt-PT" with the generic portuguese rather than the
+# brazilian. dropping subtags from the right is what BCP-47 calls lookup, and
+# it is the behaviour a reader expects: something in roughly my language beats
+# nothing.
+pub fn fallback_chain(locale: Locale) -> List[String]:
+    mut out: List[String] := []
+    full := locale_tag(locale)
+    if full == "":
+        return out
+    out.push(full)
+    if locale.script != "" and locale.region != "":
+        out.push(locale.language + "-" + locale.script)
+        out.push(locale.language + "-" + locale.region)
+    if locale.language != full:
+        out.push(locale.language)
+    return out
+
+# pick the first requested locale that something is available for, walking
+# each request's fallback chain in turn. returns none when nothing matches.
+pub fn best_match(requested: List[String], available: List[String]) -> String?:
+    for wanted in requested:
+        for candidate in fallback_chain(parse_locale(wanted)):
+            for offered in available:
+                if strings.equals_ignore_case(candidate, offered):
+                    return offered
+    return none
+
+# parse an HTTP Accept-Language header into tags, best-liked first.
+#
+# quality values order the result; anything without one is weight 1.0, and
+# "q=0" means "not this", which is a rejection rather than a low preference.
+pub fn parse_accept_language(header: String) -> List[String]:
+    mut tags: List[String] := []
+    mut weights: List[Int] := []
+
+    for entry in header.split(","):
+        piece := entry.trim()
+        if piece == "":
+            continue
+        mut tag := piece
+        mut weight := 1000
+        if piece.contains(";"):
+            parts := piece.split(";")
+            tag = parts[0].trim()
+            for part, index in parts:
+                if index == 0:
+                    continue
+                setting := part.trim()
+                if setting.starts_with("q="):
+                    weight = quality_to_thousandths(setting.substring(2, setting.len()))
+        if tag != "" and weight > 0:
+            tags.push(tag)
+            weights.push(weight)
+
+    # a stable insertion sort by descending weight: entries with equal quality
+    # keep the order the client wrote them in, which the header's own rules
+    # say is meaningful.
+    mut order: List[String] := []
+    mut placed: List[Int] := []
+    for tag, index in tags:
+        weight := weights[index]
+        mut at := placed.len()
+        mut scanning := true
+        while scanning:
+            if at <= 0:
+                scanning = false
+            elif placed[at - 1] < weight:
+                at = at - 1
+            else:
+                scanning = false
+        order.insert(at, tag)
+        placed.insert(at, weight)
+    return order
+
+# read a run of ascii digits, or -1 when the text is not one. the tables and
+# the header fields this parses are plain digits, so a hand-rolled reader is
+# clearer here than threading a general parser's error through.
+fn to_number(s: String) -> Int:
+    if s == "":
+        return - 1
+    mut value := 0
+    mut position := 0
+    while position < s.len():
+        digit := bit_and(ord(s[position]), 255) - 48
+        if digit < 0 or digit > 9:
+            return - 1
+        value = (value * 10) + digit
+        position = position + 1
+    return value
+
+# read a quality value such as "0.8" as thousandths, so the comparison stays
+# in integers.
+fn quality_to_thousandths(value: String) -> Int:
+    trimmed := value.trim()
+    if trimmed == "":
+        return 1000
+    parts := trimmed.split(".")
+    mut whole := 0
+    if parts.len() > 0:
+        whole = to_number(parts[0])
+    mut fraction := 0
+    if parts.len() > 1:
+        fraction = to_number(strings.first_n(parts[1] + "000", 3))
+    if whole < 0:
+        whole = 0
+    if fraction < 0:
+        fraction = 0
+    return (whole * 1000) + fraction
+
+# ---------------------------------------------------------------------------
+# plural categories
+# ---------------------------------------------------------------------------
+
+# the CLDR plural categories, in the order the rules are evaluated.
+pub fn plural_categories() -> List[String]:
+    return ["zero", "one", "two", "few", "many", "other"]
+
+# the index of the rule set for one exact tag, or -1 when there is no entry.
+fn rule_set_for_tag(tag: String) -> Int:
+    needle := tag + ":"
+    for entry in plural_tables.LOCALE_RULES.split(","):
+        if entry.starts_with(needle):
+            return to_number(entry.substring(needle.len(), entry.len()))
+    return - 1
+
+# the index of the rule set for a locale, or -1 when CLDR has no rules for it.
+#
+# most of CLDR's rules are keyed by language alone, but a couple are not:
+# european portuguese counts differently from brazilian, and CLDR says so with
+# a "pt-PT" entry alongside "pt". so this walks the fallback chain rather than
+# going straight to the language, or "pt-PT" would quietly be given "pt" rules.
+fn rule_set_for(locale: Locale) -> Int:
+    for tag in fallback_chain(locale):
+        found := rule_set_for_tag(tag)
+        if found >= 0:
+            return found
+    return - 1
+
+# evaluate one relation, such as "i%10=2..4" or "v=0", for an integer.
+#
+# for a whole number, n and i are the value itself and every other CLDR
+# operand -- the visible fraction digits and the compact exponent -- is zero.
+# that is what limits this to integers, and it is the honest limit: a rule set
+# that distinguishes 1 from 1.0 cannot be answered by an Int.
+fn relation_holds(relation: String, value: Int) -> Bool:
+    if relation == "":
+        return false
+
+    operand := relation[0]
+    mut rest := relation.substring(1, relation.len())
+
+    mut modulus := 0
+    if rest.starts_with("%"):
+        mut digits := 1
+        while digits < rest.len() and strings.is_digit(rest[digits]):
+            digits = digits + 1
+        modulus = to_number(rest.substring(1, digits))
+        rest = rest.substring(digits, rest.len())
+
+    if rest == "":
+        return false
+    negate := rest.starts_with("!")
+    ranges := rest.substring(1, rest.len())
+
+    mut left := 0
+    if operand == "n" or operand == "i":
+        left = value
+    if modulus > 0:
+        left = left % modulus
+
+    mut inside := false
+    for part in ranges.split(","):
+        if part.contains(".."):
+            bounds := part.split("..")
+            low := to_number(bounds[0])
+            high := to_number(bounds[1])
+            if low >= 0 and left >= low and left <= high:
+                inside = true
+        elif left == to_number(part):
+            inside = true
+
+    if negate:
+        return not inside
+    return inside
+
+# evaluate a whole condition: "or" groups of "and" relations.
+fn condition_holds(condition: String, value: Int) -> Bool:
+    # "-" marks a category the language does not use. it is written out rather
+    # than left blank because String.split drops empty segments, which would
+    # shift every later category into the wrong slot.
+    if condition == "" or condition == "-":
+        return false
+    for group in condition.split("|"):
+        mut all_hold := true
+        for relation in group.split("&"):
+            if not relation_holds(relation, value):
+                all_hold = false
+        if all_hold:
+            return true
+    return false
+
+# the CLDR plural category for a count in a language: one of "zero", "one",
+# "two", "few", "many" or "other".
+#
+# this is the thing english speakers reliably get wrong. english has two
+# forms, so code grows an `if n == 1` and every other language is wrong:
+# polish needs four, arabic six, japanese one. ask this instead, and hold the
+# forms in a catalog.
+#
+# a language CLDR does not cover answers "other", which is the category every
+# language has.
+pub fn plural_category(language: String, count: Int) -> String:
+    index := rule_set_for(parse_locale(language))
+    if index < 0:
+        return "other"
+
+    sets := plural_tables.PLURAL_RULES.split("/")
+    if index >= sets.len():
+        return "other"
+
+    names := plural_categories()
+    for condition, position in sets[index].split(";"):
+        if condition_holds(condition, count):
+            return names[position]
+    return "other"
+
+# ---------------------------------------------------------------------------
+# message catalogs
+# ---------------------------------------------------------------------------
+
+# a set of translated messages, keyed by locale tag and message key.
+#
+# entries are stored under one flat map with a composed key rather than a map
+# of maps, because pith's maps hold values rather than nested handles and the
+# flat shape keeps lookup a single hash.
+pub struct Catalog:
+    pub entries: Map[String, String]
+    pub default_locale: String
+
+# a catalog with nothing in it. the default locale is what a lookup falls back
+# to when the requested one has no answer at all.
+pub fn catalog(default_locale: String) -> Catalog:
+    return Catalog({}, locale_tag(parse_locale(default_locale)))
+
+fn entry_key(locale: String, key: String, category: String) -> String:
+    return locale + "\t" + key + "\t" + category
+
+# add a message for a locale.
+pub fn add(target: Catalog, locale: String, key: String, message: String):
+    target.entries.insert(entry_key(locale_tag(parse_locale(locale)), key, ""), message)
+
+# add one plural form of a message. `category` is a CLDR category: "one",
+# "other", and whichever of "zero", "two", "few" and "many" the language uses.
+# a form the language never selects is simply never read.
+pub fn add_plural(target: Catalog, locale: String, key: String, category: String, message: String):
+    target.entries.insert(entry_key(locale_tag(parse_locale(locale)), key, category), message)
+
+fn lookup(source: Catalog, locale: String, key: String, category: String) -> String?:
+    mut chain := fallback_chain(parse_locale(locale))
+    if source.default_locale != "":
+        chain.push(source.default_locale)
+    for tag in chain:
+        candidate := entry_key(tag, key, category)
+        if source.entries.contains_key(candidate):
+            return source.entries[candidate]
+    return none
+
+# the brace characters, built rather than written: a literal "{" in pith
+# source opens a string interpolation.
+fn open_brace() -> String:
+    return chr(123)
+
+fn close_brace() -> String:
+    return chr(125)
+
+# fill "{name}" placeholders from a map of values.
+#
+# an unknown placeholder is left exactly as written rather than blanked. a
+# translator who mistypes a name should see it in the output, not silently
+# lose the value.
+pub fn interpolate(template: String, values: Map[String, String]) -> String:
+    mut out := ""
+    mut position := 0
+    while position < template.len():
+        if template[position] == open_brace() and template.contains(close_brace()):
+            closing := find_closing(template, position)
+            if closing > position:
+                name := template.substring(position + 1, closing)
+                if values.contains_key(name):
+                    out = out + values[name]
+                else:
+                    out = out + template.substring(position, closing + 1)
+                position = closing + 1
+                continue
+        out = out + template[position]
+        position = position + 1
+    return out
+
+fn find_closing(template: String, start: Int) -> Int:
+    mut position := start + 1
+    while position < template.len():
+        if template[position] == close_brace():
+            return position
+        position = position + 1
+    return - 1
+
+# look up a message for a locale and fill its placeholders.
+#
+# returns the key itself when nothing answers, which makes a missing
+# translation visible in the output instead of turning into an empty string.
+pub fn message(source: Catalog, locale: String, key: String, values: Map[String, String]) -> String:
+    return interpolate(lookup(source, locale, key, "").unwrap_or(key), values)
+
+# look up the right plural form for a count and fill its placeholders.
+#
+# "count" is always available as a placeholder, so a message can say
+# "{count} files" without the caller passing it twice.
+pub fn plural(source: Catalog, locale: String, key: String, count: Int, values: Map[String, String]) -> String:
+    category := plural_category(locale, count)
+
+    mut found := lookup(source, locale, key, category)
+    if found == none:
+        # a catalog that only defines "other" should still answer, and a
+        # language with more forms than the translator filled in should fall
+        # back rather than show a key
+        found = lookup(source, locale, key, "other")
+    if found == none:
+        found = lookup(source, locale, key, "")
+
+    mut filled: Map[String, String] := {}
+    for name in values:
+        filled.insert(name, values[name])
+    filled.insert("count", count.to_string())
+    return interpolate(found.unwrap_or(key), filled)
+
+# ---------------------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------------------
+
+test "parses and canonicalises locale tags":
+    assert_eq(locale_tag(parse_locale("en")), "en")
+    assert_eq(locale_tag(parse_locale("en-US")), "en-US")
+    assert_eq(locale_tag(parse_locale("EN-us")), "en-US")
+    assert_eq(locale_tag(parse_locale("pt_BR")), "pt-BR")
+    assert_eq(locale_tag(parse_locale("zh-Hant-TW")), "zh-Hant-TW")
+    assert_eq(locale_tag(parse_locale("zh-hant")), "zh-Hant")
+    assert_eq(locale_tag(parse_locale("")), "")
+    assert_eq(parse_locale("de-DE").language, "de")
+    assert_eq(parse_locale("de-DE").region, "DE")
+    assert_eq(parse_locale("de-DE").script, "")
+
+test "falls back from specific to general":
+    chain := fallback_chain(parse_locale("zh-Hant-TW"))
+    assert_eq(chain.len(), 4)
+    assert_eq(chain[0], "zh-Hant-TW")
+    assert_eq(chain[1], "zh-Hant")
+    assert_eq(chain[2], "zh-TW")
+    assert_eq(chain[3], "zh")
+
+    simple := fallback_chain(parse_locale("en-GB"))
+    assert_eq(simple.len(), 2)
+    assert_eq(simple[0], "en-GB")
+    assert_eq(simple[1], "en")
+
+    assert_eq(fallback_chain(parse_locale("en")).len(), 1)
+
+test "matches a request against what is available":
+    available := ["en", "de", "pt-BR"]
+    assert_eq(best_match(["en-GB"], available).unwrap_or(""), "en")
+    assert_eq(best_match(["pt-BR"], available).unwrap_or(""), "pt-BR")
+    # no portuguese of any kind on offer, and matching does not invent one
+    assert(best_match(["pt-PT"], available) == none)
+    assert_eq(best_match(["fr", "de"], available).unwrap_or(""), "de")
+    assert(best_match(["fr"], ["de"]) == none)
+
+test "reads an accept-language header in preference order":
+    ordered := parse_accept_language("da, en-GB;q=0.8, en;q=0.7")
+    assert_eq(ordered.len(), 3)
+    assert_eq(ordered[0], "da")
+    assert_eq(ordered[1], "en-GB")
+    assert_eq(ordered[2], "en")
+
+    # q=0 is a refusal, not a weak preference
+    refused := parse_accept_language("de, en;q=0")
+    assert_eq(refused.len(), 1)
+    assert_eq(refused[0], "de")
+
+    # equal quality keeps the order the client wrote
+    equal := parse_accept_language("fr, de, es")
+    assert_eq(equal[0], "fr")
+    assert_eq(equal[1], "de")
+    assert_eq(equal[2], "es")
+    assert_eq(parse_accept_language("").len(), 0)
+
+test "selects cldr plural categories":
+    # english: two forms
+    assert_eq(plural_category("en", 0), "other")
+    assert_eq(plural_category("en", 1), "one")
+    assert_eq(plural_category("en", 2), "other")
+
+    # japanese: one form for everything
+    assert_eq(plural_category("ja", 0), "other")
+    assert_eq(plural_category("ja", 1), "other")
+    assert_eq(plural_category("ja", 42), "other")
+
+    # polish: one, few, many -- the case an english-shaped `if n == 1` gets
+    # wrong for almost every value
+    assert_eq(plural_category("pl", 1), "one")
+    assert_eq(plural_category("pl", 2), "few")
+    assert_eq(plural_category("pl", 3), "few")
+    assert_eq(plural_category("pl", 5), "many")
+    assert_eq(plural_category("pl", 12), "many")
+    assert_eq(plural_category("pl", 22), "few")
+    assert_eq(plural_category("pl", 25), "many")
+
+    # russian
+    assert_eq(plural_category("ru", 1), "one")
+    assert_eq(plural_category("ru", 2), "few")
+    assert_eq(plural_category("ru", 5), "many")
+    assert_eq(plural_category("ru", 11), "many")
+    assert_eq(plural_category("ru", 21), "one")
+
+    # arabic uses all six
+    assert_eq(plural_category("ar", 0), "zero")
+    assert_eq(plural_category("ar", 1), "one")
+    assert_eq(plural_category("ar", 2), "two")
+    assert_eq(plural_category("ar", 3), "few")
+    assert_eq(plural_category("ar", 11), "many")
+    assert_eq(plural_category("ar", 100), "other")
+
+    # welsh, which also uses all six, on different values
+    assert_eq(plural_category("cy", 0), "zero")
+    assert_eq(plural_category("cy", 3), "few")
+    assert_eq(plural_category("cy", 6), "many")
+
+    # a region subtag usually does not change the language's rules
+    assert_eq(plural_category("pl-PL", 5), "many")
+    # but sometimes it does, and cldr says so: european portuguese counts 0 as
+    # "other" where brazilian counts it as "one"
+    assert_eq(plural_category("pt", 0), "one")
+    assert_eq(plural_category("pt-BR", 0), "one")
+    assert_eq(plural_category("pt-PT", 0), "other")
+    assert_eq(plural_category("pt-PT", 1), "one")
+    # an unknown language falls back to the category every language has
+    assert_eq(plural_category("zzz", 5), "other")
+
+test "looks a message up through the fallback chain":
+    messages := catalog("en")
+    add(messages, "en", "greeting", "Hello")
+    add(messages, "de", "greeting", "Hallo")
+    add(messages, "pt-BR", "greeting", "Oi")
+
+    empty: Map[String, String] := {}
+    assert_eq(message(messages, "en", "greeting", empty), "Hello")
+    assert_eq(message(messages, "en-GB", "greeting", empty), "Hello")
+    assert_eq(message(messages, "de-AT", "greeting", empty), "Hallo")
+    assert_eq(message(messages, "pt-BR", "greeting", empty), "Oi")
+    # no portuguese of any kind, so the catalog default answers
+    assert_eq(message(messages, "fr", "greeting", empty), "Hello")
+    # a key nobody has shows itself rather than vanishing
+    assert_eq(message(messages, "en", "missing", empty), "missing")
+
+test "fills placeholders and leaves unknown ones alone":
+    # "{{name}}" in pith source is a literal "{name}"
+    messages := catalog("en")
+    add(messages, "en", "welcome", "Welcome, {{name}}!")
+    add(messages, "en", "both", "{{a}} and {{b}}")
+
+    mut values: Map[String, String] := {}
+    values.insert("name", "Ärger")
+    assert_eq(message(messages, "en", "welcome", values), "Welcome, Ärger!")
+
+    mut partial: Map[String, String] := {}
+    partial.insert("a", "x")
+    assert_eq(message(messages, "en", "both", partial), "x and {{b}}")
+
+    assert_eq(interpolate("no placeholders", partial), "no placeholders")
+    assert_eq(interpolate("", partial), "")
+
+test "picks the plural form the language actually uses":
+    messages := catalog("en")
+    add_plural(messages, "en", "files", "one", "{{count}} file")
+    add_plural(messages, "en", "files", "other", "{{count}} files")
+
+    add_plural(messages, "pl", "files", "one", "{{count}} plik")
+    add_plural(messages, "pl", "files", "few", "{{count}} pliki")
+    add_plural(messages, "pl", "files", "many", "{{count}} plików")
+
+    empty: Map[String, String] := {}
+    assert_eq(plural(messages, "en", "files", 1, empty), "1 file")
+    assert_eq(plural(messages, "en", "files", 0, empty), "0 files")
+    assert_eq(plural(messages, "en", "files", 5, empty), "5 files")
+
+    # the values an english-shaped `if n == 1` would get wrong
+    assert_eq(plural(messages, "pl", "files", 1, empty), "1 plik")
+    assert_eq(plural(messages, "pl", "files", 2, empty), "2 pliki")
+    assert_eq(plural(messages, "pl", "files", 5, empty), "5 plików")
+    assert_eq(plural(messages, "pl", "files", 22, empty), "22 pliki")
+    assert_eq(plural(messages, "pl", "files", 25, empty), "25 plików")
+
+test "a missing plural form falls back rather than showing a key":
+    messages := catalog("en")
+    # only "other" filled in, which is what a half-translated catalog looks
+    # like
+    add_plural(messages, "ru", "items", "other", "{{count}} штук")
+    empty: Map[String, String] := {}
+    assert_eq(plural(messages, "ru", "items", 1, empty), "1 штук")
+    assert_eq(plural(messages, "ru", "items", 5, empty), "5 штук")
+    assert_eq(plural(messages, "ru", "nothing", 5, empty), "nothing")

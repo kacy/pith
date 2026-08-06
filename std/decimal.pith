@@ -440,8 +440,13 @@ pub fn div_exact(left: Decimal, right: Decimal) -> Decimal!:
         twos = zeros
         fives = zeros
         denominator = bigint.mul_pow10(denominator, 0 - zeros)
+    # each loop below stops once the exponent passes the scale ceiling, so a
+    # denominator like 2^100000 fails on the bound rather than grinding through
+    # a hundred thousand divisions on the way to the same answer.
     mut stripping := true
     while stripping:
+        if twos > DECIMAL_MAX_SCALE:
+            fail "decimal: the exact quotient of {to_string(left)} / {to_string(right)} needs a scale past the maximum of {DECIMAL_MAX_SCALE}"
         if bigint.is_even(denominator):
             denominator = bigint.divmod_int(denominator, 2)!.quotient
             twos = twos + 1
@@ -449,6 +454,8 @@ pub fn div_exact(left: Decimal, right: Decimal) -> Decimal!:
             stripping = false
     stripping = true
     while stripping:
+        if fives > DECIMAL_MAX_SCALE:
+            fail "decimal: the exact quotient of {to_string(left)} / {to_string(right)} needs a scale past the maximum of {DECIMAL_MAX_SCALE}"
         parts := bigint.divmod_int(denominator, 5)!
         if bigint.is_zero(parts.remainder):
             denominator = parts.quotient
@@ -737,6 +744,13 @@ test "exact division refuses to round rather than doing it quietly":
     assert(div_exact(parse("1")!, parse("3")!).is_err)
     assert(div_exact(parse("1")!, parse("7")!).is_err)
     assert(div_exact(parse("1")!, parse("0")!).is_err)
+
+test "an exact quotient past the scale ceiling fails instead of grinding":
+    # 2^-40000 terminates in decimal, but not within the scale this module
+    # will build, so it is refused rather than computed at length.
+    tiny := from_bigint(bigint.pow(bigint.from_int(2), 40000)!, 0)!
+    assert(div_exact(from_int(1), tiny).is_err)
+    assert_eq(to_string(div_exact(from_int(1), from_int(1024))!), "0.0009765625")
 
 test "allocation splits a total without losing a minor unit":
     thirds := allocate(parse("10.00")!, [1, 1, 1])!

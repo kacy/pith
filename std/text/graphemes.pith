@@ -1,0 +1,399 @@
+# std.text.graphemes - splitting text the way a reader sees it
+#
+# a "character" in std.text is a unicode scalar value, which is the unit Go's
+# `for range` and Rust's `chars()` yield. it is not what a reader counts. an
+# "e" with a combining acute accent is two scalar values and one mark on
+# screen. a family emoji is seven. a flag is two. truncating a display name or
+# a chat message by scalar value can cut a mark away from its base, strip the
+# skin tone off a person, or leave half a flag.
+#
+# a grapheme cluster is the reader's unit. this module implements the extended
+# grapheme cluster rules from unicode annex 29, which is the same definition
+# Swift's `Character` and every text editor's arrow-key movement use.
+#
+# use these when the count or the cut is user-visible. use the scalar
+# functions in std.text when you are working with the text itself -- parsing,
+# validating, encoding -- where scalar values are the meaningful unit and
+# graphemes are an unnecessary cost.
+
+import std.text as text
+import std.text.tables as tables
+import std.text.grapheme_tables as grapheme_tables
+
+# grapheme cluster break classes, in the order the generated table encodes.
+fn class_other() -> Int:
+    return 0
+
+fn class_cr() -> Int:
+    return 1
+
+fn class_lf() -> Int:
+    return 2
+
+fn class_control() -> Int:
+    return 3
+
+fn class_extend() -> Int:
+    return 4
+
+fn class_zwj() -> Int:
+    return 5
+
+fn class_regional_indicator() -> Int:
+    return 6
+
+fn class_prepend() -> Int:
+    return 7
+
+fn class_spacing_mark() -> Int:
+    return 8
+
+fn class_lead() -> Int:
+    return 9
+
+fn class_vowel() -> Int:
+    return 10
+
+fn class_trail() -> Int:
+    return 11
+
+fn class_lv() -> Int:
+    return 12
+
+fn class_lvt() -> Int:
+    return 13
+
+# indic conjunct break values, which drive the rule that keeps a consonant
+# joined through a virama to the next consonant.
+fn conjunct_linker() -> Int:
+    return 1
+
+fn conjunct_consonant() -> Int:
+    return 2
+
+fn conjunct_extend() -> Int:
+    return 3
+
+# the packed properties of a code point: break class in bits 0-3, the
+# extended pictographic flag in bit 4, and indic conjunct break in bits 5-6.
+# hangul syllables are computed rather than stored, because whether one is LV
+# or LVT depends only on whether it carries a trailing consonant.
+fn properties(code_point: Int) -> Int:
+    if code_point >= 44032 and code_point < 55204:
+        if ((code_point - 44032) % 28) == 0:
+            return class_lv()
+        return class_lvt()
+
+    range_index := tables.find_containing(grapheme_tables.BREAK_RANGES, 3, grapheme_tables.break_ranges_count(), code_point)
+    if range_index < 0:
+        return 0
+    if code_point > tables.field(grapheme_tables.BREAK_RANGES, range_index, 1, 3):
+        return 0
+    return tables.field(grapheme_tables.BREAK_RANGES, range_index, 2, 3)
+
+# the grapheme cluster break class of a code point.
+pub fn break_class(code_point: Int) -> Int:
+    return bit_and(properties(code_point), 15)
+
+# true when a code point is Extended_Pictographic, the property that makes
+# emoji sequences hold together across a zero-width joiner.
+pub fn is_pictographic(code_point: Int) -> Bool:
+    return bit_and(properties(code_point) / 16, 1) == 1
+
+fn conjunct_class(code_point: Int) -> Int:
+    return bit_and(properties(code_point) / 32, 3)
+
+# the state carried across a scan, for the rules that cannot be decided from
+# the pair of code points alone.
+struct BreakState:
+    # regional indicators pair up, so whether to break between two of them
+    # depends on how many came before.
+    mut regional_indicators: Int
+    # GB9c needs to know that a consonant was followed by a linker, with only
+    # linkers and conjunct-extenders in between.
+    mut consonant_seen: Bool
+    mut linker_after_consonant: Bool
+    # GB11 needs to know the run leading into a zero-width joiner began with a
+    # pictograph.
+    mut pictographic_run: Bool
+
+fn new_state() -> BreakState:
+    return BreakState(0, false, false, false)
+
+# decide whether a cluster boundary falls between two adjacent code points.
+#
+# the rules are unicode annex 29's extended grapheme cluster rules, applied in
+# order; the first that matches decides. the comments name each rule so this
+# can be read against the standard.
+fn breaks_between(before: Int, after: Int, state: BreakState) -> Bool:
+    before_class := break_class(before)
+    after_class := break_class(after)
+
+    # GB3: CR x LF -- a windows line ending is one cluster
+    if before_class == class_cr() and after_class == class_lf():
+        return false
+
+    # GB4: (Control | CR | LF) / -- a control character stands alone
+    if before_class == class_control() or before_class == class_cr() or before_class == class_lf():
+        return true
+
+    # GB5: / (Control | CR | LF)
+    if after_class == class_control() or after_class == class_cr() or after_class == class_lf():
+        return true
+
+    # GB6/GB7/GB8: hangul jamo sequences stay together
+    if before_class == class_lead():
+        if after_class == class_lead() or after_class == class_vowel() or after_class == class_lv() or after_class == class_lvt():
+            return false
+    if before_class == class_lv() or before_class == class_vowel():
+        if after_class == class_vowel() or after_class == class_trail():
+            return false
+    if before_class == class_lvt() or before_class == class_trail():
+        if after_class == class_trail():
+            return false
+
+    # GB9: x (Extend | ZWJ) -- marks attach to what precedes them
+    if after_class == class_extend() or after_class == class_zwj():
+        return false
+
+    # GB9a: x SpacingMark
+    if after_class == class_spacing_mark():
+        return false
+
+    # GB9b: Prepend x
+    if before_class == class_prepend():
+        return false
+
+    # GB9c: a consonant joined through a linker holds onto the next consonant,
+    # which is what keeps an indic conjunct from being split down the middle
+    if state.linker_after_consonant and conjunct_class(after) == conjunct_consonant():
+        return false
+
+    # GB11: an emoji sequence joined by a zero-width joiner is one cluster,
+    # which is what makes a family emoji a single thing to a reader
+    if before_class == class_zwj() and is_pictographic(after) and state.pictographic_run:
+        return false
+
+    # GB12/GB13: regional indicators pair into a flag, and only pair
+    if before_class == class_regional_indicator() and after_class == class_regional_indicator():
+        return (state.regional_indicators % 2) == 0
+
+    # GB999: anything else breaks
+    return true
+
+# fold one code point into the scan state, after the boundary decision for it
+# has been made.
+fn advance(state: BreakState, code_point: Int, did_break: Bool):
+    code_class := break_class(code_point)
+
+    if code_class == class_regional_indicator():
+        if did_break:
+            state.regional_indicators = 1
+        else:
+            state.regional_indicators = state.regional_indicators + 1
+    else:
+        state.regional_indicators = 0
+
+    # GB9c bookkeeping: the rule only applies to a linker that follows a
+    # consonant. a linker on its own -- with no consonant opening the sequence
+    # -- does not join anything, so the chain has to start at a consonant and
+    # may only be continued by linkers and conjunct-extenders.
+    conjunct := conjunct_class(code_point)
+    if conjunct == conjunct_consonant():
+        state.consonant_seen = true
+        state.linker_after_consonant = false
+    elif conjunct == conjunct_linker():
+        if state.consonant_seen:
+            state.linker_after_consonant = true
+    elif conjunct != conjunct_extend():
+        state.consonant_seen = false
+        state.linker_after_consonant = false
+
+    # GB11 bookkeeping: a zero-width joiner only glues two pictographs when
+    # the run leading into it started with one.
+    if is_pictographic(code_point):
+        state.pictographic_run = true
+    elif code_class != class_extend() and code_class != class_zwj():
+        state.pictographic_run = false
+
+# the byte offset at which each grapheme cluster starts.
+pub fn offsets(s: String) -> List[Int]:
+    mut out: List[Int] := []
+    if s.len() == 0:
+        return out
+
+    state := new_state()
+    mut position := 0
+    mut previous := - 1
+
+    while position < s.len():
+        step := text.decode_at(s, position).unwrap_or(text.Decoded(65533, 1))
+        mut did_break := true
+        if previous >= 0:
+            did_break = breaks_between(previous, step.code_point, state)
+        if did_break:
+            out.push(position)
+        advance(state, step.code_point, did_break)
+        previous = step.code_point
+        position = position + step.size
+    return out
+
+# split a string into grapheme clusters -- what a reader would call the
+# characters of the text.
+pub fn split(s: String) -> List[String]:
+    mut out: List[String] := []
+    starts := offsets(s)
+    mut index := 0
+    while index < starts.len():
+        mut end := s.len()
+        if index + 1 < starts.len():
+            end = starts[index + 1]
+        out.push(s.substring(starts[index], end))
+        index = index + 1
+    return out
+
+# count the grapheme clusters in a string. this is the number to show a user
+# as a length, and to compare against a limit they were told about.
+pub fn count(s: String) -> Int:
+    return offsets(s).len()
+
+# keep at most `max_clusters` grapheme clusters. unlike a scalar-value
+# truncation, this never strips a combining mark from its base, splits a flag,
+# or removes the skin tone from a person.
+pub fn truncate(s: String, max_clusters: Int) -> String:
+    if max_clusters <= 0:
+        return ""
+    starts := offsets(s)
+    if max_clusters >= starts.len():
+        return s
+    return s.substring(0, starts[max_clusters])
+
+# truncate to `max_clusters` clusters and mark the cut. the suffix counts
+# against the limit, measured in clusters as well.
+pub fn truncate_with(s: String, max_clusters: Int, suffix: String) -> String:
+    if count(s) <= max_clusters:
+        return s
+    suffix_clusters := count(suffix)
+    if max_clusters <= suffix_clusters:
+        return truncate(suffix, max_clusters)
+    return truncate(s, max_clusters - suffix_clusters) + suffix
+
+# run every case in the official grapheme break test file, which the
+# generator packs into the tables so this does not need the UCD file at hand.
+# each entry is a code point followed by a marker: S starts a case, B is a
+# boundary inside one, C is no boundary.
+fn same_offsets(found: List[Int], wanted: List[Int]) -> Bool:
+    if found.len() != wanted.len():
+        return false
+    mut index := 0
+    while index < found.len():
+        if found[index] != wanted[index]:
+            return false
+        index = index + 1
+    return true
+
+fn conformance_failures() -> Int:
+    data := grapheme_tables.BREAK_TESTS
+    total := grapheme_tables.break_tests_count()
+
+    mut failures := 0
+    mut input := ""
+    mut wanted: List[Int] := []
+    mut index := 0
+
+    while index <= total:
+        mut marker := "S"
+        if index < total:
+            marker = data[(index * 5) + 4]
+
+        # an "S" marker opens a new case, so the one before it is complete
+        if marker == "S" and input.len() > 0:
+            if not same_offsets(offsets(input), wanted):
+                failures = failures + 1
+            input = ""
+            wanted = []
+
+        if index < total:
+            if marker != "C":
+                wanted.push(input.len())
+            input = input + text.encode(tables.field_at(data, index * 5)).unwrap_or("?")
+        index = index + 1
+    return failures
+
+test "matches the official grapheme break test file":
+    assert_eq(grapheme_tables.break_tests_count(), 3009)
+    assert_eq(conformance_failures(), 0)
+
+test "counts ascii one cluster per character":
+    assert_eq(count(""), 0)
+    assert_eq(count("hello"), 5)
+    assert_eq(split("abc").len(), 3)
+    assert_eq(split("abc").get(1).unwrap_or(""), "b")
+
+test "keeps a combining mark with its base":
+    # "e" plus a combining acute is two scalar values but one cluster
+    decomposed := "e" + chr(204) + chr(129)
+    assert_eq(text.char_count(decomposed), 2)
+    assert_eq(count(decomposed), 1)
+    assert_eq(split(decomposed).get(0).unwrap_or(""), decomposed)
+    # and truncating to one cluster keeps the accent
+    assert_eq(truncate(decomposed, 1), decomposed)
+    # where truncating by scalar value would have dropped it
+    assert_eq(text.truncate(decomposed, 1), "e")
+
+test "keeps a zero-width-joiner emoji sequence together":
+    # family: man, ZWJ, woman, ZWJ, girl -- five scalar values, one cluster
+    family := "👨" + chr(226) + chr(128) + chr(141) + "👩" + chr(226) + chr(128) + chr(141) + "👧"
+    assert_eq(text.char_count(family), 5)
+    assert_eq(count(family), 1)
+    assert_eq(truncate(family, 1), family)
+
+test "keeps a flag's two regional indicators together":
+    # regional indicators D and E make the german flag
+    flag := "🇩🇪"
+    assert_eq(text.char_count(flag), 2)
+    assert_eq(count(flag), 1)
+    # but four of them are two flags, not one
+    assert_eq(count("🇩🇪🇫🇷"), 2)
+    assert_eq(split("🇩🇪🇫🇷").get(0).unwrap_or(""), "🇩🇪")
+
+test "keeps a skin tone with its person":
+    # waving hand plus a medium-dark skin tone modifier
+    waving := "👋" + "🏾"
+    assert_eq(text.char_count(waving), 2)
+    assert_eq(count(waving), 1)
+    assert_eq(truncate(waving, 1), waving)
+
+test "joins an indic conjunct, but only from a consonant":
+    # devanagari KA, virama, SSA is one cluster: the virama joins the two
+    # consonants into a conjunct that a reader sees as a single form
+    assert_eq(count("क" + "्" + "ष"), 1)
+    # but a virama with no consonant opening the sequence joins nothing, so
+    # this is two clusters. the chain has to start at a consonant.
+    assert_eq(count("्" + "क"), 2)
+    assert_eq(count("a" + "्" + "त"), 2)
+
+test "treats a windows line ending as one cluster":
+    assert_eq(count(chr(13) + chr(10)), 1)
+    assert_eq(count(chr(10) + chr(13)), 2)
+
+test "keeps a hangul syllable's jamo together":
+    assert_eq(count("ᄒ" + "ᅡ" + "ᆫ"), 1)
+    assert_eq(count("한"), 1)
+    assert_eq(count("한글"), 2)
+
+test "truncates on cluster boundaries":
+    text_with_marks := "a" + "é" + "🇩🇪" + "b"
+    assert_eq(count(text_with_marks), 4)
+    assert_eq(truncate(text_with_marks, 2), "aé")
+    assert_eq(truncate(text_with_marks, 3), "aé🇩🇪")
+    assert_eq(truncate(text_with_marks, 0), "")
+    assert_eq(truncate(text_with_marks, 99), text_with_marks)
+    assert_eq(truncate_with("hello world", 8, "..."), "hello...")
+
+test "reports cluster offsets":
+    starts := offsets("a" + "é" + "b")
+    assert_eq(starts.len(), 3)
+    assert_eq(starts.get(0).unwrap_or(- 1), 0)
+    assert_eq(starts.get(1).unwrap_or(- 1), 1)
+    assert_eq(starts.get(2).unwrap_or(- 1), 3)

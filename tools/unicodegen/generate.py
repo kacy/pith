@@ -279,6 +279,157 @@ def verify(pairs, runs, class_map, class_runs, decompositions, compositions):
 
 
 # ---------------------------------------------------------------------------
+# grapheme cluster breaking
+# ---------------------------------------------------------------------------
+
+# Grapheme_Cluster_Break values, in the order std.text.graphemes expects.
+GCB = {
+    name: index
+    for index, name in enumerate(
+        [
+            "Other",
+            "CR",
+            "LF",
+            "Control",
+            "Extend",
+            "ZWJ",
+            "Regional_Indicator",
+            "Prepend",
+            "SpacingMark",
+            "L",
+            "V",
+            "T",
+            "LV",
+            "LVT",
+        ]
+    )
+}
+
+INCB = {"Linker": 1, "Consonant": 2, "Extend": 3}
+
+# Hangul syllables are LV or LVT depending on whether they carry a trailing
+# consonant, which is arithmetic. Leaving all 11172 of them out of the table
+# removes about 800 ranges.
+HANGUL_FIRST = 0xAC00
+HANGUL_LAST = 0xD7A3
+
+
+def property_ranges(text):
+    """Yield (first, last, fields) for a UCD file whose keys are ranges."""
+    for fields in ucd_rows(text):
+        bounds = fields[0].split("..")
+        yield int(bounds[0], 16), int(bounds[-1], 16), fields[1:]
+
+
+def build_grapheme_breaks():
+    """One range table carrying every property grapheme breaking consults.
+
+    A code point's break class, whether it is Extended_Pictographic, and its
+    Indic_Conjunct_Break value all get packed into one flags field, so a
+    segmenter needs a single lookup per character rather than three.
+    """
+    break_class = {}
+    for first, last, fields in property_ranges(fetch("auxiliary/GraphemeBreakProperty.txt")):
+        if first >= HANGUL_FIRST and last <= HANGUL_LAST:
+            continue
+        for code in range(first, last + 1):
+            break_class[code] = GCB[fields[0]]
+
+    pictographic = {}
+    for first, last, fields in property_ranges(fetch("emoji/emoji-data.txt")):
+        if fields[0] == "Extended_Pictographic":
+            for code in range(first, last + 1):
+                pictographic[code] = 1
+
+    conjunct = {}
+    for first, last, fields in property_ranges(fetch("DerivedCoreProperties.txt")):
+        if fields[0] == "InCB":
+            for code in range(first, last + 1):
+                conjunct[code] = INCB[fields[1]]
+
+    def flags(code):
+        return break_class.get(code, 0) | (pictographic.get(code, 0) << 4) | (conjunct.get(code, 0) << 5)
+
+    codes = sorted(set(break_class) | set(pictographic) | set(conjunct))
+    ranges = []
+    index = 0
+    while index < len(codes):
+        end = index + 1
+        while (
+            end < len(codes)
+            and codes[end] == codes[end - 1] + 1
+            and flags(codes[end]) == flags(codes[index])
+        ):
+            end += 1
+        ranges.append((codes[index], codes[end - 1], flags(codes[index])))
+        index = end
+    return ranges, flags
+
+
+def build_break_test_data():
+    """Pack the official break tests so they can be run as a committed test.
+
+    Each code point becomes five characters: four for its value and one marker
+    saying whether a cluster boundary falls before it -- "S" for the start of a
+    new case, "B" for a boundary inside one, "C" for no boundary. That is
+    enough for a test to rebuild both the input and the expected clustering
+    without shipping the UCD file.
+    """
+    out = []
+    for line in fetch("auxiliary/GraphemeBreakTest.txt").splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        tokens = line.split()
+        first = True
+        boundary = False
+        skip = False
+        pending = []
+        for token in tokens:
+            if token == "\u00f7":
+                boundary = True
+            elif token == "\u00d7":
+                boundary = False
+            else:
+                code = int(token, 16)
+                if code == 0:
+                    skip = True
+                marker = "S" if first else ("B" if boundary else "C")
+                pending.append(encode_field(code) + marker)
+                first = False
+        if not skip:
+            out.extend(pending)
+    return "".join(out)
+
+
+def load_break_tests():
+    """The official grapheme break test file, as (text, expected clusters)."""
+    cases = []
+    for line in fetch("auxiliary/GraphemeBreakTest.txt").splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        # the format is "÷ 0061 × 0301 ÷", where ÷ is a break and × is not
+        clusters = []
+        current = []
+        for token in line.split():
+            if token == "÷":
+                if current:
+                    clusters.append("".join(current))
+                current = []
+            elif token == "×":
+                continue
+            else:
+                current.append(chr(int(token, 16)))
+        if current:
+            clusters.append("".join(current))
+        text = "".join(clusters)
+        if text and "\x00" not in text:
+            cases.append((text, clusters))
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # emit
 # ---------------------------------------------------------------------------
 
@@ -299,14 +450,21 @@ HEADER = """# generated by tools/unicodegen/generate.py -- do not edit by hand
 def emit(path, version, constants):
     body = [HEADER.format(version=version)]
     for name, doc, arity, packed in constants:
-        count = len(packed) // (arity * FIELD_CHARS)
         body.append("")
         for line in doc.strip().splitlines():
             body.append(f"# {line}".rstrip())
-        body.append(f"# {count} records of {arity} fields.")
+        if arity:
+            count = len(packed) // (arity * FIELD_CHARS)
+            body.append(f"# {count} records of {arity} fields.")
+        else:
+            count = len(packed) // (FIELD_CHARS + 1)
+            body.append(f"# {count} entries.")
         body.append(f'pub {name} := "{packed}"')
         body.append("")
-        body.append(f"# the number of records in {name}.")
+        if arity:
+            body.append(f"# the number of records in {name}.")
+        else:
+            body.append(f"# the number of entries in {name}.")
         body.append(f"pub fn {name.lower()}_count() -> Int:")
         body.append(f"    return {count}")
     with open(path, "w", encoding="utf-8") as handle:
@@ -326,6 +484,7 @@ def main():
         raise SystemExit("run this from the repository root")
 
     pairs, fold_runs = build_case_folding()
+    grapheme_ranges, grapheme_flags = build_grapheme_breaks()
     class_map, class_runs = build_combining_classes()
     decompositions, decomposition_records = build_decompositions()
     composition_records = build_compositions(decompositions)
@@ -377,13 +536,40 @@ def main():
         ],
     )
 
+    grapheme_size = emit(
+        os.path.join(STD_TEXT, "grapheme_tables.pith"),
+        UNICODE_VERSION,
+        [
+            (
+                "BREAK_RANGES",
+                "grapheme cluster breaking properties, as (first, last, flags).\n"
+                "flags packs the Grapheme_Cluster_Break value in bits 0-3, the\n"
+                "Extended_Pictographic flag in bit 4, and Indic_Conjunct_Break in\n"
+                "bits 5-6. hangul syllables are excluded: LV and LVT are arithmetic.",
+                3,
+                pack(grapheme_ranges, 3),
+            ),
+            (
+                "BREAK_TESTS",
+                "the official grapheme break test cases, so the segmenter can be\n"
+                "checked against the standard without shipping the UCD file.\n"
+                "five characters per code point: four for the value, then S to\n"
+                "start a case, B for a boundary within one, C for no boundary.",
+                0,
+                build_break_test_data(),
+            ),
+        ],
+    )
+
     print(f"unicode {UNICODE_VERSION}")
     print(f"  fold runs        {len(fold_runs):5d}  (from {len(pairs)} pairs)")
     print(f"  combining runs   {len(class_runs):5d}")
     print(f"  decompositions   {len(decomposition_records):5d}")
     print(f"  compositions     {len(composition_records):5d}")
+    print(f"  grapheme ranges  {len(grapheme_ranges):5d}")
     print(f"  case_tables.pith {case_size:6d} bytes")
     print(f"  norm_tables.pith {norm_size:6d} bytes")
+    print(f"  grapheme_tables.pith {grapheme_size:6d} bytes")
 
 
 if __name__ == "__main__":

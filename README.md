@@ -147,6 +147,9 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling — plus db, a
 pooled high-level layer over a connection url, see [docs/db.md](docs/db.md)),
+exact numbers (bigint, decimal — arbitrary precision and fixed-point, so a
+NUMERIC column round-trips without rounding through a float, see
+[docs/numbers.md](docs/numbers.md)),
 data (json,
 toml, yaml, csv, config, table, see [docs/yaml.md](docs/yaml.md) for the
 yaml subset), bytes and crypto (hash, checksum, encoding,

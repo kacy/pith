@@ -414,20 +414,25 @@ pub fn to_int(value: BigInt) -> Int?:
         return value.sign * value.small
     if value.limbs.len() > 3:
         return none
-    magnitude := value.limbs[2] * 1000000000000000000
-    if magnitude / 1000000000000000000 != value.limbs[2]:
-        return none
-    # the partial sums of a value that fits are all in range, so widening the
-    # limbs in order cannot overflow once the total is known to fit.
+    # decide it against the boundary first: once the magnitude is known to fit,
+    # every partial sum below is a non-negative piece of a value in range, so
+    # combining the limbs in order cannot overflow.
     if value.sign > 0:
         if compare_magnitude(value, int_max_magnitude()) > 0:
             return none
-        return magnitude + value.limbs[1] * 1000000000 + value.limbs[0]
-    if compare_magnitude(value, int_min_magnitude()) > 0:
+        return combine_limbs(value)
+    order := compare_magnitude(value, int_min_magnitude())
+    if order > 0:
         return none
-    if compare_magnitude(value, int_min_magnitude()) == 0:
+    if order == 0:
+        # the minimum Int's magnitude is one past the maximum's, so it has no
+        # positive form to negate; name it directly.
         return 0 - 9223372036854775807 - 1
-    return 0 - (magnitude + value.limbs[1] * 1000000000 + value.limbs[0])
+    return 0 - combine_limbs(value)
+
+# a magnitude of exactly three limbs, already known to fit, as a machine Int.
+fn combine_limbs(value: BigInt) -> Int:
+    return value.limbs[2] * 1000000000000000000 + value.limbs[1] * 1000000000 + value.limbs[0]
 
 # the nearest Float to the value. this is lossy for anything past 2^53, and
 # infinite past a Float's range — it is a display and estimation conversion,

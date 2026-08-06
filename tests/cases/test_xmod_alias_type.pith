@@ -1,0 +1,34 @@
+# a type that crosses two module boundaries keeps resolving when the caller
+# picks its own alias for the module that declares it.
+#
+# std.sql returns a `decimal.Decimal` from `row.decimal(name)`, spelled with
+# std.sql's own alias for std.decimal. that spelling travels with the signature,
+# so a caller who imports std.decimal under a different name used to get
+# `error[E202]: unknown type: decimal.Decimal` pointing at a name they never
+# wrote. resolving the alias as a module basename recovers it.
+
+import std.sql as sql
+import std.decimal as money
+import std.bigint as integers
+
+fn main() -> Int!:
+    row := sql.row([sql.numeric(money.parse("12345678901234567.89")!)], ["amount"])
+    amount := row.decimal("amount")
+    print("amount: {money.to_string(amount)}")
+    print("scale: {money.scale_of(amount)}")
+
+    doubled := money.add(amount, amount)
+    print("doubled: {money.to_string(doubled)}")
+
+    # the same for a type two hops away: std.decimal's unscaled value is a
+    # std.bigint.BigInt, spelled with std.decimal's alias.
+    unscaled := money.unscaled_of(amount)
+    print("unscaled: {integers.to_string(unscaled)}")
+    print("digits: {integers.digit_count(unscaled)}")
+
+    optional := row.opt_decimal("amount")
+    if optional == none:
+        print("optional: none")
+    else:
+        print("optional: {money.to_string(optional.value())}")
+    return 0

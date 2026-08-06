@@ -1116,6 +1116,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_empty_list_field_ownership \
 	tests/cases/test_list_bytes_ownership \
 	tests/cases/test_container_eviction_release \
+	tests/cases/test_sql_numeric \
 	tests/cases/test_index_key_ownership \
 	tests/cases/test_direct_store_ownership \
 	tests/cases/test_struct_store_ownership \

@@ -85,6 +85,7 @@ type you expect:
 row.int("id")        # Int, by name
 row.text("name")     # String
 row.float("score")   # Float
+row.decimal("amount")# std.decimal.Decimal, exact
 row.bool("active")   # Bool
 
 row.int_at(0)        # the same, by index
@@ -103,8 +104,45 @@ else:
     print("{score.value()}")
 ```
 
-`opt_int`, `opt_float`, `opt_text`, and `opt_bool` all return `none` for a null
-or missing column, with `_at` variants for positional access.
+`opt_int`, `opt_float`, `opt_decimal`, `opt_text`, and `opt_bool` all return
+`none` for a null or missing column, with `_at` variants for positional access.
+
+## exact numbers
+
+a `NUMERIC` (postgres) or `DECIMAL` (mysql) column is exact by definition, and
+it decodes to an exact `std.decimal.Decimal` rather than to a `Float`. read it
+with `row.decimal(name)`:
+
+```pith
+import std.decimal as decimal
+
+mut balance := decimal.zero()
+for row in handle.query("select amount from ledger", [])!:
+    balance = decimal.add(balance, row.decimal("amount"))
+print(decimal.to_string(balance))
+```
+
+**do not read a numeric column with `row.float`.** a `Float` cannot hold most
+decimal fractions and runs out of integers past 2^53, so a `NUMERIC(20,2)`
+balance of `12345678901234567.89` arrives as `12345678901234568` — cents gone,
+integer part off by one, and no error anywhere. the coercion still exists so
+code written before `Numeric` did keeps compiling; it is not a good idea.
+
+`float4` and `float8` still decode to `Value.Real`, because those genuinely are
+floats.
+
+write a decimal back by binding its text, which is exact:
+
+```pith
+handle.exec("insert into ledger (amount) values ($1)", [decimal.to_string(amount)])!
+```
+
+a value the driver cannot parse as a number — postgres sends `NaN`, `Infinity`
+and `-Infinity` for a numeric — comes back as `Value.Text` holding the original
+string, never as a fabricated zero.
+
+see [docs/numbers.md](numbers.md) for when to reach for `Int`, `Float`,
+`Decimal`, and `BigInt`, and for the rounding modes.
 
 ## writes
 

@@ -1,0 +1,990 @@
+# std.bigint — arbitrary-precision signed integers.
+#
+# an `Int` is 64 bits and wraps; a `Float` is a binary double and rounds. when
+# a value has to be exact and may not fit — a ledger total, a factorial, an id
+# space wider than 2^63 — this is the type that holds it. it is the foundation
+# std.decimal is built on, and the two are separate on purpose: plenty of
+# callers want one and not the other.
+#
+#   import std.bigint as bigint
+#
+#   total := bigint.parse("170141183460469231731687303715884105727")!
+#   doubled := bigint.mul(total, bigint.from_int(2))
+#   print(bigint.to_string(doubled))
+#
+# ## representation, and why base 10^9
+#
+# a BigInt is a sign and a magnitude. the magnitude lives in one of two forms:
+#
+#   small    an ordinary Int, used whenever the magnitude has at most 18
+#            decimal digits. no list, no loop — this is the fast path, and it
+#            covers every value a request handler is likely to touch.
+#   limbs    a list of base-10^9 digits, least significant first, used for
+#            anything larger.
+#
+# the form is canonical: a magnitude that fits in `small` is never stored as
+# limbs, so comparison can decide on the form alone and equal values always
+# have equal fields.
+#
+# base 10^9 rather than a power of two is a deliberate trade. pith has no
+# 128-bit multiply and no unsigned Int, so a limb has to be small enough that
+# `limb * limb + carry` stays inside a signed 64-bit Int; that rules out 2^32
+# and leaves roughly 31 bits to play with. spending those bits on 10^9 instead
+# of 2^31 makes decimal conversion — parsing a NUMERIC off a postgres wire and
+# printing it back — a linear regrouping of digits rather than a quadratic
+# chain of divisions, and makes scaling by a power of ten (which std.decimal
+# does on every mixed-scale add) a limb shift. that is the workload this type
+# exists for.
+#
+# the cost of that choice: there are no bitwise or shift operations here.
+# `bit_and` and friends in std.bits work on Int and are the right tool for bit
+# twiddling; a bigint is for arithmetic on numbers too large for one.
+#
+# ## not for cryptography
+#
+# nothing here is constant-time, and there is no modular exponentiation. key
+# material and signatures belong in std.crypto, which is backed by a reviewed
+# implementation. using this module for secrets would leak them through timing.
+#
+# ## division
+#
+# `divmod` truncates toward zero and gives the remainder the sign of the
+# dividend, matching pith's own `/` and `%` on Int. it fails on a zero divisor
+# rather than returning a fabricated value.
+
+# the limb base. every limb holds one base-10^9 digit, so `limb * limb` peaks
+# just under 10^18 and stays well inside a signed 64-bit Int.
+BIGINT_BASE := 1000000000
+
+# decimal digits carried by one limb.
+BIGINT_BASE_DIGITS := 9
+
+# the largest magnitude kept in the `small` field: 10^18 - 1. two of these can
+# be added without overflowing an Int, which is what makes the fast path safe.
+BIGINT_SMALL_MAX := 999999999999999999
+
+# the ceiling on a magnitude, in limbs. this bounds what an attacker-supplied
+# exponent can allocate: 200000 limbs is 1.8 million decimal digits, an order
+# of magnitude past postgres's own numeric limit, and about 1.6 MB.
+BIGINT_MAX_LIMBS := 200000
+
+# an arbitrary-precision signed integer. build one with `from_int` or `parse`
+# rather than naming the fields; the two magnitude forms carry an invariant
+# that the constructors maintain.
+pub struct BigInt:
+    sign: Int
+    small: Int
+    limbs: List[Int]
+
+# a quotient and its remainder, the pair `divmod` returns.
+pub struct DivMod:
+    pub quotient: BigInt
+    pub remainder: BigInt
+
+# an internal quotient/remainder pair in raw limb form.
+struct LimbPair:
+    quotient: List[Int]
+    remainder: List[Int]
+
+# --- construction ---
+
+# the value zero.
+pub fn zero() -> BigInt:
+    return BigInt(sign: 0, small: 0, limbs: [])
+
+# the value one.
+pub fn one() -> BigInt:
+    return BigInt(sign: 1, small: 1, limbs: [])
+
+# the BigInt equal to a machine Int. exact for every Int, including the most
+# negative one, whose magnitude has no Int representation.
+pub fn from_int(value: Int) -> BigInt:
+    if value == 0:
+        return zero()
+    if value > 0:
+        if value <= BIGINT_SMALL_MAX:
+            return BigInt(sign: 1, small: value, limbs: [])
+        wide := split_magnitude(value)
+        return from_limbs(1, wide)
+    # negating first would overflow at the minimum Int, so peel limbs off the
+    # negative value directly: `%` keeps the sign, and `/` shrinks toward zero.
+    mut raw: List[Int] := []
+    mut rest := value
+    while rest != 0:
+        raw.push(0 - (rest % BIGINT_BASE))
+        rest = rest / BIGINT_BASE
+    return from_limbs(-1, raw)
+
+# parse a decimal integer: an optional `+` or `-` followed by one or more
+# digits. leading zeros are allowed. anything else — whitespace, a decimal
+# point, an exponent, an empty string — fails rather than yielding a zero.
+pub fn parse(text: String) -> BigInt!:
+    if text.len() == 0:
+        fail "bigint: cannot parse an empty string"
+    mut start := 0
+    mut sign := 1
+    # `ord(text[i])` compiles to a byte load; comparing against the character
+    # codes rather than one-character strings keeps the scan from allocating a
+    # String per digit, which is the whole cost of parsing a short number.
+    first := ord(text[0])
+    if first == 45:
+        sign = -1
+        start = 1
+    elif first == 43:
+        start = 1
+    if start >= text.len():
+        fail "bigint: '{text}' has a sign but no digits"
+    mut index := start
+    while index < text.len():
+        code := ord(text[index])
+        if code < 48 or code > 57:
+            fail "bigint: '{text}' is not a decimal integer"
+        index = index + 1
+    if start == 0:
+        # the overwhelmingly common shape, and slicing it would copy the string
+        # for nothing.
+        return from_digits(sign, text)
+    return from_digits(sign, text.substring(start, text.len()))
+
+# --- inspection ---
+
+# -1, 0, or 1 as the value is negative, zero, or positive.
+pub fn sign_of(value: BigInt) -> Int:
+    return value.sign
+
+# true when the value is zero.
+pub fn is_zero(value: BigInt) -> Bool:
+    return value.sign == 0
+
+# true when the value is a multiple of two. zero is even.
+pub fn is_even(value: BigInt) -> Bool:
+    if value.limbs.len() == 0:
+        return value.small % 2 == 0
+    # the base is even, so every limb above the first contributes an even
+    # amount and parity is decided by the lowest limb alone.
+    return value.limbs[0] % 2 == 0
+
+# how many decimal digits the magnitude is written with. zero counts as one
+# digit, matching how a number is printed.
+pub fn digit_count(value: BigInt) -> Int:
+    if value.sign == 0:
+        return 1
+    if value.limbs.len() == 0:
+        return decimal_width(value.small)
+    top := value.limbs.len() - 1
+    return top * BIGINT_BASE_DIGITS + decimal_width(value.limbs[top])
+
+# how many zeros the magnitude ends in. zero has none, so that stripping
+# trailing zeros from it terminates.
+pub fn trailing_zeros(value: BigInt) -> Int:
+    if value.sign == 0:
+        return 0
+    if value.limbs.len() == 0:
+        return int_trailing_zeros(value.small)
+    mut count := 0
+    mut index := 0
+    while index < value.limbs.len():
+        if value.limbs[index] != 0:
+            return count + int_trailing_zeros(value.limbs[index])
+        count = count + BIGINT_BASE_DIGITS
+        index = index + 1
+    return count
+
+# --- comparison ---
+
+# -1, 0, or 1 as `left` is less than, equal to, or greater than `right`.
+pub fn compare(left: BigInt, right: BigInt) -> Int:
+    if left.sign != right.sign:
+        if left.sign < right.sign:
+            return - 1
+        return 1
+    if left.sign == 0:
+        return 0
+    order := compare_magnitude(left, right)
+    if left.sign < 0:
+        return 0 - order
+    return order
+
+# true when the two values are numerically equal.
+pub fn equals(left: BigInt, right: BigInt) -> Bool:
+    return compare(left, right) == 0
+
+# --- arithmetic ---
+
+# the magnitude, as a non-negative BigInt.
+pub fn abs(value: BigInt) -> BigInt:
+    if value.sign >= 0:
+        return value
+    return BigInt(sign: 1, small: value.small, limbs: value.limbs)
+
+# the value with its sign flipped. negating zero gives zero.
+pub fn negate(value: BigInt) -> BigInt:
+    if value.sign == 0:
+        return value
+    return BigInt(sign: 0 - value.sign, small: value.small, limbs: value.limbs)
+
+# the sum of two values. exact.
+pub fn add(left: BigInt, right: BigInt) -> BigInt:
+    if left.sign == 0:
+        return right
+    if right.sign == 0:
+        return left
+    if left.sign == right.sign:
+        return add_magnitudes(left.sign, left, right)
+    order := compare_magnitude(left, right)
+    if order == 0:
+        return zero()
+    if order > 0:
+        return sub_magnitudes(left.sign, left, right)
+    return sub_magnitudes(right.sign, right, left)
+
+# the difference of two values. exact.
+pub fn sub(left: BigInt, right: BigInt) -> BigInt:
+    return add(left, negate(right))
+
+# the product of two values. exact.
+pub fn mul(left: BigInt, right: BigInt) -> BigInt:
+    if left.sign == 0 or right.sign == 0:
+        return zero()
+    sign := left.sign * right.sign
+    if left.limbs.len() == 0 and right.limbs.len() == 0:
+        # both magnitudes fit in an Int; take the machine multiply when the
+        # product does too. the test divides rather than multiplying, so it
+        # cannot itself overflow.
+        if left.small <= BIGINT_SMALL_MAX / right.small:
+            return BigInt(sign: sign, small: left.small * right.small, limbs: [])
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    product := mul_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, product)
+
+# the quotient and remainder of `dividend / divisor`. the quotient truncates
+# toward zero and the remainder takes the sign of the dividend, so
+# `quotient * divisor + remainder == dividend` always holds. fails on a zero
+# divisor.
+pub fn divmod(dividend: BigInt, divisor: BigInt) -> DivMod!:
+    if divisor.sign == 0:
+        fail "bigint: division by zero"
+    if dividend.sign == 0:
+        return DivMod(quotient: zero(), remainder: zero())
+    if compare_magnitude(dividend, divisor) < 0:
+        return DivMod(quotient: zero(), remainder: dividend)
+    quotient_sign := dividend.sign * divisor.sign
+    if dividend.limbs.len() == 0 and divisor.limbs.len() == 0:
+        return DivMod(
+            quotient: signed_small(quotient_sign, dividend.small / divisor.small),
+            remainder: signed_small(dividend.sign, dividend.small % divisor.small))
+    dividend_limbs := magnitude_limbs(dividend)
+    divisor_limbs := magnitude_limbs(divisor)
+    parts := divmod_limbs(dividend_limbs, divisor_limbs)
+    return DivMod(
+        quotient: from_limbs(quotient_sign, parts.quotient),
+        remainder: from_limbs(dividend.sign, parts.remainder))
+
+# the quotient and remainder of a division by a machine Int, on the same
+# truncating convention as `divmod`. fails on a zero divisor.
+pub fn divmod_int(dividend: BigInt, divisor: Int) -> DivMod!:
+    return divmod(dividend, from_int(divisor))
+
+# `base` raised to a non-negative power, by squaring. fails on a negative
+# exponent, and on a result past the module's size ceiling.
+pub fn pow(base: BigInt, exponent: Int) -> BigInt!:
+    if exponent < 0:
+        fail "bigint: pow needs a non-negative exponent, got {exponent}"
+    if exponent == 0:
+        return one()
+    mut result := one()
+    mut factor := base
+    mut remaining := exponent
+    while remaining > 0:
+        if remaining % 2 == 1:
+            result = mul(result, factor)
+            check_size(result)!
+        remaining = remaining / 2
+        if remaining > 0:
+            factor = mul(factor, factor)
+            check_size(factor)!
+    return result
+
+# --- powers of ten ---
+#
+# scaling by a power of ten is what std.decimal spends its time on, so these
+# regroup limbs instead of running a general multiply or division.
+
+# 10 raised to a non-negative power. fails on a negative exponent, and on a
+# result past the module's size ceiling.
+pub fn ten_pow(exponent: Int) -> BigInt!:
+    if exponent < 0:
+        fail "bigint: ten_pow needs a non-negative exponent, got {exponent}"
+    check_digits(exponent + 1)!
+    whole := exponent / BIGINT_BASE_DIGITS
+    rest := exponent % BIGINT_BASE_DIGITS
+    mut raw := zeros(whole)
+    raw.push(int_pow10(rest))
+    return from_limbs(1, raw)
+
+# the value multiplied by 10^exponent, moving the decimal point right. a
+# negative exponent moves it left instead, which for an integer means dividing
+# and truncating toward zero the way `divmod` does — reach for `divmod_pow10`
+# when the dropped digits matter.
+#
+# this is total on purpose. the result is only as large as the value the caller
+# already holds plus the exponent they chose, so there is no ceiling here; the
+# guards live on `ten_pow` and `pow`, which turn a small input into a large one.
+pub fn mul_pow10(value: BigInt, exponent: Int) -> BigInt:
+    if value.sign == 0:
+        return zero()
+    if exponent == 0:
+        return value
+    if exponent < 0:
+        return shift_right(value, 0 - exponent)
+    if value.limbs.len() == 0 and exponent <= 18:
+        factor := int_pow10(exponent)
+        if value.small <= BIGINT_SMALL_MAX / factor:
+            return BigInt(sign: value.sign, small: value.small * factor, limbs: [])
+    whole := exponent / BIGINT_BASE_DIGITS
+    rest := exponent % BIGINT_BASE_DIGITS
+    mut raw := zeros(whole)
+    for limb in magnitude_limbs(value):
+        raw.push(limb)
+    if rest > 0:
+        raw = mul_limb_grow(raw, int_pow10(rest))
+    return from_limbs(value.sign, raw)
+
+# the value divided by 10^exponent, truncated toward zero, with the remainder
+# alongside it. the remainder takes the sign of the value, matching `divmod`.
+# fails on a negative exponent, which has no meaning here — `mul_pow10` is the
+# one that reads a negative exponent as a shift the other way.
+pub fn divmod_pow10(value: BigInt, exponent: Int) -> DivMod!:
+    if exponent < 0:
+        fail "bigint: divmod_pow10 needs a non-negative exponent, got {exponent}"
+    if exponent == 0:
+        return DivMod(quotient: value, remainder: zero())
+    if value.sign == 0:
+        return DivMod(quotient: zero(), remainder: zero())
+    return split_pow10(value, exponent)
+
+# drop `count` decimal digits off the bottom, truncating toward zero. the
+# caller has already ruled out a zero value and a non-positive count.
+fn shift_right(value: BigInt, count: Int) -> BigInt:
+    return split_pow10(value, count).quotient
+
+# split a non-zero magnitude at a decimal digit position. whole limbs move to
+# the remainder untouched, and only the limb straddling the split is divided,
+# which is what makes scaling linear rather than a general division.
+fn split_pow10(value: BigInt, exponent: Int) -> DivMod:
+    whole := exponent / BIGINT_BASE_DIGITS
+    rest := exponent % BIGINT_BASE_DIGITS
+    source := magnitude_limbs(value)
+    if whole >= source.len():
+        return DivMod(quotient: zero(), remainder: value)
+    mut low: List[Int] := []
+    mut index := 0
+    while index < whole:
+        low.push(source[index])
+        index = index + 1
+    mut high: List[Int] := []
+    while index < source.len():
+        high.push(source[index])
+        index = index + 1
+    if rest == 0:
+        return DivMod(
+            quotient: from_limbs(value.sign, high),
+            remainder: from_limbs(value.sign, low))
+    # the leftover digits of the split limb belong to the remainder, one limb
+    # above the ones already there.
+    split := divmod_limb(high, int_pow10(rest))
+    low.push(split.remainder[0])
+    return DivMod(
+        quotient: from_limbs(value.sign, split.quotient),
+        remainder: from_limbs(value.sign, low))
+
+# --- conversion ---
+
+# the value written in base ten, with a leading `-` when negative. never uses
+# exponent notation, so the text round-trips through `parse` unchanged.
+pub fn to_string(value: BigInt) -> String:
+    if value.sign == 0:
+        return "0"
+    mut parts: List[String] := []
+    if value.sign < 0:
+        parts.push("-")
+    if value.limbs.len() == 0:
+        parts.push("{value.small}")
+    else:
+        mut index := value.limbs.len() - 1
+        parts.push("{value.limbs[index]}")
+        index = index - 1
+        while index >= 0:
+            parts.push(pad_limb(value.limbs[index]))
+            index = index - 1
+    return parts.join("")
+
+# the value as a machine Int, or none when it does not fit in 64 bits.
+pub fn to_int(value: BigInt) -> Int?:
+    if value.sign == 0:
+        return 0
+    if value.limbs.len() == 0:
+        return value.sign * value.small
+    if value.limbs.len() > 3:
+        return none
+    # decide it against the boundary first: once the magnitude is known to fit,
+    # every partial sum below is a non-negative piece of a value in range, so
+    # combining the limbs in order cannot overflow.
+    if value.sign > 0:
+        if compare_magnitude(value, int_max_magnitude()) > 0:
+            return none
+        return combine_limbs(value)
+    order := compare_magnitude(value, int_min_magnitude())
+    if order > 0:
+        return none
+    if order == 0:
+        # the minimum Int's magnitude is one past the maximum's, so it has no
+        # positive form to negate; name it directly.
+        return 0 - 9223372036854775807 - 1
+    return 0 - combine_limbs(value)
+
+# a magnitude of exactly three limbs, already known to fit, as a machine Int.
+fn combine_limbs(value: BigInt) -> Int:
+    return value.limbs[2] * 1000000000000000000 + value.limbs[1] * 1000000000 + value.limbs[0]
+
+# the nearest Float to the value. this is lossy for anything past 2^53, and
+# infinite past a Float's range — it is a display and estimation conversion,
+# never a step to take with money.
+pub fn to_float(value: BigInt) -> Float:
+    # the text form is exact, so the only rounding is the one a Float forces.
+    return parse_float(to_string(value)) catch 0.0
+
+# --- internals: canonical form ---
+
+# build a canonical BigInt from a raw little-endian magnitude, trimming the
+# leading zeros and collapsing to the `small` form when it fits.
+fn from_limbs(sign: Int, raw: List[Int]) -> BigInt:
+    mut top := raw.len()
+    while top > 0:
+        if raw[top - 1] != 0:
+            break
+        top = top - 1
+    if top == 0:
+        return zero()
+    if top <= 2:
+        mut magnitude := raw[0]
+        if top == 2:
+            magnitude = magnitude + raw[1] * BIGINT_BASE
+        return BigInt(sign: sign, small: magnitude, limbs: [])
+    if top == raw.len():
+        return BigInt(sign: sign, small: 0, limbs: raw)
+    trimmed := raw.slice(0, top)
+    return BigInt(sign: sign, small: 0, limbs: trimmed)
+
+# a signed value from a machine-sized magnitude, normalizing zero's sign.
+fn signed_small(sign: Int, magnitude: Int) -> BigInt:
+    if magnitude == 0:
+        return zero()
+    if magnitude <= BIGINT_SMALL_MAX:
+        return BigInt(sign: sign, small: magnitude, limbs: [])
+    wide := split_magnitude(magnitude)
+    return from_limbs(sign, wide)
+
+# the magnitude in limb form, whichever form it is stored in. for a value in
+# the small form this builds a fresh list, and the result has to be bound to a
+# name before it is passed anywhere: a freshly produced List handed straight to
+# a call is never released, so `f(magnitude_limbs(x))` leaks one list per call.
+# every caller in this module binds first for that reason.
+fn magnitude_limbs(value: BigInt) -> List[Int]:
+    if value.limbs.len() > 0:
+        return value.limbs
+    return split_magnitude(value.small)
+
+# a non-negative Int spread across base-10^9 limbs.
+fn split_magnitude(value: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut rest := value
+    while rest > 0:
+        out.push(rest % BIGINT_BASE)
+        rest = rest / BIGINT_BASE
+    return out
+
+# a list of `count` zero limbs.
+fn zeros(count: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut index := 0
+    while index < count:
+        out.push(0)
+        index = index + 1
+    return out
+
+# --- internals: magnitude arithmetic ---
+
+# compare magnitudes alone, ignoring both signs. the canonical form means a
+# value stored in `small` is always the smaller of a mixed pair.
+fn compare_magnitude(left: BigInt, right: BigInt) -> Int:
+    left_is_small := left.limbs.len() == 0
+    right_is_small := right.limbs.len() == 0
+    if left_is_small and right_is_small:
+        if left.small < right.small:
+            return - 1
+        if left.small > right.small:
+            return 1
+        return 0
+    if left_is_small:
+        return - 1
+    if right_is_small:
+        return 1
+    if left.limbs.len() != right.limbs.len():
+        if left.limbs.len() < right.limbs.len():
+            return - 1
+        return 1
+    mut index := left.limbs.len() - 1
+    while index >= 0:
+        if left.limbs[index] != right.limbs[index]:
+            if left.limbs[index] < right.limbs[index]:
+                return - 1
+            return 1
+        index = index - 1
+    return 0
+
+# the sum of two magnitudes, given the sign to hang on it.
+fn add_magnitudes(sign: Int, left: BigInt, right: BigInt) -> BigInt:
+    if left.limbs.len() == 0 and right.limbs.len() == 0:
+        # two 18-digit magnitudes sum to at most 19 digits, comfortably inside
+        # an Int, so the fast path only has to decide where the result lives.
+        return signed_small(sign, left.small + right.small)
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    total := add_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, total)
+
+# the difference of two magnitudes, which the caller has ordered so that
+# `left` is the larger.
+fn sub_magnitudes(sign: Int, left: BigInt, right: BigInt) -> BigInt:
+    if left.limbs.len() == 0:
+        # `right` is no larger, so it is in the small form too.
+        return signed_small(sign, left.small - right.small)
+    left_limbs := magnitude_limbs(left)
+    right_limbs := magnitude_limbs(right)
+    difference := sub_limbs(left_limbs, right_limbs)
+    return from_limbs(sign, difference)
+
+fn add_limbs(left: List[Int], right: List[Int]) -> List[Int]:
+    mut out: List[Int] := []
+    mut carry := 0
+    mut index := 0
+    width := max(left.len(), right.len())
+    while index < width:
+        mut total := carry
+        if index < left.len():
+            total = total + left[index]
+        if index < right.len():
+            total = total + right[index]
+        if total >= BIGINT_BASE:
+            out.push(total - BIGINT_BASE)
+            carry = 1
+        else:
+            out.push(total)
+            carry = 0
+        index = index + 1
+    if carry > 0:
+        out.push(carry)
+    return out
+
+# subtract `right` from `left`, which the caller guarantees is no smaller.
+fn sub_limbs(left: List[Int], right: List[Int]) -> List[Int]:
+    mut out: List[Int] := []
+    mut borrow := 0
+    mut index := 0
+    while index < left.len():
+        mut digit := left[index] - borrow
+        if index < right.len():
+            digit = digit - right[index]
+        if digit < 0:
+            digit = digit + BIGINT_BASE
+            borrow = 1
+        else:
+            borrow = 0
+        out.push(digit)
+        index = index + 1
+    return out
+
+# schoolbook multiplication. the accumulator peaks at
+# (BASE-1) + (BASE-1)^2 + (BASE-1), which is BASE^2 - 1 and so stays inside a
+# signed 64-bit Int with room to spare.
+fn mul_limbs(left: List[Int], right: List[Int]) -> List[Int]:
+    mut out := zeros(left.len() + right.len())
+    mut i := 0
+    while i < left.len():
+        multiplier := left[i]
+        if multiplier != 0:
+            mut carry := 0
+            mut j := 0
+            while j < right.len():
+                current := out[i + j] + multiplier * right[j] + carry
+                out[i + j] = current % BIGINT_BASE
+                carry = current / BIGINT_BASE
+                j = j + 1
+            mut k := i + right.len()
+            while carry > 0:
+                current := out[k] + carry
+                out[k] = current % BIGINT_BASE
+                carry = current / BIGINT_BASE
+                k = k + 1
+        i = i + 1
+    return out
+
+# multiply by a single limb, growing the result only when there is a carry out
+# of the top.
+fn mul_limb_grow(source: List[Int], multiplier: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut carry := 0
+    for limb in source:
+        product := limb * multiplier + carry
+        out.push(product % BIGINT_BASE)
+        carry = product / BIGINT_BASE
+    if carry > 0:
+        out.push(carry)
+    return out
+
+# multiply by a single limb, always appending the carry so the result is one
+# limb longer than the input. knuth's division indexes that limb directly.
+fn mul_limb_extend(source: List[Int], multiplier: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut carry := 0
+    for limb in source:
+        product := limb * multiplier + carry
+        out.push(product % BIGINT_BASE)
+        carry = product / BIGINT_BASE
+    out.push(carry)
+    return out
+
+# divide a magnitude by one limb. `rest * BASE + limb` peaks below BASE^2, so
+# the running remainder never overflows.
+fn divmod_limb(source: List[Int], divisor: Int) -> LimbPair:
+    mut quotient := zeros(source.len())
+    mut rest := 0
+    mut index := source.len() - 1
+    while index >= 0:
+        current := rest * BIGINT_BASE + source[index]
+        quotient[index] = current / divisor
+        rest = current % divisor
+        index = index - 1
+    leftover := [rest]
+    return LimbPair(quotient: quotient, remainder: leftover)
+
+# knuth's algorithm D, in base 10^9. the divisor is normalized so its top limb
+# is at least half the base, which bounds the trial quotient at one too large
+# and makes the add-back step rare rather than routine.
+#
+# every product below is bounded by BASE^2, which is 10^18 — inside a signed
+# 64-bit Int, and the reason the base is 10^9 rather than 2^32.
+fn divmod_limbs(dividend: List[Int], divisor: List[Int]) -> LimbPair:
+    width := divisor.len()
+    if width == 1:
+        return divmod_limb(dividend, divisor[0])
+    offset := dividend.len() - width
+    scale := BIGINT_BASE / (divisor[width - 1] + 1)
+    mut working := mul_limb_extend(dividend, scale)
+    scaled_divisor := mul_limb_grow(divisor, scale)
+    mut quotient := zeros(offset + 1)
+    mut position := offset
+    while position >= 0:
+        numerator := working[position + width] * BIGINT_BASE + working[position + width - 1]
+        mut estimate := numerator / scaled_divisor[width - 1]
+        mut rest := numerator % scaled_divisor[width - 1]
+        mut refining := true
+        while refining:
+            refining = false
+            if estimate >= BIGINT_BASE or estimate * scaled_divisor[width - 2] > rest * BIGINT_BASE + working[position + width - 2]:
+                estimate = estimate - 1
+                rest = rest + scaled_divisor[width - 1]
+                if rest < BIGINT_BASE:
+                    refining = true
+        # multiply the divisor by the estimate and subtract it in place.
+        mut borrow := 0
+        mut carry := 0
+        mut index := 0
+        while index < width:
+            product := estimate * scaled_divisor[index] + carry
+            carry = product / BIGINT_BASE
+            mut digit := working[index + position] - (product % BIGINT_BASE) - borrow
+            if digit < 0:
+                digit = digit + BIGINT_BASE
+                borrow = 1
+            else:
+                borrow = 0
+            working[index + position] = digit
+            index = index + 1
+        top := working[position + width] - carry - borrow
+        if top < 0:
+            # the estimate was one too large: add the divisor back and step the
+            # quotient digit down.
+            working[position + width] = top + BIGINT_BASE
+            estimate = estimate - 1
+            mut add_carry := 0
+            mut back := 0
+            while back < width:
+                total := working[back + position] + scaled_divisor[back] + add_carry
+                working[back + position] = total % BIGINT_BASE
+                add_carry = total / BIGINT_BASE
+                back = back + 1
+            working[position + width] = (working[position + width] + add_carry) % BIGINT_BASE
+        else:
+            working[position + width] = top
+        quotient[position] = estimate
+        position = position - 1
+    mut scaled_remainder: List[Int] := []
+    mut index := 0
+    while index < width:
+        scaled_remainder.push(working[index])
+        index = index + 1
+    remainder := divmod_limb(scaled_remainder, scale).quotient
+    return LimbPair(quotient: quotient, remainder: remainder)
+
+# --- internals: text and small helpers ---
+
+# build a value from a validated run of decimal digits, regrouping from the
+# right so every chunk is one limb.
+fn from_digits(sign: Int, digits: String) -> BigInt:
+    mut begin := 0
+    while begin < digits.len() - 1:
+        if ord(digits[begin]) != 48:
+            break
+        begin = begin + 1
+    mut body := digits
+    if begin > 0:
+        body = digits.substring(begin, digits.len())
+    if body == "0":
+        return zero()
+    mut raw: List[Int] := []
+    mut end := body.len()
+    while end > 0:
+        mut start := end - BIGINT_BASE_DIGITS
+        if start < 0:
+            start = 0
+        # the caller validated every character, and a chunk is at most nine
+        # digits, so this parse cannot fail.
+        raw.push(parse_int(body.substring(start, end)) catch 0)
+        end = start
+    return from_limbs(sign, raw)
+
+fn pad_limb(limb: Int) -> String:
+    mut text := "{limb}"
+    while text.len() < BIGINT_BASE_DIGITS:
+        text = "0" + text
+    return text
+
+fn decimal_width(value: Int) -> Int:
+    mut count := 1
+    mut rest := value / 10
+    while rest > 0:
+        count = count + 1
+        rest = rest / 10
+    return count
+
+fn int_trailing_zeros(value: Int) -> Int:
+    if value == 0:
+        return 0
+    mut count := 0
+    mut rest := value
+    while rest % 10 == 0:
+        count = count + 1
+        rest = rest / 10
+    return count
+
+# 10^exponent for an exponent of at most 18, which is all the limb regrouping
+# above ever asks for.
+fn int_pow10(exponent: Int) -> Int:
+    mut result := 1
+    mut remaining := exponent
+    while remaining > 0:
+        result = result * 10
+        remaining = remaining - 1
+    return result
+
+fn int_max_magnitude() -> BigInt:
+    return BigInt(sign: 1, small: 0, limbs: [854775807, 223372036, 9])
+
+fn int_min_magnitude() -> BigInt:
+    return BigInt(sign: 1, small: 0, limbs: [854775808, 223372036, 9])
+
+# refuse a magnitude past the size ceiling, so an attacker-supplied exponent
+# cannot turn into an allocation.
+fn check_size(value: BigInt) -> Bool!:
+    if value.limbs.len() > BIGINT_MAX_LIMBS:
+        fail "bigint: value of {value.limbs.len()} limbs exceeds the {BIGINT_MAX_LIMBS} limb ceiling"
+    return true
+
+fn check_digits(digits: Int) -> Bool!:
+    if digits > BIGINT_MAX_LIMBS * BIGINT_BASE_DIGITS:
+        fail "bigint: a {digits} digit value exceeds the {BIGINT_MAX_LIMBS * BIGINT_BASE_DIGITS} digit ceiling"
+    return true
+
+# --- tests ---
+
+test "small values round-trip through the machine-int form":
+    assert_eq(to_string(from_int(0)), "0")
+    assert_eq(to_string(from_int(1)), "1")
+    assert_eq(to_string(from_int(-1)), "-1")
+    assert_eq(to_string(from_int(999999999999999999)), "999999999999999999")
+    assert_eq(to_string(from_int(-999999999999999999)), "-999999999999999999")
+
+test "the most negative int has no positive counterpart, and still converts":
+    smallest := 0 - 9223372036854775807 - 1
+    value := from_int(smallest)
+    assert_eq(to_string(value), "-9223372036854775808")
+    back := to_int(value)
+    assert(back != none)
+    assert_eq(back.unwrap_or(0), smallest)
+
+test "int conversion refuses values that do not fit":
+    biggest := from_int(9223372036854775807)
+    assert_eq(to_int(biggest).unwrap_or(0), 9223372036854775807)
+    assert(to_int(add(biggest, one())) == none)
+    smallest := from_int(0 - 9223372036854775807 - 1)
+    assert(to_int(sub(smallest, one())) == none)
+
+test "parse rejects everything that is not a decimal integer":
+    assert(parse("").is_err)
+    assert(parse("-").is_err)
+    assert(parse("+").is_err)
+    assert(parse("1.5").is_err)
+    assert(parse(" 1").is_err)
+    assert(parse("1 ").is_err)
+    assert(parse("1e5").is_err)
+    assert(parse("12a").is_err)
+    assert(parse("--1").is_err)
+
+test "parse accepts signs and leading zeros":
+    assert_eq(to_string(parse("+42")!), "42")
+    assert_eq(to_string(parse("-42")!), "-42")
+    assert_eq(to_string(parse("007")!), "7")
+    assert_eq(to_string(parse("-000")!), "0")
+    assert_eq(to_string(parse("0")!), "0")
+
+test "values that outgrow an int keep every digit":
+    text := "170141183460469231731687303715884105727"
+    assert_eq(to_string(parse(text)!), text)
+    assert_eq(digit_count(parse(text)!), 39)
+
+test "addition carries across limb boundaries":
+    assert_eq(to_string(add(parse("999999999999999999")!, one())), "1000000000000000000")
+    assert_eq(to_string(add(parse("999999999999999999999999999")!, one())), "1000000000000000000000000000")
+    assert_eq(to_string(sub(parse("1000000000000000000")!, one())), "999999999999999999")
+    assert_eq(to_string(sub(parse("1000000000000000000000000000")!, one())), "999999999999999999999999999")
+
+test "sign combinations agree on every ordering":
+    five := from_int(5)
+    negative_five := from_int(-5)
+    three := from_int(3)
+    negative_three := from_int(-3)
+    assert_eq(to_string(add(five, negative_three)), "2")
+    assert_eq(to_string(add(negative_five, three)), "-2")
+    assert_eq(to_string(add(negative_five, negative_three)), "-8")
+    assert_eq(to_string(sub(three, five)), "-2")
+    assert_eq(to_string(sub(negative_three, negative_five)), "2")
+    assert_eq(to_string(add(five, negative_five)), "0")
+    assert_eq(to_string(mul(negative_five, negative_three)), "15")
+    assert_eq(to_string(mul(negative_five, three)), "-15")
+
+test "multiplication is exact past the machine-int range":
+    big := parse("12345678901234567890")!
+    assert_eq(to_string(mul(big, big)), "152415787532388367501905199875019052100")
+    assert_eq(to_string(mul(big, zero())), "0")
+    assert_eq(to_string(mul(from_int(1000000000), from_int(1000000000))), "1000000000000000000")
+
+test "division truncates toward zero and the remainder follows the dividend":
+    seven := from_int(7)
+    two := from_int(2)
+    assert_eq(to_string(divmod(seven, two)!.quotient), "3")
+    assert_eq(to_string(divmod(seven, two)!.remainder), "1")
+    assert_eq(to_string(divmod(negate(seven), two)!.quotient), "-3")
+    assert_eq(to_string(divmod(negate(seven), two)!.remainder), "-1")
+    assert_eq(to_string(divmod(seven, negate(two))!.quotient), "-3")
+    assert_eq(to_string(divmod(seven, negate(two))!.remainder), "1")
+    assert(divmod(seven, zero()).is_err)
+
+test "division reproduces its dividend":
+    dividend := parse("98765432109876543210987654321")!
+    divisor := parse("123456789012345")!
+    parts := divmod(dividend, divisor)!
+    assert_eq(to_string(add(mul(parts.quotient, divisor), parts.remainder)), to_string(dividend))
+    assert_eq(compare(abs(parts.remainder), abs(divisor)), -1)
+
+test "powers of ten scale by regrouping limbs":
+    assert_eq(to_string(ten_pow(0)!), "1")
+    assert_eq(to_string(ten_pow(9)!), "1000000000")
+    assert_eq(to_string(ten_pow(18)!), "1000000000000000000")
+    assert_eq(to_string(ten_pow(25)!), "10000000000000000000000000")
+    assert_eq(to_string(mul_pow10(from_int(-123), 20)), "-12300000000000000000000")
+    assert(ten_pow(-1).is_err)
+
+test "a negative exponent shifts the other way, truncating toward zero":
+    assert_eq(to_string(mul_pow10(parse("123456789012345678901")!, -11)), "1234567890")
+    assert_eq(to_string(mul_pow10(parse("-123456789012345678901")!, -11)), "-1234567890")
+    assert_eq(to_string(mul_pow10(from_int(999), -3)), "0")
+    assert_eq(to_string(mul_pow10(from_int(-999), -3)), "0")
+    assert_eq(to_string(mul_pow10(from_int(1999), -3)), "1")
+    assert_eq(to_string(mul_pow10(zero(), -5)), "0")
+
+test "dividing by a power of ten splits digits without a general division":
+    value := parse("123456789012345678901234567")!
+    parts := divmod_pow10(value, 11)!
+    assert_eq(to_string(parts.quotient), "1234567890123456")
+    assert_eq(to_string(parts.remainder), "78901234567")
+    whole := divmod_pow10(value, 9)!
+    assert_eq(to_string(whole.quotient), "123456789012345678")
+    assert_eq(to_string(whole.remainder), "901234567")
+    past := divmod_pow10(from_int(5), 30)!
+    assert_eq(to_string(past.quotient), "0")
+    assert_eq(to_string(past.remainder), "5")
+
+test "dividing a negative by a power of ten keeps the sign on both halves":
+    parts := divmod_pow10(parse("-123456789012345678901234567")!, 11)!
+    assert_eq(to_string(parts.quotient), "-1234567890123456")
+    assert_eq(to_string(parts.remainder), "-78901234567")
+
+test "pow squares its way up and refuses a negative exponent":
+    assert_eq(to_string(pow(from_int(2), 0)!), "1")
+    assert_eq(to_string(pow(from_int(2), 10)!), "1024")
+    assert_eq(to_string(pow(from_int(2), 64)!), "18446744073709551616")
+    assert_eq(to_string(pow(from_int(-3), 3)!), "-27")
+    assert_eq(to_string(pow(from_int(-3), 4)!), "81")
+    assert(pow(from_int(2), -1).is_err)
+
+test "comparison orders across both signs and both magnitude forms":
+    small := from_int(5)
+    large := parse("99999999999999999999")!
+    assert_eq(compare(small, large), -1)
+    assert_eq(compare(large, small), 1)
+    assert_eq(compare(negate(large), small), -1)
+    assert_eq(compare(negate(large), negate(small)), -1)
+    assert_eq(compare(zero(), negate(small)), 1)
+    assert_eq(compare(zero(), zero()), 0)
+    assert(equals(parse("1000000000000000000")!, add(parse("999999999999999999")!, one())))
+
+test "parity and trailing zeros read the low limb":
+    assert(is_even(zero()))
+    assert(is_even(from_int(-4)))
+    assert(not is_even(from_int(-3)))
+    assert(is_even(parse("100000000000000000000")!))
+    assert(not is_even(parse("100000000000000000001")!))
+    assert_eq(trailing_zeros(zero()), 0)
+    assert_eq(trailing_zeros(from_int(-1200)), 2)
+    assert_eq(trailing_zeros(parse("1000000000000000000000000000")!), 27)
+    assert_eq(trailing_zeros(parse("1000000000000000000000000001")!), 0)
+
+test "digit count spans the limb boundary":
+    assert_eq(digit_count(zero()), 1)
+    assert_eq(digit_count(from_int(-9)), 1)
+    assert_eq(digit_count(from_int(999999999)), 9)
+    assert_eq(digit_count(from_int(1000000000)), 10)
+    assert_eq(digit_count(parse("999999999999999999")!), 18)
+    assert_eq(digit_count(parse("1000000000000000000")!), 19)
+
+test "the size ceiling refuses an exponent that would allocate":
+    assert(ten_pow(2000000).is_err)
+    assert(pow(from_int(10), 2000000).is_err)
+
+test "a value crosses to a float, losing precision where a float must":
+    assert_eq(to_float(from_int(1)), 1.0)
+    assert_eq(to_float(from_int(-250)), -250.0)
+    assert_eq(to_float(parse("9007199254740993")!), 9007199254740992.0)

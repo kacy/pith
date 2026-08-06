@@ -19,15 +19,27 @@
 #
 # reach for std.db unless you need the raw connection; see std.db for the whole
 # high-level surface.
+#
+# ## exact numbers
+#
+# `Numeric` carries a std.decimal.Decimal, and it is the variant a postgres
+# NUMERIC or a mysql DECIMAL decodes into. that matters: those columns are
+# exact by definition, and routing them through `Real` would round a balance
+# on the way in and never say so. read one with `row.decimal("amount")`, and
+# write one back by binding `decimal.to_string(amount)`. `Real` is for float4
+# and float8, which genuinely are floats. see docs/numbers.md.
 
 import std.bytes as bytes
+import std.decimal as decimal
 
 # a column value crossing the driver boundary, in either direction. this is the
-# null-safe boundary — a missing value is `Null`, never a zero in disguise.
+# null-safe boundary — a missing value is `Null`, never a zero in disguise, and
+# an exact column is `Numeric`, never a float in disguise.
 pub enum Value:
     Null
     Integer(Int)
     Real(Float)
+    Numeric(decimal.Decimal)
     Text(String)
     Blob(Bytes)
 
@@ -40,6 +52,11 @@ pub fn integer(n: Int) -> Value:
 # the Value wrapping a real number.
 pub fn real(f: Float) -> Value:
     return Value.Real(f)
+
+# the Value wrapping an exact decimal — what a NUMERIC or DECIMAL column
+# decodes to.
+pub fn numeric(d: decimal.Decimal) -> Value:
+    return Value.Numeric(d)
 
 # the Value wrapping a text string.
 pub fn text(s: String) -> Value:
@@ -70,18 +87,35 @@ impl Row:
     # typed accessors. they coerce where it is lossless (an Integer read as Real)
     # and fall back to a zero value otherwise, so callers that know their schema
     # stay terse; use `get` + a match when a column may be null or of mixed type.
+    #
+    # the numeric family — as_int, as_real, as_decimal — coerce among each
+    # other, and the two that narrow say so: a Numeric read as an Int drops its
+    # fraction, and read as a Float rounds. `as_decimal` is the only one of the
+    # three that never loses anything, which is why an exact column should be
+    # read with it.
     pub fn as_int(col: Int) -> Int:
         return match self.values[col]:
             Value.Integer(n) => n
             Value.Real(f) => f.to_int()
+            Value.Numeric(d) => decimal.to_int(d).unwrap_or(0)
             _ => 0
 
-    # the column read as a Float (an Integer coerces).
+    # the column read as a Float (an Integer coerces exactly, a Numeric rounds).
     pub fn as_real(col: Int) -> Float:
         return match self.values[col]:
             Value.Real(f) => f
             Value.Integer(n) => n.to_float()
+            Value.Numeric(d) => decimal.to_float(d)
             _ => 0.0
+
+    # the column read as an exact Decimal. an Integer widens losslessly; a Real
+    # does not, because a Float has already lost whatever it was going to lose,
+    # so a float column reads as zero here rather than pretending otherwise.
+    pub fn as_decimal(col: Int) -> decimal.Decimal:
+        return match self.values[col]:
+            Value.Numeric(d) => d
+            Value.Integer(n) => decimal.from_int(n)
+            _ => decimal.zero()
 
     # the column read as text, or "" when it is not text.
     pub fn as_text(col: Int) -> String:
@@ -130,6 +164,14 @@ impl Row:
             return 0.0
         return self.as_real(col.value())
 
+    # the named column as an exact Decimal (zero when missing, null, or a
+    # float). this is the accessor for money and for any NUMERIC column.
+    pub fn decimal(name: String) -> decimal.Decimal:
+        col := self.column(name)
+        if col == none:
+            return decimal.zero()
+        return self.as_decimal(col.value())
+
     # the named column as text ("" when missing or not text).
     pub fn text(name: String) -> String:
         col := self.column(name)
@@ -165,6 +207,10 @@ impl Row:
     pub fn float_at(col: Int) -> Float:
         return self.as_real(col)
 
+    # the column at `col` as an exact Decimal.
+    pub fn decimal_at(col: Int) -> decimal.Decimal:
+        return self.as_decimal(col)
+
     # the column at `col` as text.
     pub fn text_at(col: Int) -> String:
         return self.as_text(col)
@@ -197,6 +243,13 @@ impl Row:
             return none
         return self.opt_float_at(col.value())
 
+    # the named column as a Decimal?, or none when null or missing.
+    pub fn opt_decimal(name: String) -> decimal.Decimal?:
+        col := self.column(name)
+        if col == none:
+            return none
+        return self.opt_decimal_at(col.value())
+
     # the named column as a String?, or none when null or missing.
     pub fn opt_text(name: String) -> String?:
         col := self.column(name)
@@ -222,6 +275,12 @@ impl Row:
         if self.is_null(col):
             return none
         return self.as_real(col)
+
+    # the column at `col` as a Decimal?, or none when null.
+    pub fn opt_decimal_at(col: Int) -> decimal.Decimal?:
+        if self.is_null(col):
+            return none
+        return self.as_decimal(col)
 
     # the column at `col` as a String?, or none when null.
     pub fn opt_text_at(col: Int) -> String?:
@@ -307,3 +366,27 @@ test "opt_ accessors return none for null or missing":
     assert(r.opt_float("score") == none)
     assert(r.opt_text("missing") == none)
     assert(r.opt_int_at(1) == none)
+    assert(r.opt_decimal("score") == none)
+    assert(r.opt_decimal("missing") == none)
+
+test "a numeric column keeps every digit a float would drop":
+    balance := decimal.parse("12345678901234567.89")!
+    r := row([numeric(balance), text("acct")], ["balance", "name"])
+    assert_eq(decimal.to_string(r.decimal("balance")), "12345678901234567.89")
+    assert_eq(decimal.to_string(r.decimal_at(0)), "12345678901234567.89")
+    # the same column read as a float is the value the old code produced.
+    assert_eq(r.float("balance"), 1.2345678901234568e16)
+    assert_eq(r.int("balance"), 12345678901234567)
+
+test "as_decimal widens an integer and refuses to invent one from a float":
+    r := row([integer(7), real(1.5), text("x"), null_value()], ["i", "f", "t", "n"])
+    assert_eq(decimal.to_string(r.decimal("i")), "7")
+    assert_eq(decimal.to_string(r.decimal("f")), "0")
+    assert_eq(decimal.to_string(r.decimal("t")), "0")
+    assert_eq(decimal.to_string(r.decimal("n")), "0")
+    assert_eq(decimal.to_string(r.decimal("absent")), "0")
+
+test "a numeric value keeps its trailing zeros through a row":
+    r := row([numeric(decimal.parse("1.10")!)], ["price"])
+    assert_eq(decimal.to_string(r.decimal("price")), "1.10")
+    assert(decimal.equals(r.decimal("price"), decimal.parse("1.1")!))

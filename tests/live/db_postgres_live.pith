@@ -6,6 +6,7 @@
 
 import std.postgres as postgres
 import std.sql as sql
+import std.decimal as decimal
 
 fn open_or_skip() -> postgres.Conn:
     attempt := postgres.connect("127.0.0.1", 5432, "pith", "pith_pw", "pithtest")
@@ -63,3 +64,55 @@ test "a syntax error is reported, not crashed on":
     result := postgres.exec(conn, "not valid sql at all")
     conn.close()
     assert(result.is_err)
+
+test "a numeric column round-trips through the wire without losing a digit":
+    conn := open_or_skip()
+    # the value from the report that started this: as a float8 it comes back
+    # 12345678901234568, cents and all.
+    mut got: List[String] := []
+    for row in postgres.query(conn, "select '12345678901234567.89'::numeric as balance, '1.10'::numeric as price, '-0.05'::numeric as delta")!:
+        got.push(decimal.to_string(row.decimal("balance")))
+        got.push(decimal.to_string(row.decimal("price")))
+        got.push(decimal.to_string(row.decimal("delta")))
+    conn.close()
+    assert_eq(got, ["12345678901234567.89", "1.10", "-0.05"])
+
+test "a numeric survives a write and a read back":
+    conn := open_or_skip()
+    postgres.exec(conn, "drop table if exists pith_numeric_probe")!
+    postgres.exec(conn, "create table pith_numeric_probe (id int primary key, amount numeric(30,10))")!
+    postgres.exec_params(conn, "insert into pith_numeric_probe values (1, $1)", ["12345678901234567.8900000000"])!
+    postgres.exec_params(conn, "insert into pith_numeric_probe values (2, $1)", ["-0.0000000001"])!
+    mut stored: List[String] := []
+    for row in postgres.query(conn, "select amount from pith_numeric_probe order by id")!:
+        stored.push(decimal.to_string(row.decimal("amount")))
+    postgres.exec(conn, "drop table pith_numeric_probe")!
+    conn.close()
+    assert_eq(stored, ["12345678901234567.8900000000", "-0.0000000001"])
+
+test "a summed ledger agrees with what postgres computed":
+    conn := open_or_skip()
+    postgres.exec(conn, "drop table if exists pith_ledger_probe")!
+    postgres.exec(conn, "create table pith_ledger_probe (amount numeric(20,2))")!
+    mut n := 0
+    while n < 100:
+        postgres.exec_params(conn, "insert into pith_ledger_probe values ($1)", ["0.10"])!
+        n = n + 1
+    mut here := decimal.zero()
+    for row in postgres.query(conn, "select amount from pith_ledger_probe")!:
+        here = decimal.add(here, row.decimal("amount"))
+    mut there := ""
+    for row in postgres.query(conn, "select sum(amount) as total from pith_ledger_probe")!:
+        there = decimal.to_string(row.decimal("total"))
+    postgres.exec(conn, "drop table pith_ledger_probe")!
+    conn.close()
+    assert_eq(decimal.to_string(here), "10.00")
+    assert_eq(there, "10.00")
+
+test "a numeric NaN keeps its text rather than turning into a zero":
+    conn := open_or_skip()
+    mut got := ""
+    for row in postgres.query(conn, "select 'NaN'::numeric as odd")!:
+        got = row.text("odd")
+    conn.close()
+    assert_eq(got, "NaN")

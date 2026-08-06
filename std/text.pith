@@ -1,0 +1,538 @@
+# std.text - unicode-correct text handling over utf-8 strings
+#
+# a pith String is a sequence of utf-8 bytes. `s.len()` and `s[i]` are byte
+# operations, and `s.substring(a, b)` slices bytes. that is the right default
+# for a server language -- it keeps indexing O(1) and avoids paying for
+# grapheme bookkeeping on every string -- but it means byte offsets and
+# character offsets stop agreeing as soon as the text leaves ascii.
+#
+# this module is the character-aware layer over those bytes. it does not
+# change how a String is stored; it adds the operations byte offsets cannot
+# express: counting characters, slicing on character boundaries, validating
+# utf-8, and truncating without cutting a character in half.
+#
+# there is no locale here, on purpose. anything that depends on the reader's
+# language -- message catalogs, plural rules, number and date formatting --
+# belongs in std.intl, which builds on this module. std.text never depends on
+# std.intl.
+#
+# ## what "character" means here
+#
+# these functions count unicode scalar values, the same unit Go's `for range`
+# and Rust's `chars()` use. that is not always what a reader would call a
+# character: "e" followed by a combining acute accent is two scalar values but
+# one mark on screen. for text a person will read -- a display name, a chat
+# message -- prefer the grapheme functions, which group those together.
+#
+# ## limitation: a String cannot hold U+0000
+#
+# pith Strings are null-terminated, so the null character has no
+# representation. `encode(0)` fails rather than handing back a string that
+# would silently measure as empty.
+
+# a decoded character and the number of bytes it occupied.
+pub struct Decoded:
+    pub code_point: Int
+    pub size: Int
+
+# the largest valid unicode scalar value, U+10FFFF.
+pub fn max_code_point() -> Int:
+    return 1114111
+
+# the replacement character, U+FFFD, which stands in for undecodable bytes.
+pub fn replacement_char() -> String:
+    return "�"
+
+# the code point reported for a byte that no valid utf-8 sequence explains.
+# it is negative so it can never collide with a real scalar value.
+pub fn invalid_code_point() -> Int:
+    return - 1
+
+# ---------------------------------------------------------------------------
+# byte classification
+# ---------------------------------------------------------------------------
+
+# read one byte as an unsigned 0-255 value. `ord(s[i])` compiles to a direct
+# byte read; the mask keeps the result unsigned no matter how a bare `ord` on
+# a signed char would widen it.
+fn raw_byte(s: String, i: Int) -> Int:
+    return bit_and(ord(s[i]), 255)
+
+# return true when a byte is a utf-8 continuation byte (10xxxxxx). a
+# continuation byte can never start a character, so an index pointing at one
+# is inside a character rather than at its edge.
+pub fn is_continuation_byte(b: Int) -> Bool:
+    return b >= 128 and b < 192
+
+# return how many bytes the character starting with this byte occupies, or 0
+# when the byte cannot start a character at all.
+pub fn sequence_length(b: Int) -> Int:
+    if b < 128:
+        return 1
+    if b < 194:
+        # 0x80-0xBF are continuations, and 0xC0/0xC1 could only ever encode an
+        # overlong form of an ascii character.
+        return 0
+    if b < 224:
+        return 2
+    if b < 240:
+        return 3
+    if b < 245:
+        return 4
+    return 0
+
+# ---------------------------------------------------------------------------
+# decoding
+# ---------------------------------------------------------------------------
+
+# decode the character starting at a byte offset. returns none when the offset
+# is out of range or the bytes there are not well-formed utf-8. overlong
+# encodings, surrogates and values above U+10FFFF are all rejected: those are
+# the shapes that let two decoders disagree about what a string says, which is
+# how a validation check gets bypassed.
+pub fn decode_at(s: String, byte_index: Int) -> Decoded?:
+    if byte_index < 0 or byte_index >= s.len():
+        return none
+
+    lead := raw_byte(s, byte_index)
+    size := sequence_length(lead)
+    if size == 0:
+        return none
+    if byte_index + size > s.len():
+        return none
+    if size == 1:
+        return Decoded(lead, 1)
+
+    mut code_point := 0
+    if size == 2:
+        code_point = bit_and(lead, 31)
+    elif size == 3:
+        code_point = bit_and(lead, 15)
+    else:
+        code_point = bit_and(lead, 7)
+
+    mut offset := 1
+    while offset < size:
+        continuation := raw_byte(s, byte_index + offset)
+        if not is_continuation_byte(continuation):
+            return none
+        code_point = (code_point * 64) + bit_and(continuation, 63)
+        offset = offset + 1
+
+    # reject sequences that are structurally well-formed but say something no
+    # conforming encoder would have written.
+    if size == 3 and code_point < 2048:
+        return none
+    if size == 4 and code_point < 65536:
+        return none
+    if code_point >= 55296 and code_point <= 57343:
+        return none
+    if code_point > 1114111:
+        return none
+
+    return Decoded(code_point, size)
+
+# decode at an offset, or report a one-byte step with a negative code point
+# when the bytes are undecodable. every walk in this module goes through this,
+# so a malformed string still advances one byte at a time instead of stalling.
+fn decode_step(s: String, byte_index: Int) -> Decoded:
+    return decode_at(s, byte_index).unwrap_or(Decoded(- 1, 1))
+
+# encode one unicode scalar value as utf-8. fails on surrogates, on values
+# above U+10FFFF, and on U+0000, which a null-terminated String cannot carry.
+pub fn encode(code_point: Int) -> String!:
+    if code_point == 0:
+        fail "cannot encode U+0000: a pith String is null-terminated"
+    if code_point < 0 or code_point > 1114111:
+        fail "code point out of range: {code_point}"
+    if code_point >= 55296 and code_point <= 57343:
+        fail "cannot encode a surrogate code point: {code_point}"
+
+    if code_point < 128:
+        return chr(code_point)
+    if code_point < 2048:
+        return chr(192 + (code_point / 64)) + chr(128 + (code_point % 64))
+    if code_point < 65536:
+        return chr(224 + (code_point / 4096)) + chr(128 + ((code_point / 64) % 64)) + chr(128 + (code_point % 64))
+    return chr(240 + (code_point / 262144)) + chr(128 + ((code_point / 4096) % 64)) + chr(128 + ((code_point / 64) % 64)) + chr(128 + (code_point % 64))
+
+# ---------------------------------------------------------------------------
+# validation
+# ---------------------------------------------------------------------------
+
+# return the byte offset of the first byte that is not part of a well-formed
+# utf-8 sequence, or -1 when the whole string is valid.
+pub fn find_invalid(s: String) -> Int:
+    mut position := 0
+    while position < s.len():
+        step := decode_step(s, position)
+        if step.code_point < 0:
+            return position
+        position = position + step.size
+    return - 1
+
+# return true when the string is well-formed utf-8.
+pub fn is_valid(s: String) -> Bool:
+    return find_invalid(s) == - 1
+
+# ---------------------------------------------------------------------------
+# boundaries
+# ---------------------------------------------------------------------------
+
+# return true when a byte offset sits on the edge of a character. both ends of
+# the string count as boundaries.
+pub fn is_boundary(s: String, byte_index: Int) -> Bool:
+    if byte_index < 0 or byte_index > s.len():
+        return false
+    if byte_index == 0 or byte_index == s.len():
+        return true
+    return not is_continuation_byte(raw_byte(s, byte_index))
+
+# round a byte offset down to the start of the character containing it.
+pub fn floor_boundary(s: String, byte_index: Int) -> Int:
+    if byte_index <= 0:
+        return 0
+    mut position := byte_index
+    if position > s.len():
+        position = s.len()
+    mut scanning := true
+    while scanning:
+        if position <= 0:
+            scanning = false
+        elif is_continuation_byte(raw_byte(s, position)):
+            position = position - 1
+        else:
+            scanning = false
+    return position
+
+# round a byte offset up to the start of the next character, or to the end of
+# the string.
+pub fn ceil_boundary(s: String, byte_index: Int) -> Int:
+    if byte_index >= s.len():
+        return s.len()
+    mut position := byte_index
+    if position < 0:
+        position = 0
+    mut scanning := true
+    while scanning:
+        if position >= s.len():
+            scanning = false
+        elif is_continuation_byte(raw_byte(s, position)):
+            position = position + 1
+        else:
+            scanning = false
+    return position
+
+# ---------------------------------------------------------------------------
+# counting and iteration
+# ---------------------------------------------------------------------------
+
+# count the characters in a string. an undecodable byte counts as one, so this
+# never disagrees with `chars()` about how many pieces the string has.
+pub fn char_count(s: String) -> Int:
+    mut total := 0
+    mut position := 0
+    while position < s.len():
+        position = position + decode_step(s, position).size
+        total = total + 1
+    return total
+
+# split a string into its characters. an undecodable byte becomes a one-byte
+# piece of its own rather than being dropped or folded into its neighbour.
+pub fn chars(s: String) -> List[String]:
+    mut out: List[String] := []
+    mut position := 0
+    while position < s.len():
+        size := decode_step(s, position).size
+        out.push(s.substring(position, position + size))
+        position = position + size
+    return out
+
+# the code points of a string, in order. an undecodable byte yields -1, so the
+# result stays index-aligned with `chars()`.
+pub fn code_points(s: String) -> List[Int]:
+    mut out: List[Int] := []
+    mut position := 0
+    while position < s.len():
+        step := decode_step(s, position)
+        out.push(step.code_point)
+        position = position + step.size
+    return out
+
+# the byte offset at which each character starts.
+pub fn char_offsets(s: String) -> List[Int]:
+    mut out: List[Int] := []
+    mut position := 0
+    while position < s.len():
+        out.push(position)
+        position = position + decode_step(s, position).size
+    return out
+
+# join characters back into one string.
+pub fn from_chars(parts: List[String]) -> String:
+    mut out := ""
+    for part in parts:
+        out = out + part
+    return out
+
+# build a string from code points. fails on any value `encode` rejects.
+pub fn from_code_points(points: List[Int]) -> String!:
+    mut out := ""
+    for point in points:
+        out = out + encode(point)!
+    return out
+
+# ---------------------------------------------------------------------------
+# character-indexed access
+# ---------------------------------------------------------------------------
+
+# the byte offset where a character index begins. an index at or past the end
+# returns the string length, so the result is always usable as a slice bound.
+pub fn byte_offset_of(s: String, char_index: Int) -> Int:
+    if char_index <= 0:
+        return 0
+    mut position := 0
+    mut seen := 0
+    while position < s.len() and seen < char_index:
+        position = position + decode_step(s, position).size
+        seen = seen + 1
+    return position
+
+# the character at a character index, or none when the index is out of range.
+# this walks the string, so it costs O(n) in the index. that is the honest
+# price of character indexing over utf-8, and the reason byte indexing stays
+# the default -- reach for `chars()` when you need every character anyway.
+pub fn char_at(s: String, char_index: Int) -> String?:
+    if char_index < 0:
+        return none
+    start := byte_offset_of(s, char_index)
+    if start >= s.len():
+        return none
+    return s.substring(start, start + decode_step(s, start).size)
+
+# slice by character index rather than byte index. out-of-range bounds clamp,
+# matching how `substring` treats byte bounds.
+pub fn slice(s: String, start_char: Int, end_char: Int) -> String:
+    if end_char <= start_char:
+        return ""
+    start_byte := byte_offset_of(s, start_char)
+    end_byte := byte_offset_of(s, end_char)
+    if end_byte <= start_byte:
+        return ""
+    return s.substring(start_byte, end_byte)
+
+# ---------------------------------------------------------------------------
+# truncation
+# ---------------------------------------------------------------------------
+
+# keep at most `max_chars` characters. this is the safe replacement for
+# `s.substring(0, n)` wherever n was meant as a count of characters.
+pub fn truncate(s: String, max_chars: Int) -> String:
+    if max_chars <= 0:
+        return ""
+    return slice(s, 0, max_chars)
+
+# keep at most `max_bytes` bytes, backing off to a character boundary rather
+# than splitting a character. reach for this when the limit comes from storage
+# -- a database column, a header size, a log field.
+pub fn truncate_bytes(s: String, max_bytes: Int) -> String:
+    if max_bytes <= 0:
+        return ""
+    if max_bytes >= s.len():
+        return s
+    return s.substring(0, floor_boundary(s, max_bytes))
+
+# truncate to `max_chars` characters and mark the cut, so a reader can tell
+# the text was shortened. the suffix counts against the limit.
+pub fn truncate_with(s: String, max_chars: Int, suffix: String) -> String:
+    if char_count(s) <= max_chars:
+        return s
+    suffix_chars := char_count(suffix)
+    if max_chars <= suffix_chars:
+        return truncate(suffix, max_chars)
+    return truncate(s, max_chars - suffix_chars) + suffix
+
+# ---------------------------------------------------------------------------
+# repair
+# ---------------------------------------------------------------------------
+
+# replace every undecodable byte with U+FFFD so the result is always valid
+# utf-8. use this at the edge where bytes you did not produce become text you
+# are going to store, log or render. one bad byte becomes one replacement
+# character; this does not implement the standard's "maximal subpart"
+# grouping, which would collapse a truncated multi-byte sequence into a single
+# replacement instead of one per byte.
+pub fn sanitize(s: String) -> String:
+    if is_valid(s):
+        return s
+    mut out := ""
+    mut position := 0
+    while position < s.len():
+        step := decode_step(s, position)
+        if step.code_point < 0:
+            out = out + replacement_char()
+        else:
+            out = out + s.substring(position, position + step.size)
+        position = position + step.size
+    return out
+
+# ---------------------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------------------
+
+fn cp_at(s: String, i: Int) -> Int:
+    return decode_at(s, i).unwrap_or(Decoded(- 1, 0)).code_point
+
+fn size_at(s: String, i: Int) -> Int:
+    return decode_at(s, i).unwrap_or(Decoded(- 1, 0)).size
+
+test "an indexed byte reads back unsigned":
+    # the emitter turns `ord(s[i])` into a direct byte read. this pins that it
+    # yields 0-255 rather than a sign-extended value, which every decode here
+    # depends on.
+    s := "Ä"
+    assert_eq(raw_byte(s, 0), 195)
+    assert_eq(raw_byte(s, 1), 132)
+
+test "decodes each utf-8 sequence length":
+    assert_eq(cp_at("A", 0), 65)
+    assert_eq(size_at("A", 0), 1)
+    assert_eq(cp_at("Ä", 0), 196)
+    assert_eq(size_at("Ä", 0), 2)
+    assert_eq(cp_at("€", 0), 8364)
+    assert_eq(size_at("€", 0), 3)
+    assert_eq(cp_at("𝄞", 0), 119070)
+    assert_eq(size_at("𝄞", 0), 4)
+
+test "rejects every malformed utf-8 shape":
+    # lone continuation byte
+    assert(decode_at(chr(128), 0) == none)
+    # truncated two-byte sequence
+    assert(decode_at(chr(195), 0) == none)
+    # truncated three-byte sequence
+    assert(decode_at(chr(226) + chr(130), 0) == none)
+    # second byte is not a continuation
+    assert(decode_at(chr(195) + "A", 0) == none)
+    # overlong two-byte encoding of "/"
+    assert(decode_at(chr(192) + chr(175), 0) == none)
+    # overlong three-byte encoding of "/"
+    assert(decode_at(chr(224) + chr(128) + chr(175), 0) == none)
+    # surrogate U+D800
+    assert(decode_at(chr(237) + chr(160) + chr(128), 0) == none)
+    # above U+10FFFF
+    assert(decode_at(chr(244) + chr(144) + chr(128) + chr(128), 0) == none)
+    # 0xFE never appears in utf-8
+    assert(decode_at(chr(254), 0) == none)
+    # out of range
+    assert(decode_at("abc", 3) == none)
+    assert(decode_at("abc", - 1) == none)
+    assert(decode_at("", 0) == none)
+
+test "validates and locates the first bad byte":
+    assert_eq(is_valid(""), true)
+    assert_eq(is_valid("hello"), true)
+    assert_eq(is_valid("Ärger"), true)
+    assert_eq(is_valid("𝄞€Ä a"), true)
+    assert_eq(find_invalid("Ärger"), - 1)
+    assert_eq(is_valid("ab" + chr(255) + "cd"), false)
+    assert_eq(find_invalid("ab" + chr(255) + "cd"), 2)
+
+test "encodes and round trips code points":
+    assert_eq(encode(65)!, "A")
+    assert_eq(encode(196)!, "Ä")
+    assert_eq(encode(8364)!, "€")
+    assert_eq(encode(119070)!, "𝄞")
+    assert_eq(encode(1114111)!, "􏿿")
+    assert_eq(from_code_points([72, 196, 8364])!, "HÄ€")
+    assert_eq(from_code_points([])!, "")
+
+test "encode refuses what a String cannot carry":
+    assert(encode(0).is_err)
+    assert(encode(- 1).is_err)
+    assert(encode(1114112).is_err)
+    assert(encode(55296).is_err)
+    assert(encode(57343).is_err)
+
+test "counts characters, not bytes":
+    assert_eq("Ärger".len(), 6)
+    assert_eq(char_count("Ärger"), 5)
+    assert_eq(char_count(""), 0)
+    assert_eq(char_count("hello"), 5)
+    assert_eq(char_count("𝄞€Ä"), 3)
+    # an undecodable byte still counts as one piece
+    assert_eq(char_count(chr(255) + "a"), 2)
+
+test "splits into characters":
+    parts := chars("Ärger")
+    assert_eq(parts.len(), 5)
+    assert_eq(parts.get(0).unwrap_or(""), "Ä")
+    assert_eq(parts.get(1).unwrap_or(""), "r")
+    assert_eq(parts.get(4).unwrap_or(""), "r")
+    assert_eq(from_chars(parts), "Ärger")
+    assert_eq(chars("").len(), 0)
+
+test "reports code points and offsets":
+    points := code_points("A€")
+    assert_eq(points.len(), 2)
+    assert_eq(points.get(0).unwrap_or(0), 65)
+    assert_eq(points.get(1).unwrap_or(0), 8364)
+
+    offsets := char_offsets("A€b")
+    assert_eq(offsets.len(), 3)
+    assert_eq(offsets.get(0).unwrap_or(- 1), 0)
+    assert_eq(offsets.get(1).unwrap_or(- 1), 1)
+    assert_eq(offsets.get(2).unwrap_or(- 1), 4)
+
+test "answers boundary questions":
+    s := "Ärger"
+    assert_eq(is_boundary(s, 0), true)
+    assert_eq(is_boundary(s, 1), false)
+    assert_eq(is_boundary(s, 2), true)
+    assert_eq(is_boundary(s, 6), true)
+    assert_eq(is_boundary(s, 7), false)
+    assert_eq(floor_boundary(s, 1), 0)
+    assert_eq(floor_boundary(s, 2), 2)
+    assert_eq(ceil_boundary(s, 1), 2)
+    assert_eq(ceil_boundary(s, 2), 2)
+
+test "indexes and slices by character":
+    s := "Ärger"
+    assert_eq(char_at(s, 0).unwrap_or(""), "Ä")
+    assert_eq(char_at(s, 1).unwrap_or(""), "r")
+    assert_eq(char_at(s, 4).unwrap_or(""), "r")
+    assert(char_at(s, 5) == none)
+    assert(char_at(s, - 1) == none)
+    assert_eq(slice(s, 0, 1), "Ä")
+    assert_eq(slice(s, 0, 2), "Är")
+    assert_eq(slice(s, 1, 5), "rger")
+    assert_eq(slice(s, 0, 99), "Ärger")
+    assert_eq(slice(s, 3, 1), "")
+    assert_eq(byte_offset_of(s, 1), 2)
+    assert_eq(byte_offset_of(s, 99), 6)
+
+test "truncates without splitting a character":
+    s := "Ärger"
+    assert_eq(truncate(s, 1), "Ä")
+    assert_eq(truncate(s, 0), "")
+    assert_eq(truncate(s, 99), "Ärger")
+    assert_eq(is_valid(truncate(s, 1)), true)
+
+    # a byte budget backs off to the last whole character
+    assert_eq(truncate_bytes(s, 1), "")
+    assert_eq(truncate_bytes(s, 2), "Ä")
+    assert_eq(truncate_bytes(s, 3), "Är")
+    assert_eq(truncate_bytes(s, 99), "Ärger")
+    assert_eq(is_valid(truncate_bytes(s, 1)), true)
+
+test "marks text it had to cut":
+    assert_eq(truncate_with("Ärger", 10, "..."), "Ärger")
+    assert_eq(truncate_with("Ärger", 4, "..."), "Ä...")
+    assert_eq(truncate_with("hello world", 8, "..."), "hello...")
+
+test "repairs undecodable bytes":
+    assert_eq(sanitize("Ärger"), "Ärger")
+    assert_eq(sanitize(""), "")
+    assert_eq(sanitize("a" + chr(255) + "b"), "a�b")
+    assert_eq(is_valid(sanitize("a" + chr(255) + "b")), true)
+    # a lead byte whose continuation was cut away
+    assert_eq(sanitize(chr(195)), "�")

@@ -1430,8 +1430,18 @@ pub fn bearer_token(metadata: Map[String, String]) -> String:
     value := metadata.get("authorization").unwrap_or("")
     if value.len() < 7:
         return ""
-    if value.substring(0, 7).to_lower() != "bearer ":
-        return ""
+    # the scheme name is ascii by rfc 7235, and the value is whatever a client
+    # sent. comparing bytes avoids slicing 7 bytes off a value whose first
+    # character is multi-byte, which is a cut through the middle of it.
+    mut position := 0
+    expected := "bearer "
+    while position < 7:
+        mut got := bit_and(ord(value[position]), 255)
+        if got >= 65 and got <= 90:
+            got = got + 32
+        if got != bit_and(ord(expected[position]), 255):
+            return ""
+        position = position + 1
     return value.substring(7, value.len())
 
 ## an interceptor that spends one token from `limiter` per call and answers
@@ -2058,3 +2068,11 @@ test "the bearer token is read case-insensitively, or not at all":
     assert_eq(bearer_token(md), "")
     mut none_set: Map[String, String] := {}
     assert_eq(bearer_token(none_set), "")
+
+    # a client can send any bytes at all. the scheme is compared byte by byte
+    # because slicing seven bytes off a value whose first character is
+    # multi-byte cuts through the middle of it.
+    md.insert("authorization", "Ärger token here")
+    assert_eq(bearer_token(md), "")
+    md.insert("authorization", "Bearer Ärger")
+    assert_eq(bearer_token(md), "Ärger")

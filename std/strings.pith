@@ -8,6 +8,12 @@
 # This module fills in the gaps: ASCII character checks, line and word
 # splitting, prefix/suffix helpers, bounded replacement, indentation, and
 # small formatting conveniences such as center and zfill.
+#
+# The checks and the padding here work in bytes, which is the same thing as
+# characters only while the text is ascii. Anything that counts or cuts and
+# could see non-ascii text goes through std.text.
+
+import std.text as text
 
 # ---------------------------------------------------------------
 # ASCII character checks
@@ -157,13 +163,14 @@ pub fn count(s: String, substr: String) -> Int:
         pos = found_pos + substr.len()
     return result
 
-# capitalizes the first character and lowercases the rest.
+# capitalizes the first character and lowercases the rest. the case change
+# itself is ascii-only, but the split is character-aware: taking byte 0 of a
+# non-ascii string used to hand back half a character.
 pub fn capitalize(s: String) -> String:
     if s.len() == 0:
         return s
-    first := s[0].to_upper()
-    rest := s.substring(1, s.len()).to_lower()
-    return first + rest
+    split := text.byte_offset_of(s, 1)
+    return s.substring(0, split).to_upper() + s.substring(split, s.len()).to_lower()
 
 # capitalizes each space-separated word.
 pub fn title(s: String) -> String:
@@ -192,7 +199,12 @@ pub fn swap_case(s: String) -> String:
         i = i + 1
     return result
 
-# compares two strings for equality, ignoring case.
+# compares two strings for equality, ignoring ascii case.
+#
+# this is the right test for a protocol token -- an http header name, a
+# "close" or "websocket" keyword, a scheme -- where the specification defines
+# case-insensitivity over ascii and nothing wider. it is the wrong test for
+# text a user typed, which does not fold at all here: use text.eq_fold.
 pub fn equals_ignore_case(a: String, b: String) -> Bool:
     return a.to_lower() == b.to_lower()
 
@@ -469,12 +481,14 @@ pub fn center_with(s: String, width: Int, fill: String) -> String:
 pub fn zfill(s: String, width: Int) -> String:
     return s.pad_left(width, "0")
 
-# returns a new string with characters in reverse order.
+# returns a new string with characters in reverse order. reversing the bytes
+# instead would turn any multi-byte character into an invalid sequence.
 pub fn reverse(s: String) -> String:
+    parts := text.chars(s)
     mut result := ""
-    mut i := s.len() - 1
+    mut i := parts.len() - 1
     while i >= 0:
-        result = result + s[i]
+        result = result + parts[i]
         i = i - 1
     return result
 
@@ -489,20 +503,19 @@ pub fn get(s: String, index: Int) -> String?:
     return s[index]
 
 # returns the first n characters, or the whole string if it is shorter.
+# characters, not bytes: on non-ascii text a byte count would cut a character
+# in half.
 pub fn first_n(s: String, n: Int) -> String:
-    if n <= 0:
-        return ""
-    if n >= s.len():
-        return s
-    return s.substring(0, n)
+    return text.truncate(s, n)
 
 # returns the last n characters, or the whole string if it is shorter.
 pub fn last_n(s: String, n: Int) -> String:
     if n <= 0:
         return ""
-    if n >= s.len():
+    total := text.char_count(s)
+    if n >= total:
         return s
-    return s.substring(s.len() - n, s.len())
+    return text.slice(s, total - n, total)
 
 # ---------------------------------------------------------------
 # Search and indentation
@@ -597,29 +610,26 @@ pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
     return result
 
 fn shared_prefix(a: String, b: String) -> String:
-    mut result := ""
     mut i := 0
     mut limit := a.len()
     if b.len() < limit:
         limit = b.len()
-    while i < limit:
-        if a[i] != b[i]:
-            break
-        result = result + a[i]
+    while i < limit and a[i] == b[i]:
         i = i + 1
-    return result
+    # two strings can agree on the first byte of a character and differ on the
+    # second -- "Ärger" and "Örger" share only 0xC3 -- so the match has to be
+    # pulled back to a boundary or the result is not utf-8 at all.
+    return a.substring(0, text.floor_boundary(a, i))
 
 fn shared_suffix(a: String, b: String) -> String:
-    mut result := ""
     mut a_idx := a.len() - 1
     mut b_idx := b.len() - 1
-    while a_idx >= 0 and b_idx >= 0:
-        if a[a_idx] != b[b_idx]:
-            break
-        result = a[a_idx] + result
+    while a_idx >= 0 and b_idx >= 0 and a[a_idx] == b[b_idx]:
         a_idx = a_idx - 1
         b_idx = b_idx - 1
-    return result
+    # as in shared_prefix, a match that stops mid-character has to be pushed
+    # forward to the next boundary.
+    return a.substring(text.ceil_boundary(a, a_idx + 1), a.len())
 
 # return the shared starting prefix across all strings.
 pub fn common_prefix(items: List[String]) -> String:
@@ -646,6 +656,35 @@ pub fn common_suffix(items: List[String]) -> String:
         if suffix.len() == 0:
             return ""
     return suffix
+
+test "counts and cuts characters, not bytes":
+    # "Ärger" is 6 bytes and 5 characters. these all used to work in bytes,
+    # which either cut a character in half or reversed one into nonsense.
+    assert_eq(first_n("Ärger", 3), "Ärg")
+    assert_eq(first_n("Ärger", 1), "Ä")
+    assert_eq(first_n("Ärger", 99), "Ärger")
+    assert_eq(first_n("Ärger", 0), "")
+    assert_eq(last_n("Ärger", 3), "ger")
+    assert_eq(last_n("Ärger", 5), "Ärger")
+    assert_eq(last_n("Ärger", 99), "Ärger")
+
+    assert_eq(reverse("Ärger"), "regrÄ")
+    assert_eq(reverse("abc"), "cba")
+    assert_eq(reverse(""), "")
+
+    assert_eq(capitalize("hello"), "Hello")
+    assert_eq(capitalize("ärger"), "ärger")
+    assert_eq(title("Ärger ünd mehr"), "Ärger ünd Mehr")
+
+test "a shared prefix stops on a character, not a byte":
+    # "Ärger" and "Örger" agree on the first byte of their first character and
+    # differ on the second. reporting that one byte as the common prefix
+    # produced a string that was not utf-8.
+    assert_eq(common_prefix(["Ärger", "Örger"]), "")
+    assert_eq(common_prefix(["Ärger", "Ärgus"]), "Ärg")
+    assert_eq(common_prefix(["abc", "abd"]), "ab")
+    assert_eq(common_suffix(["xÄ", "yÄ"]), "Ä")
+    assert_eq(common_suffix(["xÄ", "yÖ"]), "")
 
 test "string character helpers classify simple chars":
     assert(is_digit("7"))

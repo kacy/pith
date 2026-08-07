@@ -63,7 +63,10 @@ fn error_code_to_wait(code: Int) -> WaitError:
     return WaitError.Cancelled
 
 fn context_wait_error(ctx: Context) -> WaitError:
-    return error_code_to_wait(ctx.err.load())
+    # error_code(), not err.load(): the cell alone does not know about a
+    # deadline that has passed but has not been claimed yet, and reading it
+    # raw would report a deadline expiry as a plain cancellation.
+    return error_code_to_wait(ctx.error_code())
 
 fn make_child_context(parent: Context, deadline_ms: Int) -> (Context, CancelToken):
     err := AtomicInt(0)
@@ -232,6 +235,24 @@ impl Context:
         return self.error_code() != 0
 
     fn error_code() -> Int:
+        code := self.err.load()
+        if code != 0:
+            return code
+        # a deadline is data, not an event: it is set once when the context
+        # is built and never changes, so whether it has passed is a question
+        # the clock can answer on its own. leaving that answer to
+        # watch_deadline made it wait on a task being scheduled, and under
+        # load a caller could see a live context well after its deadline had
+        # gone by. claiming the cell here does exactly what the watcher would
+        # have done, and compare_set inside mark_context keeps the two from
+        # both winning — so this is the same answer, not a new one, just no
+        # longer delayed until a task gets a turn. the watcher stays for the
+        # context nobody asks about, whose done channel still has to close.
+        if self.deadline_ms < 0 or time.now() < self.deadline_ms:
+            return 0
+        mark_context(self.done_ch, self.err, 2)
+        # re-read rather than assume 2: a cancel racing this claim may have
+        # taken the cell first, and its reason is the truthful one.
         return self.err.load()
 
     fn deadline() -> Int?:
@@ -417,6 +438,34 @@ test "concurrent contexts can be cancelled":
     token.cancel()
     assert(ctx.is_cancelled())
     assert_eq(ctx.error_code(), 1)
+
+test "a deadline that has passed is observable without waiting for a task":
+    # no delay anywhere in this test: the deadline is already a second in
+    # the past when the context is built, so it is cancelled by then too.
+    # asking before watch_deadline has had a turn used to answer "live",
+    # which under load is how a caller saw a context past its deadline.
+    ctx := with_deadline(background(), time.now() - 1000).0
+    assert(ctx.is_cancelled())
+    # and the reason is the deadline, not a bare cancellation — the two
+    # readings have to agree, because every caller checks is_cancelled()
+    # and then asks error_code() why
+    assert_eq(ctx.error_code(), 2)
+    assert(blocking_from_wait(context_wait_error(ctx)).is_deadline_exceeded())
+
+test "a deadline still ahead of us leaves the context live":
+    ctx := with_deadline(background(), time.now() + 60000).0
+    assert(not ctx.is_cancelled())
+    assert_eq(ctx.error_code(), 0)
+
+test "a context with no deadline is never cancelled by the clock":
+    assert(not background().is_cancelled())
+    assert(not with_cancel(background()).0.is_cancelled())
+
+test "cancelling before a deadline passes keeps the cancel as the reason":
+    pair := with_deadline(background(), time.now() + 60000)
+    pair.1.cancel()
+    assert(pair.0.is_cancelled())
+    assert_eq(pair.0.error_code(), 1)
 
 test "concurrent blocking errors classify failures":
     cancelled := blocking_cancelled()

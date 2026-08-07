@@ -295,6 +295,18 @@ impl Connection:
         self.send_frame(frames.headers_frame(stream_id, block, true, true))!
         return self.read_response(stream_id)!
 
+    # stop the transport in both directions without closing it, so a reader
+    # blocked on it — or about to call into it — sees end-of-stream while the
+    # descriptor number stays reserved. closing instead would free the number for
+    # the next open in this process, and a reader that had not stopped yet would
+    # then read whatever landed on it.
+    fn shutdown_transport():
+        if self.live:
+            if self.plaintext:
+                tcp_shutdown(self.tls_handle)
+            else:
+                tls.conn_from_handle(self.tls_handle).shutdown_transport()
+
     # close the underlying transport.
     pub fn close():
         if self.live:
@@ -544,6 +556,10 @@ pub struct Client:
     mut going_away: Bool
     mut last_peer_stream: Int
     writer: Task[Int]
+    # closed by the reader on its way out, so close() can wait for it to stop
+    # before the transport descriptor is released. an offline client runs no
+    # reader, so its signal starts closed.
+    reader_done: Channel[Int]
     # the peer's advertised limits (RFC 9113 §6.5.2), applied from its SETTINGS.
     # the frame size bounds our outbound HEADERS (split into CONTINUATION past
     # it); the header-list size, when non-zero, caps a request's uncompressed
@@ -636,11 +652,12 @@ fn client_from_connection(conn: Connection) -> Client:
     credit: Map[Int, Channel[Int]] := {}
     outbound := Channel[Bytes](OUTBOUND_CAP)
     closed := AtomicInt(0)
+    reader_done := Channel[Int](1)
     # spawn the writer before the client exists so its handle can be stored. it
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, unary_streams, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
+    client := Client(conn, Mutex(), 1, table, ids, unary_streams, outbound, closed, false, 0, writer, reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -738,6 +755,9 @@ fn list_remove_int(items: List[Int], target: Int) -> List[Int]:
 # whole connection down; a protocol error additionally sends a GOAWAY naming the
 # fault before failing every waiting stream so their request() calls unblock.
 fn reader_loop(client: Client):
+    # tell close() we have stopped, on every exit from here. until this fires the
+    # transport descriptor must not be released: see Connection.shutdown_transport.
+    defer client.reader_done.close()
     # park until the client promotes. through the inline phase the inline call
     # owns the socket, so the reader must not read a single frame. close() before
     # any promotion closes the gate instead, which also releases us; either way we
@@ -1583,6 +1603,13 @@ impl Client:
         send_goaway(self, frames.ERROR_NO_ERROR)
         self.outbound.close()
         await self.writer
+        # stop the reader before the descriptor goes away. shutdown ends its
+        # current and next read without freeing the fd number; waiting for the
+        # done-signal means no task can still be reading when close() frees it,
+        # which would otherwise hand the reader whatever file or socket the
+        # process opened onto that number next.
+        self.conn.shutdown_transport()
+        self.reader_done.recv()
         self.conn.close()
 
 # --- tests ---
@@ -1714,7 +1741,11 @@ fn offline_client(conn: Connection) -> Client:
     credit: Map[Int, Channel[Int]] := {}
     gate := Channel[Int](1)
     gate.send(1)
-    return Client(conn, Mutex(), 1, table, ids, unary_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
+    # no reader task here, so the done-signal starts closed and close() does not
+    # wait on one that will never run.
+    reader_done := Channel[Int](1)
+    reader_done.close()
+    return Client(conn, Mutex(), 1, table, ids, unary_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:

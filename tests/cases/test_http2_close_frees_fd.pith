@@ -1,0 +1,88 @@
+# closing an http/2 client must stop its reader task before the socket
+# descriptor is released.
+#
+# the reader runs on its own task and reads the transport in a loop. if close()
+# frees the descriptor while that task is still in flight, the number goes back
+# to the kernel and the very next open in this process gets it — and the reader
+# then reads *that*. the file read below is the visible half: it opens a file of
+# a known size immediately after each close, so a reader still holding the old
+# number consumes some of its bytes and the read comes back short.
+#
+# each round promotes the client to its reader/writer pipeline (two concurrent
+# requests), so the reader really is reading the socket when close() runs.
+
+import std.net.http2.server as server
+import std.net.http2.connection as http2
+import std.net.http as http
+
+FIXTURE := "tests/live/fixtures/localhost-ca.crt"
+ROUNDS := 60
+
+fn hello(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "/"
+    return http.text(200, "hello " + path)
+
+# find a free loopback port so repeated runs never collide with TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn serve_one(fd: Int) -> Int:
+    server.serve_h2c_connection(fd, hello)
+    return 0
+
+fn accept_loop(lfd: Int, count: Int) -> Int:
+    mut i := 0
+    mut tasks: List[Task[Int]] := []
+    while i < count:
+        accepted := tcp_accept(lfd)
+        if accepted.is_err:
+            i = count
+        else:
+            tasks.push(spawn serve_one(accepted.ok))
+            i = i + 1
+    for t in tasks:
+        await t
+    return 0
+
+fn fetch(client: http2.Client, path: String) -> Bool:
+    attempt := client.get("localhost", path)
+    if attempt.is_err:
+        return false
+    return attempt.ok.status == 200
+
+fn main() -> Int!:
+    expected := read_file(FIXTURE)!.len()
+    assert(expected > 0)
+    port := choose_port(19640)!
+    lfd := tcp_listen("127.0.0.1", port)!
+    acceptor := spawn accept_loop(lfd, ROUNDS)
+
+    mut short_reads := 0
+    mut i := 0
+    while i < ROUNDS:
+        client := http2.open_h2c("127.0.0.1", port)!
+        # two concurrent streams promote the client, so the reader task takes
+        # over the socket and is live when close() runs.
+        a := spawn fetch(client, "/a")
+        b := spawn fetch(client, "/b")
+        assert(await a)
+        assert(await b)
+        client.close()
+        # the descriptor the client just gave up is the one this open reuses.
+        got := read_file(FIXTURE)!.len()
+        if got != expected:
+            short_reads = short_reads + 1
+        i = i + 1
+
+    await acceptor
+    tcp_close(lfd)
+    assert(short_reads == 0)
+    print("http/2 close left " + short_reads.to_string() + " short file reads")
+    return 0

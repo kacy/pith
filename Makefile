@@ -1118,6 +1118,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_container_eviction_release \
 	tests/cases/test_sql_numeric \
 	tests/cases/test_index_key_ownership \
+	tests/cases/test_owned_container_arg_release \
 	tests/cases/test_direct_store_ownership \
 	tests/cases/test_struct_store_ownership \
 	tests/cases/test_generic_out_list_ownership \

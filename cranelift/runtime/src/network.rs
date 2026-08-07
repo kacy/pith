@@ -284,111 +284,71 @@ pub extern "C" fn pith_tcp_accept(server_fd: i64) -> i64 {
     result
 }
 
+/// the size one read asks for. a non-positive `max_bytes` means the default
+/// chunk, as it always has.
+fn read_size(max_bytes: i64) -> usize {
+    if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    }
+}
+
+/// one read from a connection fd, whichever backend is running: the green path
+/// yields the task to the reactor on would-block, the os-thread path blocks in
+/// the kernel. `None` is a failure, `Some(empty)` is end of stream.
+///
+/// both go through `fdio`'s socket calls, which use `recv` rather than `read` so
+/// that an fd the process closed and the kernel handed to some later `open`
+/// fails with `ENOTSOCK` instead of quietly returning that file's bytes.
+fn socket_read(conn_fd: i64, size: usize) -> Option<Vec<u8>> {
+    if conn_fd <= 0 {
+        return None;
+    }
+    if is_green() {
+        fdio::socket_read_yielding(conn_fd, size)
+    } else {
+        fdio::socket_read_blocking(conn_fd, size)
+    }
+}
+
+/// one write to a connection fd, the counterpart of `socket_read`. returns the
+/// bytes accepted, `0` for a failure or a closed peer.
+fn socket_write(conn_fd: i64, data: &[u8]) -> i64 {
+    if conn_fd <= 0 {
+        return 0;
+    }
+    if is_green() {
+        fdio::socket_write_yielding(conn_fd, data)
+    } else {
+        fdio::socket_write_blocking(conn_fd, data)
+    }
+}
+
 /// TCP read — read up to 4096 bytes from connection fd, return as C string
 #[no_mangle]
 pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
-    use std::io::Read;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
-    if conn_fd <= 0 {
-        return std::ptr::null_mut();
+    match socket_read(conn_fd, 4096) {
+        Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
+        None => std::ptr::null_mut(),
     }
-
-    if is_green() {
-        return match fdio::read_yielding(conn_fd, 4096) {
-            Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
-            None => std::ptr::null_mut(),
-        };
-    }
-
-    let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let mut buf = vec![0u8; 4096];
-    let result = match stream.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            let s = String::from_utf8_lossy(&buf).to_string();
-            crate::pith_strdup_string(&s)
-        }
-        Err(_) => std::ptr::null_mut(),
-    };
-    use std::os::unix::io::IntoRawFd;
-    let _ = stream.into_raw_fd();
-    result
 }
 
 /// TCP read with max bytes limit
 #[no_mangle]
 pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
-    use std::io::Read;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
-    if conn_fd <= 0 {
-        return std::ptr::null_mut();
+    match socket_read(conn_fd, read_size(max_bytes)) {
+        Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
+        None => std::ptr::null_mut(),
     }
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
-
-    if is_green() {
-        return match fdio::read_yielding(conn_fd, size) {
-            Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
-            None => std::ptr::null_mut(),
-        };
-    }
-
-    let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let mut buf = vec![0u8; size];
-    let result = match stream.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            let s = String::from_utf8_lossy(&buf).to_string();
-            crate::pith_strdup_string(&s)
-        }
-        Err(_) => std::ptr::null_mut(),
-    };
-    use std::os::unix::io::IntoRawFd;
-    let _ = stream.into_raw_fd();
-    result
 }
 
 #[no_mangle]
 pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
-    use std::io::Read;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
-    if conn_fd <= 0 {
-        return 0;
+    match socket_read(conn_fd, read_size(max_bytes)) {
+        Some(buf) => pith_bytes_from_vec(buf),
+        None => 0,
     }
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
-
-    if is_green() {
-        return match fdio::read_yielding(conn_fd, size) {
-            Some(buf) => pith_bytes_from_vec(buf),
-            None => 0,
-        };
-    }
-
-    let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let mut buf = vec![0u8; size];
-    let result = match stream.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            pith_bytes_from_vec(buf)
-        }
-        Err(_) => 0,
-    };
-    use std::os::unix::io::IntoRawFd;
-    let _ = stream.into_raw_fd();
-    result
 }
 
 #[no_mangle]
@@ -404,55 +364,15 @@ pub extern "C" fn pith_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
 /// TCP write — write data to connection fd, return bytes written
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
-    use std::io::Write;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
-    if conn_fd <= 0 {
-        return 0;
-    }
-    let s = cstr_str_or_empty(data);
-
-    if is_green() {
-        return fdio::write_yielding(conn_fd, s.as_bytes());
-    }
-
-    let mut stream = TcpStream::from_raw_fd(conn_fd as i32);
-    let result = match stream.write(s.as_bytes()) {
-        Ok(n) => n as i64,
-        Err(_) => 0,
-    };
-    let _ = stream.flush();
-    use std::os::unix::io::IntoRawFd;
-    let _ = stream.into_raw_fd();
-    result
+    socket_write(conn_fd, cstr_str_or_empty(data).as_bytes())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
-    use std::io::Write;
-    use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
-
     let Some(bytes) = pith_bytes_ref(data) else {
         return 0;
     };
-    if conn_fd <= 0 {
-        return 0;
-    }
-
-    if is_green() {
-        return fdio::write_yielding(conn_fd, &bytes.data);
-    }
-
-    let mut stream = TcpStream::from_raw_fd(conn_fd as i32);
-    let result = match stream.write(&bytes.data) {
-        Ok(n) => n as i64,
-        Err(_) => 0,
-    };
-    use std::os::unix::io::IntoRawFd;
-    let _ = stream.into_raw_fd();
-    result
+    socket_write(conn_fd, &bytes.data)
 }
 
 /// TCP set read timeout in milliseconds (0 = no timeout)

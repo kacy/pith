@@ -1,0 +1,69 @@
+# a container written straight into a call is an allocation nothing else
+# names, so the caller holds its only count and has to drop it once the call
+# returns. the rule was in the emitter and in docs/ownership.md, but the branch
+# that applied it only ever fired for the struct and closure kinds, so lists,
+# maps and sets fell through it and every such call stranded its handle for the
+# life of the process — about 165 bytes per list argument and 400 per map.
+# unbounded, and under every bigint limb operation until std.decimal bound its
+# temporaries to a local to work around it.
+#
+# valgrind cannot see this one: a stranded handle stays reachable from the
+# handle registry, so it is "still reachable" rather than lost. resident growth
+# is what notices it, which is what this gate measures.
+import leakprobe as probe
+
+struct Holder:
+    items: List[Int]
+
+fn takes_list(xs: List[Int]) -> Int:
+    return xs.len()
+
+fn takes_map(m: Map[String, Int]) -> Int:
+    return m.len()
+
+fn takes_set(s: Set[Int]) -> Int:
+    return s.len()
+
+fn hands_back(xs: List[Int]) -> List[Int]:
+    return xs
+
+fn double(n: Int) -> Int:
+    return n * 2
+
+fn churn_round(src: List[Int], i: Int) -> Int:
+    mut n := 0
+    # the plain literal shapes
+    n = n + takes_list([1, 2])
+    n = n + takes_list([i, i + 1, i + 2])
+    n = n + takes_map({"a": i})
+    n = n + takes_set({3, 4})
+
+    # a fresh method result in argument position
+    n = n + takes_list(src.map(double))
+    n = n + takes_list(src.filter(fn(x: Int) => x > 1))
+    n = n + takes_list(src.slice(0, 2))
+    n = n + takes_list(src.sort())
+
+    # a callee that hands the argument back, and one that keeps it in a struct
+    back := hands_back([5, 6, 7])
+    h := Holder([8, 9])
+    n = n + back.len() + h.items.len()
+
+    # the transferring positions, which must stay untouched by the release
+    mut sink: List[List[Int]] := []
+    sink.push([1, 1, 1])
+    n = n + sink[0].len()
+    return n
+
+fn main():
+    src := [3, 1, 2]
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + churn_round(src, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

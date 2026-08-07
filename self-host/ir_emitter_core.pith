@@ -1351,13 +1351,59 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
 # argument: ownership transfers to the container there, and the store
 # itself completes the transfer by taking the caller's count rather than
 # adding one (see ir_owned_container_store_name).
-fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
+# container_skip_pos is the narrower exclusion: a position that keeps the
+# release for a string or a struct but not for a container
+# (ir_method_container_store_pos says why).
+fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int, container_skip_pos: Int):
     for reg, i in arg_regs:
         if i == skip_pos:
             continue
         expr_idx := ir_method_call_arg_expr(node, i)
-        if expr_idx >= 0:
-            ir_release_owned_string_operand(expr_idx, reg, ir_infer_type(expr_idx))
+        if expr_idx < 0:
+            continue
+        arg_type := ir_infer_type(expr_idx)
+        if i == container_skip_pos and ir_arg_kind_is_container(ir_rc_kind(arg_type)):
+            continue
+        ir_release_owned_string_operand(expr_idx, reg, arg_type)
+
+# the three rc kinds this rule newly reaches — the ones a container may hold
+# without being tagged to own a count of them.
+fn ir_arg_kind_is_container(arg_kind: String) -> Bool:
+    return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
+
+# the value position of a container store the emitter leaves on the plain
+# runtime path, where a released container argument would be one release too
+# many. `list_insert` is the only one: unlike push and set it has no variant
+# that takes the caller's count, so it adds a count of its own — but only when
+# the list is tagged for that element kind, and a list holding collections is
+# not reliably tagged (an empty-annotated List[List] reads the same as a
+# List[Int] in the type strings, and the runtime's element tag has no Set
+# variant at all). so a released list, map or set here can hand the list a
+# freed handle. err toward the leak, the way every untagged-container gap
+# does. strings, bytes, structs and closures keep releasing here — those lists
+# are tagged wherever the checker knows the element type, and that behaviour
+# predates the container rule.
+# returns -1 when the callee has no such position, which is every other one.
+fn ir_method_container_store_pos(emit_name: String) -> Int:
+    if emit_name == "list_insert":
+        return 1
+    return 0 - 1
+
+# the argument position, if any, whose count a builtin hands back out instead
+# of borrowing. `get_default` returns its fallback unchanged when the key is
+# missing and adds no count of its own, so that fallback can BE the
+# expression's value — releasing it once the call returns frees what the
+# caller is about to read. an owned fallback therefore leaks when the key is
+# present, which is the honest half of a choice that has no statically correct
+# answer: the release is right on one branch and a use-after-free on the
+# other. binding the fallback to a local first is exact on both.
+# (`unwrap_or` is the same shape and never reaches here — both spellings have
+# their own emitter and return before the general method path.)
+# returns -1 when no position is handed back, which is every other builtin.
+fn ir_method_arg_pos_handed_back(emit_name: String) -> Int:
+    if emit_name == "map_get_default" or emit_name == "map_get_default_ikey":
+        return 1
+    return 0 - 1
 
 fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int]):
     mut reg_i := 0
@@ -2475,15 +2521,42 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # callee borrowed it and a storing callee took its own count, so the
         # caller releases the count it still holds. a borrowed arg (a
         # variable/field/element the caller keeps) is not released; a fresh
-        # literal (a struct init, a lambda) or a transferred result is.
+        # literal (a list, a map, a struct init, a lambda) or a transferred
+        # result is.
         mut arg_kind := ir_rc_kind(expr_type)
         # a fn type has no rc kind of its own, but the value in the register
         # is a closure handle either way: a lambda literal, or a named
         # function the ident load wrapped into one.
         if arg_kind.len() == 0 and (get_node(expr_idx).kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
             arg_kind = "closure"
-        if (arg_kind == "struct" or arg_kind == "closure") and not ir_string_expr_is_borrowed(expr_idx):
+        if ir_owned_arg_kind_releases(arg_kind) and not ir_string_expr_is_borrowed(expr_idx):
             ir_rc_release_reg(reg, arg_kind)
+
+# the rc kinds an owned call argument hands back once the call returns.
+#
+# containers belong here for the same reason structs and closures do: a
+# `[1, 2]`, a `{"k": v}` or an `xs.map(f)` written straight into a call is an
+# allocation nothing else names, and a callee that keeps it adds a count of its
+# own — a parameter is a borrow, so a store retains and a returned parameter is
+# retained on the way out. leaving the container kinds off this list is what
+# made every such call strand its handle for the life of the process, about 165
+# bytes per list argument and 400 per map.
+#
+# "tuple" is deliberately absent and has to stay off. an optional and a result
+# both lower to a tuple shell, so the kind does not say whether the register
+# holds a real tuple literal or a wrapper whose ownership the result and
+# optional extraction paths settle instead — ir_emit_struct_positional_init
+# excludes tuple from its field retain for the same reason. releasing one here
+# would drop a count those paths still hand on. a tuple literal written into an
+# argument therefore still leaks its box.
+#
+# "string" and "bytes" never reach here: the branches above claim them first,
+# because a fresh string has shapes (an s[i] char, a concat) that no rc kind
+# describes.
+fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
+    if arg_kind == "struct" or arg_kind == "closure":
+        return true
+    return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
 
 # true for call and method-call results whose checked or inferred type is
 # string, outside generic bodies where the types cannot be trusted.
@@ -4628,7 +4701,16 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
     ir_emit_call_text(r, call_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    ir_release_owned_method_args(node, arg_regs, store_value_pos)
+    # a container store is not the only position whose count the caller must
+    # not drop: a fallback argument the callee may hand straight back out is
+    # the other one, and the two never occur on the same callee.
+    mut release_skip_pos := store_value_pos
+    mut container_skip_pos := 0 - 1
+    if not impl_dispatch:
+        if release_skip_pos < 0:
+            release_skip_pos = ir_method_arg_pos_handed_back(emit_name)
+        container_skip_pos = ir_method_container_store_pos(emit_name)
+    ir_release_owned_method_args(node, arg_regs, release_skip_pos, container_skip_pos)
     if node.children.len() > 0:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))

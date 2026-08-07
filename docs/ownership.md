@@ -54,6 +54,22 @@ call arguments:
 - so an *owned* argument (a fresh `s[i]` char, a concat result, a
   fresh method result) dies once the call it fed returns — the caller
   releases it
+- that covers every heap kind, not only strings. a container written
+  straight into a call — `f([1, 2])`, `f({"k": v})`, `f(xs.map(g))` —
+  is an allocation nothing else names, exactly like a struct literal, a
+  lambda, or a fresh `Bytes`. `ir_owned_arg_kind_releases` is the list
+  of kinds this applies to. leaving the container kinds off it is what
+  made every such call strand its handle for the life of the process,
+  about 165 bytes per list argument and 400 per map
+- `tuple` is deliberately not on that list, and is the one kind that
+  has to stay off. an optional and a result both lower to a tuple
+  shell, so the kind does not say whether a register holds a real tuple
+  literal or a wrapper whose ownership the result and optional
+  extraction paths settle instead — `ir_emit_struct_positional_init`
+  excludes tuple from its field retain for the same reason. a tuple
+  literal written into an argument therefore still leaks its box;
+  binding it to a local first does not, because scope cleanup releases
+  it
 - exception: an argument stored directly into a container is skipped
   by that release (`skip_pos` in `ir_release_owned_method_args`),
   because ownership transfers into the container there rather than
@@ -67,6 +83,29 @@ call arguments:
   it knows if it was built tagged. an untagged container takes nothing
   and the caller's count stays outstanding, which is a leak rather than
   an element nothing keeps alive
+- second exception: an argument the callee hands back out rather than
+  borrowing. `m.get_default(k, d)` returns `d` unchanged when the key
+  is missing and adds no count of its own, so on that branch the
+  fallback *is* the expression's value and releasing it at the call
+  frees what the caller is about to read.
+  `ir_method_arg_pos_handed_back` names the position, and the release
+  skips it. that leaves the other branch — key present, fallback
+  discarded — leaking a fresh fallback, which is the honest half of a
+  choice with no statically correct answer. bind the fallback to a
+  local first (`empty := []` then `m.get_default(k, empty)`) and scope
+  cleanup gets it exactly right on both branches. `unwrap_or` is the
+  same shape and never reaches this code: both spellings have their own
+  emitter and build the fallback inside the arm that returns it
+- third exception, narrower than the other two: `xs.insert(i, v)` keeps
+  the release for a string, a struct or a closure and drops it for a
+  container. `list_insert` is the one container store still on the
+  plain runtime path — it has no variant that takes the caller's count,
+  so it adds one of its own, but only when the list is tagged for that
+  element kind. a list of collections is not reliably tagged, and the
+  runtime's element tag has no `Set` variant at all, so a released
+  container there could hand the list a freed handle
+  (`ir_method_container_store_pos`). the kinds that are always tagged
+  keep releasing
 - an index key is an argument like any other, and the container-store
   exception does not cover it: a lookup reads the key and keeps nothing,
   a store copies the key bytes into the map's own storage, so an owned
@@ -148,8 +187,10 @@ keys are strings, and `map.values()` when the values are heap values.
 
 - the variable rules: statement lowering in
   `self-host/ir_emitter_core.pith` (binds, assigns, returns)
-- the argument rules: `ir_release_owned_method_args` and the call
-  paths near it
+- the argument rules: `ir_release_owned_method_args`,
+  `ir_release_owned_string_args` and the call paths near them. the
+  kinds they release are `ir_owned_arg_kind_releases`; the position
+  they must not release is `ir_method_arg_pos_handed_back`
 - the runtime counts: `cranelift/runtime/src/runtime_core.rs` and the
   per-type files under `collections/`
 
@@ -203,6 +244,26 @@ gaps, all bounded leaks rather than dangling pointers:
   and errs toward the leak. tuples themselves are fully reclaimed:
   a tuple frees its box at the last count and releases any heap value
   it holds, the same as a struct.
+- **a tuple literal written straight into a call leaks its box.** every
+  other owned argument kind is released once the call returns, but an
+  optional and a result both lower to a tuple shell, so the kind cannot
+  tell a real tuple literal from a wrapper whose count the extraction
+  paths still hand on — releasing one would be a double free rather
+  than a leak. `f((a, b))` therefore strands one box per call; `t := (a,
+  b)` then `f(t)` does not, because scope cleanup releases the local.
+- **an owned fallback handed to `get_default` leaks when the key is
+  present.** `m.get_default(k, [])` returns the fallback unchanged on a
+  miss, so the emitter cannot release it at the call without freeing
+  the very value being returned; it errs toward the leak, the same way
+  `catch` and `unwrap_or` do above. bind the fallback to a local to get
+  it exactly right on both branches.
+- **a fresh container written into `xs.insert(i, ...)` leaks its
+  handle.** the store adds a count only when the list is tagged to own
+  that element kind, and a list of collections is not reliably tagged —
+  a `List[Set]` never is. the caller therefore keeps its count rather
+  than risk releasing an element the list is not holding. `push` and
+  `xs[i] = v` do not have this gap: they route through the store
+  variants that take the caller's count.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

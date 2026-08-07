@@ -70,6 +70,17 @@ available helpers:
 - `send_ctx(ch, ctx, value)`
 - `recv_ctx(ch, ctx)`
 
+a deadline that has passed is cancelled, and `is_cancelled()` says so the
+moment you ask. it does not wait for a background task to get a turn, so a busy
+machine cannot show you a live context whose deadline has already gone by.
+`error_code()` agrees with it: `2` for a deadline, `1` for a manual cancel, and
+a cancel that lands before the deadline keeps the cancel as the reason.
+
+closing the done channel is still an event a task performs, so
+`ctx.done().recv()` wakes when the watcher closes it rather than at the instant
+the deadline passes. code that needs the deadline enforced exactly should ask
+`is_cancelled()`, which every `*_ctx` helper already does.
+
 tcp stream waits can use the same context story through `std.io`:
 
 - `TcpStream.read_ctx(ctx, max_bytes)`

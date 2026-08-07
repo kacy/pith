@@ -1,0 +1,46 @@
+fn seven() -> Int:
+    return 7
+
+fn main():
+    # a map literal whose key is an int expression rather than an int
+    # literal. the emitter used to decide int-vs-string keying by looking
+    # only at the syntax of the first key, so any non-literal key built a
+    # string-keyed map and then handed map_insert a raw integer where a
+    # cstring pointer belonged — a segfault on the first entry.
+    mut i := 3
+    a := {i: 10}
+    print(a.len().to_string())
+    print(a[3].to_string())
+
+    # an arithmetic key, and a literal key alongside it in the same literal
+    b := {i + 1: 20, 9: 30}
+    print(b.len().to_string())
+    print(b[4].to_string())
+    print(b[9].to_string())
+
+    # a call as the key
+    c := {seven(): 40}
+    print(c[7].to_string())
+
+    # string values take a separate constructor, so cover that target too
+    d := {i: "hello"}
+    print(d[3])
+
+    mut sv := "world"
+    e := {i: sv}
+    print(e[3])
+
+    # a container value, and an annotated declaration
+    mut f: Map[Int, Int] := {i: 5}
+    print(f[3].to_string())
+
+    # keys() must enumerate the int keys, not treat them as pointers
+    mut ksum := 0
+    for k in b.keys():
+        ksum = ksum + k
+    print(ksum.to_string())
+
+    # a string-keyed literal with a non-literal key still keys by string
+    s := "k"
+    g := {s: 1}
+    print(g["k"].to_string())

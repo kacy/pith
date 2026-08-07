@@ -3491,7 +3491,15 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
 
 fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     map_r := ir_reg()
-    has_int_keys := ir_map_uses_int_keys(node)
+    # the syntactic probe only recognizes an int *literal* key, so a literal
+    # whose key is any other int expression ({i: 1}) looked string-keyed and
+    # built a string-keyed map, then handed map_insert a raw integer where a
+    # cstring pointer was expected. the checked type already knows the key
+    # kind, so let it decide — the same way ir_emit_set_literal does. the
+    # probe stays as the fallback for a literal the checker left untyped.
+    mut has_int_keys := ir_map_uses_int_keys(node)
+    if ir_checked_type(idx) == "map_int":
+        has_int_keys = true
     mut val_target := ""
     tid := c_get_expr_type(idx)
     if tid >= 0:

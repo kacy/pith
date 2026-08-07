@@ -97,11 +97,18 @@ test "an accept loop keeps going while the run is short":
 
 # Reads up to max_bytes from a connection.
 # Returns the data read or fails on error (e.g., connection closed).
+#
+# fd must be a socket. reading a descriptor that is not one stops the process
+# with a diagnostic rather than returning an error, because the usual cause is a
+# connection closed while something still held its number — see close().
 pub fn read(fd: Int, max_bytes: Int) -> String!:
     return tcp_read(fd, max_bytes)
 
 # Writes data to a connection.
 # Returns the number of bytes written or fails on error.
+#
+# as with read(), fd must be a socket: a write to a descriptor that is not one
+# would overwrite whatever file inherited the number, so it stops the process.
 pub fn write(fd: Int, data: String) -> Int!:
     return tcp_write(fd, data)
 
@@ -111,6 +118,11 @@ pub fn set_timeout(fd: Int, ms: Int):
     tcp_set_timeout(fd, ms)
 
 # Closes a TCP connection.
+#
+# close only after every task that reads or writes fd has finished. the kernel
+# gives the freed number to the next file the process opens, so a read arriving
+# late lands on that file instead; read() and write() stop the process when they
+# can see that happen.
 pub fn close(fd: Int):
     tcp_close(fd)
 

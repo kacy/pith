@@ -14,15 +14,14 @@ import std.decimal as decimal
 # a row shaped like a ledger read: an exact amount alongside the columns that
 # usually travel with one.
 #
-# the two lists are bound before the call on purpose. a freshly built List
-# handed straight to a function is not released today — `sql.row([a], [b])`
-# leaks both literals, with or without a decimal in them — and this case is
-# here to measure the numeric path, not that.
+# the two lists go straight into the call. they used to be bound to locals
+# first, because a freshly built List handed to a function was not released
+# and `sql.row([a], [b])` leaked both literals with or without a decimal in
+# them; the inline form is the shape a caller actually writes, and it belongs
+# in the measurement now that the argument rule covers containers.
 fn ledger_row(nth: Int) -> sql.Row!:
     amount := decimal.parse("12345678901234567.{nth % 89}")!
-    values := [sql.integer(nth), sql.numeric(amount), sql.text("memo")]
-    names := ["id", "amount", "memo"]
-    return sql.row(values, names)
+    return sql.row([sql.integer(nth), sql.numeric(amount), sql.text("memo")], ["id", "amount", "memo"])
 
 # build a row, read the decimal back out, and do the arithmetic a caller would
 # do with it. nothing here is kept past the round.

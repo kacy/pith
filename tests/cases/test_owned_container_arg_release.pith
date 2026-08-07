@@ -1,0 +1,130 @@
+# a container written straight into a call — `f([1, 2])`, `f({"k": v})`,
+# `f(xs.map(g))` — is an allocation nothing else names, so the caller holds its
+# only count and drops it once the call returns. this case is the other half of
+# that rule: every shape here USES the container after the call, so a release
+# that fires one time too many shows up as a wrong answer rather than as a leak
+# (valgrind cannot see it — a released handle comes back out of the pool
+# holding someone else's data, which is perfectly valid memory).
+#
+# the churn between the shapes is load-bearing. a freed handle is only visibly
+# wrong once its slot has been handed to something else, so each round
+# allocates a few hundred throwaway values before the check reads back.
+
+mut kept: List[Int] := []
+mut kept_tags: Map[String, String] := {}
+
+fn takes(xs: List[Int]) -> Int:
+    return xs.len()
+
+fn takes_map(m: Map[String, String]) -> Int:
+    return m.len()
+
+fn takes_set(s: Set[Int]) -> Int:
+    return s.len()
+
+fn hands_back(xs: List[Int]) -> List[Int]:
+    return xs
+
+fn stores(xs: List[Int]):
+    kept = xs
+
+fn stores_map(m: Map[String, String]):
+    kept_tags = m
+
+struct Holder:
+    items: List[Int]
+    label: String
+
+fn double(n: Int) -> Int:
+    return n * 2
+
+fn churn() -> Int:
+    mut junk: List[String] := []
+    mut n := 0
+    mut i := 0
+    while i < 200:
+        junk.push("junk-" + i.to_string())
+        n = n + junk[i].len()
+        i = i + 1
+    return n
+
+# the shape that broke the first attempt at this rule, and the one sitegen
+# builds its tag pages from: `get_default` returns the fallback unchanged when
+# the key is missing, adding no count of its own, so the fallback IS the
+# expression's value on that branch. releasing it at the call frees the list
+# the caller is about to fill, and every tag then shares one recycled handle.
+fn collect_tags(slugs: List[String], tags: List[String]) -> Map[String, List[String]]:
+    mut by_tag: Map[String, List[String]] := {}
+    for slug, i in slugs:
+        t := tags[i]
+        mut acc := by_tag.get_default(t, [])
+        acc.push(slug)
+        by_tag.insert(t, acc)
+    return by_tag
+
+fn main() -> Int:
+    mut sum := 0
+    mut round := 0
+    while round < 400:
+        # a borrowing callee: the literal dies with the call
+        sum = sum + takes([1, 2, 3])
+        sum = sum + takes_map({"a": "x", "b": "y"})
+        sum = sum + takes_set({7, 8})
+
+        # a callee that hands its parameter straight back: the return retains
+        # the borrow, so the caller's release leaves one count standing
+        back := hands_back([4, 5, 6, 7])
+        sum = sum + churn()
+        sum = sum + back.len() + back[0] + back[3]
+
+        # a callee that stores its argument in a global
+        stores([9, 9, 9, 9, 9])
+        stores_map({"k": "v"})
+        sum = sum + churn()
+        sum = sum + kept.len() + kept[4] + kept_tags.len()
+
+        # a fresh method result in argument position, source read after
+        src := [5, 3, 1, 4]
+        sum = sum + takes(src.sort())
+        sum = sum + takes(src.slice(0, 2))
+        sum = sum + takes(src.map(double))
+        sum = sum + takes(src.filter(fn(n: Int) => n > 2))
+        sum = sum + churn()
+        sum = sum + src.len() + src[0] + src[3]
+
+        # method-call argument position, not just a plain call
+        holder := Holder([2, 4, 6], "h")
+        sum = sum + churn()
+        sum = sum + holder.items.len() + holder.items[2] + holder.label.len()
+
+        # a nested literal: the inner list transfers into the outer one
+        nested := [[1, 2], [3]]
+        sum = sum + takes(nested[0]) + takes(nested[1])
+
+        # the transferring positions: a store keeps the caller's count
+        mut sink: List[List[Int]] := []
+        sink.push([8, 8, 8])
+        mut msink: Map[String, String] := {}
+        msink.insert("mk", "mv" + round.to_string())
+        sum = sum + churn()
+        sum = sum + sink[0].len() + sink[0][1] + msink.get_default("mk", "?").len()
+
+        # the get_default fallback, in the shape sitegen uses
+        by_tag := collect_tags(["intro", "meta", "memory"], ["m", "n", "m"])
+        sum = sum + churn()
+        sum = sum + by_tag.len()
+        for t in by_tag.keys():
+            sum = sum + by_tag[t].len() + by_tag[t][0].len()
+
+        # an owned fallback that is never taken, and one that is
+        mut have: Map[String, List[Int]] := {}
+        have.insert("here", [1, 1])
+        hit := have.get_default("here", [2, 2, 2])
+        miss := have.get_default("gone", [3, 3, 3, 3])
+        sum = sum + churn()
+        sum = sum + hit.len() + miss.len() + miss[3]
+
+        round = round + 1
+
+    print(sum.to_string())
+    return 0

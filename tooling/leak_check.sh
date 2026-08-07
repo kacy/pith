@@ -32,6 +32,7 @@ cases=(
   tests/leaks/leak_struct_store
   tests/leaks/leak_loop_var_slot
   tests/leaks/leak_list_transform
+  tests/leaks/leak_container_arg
   tests/leaks/leak_fn_value
   tests/leaks/leak_task_result_payload
   tests/leaks/leak_result_extraction

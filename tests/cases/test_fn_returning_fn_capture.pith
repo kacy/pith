@@ -1,0 +1,53 @@
+# a function whose return type is itself a function type may be named inside a
+# lambda.
+#
+# the emitter records each declared function's return type, and the capture
+# blocker is built from that table's keys — so a name missing from it is read
+# as a free variable and the enclosing function emits a `load` for it. the
+# recorder only accepted `type`, `generic_type`, `result_type` and
+# `optional_type` nodes, so `fn pick() -> fn(Int) -> Int` was never recorded
+# and `fn(n) => pick()(n)` failed with "unknown load source 'pick' in main".
+#
+# arity had nothing to do with it, and neither did calling the result: merely
+# naming such a function inside a lambda was enough. a zero-argument function
+# returning Int was always fine.
+
+fn pick() -> fn(Int) -> Int:
+    return fn(n: Int) => n * 2
+
+fn adder(k: Int) -> fn(Int) -> Int:
+    return fn(x: Int) => x + k
+
+fn takes(f: fn(Int) -> Int, n: Int) -> Int:
+    return f(n)
+
+# the shapes that already worked, kept so a fix here cannot quietly break them
+fn zero_int() -> Int:
+    return 7
+
+fn plain(n: Int) -> Int:
+    return n * 3
+
+fn main() -> Int!:
+    # calling the result of a call, inside a lambda: the original report
+    g := fn(n: Int) => pick()(n)
+    print("call of call:      {g(4)}")
+
+    # naming it without calling the result
+    h := fn(n: Int) => takes(adder(10), n)
+    print("passed as an arg:  {h(5)}")
+
+    # a fn-returning-fn with arguments of its own
+    j := fn(n: Int) => adder(100)(n)
+    print("with arguments:    {j(5)}")
+
+    # and the shapes that were never broken
+    k := fn(n: Int) => zero_int() + n
+    print("zero-arg -> Int:   {k(1)}")
+    m := fn(n: Int) => plain(n)
+    print("plain -> Int:      {m(2)}")
+
+    # outside a lambda, unchanged
+    direct := pick()
+    print("outside a lambda:  {direct(3)}")
+    return 0

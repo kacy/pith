@@ -7232,7 +7232,14 @@ fn ir_record_function_return_as(name: String, node: Node):
 fn ir_record_returns_clause(name: String, returns_node: Node):
     for type_idx in returns_node.children:
         type_node := get_node(type_idx)
-        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "result_type" or type_node.kind == "optional_type":
+        # a function that returns a function type is still a declared callable,
+        # and recording it is what keeps it out of a lambda's capture set: the
+        # capture blocker is built from this table's keys, so a name missing
+        # here is read as a free variable and the enclosing function emits a
+        # `load` for it. `fn pick() -> fn(Int) -> Int` used to fail that way,
+        # with "unknown load source 'pick'" — merely naming it inside a lambda
+        # was enough, no call required.
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "result_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type":
             ir_func_returns.insert(name, ir_resolve_type_node(type_idx))
         if type_node.kind == "result" or type_node.kind == "result_type":
             if type_node.children.len() > 0:

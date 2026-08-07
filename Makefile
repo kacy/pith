@@ -1133,6 +1133,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_loop_var_shadows_fn tests/cases/test_weak_reference \
 	tests/cases/test_http2_concurrent_events tests/cases/test_http2_send_body \
 	tests/cases/test_http2_server_roundtrip tests/cases/test_http2_tls_roundtrip \
+	tests/cases/test_http2_close_frees_fd \
 	tests/cases/test_http1_tls_fallback \
 	tests/cases/test_protobuf_roundtrip tests/cases/test_module_ctor_heap_field \
 	tests/cases/test_catch_heap_no_leak tests/cases/test_list_struct_no_leak \

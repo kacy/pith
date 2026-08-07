@@ -124,7 +124,13 @@ correctness story:
   and the syscall lands on the wrong fd. present on both backends and
   inherited from fd semantics; closing it needs handles that carry liveness
   (a generation, like task handles have) rather than raw fd numbers. do not
-  share a connection between tasks without coordinating its close.
+  share a connection between tasks without coordinating its close. the
+  coordination std uses wherever a task of its own reads a socket — the http/2
+  client's reader, the h2 server's drain — is `tcp_shutdown` first, which ends
+  that task's current and next call while the descriptor number stays
+  reserved, then wait for it to stop, and only then close. closing first hands
+  the number back for the next open anywhere in the process, and a reader that
+  has not stopped yet reads whatever lands on it.
 
 ## the green backend, now the default on linux
 

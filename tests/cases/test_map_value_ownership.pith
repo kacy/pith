@@ -1,0 +1,157 @@
+# a map owns one count per stored heap value, the same contract a tagged
+# list has for its elements.
+#
+# every value here is read back *after* the point an over-release would have
+# freed it, with a few hundred throwaway allocations in between, so a handle
+# handed back to the pool has already been reused by the time it is read. the
+# case fails loudly rather than leaking quietly — which matters because
+# valgrind cannot see this class at all: a released handle comes back off the
+# freelist reading as perfectly valid memory holding somebody else's data.
+
+struct Box:
+    tag: String
+
+# hand the pools enough traffic that a slot freed too early is occupied by
+# something else before the read below.
+fn churn():
+    mut i := 0
+    while i < 200:
+        mut junk: List[String] := []
+        junk.push("junk-{i}")
+        mut jm: Map[String, List[String]] := {}
+        jm.insert("j", junk)
+        i = i + 1
+
+# the map outlives the local the value was built in: the only count keeping
+# the inner list alive after this returns is the map's own.
+fn make_map_with_local() -> Map[String, List[String]]:
+    mut m: Map[String, List[String]] := {}
+    mut inner: List[String] := []
+    inner.push("alpha")
+    inner.push("beta")
+    m.insert("k", inner)
+    return m
+
+# an empty literal in argument position: the parameter type is what says
+# what it holds, and the map has to own what is put in afterwards.
+fn fill(mut m: Map[String, List[String]], tag: String) -> Int:
+    mut row: List[String] := []
+    row.push(tag)
+    m.insert(tag, row)
+    return m.len()
+
+fn main():
+    m1 := make_map_with_local()
+    churn()
+    print("local into map: {m1["k"].len()} {m1["k"][0]} {m1["k"][1]}")
+
+    # a fresh container written straight into the store transfers its count
+    mut m2: Map[String, List[Int]] := {}
+    m2.insert("a", [1, 2, 3])
+    m2["b"] = [4, 5]
+    churn()
+    print("fresh into map: {m2["a"][2]} {m2["b"][1]}")
+
+    # eviction drops the map's count; a reader holding one of its own is fine
+    mut m3: Map[String, List[String]] := {}
+    mut keep: List[String] := []
+    keep.push("kept")
+    m3.insert("x", keep)
+    m3.insert("x", ["replaced"])
+    churn()
+    print("overwrite: {keep[0]} {m3["x"][0]}")
+
+    # get_default on a hit borrows the map's own value: the retain on the
+    # result is what stops the scope exit from freeing the map's entry
+    mut m4: Map[String, List[Int]] := {}
+    m4.insert("hit", [10, 20, 30])
+    mut r := 0
+    while r < 4:
+        v := m4.get_default("hit", [])
+        churn()
+        r = r + 1
+    print("get_default hit: {m4["hit"].len()} {m4["hit"][0]}")
+
+    # get_default on a miss hands the fallback back, and the round trip
+    # through the map has to leave exactly one owner — the collect_tags shape
+    mut m5: Map[String, List[String]] := {}
+    mut d := 0
+    while d < 3:
+        mut slugs := m5.get_default("t", [])
+        slugs.push("s-{d}")
+        m5.insert("t", slugs)
+        churn()
+        d = d + 1
+    print("get_default miss: {m5["t"].len()} {m5["t"][0]} {m5["t"][2]}")
+
+    # int keys leave the scalar fast path the moment they hold handles
+    mut m6: Map[Int, List[String]] := {}
+    mut inner6: List[String] := []
+    inner6.push("six")
+    m6.insert(7, inner6)
+    m6[8] = ["eight"]
+    churn()
+    print("int keys: {m6[7][0]} {m6[8][0]} {m6.len()}")
+
+    # a map literal storing a named local, and one storing a fresh value
+    mut lit: List[String] := []
+    lit.push("literal")
+    m7 := {"e": lit, "f": ["fresh"]}
+    churn()
+    print("literal: {m7["e"][0]} {m7["f"][0]}")
+
+    # every other heap value kind a map can hold
+    mut ms: Map[String, Box] := {}
+    ms.insert("s", Box("boxed"))
+    mut mb: Map[String, Bytes] := {}
+    raw := bytes_from_string_utf8("payload")
+    mb.insert("b", raw)
+    mut mset: Map[String, Set[String]] := {}
+    mut st: Set[String] := {}
+    st.add("member")
+    mset.insert("q", st)
+    mut mm: Map[String, Map[String, String]] := {}
+    mut inner_m: Map[String, String] := {}
+    inner_m.insert("ik", "iv")
+    mm.insert("n", inner_m)
+    churn()
+    print("kinds: {ms["s"].tag} {mb["b"].len()} {mset["q"].contains("member")} {mm["n"]["ik"]}")
+
+    # values() hands out counted handles, so removing the entry afterwards
+    # must not free what the caller is holding
+    mut m9: Map[String, List[String]] := {}
+    mut v9: List[String] := []
+    v9.push("val")
+    m9.insert("z", v9)
+    vals := m9.values()
+    m9.remove("z")
+    churn()
+    print("values: {vals.len()} {vals[0][0]}")
+
+    # a value read out into a local survives the map it came from
+    mut held: List[String] := []
+    mut i10 := 0
+    while i10 < 1:
+        mut m10: Map[String, List[String]] := {}
+        mut tmp: List[String] := []
+        tmp.push("survivor")
+        m10.insert("k", tmp)
+        held = m10["k"]
+        i10 = i10 + 1
+    churn()
+    print("outlives map: {held[0]}")
+
+    # a string-valued map still owns its values through overwrite and remove
+    mut m11: Map[String, String] := {}
+    m11.insert("s", "one" + "-1")
+    m11.insert("s", "two" + "-2")
+    m11.insert("t", "three" + "-3")
+    m11.remove("t")
+    churn()
+    print("strings: {m11["s"]} {m11.len()}")
+
+    # an empty literal in argument position, filled through the parameter
+    mut m12: Map[String, List[String]] := {}
+    filled := fill(m12, "row") + fill({}, "throwaway")
+    churn()
+    print("argument: {filled} {m12["row"][0]}")

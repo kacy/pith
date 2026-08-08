@@ -201,6 +201,7 @@ fn report_not_a_socket(fd: i64, operation: &str) -> ! {
         "  close a connection only after awaiting every task that reads or \
          writes it."
     );
+    // panic-guard: reading or writing a closed fd would corrupt whatever reused it; see the diagnostic above.
     std::process::exit(1);
 }
 

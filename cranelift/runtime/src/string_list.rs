@@ -95,6 +95,7 @@ fn report_split(bytes: &[u8], index: usize, start: i64, end: i64) -> ! {
     eprintln!("    text.slice(s, a, b)         slice by character index");
     eprintln!("    text.truncate(s, n)         keep n characters");
     eprintln!("    text.truncate_bytes(s, n)   keep n bytes, ending on a boundary");
+    // panic-guard: byte slicing that would split a character; see the diagnostic above.
     std::process::exit(1);
 }
 
@@ -226,6 +227,7 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
 pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -> *mut i8 {
     let Some(bytes) = cstr_bytes(s) else {
         eprintln!("pith runtime error: string indexing on invalid string handle");
+        // panic-guard: strict string indexing on an invalid handle is a program bug with no value to return.
         std::process::exit(1);
     };
     let len = bytes.len() as i64;
@@ -234,6 +236,7 @@ pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -
             "pith runtime error: string index out of bounds: {} for string of length {} (use .get(i) for Optional access)",
             index, len
         );
+        // panic-guard: strict string indexing out of bounds is a program bug with no value to return.
         std::process::exit(1);
     }
     let ptr = crate::pith_alloc_cstring(1);

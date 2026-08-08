@@ -169,6 +169,46 @@ other kinds of test, all wired through the `Makefile`:
 - **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
   round counts and fails when memory grew between them. this is the other half
   of `memcheck`, which has its leak check switched off on purpose.
+- **crash sites** — `make check-no-panics` scans the rust sources for anything
+  that can stop the process and fails on any site that is not justified in
+  place. see below.
+
+## the crash guard
+
+the rust runtime is linked into every pith program, so a panic in it is a crash
+in somebody's server. `make check-no-panics` scans `cranelift/*/src` for the
+constructs that stop a process — `panic!`, `unreachable!`, `.unwrap()`,
+`.expect(...)` — plus `std::mem::transmute` and `std::mem::forget`, which
+reinterpret memory and want the same scrutiny. `std::process::exit` is scanned
+in the runtime and the codegen crate only: the cli and the build script are
+programs, and a program exiting non-zero after printing a diagnostic is normal.
+
+a deliberate site is justified with a marker comment on the line directly above
+it:
+
+```rust
+// panic-guard: strict list indexing out of bounds is a program bug with no value to return.
+std::process::exit(1);
+```
+
+the marker moves with the code. the guard used to keep a list of regexes
+matching exact source lines instead, which went stale as soon as anything was
+reformatted or added, so the gate reports a marker whose next line is not a
+guarded site — a marker left behind by a deleted trap is a failure too.
+
+test code is skipped: `#[cfg(test)]` items are compiled out of the shipped
+runtime, and an `.unwrap()` in a test is how a test reports failure. the skip
+runs from the attribute line to the closing brace at the attribute's own
+indentation; an item whose brace never turns up is reported rather than
+silently swallowing the rest of the file.
+
+prefer `runtime_fatal!` over `panic!` for a condition the runtime cannot
+recover from. a panic on a runtime thread does not reliably stop the process:
+`run_task` catches every panic a green task raises, so a panic anywhere the
+spawn path reaches kills the task with `join.done` never set and hangs its
+awaiters forever, and a panic inside a `Once` poisons it for every later caller.
+`runtime_fatal!` prints a `pith runtime error:` line and exits, which is one
+diagnosable death instead of a silent wedge.
 
 ## the leak growth gate
 

@@ -92,7 +92,10 @@ jobs:
 
       - name: memcheck
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq valgrind || true
+          # not `|| true`: `make memcheck` skips itself when valgrind is
+          # missing, so a swallowed install failure would turn this step into a
+          # guard that passes without running.
+          sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
           make memcheck
 
       - name: verify bootstrap fixed point

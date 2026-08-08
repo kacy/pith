@@ -180,6 +180,7 @@ pub unsafe extern "C" fn pith_bytes_get(handle: i64, idx: i64) -> i64 {
 pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
     let Some(bytes) = pith_bytes_ref(handle) else {
         eprintln!("pith runtime error: bytes indexing on invalid bytes handle");
+        // panic-guard: strict bytes indexing on an invalid handle is a program bug with no value to return.
         std::process::exit(1);
     };
     let len = bytes.data.len() as i64;
@@ -188,6 +189,7 @@ pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
             "pith runtime error: bytes index out of bounds: {} for bytes of length {}",
             idx, len
         );
+        // panic-guard: strict bytes indexing out of bounds is a program bug with no value to return.
         std::process::exit(1);
     }
     bytes.data[idx as usize] as i64

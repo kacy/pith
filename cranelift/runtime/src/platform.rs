@@ -15,6 +15,7 @@ static MONO_START: OnceLock<Instant> = OnceLock::new();
 /// Exit the program with given status code
 #[no_mangle]
 pub extern "C" fn pith_exit(code: i64) {
+    // panic-guard: this is pith's own exit builtin, not a trap.
     std::process::exit(code as i32);
 }
 

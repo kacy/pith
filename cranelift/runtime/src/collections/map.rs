@@ -622,10 +622,12 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) 
 pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i8) -> i64 {
     if key.is_null() {
         eprintln!("pith runtime error: map key not found: <null>");
+        // panic-guard: a null map key is a program bug with no value to return.
         std::process::exit(1);
     }
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
         std::process::exit(1);
     };
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
@@ -643,6 +645,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i
                 "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
                 key_display
             );
+            // panic-guard: a missing key under strict indexing is a program bug with no value to return.
             std::process::exit(1);
         }
     }
@@ -845,6 +848,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64
 pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> i64 {
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
         std::process::exit(1);
     };
     crate::perf_stats!(PERF_MAP_INT_GETS += 1);
@@ -867,6 +871,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
                 "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
                 key
             );
+            // panic-guard: a missing key under strict indexing is a program bug with no value to return.
             std::process::exit(1);
         }
     }

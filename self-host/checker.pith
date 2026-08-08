@@ -1495,6 +1495,41 @@ fn propagate_expected_collection_type(literal_idx: Int, expected_tid: Int):
             entry := get_node(entry_idx)
             if entry.kind == "entry" and entry.children.len() >= 2:
                 propagate_expected_collection_type(entry.children[1], expected_info.value_type)
+    elif node.kind == "map" and expected_info.kind == "set" and node.children.len() == 0:
+        # `{}` is the only spelling of an empty set and parses as a map, so
+        # a set target has to cross the kinds. the emitter reads the
+        # recorded type back and builds a set rather than a map — without
+        # it a `{}` written into a Set position builds a map, and every
+        # `add` into it is silently dropped.
+        expression_type_cache.insert(literal_idx, expected_tid)
+
+# give a collection literal written straight into a call or method argument
+# the type the parameter declares. `[]` and `{}` carry no element type of
+# their own, so with nothing to take one from they check as an error and
+# the emitter builds an untagged container — one that takes no count for
+# what is stored into it, leaving every heap element on a count the caller
+# still has to drop. an annotated bind, a `return`, a struct field and an
+# assignment already take their type from context; an argument was the last
+# position that did not.
+#
+# only an *empty* literal is retargeted. an empty one has no elements that
+# could disagree with the parameter, so the recorded type cannot be a lie
+# and no element check is needed; a literal with elements types itself and
+# is left exactly as it was, which keeps a genuinely wrong element type
+# reporting rather than being stamped over. the container this builds is
+# the one the equivalent `mut xs: T := []` then `f(xs)` already builds, so
+# it is a shape the ownership rules cover rather than a new one.
+fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual: Int):
+    if is_error_type(actual) == false:
+        return
+    if expected < 0:
+        return
+    expr_idx := argument_expression_index(arg_idx)
+    node := get_node(expr_idx)
+    if node.children.len() != 0:
+        return
+    if node.kind == "list" or node.kind == "map" or node.kind == "set":
+        propagate_expected_collection_type(expr_idx, expected)
 
 # true when a single value can build an element of the expected type:
 # a nested collection literal recurses, an optional target accepts none
@@ -2887,6 +2922,8 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
             if arg_node.children.len() > 0:
                 arg_expr_idx = arg_node.children[0]
         arg_type := c_check_expr(arg_expr_idx, scope_id)
+        if idx < fn_info.param_types.len():
+            propagate_empty_argument_collection_type(arg_expr_idx, fn_info.param_types[idx], arg_type)
         if is_error_type(arg_type) == false:
             if idx < fn_info.param_types.len():
                 expected := fn_info.param_types[idx]
@@ -3998,6 +4035,8 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                         if pa_node.children.len() > 0:
                             pa_expr = pa_node.children[0]
                     pa_type := c_check_expr(pa_expr, scope_id)
+                    if pi < payload_types.len():
+                        propagate_empty_argument_collection_type(pa_expr, payload_types[pi], pa_type)
                     if is_error_type(pa_type) == false and pi < payload_types.len():
                         if pa_type != payload_types[pi]:
                             if types_structurally_equal(pa_type, payload_types[pi]) == false:
@@ -4052,6 +4091,8 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 if arg_node.children.len() > 0:
                     arg_expr = arg_node.children[0]
             atype := c_check_expr(arg_expr, scope_id)
+            if aidx < param_types.len():
+                propagate_empty_argument_collection_type(arg_expr, param_types[aidx], atype)
             if is_error_type(atype) == false:
                 if aidx < param_types.len():
                     if atype != param_types[aidx]:
@@ -4550,6 +4591,7 @@ fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, secon
 
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     actual := c_check_expr(argument_expression_index(arg_idx), scope_id)
+    propagate_empty_argument_collection_type(arg_idx, expected, actual)
     if is_error_type(actual) == false:
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:

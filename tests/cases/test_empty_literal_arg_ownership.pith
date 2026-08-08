@@ -1,0 +1,91 @@
+# an empty collection literal written straight into an argument used to
+# build an untagged container: one that takes no count for what is stored
+# into it and releases nothing when it dies.
+#
+# every read below happens after several hundred throwaway allocations, so
+# a handle that was released too early has already been handed to something
+# else by the time it is read. that matters because `make memcheck` cannot
+# see an over-release here — a recycled handle reads as perfectly valid
+# memory holding somebody else's data. only comparing the printed values
+# catches it.
+
+mut sink: List[List[String]] := []
+
+fn stash(mut xs: List[String]) -> Int:
+    # the caller wrote a bare `[]`, so this list is the caller's only count.
+    # the store takes one of its own and the caller drops the one it holds.
+    xs.push("m" + "n")
+    sink.push(xs)
+    return sink.len()
+
+fn count_set(mut s: Set[String]) -> Int:
+    s.add("x" + "y")
+    s.add("z" + "z")
+    return s.len()
+
+fn churn() -> Int:
+    mut n := 0
+    mut i := 0
+    while i < 300:
+        mut junk: List[String] := []
+        junk.push("junk-{i}")
+        mut jset: Set[String] := {}
+        jset.add("j-{i}")
+        n = n + junk.len() + jset.len()
+        i = i + 1
+    return n
+
+fn main():
+    # a fresh empty list into a plain call, kept by the callee
+    print("stash: {stash([])} {stash([])}")
+    print("churn: {churn() > 0}")
+    print("sink:  {sink.len()} {sink[0][0]} {sink[1][0]}")
+
+    # a fresh empty set into a plain call
+    print("set:   {count_set({})}")
+
+    # method-argument position: an empty container stored into a tagged one
+    mut nest: List[List[String]] := []
+    nest.push([])
+    nest.insert(0, [])
+    nest[0].push("a" + "b")
+    nest[1].push("c" + "d")
+    print("churn: {churn() > 0}")
+    print("nest:  {nest.len()} {nest[0][0]} {nest[1][0]}")
+
+    # `{}` in a Set position. it parses as a map, so without a target type
+    # it built a map here and every add against it silently vanished.
+    mut sets: List[Set[String]] := []
+    sets.push({})
+    sets.insert(0, {})
+    sets[0].add("e" + "f")
+    sets[1].add("g" + "h")
+    print("churn: {churn() > 0}")
+    print("sets:  {sets.len()} {sets[0].len()} {sets[0].contains("ef")} {sets[1].contains("gh")}")
+
+    # an empty fallback to get_default, on the hit branch (fallback
+    # discarded) and the miss branch (fallback handed back)
+    mut lm: Map[String, List[String]] := {}
+    lm.insert("hit", ["p", "q"])
+    mut i := 0
+    while i < 3:
+        v := lm.get_default("hit", [])
+        mut w := lm.get_default("miss", [])
+        w.push("r" + "s")
+        print("gd {i}:  {v.len()} {v[0]} {w.len()} {w[0]}")
+        i = i + 1
+    print("churn: {churn() > 0}")
+    print("map:   {lm["hit"].len()} {lm["hit"][0]} {lm["hit"][1]}")
+
+    # a set-valued map read through the same fallback
+    mut sm: Map[String, Set[String]] := {}
+    sm.insert("hit", {"t"})
+    mut j := 0
+    while j < 3:
+        s := sm.get_default("hit", {})
+        mut t := sm.get_default("miss", {})
+        t.add("u" + "v")
+        print("gs {j}:  {s.len()} {s.contains("t")} {t.len()} {t.contains("uv")}")
+        j = j + 1
+    print("churn: {churn() > 0}")
+    print("smap:  {sm["hit"].len()} {sm["hit"].contains("t")}")

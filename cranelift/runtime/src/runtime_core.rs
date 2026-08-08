@@ -27,6 +27,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         _ => "runtime error",
     };
     eprintln!("pith runtime error: {message}");
+    // panic-guard: the compiler's runtime-error trap; the program cannot continue past any of these.
     std::process::exit(1);
 }
 
@@ -35,6 +36,7 @@ pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
         Ok(layout) => layout,
         Err(_) => {
             eprintln!("pith runtime error: invalid allocation layout");
+            // panic-guard: an invalid allocation layout is a compiler bug with no way to continue.
             std::process::exit(1);
         }
     }
@@ -44,6 +46,7 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
     let ptr = alloc(layout);
     if ptr.is_null() {
         eprintln!("pith runtime error: allocation failed");
+        // panic-guard: out of memory.
         std::process::exit(1);
     }
     ptr
@@ -95,7 +98,7 @@ pub fn report_leaked_cstrings() {
     let Some(reg) = leak_scan_registry() else {
         return;
     };
-    let ptrs = reg.lock().unwrap();
+    let ptrs = reg.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for &p in ptrs.iter() {
         unsafe {
@@ -130,7 +133,9 @@ pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
     let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
     *data.add(data_len) = 0;
     if let Some(reg) = leak_scan_registry() {
-        reg.lock().unwrap().push(data as usize);
+        reg.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(data as usize);
     }
     data
 }
@@ -780,6 +785,7 @@ pub unsafe extern "C" fn pith_main_error_exit(err: i64, is_string: i64) -> i64 {
     } else {
         eprintln!("error: main returned an error");
     }
+    // panic-guard: main returned an error; this is the process exit status for it.
     std::process::exit(1);
 }
 
@@ -1012,6 +1018,7 @@ pub unsafe extern "C" fn pith_test_skip(reason: *const i8) -> i64 {
     let name = CURRENT_TEST.lock().map(|n| n.clone()).unwrap_or_default();
     println!("  {} ... skipped ({})", name, cstr_to_display(reason));
     let _ = std::io::stdout().flush();
+    // panic-guard: a skipped test exits with the skip code the harness reads.
     std::process::exit(TEST_SKIP_CODE);
 }
 
@@ -1057,8 +1064,10 @@ pub extern "C" fn pith_test_child_ok() -> i64 {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     if TEST_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        // panic-guard: a failing test child exits non-zero for the harness.
         std::process::exit(1);
     }
+    // panic-guard: a passing test child exits zero for the harness.
     std::process::exit(0);
 }
 
@@ -1565,6 +1574,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
         if let Some(v) = (*map).get(&slot).copied() {
             return v;
         }
+        // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
         let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
         let value = thunk();
         (*map).insert(slot, value);
@@ -1574,6 +1584,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
     if let Some(v) = TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied()) {
         return v;
     }
+    // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
     let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
     let value = thunk();
     TLS_GLOBALS.with(|t| {
@@ -1732,6 +1743,7 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         let allocated = alloc_zeroed(pith_layout(total, 8));
         if allocated.is_null() {
             eprintln!("pith runtime error: allocation failed");
+            // panic-guard: out of memory.
             std::process::exit(1);
         }
         allocated
@@ -1866,6 +1878,7 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
+        // panic-guard: calling a compiler-emitted struct destructor from its header slot.
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
     }

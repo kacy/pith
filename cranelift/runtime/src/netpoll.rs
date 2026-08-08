@@ -258,10 +258,12 @@ fn ensure_started() {
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         reactor();
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("pith-netpoll".to_string())
             .spawn(reactor_loop)
-            .expect("spawn netpoll reactor");
+        {
+            runtime_fatal!("could not start the netpoll reactor thread: {err}")
+        }
     });
 }
 
@@ -599,6 +601,7 @@ fn collect_expired(reactor: &Reactor, inner: &mut Inner, now: Instant, to_wake: 
         if top.0.at > now {
             break;
         }
+        // panic-guard: `peek` above returned Some under this same `&mut Inner`, so the pop cannot fail.
         let Deadline { seq, target, .. } = inner.deadlines.pop().unwrap().0;
 
         match target {

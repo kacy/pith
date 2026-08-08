@@ -742,6 +742,7 @@ pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
 #[inline(never)]
 fn strict_index_bad_handle() -> ! {
     eprintln!("pith runtime error: list indexing on invalid list handle");
+    // panic-guard: strict list indexing on an invalid handle is a program bug with no value to return.
     std::process::exit(1);
 }
 
@@ -752,6 +753,7 @@ fn strict_index_out_of_bounds(index: i64, len: i64) -> ! {
         "pith runtime error: list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
         index, len
     );
+    // panic-guard: strict list indexing out of bounds is a program bug with no value to return.
     std::process::exit(1);
 }
 
@@ -762,6 +764,7 @@ fn strict_index_bad_elem_size(elem_size: usize) -> ! {
         "pith runtime error: list index requires 8-byte element (elem_size={})",
         elem_size
     );
+    // panic-guard: strict list indexing needs an 8-byte element; anything else is a compiler bug.
     std::process::exit(1);
 }
 

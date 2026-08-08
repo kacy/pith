@@ -485,10 +485,12 @@ impl SyncArena {
     /// the sync block for `id`, allocating its chunk on first use. spawn-path
     /// only; the hot paths use `get`.
     fn ensure(&self, id: TaskId) -> &SyncBlock {
-        let slot = self
-            .spine
-            .get(id / ARENA_CHUNK)
-            .unwrap_or_else(|| panic!("green task index {id} exceeds the sync arena bound"));
+        let Some(slot) = self.spine.get(id / ARENA_CHUNK) else {
+            runtime_fatal!(
+                "green task index {id} exceeds the sync arena bound of {}",
+                ARENA_CHUNK * ARENA_SPINE
+            )
+        };
         let mut chunk = slot.load(AtomicOrdering::Acquire);
         if chunk.is_null() {
             let fresh: Box<[SyncBlock]> = (0..ARENA_CHUNK).map(|_| SyncBlock::new()).collect();
@@ -679,7 +681,12 @@ fn take_stack() -> corosensei::stack::DefaultStack {
     if let Some(stack) = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner()).pop() {
         return stack;
     }
-    corosensei::stack::DefaultStack::new(STACK_SIZE).expect("allocate coroutine stack")
+    match corosensei::stack::DefaultStack::new(STACK_SIZE) {
+        Ok(stack) => stack,
+        Err(err) => {
+            runtime_fatal!("could not allocate a {STACK_SIZE}-byte green task stack: {err}")
+        }
+    }
 }
 
 /// recycle a finished coroutine's stack. `into_stack` requires the coroutine to
@@ -1245,10 +1252,12 @@ fn ensure_workers_started() {
     WORKERS_STARTED.call_once(|| {
         let n = scheduler().workers.len();
         for i in 0..n {
-            std::thread::Builder::new()
+            if let Err(err) = std::thread::Builder::new()
                 .name(format!("pith-green-{i}"))
                 .spawn(move || worker_loop(i))
-                .expect("spawn green worker");
+            {
+                runtime_fatal!("could not start green worker {i} of {n}: {err}")
+            }
         }
         start_monitor();
     });
@@ -1258,10 +1267,12 @@ fn ensure_workers_started() {
 /// sets `PITH_PREEMPT_REQUESTED`, and it starts only here alongside the green
 /// workers — so under the os-thread backend it never runs and the flag stays 0.
 fn start_monitor() {
-    std::thread::Builder::new()
+    if let Err(err) = std::thread::Builder::new()
         .name("pith-green-sysmon".to_string())
         .spawn(monitor_loop)
-        .expect("spawn green monitor");
+    {
+        runtime_fatal!("could not start the green preemption monitor: {err}")
+    }
 }
 
 /// the monitor loop: every `MONITOR_INTERVAL`, bump the epoch and scan the
@@ -1984,6 +1995,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
                     return 0;
                 }
                 let func: extern "C" fn(i64) -> i64 =
+                    // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
                     std::mem::transmute(func_ptr as *const ());
                 func(closure_handle)
             }
@@ -2009,6 +2021,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
         let tls_ptr: *mut HashMap<i64, i64> = slab
             .get_mut(id)
             .map(|task| &mut *task.tls as *mut _)
+            // panic-guard: `slab.insert` returned this id on the line above, still under the slab lock.
             .expect("freshly inserted task");
         scheduler()
             .sync
@@ -2536,6 +2549,53 @@ mod tests {
     fn wake_on_never_used_id_is_noop() {
         wake(ARENA_CHUNK * ARENA_SPINE + 5); // beyond the spine entirely
         wake(ARENA_CHUNK * (ARENA_SPINE - 1)); // in range, chunk never allocated
+    }
+
+    /// set in the child half of the arena-bound case below.
+    const ARENA_BOUND_CHILD: &str = "PITH_GREEN_ARENA_BOUND";
+
+    // arming a sync block past the end of the spine has to stop the process with
+    // a diagnostic. it used to `panic!`, which on this path is far worse than a
+    // crash: `ensure` runs on the spawn path, inside whatever task called spawn,
+    // and `run_task` catches every panic a task raises — so the spawning task
+    // would die with `join.done` never set and its awaiters would block forever,
+    // with nothing on stderr to say why.
+    //
+    // `ensure` exits, so the case runs this test binary again as a child and the
+    // parent asserts on how the child died.
+    #[test]
+    fn arming_past_the_arena_spine_stops_the_process() {
+        if std::env::var(ARENA_BOUND_CHILD).is_ok() {
+            scheduler().sync.ensure(ARENA_CHUNK * ARENA_SPINE);
+            unreachable!("ensure past the spine returned instead of stopping the process");
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "concurrency::green::tests::arming_past_the_arena_spine_stops_the_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(ARENA_BOUND_CHILD, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "expected a clean exit(1), got {:?}. stderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains("exceeds the sync arena bound"),
+            "the diagnostic should name the bound. stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "the trap must not surface as a rust panic. stderr:\n{stderr}"
+        );
     }
 
     // the full park -> wake -> resume cycle on the lock-free scheduling word: a

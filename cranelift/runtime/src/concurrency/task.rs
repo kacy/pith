@@ -298,6 +298,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         let result = if func_ptr == 0 {
             0
         } else {
+            // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
             let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr as *const ());
             func(closure_handle)
         };

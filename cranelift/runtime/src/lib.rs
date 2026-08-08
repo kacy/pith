@@ -11,6 +11,31 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+/// Stop the process with a diagnostic, the way every other runtime trap does.
+///
+/// This is deliberately not a `panic!`. The runtime is linked into user
+/// programs, and a panic on a runtime thread does not reliably stop one:
+///
+/// - a panic raised anywhere the green spawn path reaches runs inside whatever
+///   task called it, and `run_task` wraps every task resume in `catch_unwind`.
+///   The task dies without ever setting `join.done`, so every awaiter blocks
+///   forever — a silent wedge rather than a crash.
+/// - a panic inside a `Once::call_once` (worker startup, reactor startup)
+///   poisons the `Once`, so every later caller panics too.
+/// - neither cargo profile sets `panic = "abort"`, so nothing turns either of
+///   those into a process exit.
+///
+/// Exiting with a message turns all of that into one diagnosable death. Use it
+/// for conditions with no recovery: the OS refusing a thread or a stack, a
+/// capacity ceiling the runtime cannot grow past.
+macro_rules! runtime_fatal {
+    ($($arg:tt)*) => {{
+        eprintln!("pith runtime error: {}", format_args!($($arg)*));
+        // panic-guard: the runtime's fatal-trap idiom; see the doc comment above.
+        std::process::exit(1);
+    }};
+}
+
 pub mod argon2;
 pub mod blake2b;
 pub mod blocking;

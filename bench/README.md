@@ -4,6 +4,28 @@ A few Pith vs Go (and sometimes Rust and Zig) benchmarks, measured on the
 same machine. Compile times give a sense of the toolchain; the workload
 and pipeline benchmarks below isolate runtime and service-logic costs.
 
+## reading these numbers
+
+The cross-language runners interleave: one round runs every language once,
+and a round repeats for the trial count. They used to measure each language
+to completion in turn, which on a small shared box hands whoever goes first
+a systematic advantage, because ambient load drifts over the length of a run
+and pools on whoever goes last. It was worth roughly 2x — in one pair of
+runs the same Go binary read 474 ms and then 1005 ms purely from its position
+in the order.
+
+So, two habits:
+
+- **Discard the first run after a build.** It competes with whatever the
+  build left behind, and it is reliably the worst one.
+- **Read the non-Pith columns first.** They are fixed programs. When they
+  reproduce their published figures the run is trustworthy; when they do
+  not, nothing in that run is, and the right move is to rerun rather than
+  to believe the Pith column.
+
+Absolute times are only comparable within a run. Memory columns are far more
+stable than time columns and carry most of the signal here.
+
 ## event ledger benchmark (json + collections + crypto)
 
 `bench/event_ledger.*` ingests a stream of newline-delimited JSON events,
@@ -40,14 +62,14 @@ zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledge
 ```
 
 Latest measured results on this machine, 200000 events, median of 5
-(2026-07-29):
+interleaved trials (2026-08-08; the 2026-07-29 pith total was 618):
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 325 | 202 | 61 | 0 | 618 |
-| go | 100 | 372 | 16 | 0 | 481 |
-| rust | 29 | 61 | 26 | 0 | 117 |
-| zig | 22 | 114 | 11 | 0 | 137 |
+| pith | 299 | 195 | 57 | 0 | 570 |
+| go | 120 | 336 | 14 | 0 | 477 |
+| rust | 28 | 60 | 24 | 0 | 113 |
+| zig | 21 | 105 | 9 | 0 | 137 |
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
@@ -99,9 +121,16 @@ bench/http_bench.sh ./bench/http_server_go 8081 120
 
 It prints a per-10s RSS table and a summary line (requests, throughput, and
 RSS start / end / peak). The Pith server holds flat RSS across the run: on
-the 2026-07-29 30-second run it served 8079 req/s with 4 kb of RSS growth,
-against the Go server's 28453 req/s with 6.1 mb of growth. Go is ~3.5x
+the 2026-08-08 30-second run it served 4648 req/s with **zero** RSS growth,
+against the Go server's 15444 req/s with 5.9 mb of growth. Go is ~3.3x
 faster here; the flat line is the part this benchmark exists to watch.
+
+Take the throughput figures as same-run comparisons only, never across runs.
+`wrk` competes with the server for the same two cores, so the absolute rate
+tracks whatever else the machine is doing — both servers fell about 45% from
+the 2026-07-29 run (8079 and 28453) while the ratio between them barely moved.
+The memory column does not have that problem and is the one to trust: Pith
+went from +4 kb to +0 kb, and Go's ~6 mb of growth reproduces run to run.
 
 ## catalog service benchmark
 
@@ -194,11 +223,14 @@ an actual in-memory service would avoid rescanning the full catalog on every
 request.
 
 latest measured results on this machine, using the median of 5 trials
-(2026-07-29, direct 200k-iteration runs interleaved):
+(2026-08-08, direct 200k-iteration runs interleaved):
 
 | iterations | go total | pith total | ratio | rust total |
 |---|---:|---:|---:|---:|
-| `200000` | `~436 ms` | `~114 ms` | `0.26x` | `~80 ms` |
+| `200000` | `~408 ms` | `~118 ms` | `0.29x` | `~70 ms` |
+
+unchanged from the 2026-07-29 run (go `~436`, pith `~114`, rust `~80`) once
+the comparators are taken into account — all three moved together.
 
 the earlier 1m-iteration medians, for the trend:
 
@@ -331,7 +363,10 @@ green wake-path work described below):
 
 the 2026-07-29 rerun (medians of 7, interleaved) held the same shape with
 the usual comparator drift: green ~133 (bimodal, best runs at ~69), green
-pinned to one worker ~46, go ~75, rust ~75, zig ~240.
+pinned to one worker ~46, go ~75, rust ~75, zig ~240. the 2026-08-08 rerun
+reproduced it almost exactly — green ~133 (best runs at ~61), go ~71, rust
+~73, zig ~205 — which is the clearest evidence the harness fix landed
+correctly: the same three comparator programs came back to the same figures.
 
 read the rows that oversubscribe os threads (pith os-thread, rust, zig)
 with the box in mind: eight threads on two cores, so they swing run to run.
@@ -416,12 +451,17 @@ oom killer starts taking builds out mid-run. go's default cache is on
 disk, which is what you want.
 
 latest measured results on this machine, using the median of 5 trials
-(totals rerun 2026-07-29; the phase breakdown below is from the 2026-07-21
+(totals rerun 2026-08-08; the phase breakdown below is from the 2026-07-21
 run and its shape still holds):
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `~352 ms` | `~177 ms` | `~576 ms` | `1.63x` | `3.25x` |
+| `50000` | `~319 ms` | `~145 ms` | `~480 ms` | `1.50x` | `3.31x` |
+
+pith fell from `~576 ms` on 2026-07-29 and closed the gap to go from `1.63x`
+to `1.50x`. this is the noisiest suite on this box — two of five interleaved
+rounds inflated all three languages together — so the medians are taken from
+the rounds where the comparators held their shape.
 
 phase breakdown from the same run:
 

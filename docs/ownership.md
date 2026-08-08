@@ -84,11 +84,22 @@ call arguments:
   tagged. an untagged container takes nothing and the caller's count
   stays outstanding, which is a leak rather than an element nothing
   keeps alive
-- a heap value stored into a map carries its kind with it, in both the
-  borrowed and the owned form — `pith_map_insert_cstr_kind`,
-  `pith_map_insert_ikey_kind` and their `_owned_` twins, chosen by
-  `ir_map_kind_store_name` and gated on `ir_map_store_learns_kind`. see
-  "container flavors" for why the store rather than the constructor
+- a *borrowed* heap value stored into a container carries its kind with
+  it, and the container takes the one count it needs —
+  `pith_list_push_value_kind`, `pith_list_insert_value_kind` and
+  `pith_list_set_value_kind` for a list, `pith_map_insert_cstr_kind`,
+  `pith_map_insert_ikey_kind` and their `_owned_` twins for a map,
+  chosen by `ir_list_kind_store_name` and `ir_map_kind_store_name` and
+  gated on `ir_store_learns_kind`. the emitter adds no count of its own
+  at a container store, which is what stopped a tagged list counting its
+  elements twice. see "container flavors" for why the store rather than
+  the constructor
+- a channel send is the one store the emitter still counts for. a channel
+  is not a counted container: it holds a raw handle between the send and
+  the receive, with nothing on either side that could take a count, so
+  the sender adds one (`ir_channel_send_needs_retain`) and the value
+  outlives its local. that is a leak; a missing count would be a dangling
+  element
 - a callee that may hand an argument straight back out takes no count on
   either branch, so the caller takes one on the *result* instead.
   `m.get_default(k, d)` returns `d` unchanged when the key is missing and
@@ -182,6 +193,27 @@ map that owns strings has always been built that way and an int-keyed
 map with primitive values keeps its scalar fast path; adoption drops out
 of that fast path the moment the map holds handles.
 
+a list store carries the element's kind for the same reason and with
+the same fallback (`pith_list_push_value_kind`,
+`pith_list_insert_value_kind`, `pith_list_set_value_kind`, and
+`ListImpl::adopt_element_tag`), but it fixes the opposite error. a list
+was tagged correctly nearly always, so the runtime store already
+retained what it was handed — and the emitter, with nothing at the store
+to tell a tagged list from an untagged one, retained a second time. only
+one of the two counts was ever dropped, so every borrowed container or
+struct pushed into a list outlived it, about 215 bytes a `List[List]`
+store and 96 a `List[Row]` one. the kind is that missing evidence: the
+list answers whether it owns the kind, takes exactly one count when it
+does, and adds the compensating one itself when it does not. because the
+same `store_kind` decides both whether to carry the kind and whether to
+skip the emitter-side retain, the two cannot disagree. adoption is gated
+on the list being empty, on 8-byte storage and on holding no other heap
+kind already, so it is count-neutral, never reinterprets a narrower
+element as a handle, and never retags a list whose constructor and store
+disagree — that last one falls to the leak instead.
+only the borrowed stores carry a kind; an owned value transfers its
+count through the `_owned_` variants instead of taking one.
+
 sets are a list element type too. the runtime's element tag had no
 `Set` variant, so a `List[Set]` was the one collection-of-collections
 that could not be tagged at all: `xs.push({1, 2})` stranded its element
@@ -260,8 +292,12 @@ keys are strings, and `map.values()` when the values are heap values.
 - the map value tag: `MapImpl.val_tag` and `adopt_value_tag` in
   `cranelift/runtime/src/collections/map.rs`, which reuse `ListTypeTag`
   and its `retain_element`/`release_element` pair so a map and a list
-  can never disagree about what a kind means. the emitter side is
-  `ir_map_store_learns_kind`, `ir_map_kind_store_name` and
+  can never disagree about what a kind means
+- the kind-carrying stores: `ListImpl::adopt_element_tag` and the
+  `pith_list_*_value_kind` entry points in `collections/list.rs`,
+  `adopt_value_tag` and the `pith_map_insert_*_kind` ones in
+  `collections/map.rs`. the emitter side is `ir_store_learns_kind`,
+  `ir_list_kind_store_name`, `ir_map_kind_store_name` and
   `ir_element_tag_code` — that last one writes the wire codes, which are
   part of the ir contract and must not be renumbered
 - the runtime counts: `cranelift/runtime/src/runtime_core.rs` and the
@@ -287,25 +323,11 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a *borrowed* container or struct stored into a list is counted
-  twice.** the list is tagged, so the runtime store retains; the emitter
-  adds a compensating retain as well, and only one of the two is ever
-  dropped. `xs.push(inner)` with a named local covers the collection and
-  struct kinds (`ir_container_store_needs_retain`), and `xs[i] = inner`
-  covers those plus `Bytes`, from its own hardcoded list in
-  `ir_emit_index_assignment`. measured per round on a `List[List[T]]`
-  push, about 209 bytes; on a `List[SomeStruct]` push, about 93; on a
-  `List[Bytes]` index store, about 94. a value built straight into the
-  store is exact, because that path transfers instead
-  (`pith_list_push_value_owned`), so it is only the named-local spelling
-  that leaks — and a `List[String]`, a `List[Bytes]` under `push`, and a
-  list of closures are exact either way. the compensating retain is
-  there because nothing at the store tells a tagged list from an
-  untagged one, which is the same question the kind-carrying map stores
-  answer by carrying the kind. giving `push`, `insert` and `xs[i] = v`
-  the same treatment is the fix, and it is a wider change than the map
-  one: it moves every list store of a container or struct in the tree,
-  on the hottest container path there is.
+- **a value sent down a channel outlives its local.** a channel holds a
+  raw handle between the send and the receive and is not a counted
+  container, so the sender adds a count nothing drops. it is the last
+  store the emitter counts for; every other one carries the value's kind
+  and lets the container decide.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly
@@ -344,8 +366,13 @@ gaps, all bounded leaks rather than dangling pointers:
   (`f(v: List[String]?)`) gets nothing, because the target the argument
   declares is the optional and not the container inside it. both err
   toward the leak: a store into an untagged list takes no count, so the
-  caller's stays outstanding. an empty *map* literal is no longer on this
-  list — its values are counted from the store rather than the
+  caller's stays outstanding. what narrows it is the store: an untagged
+  list that is handed a container, struct, `Bytes` or closure adopts that
+  kind at the first store and owns it from then on, the same second
+  chance a map has. a string element is the case left, because string
+  stores stay on the constructor path — so it is an untagged
+  `List[String]` that still leaks. an empty *map* literal is not on this
+  list at all: its values are counted from the store rather than the
   constructor, so `f({})` owns what is put into it whatever the checker
   managed to record.
 - **a result or optional bound to a name can leak its payload.** `T!` and

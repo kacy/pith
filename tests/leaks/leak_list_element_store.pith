@@ -1,0 +1,112 @@
+# a borrowed container, struct or bytes value stored into a list.
+#
+# a list is tagged from its constructor, so the runtime store already retained
+# every heap element it was handed. the emitter added a second, compensating
+# count at the call site anyway — it could not tell a tagged list from an
+# untagged one — and only one of the two was ever dropped. every named local
+# pushed into a list of containers or structs outlived the list.
+#
+# valgrind sees none of it: the stranded values stay reachable from the handle
+# registry, so they are "still reachable" rather than lost. resident growth is
+# what notices.
+#
+# the flat shapes are here on purpose. a value built straight into the store
+# transfers instead of retaining, and a List[String] was always exact — both
+# have to stay flat, because the way to break this fix is to drop a count the
+# store was relying on.
+import leakprobe as probe
+
+struct Row:
+    name: String
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    # a named local container into a list of containers, all three spellings
+    mut nested: List[List[String]] := []
+    mut inner: List[String] := []
+    inner.push("a-{i}")
+    nested.push(inner)
+    mut inner2: List[String] := []
+    inner2.push("b-{i}")
+    nested.insert(0, inner2)
+    mut inner3: List[String] := []
+    inner3.push("c-{i}")
+    nested[0] = inner3
+    acc = acc + nested.len() + nested[0].len()
+
+    # a named local struct
+    mut rows: List[Row] := []
+    r := Row("row-{i}")
+    rows.push(r)
+    rows[0] = r
+    acc = acc + rows.len()
+
+    # a named local Bytes, both spellings. push was exact already; the index
+    # store double-counted.
+    mut blobs: List[Bytes] := []
+    b := bytes_from_string_utf8("d-{i}")
+    blobs.push(b)
+    blobs[0] = b
+    acc = acc + blobs.len()
+
+    # a named local map and set
+    mut maps: List[Map[String, String]] := []
+    mut m: Map[String, String] := {}
+    m.insert("k", "e-{i}")
+    maps.push(m)
+    mut sets: List[Set[String]] := []
+    mut s: Set[String] := {}
+    s.add("f-{i}")
+    sets.push(s)
+    acc = acc + maps.len() + sets.len()
+
+    # a named local closure
+    mut fns: List[fn(Int) -> Int] := []
+    step := fn(x: Int) => x + i
+    fns.push(step)
+    acc = acc + fns[0](1)
+
+    # a value built straight into the store transfers its count; these were
+    # exact before and have to stay exact
+    mut fresh: List[List[String]] := []
+    fresh.push(["g-{i}"])
+    fresh.insert(0, ["h-{i}"])
+    fresh[0] = ["j-{i}"]
+    acc = acc + fresh.len()
+    mut freshb: List[Bytes] := []
+    freshb.push(bytes_from_string_utf8("k-{i}"))
+    acc = acc + freshb.len()
+
+    # a List[String] was exact under every spelling and must remain so
+    mut strs: List[String] := []
+    borrowed := "m-{i}"
+    strs.push(borrowed)
+    strs.insert(0, borrowed)
+    strs[0] = borrowed
+    strs.push("n-{i}")
+    acc = acc + strs.len()
+
+    # the list drops its count on what leaves it
+    mut churn: List[List[String]] := []
+    mut leaving: List[String] := []
+    leaving.push("p-{i}")
+    churn.push(leaving)
+    churn.remove(0)
+    churn.push(leaving)
+    churn.clear()
+    acc = acc + churn.len()
+
+    return acc
+
+fn main():
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

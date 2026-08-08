@@ -1,0 +1,160 @@
+# a list owns one count per stored heap element, and exactly one.
+#
+# the store used to take a count in the runtime *and* get a compensating one
+# from the emitter, so every borrowed container or struct pushed into a list
+# outlived it. the store now carries the element's kind, which is the evidence
+# that was missing — so the runtime knows whether it owns the kind and can
+# take the single count itself.
+#
+# every element here is read back *after* the point an over-release would have
+# freed it, with a few hundred throwaway allocations in between, so a handle
+# handed back to the pool has already been reused by the time it is read. the
+# case fails loudly rather than leaking quietly — which matters because
+# valgrind cannot see this class at all: a released handle comes back off the
+# freelist reading as perfectly valid memory holding somebody else's data.
+
+struct Box:
+    tag: String
+
+# hand the pools enough traffic that a slot freed too early is occupied by
+# something else before the read below.
+fn churn():
+    mut i := 0
+    while i < 200:
+        mut junk: List[String] := []
+        junk.push("junk-{i}")
+        mut jn: List[List[String]] := []
+        jn.push(junk)
+        i = i + 1
+
+# the list outlives the local the element was built in: the only count keeping
+# the inner list alive after this returns is the outer list's own.
+fn make_list_with_local() -> List[List[String]]:
+    mut xs: List[List[String]] := []
+    mut inner: List[String] := []
+    inner.push("alpha")
+    inner.push("beta")
+    xs.push(inner)
+    return xs
+
+# an empty literal in argument position: the parameter type is what says what
+# it holds, and the list has to own what is put in afterwards.
+fn fill(mut xs: List[List[String]], tag: String) -> Int:
+    mut row: List[String] := []
+    row.push(tag)
+    xs.push(row)
+    return xs.len()
+
+fn main():
+    x1 := make_list_with_local()
+    churn()
+    print("local into list: {x1.len()} {x1[0][0]} {x1[0][1]}")
+
+    # a fresh container written straight into the store transfers its count,
+    # under all three spellings
+    mut x2: List[List[Int]] := []
+    x2.push([1, 2, 3])
+    x2.insert(0, [4, 5])
+    x2[0] = [6, 7, 8]
+    churn()
+    print("fresh into list: {x2[0][2]} {x2[1][2]}")
+
+    # insert and index assignment with a named local
+    mut x3: List[List[String]] := []
+    mut a3: List[String] := []
+    a3.push("ins")
+    x3.insert(0, a3)
+    mut b3: List[String] := []
+    b3.push("set")
+    x3[0] = b3
+    churn()
+    print("named local spellings: {x3.len()} {x3[0][0]} {a3[0]} {b3[0]}")
+
+    # overwrite drops the list's count on what it displaces; a reader holding
+    # a count of its own is unaffected
+    mut x4: List[List[String]] := []
+    mut keep: List[String] := []
+    keep.push("kept")
+    x4.push(keep)
+    x4[0] = ["replaced"]
+    churn()
+    print("overwrite: {keep[0]} {x4[0][0]}")
+
+    # every other heap element kind a list can hold, stored from a local
+    mut xs5: List[Box] := []
+    bx := Box("boxed")
+    xs5.push(bx)
+    mut xb: List[Bytes] := []
+    raw := bytes_from_string_utf8("payload")
+    xb.push(raw)
+    xb.push(raw)
+    xb[0] = raw
+    mut xset: List[Set[String]] := []
+    mut st: Set[String] := {}
+    st.add("member")
+    xset.push(st)
+    mut xm: List[Map[String, String]] := []
+    mut inner_m: Map[String, String] := {}
+    inner_m.insert("ik", "iv")
+    xm.push(inner_m)
+    churn()
+    print("kinds: {xs5[0].tag} {xb[0].len()} {xb.len()} {xset[0].contains("member")} {xm[0]["ik"]}")
+    print("sources still live: {bx.tag} {raw.len()} {st.contains("member")} {inner_m["ik"]}")
+
+    # a list of closures, stored from a local
+    mut fns: List[fn(Int) -> Int] := []
+    step := fn(v: Int) => v + 1
+    fns.push(step)
+    fns.push(step)
+    churn()
+    print("closures: {fns[0](1)} {fns[1](2)} {step(3)}")
+
+    # a list of strings was always exact and has to stay that way
+    mut ss: List[String] := []
+    s := "one" + "-1"
+    ss.push(s)
+    ss.insert(0, s)
+    ss.push("two" + "-2")
+    ss[0] = s
+    churn()
+    print("strings: {ss.len()} {ss[0]} {ss[2]} {s}")
+
+    # an element read out into a local survives the list it came from
+    mut held: List[String] := []
+    mut i6 := 0
+    while i6 < 1:
+        mut x6: List[List[String]] := []
+        mut tmp: List[String] := []
+        tmp.push("survivor")
+        x6.push(tmp)
+        held = x6[0]
+        i6 = i6 + 1
+    churn()
+    print("outlives list: {held[0]}")
+
+    # removal and clear drop the list's counts, and a holder keeps its own
+    mut x7: List[List[String]] := []
+    mut gone: List[String] := []
+    gone.push("removed")
+    x7.push(gone)
+    x7.push(gone)
+    x7.remove(0)
+    x7.clear()
+    churn()
+    print("removed: {gone[0]} {x7.len()}")
+
+    # an empty literal in argument position, filled through the parameter
+    mut x8: List[List[String]] := []
+    filled := fill(x8, "row") + fill([], "throwaway")
+    churn()
+    print("argument: {filled} {x8[0][0]}")
+
+    # the same element stored twice: two counts in, two out
+    mut x9: List[List[String]] := []
+    mut twice: List[String] := []
+    twice.push("twice")
+    x9.push(twice)
+    x9.push(twice)
+    x9.insert(0, twice)
+    churn()
+    print("aliased: {x9.len()} {x9[0][0]} {x9[2][0]} {twice[0]}")

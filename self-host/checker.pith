@@ -9,10 +9,14 @@
 # uses an error sentinel pattern: when a sub-expression has type
 # TID_ERR, further checks are skipped to prevent cascading noise.
 #
+# a bare `none` is deliberately NOT that sentinel. it carries TID_NONE,
+# which participates in every comparison and satisfies exactly one kind of
+# target: an optional. see types_structurally_equal.
+#
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, lookup_binding_index, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
@@ -1435,6 +1439,10 @@ fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: 
     value_node := get_node(value_idx)
     if value_node.kind == "none_lit":
         return true
+    # a name bound to a bare `none` carries the sentinel rather than the
+    # literal node, and satisfies the same optional targets.
+    if is_none_type(actual_tid):
+        return true
     if actual_tid < 0:
         return false
     if actual_tid == expected_tid:
@@ -1630,7 +1638,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                     # which also records the type for the emitter's container
                     # choice; a genuinely wrong element type still fails.
                     if collection_literal_matches_target(node.children[1], annotated, scope_id) == false:
-                        report_error("E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
+                        report_error_at(node.children[1], "E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
         define_binding(scope_id, name, annotated, is_mut)
     elif node.children.len() == 1:
         val_type := c_check_expr(node.children[0], scope_id)
@@ -1675,13 +1683,13 @@ fn check_assignment(node: Node, scope_id: Int):
     if op == "=":
         if target_type != val_type:
             if types_structurally_equal(target_type, val_type) == false:
-                report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
+                report_error_at(value_idx, "E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
     else:
         # compound assignment: +=, -=, *=, /=
         if is_numeric_type(target_type) == false:
             report_error("E217", "operator " + op + " requires numeric type, got " + get_type_name(target_type))
         elif target_type != val_type:
-            report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
+            report_error_at(value_idx, "E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
 
 # ---------------------------------------------------------------
 # return statement
@@ -1750,7 +1758,12 @@ fn check_return_statement(node: Node, scope_id: Int):
     # check structural equality (tuples)
     if types_structurally_equal(actual, expected):
         return
-    report_error_with_fix("E200", "return type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual), "change the return type to " + get_type_name(actual))
+    # `none` is not a type to widen the signature to; the fix is either an
+    # optional return type or a real value.
+    if is_none_type(actual):
+        report_error_with_fix_at(node.children[0], "E200", "return type mismatch: expected " + get_type_name(expected) + ", got none", "return a value, or declare the return type " + get_type_name(expected) + "?")
+        return
+    report_error_with_fix_at(node.children[0], "E200", "return type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual), "change the return type to " + get_type_name(actual))
 
 # ---------------------------------------------------------------
 # fail statement
@@ -2035,7 +2048,7 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "bool_lit":
         return tid_bool
     if node.kind == "none_lit":
-        return tid_err
+        return TID_NONE
     if node.kind == "ident":
         return check_identifier(node_idx, node.value, scope_id)
     if node.kind == "self":
@@ -2186,13 +2199,19 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
     left := c_check_expr(node.children[0], scope_id)
     right := c_check_expr(node.children[1], scope_id)
 
+    # `x == none` is the emptiness test, so an optional on the other side is
+    # the whole point. the node-kind arms carry the literal; the tid arms
+    # carry a name bound to a bare `none`. anything else falls through to the
+    # ordinary comparison check, which now reports rather than skipping.
     if op == "eq" or op == "neq":
-        if left_node.kind == "none_lit" and right_node.kind == "none_lit":
+        left_is_none := left_node.kind == "none_lit" or is_none_type(left)
+        right_is_none := right_node.kind == "none_lit" or is_none_type(right)
+        if left_is_none and right_is_none:
             return tid_bool
-        if left_node.kind == "none_lit" and right >= 0:
+        if left_is_none:
             if get_type_info(right).kind == "optional":
                 return tid_bool
-        if right_node.kind == "none_lit" and left >= 0:
+        if right_is_none:
             if get_type_info(left).kind == "optional":
                 return tid_bool
 
@@ -2929,7 +2948,7 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 expected := fn_info.param_types[idx]
                 if arg_type != expected:
                     if types_structurally_equal(arg_type, expected) == false:
-                        report_error("E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                        report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
 
@@ -2992,7 +3011,7 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
                 if value_matches_optional_target(expr, arg_type, expected) == false:
                     if collection_literal_matches_target(expr, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
-                            report_error("E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                            report_error_at(expr, "E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return struct_tid
 
@@ -3029,7 +3048,7 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
                 if value_matches_optional_target(arg_expr_idx, arg_type, expected) == false:
                     if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
-                            report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                            report_error_at(arg_expr_idx, "E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return struct_tid
 
@@ -4590,12 +4609,13 @@ fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, secon
     check_argument_type(args[1], second, scope_id)
 
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
-    actual := c_check_expr(argument_expression_index(arg_idx), scope_id)
+    expr_idx := argument_expression_index(arg_idx)
+    actual := c_check_expr(expr_idx, scope_id)
     propagate_empty_argument_collection_type(arg_idx, expected, actual)
     if is_error_type(actual) == false:
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:
-                report_error("E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
+                report_error_at(expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
 
 # ---------------------------------------------------------------
 # field access
@@ -5347,6 +5367,19 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
 # collection literal expressions
 # ---------------------------------------------------------------
 
+# a bare `none` element names no type of its own — all it says is that the
+# element type has to be an optional. so it is folded into the unified
+# element type rather than compared against it: the concrete elements decide
+# the inner type and the result is wrapped once. `[none, 1]` is a
+# `List[Int?]`, which is also what a `List[Int?]` annotation asks for, while
+# a `List[Int]` annotation still rejects it element by element.
+fn element_type_with_none(elem_type: Int) -> Int:
+    if elem_type < 0:
+        return elem_type
+    if get_type_info(elem_type).kind == "optional":
+        return elem_type
+    return add_type_info(ti_optional(elem_type))
+
 fn check_list_expression(node: Node, scope_id: Int) -> Int:
     tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
@@ -5354,13 +5387,23 @@ fn check_list_expression(node: Node, scope_id: Int) -> Int:
         return tid_err
     # check all elements
     mut elem_type := tid_err
+    mut saw_none := false
     for child in node.children:
         t := c_check_expr(child, scope_id)
+        if is_none_type(t):
+            saw_none = true
+            continue
         if is_error_type(elem_type):
             elem_type = t
         elif is_error_type(t) == false:
             if t != elem_type and types_structurally_equal(t, elem_type) == false:
-                report_error("E223", "list elements must be the same type: expected " + get_type_name(elem_type) + ", got " + get_type_name(t))
+                report_error_at(child, "E223", "list elements must be the same type: expected " + get_type_name(elem_type) + ", got " + get_type_name(t))
+    if saw_none:
+        # even an all-`none` literal has a shape: a list of optionals whose
+        # inner is not yet known. that is enough for a `List[T?]` annotation to
+        # match structurally and for a `List[T]` one to reject, and it keeps
+        # the element tag right (an optional is heap-shaped, not an int).
+        return intern_list_type(element_type_with_none(elem_type))
     if is_error_type(elem_type):
         return tid_err
     return intern_list_type(elem_type)
@@ -5371,24 +5414,33 @@ fn check_map_expression(node: Node, scope_id: Int) -> Int:
         return tid_err
     mut key_type := tid_err
     mut val_type := tid_err
+    mut saw_none_value := false
     for child in node.children:
         entry := get_node(child)
         if entry.kind == "entry":
             if entry.children.len() >= 2:
                 kt := c_check_expr(entry.children[0], scope_id)
                 vt := c_check_expr(entry.children[1], scope_id)
-                if is_error_type(key_type):
+                if is_none_type(kt):
+                    # a map key is hashed and compared; the empty case of an
+                    # optional is not a key.
+                    report_error_at(entry.children[0], "E223", "map key cannot be none")
+                elif is_error_type(key_type):
                     key_type = kt
                 elif is_error_type(kt) == false:
                     if kt != key_type:
-                        report_error("E223", "map keys must be the same type")
-                if is_error_type(val_type):
+                        report_error_at(entry.children[0], "E223", "map keys must be the same type")
+                if is_none_type(vt):
+                    saw_none_value = true
+                elif is_error_type(val_type):
                     val_type = vt
                 elif is_error_type(vt) == false:
                     if vt != val_type and types_structurally_equal(vt, val_type) == false:
-                        report_error("E223", "map values must be the same type")
+                        report_error_at(entry.children[1], "E223", "map values must be the same type")
     if is_error_type(key_type):
         return tid_err
+    if saw_none_value:
+        return intern_map_type(key_type, element_type_with_none(val_type))
     if is_error_type(val_type):
         return tid_err
     return intern_map_type(key_type, val_type)
@@ -5401,27 +5453,25 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
     mut elem_type := tid_err
     for child in node.children:
         t := c_check_expr(child, scope_id)
-        if is_error_type(elem_type):
+        if is_none_type(t):
+            # a set element is hashed and compared; the empty case of an
+            # optional is not a member.
+            report_error_at(child, "E223", "set element cannot be none")
+        elif is_error_type(elem_type):
             elem_type = t
         elif is_error_type(t) == false:
             if t != elem_type and types_structurally_equal(t, elem_type) == false:
-                report_error("E223", "set elements must be the same type")
+                report_error_at(child, "E223", "set elements must be the same type")
     if is_error_type(elem_type):
         return tid_err
     return intern_set_type(elem_type)
 
+# a bare `none` element carries TID_NONE, which the structural comparison
+# accepts against a declared `T?` element and rejects against every other.
 fn check_tuple_expression(node: Node, scope_id: Int) -> Int:
     mut elems: List[Int] := []
     for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "none_lit":
-            # a bare none element can only be an optional. type it as an
-            # optional with a wildcard inner so structural comparison against a
-            # declared `T?` element succeeds, while a non-optional target still
-            # mismatches on kind.
-            elems.push(add_type_info(ti_optional(TID_ERR)))
-        else:
-            elems.push(c_check_expr(child, scope_id))
+        elems.push(c_check_expr(child, scope_id))
     return add_type_info(ti_tuple(elems))
 
 fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
@@ -5457,7 +5507,7 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
                 if value_matches_optional_target(child, arg_type, expected) == false:
                     if collection_literal_matches_target(child, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
-                            report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                            report_error_at(child, "E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
 
     return struct_tid
@@ -5610,6 +5660,13 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
         return true
     if is_error_type(b):
         return true
+    # `none` is not a wildcard. it names the empty case of an optional and
+    # nothing else, so it satisfies an optional target and fails against every
+    # concrete type — which is what makes `takes_int(none)` report.
+    if is_none_type(a):
+        return b >= 0 and get_type_info(b).kind == "optional"
+    if is_none_type(b):
+        return a >= 0 and get_type_info(a).kind == "optional"
     if a < 0:
         return false
     if b < 0:

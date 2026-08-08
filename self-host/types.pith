@@ -25,7 +25,14 @@ pub TID_UINT16 := 12
 pub TID_UINT32 := 13
 pub TID_UINT64 := 14
 pub TID_ERR := 15
-pub TID_FIRST_USER := 16
+# a bare `none` types as its own sentinel rather than as the error type.
+# every checker guard skips its comparison when a side is the error type —
+# that is the cascade-suppression rule, and overloading it for `none` made
+# `none` compatible with every type in every position. a separate sentinel
+# keeps the suppression and still lets `none` be compared: it is accepted
+# only where an optional is expected (see types_structurally_equal).
+pub TID_NONE := 16
+pub TID_FIRST_USER := 17
 
 # ---------------------------------------------------------------
 # type info — flat struct with string kind tag
@@ -246,6 +253,8 @@ pub fn get_type_name(tid: Int) -> String:
         return "UInt64"
     if tid == TID_ERR:
         return "<error>"
+    if tid == TID_NONE:
+        return "none"
     if tid < 0:
         return "<unknown>"
     if tid >= tt_types.len():
@@ -353,8 +362,13 @@ pub fn is_integer_type(tid: Int) -> Bool:
 pub fn is_error_type(tid: Int) -> Bool:
     return tid == lookup_type_id("<error>")
 
+# true for the bare-`none` sentinel. `none` carries no type of its own, so it
+# only satisfies a target that is already an optional.
+pub fn is_none_type(tid: Int) -> Bool:
+    return tid == TID_NONE
+
 # ---------------------------------------------------------------
-# initialization — register all 16 builtin types
+# initialization — register all 17 builtin types
 # ---------------------------------------------------------------
 
 pub fn initialize_type_table():
@@ -395,3 +409,6 @@ pub fn initialize_type_table():
     # error sentinel at index 15
     add_type_info(ti_primitive("<error>"))
     register_type_name("<error>", TID_ERR)
+    # bare-`none` sentinel at index 16. deliberately not registered under a
+    # source-visible name: `none` is a value, never something to annotate with.
+    add_type_info(ti_primitive("none"))

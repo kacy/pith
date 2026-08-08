@@ -3,6 +3,8 @@
 # renders diagnostics with source context, underlines, and fix
 # suggestions.
 
+from std.strings import lines_keep_empty
+
 pub struct Diagnostic:
     pub severity: String
     pub code: String
@@ -40,7 +42,13 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
 
     # source line + underline (only if we have line info)
     if d.line > 0:
-        lines := source.split(chr(10))
+        # split() drops empty segments, so every blank line in the file used to
+        # shift the snippet up by one: a diagnostic reported at line 8 of a file
+        # with three blank lines above it printed line 11 instead, and anything
+        # past the last non-empty segment printed no snippet at all. the line
+        # number in the header was right the whole time — only the source line
+        # under it was wrong, which is worse than no snippet.
+        lines := lines_keep_empty(source)
         line_idx := d.line - 1
         if line_idx >= 0 and line_idx < lines.len():
             source_line := lines[line_idx]

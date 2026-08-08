@@ -308,6 +308,12 @@ error[E219]: argument type mismatch: expected Int, got none
                  ^
 ```
 
+the reverse is fine: a plain value passed to an optional parameter widens to
+`Some(v)`, so `f(3)` against `fn f(x: Int?)` is accepted. it does not run
+backwards — an `Int?` argument to an `Int` parameter still reports here, and
+so does an inner type that does not match (`f("three")` against `Int?`).
+a few argument positions do not widen yet; see `docs/limitations.md`.
+
 ### E220 — pipe operator error
 
 the right side of a pipe operator (`|`) is not a valid function.

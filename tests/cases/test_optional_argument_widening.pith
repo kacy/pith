@@ -1,0 +1,118 @@
+# a plain value written where an optional argument is expected widens to
+# Some(v). the checker accepting it is only half the story — the callee reads
+# the argument as an optional, so each probe reads the value back out through
+# unwrap_or, an `== none` comparison, `if let` and `match` rather than just
+# compiling.
+
+struct Point:
+    n: Int
+
+struct Holder:
+    v: Int?
+    p: Point?
+    s: String?
+
+struct Counter:
+    base: Int
+
+impl Counter:
+    fn bump(step: Int?) -> Int:
+        return self.base + step.unwrap_or(100)
+
+    fn empty(step: Int?) -> Bool:
+        return step == none
+
+fn probe_int(x: Int?) -> String:
+    mut seen := "-"
+    if let n = x:
+        seen = n.to_string()
+    return "none={x == none} unwrap={x.unwrap_or(0 - 1)} iflet={seen}"
+
+fn probe_string(x: String?) -> String:
+    return "none={x == none} unwrap={x.unwrap_or("MISS")}"
+
+fn probe_point(x: Point?) -> String:
+    p := x.unwrap_or(Point(0 - 1))
+    return "none={x == none} n={p.n}"
+
+fn probe_list(x: List[Int]?) -> String:
+    l := x.unwrap_or([])
+    return "none={x == none} len={l.len()}"
+
+fn probe_match(x: Int?) -> String:
+    return match x:
+        none => "NONE"
+        v => "SOME{v}"
+
+fn forward(x: Int?) -> Int?:
+    return x
+
+fn hop(x: Int?) -> Int:
+    return forward(x).unwrap_or(0 - 1)
+
+fn stash(v: Int?, p: Point?, s: String?) -> Holder:
+    return Holder(v, p, s)
+
+fn apply(v: Int, f: fn(Int?) -> Int) -> Int:
+    return f(v)
+
+fn main():
+    # a literal, a named local, and a fresh expression all widen
+    print("lit:{probe_int(3)}")
+    v := 42
+    print("name:{probe_int(v)}")
+    print("expr:{probe_int(v + 1)}")
+
+    # an argument that is already an optional keeps working unchanged
+    mut o: Int? := 9
+    print("opt:{probe_int(o)}")
+    print("none:{probe_int(none)}")
+
+    # a string payload, including a freshly built one
+    print("strlit:{probe_string("hi")}")
+    fresh := "a" + "b"
+    print("strfresh:{probe_string(fresh)}")
+    print("strnone:{probe_string(none)}")
+
+    # a struct payload, borrowed and fresh. the borrowed one must survive the
+    # call: a widened optional owns its payload, so an over-eager release here
+    # would show up as a wrong `n` on the next read.
+    print("structfresh:{probe_point(Point(7))}")
+    borrowed := Point(11)
+    print("structborrow:{probe_point(borrowed)}")
+    print("structalive:{borrowed.n}")
+
+    # a list payload, borrowed and fresh
+    print("listfresh:{probe_list([1, 2, 3])}")
+    xs := [4, 5]
+    print("listborrow:{probe_list(xs)}")
+    print("listalive:{xs.len()}")
+
+    # match reads the flag, not the pointer
+    print("match_some:{probe_match(5)}")
+    print("match_none:{probe_match(none)}")
+
+    # a widened argument forwarded on to a second optional parameter
+    print("hop:{hop(8)}")
+
+    # a method on a struct, and a lambda passed as a function value
+    c := Counter(1)
+    print("method:{c.bump(4)}")
+    print("method_none_flag:{c.empty(4)}")
+    print("lambda:{apply(6, fn(x: Int?) => x.unwrap_or(0 - 1))}")
+
+    # the callee storing what it was handed: the payload has to outlive the
+    # call frame the widening happened in
+    h := stash(5, Point(6), "seven")
+    print("stash:v={h.v.unwrap_or(0)} p={h.p.unwrap_or(Point(0)).n} s={h.s.unwrap_or("x")}")
+
+    mut held: List[Holder] := []
+    mut i := 0
+    while i < 200:
+        held.push(stash(i, Point(i * 2), "s{i}"))
+        i = i + 1
+    mut total := 0
+    for hh in held:
+        total = total + hh.v.unwrap_or(0) + hh.p.unwrap_or(Point(0)).n
+    print("held_total:{total}")
+    print("held_last:{held[199].s.unwrap_or("x")}")

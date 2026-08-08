@@ -23,6 +23,30 @@ something here that now works, the page is stale and a fix to it is welcome.
   and tuple elements, and `==` / `!=`. an unannotated `x := none` is the one
   place with no target to check against; it binds a type nothing else accepts,
   so the first use of `x` reports instead. write `x: T? := none`.
+- **a plain value widens into an optional in most positions, not all** — `3`
+  is accepted where an `Int?` is expected, and the callee reads the `Some(3)`
+  it expects. that covers bindings, assignments, returns, struct fields
+  (positional, named and defaulted), collection literal elements, map index
+  assignment, and the argument of a plain function, a method, a lambda and a
+  function value. three argument positions still need the value bound to a
+  `T?` local first:
+  - a builtin container store or query — `xs.push(3)` into a `List[Int?]`,
+    `m.insert(k, 3)` into a `Map[K, Int?]`, `s.add(3)` into a `Set[Int?]`.
+    the element type also feeds `contains`, `index_of` and `remove`, which
+    compare rather than store, so widening there would answer against a
+    freshly built optional and always miss.
+  - a parameter of a *generic function* — a generic specialization decides
+    whether a parameter is an optional from the call site's argument type
+    rather than from the declaration, so `fn pick[T](a: T, b: Int?)` reads
+    `b` as a bare pointer. `pick(x, none)` already answers "some" for
+    `b == none` today for the same reason; widening into it would launder a
+    compile error into a wrong answer. a method on a *generic struct* is
+    unaffected and does widen.
+  - an enum variant payload — an `Int?` payload binds as `Int` when
+    destructured, so an optional payload is not usable yet in either
+    direction.
+- **`==` does not widen** — `o == 5` where `o` is an `Int?` reports; compare
+  against `none` or unwrap first.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.
@@ -120,9 +144,12 @@ correctness story:
   does not leak. the leak is bounded per read and never dangles; reclaiming the
   remaining synthesized-optional temporaries is a known follow-up.
 - a fresh optional written straight into an argument is not released — about 64
-  bytes per call, whether it comes from a bare `none` (`f(none)`) or from a call
-  (`f(maybe(i))`). binding it first (`v := maybe(i)` then `f(v)`) is reclaimed
-  normally, so the local is the workaround on a hot path.
+  bytes per call, whether it comes from a bare `none` (`f(none)`), from a call
+  (`f(maybe(i))`), or from a plain value widened into an optional parameter
+  (`f(3)`). the widened form also holds the count on its payload, so a heap
+  payload passed that way (`f(Point(1))`, `f(some_list)`) is held by the
+  optional that leaks. binding it first (`v: Int? := 3` then `f(v)`) is
+  reclaimed normally, so the local is the workaround on a hot path.
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) does not release the optionals it holds — about 128 bytes
   per literal. building the container and pushing into it does not leak; only

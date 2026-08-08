@@ -1,0 +1,65 @@
+# the two argument positions where the emitter could not settle ownership
+# statically, and the untagged-list shape that sat behind both.
+#
+# every read below happens after the point where a released-too-early value
+# would already have been freed, so this case fails loudly rather than
+# quietly leaking. that is deliberate: `make memcheck` cannot see an
+# over-release here, because a handle that goes back on the pool reads as
+# perfectly valid memory holding somebody else's data. only comparing the
+# printed values catches it.
+
+fn insert_into(mut xs: List[String]) -> String:
+    # the list arrives untagged when the caller wrote a bare `[]`, so the
+    # store has no count to take. the caller must keep its own rather than
+    # release into a list that is not holding the element.
+    xs.insert(0, "a" + "b")
+    xs.insert(0, "c" + "d")
+    return xs[0] + "/" + xs[1]
+
+fn main():
+    # a list of sets: the element tag the runtime was missing, so the list
+    # owned nothing it held
+    mut sets: List[Set[Int]] := []
+    sets.push({1, 2})
+    sets.insert(0, {3, 4, 5})
+    print("sets: {sets.len()} {sets[0].len()} {sets[1].len()}")
+
+    # the same shape one level down, where a tag already existed
+    mut lists: List[List[Int]] := []
+    lists.push([1, 2])
+    lists.insert(0, [3, 4, 5])
+    print("lists: {lists.len()} {lists[0].len()} {lists[1].len()}")
+
+    # insert into a list whose element type the checker did not reach, so
+    # the list is untagged and the store takes nothing
+    print("untagged: {insert_into([])}")
+    seeded := ["z"]
+    print("tagged:   {insert_into(seeded)}")
+
+    # get_default hands its fallback back on a miss and the map's own value
+    # on a hit. the result has to outlive both the call and the map entry
+    # it was read from, on either branch.
+    mut lm: Map[String, List[Int]] := {}
+    lm.insert("hit", [10, 20, 30])
+    mut i := 0
+    while i < 3:
+        v := lm.get_default("hit", [])
+        w := lm.get_default("miss", [7, 8])
+        print("get_default {i}: {v.len()} {v[0]} {w.len()} {w[0]}")
+        i = i + 1
+    print("map intact: {lm["hit"].len()}")
+
+    # the string and int-keyed spellings of the same thing
+    mut sm: Map[String, String] := {}
+    sm.insert("hit", "value")
+    mut im: Map[Int, String] := {}
+    im.insert(1, "value")
+    mut j := 0
+    while j < 3:
+        a := sm.get_default("hit", "fb" + "-s")
+        b := sm.get_default("miss", "fb" + "-s")
+        c := im.get_default(1, "fb" + "-i")
+        d := im.get_default(9, "fb" + "-i")
+        print("strings {j}: {a} {b} {c} {d}")
+        j = j + 1
+    print("maps intact: {sm["hit"]} {im[1]}")

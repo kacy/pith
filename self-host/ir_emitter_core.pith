@@ -3592,7 +3592,7 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
         entry_kind = ir_rc_kind(ir_infer_type(entry.children[1]))
     entry_owned := not ir_string_expr_is_borrowed(entry.children[1])
     kind_store := ir_map_kind_store_name(store_name, entry_owned)
-    if kind_store.len() > 0 and ir_map_store_learns_kind(entry_kind):
+    if kind_store.len() > 0 and ir_store_learns_kind(entry_kind):
         tag_r := ir_emit_element_tag_const(entry_kind)
         ir_emit_call4(ir_reg(), kind_store, "void", map_r, k_r, v_r, tag_r)
         return
@@ -3654,9 +3654,18 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
     return set_r
 
-# the container stores that land in a list rather than a map or a set.
-fn ir_is_list_store_name(emit_name: String) -> Bool:
-    return emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push" or emit_name == "set" or emit_name == "pith_list_set_value"
+# the list store that carries the element's kind with it, or "" when this is
+# not a list store. only the borrowed stores have a kind-carrying variant: an
+# owned value transfers its count instead of taking one, which the `_owned`
+# stores already do.
+fn ir_list_kind_store_name(emit_name: String) -> String:
+    if emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        return "list_push_kind"
+    if emit_name == "set" or emit_name == "pith_list_set_value":
+        return "list_set_kind"
+    if emit_name == "list_insert":
+        return "list_insert_kind"
+    return ""
 
 # the element-tag code a heap kind is written as in the ir. these are the
 # codes `pith_list_new` takes and the kind-carrying map stores carry, so they
@@ -3678,23 +3687,30 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 7
     return 0
 
-# the value kinds a map learns from the store rather than from its
+# the value kinds a container learns from the store rather than from its
 # constructor.
 #
 # a container's flavor is normally picked at construction from the checked
 # type, but a map literal reads its value kind off the first entry, and an
 # empty `{}` has none — so `f({})` and every other empty map literal built a
 # map that owned nothing it held. carrying the kind on the store settles it
-# where the kind is known for certain: the map adopts it at the first store
-# (`MapImpl::adopt_value_tag`), so the count no longer depends on the
-# constructor having guessed right, and a map that cannot adopt takes the
-# compensating count in the runtime instead — the same leak the emitter used
-# to add here.
+# where the kind is known for certain: the container adopts it at the first
+# store (`MapImpl::adopt_value_tag`, `ListImpl::adopt_element_tag`), so the
+# count no longer depends on the constructor having guessed right, and a
+# container that cannot adopt takes the compensating count in the runtime
+# instead — the same leak the emitter used to add here.
+#
+# it is also what stops a *tagged* container being counted twice, which is
+# what a list store did: the list retained in the runtime and the emitter
+# retained again, because nothing at the store told a tagged list from an
+# untagged one. the kind is that missing evidence, and because the same
+# `store_kind` decides both whether to carry it and whether to skip the
+# compensating retain, the two cannot disagree.
 #
 # string values stay on the constructor path. that flavor has always been
 # picked correctly there, and routing it through the kind store would rewrite
-# every string map insert in the tree for no change in ownership.
-fn ir_map_store_learns_kind(store_kind: String) -> Bool:
+# every string insert in the tree for no change in ownership.
+fn ir_store_learns_kind(store_kind: String) -> Bool:
     if store_kind == "list" or store_kind == "map" or store_kind == "set":
         return true
     return store_kind == "struct" or store_kind == "bytes" or store_kind == "closure"
@@ -3718,35 +3734,19 @@ fn ir_map_kind_store_name(emit_name: String, owned: Bool) -> String:
         return "map_insert_ikey_kind"
     return ""
 
-# true when a *borrowed* value stored into a container needs a count added
-# here rather than by the runtime store. tagged containers retain their own
-# elements, so this covers only the places where tagging cannot be
-# guaranteed: channel sends, and collection or struct values inside lists.
-# a double count on a tagged container is a bounded leak; a missing count is
-# a dangling element.
+# true when a *borrowed* value sent down a channel needs a count added here
+# rather than by the receiving end. a channel is not a counted container: it
+# holds a raw handle between the send and the receive, with nothing on either
+# side that could take a count for it, so the sender adds one and the value
+# outlives its local. that is a leak, and a missing count would be a dangling
+# element.
 #
-# maps are no longer on that list. a map store of a heap kind carries the
-# kind with it (ir_map_kind_store_name), so the runtime knows whether it owns
-# the value and takes the count itself — the one place that can answer the
-# question the emitter was guessing at.
-fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Bool:
-    if ir_is_channel_send_name(emit_name):
-        return store_kind.len() > 0
-    if emit_name == "list_insert":
-        # the plain insert retains every tagged element itself, for every kind,
-        # so a borrowed value already has its count from the runtime and a
-        # compensating one here would be a second. only the owned path differs,
-        # and that swaps the call rather than adding a count.
-        return false
-    if store_kind == "bytes" or store_kind == "closure":
-        # a List[Bytes] and a List of closures are both tagged wherever the
-        # checker knows the element type — including an empty literal in a
-        # struct constructor — so the runtime push already retains and a
-        # count here would only leak.
-        return false
-    if not ir_is_list_store_name(emit_name):
-        return false
-    return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "struct"
+# lists and maps used to be on this list too. both now carry the stored
+# value's kind (ir_list_kind_store_name, ir_map_kind_store_name), so the
+# runtime knows whether it owns the value and takes the count itself — the
+# one place that can answer the question the emitter was guessing at.
+fn ir_channel_send_needs_retain(emit_name: String, store_kind: String) -> Bool:
+    return ir_is_channel_send_name(emit_name) and store_kind.len() > 0
 
 # the value kinds a container store may take the caller's count for.
 #
@@ -4797,8 +4797,9 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if ir_is_void_method(emit_name):
         ret_type = "void"
     # a container store treats its value argument specially: a borrowed value
-    # may need a compensating retain, an owned one transfers its count into
-    # the container, and either way the caller's own release is skipped.
+    # travels with its kind so the container can take the count itself, an
+    # owned one transfers its count into the container, and either way the
+    # caller's own release is skipped.
     mut store_value_pos := 0 - 1
     if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
@@ -4807,8 +4808,9 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     # the name the call is emitted under. an owned value swaps in the store
     # that takes the caller's count; everything else keeps the plain store.
     mut call_name := emit_name
-    # a heap value stored into a map travels with its kind, appended after the
-    # ordinary arguments, so the map can adopt it and own the count itself.
+    # a heap value stored into a list or a map travels with its kind, appended
+    # after the ordinary arguments, so the container knows whether it owns the
+    # kind and can take the one count itself.
     mut store_tag_r := 0 - 1
     if not impl_dispatch:
         if store_value_pos >= 0 and store_value_pos < arg_regs.len():
@@ -4816,12 +4818,14 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             if value_expr >= 0:
                 store_kind := ir_rc_kind(ir_infer_type(value_expr))
                 borrowed := ir_string_expr_is_borrowed(value_expr)
-                kind_store := ir_map_kind_store_name(emit_name, not borrowed)
-                if kind_store.len() > 0 and ir_map_store_learns_kind(store_kind):
+                mut kind_store := ir_map_kind_store_name(emit_name, not borrowed)
+                if kind_store.len() == 0 and borrowed:
+                    kind_store = ir_list_kind_store_name(emit_name)
+                if kind_store.len() > 0 and ir_store_learns_kind(store_kind):
                     call_name = kind_store
                     store_tag_r = ir_emit_element_tag_const(store_kind)
                 elif borrowed:
-                    if ir_container_store_needs_retain(emit_name, store_kind):
+                    if ir_channel_send_needs_retain(emit_name, store_kind):
                         ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
                 elif ir_container_store_takes_count(store_kind):
                     # an owned value has a count nobody else will release, so
@@ -5607,23 +5611,23 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
     value_r := ir_emit_value_for_target(value_idx, value_type)
-    # tagged containers retain stored elements in the runtime. a heap value
-    # written into a map carries its kind so the map can adopt it and take the
-    # count itself; a list keeps the emitter-side compensating retain, because
-    # nothing tells a list holding collections apart from one that is untagged.
+    # tagged containers retain stored elements in the runtime. a borrowed heap
+    # value carries its kind with it, so the container adopts it where it has
+    # none and takes exactly one count either way — a list used to get a
+    # compensating retain here on top of the one the runtime store took,
+    # because nothing told a tagged list from an untagged one.
     idx_store_kind := ir_rc_kind(value_type)
     mut set_name := ir_index_set_call_name(obj_type)
     idx_borrowed := ir_string_expr_is_borrowed(value_idx)
-    idx_kind_store := ir_map_kind_store_name(set_name, not idx_borrowed)
-    if idx_kind_store.len() > 0 and ir_map_store_learns_kind(idx_store_kind):
+    mut idx_kind_store := ir_map_kind_store_name(set_name, not idx_borrowed)
+    if idx_kind_store.len() == 0 and idx_borrowed:
+        idx_kind_store = ir_list_kind_store_name(set_name)
+    if idx_kind_store.len() > 0 and ir_store_learns_kind(idx_store_kind):
         tag_r := ir_emit_element_tag_const(idx_store_kind)
         ir_emit_call4(ir_reg(), idx_kind_store, "void", obj_r, idx_r, value_r, tag_r)
         ir_release_owned_index_key(target.children[1], idx_r)
         return true
-    if idx_borrowed:
-        if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes" or idx_store_kind == "struct":
-            ir_rc_retain_reg(value_r, idx_store_kind)
-    elif ir_container_store_takes_count(idx_store_kind):
+    if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
         # `m[k] = "v-{i}"` builds a value nobody else tracks. the store takes
         # the count the temporary was holding instead of adding its own, which
         # is what leaves it with exactly one owner.

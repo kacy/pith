@@ -287,22 +287,25 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a container or struct stored into a *list* under a name is counted
-  twice.** the list is tagged, so its push retains; the emitter adds a
-  compensating retain as well (`ir_container_store_needs_retain`), and
-  only one of the two is ever dropped. `xs.push(inner)` and `xs[i] =
-  inner` on a `List[List[T]]`, `List[Map[K,V]]`, `List[Set[T]]` or
-  `List[SomeStruct]` therefore strand one count per store — about the
-  same 250 bytes a round that a map value used to. a value built
-  straight into the store is exact, because that path transfers instead
+- **a *borrowed* container or struct stored into a list is counted
+  twice.** the list is tagged, so the runtime store retains; the emitter
+  adds a compensating retain as well, and only one of the two is ever
+  dropped. `xs.push(inner)` with a named local covers the collection and
+  struct kinds (`ir_container_store_needs_retain`), and `xs[i] = inner`
+  covers those plus `Bytes`, from its own hardcoded list in
+  `ir_emit_index_assignment`. measured per round on a `List[List[T]]`
+  push, about 209 bytes; on a `List[SomeStruct]` push, about 93; on a
+  `List[Bytes]` index store, about 94. a value built straight into the
+  store is exact, because that path transfers instead
   (`pith_list_push_value_owned`), so it is only the named-local spelling
-  that leaks. the compensating retain is there because nothing at the
-  store tells a tagged list from an untagged one, which is the same
-  question the kind-carrying map stores answer by carrying the kind —
-  giving `push`, `insert` and `xs[i] = v` the same treatment is the fix,
-  and it is a wider change than the map one because it rewrites every
-  list store of a container or struct in the tree. lists holding
-  strings, bytes or closures are already exact and are not part of this.
+  that leaks — and a `List[String]`, a `List[Bytes]` under `push`, and a
+  list of closures are exact either way. the compensating retain is
+  there because nothing at the store tells a tagged list from an
+  untagged one, which is the same question the kind-carrying map stores
+  answer by carrying the kind. giving `push`, `insert` and `xs[i] = v`
+  the same treatment is the fix, and it is a wider change than the map
+  one: it moves every list store of a container or struct in the tree,
+  on the hottest container path there is.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

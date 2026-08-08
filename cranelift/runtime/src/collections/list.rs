@@ -43,9 +43,11 @@ pub struct ListImpl {
 /// Magic number to identify ListImpl pointers
 pub const LIST_MAGIC: u32 = 0x464F5247;
 
-/// Type tag for list elements
+/// Type tag for a heap-owning collection's elements. Lists carry one per
+/// list; maps carry one for their values (`MapImpl.val_tag`), which is why
+/// this lives here rather than being list-specific.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ListTypeTag {
     Primitive, // Int, Float, Bool - stored by value
     String,    // PithString - needs retain/release
@@ -230,9 +232,25 @@ impl ListImpl {
     }
 }
 
+/// Decode the wire form of an element tag. The codes are part of the ir
+/// contract: the emitter writes them into `pith_list_new` and into the
+/// kind-carrying map stores, so they must not be renumbered.
+pub(crate) fn element_tag_from_code(code: i32) -> ListTypeTag {
+    match code {
+        1 => ListTypeTag::String,
+        2 => ListTypeTag::List,
+        3 => ListTypeTag::Map,
+        4 => ListTypeTag::Struct,
+        5 => ListTypeTag::Bytes,
+        6 => ListTypeTag::Closure,
+        7 => ListTypeTag::Set,
+        _ => ListTypeTag::Primitive,
+    }
+}
+
 /// The list owns one count per heap element. These pick the right retain
 /// and release operation for the element tag.
-unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
+pub(crate) unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
     match tag {
         ListTypeTag::String => {
             crate::perf_count(&crate::PERF_CSTRING_RETAINS_PUSH, 1);
@@ -273,7 +291,7 @@ unsafe fn release_all_elements(impl_ref: &ListImpl) {
     }
 }
 
-unsafe fn release_element(tag: ListTypeTag, raw: i64) {
+pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
     match tag {
         ListTypeTag::String => crate::pith_cstring_release(raw as *const i8),
         ListTypeTag::List => pith_list_release_handle(raw),
@@ -396,16 +414,7 @@ pub unsafe extern "C" fn pith_list_new_set() -> PithList {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
-    let tag = match type_tag {
-        1 => ListTypeTag::String,
-        2 => ListTypeTag::List,
-        3 => ListTypeTag::Map,
-        4 => ListTypeTag::Struct,
-        5 => ListTypeTag::Bytes,
-        6 => ListTypeTag::Closure,
-        7 => ListTypeTag::Set,
-        _ => ListTypeTag::Primitive,
-    };
+    let tag = element_tag_from_code(type_tag);
 
     let list_impl = ListImpl::new(elem_size as usize, tag);
     let boxed = Box::new(list_impl);

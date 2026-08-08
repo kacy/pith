@@ -11,12 +11,12 @@
 # handle registry, so they are "still reachable" rather than lost. resident
 # growth is what notices it.
 #
-# two neighbouring shapes are deliberately not here, because they leak for
-# reasons this has nothing to do with and would mask it: storing a named
+# one neighbouring shape is deliberately not here, because it leaks for a
+# reason this has nothing to do with and would mask it: storing a named
 # local container into a list (`xs.push(inner)`) double-counts it, and
-# storing one into a map takes no count at all because map value counting
-# is cstring-only. both measure the same before and after — see the gap
-# list in docs/ownership.md.
+# measures the same before and after — see the gap list in
+# docs/ownership.md. the map version of that shape is covered by
+# leak_map_value_store.
 import leakprobe as probe
 
 fn fill_list(mut xs: List[String], i: Int) -> Int:
@@ -51,9 +51,9 @@ fn round(lm: Map[String, List[String]], i: Int) -> Int:
     acc = acc + sets.len()
 
     # the get_default fallback, on the branch that hands it back and on the
-    # branch that discards it. the map is built once outside the loop: a
-    # container stored as a map value is the cstring-only gap above, and a
-    # per-round insert would swamp what this is measuring.
+    # branch that discards it. the map is built once outside the loop so
+    # that what a per-round insert costs stays in leak_map_value_store,
+    # where it is the thing being measured.
     mut miss := lm.get_default("miss", [])
     miss.push("c-{i}")
     hit := lm.get_default("hit", [])

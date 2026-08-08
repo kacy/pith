@@ -10,6 +10,16 @@ fn find_positive(n: Int) -> Int?:
 fn lookup(scores: Map[String, Int], name: String) -> Int?:
     return scores.get(name)
 
+# an optional parameter takes a bare none at the call site
+fn describe(label: String, score: Int?) -> String:
+    return "{label}: {score.unwrap_or(0)}"
+
+# an optional field can be left empty, and can default to empty
+struct Entry:
+    name: String
+    rank: Int?
+    note: String? = none
+
 fn main():
     # if let runs the branch only when the optional has a value
     if let n = find_positive(42):
@@ -28,3 +38,16 @@ fn main():
     match lookup(scores, "grace"):
         none => print("grace: unranked")
         score => print("grace: {score}")
+
+    # none is a value you can write wherever an optional is expected: an
+    # argument, a struct field, a list element. it is only accepted there —
+    # `describe("x", none)` is fine, but a plain `Int` parameter rejects it.
+    print(describe("unranked", none))
+    print(describe("ada", lookup(scores, "ada")))
+
+    entry := Entry("carol", none)
+    print("carol rank set: {entry.rank == none}, note set: {entry.note == none}")
+
+    # a list literal mixing none with values is a list of optionals
+    ranks: List[Int?] := [1, none, 3]
+    print("ranks: {ranks.len()}, second empty: {ranks[1] == none}")

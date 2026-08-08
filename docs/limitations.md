@@ -17,6 +17,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   payload-carrying enums compares structurally: tags, then payloads, with
   string payloads by content and nested enums recursively; struct payloads
   compare by identity.
+- **a bare `none` cannot start an inference chain** — `none` is accepted only
+  where the target is already an optional, which is every position that has
+  one: bindings, assignments, returns, arguments, struct fields, collection
+  and tuple elements, and `==` / `!=`. an unannotated `x := none` is the one
+  place with no target to check against; it binds a type nothing else accepts,
+  so the first use of `x` reports instead. write `x: T? := none`.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.
@@ -75,6 +81,16 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **no package registry** — dependencies are local path entries in `pith.toml`;
   there is no fetch, lock, or hosted index yet.
 - **no debugger** — runtime stack traces are thin and there is no stepping.
+- **diagnostic columns are approximate** — the line a diagnostic reports is
+  right and the source line printed under it is right, but the caret lands to
+  the right of the token it means. a token's recorded column is stamped after
+  the lexer has consumed it, so every column in the compiler is off by roughly
+  the token's own width. the line number is the part to trust.
+- **an error inside a string interpolation reports at line 1** — the expression
+  in `"{f(x)}"` is parsed as its own fragment and carries no position from the
+  enclosing file, so a type error in it lands on line 1 rather than on the line
+  the string is written. pull the expression out to a binding to see where it
+  really is.
 
 ## backend
 
@@ -103,6 +119,14 @@ correctness story:
   that is not reclaimed. a stored optional field read does not synthesize and
   does not leak. the leak is bounded per read and never dangles; reclaiming the
   remaining synthesized-optional temporaries is a known follow-up.
+- a fresh optional written straight into an argument is not released — about 64
+  bytes per call, whether it comes from a bare `none` (`f(none)`) or from a call
+  (`f(maybe(i))`). binding it first (`v := maybe(i)` then `f(v)`) is reclaimed
+  normally, so the local is the workaround on a hot path.
+- a collection literal whose element type is an optional (`List[Int?]`,
+  `Map[String, Int?]`) does not release the optionals it holds — about 128 bytes
+  per literal. building the container and pushing into it does not leak; only
+  the literal form does.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

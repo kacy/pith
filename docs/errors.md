@@ -139,6 +139,18 @@ error[E200]: type mismatch: expected String, got Int
   fix: change the return type to Int
 ```
 
+a bare `none` reports here too. `none` is the empty case of an optional and
+satisfies nothing else, so it is accepted only where the target is already
+a `T?` — a binding, an assignment, a return, an argument, a struct field, a
+collection element, a tuple element, or the other side of `==` / `!=`.
+
+```
+error[E200]: return type mismatch: expected Int, got none
+  8 |     return none
+             ^
+  fix: return a value, or declare the return type Int?
+```
+
 ### E201 — undefined variable
 
 a variable or function name was used but never defined.
@@ -288,6 +300,14 @@ error[E219]: argument type mismatch: expected String, got Int
             ^^
 ```
 
+a bare `none` passed to a parameter that is not an optional reports here.
+
+```
+error[E219]: argument type mismatch: expected Int, got none
+  11 |     print(takes_int(none).to_string())
+                 ^
+```
+
 ### E220 — pipe operator error
 
 the right side of a pipe operator (`|`) is not a valid function.
@@ -302,7 +322,16 @@ the compiler couldn't infer the type arguments for a generic type.
 
 ### E223 — collection type inference error
 
-the compiler couldn't determine the element type of a collection literal.
+the compiler couldn't determine the element type of a collection literal,
+or the elements disagree. a `none` element is folded in rather than compared
+— `[none, 1]` is a `List[Int?]` — but a set element and a map key are hashed
+and compared, so neither accepts `none`.
+
+```
+error[E223]: set element cannot be none
+  4 |     zs: Set[Int] := {none}
+                           ^
+```
 
 ### E224 — invalid unwrap/try target
 

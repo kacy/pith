@@ -1,0 +1,67 @@
+# a bare `none` is accepted exactly where an optional is expected. this case
+# pins every accepting position, because the rule that rejects `none` against
+# a concrete type is easy to over-tighten into one that makes `none` useless.
+
+struct Row:
+    id: Int
+    label: String?
+    parent: Int? = none
+
+fn takes_optional(x: Int?) -> Int:
+    return x.unwrap_or(7)
+
+fn returns_optional(want_value: Bool) -> Int?:
+    if want_value:
+        return 3
+    return none
+
+fn optional_pair() -> (Int?, Int):
+    return (none, 4)
+
+fn main():
+    # binding and assignment
+    mut a: Int? := none
+    print("bind:" + (a == none).to_string())
+    a = 5
+    print("assign_value:" + a.unwrap_or(0).to_string())
+    a = none
+    print("assign_none:" + (a == none).to_string())
+
+    # argument position, both as a literal and through a name
+    print("arg_literal:" + takes_optional(none).to_string())
+    print("arg_name:" + takes_optional(a).to_string())
+
+    # return position
+    print("ret_none:" + (returns_optional(false) == none).to_string())
+    print("ret_value:" + returns_optional(true).unwrap_or(0).to_string())
+
+    # struct fields, positional, named, and defaulted
+    r1 := Row(1, none)
+    print("field_positional:" + (r1.label == none).to_string())
+    print("field_default:" + (r1.parent == none).to_string())
+    r2 := Row(id: 2, label: "x", parent: none)
+    print("field_named:" + (r2.parent == none).to_string())
+    print("field_value:" + r2.label.unwrap_or(""))
+
+    # collection literals: mixed and all-none, annotated and inferred
+    xs: List[Int?] := [none, 2, none]
+    print("list_len:" + xs.len().to_string())
+    print("list_none:" + (xs[0] == none).to_string())
+    print("list_value:" + xs[1].unwrap_or(0).to_string())
+    only: List[Int?] := [none]
+    print("list_all_none:" + (only[0] == none).to_string())
+    inferred := [none, 9]
+    print("list_inferred:" + inferred[1].unwrap_or(0).to_string())
+    m: Map[String, Int?] := {"a": none, "b": 1}
+    print("map_len:" + m.len().to_string())
+
+    # tuple elements
+    t: (Int?, Int) := (none, 6)
+    print("tuple_second:" + t.1.to_string())
+    p := optional_pair()
+    print("tuple_ret:" + p.1.to_string())
+
+    # comparison in both directions, and none against none
+    print("cmp_left:" + (none == a).to_string())
+    print("cmp_right:" + (a == none).to_string())
+    print("cmp_both:" + (none == none).to_string())

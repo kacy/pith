@@ -3,6 +3,9 @@
 //! Hybrid approach: Uses hashbrown::HashMap internally for O(1) lookups,
 //! but presents FFI-compatible interface matching the C runtime.
 
+use crate::collections::list::{
+    element_tag_from_code, release_element, retain_element, ListTypeTag,
+};
 use crate::handle_registry::{self, HandleKind};
 use crate::runtime_core::optional_tuple;
 use hashbrown::HashMap;
@@ -55,8 +58,10 @@ pub struct MapImpl {
     key_type: KeyType,
     /// Size of values in bytes
     val_size: usize,
-    /// Whether values are heap types (need retain/release)
-    val_is_heap: bool,
+    /// Which heap kind the map's values are, or `Primitive` when it owns no
+    /// value counts. A map holds exactly one count per stored heap value, the
+    /// same contract a tagged list has for its elements.
+    val_tag: ListTypeTag,
 }
 
 /// Key type enumeration
@@ -67,7 +72,8 @@ pub enum KeyType {
 }
 
 impl MapImpl {
-    fn new(key_type: KeyType, val_size: usize, val_is_heap: bool) -> Self {
+    fn new(key_type: KeyType, val_size: usize, val_tag: ListTypeTag) -> Self {
+        let val_is_heap = val_tag != ListTypeTag::Primitive;
         let int_values8 = if matches!(key_type, KeyType::Int) && val_size == 8 && !val_is_heap {
             Some(HashMap::new())
         } else {
@@ -80,8 +86,41 @@ impl MapImpl {
             int_values8,
             key_type,
             val_size,
-            val_is_heap,
+            val_tag,
         }
+    }
+
+    fn val_is_heap(&self) -> bool {
+        self.val_tag != ListTypeTag::Primitive
+    }
+
+    /// Learn the value kind from a store, when the emitter knows it and the
+    /// map does not. Returns true when the map owns a count on values of that
+    /// kind once this returns.
+    ///
+    /// The constructor cannot always pick the flavor — an empty `{}` in a
+    /// position the checker could not type builds a plain map — so the store
+    /// is the second chance, and the only place the value's kind is known for
+    /// certain. Adopting is count-neutral because it is gated on the map being
+    /// empty: there are no already-stored values whose counts the new tag
+    /// would start releasing. A non-empty untagged map keeps its tag and the
+    /// caller is told so, which is what keeps the fallback a leak rather than
+    /// a freed value.
+    fn adopt_value_tag(&mut self, tag: ListTypeTag) -> bool {
+        if tag == ListTypeTag::Primitive {
+            return false;
+        }
+        if self.val_tag == tag {
+            return true;
+        }
+        if self.val_tag == ListTypeTag::Primitive && self.len() == 0 {
+            self.val_tag = tag;
+            // heap values never live in the scalar fast path, which stores
+            // raw i64s and skips every retain and release.
+            self.int_values8 = None;
+            return true;
+        }
+        false
     }
 
     fn len(&self) -> usize {
@@ -173,11 +212,22 @@ impl MapImpl {
     /// # Safety
     /// `val` must be the raw storage of a value this map owned.
     unsafe fn release_value(&self, val: &[u8]) {
-        if !self.val_is_heap || val.len() < 8 {
+        if !self.val_is_heap() || val.len() < 8 {
             return;
         }
         let raw = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
-        crate::pith_cstring_release(raw as *const i8);
+        release_element(self.val_tag, raw);
+    }
+
+    /// Take the map's count on a value being stored.
+    ///
+    /// # Safety
+    /// `raw` must be a handle of the map's value kind.
+    unsafe fn retain_value(&self, raw: i64) {
+        if !self.val_is_heap() {
+            return;
+        }
+        retain_element(self.val_tag, raw);
     }
 
     /// Drop the map's count on every stored value, for clear and free.
@@ -185,7 +235,7 @@ impl MapImpl {
     /// # Safety
     /// The caller must not use the values afterwards.
     unsafe fn release_all_values(&self) {
-        if !self.val_is_heap {
+        if !self.val_is_heap() {
             return;
         }
         for val in self.data.values() {
@@ -268,12 +318,29 @@ pub unsafe extern "C" fn pith_map_new_int_cstr_val() -> PithMap {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap: i64) -> PithMap {
+    // the historical spelling: "heap" meant cstring, the only kind a map
+    // could own. pith_map_new_tagged is the general form.
+    pith_map_new_tagged(
+        key_type,
+        val_size,
+        if val_is_heap != 0 {
+            ListTypeTag::String as i32
+        } else {
+            ListTypeTag::Primitive as i32
+        },
+    )
+}
+
+/// Create a map whose values are of a named heap kind, or `Primitive` for a
+/// map that owns no value counts. The tag codes are the element-tag codes
+/// `pith_list_new` uses.
+unsafe fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> PithMap {
     let ktype = match key_type {
         1 => KeyType::String,
         _ => KeyType::Int,
     };
 
-    let map_impl = MapImpl::new(ktype, val_size as usize, val_is_heap != 0);
+    let map_impl = MapImpl::new(ktype, val_size as usize, element_tag_from_code(val_tag));
     let boxed = Box::new(map_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
     handle_registry::register(ptr as *const (), HandleKind::Map);
@@ -334,12 +401,14 @@ pub unsafe extern "C" fn pith_map_insert_int(
     crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
     let val_vec = val_slice.to_vec();
 
-    // The map owns one count per stored string value.
-    // (the retain must stay gated on val_is_heap: magic-checking an
+    // The map owns one count per stored heap value, read out of the same
+    // eight bytes release_value drops it from.
+    // (the retain must stay gated on the value tag: magic-checking an
     // arbitrary integer dereferences value-16, which faults on values
     // that resemble unmapped addresses.)
-    if impl_ref.val_is_heap {
-        crate::pith_cstring_retain(value as *const i8);
+    if val_slice.len() >= 8 {
+        let raw = i64::from_le_bytes(val_slice[..8].try_into().unwrap_or([0u8; 8]));
+        impl_ref.retain_value(raw);
     }
 
     // Retain before insert, release the displaced value after: `m[k] = m[k]`
@@ -515,6 +584,57 @@ pub unsafe extern "C" fn pith_map_insert_cstr_owned(map_handle: i64, key: *const
     insert_cstr_inner(map_handle, key, value, true);
 }
 
+/// Insert a borrowed value of a named heap kind. The map learns the kind
+/// here when its constructor could not supply one — see
+/// `MapImpl::adopt_value_tag` — which is what lets a container stored into a
+/// map be owned by it. When the map cannot own the kind, the count the
+/// emitter would once have added at the call site is added here instead, so
+/// the value still outlives the caller's local: a leak, never a freed value.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_cstr_kind(
+    map_handle: i64,
+    key: *const i8,
+    value: i64,
+    val_tag: i64,
+) {
+    let owns = map_adopt_value_tag(map_handle, val_tag);
+    if !owns {
+        retain_element(element_tag_from_code(val_tag as i32), value);
+    }
+    insert_cstr_inner(map_handle, key, value, false);
+}
+
+/// Insert an owned value of a named heap kind: the map takes the caller's
+/// count, adopting the kind first when it has none. A map that cannot own
+/// the kind takes nothing and the caller's count stays outstanding.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_cstr_owned_kind(
+    map_handle: i64,
+    key: *const i8,
+    value: i64,
+    val_tag: i64,
+) {
+    map_adopt_value_tag(map_handle, val_tag);
+    insert_cstr_inner(map_handle, key, value, true);
+}
+
+/// Let a map learn the heap kind of the values being stored into it.
+/// Returns true when the map owns a count on that kind afterwards.
+unsafe fn map_adopt_value_tag(map_handle: i64, val_tag: i64) -> bool {
+    match map_mut_from_handle(map_handle) {
+        Some(impl_ref) => impl_ref.adopt_value_tag(element_tag_from_code(val_tag as i32)),
+        None => false,
+    }
+}
+
 unsafe fn insert_cstr_inner(
     map_handle: i64,
     key: *const i8,
@@ -533,9 +653,9 @@ unsafe fn insert_cstr_inner(
     // the map retains the incoming value when it owns heap values, and
     // drops its count on whatever that displaces. an owned value arrives
     // with the caller's count, which the map keeps as its own.
-    if impl_ref.val_is_heap {
+    if impl_ref.val_is_heap() {
         if !takes_caller_count {
-            crate::pith_cstring_retain(value as *const i8);
+            impl_ref.retain_value(value);
         }
         if map_trace_enabled() {
             let kb = match &map_key {
@@ -571,7 +691,7 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
             let v = i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]));
-            if impl_ref.val_is_heap && map_trace_enabled() {
+            if impl_ref.val_is_heap() && map_trace_enabled() {
                 let kb = match &map_key {
                     MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
                     MapKey::Int(n) => n.to_string(),
@@ -765,6 +885,41 @@ pub unsafe extern "C" fn pith_map_insert_ikey_owned(map_handle: i64, key: i64, v
     insert_ikey_inner(map_handle, key, value, true);
 }
 
+/// Int-keyed borrowed store of a named heap kind — see
+/// `pith_map_insert_cstr_kind`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_ikey_kind(
+    map_handle: i64,
+    key: i64,
+    value: i64,
+    val_tag: i64,
+) {
+    let owns = map_adopt_value_tag(map_handle, val_tag);
+    if !owns {
+        retain_element(element_tag_from_code(val_tag as i32), value);
+    }
+    insert_ikey_inner(map_handle, key, value, false);
+}
+
+/// Int-keyed owned store of a named heap kind — see
+/// `pith_map_insert_cstr_owned_kind`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_ikey_owned_kind(
+    map_handle: i64,
+    key: i64,
+    value: i64,
+    val_tag: i64,
+) {
+    map_adopt_value_tag(map_handle, val_tag);
+    insert_ikey_inner(map_handle, key, value, true);
+}
+
 unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
@@ -775,8 +930,8 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
         impl_ref.insert_int_value(key, value);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
-        if impl_ref.val_is_heap && !takes_caller_count {
-            crate::pith_cstring_retain(value as *const i8);
+        if !takes_caller_count {
+            impl_ref.retain_value(value);
         }
         let val_bytes = value.to_le_bytes().to_vec();
         if let Some(old) = impl_ref.insert(MapKey::Int(key), val_bytes) {
@@ -1081,11 +1236,12 @@ pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     };
-    // a heap-valued map hands out its stored handles, so the list has to be
-    // string-tagged: push takes a count of its own and the list's free
-    // cascades it back. an untagged list would leave the caller holding raw
-    // pointers the map is free to evict and release out from under.
-    let list = pith_list_new(8, if impl_ref.val_is_heap { 1 } else { 0 });
+    // a heap-valued map hands out its stored handles, so the list has to
+    // carry the map's own value tag: push takes a count of its own and the
+    // list's free cascades it back. an untagged list would leave the caller
+    // holding raw pointers the map is free to evict and release out from
+    // under.
+    let list = pith_list_new(8, impl_ref.val_tag as i32);
 
     for val in impl_ref.values() {
         if val.len() >= 8 {
@@ -1224,6 +1380,146 @@ mod tests {
             assert_eq!(pith_map_get_ikey(handle, 1), 8);
             pith_map_remove_ikey(handle, 1);
             pith_map_clear_handle(handle);
+            pith_map_release_handle(handle);
+        }
+    }
+
+    /// A one-element list, and a liveness probe for it: a freed list has its
+    /// magic scrubbed, so its length reads back as 0 rather than 1.
+    unsafe fn one_element_list() -> i64 {
+        use crate::collections::list::{pith_list_new_cstr, pith_list_push_value};
+        let list = pith_list_new_cstr();
+        let s = crate::pith_copy_bytes_to_cstring(b"elem");
+        pith_list_push_value(list, s as i64);
+        crate::pith_cstring_release(s);
+        list.ptr as i64
+    }
+
+    unsafe fn list_is_alive(handle: i64) -> bool {
+        use crate::collections::list::{pith_list_len, PithList};
+        pith_list_len(PithList {
+            ptr: handle as *mut (),
+        }) == 1
+    }
+
+    #[test]
+    fn a_map_learns_its_value_kind_from_a_borrowed_store() {
+        unsafe {
+            use crate::collections::list::pith_list_release_handle;
+
+            // built with no value flavor at all, the shape an empty `{}` in a
+            // position the checker could not type produces
+            let handle = pith_map_new_default().ptr as i64;
+            let list = one_element_list();
+            let key = b"k\0".as_ptr() as *const i8;
+            pith_map_insert_cstr_kind(handle, key, list, ListTypeTag::List as i64);
+
+            // the map took a count of its own, so the caller letting go is not
+            // the last release
+            pith_list_release_handle(list);
+            assert!(list_is_alive(list));
+            assert_eq!(pith_map_get_cstr(handle, key), list);
+
+            pith_map_release_handle(handle);
+            assert!(!list_is_alive(list));
+        }
+    }
+
+    #[test]
+    fn an_owned_value_hands_its_count_to_the_map() {
+        unsafe {
+            let handle = pith_map_new_default().ptr as i64;
+            let list = one_element_list();
+            let key = b"k\0".as_ptr() as *const i8;
+            // the caller stops tracking the value here and never releases it
+            pith_map_insert_cstr_owned_kind(handle, key, list, ListTypeTag::List as i64);
+            assert!(list_is_alive(list));
+
+            pith_map_release_handle(handle);
+            assert!(!list_is_alive(list));
+        }
+    }
+
+    #[test]
+    fn an_int_keyed_map_leaves_the_scalar_fast_path_to_hold_handles() {
+        unsafe {
+            use crate::collections::list::pith_list_release_handle;
+
+            let handle = pith_map_new_int().ptr as i64;
+            assert!(map_ref_from_handle(handle).unwrap().uses_int_values8());
+            let list = one_element_list();
+            pith_map_insert_ikey_kind(handle, 7, list, ListTypeTag::List as i64);
+            assert!(!map_ref_from_handle(handle).unwrap().uses_int_values8());
+            assert_eq!(pith_map_get_ikey(handle, 7), list);
+            assert_eq!(pith_map_len_handle(handle), 1);
+
+            pith_list_release_handle(list);
+            assert!(list_is_alive(list));
+            pith_map_release_handle(handle);
+            assert!(!list_is_alive(list));
+        }
+    }
+
+    #[test]
+    fn a_map_that_cannot_adopt_leaks_rather_than_frees() {
+        unsafe {
+            use crate::collections::list::pith_list_release_handle;
+
+            // a value already stored without a kind leaves the map holding no
+            // count on it, so adopting a tag now would start releasing counts
+            // the map never took. it must refuse, and take the compensating
+            // count itself instead.
+            let handle = pith_map_new_default().ptr as i64;
+            let first = one_element_list();
+            pith_map_insert_cstr(handle, b"a\0".as_ptr() as *const i8, first);
+
+            let second = one_element_list();
+            pith_map_insert_cstr_kind(
+                handle,
+                b"b\0".as_ptr() as *const i8,
+                second,
+                ListTypeTag::List as i64,
+            );
+            pith_list_release_handle(second);
+            assert!(list_is_alive(second));
+
+            pith_map_release_handle(handle);
+            // neither value was freed by the map: `first` is still the
+            // caller's, `second` is the leak this trades for the dangle
+            assert!(list_is_alive(first));
+            assert!(list_is_alive(second));
+            pith_list_release_handle(first);
+            pith_list_release_handle(second);
+        }
+    }
+
+    #[test]
+    fn values_of_a_list_valued_map_come_back_list_tagged() {
+        unsafe {
+            use crate::collections::list::{pith_list_len, pith_list_release_handle, PithList};
+
+            let handle = pith_map_new_default().ptr as i64;
+            let list = one_element_list();
+            pith_map_insert_cstr_owned_kind(
+                handle,
+                b"k\0".as_ptr() as *const i8,
+                list,
+                ListTypeTag::List as i64,
+            );
+            let vals = pith_map_values_handle(handle);
+            assert_eq!(
+                pith_list_len(PithList {
+                    ptr: vals as *mut ()
+                }),
+                1
+            );
+            // the values list took its own count, so evicting the entry does
+            // not free what the caller is now holding
+            pith_map_clear_handle(handle);
+            assert!(list_is_alive(list));
+
+            pith_list_release_handle(vals);
+            assert!(!list_is_alive(list));
             pith_map_release_handle(handle);
         }
     }

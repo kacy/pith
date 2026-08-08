@@ -84,6 +84,11 @@ call arguments:
   tagged. an untagged container takes nothing and the caller's count
   stays outstanding, which is a leak rather than an element nothing
   keeps alive
+- a heap value stored into a map carries its kind with it, in both the
+  borrowed and the owned form — `pith_map_insert_cstr_kind`,
+  `pith_map_insert_ikey_kind` and their `_owned_` twins, chosen by
+  `ir_map_kind_store_name` and gated on `ir_map_store_learns_kind`. see
+  "container flavors" for why the store rather than the constructor
 - a callee that may hand an argument straight back out takes no count on
   either branch, so the caller takes one on the *result* instead.
   `m.get_default(k, d)` returns `d` unchanged when the key is missing and
@@ -146,10 +151,36 @@ uses the closure constructor, so its push retains and its free-time
 cascade releases. a route table and a middleware chain are exactly
 that shape, and untagged they held handles they did not own — which
 was survivable only while every closure that reached one was leaking a
-count somewhere else. maps and sets of closures are still untagged,
-because a map's value counting is cstring-only; a borrowed closure
-stored in one gets its count added at the store instead
-(`ir_container_store_needs_retain`), which leaks rather than dangles.
+count somewhere else. a set of closures needs no count at all, since a
+set copies element bytes into its own storage rather than holding the
+caller's handle.
+
+a map's values carry the same tag a list's elements do — the runtime
+shares one `ListTypeTag` and one retain/release pair between them — so a
+map owns a count on every heap value it holds, of every kind. that used
+to be cstring-only: a list, map, set, struct, bytes or closure written
+into a map got no count from the map and none released on eviction, and
+the emitter added a compensating count at the call site so the value
+would at least outlive the caller's local. nothing ever dropped it.
+
+the tag comes from the *store* rather than only the constructor, which
+is what makes that sound. a container normally picks its flavor at
+construction from the checked type, but `ir_emit_map_literal` reads its
+value kind off the literal's first entry and an empty `{}` has none — so
+`f({})` built a map that could never own what was put into it, however
+well the checker had typed the parameter. a store instead carries the
+value's kind (`pith_map_insert_cstr_kind` and friends) and the map
+adopts it, so ownership no longer depends on the constructor having
+guessed right. `MapImpl::adopt_value_tag` only adopts into an *empty*
+map, which is what keeps the change count-neutral: there are no
+already-stored values whose counts a new tag would start releasing. a
+map that cannot adopt — one already holding values under a different
+tag — takes the compensating count in the runtime instead, exactly the
+one the emitter used to add, so the fallback is a leak and never a freed
+value. the constructor still picks the flavor where it can, because a
+map that owns strings has always been built that way and an int-keyed
+map with primitive values keeps its scalar fast path; adoption drops out
+of that fast path the moment the map holds handles.
 
 sets are a list element type too. the runtime's element tag had no
 `Set` variant, so a `List[Set]` was the one collection-of-collections
@@ -160,7 +191,8 @@ variant exists now (`pith_list_new_set`), which is what let `insert`
 join the other stores on the transferring path.
 
 the constructor a literal picks comes from the checked type of the
-literal node, so it is only as good as what the checker recorded there.
+literal node, so for a list it is only as good as what the checker
+recorded there (a map has the store as its second chance, above).
 an empty `[]` or `{}` has no type of its own and takes one from context.
 the checker propagates that context for an annotated bind, a `return`, a
 struct constructor, an assignment and a call or method argument, and the
@@ -225,6 +257,13 @@ keys are strings, and `map.values()` when the values are heap values.
   the name mapping in `self-host/ir_metadata.pith`, and the kind-to-
   constructor table `ir_list_ctor_for_elem_kind`. adding a tag means
   all four
+- the map value tag: `MapImpl.val_tag` and `adopt_value_tag` in
+  `cranelift/runtime/src/collections/map.rs`, which reuse `ListTypeTag`
+  and its `retain_element`/`release_element` pair so a map and a list
+  can never disagree about what a kind means. the emitter side is
+  `ir_map_store_learns_kind`, `ir_map_kind_store_name` and
+  `ir_element_tag_code` — that last one writes the wire codes, which are
+  part of the ir contract and must not be renumbered
 - the runtime counts: `cranelift/runtime/src/runtime_core.rs` and the
   per-type files under `collections/`
 
@@ -248,18 +287,25 @@ gaps, all bounded leaks rather than dangling pointers:
   captures a binding which transitively holds the closure — for example
   a list that contains a closure capturing that same list; there is no
   weak capture yet, so that shape still leaks.
-- **a struct value stored in a map keeps its count outstanding.** a
-  map's value counting is cstring-only, so it takes no count on a
-  struct value and releases none when the entry is evicted; a struct
-  stored in one lives forever on the count the store left with it — the
-  caller's transferred count for an owned value, the compensating
-  retain for a borrowed one. this is the same untagged-container gap
-  closures and nested collections have, and it errs the same way: the
-  struct outlives the map rather than dangling inside it. lists are not
-  part of this gap — a struct-tagged list retains, releases on
-  eviction, and takes the caller's count when the stored value arrives
-  owned, the same transfer every other kind makes (`make leak-check`
-  covers that shape in `leak_struct_store`).
+- **a *borrowed* container or struct stored into a list is counted
+  twice.** the list is tagged, so the runtime store retains; the emitter
+  adds a compensating retain as well, and only one of the two is ever
+  dropped. `xs.push(inner)` with a named local covers the collection and
+  struct kinds (`ir_container_store_needs_retain`), and `xs[i] = inner`
+  covers those plus `Bytes`, from its own hardcoded list in
+  `ir_emit_index_assignment`. measured per round on a `List[List[T]]`
+  push, about 209 bytes; on a `List[SomeStruct]` push, about 93; on a
+  `List[Bytes]` index store, about 94. a value built straight into the
+  store is exact, because that path transfers instead
+  (`pith_list_push_value_owned`), so it is only the named-local spelling
+  that leaks — and a `List[String]`, a `List[Bytes]` under `push`, and a
+  list of closures are exact either way. the compensating retain is
+  there because nothing at the store tells a tagged list from an
+  untagged one, which is the same question the kind-carrying map stores
+  answer by carrying the kind. giving `push`, `insert` and `xs[i] = v`
+  the same treatment is the fix, and it is a wider change than the map
+  one: it moves every list store of a container or struct in the tree,
+  on the hottest container path there is.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly
@@ -291,19 +337,17 @@ gaps, all bounded leaks rather than dangling pointers:
   assignment and a call or method argument all supply one, so `f([])`,
   `xs.push([])`, `xs.insert(i, [])` and `m.get_default(k, {})` build the
   same tagged container `mut xs: List[String] := []` then `f(xs)` builds.
-  three shapes still miss out. an argument literal that *has* elements
-  types itself and is left alone, so a nested `f([[]])` tags the outer
-  list and not the inner one — bind the inner list first. an empty
-  literal against an optional parameter (`f(v: List[String]?)`) gets
-  nothing, because the target the argument declares is the optional and
-  not the container inside it. and a map argument literal is tagged only
-  as far as the runtime goes, which is not far: map value counting is
-  cstring-only and the emitter reads the value kind off the literal's
-  first entry, which an empty one does not have, so `f({})` for a
-  `Map[String, String]` leaves its values on the count the caller stored
-  them with — the same gap as the struct-value bullet above. all three
-  err toward the leak: a store into an untagged container takes no
-  count, so the caller's stays outstanding.
+  two shapes still miss out, both of them lists. an argument literal that
+  *has* elements types itself and is left alone, so a nested `f([[]])`
+  tags the outer list and not the inner one — bind the inner list first.
+  and an empty literal against an optional parameter
+  (`f(v: List[String]?)`) gets nothing, because the target the argument
+  declares is the optional and not the container inside it. both err
+  toward the leak: a store into an untagged list takes no count, so the
+  caller's stays outstanding. an empty *map* literal is no longer on this
+  list — its values are counted from the store rather than the
+  constructor, so `f({})` owns what is put into it whatever the checker
+  managed to record.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

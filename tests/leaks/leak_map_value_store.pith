@@ -1,0 +1,88 @@
+# a container, struct or bytes value stored into a map.
+#
+# a map's value counting used to be cstring-only: the map took no count on a
+# list, map, set, struct, bytes or closure value and released none when the
+# entry was evicted, so the emitter added a compensating count at the call
+# site to stop the value dying with the caller's local. nothing ever dropped
+# that count. every value stored into a map outlived the map.
+#
+# valgrind sees none of it — the stranded values stay reachable from the
+# handle registry, so they are "still reachable" rather than lost. resident
+# growth is what notices.
+#
+# one neighbouring shape is deliberately not here: `xs.push(inner)` with a
+# named local container or struct into a tagged list, which double-counts
+# for a different reason and measures the same before and after. see the gap
+# list in docs/ownership.md.
+import leakprobe as probe
+
+struct Row:
+    name: String
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    # a named local container stored under a string key and an int key
+    mut lists: Map[String, List[String]] := {}
+    mut inner: List[String] := []
+    inner.push("a-{i}")
+    inner.push("b-{i}")
+    lists.insert("k", inner)
+    mut ilists: Map[Int, List[String]] := {}
+    mut inner2: List[String] := []
+    inner2.push("c-{i}")
+    ilists.insert(i, inner2)
+    acc = acc + lists["k"].len() + ilists[i].len()
+
+    # a fresh container written straight into the store, both spellings
+    mut fresh: Map[String, List[String]] := {}
+    fresh.insert("f", ["d-{i}"])
+    fresh["g"] = ["e-{i}"]
+    acc = acc + fresh["f"].len() + fresh["g"].len()
+
+    # a map literal, storing a local and a fresh value
+    mut held: List[String] := []
+    held.push("h-{i}")
+    lit := {"held": held, "made": ["j-{i}"]}
+    acc = acc + lit.len()
+
+    # the other value kinds
+    mut structs: Map[String, Row] := {}
+    structs.insert("r", Row("row-{i}"))
+    mut blobs: Map[String, Bytes] := {}
+    blobs.insert("b", bytes_from_string_utf8("k-{i}"))
+    mut sets: Map[String, Set[String]] := {}
+    mut s: Set[String] := {}
+    s.add("m-{i}")
+    sets.insert("s", s)
+    mut maps: Map[String, Map[String, String]] := {}
+    mut nested: Map[String, String] := {}
+    nested.insert("n", "o-{i}")
+    maps.insert("m", nested)
+    acc = acc + structs.len() + blobs.len() + sets.len() + maps.len()
+
+    # overwrite and remove: the map drops its count on what left
+    mut churned: Map[String, List[String]] := {}
+    churned.insert("c", ["p-{i}"])
+    churned.insert("c", ["q-{i}"])
+    churned.remove("c")
+    acc = acc + churned.len()
+
+    # values() hands out counted handles
+    mut vals: Map[String, List[String]] := {}
+    vals.insert("v", ["r-{i}"])
+    acc = acc + vals.values().len()
+
+    return acc
+
+fn main():
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

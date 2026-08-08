@@ -2708,13 +2708,19 @@ fn ir_generic_param_optional_tid(operand_node: Node) -> Int:
 
 fn ir_emit_binary_expr(node: Node) -> Int:
     if node.value == "eq" or node.value == "neq":
+        # `none == none` is decided without building either operand. both
+        # sides now lower to a fresh optional tuple, so comparing the emitted
+        # values would compare two heap addresses and answer false.
+        both_none_r := ir_try_emit_none_to_none_compare(node)
+        if both_none_r >= 0:
+            return both_none_r
         fast_r := ir_try_emit_byte_compare(node, node.value)
         if fast_r >= 0:
             return fast_r
     if node.value == "and" or node.value == "or":
         return ir_emit_short_circuit_logic(node)
-    left_r := ir_expr(node.children[0])
-    right_r := ir_expr(node.children[1])
+    left_r := ir_emit_binary_operand(node.children[0], node.value)
+    right_r := ir_emit_binary_operand(node.children[1], node.value)
     r := ir_reg()
     # Optional-typed `==` / `!=` compares by (is_some, value), not by pointer
     # identity, and has several shapes; try it before the value operators.
@@ -2722,6 +2728,33 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     if opt_r >= 0:
         return opt_r
     return ir_emit_value_binary(node, r, left_r, right_r)
+
+# emit one operand of a binary expression. a bare `none` under `==` / `!=` is
+# the exception: every comparison shape below reads the *other* side and only
+# needs the none operand to occupy a register, so building the optional tuple
+# for it would allocate one per comparison and drop it unread — `x != none` in
+# a loop leaked an optional a round.
+fn ir_emit_binary_operand(idx: Int, op: String) -> Int:
+    if op == "eq" or op == "neq":
+        if node_kind(idx) == "none_lit":
+            return ir_emit_zero_value()
+    return ir_expr(idx)
+
+# `none == none` / `none != none`, answered as a constant. returns -1 when
+# either side is anything other than a bare `none`.
+fn ir_try_emit_none_to_none_compare(node: Node) -> Int:
+    if node.children.len() < 2:
+        return 0 - 1
+    if node_kind(node.children[0]) != "none_lit":
+        return 0 - 1
+    if node_kind(node.children[1]) != "none_lit":
+        return 0 - 1
+    r := ir_reg()
+    if node.value == "eq":
+        ir_emit("iconst " + r.to_string() + " 1")
+    else:
+        ir_emit("iconst " + r.to_string() + " 0")
+    return r
 
 # `==` / `!=` where at least one operand is an Optional. A raw pointer eq would
 # compare heap addresses, so compare by (is_some, value) instead. Covers a none
@@ -5522,6 +5555,15 @@ fn ir_expr(idx: Int) -> Int:
     if node.kind == "bool" or node.kind == "bool_lit":
         return ir_emit_bool_literal(node)
 
+    # a bare `none` the checker let through is the empty case of an optional
+    # — nothing else typechecks there any more — so it lowers to the canonical
+    # optional tuple. the positions that know their target (return, bind,
+    # tuple element, `== none`) still intercept above; this is what an
+    # argument position gets, which used to fall through to the zero-value
+    # fallback and hand the callee a null where it expected the wrapper.
+    if node.kind == "none_lit":
+        return ir_emit_optional_none_value()
+
     if node.kind == "ident":
         return ir_emit_ident_load(idx, node.value)
 
@@ -5800,7 +5842,15 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
 
 fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:
-        mut r := ir_expr(node.children[0])
+        # `return none` builds its optional below, from the function's own
+        # return kind. going through ir_expr for it would build one optional
+        # tuple here and a second one there, and strand the first — every
+        # `return none` in the tree leaked an optional per call.
+        mut r := 0
+        if node_kind(node.children[0]) == "none_lit":
+            r = ir_emit_zero_value()
+        else:
+            r = ir_expr(node.children[0])
         # hand the returned string's count to the caller: a returned local
         # transfers its count (skip it in cleanup), a returned borrow gets
         # a fresh count. fresh results already arrive owned.

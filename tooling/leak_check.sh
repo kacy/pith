@@ -40,6 +40,7 @@ cases=(
   tests/leaks/leak_result_extraction
   tests/leaks/leak_yaml_parse
   tests/leaks/leak_sql_numeric
+  tests/leaks/leak_none_lowering
 )
 
 echo "--- leak growth (${low_rounds} vs ${high_rounds} rounds, limit ${limit_kb}kb) ---"

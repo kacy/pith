@@ -1,0 +1,64 @@
+# the two places a bare `none` is lowered on a hot path.
+#
+# `return none` builds the canonical optional from the function's declared
+# return kind. the expression itself must not be built on the way there — for
+# a while it was, and the discarded first tuple leaked once per call, which is
+# once per `row.column(name)` miss in std.sql.
+#
+# `x == none` and `x != none` read the flag out of the optional side and never
+# look at the none operand, so that operand only has to occupy a register.
+# building an optional for it leaked one per comparison.
+#
+# valgrind sees none of this: the stranded tuple stays reachable from the
+# handle registry, so it is "still reachable" rather than lost. resident
+# growth is what notices it.
+#
+# note what is deliberately NOT measured here: `f(none)` against an optional
+# parameter, and a list literal of optionals. both leak, and both leak exactly
+# as much when the optional comes from a call instead of a `none` — they are
+# the fresh-optional-argument and optional-element-container gaps, not this
+# lowering. pinning them here would measure someone else's bug.
+import leakprobe as probe
+
+fn maybe(i: Int) -> Int?:
+    if i % 2 == 0:
+        return none
+    return i
+
+fn maybe_text(i: Int) -> String?:
+    if i % 3 == 0:
+        return none
+    return "s-{i}"
+
+fn round(i: Int) -> Int:
+    mut hits := 0
+    n := maybe(i)
+    if n == none:
+        hits = hits + 1
+    if n != none:
+        hits = hits + 2
+    t := maybe_text(i)
+    if t == none:
+        hits = hits + 4
+    if t != none:
+        hits = hits + 8
+    mut slot: Int? := none
+    if slot == none:
+        hits = hits + 16
+    slot = i
+    if slot != none:
+        hits = hits + 32
+    slot = none
+    return hits
+
+fn main():
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -206,9 +206,11 @@ store and 96 a `List[Row]` one. the kind is that missing evidence: the
 list answers whether it owns the kind, takes exactly one count when it
 does, and adds the compensating one itself when it does not. because the
 same `store_kind` decides both whether to carry the kind and whether to
-skip the emitter-side retain, the two cannot disagree. adoption is
-gated on the list being empty and on 8-byte storage, so it is
-count-neutral and never reinterprets a narrower element as a handle.
+skip the emitter-side retain, the two cannot disagree. adoption is gated
+on the list being empty, on 8-byte storage and on holding no other heap
+kind already, so it is count-neutral, never reinterprets a narrower
+element as a handle, and never retags a list whose constructor and store
+disagree — that last one falls to the leak instead.
 only the borrowed stores carry a kind; an owned value transfers its
 count through the `_owned_` variants instead of taking one.
 

@@ -99,6 +99,13 @@ impl ListImpl {
     /// makes it count-neutral: there are no already-stored elements whose
     /// counts a new tag would start releasing. It is gated on 8-byte storage
     /// too, because a narrower element is not a handle at all.
+    ///
+    /// A list that already owns some *other* heap kind does not adopt, even
+    /// when empty. That would be the constructor and the store disagreeing
+    /// about the element type, and there is no way to tell which of them is
+    /// right — retagging would make every later store of the original kind
+    /// retain and release as the wrong one. Refusing leaves the caller on the
+    /// fallback, which is a leak.
     fn adopt_element_tag(&mut self, tag: ListTypeTag) -> bool {
         if tag == ListTypeTag::Primitive {
             return false;
@@ -106,7 +113,7 @@ impl ListImpl {
         if self.type_tag == tag {
             return true;
         }
-        if self.len() == 0 && self.uses_value_storage() {
+        if self.type_tag == ListTypeTag::Primitive && self.len() == 0 && self.uses_value_storage() {
             self.type_tag = tag;
             return true;
         }
@@ -1347,6 +1354,80 @@ mod tests {
             assert_eq!(crate::cstring_refcount_for_tests(popped), Some(1));
             crate::pith_cstring_release(popped);
             pith_list_release(list);
+        }
+    }
+
+    #[test]
+    fn a_kind_store_takes_exactly_one_count_on_a_tagged_list() {
+        unsafe {
+            let list = pith_list_new(8, 1); // ListTypeTag::String
+            let s = crate::pith_copy_bytes_to_cstring(b"borrowed");
+            pith_list_push_value_kind(list, s as i64, 1);
+            // one count for the caller's local, one for the list, and no
+            // third one from a compensating retain
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            crate::pith_cstring_release(s);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+        }
+    }
+
+    #[test]
+    fn a_kind_store_adopts_into_an_empty_untagged_list() {
+        unsafe {
+            let list = pith_list_new_default(); // ListTypeTag::Primitive
+            let s = crate::pith_copy_bytes_to_cstring(b"adopted");
+            pith_list_push_value_kind(list, s as i64, 1);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            // the list learned the kind at the store, so its free-time
+            // cascade reclaims what it holds
+            crate::pith_cstring_release(s);
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+        }
+    }
+
+    #[test]
+    fn a_kind_store_that_cannot_adopt_leaks_rather_than_frees() {
+        unsafe {
+            // already holding a primitive, so the tag cannot change without
+            // making the list release something it never counted
+            let list = pith_list_new_default();
+            pith_list_push_value(list, 41);
+            let s = crate::pith_copy_bytes_to_cstring(b"stranded");
+            pith_list_push_value_kind(list, s as i64, 1);
+            // the compensating count the emitter used to add, added here
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            crate::pith_cstring_release(s);
+            pith_list_release(list);
+            // outlives the list rather than being freed under it
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+            crate::pith_cstring_release(s);
+        }
+    }
+
+    #[test]
+    fn a_kind_insert_and_overwrite_own_one_count_each() {
+        unsafe {
+            let list = pith_list_new(8, 1);
+            let first = crate::pith_copy_bytes_to_cstring(b"first");
+            pith_list_insert_value_kind(list, 0, first as i64, 1);
+            assert_eq!(crate::cstring_refcount_for_tests(first), Some(2));
+            crate::pith_cstring_release(first);
+
+            let second = crate::pith_copy_bytes_to_cstring(b"second");
+            pith_list_set_value_kind(list, 0, second as i64, 1);
+            // the displaced element loses the list's count, which was its last
+            assert_eq!(crate::cstring_refcount_for_tests(first), None);
+            assert_eq!(crate::cstring_refcount_for_tests(second), Some(2));
+
+            crate::pith_cstring_release(second);
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(second), None);
         }
     }
 

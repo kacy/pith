@@ -26,40 +26,74 @@ command -v go >/dev/null && go build -o "$GO" bench/chan_fanout.go
 command -v rustc >/dev/null && rustc -O -o "$RUST" bench/chan_fanout.rs
 command -v zig >/dev/null && zig build-exe -O ReleaseFast -femit-bin="$ZIG" bench/chan_fanout.zig
 
-# run one binary TRIALS times, keeping every metric line from every run
-trials_output=""
-run_trials() {
-    local bin=$1 green=$2
-    trials_output=""
-    for _ in $(seq "$TRIALS"); do
-        trials_output+="$(env PITH_GREEN="$green" "$bin" "$MESSAGES")"$'\n'
-    done
-}
+# --- why the trials interleave ---
+#
+# this used to measure one variant to completion before starting the next.
+# ambient load drifts over the length of a run, so a fixed order hands the
+# variant measured first a systematic advantage; the sibling event_ledger
+# suite showed the same binary reading 474 ms and then 1005 ms across two runs
+# purely from where it sat in the order. one round now runs every variant
+# once, and a round repeats TRIALS times, so drift lands on all of them alike.
+#
+# a slow first round is normal — the first run after a build competes with
+# whatever the build left behind. read the non-pith rows as the canary: they
+# should reproduce their published figures, and when they do not it is the box
+# that moved rather than the language.
+METRICS=(elapsed_ms rate_per_sec peak_rss_kb)
 
-median() {
-    printf '%s' "$trials_output" | grep "^$1=" | cut -d= -f2 |
-        sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'
-}
-
-# every run of every implementation has to agree, not just one sample
-checksums() { printf '%s' "$trials_output" | grep '^checksum=' | cut -d= -f2 | sort -u; }
-
-printf '\nchan fanout — %s messages, median of %s trials\n\n' "$MESSAGES" "$TRIALS"
-printf '%-12s %8s %14s %12s\n' lang ms msgs_per_sec peak_rss_kb
-
-ref_checksum=""
+names=()
+bins=()
+greens=()
 for entry in "pith-threads:$PITH:0" "pith-green:$PITH:1" "go:$GO:0" "rust:$RUST:0" "zig:$ZIG:0"; do
-    name=${entry%%:*}
     rest=${entry#*:}
     bin=${rest%%:*}
-    green=${rest#*:}
     [ -x "$bin" ] || continue
+    names+=("${entry%%:*}")
+    bins+=("$bin")
+    greens+=("${rest#*:}")
+done
+if [ "${#names[@]}" -eq 0 ]; then
+    echo "chan_fanout_bench: no implementations built" >&2
+    exit 1
+fi
 
-    run_trials "$bin" "$green"
+declare -A samples=()
+declare -A checksums=()
+
+for _ in $(seq "$TRIALS"); do
+    for i in "${!names[@]}"; do
+        out="$(env PITH_GREEN="${greens[$i]}" "${bins[$i]}" "$MESSAGES")"
+        for metric in "${METRICS[@]}"; do
+            value=$(printf '%s\n' "$out" | grep "^$metric=" | cut -d= -f2)
+            if [ -z "$value" ]; then
+                echo "chan_fanout_bench: ${names[$i]} reported no $metric" >&2
+                exit 1
+            fi
+            samples[${names[$i]},$metric]+="$value"$'\n'
+        done
+        checksums[${names[$i]}]+="$(printf '%s\n' "$out" | grep '^checksum=' | cut -d= -f2)"$'\n'
+    done
+done
+
+median() {
+    printf '%s' "${samples[$1,$2]}" | sort -n |
+        awk 'NF {a[++n]=$1} END {print a[int((n+1)/2)]}'
+}
+
+printf '\nchan fanout — %s messages, median of %s interleaved trials\n\n' "$MESSAGES" "$TRIALS"
+printf '%-12s %8s %14s %12s\n' lang ms msgs_per_sec peak_rss_kb
+
+for name in "${names[@]}"; do
     printf '%-12s %8s %14s %12s\n' "$name" \
-        "$(median elapsed_ms)" "$(median rate_per_sec)" "$(median peak_rss_kb)"
+        "$(median "$name" elapsed_ms)" \
+        "$(median "$name" rate_per_sec)" \
+        "$(median "$name" peak_rss_kb)"
+done
 
-    seen=$(checksums)
+# every run of every implementation has to agree, not just one sample
+ref_checksum=""
+for name in "${names[@]}"; do
+    seen=$(printf '%s' "${checksums[$name]}" | sort -u)
     if [ "$(printf '%s\n' "$seen" | wc -l)" -ne 1 ]; then
         echo "UNSTABLE: $name produced more than one checksum:" $seen >&2
         exit 1

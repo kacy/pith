@@ -163,16 +163,26 @@ the constructor a literal picks comes from the checked type of the
 literal node, so it is only as good as what the checker recorded there.
 an empty `[]` or `{}` has no type of its own and takes one from context.
 the checker propagates that context for an annotated bind, a `return`, a
-struct constructor and an assignment, and the emitter separately reads
-the annotation itself for a bind — which is the only thing that tells an
-empty `{}` under a `Set` annotation to build a set, since the parser
-makes every empty brace pair a `map` node. neither route reaches a call
-or method argument: nothing threads a target type through one, so `f([])`
-and `xs.insert(i, [])` build an untagged list even where the parameter
-type says exactly what it holds, and `m.get_default(k, {})` on a
-set-valued map builds a map. that is a leak wherever a store is
-involved, because an untagged container takes no count and the caller
-keeps its own — see the gap list below.
+struct constructor, an assignment and a call or method argument, and the
+emitter separately reads the annotation itself for a bind. an empty `{}`
+needs one extra step in either route, because the parser makes every
+empty brace pair a `map` node: a `Set` target crosses the kinds, and
+without that `m.get_default(k, {})` on a set-valued map built a map,
+which quietly swallowed every `add` against it.
+
+argument position is the newest of those and the narrowest.
+`propagate_empty_argument_collection_type` retargets only a literal with
+no elements, at the four places an argument's declared type is known —
+`check_argument_type` for the builtins, `check_callable_type_with_args`
+for calls and fn values, the user-method loop and the enum-payload loop.
+an empty literal has nothing that could disagree with the parameter, so
+the recorded type cannot be a lie and no element check is needed; a
+literal that has elements types itself and is left exactly as it was, so
+a genuinely wrong element type still reports rather than being stamped
+over. what it builds is the container the equivalent two-line `mut xs:
+List[String] := []` then `f(xs)` already built, which is a shape these
+rules cover rather than a new one. the leftovers are in the gap list
+below.
 
 the lists `map` and `filter` produce pick their flavor the same way,
 from the checked element type of the call, and the two differ in where
@@ -275,18 +285,25 @@ gaps, all bounded leaks rather than dangling pointers:
   paths still hand on — releasing one would be a double free rather
   than a leak. `f((a, b))` therefore strands one box per call; `t := (a,
   b)` then `f(t)` does not, because scope cleanup releases the local.
-- **an empty collection literal in an argument position builds an
-  untagged container.** `[]` and `{}` have no type of their own and take
-  one from context; the checker propagates that context for an annotated
-  bind, a `return`, a struct constructor and an assignment, but not for a
-  call or method argument. so `f([])`, `xs.push([])` and
-  `m.get_default(k, {})` build a container that owns nothing it holds,
-  and every heap element written into it afterwards lives on a count
-  somebody else has to keep. it errs toward the leak everywhere — a store
-  into an untagged container takes no count, so the caller's stays
-  outstanding — but it is a leak the checker could close, not one the
-  ownership rules require. `f(xs)` with `mut xs: List[String] := []`
-  bound first is exactly right.
+- **a collection literal the checker cannot type builds an untagged
+  container.** `[]` and `{}` have no type of their own and take one from
+  context. an annotated bind, a `return`, a struct constructor, an
+  assignment and a call or method argument all supply one, so `f([])`,
+  `xs.push([])`, `xs.insert(i, [])` and `m.get_default(k, {})` build the
+  same tagged container `mut xs: List[String] := []` then `f(xs)` builds.
+  three shapes still miss out. an argument literal that *has* elements
+  types itself and is left alone, so a nested `f([[]])` tags the outer
+  list and not the inner one — bind the inner list first. an empty
+  literal against an optional parameter (`f(v: List[String]?)`) gets
+  nothing, because the target the argument declares is the optional and
+  not the container inside it. and a map argument literal is tagged only
+  as far as the runtime goes, which is not far: map value counting is
+  cstring-only and the emitter reads the value kind off the literal's
+  first entry, which an empty one does not have, so `f({})` for a
+  `Map[String, String]` leaves its values on the count the caller stored
+  them with — the same gap as the struct-value bullet above. all three
+  err toward the leak: a store into an untagged container takes no
+  count, so the caller's stays outstanding.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

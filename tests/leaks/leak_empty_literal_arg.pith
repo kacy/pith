@@ -1,0 +1,75 @@
+# an empty collection literal written straight into an argument.
+#
+# `[]` and `{}` carry no element type of their own. an annotated bind, a
+# `return`, a struct field and an assignment all hand one to the literal;
+# an argument did not, so `f([])`, `xs.push([])` and `m.get_default(k, {})`
+# built an untagged container — one that takes no count for anything stored
+# into it and releases nothing when it dies. every heap element written in
+# afterwards outlived the container that was supposed to own it.
+#
+# valgrind sees none of this: the stranded elements stay reachable from the
+# handle registry, so they are "still reachable" rather than lost. resident
+# growth is what notices it.
+#
+# two neighbouring shapes are deliberately not here, because they leak for
+# reasons this has nothing to do with and would mask it: storing a named
+# local container into a list (`xs.push(inner)`) double-counts it, and
+# storing one into a map takes no count at all because map value counting
+# is cstring-only. both measure the same before and after — see the gap
+# list in docs/ownership.md.
+import leakprobe as probe
+
+fn fill_list(mut xs: List[String], i: Int) -> Int:
+    xs.push("s-{i}")
+    xs.push("t-{i}")
+    return xs.len()
+
+fn fill_set(mut s: Set[String], i: Int) -> Int:
+    s.add("u-{i}")
+    s.add("v-{i}")
+    return s.len()
+
+fn round(lm: Map[String, List[String]], i: Int) -> Int:
+    mut acc := fill_list([], i) + fill_set({}, i)
+
+    # method-argument position: a fresh empty container stored into a
+    # tagged one, then filled through the container that now holds it
+    mut nest: List[List[String]] := []
+    nest.push([])
+    nest.insert(0, [])
+    nest[0].push("y-{i}")
+    nest[1].push("z-{i}")
+    acc = acc + nest.len()
+
+    # `{}` in a Set position: the only spelling of an empty set parses as a
+    # map, so without a target type it built a map and every add vanished
+    mut sets: List[Set[String]] := []
+    sets.push({})
+    sets.insert(0, {})
+    sets[0].add("a-{i}")
+    sets[1].add("b-{i}")
+    acc = acc + sets.len()
+
+    # the get_default fallback, on the branch that hands it back and on the
+    # branch that discards it. the map is built once outside the loop: a
+    # container stored as a map value is the cstring-only gap above, and a
+    # per-round insert would swamp what this is measuring.
+    mut miss := lm.get_default("miss", [])
+    miss.push("c-{i}")
+    hit := lm.get_default("hit", [])
+    acc = acc + miss.len() + hit.len()
+    return acc
+
+fn main():
+    mut lm: Map[String, List[String]] := {}
+    lm.insert("hit", ["p"])
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(lm, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

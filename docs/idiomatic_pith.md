@@ -70,10 +70,11 @@ fuses and the source is walked once. See `docs/iterators.md` for the
 protocol and worked examples.
 
 An empty literal takes its element type from an annotation when you give one
-(`mut names: List[String] := []`), and otherwise from the first value stored
-into it — `mut tasks := []` followed by `tasks.push(spawn worker())` types
-`tasks` as a list of tasks. Annotate when the first store sits far from the
-declaration and a reader would have to hunt for it.
+(`mut names: List[String] := []`), from the parameter it is written into
+(`f([])` where `f` takes a `List[String]`), and otherwise from the first value
+stored into it — `mut tasks := []` followed by `tasks.push(spawn worker())`
+types `tasks` as a list of tasks. Annotate when the first store sits far from
+the declaration and a reader would have to hunt for it.
 
 Collections are shared handles. If a function needs to mutate its own top-level
 container, start with `copy_list`, `copy_map`, or `copy_set`.

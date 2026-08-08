@@ -137,7 +137,8 @@ skip_brace != "" {
   # a comment is not code, so it never counts as a site. a marker sitting on the
   # end of a line of code justifies that line where a separate line would read
   # worse.
-  is_comment = ($0 ~ /^[ \t]*(\/\/|\*)/)
+  # only `//`: a line opening with `*` is a deref, not a comment continuation.
+  is_comment = ($0 ~ /^[ \t]*\/\//)
   standalone_marker = (is_comment && marker($0))
   trailing_marker = (!is_comment && marker($0))
   matched = (!is_comment && !trailing_marker && $0 ~ pattern)

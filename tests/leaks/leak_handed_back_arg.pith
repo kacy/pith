@@ -1,0 +1,58 @@
+# the two argument positions that used to strand their value because the
+# emitter had nowhere safe to put the release.
+#
+# `get_default` returns its fallback unchanged on a miss, so releasing that
+# argument at the call would free the expression's own value. the emitter
+# skipped the release instead, which left a fresh fallback stranded on every
+# call that hit. taking a count on the result first makes the value owned on
+# both branches, so the fallback can be released like any other argument.
+#
+# `xs.insert(i, v)` was the one container store with no variant that takes the
+# caller's count, so a fresh container written into it kept a count nothing
+# would ever drop — and a `List[Set]` was untagged on top of that, so the list
+# owned nothing it held either.
+#
+# valgrind sees none of this: a stranded handle stays reachable from the
+# handle registry, so it is "still reachable" rather than lost. resident
+# growth is what notices it.
+import leakprobe as probe
+
+fn insert_round(i: Int) -> Int:
+    mut sets: List[Set[Int]] := []
+    sets.push({i, i + 1})
+    sets.insert(0, {i + 2, i + 3})
+    mut lists: List[List[Int]] := []
+    lists.push([i, i + 1])
+    lists.insert(0, [i + 2, i + 3])
+    mut strs: List[String] := []
+    strs.insert(0, "s-{i}")
+    return sets.len() + lists.len() + strs.len()
+
+fn default_round(sm: Map[String, String], lm: Map[String, List[Int]], im: Map[Int, String], i: Int) -> Int:
+    # the hit branch discards the fallback; the miss branch returns it
+    hit := sm.get_default("hit", "fb-{i}")
+    miss := sm.get_default("miss", "fb-{i}")
+    ihit := im.get_default(1, "fb-{i}")
+    imiss := im.get_default(9, "fb-{i}")
+    lhit := lm.get_default("hit", [i])
+    lmiss := lm.get_default("miss", [i, i])
+    return hit.len() + miss.len() + ihit.len() + imiss.len() + lhit.len() + lmiss.len()
+
+fn main():
+    mut sm: Map[String, String] := {}
+    sm.insert("hit", "value")
+    mut im: Map[Int, String] := {}
+    im.insert(1, "value")
+    mut lm: Map[String, List[Int]] := {}
+    lm.insert("hit", [1, 2, 3])
+
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + insert_round(i) + default_round(sm, lm, im, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

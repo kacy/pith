@@ -9,37 +9,66 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-the short version, all on the same 2-core machine, fully rerun 2026-07-29
-after the july hardening pass (details in the summary below). the concurrency
-rows are the green backend, which is the default on linux; rows marked
-`PITH_GREEN=0` are the os-thread opt-out, kept for contrast:
+the short version, all on the same 2-core machine, rerun 2026-08-08 after the
+august ownership and hardening work. the concurrency rows are the green
+backend, which is the default on linux; rows marked `PITH_GREEN=0` are the
+os-thread opt-out, kept for contrast. the go, rust and zig columns double as
+canaries — they are the same programs as in the 2026-07-29 run, so when one of
+them moves it is the machine that moved and not the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **~133 ms** (bimodal, best 69) | ~75 ms | ~75 ms | ~240 ms |
-| chan_fanout, pinned to 1 worker | **~46 ms** | ~75 ms | — | — |
-| 20k spawn + join (batches of 64) | **~56 ms / 3.2 mb** | ~8 ms / 3.8 mb | — | — |
-| 20k spawn, `PITH_GREEN=0` | ~1017 ms / 3.5 mb | — | — | — |
+| chan_fanout, 1m msgs | **~133 ms** (bimodal, best 61) | ~71 ms | ~73 ms | ~205 ms |
+| chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
+| 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
+| 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
 
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| catalog workload, 200k requests | **~114 ms** | ~436 ms | ~80 ms | — |
+| catalog workload, 200k requests | **~118 ms** | ~408 ms | ~70 ms | — |
 | grpc unary echo, conc=8, 16 B | 7476 calls/s | 14731 | 12005 | — |
-| http server under wrk, 30 s | 8079 req/s, rss flat (+4 kb) | 28453 req/s (+6.1 mb) | — | — |
-| event_ledger, 200k events | 618 ms (1.28x go) | 481 ms | 117 ms | 137 ms |
-| std_pipeline, 50k records | 576 ms (1.63x go) | 352 ms | 177 ms | — |
+| http server under wrk, 30 s | 4648 req/s, rss flat (+0 kb) | 15444 req/s (+5.9 mb) | — | — |
+| event_ledger, 200k events | 570 ms (1.19x go) | 477 ms | 113 ms | 137 ms |
+| std_pipeline, 50k records | 480 ms (1.50x go) | 319 ms | 145 ms | — |
 
-reading it honestly: on channel coordination green matches rust and beats zig,
-runs ~1.8x behind go at the default worker count (placement is still decided
-by first-resume luck, hence the bimodal spread), and beats go pinned to one
-worker. raw spawn/await is where go's scheduler still clearly wins; what the
-green backend buys over pith's own os-thread backend there is ~18x the speed
-at flat memory. the service-shaped rows are the strongest: the catalog
-workload — lookups, filtered scans, json batch scoring — runs ~4x faster than
-go's version, because a flat struct decodes in one pass with no reflection,
-and the http server holds byte-flat rss across a sustained load where the go
-server grows. the compute rows keep their long-standing shape: modestly behind
-go, well behind rust and zig, with string building the remaining gap.
+what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
+to ~27 ms at flat memory — the argument-ownership fixes took a per-call
+allocation out of the spawn path. **event_ledger fell 618 to 570 ms** and
+**std_pipeline 576 to 480 ms**, closing the gap to go from 1.28x to 1.19x and
+from 1.63x to 1.50x. channel fan-out and the catalog workload are unchanged.
+
+the http row is the one not to read as a regression. both servers dropped by
+about the same 45% against july, because `wrk` itself competes for the two
+cores; the ratio between them barely moved, and the number worth keeping is
+the memory column, where pith is now exactly flat over a sustained run while
+the go server grows ~6 mb — a shape that reproduces run to run.
+
+reading the rest honestly: on channel coordination green matches rust and beats
+zig, runs ~1.9x behind go at the default worker count (placement is still
+decided by first-resume luck, hence the bimodal spread), and beats go pinned to
+one worker. raw spawn/await is still go's, though by ~3.4x now rather than ~7x;
+what the green backend buys over pith's own os-thread backend there is ~34x the
+speed at flat memory. the service-shaped rows are the strongest: the catalog
+workload — lookups, filtered scans, json batch scoring — runs ~3.5x faster than
+go's version, because a flat struct decodes in one pass with no reflection. the
+compute rows keep their long-standing shape: modestly behind go, well behind
+rust and zig, with string building the remaining gap.
+
+### a note on how these are measured
+
+the cross-language harnesses interleave: one round runs every language once,
+and a round repeats for the trial count. they used to measure each language to
+completion in turn, which on a small shared box hands whoever goes first a
+systematic advantage — ambient load drifts over the length of a run and pools
+on whoever goes last. it was worth roughly 2x. the event_ledger runner also
+used to re-run each binary once per metric column, so a row's phase times did
+not come from the same work and need not sum to that row's own total.
+
+two habits follow from that. **discard the first run after a build**, which
+competes with whatever the build left behind. and **read the non-pith columns
+before the pith one**: they are fixed programs, so when they reproduce their
+published figures the run is trustworthy, and when they do not, nothing in that
+run is.
 
 ## july 2026 hardening, in numbers
 
@@ -365,9 +394,17 @@ interleaved with a go canary on the 2-core box (2026-07-26):
 |---|---:|---:|
 | os threads (2026-07-26) | ~1450 ms | 174 mb |
 | os threads (2026-07-29) | ~1017 ms | 3.5 mb |
+| os threads (2026-08-08) | ~919 ms | 3.5 mb |
 | green, before the pool | ~580 ms | 10 mb |
 | green (2026-07-29) | ~56 ms | 3.2 mb |
+| green (2026-08-08) | ~27 ms | 3.3 mb |
 | go (batch twin, 2026-07-29) | ~8 ms | 3.8 mb |
+
+the 2026-08-08 halving, 56 ms to ~27 ms, is the argument-ownership work
+rather than anything scheduler-shaped: a container written straight into a
+call was stranding its handle, and the spawn path builds one per task. the
+os-thread row moved with the box, not with the fix, which is what says the
+green number is real.
 
 page faults over the run fell 21832 -> ~2500 and context switches 25748 ->
 ~3000. shrinking the stack from 1 MiB to 64 KiB changed nothing before the

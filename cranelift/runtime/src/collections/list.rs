@@ -54,6 +54,7 @@ pub enum ListTypeTag {
     Struct,    // struct handle - needs retain/release (rc-counted, magic-checked)
     Bytes,     // Bytes handle - needs retain/release
     Closure,   // closure handle - needs retain/release
+    Set,       // Set handle - needs retain/release
 }
 
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
@@ -242,6 +243,7 @@ unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Struct => crate::runtime_core::pith_struct_retain(raw),
         ListTypeTag::Bytes => crate::bytes::pith_bytes_retain(raw),
         ListTypeTag::Closure => crate::runtime_core::pith_closure_retain(raw),
+        ListTypeTag::Set => crate::collections::set::pith_set_retain_handle(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -279,6 +281,7 @@ unsafe fn release_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Struct => crate::runtime_core::pith_struct_release(raw),
         ListTypeTag::Bytes => crate::bytes::pith_bytes_release(raw),
         ListTypeTag::Closure => crate::runtime_core::pith_closure_release(raw),
+        ListTypeTag::Set => crate::collections::set::pith_set_release_handle(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -380,6 +383,17 @@ pub unsafe extern "C" fn pith_list_new_closure() -> PithList {
     pith_list_new(8, 6)
 }
 
+/// List that owns set elements (List[Set[T]]): push/insert retain, and the
+/// free-time cascade releases each element. a set is a shared handle like any
+/// other collection, so an untagged list of them held handles it did not own --
+/// which left `xs.push({1, 2})` stranding its element and made the value
+/// position of `xs.insert(i, {1, 2})` the one store the caller could not
+/// safely release into.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_set() -> PithList {
+    pith_list_new(8, 7)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = match type_tag {
@@ -389,6 +403,7 @@ pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithLis
         4 => ListTypeTag::Struct,
         5 => ListTypeTag::Bytes,
         6 => ListTypeTag::Closure,
+        7 => ListTypeTag::Set,
         _ => ListTypeTag::Primitive,
     };
 
@@ -509,11 +524,27 @@ unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool)
 /// takes an owner's count for tagged element kinds, like push.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, value: i64) {
+    insert_value_inner(list, index, value, false);
+}
+
+/// Insert a value the caller owns and is about to stop tracking. The list
+/// keeps the count the caller was holding instead of adding a second one,
+/// the same transfer `pith_list_push_value_owned` performs — and, like it,
+/// takes nothing when the list is untagged, so the caller's count stays
+/// outstanding rather than leaving the list pointing at a freed element.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_insert_value_owned(list: PithList, index: i64, value: i64) {
+    insert_value_inner(list, index, value, true);
+}
+
+unsafe fn insert_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
     crate::perf_stats!(PERF_LIST_INSERTS += 1);
-    retain_element(impl_ref.type_tag, value);
+    if !takes_caller_count {
+        retain_element(impl_ref.type_tag, value);
+    }
     impl_ref.insert_value_at(index.max(0) as usize, value);
 }
 

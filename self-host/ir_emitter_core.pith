@@ -737,8 +737,22 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         # builtin string methods, which don't route through that return path,
         # fall back to the known-fresh list.
         mname := ir_plain_method_name(node.value)
-        if ir_lookup_impl_method_name(ir_method_receiver_type(node), mname).len() > 0:
+        recv_type := ir_method_receiver_type(node)
+        if ir_lookup_impl_method_name(recv_type, mname).len() > 0:
             return false
+        # a builtin that takes the count on its own result hands back an owned
+        # value whichever branch it ran (ir_method_result_retains_over_args).
+        # keyed on the resolved builtin rather than the spelling, so a
+        # same-named method on another receiver keeps its own classification —
+        # and on the same rc kind the call site retains through, so "owned"
+        # here can never outrun the count that backs it. where the kind is
+        # unknown (a generic body, where specialization suppresses the checked
+        # types) no retain is emitted, so the answer stays "borrowed" and the
+        # consumer adds its own count: a leak rather than a value released
+        # twice.
+        if ir_rc_kind(ir_infer_type(idx)).len() > 0:
+            if ir_method_result_retains_over_args(ir_method_emit_name(mname, recv_type)):
+                return false
         return not ir_string_method_returns_fresh(mname)
     return true
 
@@ -1351,59 +1365,34 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
 # argument: ownership transfers to the container there, and the store
 # itself completes the transfer by taking the caller's count rather than
 # adding one (see ir_owned_container_store_name).
-# container_skip_pos is the narrower exclusion: a position that keeps the
-# release for a string or a struct but not for a container
-# (ir_method_container_store_pos says why).
-fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int, container_skip_pos: Int):
+fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
     for reg, i in arg_regs:
         if i == skip_pos:
             continue
         expr_idx := ir_method_call_arg_expr(node, i)
         if expr_idx < 0:
             continue
-        arg_type := ir_infer_type(expr_idx)
-        if i == container_skip_pos and ir_arg_kind_is_container(ir_rc_kind(arg_type)):
-            continue
-        ir_release_owned_string_operand(expr_idx, reg, arg_type)
+        ir_release_owned_string_operand(expr_idx, reg, ir_infer_type(expr_idx))
 
-# the three rc kinds this rule newly reaches — the ones a container may hold
-# without being tagged to own a count of them.
-fn ir_arg_kind_is_container(arg_kind: String) -> Bool:
-    return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
-
-# the value position of a container store the emitter leaves on the plain
-# runtime path, where a released container argument would be one release too
-# many. `list_insert` is the only one: unlike push and set it has no variant
-# that takes the caller's count, so it adds a count of its own — but only when
-# the list is tagged for that element kind, and a list holding collections is
-# not reliably tagged (an empty-annotated List[List] reads the same as a
-# List[Int] in the type strings, and the runtime's element tag has no Set
-# variant at all). so a released list, map or set here can hand the list a
-# freed handle. err toward the leak, the way every untagged-container gap
-# does. strings, bytes, structs and closures keep releasing here — those lists
-# are tagged wherever the checker knows the element type, and that behaviour
-# predates the container rule.
-# returns -1 when the callee has no such position, which is every other one.
-fn ir_method_container_store_pos(emit_name: String) -> Int:
-    if emit_name == "list_insert":
-        return 1
-    return 0 - 1
-
-# the argument position, if any, whose count a builtin hands back out instead
-# of borrowing. `get_default` returns its fallback unchanged when the key is
-# missing and adds no count of its own, so that fallback can BE the
-# expression's value — releasing it once the call returns frees what the
-# caller is about to read. an owned fallback therefore leaks when the key is
-# present, which is the honest half of a choice that has no statically correct
-# answer: the release is right on one branch and a use-after-free on the
-# other. binding the fallback to a local first is exact on both.
-# (`unwrap_or` is the same shape and never reaches here — both spellings have
-# their own emitter and return before the general method path.)
-# returns -1 when no position is handed back, which is every other builtin.
-fn ir_method_arg_pos_handed_back(emit_name: String) -> Int:
-    if emit_name == "map_get_default" or emit_name == "map_get_default_ikey":
-        return 1
-    return 0 - 1
+# true for a builtin whose result may BE one of its arguments rather than a
+# value the receiver keeps a count for. `get_default` is the only one: it
+# returns its fallback unchanged when the key is missing, and the map's own
+# value when the key is present, adding no count on either branch.
+#
+# neither branch hands back a count, so the caller has to take one — and one
+# retain of the result settles both. on a miss it lands on the fallback, which
+# the ordinary owned-argument release then drops back to the single count the
+# caller now holds; on a hit it lands on the map's value, which is the count
+# that keeps a container result alive past the map entry that lent it.
+# without it, `v := m.get_default(k, [])` released the map's own list at scope
+# exit and the next read of that entry was a use-after-free.
+#
+# the order is load-bearing: retain first. on the miss branch the register the
+# release drops is the very one the retain just counted, so releasing first
+# would free the value in between — that is the shape that made the first
+# attempt at this hand back a recycled handle.
+fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
+    return emit_name == "map_get_default" or emit_name == "map_get_default_ikey"
 
 fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int]):
     mut reg_i := 0
@@ -3626,6 +3615,12 @@ fn ir_is_list_store_name(emit_name: String) -> Bool:
 fn ir_container_store_needs_retain(emit_name: String, store_kind: String) -> Bool:
     if ir_is_channel_send_name(emit_name):
         return store_kind.len() > 0
+    if emit_name == "list_insert":
+        # the plain insert retains every tagged element itself, for every kind,
+        # so a borrowed value already has its count from the runtime and a
+        # compensating one here would be a second. only the owned path differs,
+        # and that swaps the call rather than adding a count.
+        return false
     if store_kind == "bytes" or store_kind == "closure":
         # a List[Bytes] and a List of closures are both tagged wherever the
         # checker knows the element type — including an empty literal in a
@@ -3675,6 +3670,12 @@ fn ir_owned_container_store_name(emit_name: String) -> String:
         return "pith_map_insert_cstr_owned"
     if emit_name == "map_insert_ikey":
         return "pith_map_insert_ikey_owned"
+    # insert is push with an index, and was the one container store left
+    # without a transferring variant. for want of it the caller had to keep its
+    # count on a fresh container — `xs.insert(0, {1, 2})` stranded the set,
+    # because releasing it would have handed the list a freed handle.
+    if emit_name == "list_insert":
+        return "pith_list_insert_value_owned"
     return ""
 
 fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
@@ -3694,6 +3695,13 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     # fn value transfers its count at the call.
     if elem_kind == "closure":
         return "__list_new_closure"
+    # a set is a shared handle like a list or a map, and the only collection
+    # kind the runtime's element tag was missing. untagged, a List[Set] owned
+    # nothing: `xs.push({1, 2})` stranded its element for the life of the
+    # process, and the value position of `xs.insert(i, {1, 2})` had to keep its
+    # count for want of anywhere to transfer it to.
+    if elem_kind == "set":
+        return "__list_new_set"
     return "__list_new"
 
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
@@ -4677,7 +4685,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     mut store_value_pos := 0 - 1
     if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
-    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
+    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value" or emit_name == "list_insert":
         store_value_pos = 1
     # the name the call is emitted under. an owned value swaps in the store
     # that takes the caller's count; everything else keeps the plain store.
@@ -4701,16 +4709,15 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
     ir_emit_call_text(r, call_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    # a container store is not the only position whose count the caller must
-    # not drop: a fallback argument the callee may hand straight back out is
-    # the other one, and the two never occur on the same callee.
-    mut release_skip_pos := store_value_pos
-    mut container_skip_pos := 0 - 1
-    if not impl_dispatch:
-        if release_skip_pos < 0:
-            release_skip_pos = ir_method_arg_pos_handed_back(emit_name)
-        container_skip_pos = ir_method_container_store_pos(emit_name)
-    ir_release_owned_method_args(node, arg_regs, release_skip_pos, container_skip_pos)
+    # a builtin that may hand an argument straight back out takes no count on
+    # either branch, so the caller takes one here — before the release below,
+    # which on the hand-back branch drops the very register this just counted.
+    # that makes the result owned whichever branch ran, which is what lets the
+    # fallback be released like any other owned argument and what stops a
+    # container result from being freed out of the map it was read from.
+    if not impl_dispatch and ir_method_result_retains_over_args(emit_name):
+        ir_rc_retain_reg(r, ir_rc_kind(ir_infer_type(idx)))
+    ir_release_owned_method_args(node, arg_regs, store_value_pos)
     if node.children.len() > 0:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))

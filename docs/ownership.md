@@ -76,36 +76,29 @@ call arguments:
   ending with the call. the store completes that transfer: an owned
   value goes through the variant of the store that keeps the caller's
   count instead of taking a second one — `pith_list_push_value_owned`,
-  `pith_list_set_value_owned`, `pith_map_insert_cstr_owned`,
-  `pith_map_insert_ikey_owned`. the emitter picks the variant from the
-  value's ownership alone (`ir_owned_container_store_name`); whether
-  there is a count to take is the container's own business, since only
-  it knows if it was built tagged. an untagged container takes nothing
-  and the caller's count stays outstanding, which is a leak rather than
-  an element nothing keeps alive
-- second exception: an argument the callee hands back out rather than
-  borrowing. `m.get_default(k, d)` returns `d` unchanged when the key
-  is missing and adds no count of its own, so on that branch the
-  fallback *is* the expression's value and releasing it at the call
-  frees what the caller is about to read.
-  `ir_method_arg_pos_handed_back` names the position, and the release
-  skips it. that leaves the other branch — key present, fallback
-  discarded — leaking a fresh fallback, which is the honest half of a
-  choice with no statically correct answer. bind the fallback to a
-  local first (`empty := []` then `m.get_default(k, empty)`) and scope
-  cleanup gets it exactly right on both branches. `unwrap_or` is the
-  same shape and never reaches this code: both spellings have their own
-  emitter and build the fallback inside the arm that returns it
-- third exception, narrower than the other two: `xs.insert(i, v)` keeps
-  the release for a string, a struct or a closure and drops it for a
-  container. `list_insert` is the one container store still on the
-  plain runtime path — it has no variant that takes the caller's count,
-  so it adds one of its own, but only when the list is tagged for that
-  element kind. a list of collections is not reliably tagged, and the
-  runtime's element tag has no `Set` variant at all, so a released
-  container there could hand the list a freed handle
-  (`ir_method_container_store_pos`). the kinds that are always tagged
-  keep releasing
+  `pith_list_set_value_owned`, `pith_list_insert_value_owned`,
+  `pith_map_insert_cstr_owned`, `pith_map_insert_ikey_owned`. the
+  emitter picks the variant from the value's ownership alone
+  (`ir_owned_container_store_name`); whether there is a count to take is
+  the container's own business, since only it knows if it was built
+  tagged. an untagged container takes nothing and the caller's count
+  stays outstanding, which is a leak rather than an element nothing
+  keeps alive
+- a callee that may hand an argument straight back out takes no count on
+  either branch, so the caller takes one on the *result* instead.
+  `m.get_default(k, d)` returns `d` unchanged when the key is missing and
+  the map's own value when it is present, and neither is a count the
+  caller owns. retaining the result settles both: on a miss the count
+  lands on the fallback, which the ordinary owned-argument release then
+  drops back to one; on a hit it lands on the map's value, which is what
+  lets a container result outlive the entry it was read from. the order
+  is load-bearing — retain first, because on the miss branch the release
+  drops the very register the retain just counted.
+  `ir_method_result_retains_over_args` names the callees this applies to,
+  and `ir_string_expr_is_borrowed` classifies their result as owned to
+  match. `unwrap_or` is the same shape and never reaches this code: both
+  spellings have their own emitter and build the fallback inside the arm
+  that returns it
 - an index key is an argument like any other, and the container-store
   exception does not cover it: a lookup reads the key and keeps nothing,
   a store copies the key bytes into the map's own storage, so an owned
@@ -158,6 +151,29 @@ because a map's value counting is cstring-only; a borrowed closure
 stored in one gets its count added at the store instead
 (`ir_container_store_needs_retain`), which leaks rather than dangles.
 
+sets are a list element type too. the runtime's element tag had no
+`Set` variant, so a `List[Set]` was the one collection-of-collections
+that could not be tagged at all: `xs.push({1, 2})` stranded its element
+for the life of the process, and the value position of `xs.insert(i, v)`
+had to keep its count for want of anywhere to transfer it to. the
+variant exists now (`pith_list_new_set`), which is what let `insert`
+join the other stores on the transferring path.
+
+the constructor a literal picks comes from the checked type of the
+literal node, so it is only as good as what the checker recorded there.
+an empty `[]` or `{}` has no type of its own and takes one from context.
+the checker propagates that context for an annotated bind, a `return`, a
+struct constructor and an assignment, and the emitter separately reads
+the annotation itself for a bind — which is the only thing that tells an
+empty `{}` under a `Set` annotation to build a set, since the parser
+makes every empty brace pair a `map` node. neither route reaches a call
+or method argument: nothing threads a target type through one, so `f([])`
+and `xs.insert(i, [])` build an untagged list even where the parameter
+type says exactly what it holds, and `m.get_default(k, {})` on a
+set-valued map builds a map. that is a leak wherever a store is
+involved, because an untagged container takes no count and the caller
+keeps its own — see the gap list below.
+
 the lists `map` and `filter` produce pick their flavor the same way,
 from the checked element type of the call, and the two differ in where
 the count comes from. a mapper hands back a value nothing else is
@@ -190,7 +206,15 @@ keys are strings, and `map.values()` when the values are heap values.
 - the argument rules: `ir_release_owned_method_args`,
   `ir_release_owned_string_args` and the call paths near them. the
   kinds they release are `ir_owned_arg_kind_releases`; the position
-  they must not release is `ir_method_arg_pos_handed_back`
+  they must not release is the container store's, and the callees that
+  take a count on their own result instead are
+  `ir_method_result_retains_over_args`
+- the element tags: `ListTypeTag` and the `pith_list_new_*`
+  constructors in `cranelift/runtime/src/collections/list.rs`, the
+  entries for them in `cranelift/runtime-abi/runtime_functions.txt`,
+  the name mapping in `self-host/ir_metadata.pith`, and the kind-to-
+  constructor table `ir_list_ctor_for_elem_kind`. adding a tag means
+  all four
 - the runtime counts: `cranelift/runtime/src/runtime_core.rs` and the
   per-type files under `collections/`
 
@@ -251,19 +275,18 @@ gaps, all bounded leaks rather than dangling pointers:
   paths still hand on — releasing one would be a double free rather
   than a leak. `f((a, b))` therefore strands one box per call; `t := (a,
   b)` then `f(t)` does not, because scope cleanup releases the local.
-- **an owned fallback handed to `get_default` leaks when the key is
-  present.** `m.get_default(k, [])` returns the fallback unchanged on a
-  miss, so the emitter cannot release it at the call without freeing
-  the very value being returned; it errs toward the leak, the same way
-  `catch` and `unwrap_or` do above. bind the fallback to a local to get
-  it exactly right on both branches.
-- **a fresh container written into `xs.insert(i, ...)` leaks its
-  handle.** the store adds a count only when the list is tagged to own
-  that element kind, and a list of collections is not reliably tagged —
-  a `List[Set]` never is. the caller therefore keeps its count rather
-  than risk releasing an element the list is not holding. `push` and
-  `xs[i] = v` do not have this gap: they route through the store
-  variants that take the caller's count.
+- **an empty collection literal in an argument position builds an
+  untagged container.** `[]` and `{}` have no type of their own and take
+  one from context; the checker propagates that context for an annotated
+  bind, a `return`, a struct constructor and an assignment, but not for a
+  call or method argument. so `f([])`, `xs.push([])` and
+  `m.get_default(k, {})` build a container that owns nothing it holds,
+  and every heap element written into it afterwards lives on a count
+  somebody else has to keep. it errs toward the leak everywhere — a store
+  into an untagged container takes no count, so the caller's stays
+  outstanding — but it is a leak the checker could close, not one the
+  ownership rules require. `f(xs)` with `mut xs: List[String] := []`
+  bound first is exactly right.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

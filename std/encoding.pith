@@ -6,7 +6,8 @@
 import std.bits as bits
 import std.bytes as bytes
 
-# the ascii code of "=", the base64 and base32 padding character.
+# the ascii code of "=", so the base64 paths can compare and emit padding
+# by byte instead of allocating a one-character string per group.
 PAD_BYTE := 61
 
 # a decoded pem block.
@@ -553,14 +554,14 @@ pub fn pem_decode(text: String) -> PemBlock!:
 
     mut headers: Map[String, String] := {}
     mut saw_body := false
-    mut body_text := ""
+    mut body_lines: List[String] := []
     while index < lines.len():
         line := lines[index].trim()
         end_kind := parse_pem_end(line)
         if end_kind != "":
             if end_kind != kind:
                 fail "pem end marker mismatch"
-            body := b64_decode_ignore_ws(body_text)!
+            body := b64_decode_ignore_ws(body_lines.join(""))!
             return PemBlock(kind, headers, body)
         if line == "":
             saw_body = true
@@ -569,7 +570,7 @@ pub fn pem_decode(text: String) -> PemBlock!:
             headers.insert(parts[0].trim(), parts.slice(1, parts.len()).join(":").trim())
         else:
             saw_body = true
-            body_text = body_text + line
+            body_lines.push(line)
         index = index + 1
     fail "pem end marker not found"
 
@@ -586,7 +587,7 @@ pub fn pem_decode_all(text: String) -> List[PemBlock]!:
         index = index + 1
         mut headers: Map[String, String] := {}
         mut saw_body := false
-        mut body_text := ""
+        mut body_lines: List[String] := []
         mut found_end := false
         while index < lines.len():
             line := lines[index].trim()
@@ -594,7 +595,7 @@ pub fn pem_decode_all(text: String) -> List[PemBlock]!:
             if end_kind != "":
                 if end_kind != kind:
                     fail "pem end marker mismatch"
-                blocks.push(PemBlock(kind, headers, b64_decode_ignore_ws(body_text)!))
+                blocks.push(PemBlock(kind, headers, b64_decode_ignore_ws(body_lines.join(""))!))
                 found_end = true
                 break
             if line == "":
@@ -604,7 +605,7 @@ pub fn pem_decode_all(text: String) -> List[PemBlock]!:
                 headers.insert(parts[0].trim(), parts.slice(1, parts.len()).join(":").trim())
             else:
                 saw_body = true
-                body_text = body_text + line
+                body_lines.push(line)
             index = index + 1
         if not found_end:
             fail "pem end marker not found"

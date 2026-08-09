@@ -1,0 +1,65 @@
+# a tls client config that is built and then closed.
+#
+# an https client builds a fresh config for every request, so a config that
+# does not give everything back on close leaks once per request. there is
+# nothing subtle about the failure — it is just that the registry is a dozen
+# separate handle-keyed maps and a close that misses one of them still looks
+# like it works. this churns a config through every builder that writes to a
+# different map and then closes it, so a map that close() forgets shows up as
+# growth.
+#
+# it also covers the root bundle behind the config. the trust anchors are the
+# only large thing a client config holds, and each config used to be handed its
+# own copy of the pem text and its own parse of it; they are shared and cached
+# now, so a config costs a handful of small map entries. a regression that
+# un-shares them puts a bundle-sized allocation back on every round.
+#
+# valgrind sees none of this: a stranded registry entry stays reachable from a
+# module global, so it is "still reachable" rather than lost.
+import leakprobe as probe
+import std.net.tls as tls
+
+# a small pem bundle rather than the system one. the registry path is the same
+# either way, and hashing a 220kb bundle to find its cached parse would make
+# this case cost more than the rest of the gate put together. the round count
+# is scaled down for the same reason: a config is a heavier round than the
+# container churn the other cases do, and 80k of them is already 240k configs.
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+fn round(i: Int) -> Int:
+    # the plain shape: build, use nothing, close.
+    plain := tls.client_config_with_ca_file(CA_PATH)
+    if plain.is_err:
+        return 0
+    plain.ok.close()
+
+    # the same config with a value written into each of the other maps a
+    # client config can touch, so close() has something to drop in all of them.
+    built := tls.client_config_with_ca_file(CA_PATH)
+    if built.is_err:
+        return 0
+    cfg := built.ok.with_alpn(["h2", "http/1.1"]).enable_session_resumption()
+    cfg.close()
+
+    # a config closed twice, and one closed without ever being built out. a
+    # close has to stay a no-op on a handle that holds nothing, because that is
+    # what a failed request looks like on the way out.
+    again := tls.client_config_with_ca_file(CA_PATH)
+    if again.is_err:
+        return 0
+    again.ok.close()
+    again.ok.close()
+
+    return i % 2
+
+fn main():
+    rounds := probe.rounds() / 10
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

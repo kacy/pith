@@ -1,0 +1,59 @@
+# who closes a tls config
+#
+# a tls config is a handle into a registry that std.net.tls keeps for the life
+# of the process. whoever builds one closes it; nothing closes it for you. this
+# matters most on an https client, which builds a config per request — a config
+# that is never closed holds its slot until the program exits, so forgetting it
+# leaks once per request.
+#
+# the counterpart is that building one is cheap. trust anchors are the only
+# large thing a config holds, and they are parsed once per distinct bundle and
+# shared by every config that trusts them, so a config costs a handful of small
+# map entries rather than a copy and a re-parse of a couple of hundred kilobytes
+# of pem. that is what makes building one per request reasonable.
+#
+# this opens no connections: the point is the lifecycle, not the handshake. the
+# ca bundle is the repository's own test fixture, so the example reads the same
+# on every machine and needs no network. see docs/tls.md.
+import std.net.tls as tls
+
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+# one request's worth of config: build it, hand it to the connection, give it
+# back. defer is the point — the config goes back on every exit from here,
+# including the ones a failing handshake takes.
+fn one_request(label: String) -> String!:
+    config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["h2"])
+    defer config.close()
+
+    # a real request hands `config` to tls.dial_with_config or
+    # http2.open_with_config here. the connection reads the config while the
+    # handshake runs and never again, so closing it on the way out of this
+    # function is safe even though the connection outlives the call.
+    return "{label}: built and released a config"
+
+fn main():
+    print("tls config ownership")
+
+    # many configs over the same bundle. each is independent — one caller's
+    # with_alpn cannot reach another caller's config — but they share the parse.
+    mut i := 0
+    while i < 3:
+        line := one_request("request {i}") catch "request {i}: no ca bundle"
+        print(line)
+        i = i + 1
+
+    # a config the caller keeps across several connections. the _with_config
+    # entry points never close, precisely so this shape works; the caller closes
+    # once, after the connections made from it are up.
+    built := tls.client_config_with_ca_file(CA_PATH)
+    if built.is_err:
+        print("could not read the ca bundle")
+        return
+    shared := built.ok
+    print("shared config is live")
+    shared.close()
+
+    # closing twice is a no-op, so a failure path can close unconditionally.
+    shared.close()
+    print("done")

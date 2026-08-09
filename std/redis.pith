@@ -166,7 +166,11 @@ impl Client:
         errdefer out.free()
         mut got := self.buffered()
         if got > 0:
-            out.write_range(self.buf, self.pos, got)
+            # the range is the unconsumed tail by construction, so a refusal
+            # here would mean the cursor and the buffer had come apart. say so
+            # rather than carry on having silently dropped the head of a reply.
+            if not out.write_range(self.buf, self.pos, got):
+                fail "redis: buffered range is outside the read buffer"
         self.buf = bytes.empty()
         self.pos = 0
         while got < need:

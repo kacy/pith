@@ -69,6 +69,24 @@ impl Counter:
     fn total(xs: List[Int?]) -> Int:
         return self.base + sum_optionals(xs)
 
+    fn width(xs: List[String]?) -> Int:
+        return self.base + xs.unwrap_or(["a", "b", "c"]).len()
+
+# an optional whose inner type is a container: the argument has to arrive as a
+# Some holding a properly tagged container, not as a bare handle the callee
+# would then read as an optional tuple.
+fn count_words(xs: List[String]?) -> Int:
+    return xs.unwrap_or(["fallback", "pair"]).len()
+
+fn count_pairs(m: Map[String, Int]?) -> Int:
+    return m.unwrap_or({"x": 1, "y": 2}).len()
+
+fn count_uniques(s: Set[Int]?) -> Int:
+    return s.unwrap_or({1, 2, 3}).len()
+
+fn is_absent(xs: List[String]?) -> Bool:
+    return xs == none
+
 fn main():
     # a literal, a named local, and a fresh expression all widen
     print("lit:{probe_int(3)}")
@@ -130,6 +148,19 @@ fn main():
     kept := "k" + "1"
     print("maparg_fresh:{first_label({"a": kept})}")
     print("maparg_alive:{kept}")
+
+    # an empty literal against an optional container parameter. the fallback in
+    # each callee has a different length from the literal, so a value that
+    # arrived as `none` — or as a bare handle — reads differently from one that
+    # arrived as an empty Some.
+    print("optcontainer_list:{count_words([])}")
+    print("optcontainer_map:{count_pairs({})}")
+    print("optcontainer_set:{count_uniques({})}")
+    print("optcontainer_none:{count_words(none)}")
+    print("optcontainer_flag_empty:{is_absent([])}")
+    print("optcontainer_flag_none:{is_absent(none)}")
+    print("optcontainer_filled:{count_words(["one", "two", "three", "four"])}")
+    print("optcontainer_method:{c.width([])}")
 
     mut held: List[Holder] := []
     mut i := 0

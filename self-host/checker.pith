@@ -1582,6 +1582,25 @@ fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual:
     if node.children.len() != 0:
         return
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
+        # an optional-of-container parameter (`f(v: List[String]?)`) declares
+        # the optional, not the container inside it, so an empty literal used
+        # to match nothing and reach the callee as a bare container handle —
+        # which the callee then read as an optional tuple and dereferenced.
+        # take the type from the inner container and mark the argument so the
+        # emitter wraps the tagged container in the Some the callee expects.
+        expected_info := get_type_info(expected)
+        if expected_info.kind == "optional" and expected_info.inner >= 0:
+            inner_info := get_type_info(expected_info.inner)
+            if inner_info.kind == "list" or inner_info.kind == "map" or inner_info.kind == "set":
+                propagate_expected_collection_type(expr_idx, expected_info.inner)
+                # only wrap once the literal really took the inner container's
+                # type. a literal whose spelling does not match it (`{}` against
+                # a `List[T]?`) is left exactly as it was rather than wrapped
+                # around the wrong container.
+                if expression_type_cache.contains_key(expr_idx):
+                    if expression_type_cache[expr_idx] == expected_info.inner:
+                        optional_widened_arguments.insert(expr_idx, true)
+                return
         propagate_expected_collection_type(expr_idx, expected)
 
 # true when a single value can build an element of the expected type:

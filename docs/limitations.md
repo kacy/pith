@@ -54,7 +54,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   reports, because the literal walk recurses into a container target and an
   optional is not one. this predates the widening above and applies equally to
   a binding, a struct field and an argument. bind the inner container to a
-  `List[Int]?` local first.
+  `List[Int]?` local first. the same nesting stops one argument case: a
+  literal against a `List[Int?]?` parameter has to widen its elements and its
+  container at once, and reports.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

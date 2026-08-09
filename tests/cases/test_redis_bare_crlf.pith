@@ -1,0 +1,80 @@
+# a malformed redis reply must fail the call, not end the process.
+#
+# read_line returns what came before the terminator, so a bare "\r\n" hands the
+# parser an empty line. it then read line[0] to get the reply tag, and indexing
+# a String in pith is strict: an out-of-range index prints a diagnostic and
+# exits. a peer sending two bytes could therefore kill a client outright, while
+# every other malformed shape in the same parser — an unknown tag, a bad length,
+# a truncated payload — came back as an ordinary error.
+#
+# so what this checks is not only that the empty line is rejected, but that the
+# process is still running afterwards and can be told the same thing again.
+
+import std.redis as redis
+from std.redis import Reply
+from std.collections import copy_list
+
+# answer each command with the next canned reply, whatever it is. no parsing:
+# the client sends its commands in a fixed order, so canned replies line up.
+fn serve(listener: Int, script: List[String]) -> Int!:
+    conn := tcp_accept(listener)!
+    for reply in script:
+        request := tcp_read(conn, 4096)!
+        if request.len() == 0:
+            tcp_close(conn)
+            return 0
+        wrote := tcp_write(conn, reply) catch 0
+        if wrote == 0:
+            tcp_close(conn)
+            return 0
+    tcp_close(conn)
+    return 0
+
+fn describe(reply: Reply) -> String:
+    return match reply:
+        Reply.Status(s) => "status:" + s
+        Reply.Error(s) => "error:" + s
+        Reply.Integer(n) => "int:" + n.to_string()
+        Reply.Bulk(s) => "bulk:" + s
+        Reply.Nil => "nil"
+        Reply.Array(items) => "array:" + items.len().to_string()
+
+# run one script against a fresh stub and render one line per command. reaching
+# the end of this function at all is the point: a reply that stopped the process
+# would print nothing after the command that carried it.
+fn run(port: Int, script: List[String]) -> List[String]!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve(listener, copy_list(script))
+    client := redis.connect("127.0.0.1", port)!
+    mut out: List[String] := []
+    mut i := 0
+    while i < script.len():
+        reply := client.command(["PROBE", i.to_string()])
+        if reply.is_err:
+            out.push("failed:" + reply.err)
+        else:
+            out.push(describe(reply.ok))
+        i = i + 1
+    client.close()
+    await task
+    tcp_close(listener)
+    return out
+
+fn main() -> Int!:
+    # a bare terminator, on its own and after a reply that parsed fine. a fresh
+    # connection each time, since a rejected reply leaves the rest of the stream
+    # unread and nothing can follow it on the same socket.
+    for line in run(17540, ["\r\n"])!:
+        print(line)
+    for line in run(17541, ["+PONG\r\n"])!:
+        print(line)
+    for line in run(17542, ["\n"])!:
+        print(line)
+
+    # an empty line nested inside an array reply takes the same path one level
+    # down, and must be reported the same way.
+    for line in run(17543, ["*2\r\n\r\n:1\r\n"])!:
+        print(line)
+
+    print("the client is still running")
+    return 0

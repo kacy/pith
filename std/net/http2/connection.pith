@@ -30,6 +30,7 @@ import std.bytes as bytes
 import std.binary as binary
 import std.encoding as encoding
 import std.net.url as url
+import std.net.tcp as tcp
 import std.net.tls as tls
 import std.time as time
 
@@ -177,7 +178,7 @@ impl Connection:
     fn send(data: Bytes) -> Int!:
         if self.live:
             if self.plaintext:
-                return tcp_write_bytes(self.tls_handle, data)!
+                return tcp.write_all_bytes(self.tls_handle, data)!
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
         self.sent = bytes.concat(self.sent, data)
         return data.len()

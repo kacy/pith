@@ -1,12 +1,16 @@
 # TCP echo server/client test
 
+import std.net.tcp as tcp
+
 fn run_server(port: Int) -> Int!:
-    s := tcp_listen("127.0.0.1", port)!
-    defer tcp_close(s)
-    c := tcp_accept(s)!
-    defer tcp_close(c)
-    data := tcp_read(c, 1024)!
-    tcp_write(c, "echo: {data}")!
+    s := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(s)
+    c := tcp.accept(s)!
+    defer tcp.close(c)
+    data := tcp.read(c, 1024)!
+    # write_all, not write: one write syscall stops when the send buffer fills,
+    # and the bytes it did not take are simply not sent.
+    tcp.write_all(c, "echo: {data}")!
     return 0
 
 fn run() -> String!:
@@ -17,10 +21,10 @@ fn run() -> String!:
     sleep(200)
 
     # connect client
-    conn := tcp_connect("127.0.0.1", port)!
-    defer tcp_close(conn)
-    tcp_write(conn, "hello pith")!
-    response := tcp_read(conn, 1024)!
+    conn := tcp.connect("127.0.0.1", port)!
+    defer tcp.close(conn)
+    tcp.write_all(conn, "hello pith")!
+    response := tcp.read(conn, 1024)!
     print(response)
 
     await task

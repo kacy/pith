@@ -283,7 +283,7 @@ impl ServerConn:
     # is sent, exactly as the h2 client writes.
     fn send(data: Bytes) -> Int!:
         if self.transport == TRANSPORT_TCP:
-            return tcp_write_bytes(self.fd, data)!
+            return tcp.write_all_bytes(self.fd, data)!
         if self.transport == TRANSPORT_TLS:
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
         self.sent = bytes.concat(self.sent, data)

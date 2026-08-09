@@ -638,15 +638,28 @@ fn build_request(fields: List[hpack.HeaderField], body: Bytes) -> http.HttpReque
     path := pseudo(fields, ":path")
     authority := pseudo(fields, ":authority")
     crlf := "\r\n"
-    mut head := method + " " + path + " HTTP/1.1" + crlf
-    head = head + "host: " + authority + crlf
+    # the head is appended to a byte buffer rather than to a string. pith
+    # strings are immutable, so `head = head + field` re-copies everything
+    # written so far, four times per header field. open_stream has already
+    # capped the list at MAX_HEADER_COUNT fields and MAX_HEADER_LIST_BYTES, so
+    # the worst request that reaches here is bounded — but the bound still means
+    # about twelve megabytes of copying for a head of sixty kilobytes, and this
+    # runs once per request. a buffer appends each piece once, and
+    # build_http_request wants bytes anyway.
+    head := bytes.buffer()
+    errdefer head.free()
+    head.write_string_utf8(method + " " + path + " HTTP/1.1" + crlf)!
+    head.write_string_utf8("host: " + authority + crlf)!
     for field in fields:
         # pseudo-headers are h2-only; they became the request line and Host above.
         if field.name.starts_with(":"):
             continue
-        head = head + field.name + ": " + field.value + crlf
-    head = head + crlf
-    return http.build_http_request(bytes.from_string_utf8(head), body)!
+        head.write_string_utf8(field.name)!
+        head.write_string_utf8(": ")!
+        head.write_string_utf8(field.value)!
+        head.write_string_utf8(crlf)!
+    head.write_string_utf8(crlf)!
+    return http.build_http_request(head.take_bytes(), body)!
 
 # --- the response bridge ---
 

@@ -1,0 +1,99 @@
+# a header sent with an empty value must survive the http/2 request bridge.
+#
+# the bridge synthesizes an http/1.1 request head from the decoded header list,
+# and it builds that head through a byte buffer. an empty value is an empty
+# append, and an append that reports "wrote nothing" reads as a failure under
+# the result convention — so an empty value is exactly the case that turns a
+# legal request into a dropped one. this drives a real h2c request carrying
+# one empty-valued header, one ordinary header, and one whose value is empty
+# between two that are not, and checks the server saw all three.
+
+import std.net.http2.server as server
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.net.http as http
+import std.bytes as bytes
+import std.binary as binary
+import std.encoding as encoding
+
+# report the head the bridge synthesized, with the line breaks made visible.
+# the raw head is what proves an empty value came through: the accessor map
+# cannot tell a header with an empty value from one that was never sent.
+fn echo_headers(req: http.HttpRequestBytes) -> http.HttpResponse:
+    head := req.headers() catch "<none>"
+    return http.text(200, head.replace("\r\n", "|"))
+
+fn serve_once(listener: Int):
+    client_fd := tcp_accept(listener) catch 0
+    if client_fd != 0:
+        server.serve_h2c_connection(client_fd, echo_headers)
+
+fn send_request(fd: Int):
+    preface := encoding.from_hex("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a") catch bytes.empty()
+    tcp_write_bytes(fd, preface) catch 0
+    settings := frames.frame_bytes(frames.settings_frame([]) catch frames.settings_ack_frame()) catch bytes.empty()
+    tcp_write_bytes(fd, settings) catch 0
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    block := encoder.encode([
+        hpack.header_field(":method", "GET"),
+        hpack.header_field(":path", "/hi"),
+        hpack.header_field(":scheme", "http"),
+        hpack.header_field(":authority", "localhost"),
+        hpack.header_field("x-empty", ""),
+        hpack.header_field("x-filled", "value"),
+        hpack.header_field("x-trailing", ""),
+    ])
+    headers := frames.frame_bytes(frames.headers_frame(1, block, true, true)) catch bytes.empty()
+    tcp_write_bytes(fd, headers) catch 0
+
+# read frames until a DATA frame ends stream 1, collecting the body bytes.
+fn read_body(fd: Int) -> Bytes:
+    body := bytes.buffer()
+    mut buf := bytes.empty()
+    mut pos := 0
+    mut rounds := 0
+    while rounds < 200:
+        rounds = rounds + 1
+        while buf.len() - pos < 9:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                out := body.bytes()
+                body.free()
+                return out
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        length := binary.read_u24_be_at(buf, pos).unwrap_or(0)
+        total := 9 + length
+        while buf.len() - pos < total:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                out := body.bytes()
+                body.free()
+                return out
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        full := buf.slice(pos, pos + total)
+        pos = pos + total
+        frame := frames.read_frame(binary.reader(full), frames.MAX_ALLOWED_FRAME_SIZE) catch frames.settings_ack_frame()
+        if frame.header.frame_type == frames.FRAME_DATA:
+            df := frames.parse_data(frame) catch frames.DataFrame(0, bytes.empty(), true)
+            body.write(df.data) catch 0
+            if df.end_stream:
+                out := body.bytes()
+                body.free()
+                return out
+    out := body.bytes()
+    body.free()
+    return out
+
+fn main():
+    port := 17521
+    listener := tcp_listen("127.0.0.1", port) catch 0
+    task := spawn serve_once(listener)
+    fd := tcp_connect("127.0.0.1", port) catch 0
+    send_request(fd)
+    body := read_body(fd)
+    print(body.to_string_utf8() catch "?")
+    tcp_close(fd)
+    await task
+    tcp_close(listener)

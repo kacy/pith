@@ -1,0 +1,151 @@
+# a redis reply must parse the same however the socket happens to break it up.
+#
+# this drives the client with one RESP script delivered whole, then a byte at a
+# time, then in odd-sized pieces, and compares what came back each time. the
+# byte-at-a-time run is the interesting one: it splits every CRLF across two
+# reads, which is what the parser's scan resume has to get right, and it puts a
+# read boundary at every offset inside every reply. the script covers the reply
+# shapes — status, error, integer, bulk (including empty and null), flat and
+# nested arrays — and a bulk large enough to arrive in many reads. the limits
+# that must still reject get their own connection each, since a rejected reply
+# leaves the stream unparsed.
+
+import std.redis as redis
+from std.redis import Reply
+import std.time as time
+from std.collections import copy_list
+
+fn min_int(a: Int, b: Int) -> Int:
+    if a < b:
+        return a
+    return b
+
+fn repeat(text: String, times: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < times:
+        out = out + text
+        i = i + 1
+    return out
+
+# answer each command with the next canned reply, written `piece` bytes at a
+# time. the pause between pieces is what keeps the kernel from coalescing them
+# back into one read — without it the client would see the whole reply at once
+# and the split would never be exercised. `piece` at or above the reply length
+# means one write, and no pauses.
+fn serve(listener: Int, script: List[String], piece: Int) -> Int!:
+    conn := tcp_accept(listener)!
+    for reply in script:
+        request := tcp_read(conn, 4096)!
+        if request.len() == 0:
+            tcp_close(conn)
+            return 0
+        mut off := 0
+        while off < reply.len():
+            stop := min_int(off + piece, reply.len())
+            wrote := tcp_write(conn, reply.substring(off, stop)) catch 0
+            if wrote == 0:
+                tcp_close(conn)
+                return 0
+            off = off + wrote
+            if piece < reply.len():
+                time.delay(1)
+    tcp_close(conn)
+    return 0
+
+# a stable rendering of a reply, so two runs can be compared as text.
+fn render(reply: Reply) -> String:
+    return match reply:
+        Reply.Status(s) => "status:" + s
+        Reply.Error(s) => "error:" + s
+        Reply.Integer(n) => "int:" + n.to_string()
+        Reply.Bulk(s) => "bulk:" + s.len().to_string() + ":" + s
+        Reply.Nil => "nil"
+        Reply.Array(items) => "array:" + items.len().to_string() + ":" + items.join("|")
+
+# run the whole script against a fresh stub on `port` and return one rendering
+# per reply. a command that fails renders its error, so a `-ERR` reply and a
+# rejected limit are compared as text like everything else.
+fn run_script(port: Int, script: List[String], piece: Int) -> List[String]!:
+    listener := tcp_listen("127.0.0.1", port)!
+    # the stub reads the script on another task, so it gets its own copy.
+    task := spawn serve(listener, copy_list(script), piece)
+    client := redis.connect("127.0.0.1", port)!
+    mut out: List[String] := []
+    mut i := 0
+    while i < script.len():
+        reply := client.command(["PROBE", i.to_string()])
+        if reply.is_err:
+            out.push("failed:" + reply.err)
+        else:
+            out.push(render(reply.ok))
+        i = i + 1
+    client.close()
+    await task
+    tcp_close(listener)
+    return out
+
+# the reply shapes, small enough that a byte-at-a-time run stays quick.
+fn shapes_script() -> List[String]:
+    return [
+        "+PONG\r\n",
+        "-ERR unknown command\r\n",
+        ":42\r\n",
+        ":-1\r\n",
+        "$5\r\nhello\r\n",
+        "$0\r\n\r\n",
+        "$-1\r\n",
+        "*0\r\n",
+        "*-1\r\n",
+        "*3\r\n$3\r\nfoo\r\n:7\r\n$-1\r\n",
+        "*2\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+        "$" + repeat("x", 300).len().to_string() + "\r\n" + repeat("x", 300) + "\r\n",
+    ]
+
+# one bulk reply far larger than a single read, to exercise the gather path.
+fn bulk_script() -> List[String]:
+    payload := repeat(repeat("abcdefgh", 128), 256)
+    return ["$" + payload.len().to_string() + "\r\n" + payload + "\r\n"]
+
+# a rendering short enough to print. the comparison always uses the full text;
+# only what lands in the expected output is shortened.
+fn brief(text: String) -> String:
+    if text.len() <= 40:
+        return text
+    return text.substring(0, 40) + "...(" + text.len().to_string() + ")"
+
+fn compare(label: String, expected: List[String], actual: List[String]):
+    if expected.len() != actual.len():
+        print(label + ": MISMATCH (" + expected.len().to_string() + " vs " + actual.len().to_string() + " replies)")
+        return
+    mut i := 0
+    while i < expected.len():
+        if expected[i] != actual[i]:
+            print(label + ": MISMATCH at " + i.to_string() + ": " + expected[i] + " != " + actual[i])
+            return
+        i = i + 1
+    print(label + ": same")
+
+fn main() -> Int!:
+    shapes := shapes_script()
+    whole := run_script(17510, shapes, 65536)!
+    for line in whole:
+        print(brief(line))
+
+    compare("1-byte pieces", whole, run_script(17511, shapes, 1)!)
+    compare("3-byte pieces", whole, run_script(17512, shapes, 3)!)
+    compare("7-byte pieces", whole, run_script(17513, shapes, 7)!)
+
+    big := bulk_script()
+    big_whole := run_script(17514, big, 1048576)!
+    print(brief(big_whole[0]))
+    compare("262144-byte bulk in 997-byte pieces", big_whole, run_script(17515, big, 997)!)
+    compare("262144-byte bulk in 4096-byte pieces", big_whole, run_script(17516, big, 4096)!)
+
+    # the limits get a connection each: a rejected reply leaves the rest of the
+    # stream unparsed, so nothing can follow it on the same socket.
+    print(run_script(17517, ["$536870913\r\n"], 65536)![0])
+    print(run_script(17518, ["*10485761\r\n"], 65536)![0])
+    print(run_script(17519, [repeat("*1\r\n", 66) + ":1\r\n"], 65536)![0])
+    print(run_script(17520, [repeat("x", 70000)], 65536)![0])
+    return 0

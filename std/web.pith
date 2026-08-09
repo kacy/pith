@@ -570,7 +570,14 @@ impl App:
     fn listen_tls(host: String, port: Int, cert: String, key: String) -> Int!:
         app := self
         config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
-        listener := tls.listen(host, port, config)!
+        bound := tls.listen(host, port, config)
+        if bound.is_err:
+            # the bind never happened, so nothing borrowed the config and it is
+            # still this call's to close. a server that retries a taken port
+            # would otherwise leak a certificate and a key per attempt.
+            config.close()
+            fail bound.err
+        listener := bound.ok
         shutdown.register_listener(listener.handle)
         defer release_tls_listener(listener)
         mut failures := 0
@@ -580,13 +587,23 @@ impl App:
                 if shutdown.requested():
                     break
                 failures = failures + 1
+                # a give-up here leaves the config open on purpose: nothing
+                # drains on this path, and a task already mid-handshake still
+                # reads the certificate and key out of the registry.
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
             spawn handle_tls_socket(app, listener.handle, accepted.ok)
         # free the port before draining (see the plaintext listener above).
         release_tls_listener(listener)
-        return shutdown.drain_default()
+        drained := shutdown.drain_default()
+        # this call built the config, so this call closes it — and only here,
+        # once the drain has finished. the listener merely borrowed it, and each
+        # connection task reads the certificate and key out of the registry when
+        # its own handshake gets that far, which is long after the accept that
+        # spawned it returned. see docs/tls.md.
+        config.close()
+        return drained
 
 # --- tests ---
 

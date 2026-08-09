@@ -78,6 +78,12 @@ fn config_drop[V](values: Map[Int, V], handle: Int):
         values.remove(handle)
     native_config_mu.unlock()
 
+fn config_len[V](values: Map[Int, V]) -> Int:
+    native_config_mu.lock()
+    n := values.len()
+    native_config_mu.unlock()
+    return n
+
 # the root bundle caches, guarded by native_config_mu like the registry above.
 #
 # a client config's trust anchors are the most expensive thing about it. the
@@ -1370,6 +1376,16 @@ pub fn listener_from_handle(handle: Int) -> Listener:
 pub fn release_listener_config(listener: Listener):
     config_drop(native_listener_config, listener.handle)
 
+# how many server configs are open right now: one per server_config() that has
+# not been closed yet.
+#
+# a server builds one config per listener, so on a running process this is flat
+# and small. a number that climbs is a config leak, and the leak is not free —
+# an open server config pins its certificate pem and its private key der in the
+# registry for as long as it stays open.
+pub fn open_server_configs() -> Int:
+    return config_len(native_server_cert_pem)
+
 # how many server handshakes have failed since this process started.
 #
 # a handshake fails when a peer opens a connection and then hangs up, sends
@@ -1447,8 +1463,16 @@ impl Config:
     # closing is safe as soon as the handshakes made from the config have
     # returned. a client config is read only while a handshake runs, and the
     # connection it produces keeps its own keys rather than a reference back
-    # here. a listener is the exception: it holds a server config for as long as
-    # it is listening, and Listener.close() is what releases that one.
+    # here.
+    #
+    # a server config is the same rule read carefully. `listen` records the
+    # handle against the listening socket, but that is a borrow, not a transfer:
+    # Listener.close() gives back the borrow, and whoever called server_config()
+    # still closes the config. the borrow is what makes the timing matter. an
+    # accept loop hands each socket to its own task, and that task reads the
+    # certificate and the key out of this registry when its handshake reaches
+    # them — which can be a whole handshake timeout after the accept returned.
+    # so a server closes its config after the drain, never before it.
     #
     # every map a config can write to is dropped here. missing one would move
     # the leak rather than fix it, so there is a test that walks all of them.
@@ -1696,6 +1720,31 @@ test "closing a client config empties every registry map it wrote to":
     assert(client(TcpStream(0 - 1), "example.com", cfg).is_err)
 
     # closing again is a no-op, so a failure path can close unconditionally.
+    cfg.close()
+
+test "closing a server config empties every registry map it wrote to":
+    before := open_server_configs()
+    cfg := server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["pith.rpc"]).request_client_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    assert(is_native_server_config(cfg))
+    assert_eq(open_server_configs(), before + 1)
+
+    cfg.close()
+
+    # the server half of the client test above. the certificate pem and the
+    # private key der are the expensive entries here, so a close that misses one
+    # keeps a key in memory for the rest of the process.
+    assert(not config_has(native_server_cert_pem, cfg.handle))
+    assert(not config_has(native_server_key_der, cfg.handle))
+    assert(not config_has(native_server_client_ca_pem, cfg.handle))
+    assert(not config_has(native_server_client_ca_optional, cfg.handle))
+    assert(not config_has(native_config_alpn, cfg.handle))
+    assert(not is_native_server_config(cfg))
+    assert_eq(open_server_configs(), before)
+
+    # a closed server config fails a handshake rather than serving one with
+    # whatever is left in the registry — handles are never reissued.
+    assert(native_server_certificate_chain(cfg).is_err)
+
     cfg.close()
 
 test "a root bundle is parsed once and shared by every config that trusts it":

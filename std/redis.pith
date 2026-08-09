@@ -22,8 +22,16 @@ MAX_BULK_LEN := 536870912      # 512 MiB — a single bulk string
 MAX_ARRAY_ITEMS := 10485760    # elements in one array reply
 MAX_REPLY_DEPTH := 64          # nested-array nesting
 
-# bytes asked for in one socket read.
-READ_CHUNK := 65536
+# bytes asked for in one socket read while looking for the end of a line. a
+# read allocates and zeroes everything it asks for, so asking for more than a
+# reply header needs makes every small reply pay for the one large one.
+READ_CHUNK := 4096
+
+# bytes asked for in one socket read while gathering a bulk payload of a known
+# length. the size is already known here, so a larger read is a straight saving
+# in syscalls and never over-reads: what is asked for is what is still missing,
+# up to this.
+PAYLOAD_CHUNK := 65536
 
 # the most a bulk read reserves up front. the payload length comes off the
 # wire, so reserving all of it would let a twelve-byte header ask for half a
@@ -163,8 +171,8 @@ impl Client:
         self.pos = 0
         while got < need:
             mut want := need - got
-            if want > READ_CHUNK:
-                want = READ_CHUNK
+            if want > PAYLOAD_CHUNK:
+                want = PAYLOAD_CHUNK
             chunk := tcp_read_bytes(self.fd, want)!
             if chunk.len() == 0:
                 fail "redis: connection closed"

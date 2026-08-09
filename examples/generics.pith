@@ -66,6 +66,15 @@ fn show_and_hash[T: Display + Hash](x: T) -> String:
 struct Wrapper[T: Display]:
     pub value: T
 
+# a generic function can take an optional parameter alongside its type
+# parameter. every call site shares one specialization, and each reads the
+# optional from the declaration, so a literal `none` and a real `Int?` at
+# different call sites both answer correctly.
+fn label[T](tag: T, count: Int?) -> String:
+    if count == none:
+        return "{tag}: unknown"
+    return "{tag}: {count.unwrap_or(0)}"
+
 fn main():
     p: Pair[Int, String] := Pair(1, "hello")
     b: Box[Float] := Box(3.14)
@@ -86,3 +95,8 @@ fn main():
     # inferred from the values, in any field order
     named := Pair(second: "answer", first: 42)
     print("named {show_pair(named)}")
+
+    # an optional parameter of a generic function, written both ways
+    total: Int? := 7
+    print(label("apples", none))
+    print(label("pears", total))

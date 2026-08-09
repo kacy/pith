@@ -12,6 +12,7 @@ from types import get_type_info
 from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs, ir_var_types, ir_current_func_return_kind, ir_untracked_rc_binds
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
+from ir_alias_registry import ir_emission_tid
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind
 from ir_ownership import ir_rc_retain_reg, ir_rc_release_reg
@@ -41,7 +42,7 @@ pub fn ir_emit_match_arm_return(body_idx: Int, emit_expr: fn(Int) -> Int, emit_b
 pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
-    ir_match_subject_tid = c_get_expr_type(node.children[0])
+    ir_match_subject_tid = ir_emission_tid(node.children[0])
     mut i := 1
     while i < node.children.len():
         arm := get_node(node.children[i])
@@ -396,7 +397,7 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
 pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int) -> Int:
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
-    ir_match_subject_tid = c_get_expr_type(node.children[0])
+    ir_match_subject_tid = ir_emission_tid(node.children[0])
     result_temp := ir_new_temp_name("match")
     end_l := ir_label()
     mut i := 1

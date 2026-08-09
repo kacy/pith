@@ -1,0 +1,193 @@
+# an optional parameter of a *generic* function, read back through every
+# form: `== none`, `!= none`, `unwrap_or`, `if let` and `match`.
+#
+# a specialization used to decide whether a parameter was an optional from
+# the argument tid recorded at a call site rather than from the declaration.
+# a bare `none` carries TID_NONE, not an Optional tid, so a literal-`none`
+# call site recorded no optional and the body lowered `b == none` as a bare
+# value compare. all call sites share one specialization and the arg tids are
+# recorded first-site-wins, so that one site also corrupted its neighbours.
+#
+# every generic function below is therefore called with a literal `none`
+# FIRST and with real optionals after: the ordering is the test.
+
+type Count = Int
+
+struct P:
+    n: Int
+
+fn none_int() -> Int?:
+    return none
+
+fn some_int() -> Int?:
+    return 7
+
+# --- the four read-back forms, each on a concrete `Int?` parameter ---
+
+fn probe_eq[T](a: T, b: Int?) -> String:
+    if b == none:
+        return "NONE"
+    return "SOME"
+
+fn probe_neq[T](a: T, b: Int?) -> Bool:
+    return b != none
+
+fn probe_unwrap[T](a: T, b: Int?) -> Int:
+    return b.unwrap_or(0 - 1)
+
+fn probe_if_let[T](a: T, b: Int?) -> Int:
+    if let v = b:
+        return v
+    return 0 - 1
+
+fn probe_match[T](a: T, b: Int?) -> String:
+    return match b:
+        none => "NONE"
+        v => "SOME{v}"
+
+# --- a generic optional parameter (`T?`, not a concrete `Int?`) ---
+
+fn probe_generic_optional[T](tag: String, v: T?) -> String:
+    if v == none:
+        return "{tag}:NONE"
+    return "{tag}:SOME"
+
+# --- two optional parameters of different inner types on one parameter list ---
+
+fn probe_two[T](a: T, x: Int?, y: String?) -> String:
+    mut out := ""
+    if x == none:
+        out = out + "x-NONE "
+    else:
+        out = out + "x-{x.unwrap_or(0 - 1)} "
+    if y == none:
+        out = out + "y-NONE"
+    else:
+        out = out + "y-{y.unwrap_or(\"?\")}"
+    return out
+
+# --- an optional parameter forwarded on to a plain function's optional ---
+
+fn takes_optional(b: Int?) -> String:
+    if b == none:
+        return "NONE"
+    return "SOME{b.unwrap_or(0 - 1)}"
+
+fn probe_forward[T](a: T, b: Int?) -> String:
+    return takes_optional(b)
+
+# --- a struct-typed optional parameter ---
+
+fn probe_struct[T](a: T, p: P?) -> String:
+    if p == none:
+        return "NONE"
+    return "SOME"
+
+# --- container-typed optional parameters: the declared inner type is a
+# generic_type node rather than a plain name, so rebuilding its tid has to
+# recurse ---
+
+fn probe_list[T](a: T, xs: List[Int]?) -> String:
+    if xs == none:
+        return "NONE"
+    return "SOME"
+
+fn probe_map[T](a: T, m: Map[String, Int]?) -> String:
+    if m == none:
+        return "NONE"
+    return "SOME"
+
+fn probe_nested[T](a: T, xs: List[List[Int]]?) -> String:
+    if xs == none:
+        return "NONE"
+    return "SOME"
+
+fn probe_tuple[T](a: T, t: (Int, String)?) -> String:
+    if t == none:
+        return "NONE"
+    return "SOME"
+
+fn probe_alias[T](a: T, v: Count?) -> String:
+    if v == none:
+        return "NONE"
+    return "SOME"
+
+fn main():
+    n := none_int()
+    s := some_int()
+    sn: String? := none
+    ss: String? := "hi"
+    pn: P? := none
+    ps: P? := P(9)
+    si: Int? := 4
+
+    # `== none`: literal site first, then two sites sharing probe_eq__string
+    print("eq_literal:{probe_eq(\"a\", none)}")
+    print("eq_none:{probe_eq(\"b\", n)}")
+    print("eq_some:{probe_eq(\"c\", s)}")
+    # a second specialization of the same declaration
+    print("eq_int_literal:{probe_eq(1, none)}")
+    print("eq_int_some:{probe_eq(2, s)}")
+
+    print("neq_literal:{probe_neq(\"a\", none)}")
+    print("neq_none:{probe_neq(\"b\", n)}")
+    print("neq_some:{probe_neq(\"c\", s)}")
+
+    print("unwrap_literal:{probe_unwrap(\"a\", none)}")
+    print("unwrap_none:{probe_unwrap(\"b\", n)}")
+    print("unwrap_some:{probe_unwrap(\"c\", s)}")
+
+    print("if_let_literal:{probe_if_let(\"a\", none)}")
+    print("if_let_none:{probe_if_let(\"b\", n)}")
+    print("if_let_some:{probe_if_let(\"c\", s)}")
+
+    print("match_literal:{probe_match(\"a\", none)}")
+    print("match_none:{probe_match(\"b\", n)}")
+    print("match_some:{probe_match(\"c\", s)}")
+
+    # a `T?` parameter: T is inferred from the argument, so a bare none has
+    # nothing to infer from and every site passes a real optional
+    print("gen_int_some:{probe_generic_optional(\"i\", si)}")
+    print("gen_int_none:{probe_generic_optional(\"i\", n)}")
+    print("gen_str_some:{probe_generic_optional(\"s\", ss)}")
+    print("gen_str_none:{probe_generic_optional(\"s\", sn)}")
+
+    # both literal-none first, then the same specialization with real values
+    print("two_literal:{probe_two(\"t\", none, none)}")
+    print("two_some:{probe_two(\"t\", si, ss)}")
+    print("two_none:{probe_two(\"t\", n, sn)}")
+
+    print("fwd_literal:{probe_forward(\"a\", none)}")
+    print("fwd_none:{probe_forward(\"b\", n)}")
+    print("fwd_some:{probe_forward(\"c\", s)}")
+
+    print("struct_literal:{probe_struct(\"a\", none)}")
+    print("struct_none:{probe_struct(\"b\", pn)}")
+    print("struct_some:{probe_struct(\"c\", ps)}")
+
+    ln: List[Int]? := none
+    ls: List[Int]? := [1, 2]
+    mn: Map[String, Int]? := none
+    ms: Map[String, Int]? := {"k": 1}
+    print("list_literal:{probe_list(\"a\", none)}")
+    print("list_none:{probe_list(\"b\", ln)}")
+    print("list_some:{probe_list(\"c\", ls)}")
+    print("map_literal:{probe_map(\"a\", none)}")
+    print("map_none:{probe_map(\"b\", mn)}")
+    print("map_some:{probe_map(\"c\", ms)}")
+
+    nn: List[List[Int]]? := none
+    ns: List[List[Int]]? := [[1], [2]]
+    tn2: (Int, String)? := none
+    ts: (Int, String)? := (1, "a")
+    an: Count? := none
+    as2: Count? := 5
+    print("nested_literal:{probe_nested(\"a\", none)}")
+    print("nested_none:{probe_nested(\"b\", nn)}")
+    print("nested_some:{probe_nested(\"c\", ns)}")
+    print("tuple_literal:{probe_tuple(\"a\", none)}")
+    print("tuple_none:{probe_tuple(\"b\", tn2)}")
+    print("tuple_some:{probe_tuple(\"c\", ts)}")
+    print("alias_literal:{probe_alias(\"a\", none)}")
+    print("alias_none:{probe_alias(\"b\", an)}")
+    print("alias_some:{probe_alias(\"c\", as2)}")

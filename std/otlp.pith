@@ -515,7 +515,9 @@ fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> http.HttpRespon
     if cfg.timeout_ms > 0:
         req = req.with_timeout(cfg.timeout_ms)
     if cfg.use_tls:
-        return req.send_tls_with_config(cfg.host, tls.client_config()!)!
+        config := tls.client_config()!
+        defer config.close()
+        return req.send_tls_with_config(cfg.host, config)!
     return req.send()!
 
 # POST a signal with retries. best-effort: returns true once the collector

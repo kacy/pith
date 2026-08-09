@@ -38,14 +38,15 @@ mut native_server_client_ca_optional: Map[Int, Bool] := {}
 mut native_listener_config: Map[Int, Int] := {}
 
 # guards the whole config registry above, the two hook maps declared further
-# down, and the handle counter. the registry is not startup-only state: an https
-# client builds a fresh config for every request (see std.net.http), so one task
-# is allocating a handle and inserting while another is mid-handshake reading
-# the same maps and a third is removing from them in Config.close(). two tasks
-# that read the counter together would also land on the same handle and share a
-# registry slot, so a handshake could pick up another config's certificate and
-# key. the lock only ever spans a single map operation — pem parsing,
-# certificate verification, and the user-supplied config hooks all run off it.
+# down, the handle counter, and the root bundle caches below. the registry is
+# not startup-only state: an https client builds a fresh config for every
+# request (see std.net.http), so one task is allocating a handle and inserting
+# while another is mid-handshake reading the same maps and a third is removing
+# from them in Config.close(). two tasks that read the counter together would
+# also land on the same handle and share a registry slot, so a handshake could
+# pick up another config's certificate and key. the lock only ever spans a
+# single map operation — pem parsing, certificate verification, and the
+# user-supplied config hooks all run off it.
 mut native_config_mu := Mutex()
 
 # the registry accessors. each takes native_config_mu for one map operation and
@@ -76,6 +77,28 @@ fn config_drop[V](values: Map[Int, V], handle: Int):
     if values.contains_key(handle):
         values.remove(handle)
     native_config_mu.unlock()
+
+# the root bundle caches, guarded by native_config_mu like the registry above.
+#
+# a client config's trust anchors are the most expensive thing about it. the
+# system bundle is ~220KB of pem holding ~150 certificates, and before these
+# caches existed every client_config() re-read that file, re-parsed it, and
+# handed each config its own copy of the text — then every handshake parsed it a
+# second time to verify the peer chain. an https request therefore paid for two
+# full bundle parses before it sent a byte, and each live config pinned another
+# copy of the pem. measured on a 220KB bundle that was about a quarter second of
+# cpu and about a megabyte of memory per request.
+#
+# both caches are keyed on content, not on a config handle, so configs that
+# trust the same roots share one entry no matter how many of them exist or when
+# they are closed. entries are never evicted — a parsed root bundle is valid for
+# as long as the process runs — so a reader can hold one without a lock and a
+# closing config never invalidates another config's roots. the cap is what keeps
+# that bounded: a program trusting more than this many distinct bundles keeps
+# working, it just parses the ones that did not fit.
+TLS_MAX_ROOTS_CACHE := 8
+mut native_system_roots_pem := ""
+mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
 
 # hand out the next config handle, one per caller.
 fn next_config_handle() -> Int:
@@ -306,11 +329,65 @@ mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookR
 fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
     return ConfigHookResult(Config(0 - 1), "")
 
+# parse a root bundle, reusing the parse when the same pem text has been seen.
+#
+# the lock is only ever held for a map operation; the parse itself runs off it,
+# so two tasks that miss together both parse and one of them stores. that is
+# wasted work on a cold start, never a wrong answer: parsing is pure, so the two
+# results are equal and it does not matter which one wins. the alternative —
+# holding the lock across the parse — would serialize every config creation in
+# the process behind a quarter-second parse.
+fn parse_roots_cached(roots_pem: String) -> List[x509.Certificate]!:
+    native_config_mu.lock()
+    hit := native_roots_parsed.contains_key(roots_pem)
+    mut cached: List[x509.Certificate] := []
+    if hit:
+        cached = native_roots_parsed[roots_pem]
+    native_config_mu.unlock()
+    if hit:
+        return cached
+    parsed := x509.parse_pem_chain(roots_pem)!
+    native_config_mu.lock()
+    if not native_roots_parsed.contains_key(roots_pem) and native_roots_parsed.len() < TLS_MAX_ROOTS_CACHE:
+        native_roots_parsed.insert(roots_pem, parsed)
+    native_config_mu.unlock()
+    return parsed
+
+# the system root bundle as pem text, read from disk at most once.
+#
+# every caller gets the same string rather than its own copy of it, so the
+# hundreds of configs an https client builds over a process lifetime pin one
+# bundle between them instead of one each.
+#
+# the fill deliberately does not hold the lock across the read and the parse.
+# it loads into a local first and then takes the lock once to decide the winner,
+# so there is never a window where the global is published but not yet filled —
+# a shape that has been a real bug in this registry before. two tasks racing a
+# cold start both read the file and one of them wins; both return the winner, so
+# every config still shares a single copy.
+fn system_roots_pem() -> String!:
+    native_config_mu.lock()
+    cached := native_system_roots_pem
+    native_config_mu.unlock()
+    if cached != "":
+        return cached
+    loaded := os_certs.roots_pem()!
+    # parse here so a broken system bundle fails config creation, and so the
+    # first config warms the parse cache for every later one.
+    parse_roots_cached(loaded)!
+    native_config_mu.lock()
+    if native_system_roots_pem == "":
+        native_system_roots_pem = loaded
+    winner := native_system_roots_pem
+    native_config_mu.unlock()
+    return winner
+
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
         fail "tls root certificates not found"
-    # parse once here so config creation fails early for bad pem data.
-    x509.parse_pem_chain(roots_pem)!
+    # parse once here so config creation fails early for bad pem data. the
+    # parse is cached, so a second config over the same roots pays a lookup.
+    parse_roots_cached(roots_pem)!
     handle := next_config_handle()
     config_put(native_config_roots_pem, handle, roots_pem)
     return Config(handle)
@@ -377,7 +454,7 @@ fn native_config_roots(config: Config) -> List[x509.Certificate]!:
     roots_pem := config_get(native_config_roots_pem, config.handle, "")
     if roots_pem == "":
         fail "native tls client config not found"
-    return x509.parse_pem_chain(roots_pem)!
+    return parse_roots_cached(roots_pem)!
 
 fn is_native_config(config: Config) -> Bool:
     return config_has(native_config_roots_pem, config.handle)
@@ -1178,10 +1255,27 @@ fn native_conn_close(handle: Int):
     native_conn_drop(handle)
 
 # create a client config using system certificate roots.
+#
+# the caller owns the returned config and should close() it once the connections
+# made from it have finished their handshakes. the system root bundle behind it
+# is read and parsed at most once per process and shared by every config, so
+# building one of these per request is cheap; leaving them unclosed is not,
+# because each one keeps a registry slot for the life of the process.
+#
+# caching the bundle means a process does not notice the system trust store
+# being updated underneath it — it keeps the roots it started with until it
+# restarts. that is the usual bargain (go's SystemCertPool makes it too), and
+# the alternative was re-reading and re-parsing a couple of hundred kilobytes on
+# every request. a program that has to pick up a rotation without restarting
+# should read the bundle itself and use client_config_with_ca_file.
 pub fn client_config() -> Config!:
-    return native_config_handle(os_certs.roots_pem()!)
+    return native_config_handle(system_roots_pem()!)
 
 # create a client config using a pem ca file.
+#
+# owned by the caller and closed by the caller, like client_config(). the file
+# is read on every call; the parse of it is shared with every other config over
+# the same bundle.
 pub fn client_config_with_ca_file(path: String) -> Config!:
     return native_config_handle(read_file(path)!)
 
@@ -1196,7 +1290,11 @@ pub fn with_config_selector(config: Config, chooser: fn(ClientHelloInfo) -> Conf
 
 # dial a tls server with system roots and host name verification.
 pub fn dial(host: String, port: Int) -> Conn!:
-    return dial_with_config(host, port, host, client_config()!)
+    # this call built the config, so this call closes it. dial_with_config does
+    # not, because there the config is the caller's and is usually reused.
+    config := client_config()!
+    defer config.close()
+    return dial_with_config(host, port, host, config)
 
 # dial a tls server with an explicit server name and config.
 pub fn dial_with_config(host: String, port: Int, server_name: String, config: Config) -> Conn!:
@@ -1340,6 +1438,22 @@ impl Config:
         config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
         return self
 
+    # give the config's registry slot back.
+    #
+    # whoever built a config closes it; nothing closes one for you, and a config
+    # left open holds its slot until the process exits. an https client builds
+    # one per request, so that is a leak per request.
+    #
+    # closing is safe as soon as the handshakes made from the config have
+    # returned. a client config is read only while a handshake runs, and the
+    # connection it produces keeps its own keys rather than a reference back
+    # here. a listener is the exception: it holds a server config for as long as
+    # it is listening, and Listener.close() is what releases that one.
+    #
+    # every map a config can write to is dropped here. missing one would move
+    # the leak rather than fix it, so there is a test that walks all of them.
+    # a handle is never reissued, so a use after close reads an empty registry
+    # and fails — it cannot land on another config's certificate and key.
     fn close():
         config_drop(native_config_roots_pem, self.handle)
         config_drop(native_config_alpn, self.handle)
@@ -1557,6 +1671,56 @@ test "tls config helpers track alpn, client auth, and resumption":
     client_cfg.close()
     server_cfg.close()
     optional_cfg.close()
+
+test "closing a client config empties every registry map it wrote to":
+    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["pith.rpc"]).with_client_certificate("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.enable_session_resumption().with_verify_connection(verify_state_accept)
+    assert(is_native_config(cfg))
+
+    cfg.close()
+
+    # every map a client config can write to has to be empty afterwards. a
+    # close that misses one moves the leak rather than fixing it, and the miss
+    # is invisible from the outside because the handle is never reissued.
+    assert(not config_has(native_config_roots_pem, cfg.handle))
+    assert(not config_has(native_config_alpn, cfg.handle))
+    assert(not config_has(native_config_resumption_enabled, cfg.handle))
+    assert(not config_has(native_config_verify_connection, cfg.handle))
+    assert(not config_has(native_client_cert_pem, cfg.handle))
+    assert(not config_has(native_client_key_der, cfg.handle))
+    assert(not is_native_config(cfg))
+
+    # a closed config is dead rather than dangerous: handles count up and are
+    # never reissued, so a stale one misses the registry and fails cleanly
+    # instead of landing on somebody else's certificate and key.
+    assert(native_config_roots(cfg).is_err)
+    assert(client(TcpStream(0 - 1), "example.com", cfg).is_err)
+
+    # closing again is a no-op, so a failure path can close unconditionally.
+    cfg.close()
+
+test "a root bundle is parsed once and shared by every config that trusts it":
+    first := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    second := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    assert(first.handle != second.handle)
+
+    first_roots := native_config_roots(first)!
+    second_roots := native_config_roots(second)!
+    assert(first_roots.len() > 0)
+    assert_eq(first_roots.len(), second_roots.len())
+    assert_eq(first_roots[0].subject_common_name, second_roots[0].subject_common_name)
+
+    # closing one config must not disturb the other's trust anchors: the parse
+    # belongs to the bundle, not to whichever config happened to ask first.
+    first.close()
+    still_there := native_config_roots(second)!
+    assert_eq(still_there.len(), second_roots.len())
+    second.close()
+
+    # and the cache survives both of them, because a parsed bundle stays valid
+    # for the life of the process.
+    third := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    assert_eq(native_config_roots(third)!.len(), second_roots.len())
+    third.close()
 
 test "tls wrappers reject invalid handles":
     bad_conn := Conn(-1)

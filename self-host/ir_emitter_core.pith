@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
@@ -7272,9 +7272,50 @@ fn ir_tid_for_declared_type_name(name: String) -> Int:
         return TID_BYTES
     return - 1
 
+# the tid a *declared* type node denotes under the active substitution, or -1
+# when the shape is one this cannot rebuild. only the shape has to be right:
+# every consumer reads the emission kind off the tid, never its identity.
+fn ir_declared_type_node_tid(type_idx: Int) -> Int:
+    tn := get_node(type_idx)
+    if tn.kind == "type":
+        mut name := tn.value
+        for generic_param, i in ir_active_generic_params:
+            if generic_param == name and i < ir_active_generic_concrete_types.len():
+                name = ir_active_generic_concrete_types[i]
+        return ir_tid_for_declared_type_name(name)
+    if tn.kind == "generic_type":
+        if tn.value == "List" and tn.children.len() == 1:
+            elem := ir_declared_type_node_tid(tn.children[0])
+            if elem < 0:
+                return - 1
+            return add_type_info(ti_list(elem))
+        if tn.value == "Set" and tn.children.len() == 1:
+            elem := ir_declared_type_node_tid(tn.children[0])
+            if elem < 0:
+                return - 1
+            return add_type_info(ti_set(elem))
+        if tn.value == "Map" and tn.children.len() == 2:
+            key := ir_declared_type_node_tid(tn.children[0])
+            val := ir_declared_type_node_tid(tn.children[1])
+            if key < 0 or val < 0:
+                return - 1
+            return add_type_info(ti_map(key, val))
+        # a generic struct: its emission kind comes from the base name, and
+        # the type arguments do not change it
+        return ir_tid_for_declared_type_name(tn.value)
+    if tn.kind == "tuple_type":
+        mut element_tids: List[Int] := []
+        for element_idx in tn.children:
+            element_tid := ir_declared_type_node_tid(element_idx)
+            if element_tid < 0:
+                return - 1
+            element_tids.push(element_tid)
+        return add_type_info(ti_tuple(element_tids))
+    return - 1
+
 # the Optional tid a parameter was *declared* with, under the active
 # substitution, or -1 when the declaration is not an optional (or names an
-# inner type the type table cannot resolve). this is what makes a parameter's
+# inner type this cannot rebuild). this is what makes a parameter's
 # optional-ness a property of the declaration rather than of whatever the
 # first call site happened to pass.
 fn ir_declared_param_optional_tid(param_node: Node) -> Int:
@@ -7283,14 +7324,7 @@ fn ir_declared_param_optional_tid(param_node: Node) -> Int:
     tn := get_node(param_node.children[0])
     if tn.kind != "optional_type" or tn.children.len() == 0:
         return - 1
-    inner_node := get_node(tn.children[0])
-    if inner_node.kind != "type":
-        return - 1
-    mut inner_name := inner_node.value
-    for generic_param, i in ir_active_generic_params:
-        if generic_param == inner_name and i < ir_active_generic_concrete_types.len():
-            inner_name = ir_active_generic_concrete_types[i]
-    inner_tid := ir_tid_for_declared_type_name(inner_name)
+    inner_tid := ir_declared_type_node_tid(tn.children[0])
     if inner_tid < 0:
         return - 1
     return add_type_info(ti_optional(inner_tid))

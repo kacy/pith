@@ -37,13 +37,14 @@ something here that now works, the page is stale and a fix to it is welcome.
     the element type also feeds `contains`, `index_of` and `remove`, which
     compare rather than store, so widening there would answer against a
     freshly built optional and always miss.
-  - a parameter of a *generic function* — a generic specialization decides
-    whether a parameter is an optional from the call site's argument type
-    rather than from the declaration, so `fn pick[T](a: T, b: Int?)` reads
-    `b` as a bare pointer. `pick(x, none)` already answers "some" for
-    `b == none` today for the same reason; widening into it would launder a
-    compile error into a wrong answer. a method on a *generic struct* is
-    unaffected and does widen.
+  - a parameter of a *generic function* — `fn pick[T](a: T, b: Int?)` still
+    needs `pick(x, v)` with `v: Int?` rather than `pick(x, 3)`. the lowering
+    bug that used to make this dangerous is fixed (a specialization now takes
+    a parameter's optional-ness from the declaration, so `pick(x, none)`
+    answers "none"), so widening here is no longer unsound in principle — it
+    is simply not wired up on the generic call path, and turning it on wants
+    its own verification pass. a method on a *generic struct* is unaffected
+    and does widen.
   - an enum variant payload — an `Int?` payload binds as `Int` when
     destructured, so an optional payload is not usable yet in either
     direction.

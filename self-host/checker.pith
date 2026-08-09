@@ -2993,8 +2993,9 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 expected := fn_info.param_types[idx]
                 if arg_type != expected:
                     if argument_widens_to_optional(arg_expr_idx, arg_type, expected) == false:
-                        if types_structurally_equal(arg_type, expected) == false:
-                            report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                        if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
+                            if types_structurally_equal(arg_type, expected) == false:
+                                report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
 
@@ -4162,8 +4163,9 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 if aidx < param_types.len():
                     if atype != param_types[aidx]:
                         if argument_widens_to_optional(arg_expr, atype, param_types[aidx]) == false:
-                            if types_structurally_equal(atype, param_types[aidx]) == false:
-                                report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
+                            if collection_literal_matches_target(arg_expr, param_types[aidx], scope_id) == false:
+                                if types_structurally_equal(atype, param_types[aidx]) == false:
+                                    report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
             aidx = aidx + 1
         return ret_type
     # a fn-value field invoked like a method: `h.shut(x)` where `shut: fn(C)` is

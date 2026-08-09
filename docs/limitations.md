@@ -28,8 +28,10 @@ something here that now works, the page is stale and a fix to it is welcome.
   it expects. that covers bindings, assignments, returns, struct fields
   (positional, named and defaulted), collection literal elements, map index
   assignment, and the argument of a plain function, a method, a lambda and a
-  function value. three argument positions still need the value bound to a
-  `T?` local first:
+  function value. a collection literal in argument position takes the
+  parameter's declared element type too, so `f([1, 2])` against a
+  `List[Int?]` parameter widens element by element. three argument positions
+  still need the value bound to a `T?` local first:
   - a builtin container store or query — `xs.push(3)` into a `List[Int?]`,
     `m.insert(k, 3)` into a `Map[K, Int?]`, `s.add(3)` into a `Set[Int?]`.
     the element type also feeds `contains`, `index_of` and `remove`, which
@@ -47,6 +49,12 @@ something here that now works, the page is stale and a fix to it is welcome.
     direction.
 - **`==` does not widen** — `o == 5` where `o` is an `Int?` reports; compare
   against `none` or unwrap first.
+- **a collection literal does not widen into an optional element that is
+  itself a container** — `{"a": [1, 2]}` against a `Map[String, List[Int]?]`
+  reports, because the literal walk recurses into a container target and an
+  optional is not one. this predates the widening above and applies equally to
+  a binding, a struct field and an argument. bind the inner container to a
+  `List[Int]?` local first.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

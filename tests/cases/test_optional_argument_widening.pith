@@ -56,6 +56,19 @@ fn stash(v: Int?, p: Point?, s: String?) -> Holder:
 fn apply(v: Int, f: fn(Int?) -> Int) -> Int:
     return f(v)
 
+fn sum_optionals(xs: List[Int?]) -> Int:
+    mut t := 0
+    for x in xs:
+        t = t + x.unwrap_or(0)
+    return t
+
+fn first_label(m: Map[String, String?]) -> String:
+    return m["a"].unwrap_or("MISS")
+
+impl Counter:
+    fn total(xs: List[Int?]) -> Int:
+        return self.base + sum_optionals(xs)
+
 fn main():
     # a literal, a named local, and a fresh expression all widen
     print("lit:{probe_int(3)}")
@@ -105,6 +118,18 @@ fn main():
     # call frame the widening happened in
     h := stash(5, Point(6), "seven")
     print("stash:v={h.v.unwrap_or(0)} p={h.p.unwrap_or(Point(0)).n} s={h.s.unwrap_or("x")}")
+
+    # a collection literal in argument position takes the parameter's declared
+    # element type, so its plain elements widen the same way a lone argument
+    # does. the container is tagged from that type, so a heap element it holds
+    # is counted rather than borrowed.
+    print("listarg:{sum_optionals([1, 2, 3])}")
+    print("listarg_mixed:{sum_optionals([1, none, 3])}")
+    print("maparg:{first_label({"a": "one"})}")
+    print("methodlistarg:{c.total([1, 2])}")
+    kept := "k" + "1"
+    print("maparg_fresh:{first_label({"a": kept})}")
+    print("maparg_alive:{kept}")
 
     mut held: List[Holder] := []
     mut i := 0

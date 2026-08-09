@@ -1,0 +1,129 @@
+# a tls server closes the config it built, and not a moment too soon.
+#
+# the two halves of the rule, in one run against a real listener:
+#
+#   1. the config survives the drain. this test gets a connection accepted and
+#      counted as in flight, *then* asks for a shutdown, and only then sends the
+#      client hello. the server's connection task reads the certificate and the
+#      private key out of the tls registry at that point — well after the accept
+#      loop stopped — so a listen loop that closed its config before draining
+#      would fail this handshake.
+#   2. the config is closed once the drain is over. tls.open_server_configs()
+#      counts the configs still holding a certificate; it has to come back to
+#      zero after the listen call returns, or the certificate pem and the key
+#      der sit in the registry for the rest of the process.
+#
+# nothing here waits on a fixed sleep. the connect retries until the listener is
+# bound, and shutdown.inflight() is what says the server has taken the
+# connection, so the ordering is observed rather than hoped for.
+import std.web as web
+import std.net.http as http
+import std.net.tls as tls
+import std.net.tcp as tcp
+import std.shutdown as shutdown
+import std.time as time
+from std.io import TcpStream
+
+PORT := 18473
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+
+# how many 10ms turns a poll gives up after. generous, because it only ever runs
+# to completion on a broken build; a healthy one leaves after a turn or two.
+POLL_TURNS := 500
+
+mut server_returned := false
+
+fn hello(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "hello")
+
+# the server under test: a one-route app on a real tls listener. the flag is how
+# main knows the listen call returned, so it can check the registry afterwards
+# without guessing at a delay.
+fn serve_bg() -> Int:
+    app := web.new().get("/", hello)
+    code := app.listen_tls("127.0.0.1", PORT, CERT, KEY) catch 0
+    server_returned = true
+    return code
+
+# connect to the listener, retrying until it is bound. returns -1 if it never
+# comes up.
+fn connect_when_bound() -> Int:
+    mut turns := 0
+    while turns < POLL_TURNS:
+        attempt := tcp.connect("127.0.0.1", PORT)
+        if attempt.is_ok:
+            return attempt.ok
+        turns = turns + 1
+        time.delay(10)
+    return 0 - 1
+
+# wait until the server has accepted the connection and counted it as in flight.
+fn wait_for_inflight() -> Bool:
+    mut turns := 0
+    while turns < POLL_TURNS:
+        if shutdown.inflight() > 0:
+            return true
+        turns = turns + 1
+        time.delay(10)
+    return false
+
+fn wait_for_server_return() -> Bool:
+    mut turns := 0
+    while turns < POLL_TURNS:
+        if server_returned:
+            return true
+        turns = turns + 1
+        time.delay(10)
+    return false
+
+# the response status line, or "" when the exchange failed.
+fn request_over(conn: tls.Conn) -> String:
+    crlf := chr(13) + chr(10)
+    sent := conn.write_all("GET / HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf)
+    if sent.is_err:
+        return ""
+    reply := conn.read(256)
+    if reply.is_err:
+        return ""
+    lines := reply.ok.split(crlf)
+    if lines.len() == 0:
+        return ""
+    return lines[0]
+
+fn main() -> Int!:
+    shutdown.reset()
+    shutdown.set_drain_deadline(5000)
+    print("open server configs at start: " + tls.open_server_configs().to_string())
+
+    spawn serve_bg()
+
+    # a tcp connection the server accepts and counts, with no client hello on it
+    # yet. from here the server task is parked reading a handshake record.
+    fd := connect_when_bound()
+    print("connected: " + (fd > 0).to_string())
+    print("server took the connection: " + wait_for_inflight().to_string())
+
+    # now stop the server. the accept loop breaks, frees the port, and drains —
+    # with this connection's handshake still to happen.
+    shutdown.request()
+
+    # the listener offers alpn, so a client that offers none is refused. ask for
+    # http/1.1 and stay off the http/2 path this test does not need.
+    client_cfg := tls.client_config_with_ca_file(CA)!.with_alpn(["http/1.1"])
+    defer client_cfg.close()
+    handshaken := tls.client(TcpStream(fd), "localhost", client_cfg)
+    print("handshake after the shutdown request: " + handshaken.is_ok.to_string())
+    if handshaken.is_err:
+        print("handshake error: " + handshaken.err)
+        return 1
+
+    # the server config is still open here, because the drain is still running.
+    print("open server configs during the drain: " + tls.open_server_configs().to_string())
+    print("served during the drain: " + request_over(handshaken.ok))
+    handshaken.ok.close()
+
+    print("listen returned: " + wait_for_server_return().to_string())
+    print("open server configs after: " + tls.open_server_configs().to_string())
+    return 0

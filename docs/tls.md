@@ -46,8 +46,38 @@ closing after the connection is up is deliberate, not a trick. a client config
 is read only while the handshake runs — the roots to verify the peer chain, the
 alpn list to offer, the client certificate to present. once the handshake
 returns, the connection holds its own keys and never looks the config up again,
-so the config has no job left. the same goes for `tls.listen`: the listener owns
-its server config from that point on and `Listener.close()` releases it.
+so the config has no job left.
+
+a server config is the same rule with the timing spelled out. `tls.listen`
+records the config against the listening socket, but that is a borrow, not a
+transfer: `Listener.close()` gives the borrow back, and whoever called
+`server_config()` is still the one who closes the config.
+
+the timing is what makes a server different in practice. an accept loop hands
+each socket to its own task, and that task reads the certificate and the private
+key out of the registry when its own handshake reaches them — which can be a
+whole handshake timeout after the accept that spawned it returned. so a server
+closes its config once it has drained, never before:
+
+```pith
+cfg := tls.server_config("certs/server.crt", "certs/server.key")!
+listener := tls.listen(host, 443, cfg)!
+# ... accept, spawning a task per connection, until a shutdown is requested ...
+listener.close()
+drained := shutdown.drain_default()
+cfg.close()
+```
+
+closing before the drain does not corrupt anything — a handle is never reissued,
+so the handshake that loses the race fails cleanly rather than reaching for
+another config's key — but it does turn working connections into failed ones on
+the way out, which is a worse shutdown than the leak it was fixing.
+
+the std servers do this for you: `App.listen_tls`, `http2.listen_h2_tls` and its
+streaming twin each build a config, serve on it, and close it after their drain,
+so a program that calls one of those has nothing to close.
+`tls.open_server_configs()` counts the server configs still holding a
+certificate, and on a healthy process the number is flat.
 
 `close()` is idempotent and safe on a config that holds nothing, so a failure
 path can close unconditionally on its way out.

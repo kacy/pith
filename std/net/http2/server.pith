@@ -1372,7 +1372,13 @@ fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequest
 # racing connections — from taking the accept loop down with it.
 pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
-    listener := tls.listen(host, port, config)!
+    bound := tls.listen(host, port, config)
+    if bound.is_err:
+        # the bind never happened, so nothing borrowed the config and it is
+        # still this call's to close.
+        config.close()
+        fail bound.err
+    listener := bound.ok
     shutdown.register_listener(listener.handle)
     defer release_tls_listener(listener)
     mut failures := 0
@@ -1382,6 +1388,9 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
             if shutdown.requested():
                 break
             failures = failures + 1
+            # a give-up here leaves the config open on purpose: nothing drains
+            # on this path, and a task already mid-handshake still reads the
+            # certificate and key out of the registry.
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
@@ -1389,7 +1398,13 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
         spawn serve_h2_tls_slot(listener.handle, accepted.ok, handler)
     # free the port before draining (see listen_h2c above).
     release_tls_listener(listener)
-    return shutdown.drain_default()
+    drained := shutdown.drain_default()
+    # this call built the config, so this call closes it — and only here, once
+    # the drain has finished. the listener merely borrowed it, and each
+    # connection task reads the certificate and key out of the registry when its
+    # own handshake gets that far. see docs/tls.md.
+    config.close()
+    return drained
 
 # --- streaming entry points ---
 #
@@ -1472,7 +1487,13 @@ fn serve_h2_tls_streaming_slot(listener_handle: Int, fd: Int):
 pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: String, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
-    listener := tls.listen(host, port, config)!
+    bound := tls.listen(host, port, config)
+    if bound.is_err:
+        # the bind never happened, so nothing borrowed the config and it is
+        # still this call's to close.
+        config.close()
+        fail bound.err
+    listener := bound.ok
     shutdown.register_listener(listener.handle)
     defer release_tls_listener(listener)
     mut failures := 0
@@ -1482,6 +1503,9 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
             if shutdown.requested():
                 break
             failures = failures + 1
+            # a give-up here leaves the config open on purpose: nothing drains
+            # on this path, and a task already mid-handshake still reads the
+            # certificate and key out of the registry.
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
@@ -1489,7 +1513,10 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
         spawn serve_h2_tls_streaming_slot(listener.handle, accepted.ok)
     # free the port before draining (see listen_h2c above).
     release_tls_listener(listener)
-    return shutdown.drain_default()
+    drained := shutdown.drain_default()
+    # this call built the config, so this call closes it — see listen_h2_tls.
+    config.close()
+    return drained
 
 # --- offline frame tests ---
 #

@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, add_type_info
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -1918,10 +1918,19 @@ fn ir_method_expr_type(idx: Int, node: Node) -> String:
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         return ir_known_callable_return_type(alias_fname)
+    mname := ir_plain_method_name(node_value(idx))
+    # inside a generic specialization an optional parameter's receiver carries
+    # the unspecialized tid, so the extraction methods would answer "unknown".
+    # an unknown part in an interpolation is concatenated raw, which for an
+    # `Int?` means splicing an integer where a string pointer belongs.
+    if node.children.len() > 0 and (mname == "unwrap_or" or mname == "value"):
+        generic_recv_tid := ir_generic_param_optional_tid(get_node(node.children[0]))
+        if generic_recv_tid >= 0:
+            return ir_type_from_tid(get_type_info(generic_recv_tid).inner)
     mut obj_type := ""
     if node.children.len() > 0:
         obj_type = ir_infer_type(node.children[0])
-    return ir_known_method_return_type(obj_type, ir_plain_method_name(node_value(idx)))
+    return ir_known_method_return_type(obj_type, mname)
 
 fn ir_checked_struct_field_type(recv_idx: Int, field_name: String) -> String:
     recv_tid := c_get_expr_type(recv_idx)
@@ -4624,7 +4633,12 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
     node := get_node(idx)
     mname := ir_plain_method_name(node_value(idx))
     if node.children.len() > 0:
-        recv_tid := c_get_expr_type(node.children[0])
+        # ir_emission_tid, not the bare checked tid: inside a generic
+        # specialization an optional parameter's receiver carries the
+        # unspecialized marker, and `b.unwrap_or(d)` then fell past this
+        # whole block to a plain method call, emitting `call unwrap_or` —
+        # a name no function ever defines.
+        recv_tid := ir_emission_tid(node.children[0])
         if recv_tid >= 0:
             recv_info := get_type_info(recv_tid)
             if recv_info.kind == "primitive" and mname == "to_string":
@@ -6423,7 +6437,11 @@ fn ir_emit_let_cond(pat_idx: Int, subj_r: Int) -> Int:
 fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
     pat := get_node(pat_idx)
     if pat.kind == "pat_binding":
-        subj_tid := c_get_expr_type(subj_idx)
+        # ir_emission_tid, not the bare checked tid: inside a generic
+        # specialization an optional parameter is checked before the
+        # substitution, and the value-field extract answers register zero
+        # when handed a tid that is not an Optional.
+        subj_tid := ir_emission_tid(subj_idx)
         val_r := ir_optional_value_field(subj_r, subj_tid)
         ir_var_regs.insert(pat.value, val_r)
         if subj_tid >= 0:
@@ -7233,20 +7251,85 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_param_optional_tids = saved_param_optional_tids
     ir_active_generic_decl_idx = saved_decl_idx
 
+# the tid a declared type name denotes, or -1 when it names nothing the type
+# table knows. a source-level name (`Int`, a struct) resolves directly; a name
+# that arrived as a substituted generic concrete is an emission kind, so map
+# the primitive kinds back. anything else stays unresolved and the caller
+# falls back to whatever the call sites recorded.
+fn ir_tid_for_declared_type_name(name: String) -> Int:
+    direct := lookup_type_id(name)
+    if direct >= 0:
+        return direct
+    if name == "int":
+        return TID_INT
+    if name == "float":
+        return TID_FLOAT
+    if name == "bool":
+        return TID_BOOL
+    if name == "string":
+        return TID_STRING
+    if name == "bytes":
+        return TID_BYTES
+    return - 1
+
+# the Optional tid a parameter was *declared* with, under the active
+# substitution, or -1 when the declaration is not an optional (or names an
+# inner type the type table cannot resolve). this is what makes a parameter's
+# optional-ness a property of the declaration rather than of whatever the
+# first call site happened to pass.
+fn ir_declared_param_optional_tid(param_node: Node) -> Int:
+    if param_node.children.len() == 0:
+        return - 1
+    tn := get_node(param_node.children[0])
+    if tn.kind != "optional_type" or tn.children.len() == 0:
+        return - 1
+    inner_node := get_node(tn.children[0])
+    if inner_node.kind != "type":
+        return - 1
+    mut inner_name := inner_node.value
+    for generic_param, i in ir_active_generic_params:
+        if generic_param == inner_name and i < ir_active_generic_concrete_types.len():
+            inner_name = ir_active_generic_concrete_types[i]
+    inner_tid := ir_tid_for_declared_type_name(inner_name)
+    if inner_tid < 0:
+        return - 1
+    return add_type_info(ti_optional(inner_tid))
+
+# which of a specialization's parameters are optionals, and with which tid.
+#
+# a parameter is optional when EITHER the declaration says so or the recorded
+# call-site argument tid is an optional. the union matters in both directions:
+#
+#  - the declaration alone is not enough, because `fn my_eq[T](a: T, b: T)`
+#    called with `Int?` has a plain `T` parameter whose optional-ness only the
+#    argument knows.
+#  - the argument alone is not enough, and was the bug: a bare `none` literal
+#    carries TID_NONE, not an Optional tid, so `fn pick[T](a: T, b: Int?)`
+#    called as `pick(x, none)` recorded no optional and lowered `b == none` as
+#    a bare value compare. worse, arg tids are recorded first-call-site-wins
+#    and every call site shares one specialization, so a single literal-`none`
+#    site silently corrupted the sites around it that passed a real `Int?`.
+#
+# the argument tid is preferred when it is a genuine optional so the inner
+# type keeps coming from the same place it always has; the declaration is the
+# fallback that closes the hole.
 fn ir_collect_param_optional_tids(fn_idx: Int, spec_key: String) -> Map[String, Int]:
     result: Map[String, Int] := {}
     arg_tids := ir_decode_generic_spec_arg_tids(spec_key)
-    if arg_tids.len() == 0:
-        return result
     node := get_node(fn_idx)
     mut param_idx := 0
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "param":
+            mut tid := 0 - 1
             if param_idx < arg_tids.len():
-                tid := arg_tids[param_idx]
-                if tid >= 0 and get_type_info(tid).kind == "optional":
-                    result.insert(cn.value, tid)
+                arg_tid := arg_tids[param_idx]
+                if arg_tid >= 0 and get_type_info(arg_tid).kind == "optional":
+                    tid = arg_tid
+            if tid < 0:
+                tid = ir_declared_param_optional_tid(cn)
+            if tid >= 0:
+                result.insert(cn.value, tid)
             param_idx = param_idx + 1
     return result
 

@@ -465,19 +465,75 @@ pub fn format_traceparent(ctx: SpanContext) -> String:
         flags = "01"
     return "00-" + ctx.trace_id + "-" + ctx.span_id + "-" + flags
 
-# parse a W3C traceparent header into a context, or none when malformed.
+HEX_LOWER := "0123456789abcdef"
+
+# the value of one hex digit in either case, or -1 when the character is not
+# one. indexing a String yields one byte, so this is safe to call on any byte of
+# any string, however the bytes were encoded.
+fn hex_digit(character: String) -> Int:
+    code := bits.band(ord(character), 255)
+    if code >= 48 and code <= 57:
+        return code - 48
+    if code >= 97 and code <= 102:
+        return code - 87
+    if code >= 65 and code <= 70:
+        return code - 55
+    return -1
+
+# `field` as canonical lowercase hex, or none unless it is exactly `width` hex
+# digits, as every field of a W3C traceparent must be.
+#
+# this is a safety check and not only a validation one: len() counts bytes and
+# substring() takes byte offsets, so a length check alone never proves an offset
+# falls on a character boundary, and slicing through the middle of a multi-byte
+# character is a runtime trap that no catch can intercept. a traceparent arrives
+# from the network unauthenticated, so proving the field is hex — hence all
+# ascii, hence every byte offset is a boundary — is what keeps a hostile header
+# from taking the process down. std.net.grpc.bearer_token guards the same hazard
+# the same way.
+#
+# accepting uppercase does not weaken that: A-F is 0x41-0x46, so the accepted
+# bytes are still every one below 0x80, while every byte of a multi-byte utf-8
+# sequence is 0x80 or above. the two sets stay disjoint.
+#
+# the spec writes these fields in lowercase, so an uppercase one is joined but
+# not passed on as it arrived: normalising here means what we propagate and
+# export is canonical whatever a peer sent, rather than moving the interop
+# problem one hop downstream. validating and normalising in the same pass keeps
+# the two from drifting apart later.
+fn hex_field(field: String, width: Int) -> String?:
+    if field.len() != width:
+        return none
+    mut canonical := ""
+    mut position := 0
+    while position < width:
+        digit := hex_digit(field[position])
+        if digit < 0:
+            return none
+        canonical = canonical + HEX_LOWER[digit]
+        position = position + 1
+    return canonical
+
+# parse a W3C traceparent header into a context, or none when malformed. every
+# field is validated as hex before it is read, so a malformed or hostile header
+# is rejected rather than trusted or fatal, and the ids come back lowercased.
 pub fn parse_traceparent(header: String) -> SpanContext?:
     parts := header.split("-")
     if parts.len() < 4:
         return none
+    # the version is "00" exactly, which has no letter in it to case-fold.
     if parts[0] != "00":
         return none
-    trace_id := parts[1]
-    span_id := parts[2]
-    if trace_id.len() != 32 or span_id.len() != 16:
+    trace_id := hex_field(parts[1], 32)
+    span_id := hex_field(parts[2], 16)
+    flags := hex_field(parts[3], 2)
+    if trace_id == none or span_id == none or flags == none:
         return none
-    sampled := parts[3].len() >= 2 and parts[3].substring(1, 2) == "1"
-    return SpanContext(trace_id, span_id, sampled)
+    # the sampled decision is bit 0 of the flags byte, which is the low bit of
+    # the second hex digit.
+    flags_text := flags.value()
+    sampled := bits.band(hex_digit(flags_text[1]), 1) == 1
+    return SpanContext(trace_id.value(), span_id.value(), sampled)
 
 test "spans nest through the per-thread current span":
     set_active(true)
@@ -518,6 +574,118 @@ test "traceparent round-trips":
     assert_eq(back.value().span_id, ctx.span_id)
     assert(back.value().sampled)
     assert(parse_traceparent("garbage") == none)
+
+test "a traceparent carrying a multi-byte character does not parse":
+    # a traceparent arrives from the network with no authentication behind it.
+    # len() counts bytes and substring() takes byte offsets, so the old length
+    # guard did not make the offsets safe: a multi-byte character in the flags
+    # field was cut in half, and a cut through a character is a runtime trap
+    # that ends the process — two bytes from any client. every field must now be
+    # rejected rather than sliced.
+    trace_id := "0af7651916cd43dd8448eb211c80319c"
+    span_id := "b7ad6b7169203331"
+    prefix := "00-" + trace_id + "-" + span_id + "-"
+
+    # the flags field: the one that used to be sliced.
+    assert(parse_traceparent(prefix + "0€") == none)
+    assert(parse_traceparent(prefix + "€") == none)
+    assert(parse_traceparent(prefix + "€0") == none)
+    assert(parse_traceparent(prefix + "0é") == none)
+    # "é" is exactly two bytes, so it is the width the flags field wants and the
+    # hex check is the only thing that can turn it away. the same for a two-byte
+    # character sitting in a trace id or span id of exactly the right length.
+    assert(parse_traceparent(prefix + "é") == none)
+    assert(parse_traceparent("00-" + trace_id.substring(0, 30) + "é-" + span_id + "-01") == none)
+    assert(parse_traceparent("00-" + trace_id + "-" + span_id.substring(0, 14) + "é-01") == none)
+
+    # the other fields, which were never sliced but were taken on trust. each of
+    # these is exactly the right byte length, so only a hex check rejects them.
+    bad_trace := trace_id.substring(0, 29) + "€"
+    bad_span := span_id.substring(0, 13) + "€"
+    assert_eq(bad_trace.len(), 32)
+    assert_eq(bad_span.len(), 16)
+    assert(parse_traceparent("00-" + bad_trace + "-" + span_id + "-01") == none)
+    assert(parse_traceparent("00-" + trace_id + "-" + bad_span + "-01") == none)
+    assert(parse_traceparent("0€-" + trace_id + "-" + span_id + "-01") == none)
+
+test "a traceparent field that is not hex does not parse":
+    trace_id := "0af7651916cd43dd8448eb211c80319c"
+    span_id := "b7ad6b7169203331"
+    prefix := "00-" + trace_id + "-" + span_id + "-"
+    assert(parse_traceparent(prefix + "zz") == none)
+    assert(parse_traceparent(prefix + "0") == none)
+    assert(parse_traceparent(prefix + "001") == none)
+    # "g" is the first letter past the hex alphabet in both cases.
+    assert(parse_traceparent(prefix + "0g") == none)
+    assert(parse_traceparent(prefix + "0G") == none)
+    assert(parse_traceparent("00-" + trace_id.substring(0, 31) + "z-" + span_id + "-01") == none)
+    assert(parse_traceparent("00-" + trace_id + "-" + span_id.substring(0, 15) + "z-01") == none)
+
+test "an uppercase traceparent is joined and normalised to lowercase":
+    # the spec writes these fields lowercase, but an upstream that emits
+    # uppercase is easier to diagnose joined than silently dropped. what we
+    # store is canonical either way, so what we propagate and export downstream
+    # does not carry the peer's spelling on to the next hop.
+    upper := parse_traceparent("00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01")
+    assert(upper != none)
+    assert_eq(upper.value().trace_id, "0af7651916cd43dd8448eb211c80319c")
+    assert_eq(upper.value().span_id, "b7ad6b7169203331")
+    assert(upper.value().sampled)
+
+    # mixed case, and an uppercase flags digit carrying the sampled bit.
+    mixed := parse_traceparent("00-0Af7651916cD43dd8448Eb211c80319C-b7Ad6b7169203331-0B")
+    assert(mixed != none)
+    assert_eq(mixed.value().trace_id, "0af7651916cd43dd8448eb211c80319c")
+    assert_eq(mixed.value().span_id, "b7ad6b7169203331")
+    assert(mixed.value().sampled)
+
+    # an uppercase flags digit with bit 0 clear is still not sampled.
+    even := parse_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-0A")
+    assert(even != none)
+    assert(not even.value().sampled)
+
+    # a normalised id formats back out canonically, so the round trip is stable.
+    assert_eq(format_traceparent(upper.value()), "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+
+test "a well-formed traceparent still parses both sampling decisions":
+    trace_id := "0af7651916cd43dd8448eb211c80319c"
+    span_id := "b7ad6b7169203331"
+
+    sampled := parse_traceparent("00-" + trace_id + "-" + span_id + "-01")
+    assert(sampled != none)
+    assert_eq(sampled.value().trace_id, trace_id)
+    assert_eq(sampled.value().span_id, span_id)
+    assert(sampled.value().sampled)
+
+    plain := parse_traceparent("00-" + trace_id + "-" + span_id + "-00")
+    assert(plain != none)
+    assert_eq(plain.value().trace_id, trace_id)
+    assert_eq(plain.value().span_id, span_id)
+    assert(not plain.value().sampled)
+
+    # sampled is bit 0 of the flags byte, not the whole second digit: a peer that
+    # sets another flag alongside it still reads as sampled.
+    both := parse_traceparent("00-" + trace_id + "-" + span_id + "-03")
+    assert(both != none)
+    assert(both.value().sampled)
+    other := parse_traceparent("00-" + trace_id + "-" + span_id + "-02")
+    assert(other != none)
+    assert(not other.value().sampled)
+
+test "a parsed traceparent still parents the spans that follow it":
+    set_active(true)
+    clear_context()
+    incoming := parse_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+    assert(incoming != none)
+    with_context(incoming.value())
+
+    child := start("child")
+    assert_eq(child.trace_id, "0af7651916cd43dd8448eb211c80319c")
+    assert_eq(child.parent_id, "b7ad6b7169203331")
+    child.end()
+
+    clear_context()
+    set_active(false)
 
 test "typed attributes record their kind and value":
     set_active(true)

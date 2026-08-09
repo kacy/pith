@@ -5,8 +5,14 @@
 # a tagged value that mirrors RESP: a status line, an error, an integer, a bulk
 # string, nil, or an array of nested replies.
 #
+# a reply is text: a bulk string carrying bytes that are not utf-8 comes back
+# as an error rather than as a string quietly filled with replacement
+# characters. reach for a redis client that speaks bytes if you store blobs.
+#
 # i/o goes straight to the tcp_* builtins, the same ones std.io wraps; the
 # std.net.tcp module is a thin alias over them and isn't needed here.
+
+import std.bytes as bytes
 
 # replies come off an untrusted socket, so the length and count fields a server
 # advertises are bounded before we act on them: a hostile or buggy peer must not
@@ -15,6 +21,19 @@ MAX_LINE_LEN := 65536          # a status/error/header line before its CRLF
 MAX_BULK_LEN := 536870912      # 512 MiB — a single bulk string
 MAX_ARRAY_ITEMS := 10485760    # elements in one array reply
 MAX_REPLY_DEPTH := 64          # nested-array nesting
+
+# bytes asked for in one socket read.
+READ_CHUNK := 65536
+
+# the most a bulk read reserves up front. the payload length comes off the
+# wire, so reserving all of it would let a twelve-byte header ask for half a
+# gigabyte before a single payload byte has arrived; the buffer grows as the
+# data actually lands instead.
+MAX_RESERVE := 262144
+
+# the two bytes that terminate every RESP line.
+CR := 13
+LF := 10
 
 # a reply from redis. `Bulk` and `Array` may be absent, reported as `Nil`.
 # an array's elements are flattened to strings (a scalar becomes its text, a
@@ -44,48 +63,120 @@ fn reply_is_error(r: Reply) -> Bool:
         Reply.Error(_) => true
         _ => false
 
-# a connection to a redis server. `buf` holds bytes read past the current reply.
+# a connection to a redis server. `buf` holds the bytes read off the socket
+# that have not been parsed yet, and `pos` is how far into them the parser has
+# got. the cursor is what keeps the client linear: consuming a line or a
+# payload only moves `pos`, and the bytes already consumed are dropped in one
+# step when the next read comes in, so no byte of a reply is copied twice.
 pub struct Client:
     fd: Int
-    mut buf: String
+    mut buf: Bytes
+    mut pos: Int
 
 # open a connection to a redis server.
 pub fn connect(host: String, port: Int) -> Client!:
     fd := tcp_connect(host, port)!
-    return Client(fd: fd, buf: "")
+    return Client(fd: fd, buf: bytes.empty(), pos: 0)
 
 impl Client:
-    # pull one more chunk from the socket into the buffer; false at end of stream.
+    # bytes read off the socket that the parser has not consumed yet.
+    fn buffered() -> Int:
+        return self.buf.len() - self.pos
+
+    # decode a byte range of the buffer as text. a reply is text as far as this
+    # client is concerned, so bytes that are not utf-8 are an error rather than
+    # a string quietly filled with replacement characters.
+    fn text(start: Int, end: Int) -> String!:
+        decoded := bytes.substring_utf8(self.buf, start, end)
+        if decoded.is_err:
+            fail "redis: reply is not valid utf-8"
+        return decoded.ok
+
+    # pull one more chunk from the socket into the buffer; false at end of
+    # stream. the consumed prefix is dropped here, once per read, rather than
+    # on every parse step.
     fn fill() -> Bool!:
-        chunk := tcp_read(self.fd, 4096)!
+        chunk := tcp_read_bytes(self.fd, READ_CHUNK)!
         if chunk.len() == 0:
             return false
-        self.buf = self.buf + chunk
+        if self.buffered() == 0:
+            self.buf = chunk
+        else:
+            self.buf = self.buf.slice(self.pos, self.buf.len()).concat(chunk)
+        self.pos = 0
         return true
+
+    # index of the first CRLF at or after `start`, or -1 when there is none in
+    # the bytes read so far.
+    fn find_crlf(start: Int) -> Int:
+        mut i := start
+        if i < self.pos:
+            i = self.pos
+        limit := self.buf.len() - 1
+        while i < limit:
+            if self.buf[i] == CR and self.buf[i + 1] == LF:
+                return i
+            i = i + 1
+        return -1
 
     # read one CRLF-terminated line, returning it without the terminator.
     fn read_line() -> String!:
-        mut idx := self.buf.index_of("\r\n")
+        mut idx := self.find_crlf(self.pos)
         while idx < 0:
             # a server that never sends the terminator must not grow the buffer
             # without bound.
-            if self.buf.len() > MAX_LINE_LEN:
+            if self.buffered() > MAX_LINE_LEN:
                 fail "redis: reply line exceeds maximum length"
+            searched := self.buffered()
             if not self.fill()!:
                 fail "redis: connection closed"
-            idx = self.buf.index_of("\r\n")
-        line := self.buf.substring(0, idx)
-        self.buf = self.buf.substring(idx + 2, self.buf.len())
+            # resume one byte back, so a CR that was the last byte of the
+            # previous read still pairs with the LF that follows it. every
+            # other byte is looked at once, whatever sizes the reply arrives in.
+            mut resume := self.pos + searched - 1
+            if resume < self.pos:
+                resume = self.pos
+            idx = self.find_crlf(resume)
+        line := self.text(self.pos, idx)!
+        self.pos = idx + 2
         return line
 
     # read exactly `count` payload bytes plus the trailing CRLF.
     fn read_payload(count: Int) -> String!:
-        while self.buf.len() < count + 2:
-            if not self.fill()!:
+        need := count + 2
+        if self.buffered() >= need:
+            data := self.text(self.pos, self.pos + count)!
+            self.pos = self.pos + need
+            return data
+        # the length is known, so the rest of the payload is read straight into
+        # a buffer that grows: the payload is copied once on the way in and
+        # once on the way out, however many reads it takes to arrive.
+        mut reserve := need
+        if reserve > MAX_RESERVE:
+            reserve = MAX_RESERVE
+        out := bytes.buffer_with_capacity(reserve)
+        errdefer out.free()
+        mut got := self.buffered()
+        if got > 0:
+            out.write_range(self.buf, self.pos, got)
+        self.buf = bytes.empty()
+        self.pos = 0
+        while got < need:
+            mut want := need - got
+            if want > READ_CHUNK:
+                want = READ_CHUNK
+            chunk := tcp_read_bytes(self.fd, want)!
+            if chunk.len() == 0:
                 fail "redis: connection closed"
-        data := self.buf.substring(0, count)
-        self.buf = self.buf.substring(count + 2, self.buf.len())
-        return data
+            out.write(chunk)!
+            got = got + chunk.len()
+        # nothing is read past the payload, so the buffer is empty afterwards
+        # and the gathered bytes are released as soon as the text is out.
+        gathered := out.take_bytes()
+        payload := bytes.substring_utf8(gathered, 0, count)
+        if payload.is_err:
+            fail "redis: reply is not valid utf-8"
+        return payload.ok
 
     # parse one reply off the wire, recursing for arrays.
     fn read_reply() -> Reply!:

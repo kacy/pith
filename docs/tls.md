@@ -64,6 +64,11 @@ per request costs a few small map entries rather than a copy and a re-parse of
 a couple of hundred kilobytes of pem. that sharing is why `client_config()` is
 cheap enough to call on a hot path; closing is what keeps it that way.
 
+the trade is that a process does not notice the system trust store changing
+underneath it: `client_config()` reads it once and keeps those roots until the
+process restarts. to pick up a rotation without restarting, read the bundle
+yourself and build configs with `client_config_with_ca_file`.
+
 ## common options
 
 these helpers can be combined on the same config:

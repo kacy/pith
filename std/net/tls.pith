@@ -1261,6 +1261,13 @@ fn native_conn_close(handle: Int):
 # is read and parsed at most once per process and shared by every config, so
 # building one of these per request is cheap; leaving them unclosed is not,
 # because each one keeps a registry slot for the life of the process.
+#
+# caching the bundle means a process does not notice the system trust store
+# being updated underneath it — it keeps the roots it started with until it
+# restarts. that is the usual bargain (go's SystemCertPool makes it too), and
+# the alternative was re-reading and re-parsing a couple of hundred kilobytes on
+# every request. a program that has to pick up a rotation without restarting
+# should read the bundle itself and use client_config_with_ca_file.
 pub fn client_config() -> Config!:
     return native_config_handle(system_roots_pem()!)
 

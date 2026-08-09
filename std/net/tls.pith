@@ -42,11 +42,11 @@ mut native_listener_config: Map[Int, Int] := {}
 # not startup-only state: an https client builds a fresh config for every
 # request (see std.net.http), so one task is allocating a handle and inserting
 # while another is mid-handshake reading the same maps and a third is removing
-# from them in Config.close(). two tasks
-# that read the counter together would also land on the same handle and share a
-# registry slot, so a handshake could pick up another config's certificate and
-# key. the lock only ever spans a single map operation — pem parsing,
-# certificate verification, and the user-supplied config hooks all run off it.
+# from them in Config.close(). two tasks that read the counter together would
+# also land on the same handle and share a registry slot, so a handshake could
+# pick up another config's certificate and key. the lock only ever spans a
+# single map operation — pem parsing, certificate verification, and the
+# user-supplied config hooks all run off it.
 mut native_config_mu := Mutex()
 
 # the registry accessors. each takes native_config_mu for one map operation and
@@ -1265,6 +1265,10 @@ pub fn client_config() -> Config!:
     return native_config_handle(system_roots_pem()!)
 
 # create a client config using a pem ca file.
+#
+# owned by the caller and closed by the caller, like client_config(). the file
+# is read on every call; the parse of it is shared with every other config over
+# the same bundle.
 pub fn client_config_with_ca_file(path: String) -> Config!:
     return native_config_handle(read_file(path)!)
 

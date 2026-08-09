@@ -136,6 +136,13 @@ impl ByteBuffer:
         return byte_buffer_write_byte(self.handle, value)
 
     fn write_string_utf8(text: String) -> Int!:
+        # same reasoning as write: the builtin reports bytes written and the
+        # result convention reads 0 as failure, so appending an empty string
+        # has to short-circuit rather than report an error for a no-op. text
+        # assembled piece by piece — a header value, a field that happens to
+        # be blank — is full of empty pieces.
+        if text.len() == 0:
+            return 0
         return byte_buffer_write_string_utf8(self.handle, text)
 
     fn write_line_utf8(text: String) -> Int!:
@@ -256,6 +263,13 @@ test "byte buffers write and reset":
     assert_eq(out.bytes().to_string_utf8()!, "hithere" + chr(10) + "!")
     out.reset()
     assert_eq(out.bytes().len(), 0)
+
+    # an empty append is a no-op, not an error — the same contract write() has
+    empty_write := out.write_string_utf8("")
+    assert(not empty_write.is_err)
+    assert_eq(empty_write.ok, 0)
+    assert_eq(out.write_string_utf8("ok")!, 2)
+    assert_eq(out.bytes().to_string_utf8()!, "ok")
 
 test "byte buffers append ranges and packed words":
     src := from_string_utf8("abcdef")

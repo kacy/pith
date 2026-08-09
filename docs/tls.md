@@ -80,7 +80,10 @@ so a program that calls one of those has nothing to close.
 certificate, and on a healthy process the number is flat.
 
 `close()` is idempotent and safe on a config that holds nothing, so a failure
-path can close unconditionally on its way out.
+path can close unconditionally on its way out — as long as it is a path where
+nothing is still handshaking on it. that caveat is the whole reason a server
+closes after its drain rather than in a `defer`, which would fire on the paths
+that never drain too.
 
 the functions that build a config for you close it for you — `tls.dial`,
 `http.get` and friends, `http2.connect`. the `_with_config` variants never

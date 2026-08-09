@@ -233,11 +233,17 @@ grpc.serve_Catalog_tls("0.0.0.0", 443, "server.crt", "server.key", get_product, 
 ```
 ```pith
 cfg := tls.client_config_with_ca_file("ca.crt")!.with_alpn(["h2"])
+defer cfg.close()
 conn := grpc.dial_with_config("catalog.internal", 443, cfg)!
 ```
 
 use `dial_with_config` when the server's cert is signed by a private ca; plain
 `grpc.dial` trusts the system roots.
+
+the config is the caller's here, so the caller closes it — see
+[who closes a config](tls.md#who-closes-a-config). closing it once `dial_with_config`
+has returned is fine: the connection is already up and does not read the config
+again. `grpc.dial` builds its own config and closes it for you.
 
 ## deadlines and metadata
 

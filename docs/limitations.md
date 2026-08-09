@@ -306,15 +306,23 @@ snapshot harder to take. a lock per series adds a lookup to the hot path.
 atomic counters are the obvious answer for a counter and no answer at all for a
 histogram, which updates seven values as one unit.
 
-`std.net.tls` configs are never closed, and `std.net.http` builds one per https
-request. `Config.close()` exists and removes the config's entries from the
-registry, but nothing in std or the examples calls it, so every https request
-adds another copy of the system root bundle — 219 KB here — to a map that only
-grows. two hundred configs held 44 MB that closing them released. the fix is an
-ownership decision rather than a patch: either the http client closes the config
-it built, which means being sure no response still refers to it, or the default
-client config becomes a process-wide value built once, which changes what
-`tls.client_config()` returns.
+a `std.net.tls` config that the caller builds is the caller's to close, and
+nothing in the language notices when one is not. the rule is now uniform inside
+std — whoever builds a config closes it, and `client_config()` shares one cached
+root bundle rather than handing out a copy — so an https request no longer leaks
+a config per request. what is left is that the compiler cannot help: a program
+that builds its own config for `dial_with_config` and forgets `close()` holds a
+registry slot until it exits, with no diagnostic. the slot is small now, which
+makes it a slow leak rather than a fast one, which is arguably worse. what would
+actually fix it is a destructor that runs when the last reference to a `Config`
+goes away, which is the same missing feature behind several entries here.
+
+the root bundle cache that made per-request configs cheap is capped at eight
+distinct bundles and never evicts. a process that trusts more than eight
+different ca bundles keeps working and keeps re-parsing the ones past the cap.
+that is the right failure for the shape of the problem — programs trust one
+bundle, or two — but it is a fixed number chosen rather than derived, and a
+bundle that stops being used is never reclaimed.
 
 `std.args` is safe by convention, with nothing enforcing the convention. its ten
 globals have no lock, which is fine given the parser's shape: init, then the

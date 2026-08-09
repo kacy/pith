@@ -1278,7 +1278,11 @@ pub fn with_config_selector(config: Config, chooser: fn(ClientHelloInfo) -> Conf
 
 # dial a tls server with system roots and host name verification.
 pub fn dial(host: String, port: Int) -> Conn!:
-    return dial_with_config(host, port, host, client_config()!)
+    # this call built the config, so this call closes it. dial_with_config does
+    # not, because there the config is the caller's and is usually reused.
+    config := client_config()!
+    defer config.close()
+    return dial_with_config(host, port, host, config)
 
 # dial a tls server with an explicit server name and config.
 pub fn dial_with_config(host: String, port: Int, server_name: String, config: Config) -> Conn!:
@@ -1422,6 +1426,22 @@ impl Config:
         config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
         return self
 
+    # give the config's registry slot back.
+    #
+    # whoever built a config closes it; nothing closes one for you, and a config
+    # left open holds its slot until the process exits. an https client builds
+    # one per request, so that is a leak per request.
+    #
+    # closing is safe as soon as the handshakes made from the config have
+    # returned. a client config is read only while a handshake runs, and the
+    # connection it produces keeps its own keys rather than a reference back
+    # here. a listener is the exception: it holds a server config for as long as
+    # it is listening, and Listener.close() is what releases that one.
+    #
+    # every map a config can write to is dropped here. missing one would move
+    # the leak rather than fix it, so there is a test that walks all of them.
+    # a handle is never reissued, so a use after close reads an empty registry
+    # and fails — it cannot land on another config's certificate and key.
     fn close():
         config_drop(native_config_roots_pem, self.handle)
         config_drop(native_config_alpn, self.handle)
@@ -1639,6 +1659,56 @@ test "tls config helpers track alpn, client auth, and resumption":
     client_cfg.close()
     server_cfg.close()
     optional_cfg.close()
+
+test "closing a client config empties every registry map it wrote to":
+    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["pith.rpc"]).with_client_certificate("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.enable_session_resumption().with_verify_connection(verify_state_accept)
+    assert(is_native_config(cfg))
+
+    cfg.close()
+
+    # every map a client config can write to has to be empty afterwards. a
+    # close that misses one moves the leak rather than fixing it, and the miss
+    # is invisible from the outside because the handle is never reissued.
+    assert(not config_has(native_config_roots_pem, cfg.handle))
+    assert(not config_has(native_config_alpn, cfg.handle))
+    assert(not config_has(native_config_resumption_enabled, cfg.handle))
+    assert(not config_has(native_config_verify_connection, cfg.handle))
+    assert(not config_has(native_client_cert_pem, cfg.handle))
+    assert(not config_has(native_client_key_der, cfg.handle))
+    assert(not is_native_config(cfg))
+
+    # a closed config is dead rather than dangerous: handles count up and are
+    # never reissued, so a stale one misses the registry and fails cleanly
+    # instead of landing on somebody else's certificate and key.
+    assert(native_config_roots(cfg).is_err)
+    assert(client(TcpStream(0 - 1), "example.com", cfg).is_err)
+
+    # closing again is a no-op, so a failure path can close unconditionally.
+    cfg.close()
+
+test "a root bundle is parsed once and shared by every config that trusts it":
+    first := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    second := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    assert(first.handle != second.handle)
+
+    first_roots := native_config_roots(first)!
+    second_roots := native_config_roots(second)!
+    assert(first_roots.len() > 0)
+    assert_eq(first_roots.len(), second_roots.len())
+    assert_eq(first_roots[0].subject_common_name, second_roots[0].subject_common_name)
+
+    # closing one config must not disturb the other's trust anchors: the parse
+    # belongs to the bundle, not to whichever config happened to ask first.
+    first.close()
+    still_there := native_config_roots(second)!
+    assert_eq(still_there.len(), second_roots.len())
+    second.close()
+
+    # and the cache survives both of them, because a parsed bundle stays valid
+    # for the life of the process.
+    third := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    assert_eq(native_config_roots(third)!.len(), second_roots.len())
+    third.close()
 
 test "tls wrappers reject invalid handles":
     bad_conn := Conn(-1)

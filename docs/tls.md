@@ -20,11 +20,49 @@ client_cfg := tls.client_config()!
 custom_cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!
 ```
 
+both are yours to close — see [who closes a config](#who-closes-a-config).
+
 server configs come from a certificate chain and a pkcs#8 private key:
 
 ```pith
 server_cfg := tls.server_config("certs/server.crt", "certs/server.key")!
 ```
+
+## who closes a config
+
+a config is a handle into a registry that `std.net.tls` keeps for the life of
+the process. **whoever builds a config closes it**, and nothing closes one for
+you. a config that is never closed keeps its registry slot until the program
+exits, so an https client that builds one per request and drops it leaks once
+per request.
+
+```pith
+cfg := tls.client_config()!
+defer cfg.close()
+conn := tls.dial_with_config(host, 443, host, cfg)!
+```
+
+closing after the connection is up is deliberate, not a trick. a client config
+is read only while the handshake runs — the roots to verify the peer chain, the
+alpn list to offer, the client certificate to present. once the handshake
+returns, the connection holds its own keys and never looks the config up again,
+so the config has no job left. the same goes for `tls.listen`: the listener owns
+its server config from that point on and `Listener.close()` releases it.
+
+`close()` is idempotent and safe on a config that holds nothing, so a failure
+path can close unconditionally on its way out.
+
+the functions that build a config for you close it for you — `tls.dial`,
+`http.get` and friends, `http2.connect`. the `_with_config` variants never
+close, because there the config came from the caller and may well be reused for
+the next connection.
+
+what a config does **not** own is its trust anchors. root bundles are parsed
+once per distinct bundle and shared by every config that trusts them, and the
+system bundle is read from disk at most once per process, so building a config
+per request costs a few small map entries rather than a copy and a re-parse of
+a couple of hundred kilobytes of pem. that sharing is why `client_config()` is
+cheap enough to call on a hot path; closing is what keeps it that way.
 
 ## common options
 

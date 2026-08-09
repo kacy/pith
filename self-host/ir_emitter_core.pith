@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import c_get_expr_type, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, add_type_info
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind
@@ -1342,6 +1342,23 @@ fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
 fn ir_temp_name(prefix: String) -> String:
     return prefix + "_" + ir_label()
 
+# emit one call argument. a plain value the checker widened to an optional
+# parameter goes through the same target-shaped emitter every other widening
+# position already uses, so a `f(x: Int?)` body reads the Some(3) tuple it
+# expects rather than the bare integer. everything else emits unchanged.
+fn ir_emit_call_arg(expr_idx: Int) -> Int:
+    if c_argument_widens_to_optional(expr_idx):
+        return ir_emit_value_for_target(expr_idx, "tuple")
+    return ir_expr(expr_idx)
+
+# a widened argument's register is the optional wrapper, not the value the
+# release walkers were written against — releasing it as a string or an rc
+# payload would drop a count on the wrong object. the wrapper owns whatever it
+# holds (ir_emit_value_for_target attaches the destructor), so skipping the
+# caller-side release leaks the wrapper rather than freeing something twice.
+fn ir_arg_release_is_skipped(expr_idx: Int) -> Bool:
+    return expr_idx >= 0 and c_argument_widens_to_optional(expr_idx)
+
 fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
     mut arg_regs: List[Int] := []
     for child, i in node.children:
@@ -1351,9 +1368,9 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
         if child_kind == "arg":
             cn := get_node(child)
             if cn.children.len() > 0:
-                arg_regs.push(ir_expr(cn.children[0]))
+                arg_regs.push(ir_emit_call_arg(cn.children[0]))
         else:
-            arg_regs.push(ir_expr(child))
+            arg_regs.push(ir_emit_call_arg(child))
     return arg_regs
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
@@ -1371,6 +1388,8 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
             continue
         expr_idx := ir_method_call_arg_expr(node, i)
         if expr_idx < 0:
+            continue
+        if ir_arg_release_is_skipped(expr_idx):
             continue
         ir_release_owned_string_operand(expr_idx, reg, ir_infer_type(expr_idx))
 
@@ -1407,7 +1426,8 @@ fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int])
             if cn.children.len() == 0:
                 continue
             expr_idx = cn.children[0]
-        ir_release_owned_string_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
+        if ir_arg_release_is_skipped(expr_idx) == false:
+            ir_release_owned_string_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
         reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
@@ -2169,9 +2189,9 @@ fn ir_collect_method_call_regs(node: Node) -> List[Int]:
             if child_kind == "arg":
                 cn := get_node(child)
                 if cn.children.len() > 0:
-                    regs.push(ir_expr(cn.children[0]))
+                    regs.push(ir_emit_call_arg(cn.children[0]))
             else:
-                regs.push(ir_expr(child))
+                regs.push(ir_emit_call_arg(child))
     return regs
 
 # {x:8.2}-style parts: convert with precision when asked, then pad.
@@ -4762,7 +4782,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             mut ai := 0
             while ai < node.children.len() - 1:
                 arg_idx := ir_method_call_arg_expr(node, ai)
-                arg_regs.push(ir_expr(arg_idx))
+                arg_regs.push(ir_emit_call_arg(arg_idx))
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))

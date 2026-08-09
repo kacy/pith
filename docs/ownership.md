@@ -359,13 +359,13 @@ gaps, all bounded leaks rather than dangling pointers:
   assignment and a call or method argument all supply one, so `f([])`,
   `xs.push([])`, `xs.insert(i, [])` and `m.get_default(k, {})` build the
   same tagged container `mut xs: List[String] := []` then `f(xs)` builds.
-  two shapes still miss out, both of them lists. an argument literal that
-  *has* elements types itself and is left alone, so a nested `f([[]])`
-  tags the outer list and not the inner one — bind the inner list first.
-  and an empty literal against an optional parameter
-  (`f(v: List[String]?)`) gets nothing, because the target the argument
-  declares is the optional and not the container inside it. both err
-  toward the leak: a store into an untagged list takes no count, so the
+  an optional parameter is covered too: `f(v: List[String]?)` takes the
+  type from the container inside the optional and wraps the tagged
+  container in a `Some`, which is also what stops the callee reading a
+  bare list handle as an optional tuple. one shape still misses out — an
+  argument literal that *has* elements types itself and is left alone, so
+  a nested `f([[]])` tags the outer list and not the inner one; bind the
+  inner list first. it errs toward the leak: a store into an untagged list takes no count, so the
   caller's stays outstanding. what narrows it is the store: an untagged
   list that is handed a container, struct, `Bytes` or closure adopts that
   kind at the first store and owns it from then on, the same second

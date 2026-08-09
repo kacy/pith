@@ -1,0 +1,39 @@
+# widening a plain value into an optional argument runs in exactly one
+# direction, and only when the inner type matches. every case below stays a
+# compile error.
+
+struct Counter:
+    base: Int
+
+impl Counter:
+    fn bump(step: Int?) -> Int:
+        return self.base + step.unwrap_or(0)
+
+    fn exact(step: Int) -> Int:
+        return self.base + step
+
+fn takes_int(n: Int) -> Int:
+    return n + 1
+
+fn takes_optional(x: Int?) -> Int:
+    return x.unwrap_or(0)
+
+fn takes_list_optional(xs: List[Int]?) -> Int:
+    return xs.unwrap_or([]).len()
+
+fn main():
+    c := Counter(1)
+    # a bare `none` still satisfies only an optional target, so a concrete
+    # parameter rejects it — for a function and for a method alike.
+    print(takes_int(none).to_string())
+    print(c.exact(none).to_string())
+    # widening does not run backwards: an optional does not narrow into a
+    # plain parameter.
+    mut o: Int? := 3
+    print(takes_int(o).to_string())
+    print(c.exact(o).to_string())
+    # the inner type still has to match.
+    print(takes_optional("three").to_string())
+    print(c.bump("three").to_string())
+    # a plain Int is not the inner type of List[Int]?, so it does not widen.
+    print(takes_list_optional(3).to_string())

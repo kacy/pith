@@ -105,6 +105,12 @@ pub mut struct_instance_tids: List[Int] := []
 mut suppress_unknown_type_for: Map[String, Int] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
 pub mut expression_type_cache: Map[Int, Int] := {}
+# argument expressions the checker accepted by widening a plain value into
+# the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
+# the emitter has no view of a callee's declared parameter types once the
+# call name is resolved, so the decision is recorded here at the one place
+# that does know it. see argument_widens_to_optional.
+pub mut optional_widened_arguments: Map[Int, Bool] := {}
 # bindings declared from an empty collection literal with no annotation
 # (`mut tasks := []`), keyed by binding arena index, valued with the
 # literal's node index. such a binding has no element type yet; the
@@ -135,6 +141,7 @@ pub fn initialize_checker(file_path: String):
     struct_instance_tids = []
     suppress_unknown_type_for = {}
     expression_type_cache = {}
+    optional_widened_arguments = {}
     open_empty_literal_bindings = {}
     module_aliases = {}
     module_export_entries = []
@@ -1451,6 +1458,44 @@ fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: 
         return true
     return types_structurally_equal(actual_tid, expected_info.inner)
 
+# a plain inner value satisfies an optional parameter by widening to Some(v),
+# the same rule a binding, a struct field and a collection element already
+# apply through value_matches_optional_target. argument position is the one
+# that never routed through it, so `f(3)` against `fn f(x: Int?)` reported.
+#
+# only the widening case is recorded. an argument that is already the optional
+# arrives in the right shape on its own, and a bare `none` builds the empty
+# tuple in ir_expr — recording either would make the emitter wrap a value that
+# is already wrapped. `none` is excluded outright so #680's rule survives: it
+# stays a value that only an optional target accepts, and nothing here lets a
+# plain value satisfy `none` in the other direction.
+fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
+    if expr_idx < 0 or actual_tid < 0 or expected_tid < 0:
+        return false
+    if actual_tid == expected_tid:
+        return false
+    if is_error_type(actual_tid) or is_error_type(expected_tid):
+        return false
+    if is_none_type(actual_tid) or is_none_type(expected_tid):
+        return false
+    expected_info := get_type_info(expected_tid)
+    if expected_info.kind != "optional":
+        return false
+    if expected_info.inner < 0:
+        return false
+    if get_type_info(actual_tid).kind == "optional":
+        return false
+    if actual_tid != expected_info.inner:
+        if types_structurally_equal(actual_tid, expected_info.inner) == false:
+            return false
+    optional_widened_arguments.insert(expr_idx, true)
+    return true
+
+# does the emitter have to wrap this argument expression in Some(v)? true only
+# for the nodes argument_widens_to_optional accepted.
+pub fn c_argument_widens_to_optional(expr_idx: Int) -> Bool:
+    return optional_widened_arguments.contains_key(expr_idx)
+
 fn struct_field_has_default(struct_name: String, field_name: String) -> Bool:
     return struct_field_default_nodes.contains_key(struct_name + "." + field_name)
 
@@ -1537,6 +1582,25 @@ fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual:
     if node.children.len() != 0:
         return
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
+        # an optional-of-container parameter (`f(v: List[String]?)`) declares
+        # the optional, not the container inside it, so an empty literal used
+        # to match nothing and reach the callee as a bare container handle —
+        # which the callee then read as an optional tuple and dereferenced.
+        # take the type from the inner container and mark the argument so the
+        # emitter wraps the tagged container in the Some the callee expects.
+        expected_info := get_type_info(expected)
+        if expected_info.kind == "optional" and expected_info.inner >= 0:
+            inner_info := get_type_info(expected_info.inner)
+            if inner_info.kind == "list" or inner_info.kind == "map" or inner_info.kind == "set":
+                propagate_expected_collection_type(expr_idx, expected_info.inner)
+                # only wrap once the literal really took the inner container's
+                # type. a literal whose spelling does not match it (`{}` against
+                # a `List[T]?`) is left exactly as it was rather than wrapped
+                # around the wrong container.
+                if expression_type_cache.contains_key(expr_idx):
+                    if expression_type_cache[expr_idx] == expected_info.inner:
+                        optional_widened_arguments.insert(expr_idx, true)
+                return
         propagate_expected_collection_type(expr_idx, expected)
 
 # true when a single value can build an element of the expected type:
@@ -2947,8 +3011,10 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
             if idx < fn_info.param_types.len():
                 expected := fn_info.param_types[idx]
                 if arg_type != expected:
-                    if types_structurally_equal(arg_type, expected) == false:
-                        report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                    if argument_widens_to_optional(arg_expr_idx, arg_type, expected) == false:
+                        if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
+                            if types_structurally_equal(arg_type, expected) == false:
+                                report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
 
@@ -4115,8 +4181,10 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             if is_error_type(atype) == false:
                 if aidx < param_types.len():
                     if atype != param_types[aidx]:
-                        if types_structurally_equal(atype, param_types[aidx]) == false:
-                            report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
+                        if argument_widens_to_optional(arg_expr, atype, param_types[aidx]) == false:
+                            if collection_literal_matches_target(arg_expr, param_types[aidx], scope_id) == false:
+                                if types_structurally_equal(atype, param_types[aidx]) == false:
+                                    report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
             aidx = aidx + 1
         return ret_type
     # a fn-value field invoked like a method: `h.shut(x)` where `shut: fn(C)` is

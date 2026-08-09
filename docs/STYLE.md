@@ -444,7 +444,7 @@ Every file should start with a brief description:
 # This module provides functions for making HTTP requests with support
 # for keep-alive connections, retries, and custom headers.
 
-from std.net.tcp import connect, read, write, close
+from std.net.tcp import connect, read, write_all, close
 ```
 
 ### Import Organization

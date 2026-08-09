@@ -30,6 +30,7 @@ import std.hash as hash
 import std.crypto.hmac as hmac
 import std.crypto.kdf as kdf
 import std.crypto.random as random
+import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
@@ -129,7 +130,7 @@ impl Conn:
     fn send_raw(data: Bytes) -> Int!:
         if self.secure:
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
-        return tcp_write_bytes(self.fd, data)!
+        return tcp.write_all_bytes(self.fd, data)!
 
     # frame and send a message. a `type_byte` of 0 omits the type prefix, as the
     # startup message requires.
@@ -198,7 +199,7 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
     # until the socket is wrapped in a Conn (or handed to the tls session), no
     # owner will close it, so every failure below closes the fd by hand.
     request := bytes.concat(be32(8), be32(80877103))
-    sent := tcp_write_bytes(fd, request)
+    sent := tcp.write_all_bytes(fd, request)
     if sent.is_err:
         tcp_close(fd)
         fail sent.err

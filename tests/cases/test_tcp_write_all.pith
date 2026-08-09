@@ -1,0 +1,160 @@
+# a write larger than the socket send buffer has to finish, not stop half way.
+#
+# tcp_write is one write(2). the kernel takes what fits in the send buffer and
+# returns that count; the rest is not queued anywhere and is simply not sent.
+# a caller that ignores the count drops the tail, and the peer waits forever for
+# bytes that were never written — which is why a 1 MiB redis SET worked and a
+# 4 MiB one hung.
+#
+# every case here sends a payload several times the send buffer to a reader that
+# deliberately drains slower than the writer fills, which is what forces the
+# short write. the delay between chunks is the mechanism under test, not a
+# startup wait: the listener is always bound before anything connects to it.
+#
+# the non-ascii case is the one worth reading twice. the send buffer fills at
+# whatever byte offset it fills at, which may be in the middle of a multi-byte
+# character, and a String cannot be cut there — resuming as text stopped the
+# process outright. the one-byte ascii prefix on that payload guarantees the
+# boundary misses a character start.
+
+import std.redis as redis
+import std.net.tcp as tcp
+import std.time as time
+from std.io import TcpStream
+
+# how much the stub takes per read, and the pause after each one. together they
+# hold the reader well under the writer, so the send buffer is full for most of
+# the transfer.
+DRAIN_CHUNK := 65536
+DRAIN_PAUSE := 1
+
+# grow a seed by doubling until it covers `size` bytes. doubling keeps building
+# a multi-megabyte payload cheap; repeated appends would copy the whole thing
+# once per append.
+fn payload_of(seed: String, size: Int) -> String:
+    mut out := seed
+    while out.len() < size:
+        out = out + out
+    return out.substring(0, size)
+
+# accept one connection, then read it dry a chunk at a time, reporting the total.
+# reading into Bytes rather than String keeps the count honest: a String read
+# that splits a multi-byte character substitutes a replacement character and the
+# byte count stops matching what was sent.
+fn drain(listener: Int, label: String) -> Int!:
+    conn := tcp_accept(listener)!
+    mut got := 0
+    while true:
+        chunk := tcp_read_bytes(conn, DRAIN_CHUNK)!
+        if chunk.len() == 0:
+            break
+        got = got + chunk.len()
+        time.delay(DRAIN_PAUSE)
+    print("{label}: read {got}")
+    tcp_close(conn)
+    return 0
+
+# write `payload` with the fd-level helper and report what it returned.
+fn round_trip_fd(port: Int, label: String, payload: String) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn drain(listener, label)
+    fd := tcp_connect("127.0.0.1", port)!
+    wrote := tcp.write_all(fd, payload)!
+    print("{label}: write_all returned {wrote}")
+    tcp_close(fd)
+    await task
+    tcp_close(listener)
+    return 0
+
+# the same, through std.io's TcpStream.write_all — the buffered-writer layer
+# sits on this one.
+fn round_trip_stream(port: Int, label: String, payload: String) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn drain(listener, label)
+    stream := TcpStream(tcp_connect("127.0.0.1", port)!)
+    wrote := stream.write_all(payload)!
+    print("{label}: write_all returned {wrote}")
+    stream.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+# a stub redis that reads a command of a known length and answers +OK, draining
+# as slowly as the others so the client's request is short-written.
+fn stub_redis(listener: Int, want: Int) -> Int!:
+    conn := tcp_accept(listener)!
+    mut got := 0
+    while got < want:
+        chunk := tcp_read_bytes(conn, DRAIN_CHUNK)!
+        if chunk.len() == 0:
+            print("redis stub: peer stopped after {got} of {want}")
+            tcp_close(conn)
+            return 0
+        got = got + chunk.len()
+        time.delay(DRAIN_PAUSE)
+    print("redis stub: read the whole {got}-byte command")
+    tcp.write_all(conn, "+OK\r\n")!
+    tcp_close(conn)
+    return 0
+
+# the exact wire length of `SET big <value>` as a RESP array of bulk strings.
+fn set_command_len(key: String, value: String) -> Int:
+    header := "*3\r\n$3\r\nSET\r\n"
+    key_part := "${key.len()}\r\n{key}\r\n"
+    value_part := "${value.len()}\r\n{value}\r\n"
+    return header.len() + key_part.len() + value_part.len()
+
+fn redis_set(port: Int, value: String) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn stub_redis(listener, set_command_len("big", value))
+    client := redis.connect("127.0.0.1", port)!
+    stored := client.set("big", value)
+    if stored.is_err:
+        print("redis SET: failed: {stored.err}")
+    else:
+        print("redis SET: stored={stored.ok}")
+    client.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+# a peer that hangs up without reading: the write must report the close rather
+# than claim it sent everything, and must not take the process down with it.
+fn hang_up(listener: Int) -> Int!:
+    conn := tcp_accept(listener)!
+    tcp_close(conn)
+    return 0
+
+fn write_to_a_gone_peer(port: Int, payload: String) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn hang_up(listener)
+    fd := tcp_connect("127.0.0.1", port)!
+    await task
+    result := tcp.write_all(fd, payload)
+    if result.is_err:
+        print("closed peer: failed as it should")
+    else:
+        print("closed peer: claimed {result.ok} bytes went out")
+    tcp_close(fd)
+    tcp_close(listener)
+    return 0
+
+fn main() -> Int!:
+    # 4 MiB of ascii: the size the redis report named.
+    ascii := payload_of("abcdefgh", 4 * 1024 * 1024)
+    print("ascii payload: {ascii.len()} bytes")
+    round_trip_fd(17530, "fd ascii", ascii)!
+    redis_set(17531, ascii)!
+
+    # 3 MiB of three-byte characters behind a single ascii byte, so the first
+    # short write cannot land on a character start.
+    wide := "x" + payload_of("€€€€€€€€", 3 * 1024 * 1024)
+    print("wide payload: {wide.len()} bytes")
+    round_trip_fd(17532, "fd wide", wide)!
+    round_trip_stream(17533, "stream wide", wide)!
+
+    write_to_a_gone_peer(17534, ascii)!
+
+    # the empty write is a no-op, not a failure, and not a closed-peer report.
+    print("empty: {tcp.write_all(-1, "") catch -1}")
+    return 0

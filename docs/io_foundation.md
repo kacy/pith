@@ -64,6 +64,35 @@ the io layer now includes:
 `std.fs` now exposes stream-based `open`, `create`, and `open_append` on the
 same foundation.
 
+## write is one syscall, write_all is the loop
+
+this is the one distinction in the layer worth learning before you use it.
+
+`write` and `write_bytes` are a single `write(2)`. a socket has a bounded send
+buffer, so a buffer larger than the space left in it is written *in part*: the
+kernel takes what fits and returns that count, and the rest is not queued
+anywhere. a short write is normal, not an error — but discarding the returned
+count drops the tail silently, and the peer then waits for bytes that were never
+written. a 1 MiB redis `SET` used to work and a 4 MiB one used to hang for
+exactly this reason.
+
+`write_all` and `write_all_bytes` are the looping form: they resume from where
+the last write stopped and only stop early when a write accepts nothing at all,
+which means the reader is gone. use them unless you have a specific reason to
+handle the count yourself. the same pair exists at every level:
+
+- fd level: `std.net.tcp`'s `write` / `write_all` / `write_all_bytes`
+- stream level: `TcpStream`, `FileStream`, `ProcessStdin`
+- tls: `Conn.write_bytes` is capped at one 16 KiB record, so it too is a partial
+  write by construction; `Conn.write_all_bytes` is the loop
+- the buffered writers flush through `write_all`, so they are already correct
+
+one subtlety the loop has to get right: the resume runs on **bytes**, never on
+text. a send buffer fills at whatever byte offset it fills at, and that offset
+can be in the middle of a multi-byte character. a `String` cannot be cut there —
+slicing one at a non-boundary offset stops the process — so the text `write_all`
+helpers encode once and resume through their bytes counterpart.
+
 ## why the adapters are handle-backed
 
 pith structs are value types right now. that means a tiny adapter struct cannot

@@ -201,6 +201,13 @@ http.end_server_span(span, resp.status)
 if you're speaking a protocol the std clients don't cover, `format_traceparent`
 and `parse_traceparent` give you the raw header both ways.
 
+an inbound header is untrusted input, so `parse_traceparent` validates it before
+it trusts it: the version, trace id, span id, and flags must each be exactly
+their spec width in lowercase hex, and anything else returns `none` and starts a
+fresh trace rather than joining a bogus one. the sampled decision is read as bit
+0 of the flags byte, as the spec defines it, so a peer that sets another flag
+alongside it (`-03`) is still understood as sampled.
+
 ## OTLP export
 
 `std.obs.init()` reads the environment and wires everything up. the variables

@@ -1,0 +1,146 @@
+# one unauthenticated http request used to be able to kill a pith web server.
+#
+# std.web installs its observe middleware on every app by default. it opens a
+# server span through http.begin_server_span, which reads the inbound
+# `traceparent` header and hands it to trace.parse_traceparent. that parser
+# length-checked the flags field in bytes and then sliced it by byte offset —
+# and a slice through the middle of a multi-byte character is a runtime trap,
+# not a recoverable error, so the process exited 1 and no catch could stop it.
+# two bytes from any client, no credentials.
+#
+# a unit test on the parser does not prove the middleware path is safe, so this
+# drives the whole chain over a real socket: hostile headers first, then a
+# well-formed one, then a plain request, checking after every hostile round that
+# the server is still answering. it also checks that a valid traceparent is
+# still joined, because rejecting everything would "fix" this and break tracing.
+
+import std.net.http as http
+import std.net.tcp as tcp
+import std.time as time
+import std.trace as trace
+import std.web as web
+
+PORT := 50933
+
+TRACE_ID := "0af7651916cd43dd8448eb211c80319c"
+SPAN_ID := "b7ad6b7169203331"
+
+# echo the trace id the request is running under, so the caller can tell a
+# joined trace from a fresh one.
+fn home(req: web.Request) -> http.HttpResponse:
+    return http.text(200, trace.current_context().trace_id)
+
+fn run_server():
+    app := web.new().get("/", home)
+    app.listen("127.0.0.1", PORT) catch 0
+
+# read until the 32-byte body has arrived. every response here carries a trace
+# id, so the length is known and there is no need to hang waiting on EOF.
+fn read_response(fd: Int) -> String:
+    mut buffer := ""
+    mut rounds := 0
+    while rounds < 64:
+        cut := buffer.index_of("\r\n\r\n")
+        if cut >= 0 and buffer.len() - (cut + 4) >= 32:
+            break
+        chunk := tcp.read(fd, 4096) catch ""
+        if chunk == "":
+            break
+        buffer = buffer + chunk
+        rounds = rounds + 1
+    return buffer
+
+# "200" for a normal answer, or a marker naming how the exchange failed.
+fn status_of(response: String) -> String:
+    if response == "":
+        return "NO_RESPONSE"
+    space := response.index_of(" ")
+    if space < 0:
+        return "NO_STATUS"
+    rest := response.substring(space + 1, response.len())
+    next := rest.index_of(" ")
+    if next < 0:
+        return "NO_STATUS"
+    return rest.substring(0, next)
+
+# the trace id the handler ran under: "joined" when it is the one we sent,
+# "fresh" when the server started its own trace, and a marker otherwise.
+fn trace_of(response: String) -> String:
+    cut := response.index_of("\r\n\r\n")
+    if cut < 0:
+        return "NO_BODY"
+    body := response.substring(cut + 4, response.len())
+    if body == TRACE_ID:
+        return "joined"
+    if body.len() == 32:
+        return "fresh"
+    return "NO_TRACE"
+
+# one raw http/1.1 request, with `header` sent verbatim as the traceparent. it
+# is written by hand rather than through the http client so that bytes no client
+# would produce still reach the server exactly as written.
+fn probe(header: String) -> String:
+    fd_r := tcp.connect("127.0.0.1", PORT)
+    if fd_r.is_err:
+        return "CONNECT_ERR"
+    fd := fd_r.ok
+    tcp.set_timeout(fd, 5000)
+    mut request := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    if header != "":
+        request = request + "traceparent: " + header + "\r\n"
+    request = request + "\r\n"
+    written := tcp.write_all(fd, request) catch 0
+    if written == 0:
+        tcp.close(fd)
+        return "WRITE_ERR"
+    response := read_response(fd)
+    tcp.close(fd)
+    return status_of(response) + " " + trace_of(response)
+
+# the spawned server is up once a plain request comes back answered. polling the
+# thing under test is the readiness signal; a sleep would only be a guess.
+fn wait_until_serving(timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := probe("")
+        if got != "CONNECT_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "CONNECT_ERR"
+
+fn main() -> Int:
+    # the parser is only reached when tracing is on, which is what std.obs.init
+    # does for any service with an OTLP endpoint configured.
+    trace.set_active(true)
+    spawn run_server()
+
+    print("ready: " + wait_until_serving(10000))
+
+    good := "00-" + TRACE_ID + "-" + SPAN_ID + "-"
+
+    # the flags field cut mid-character: the header that used to end the process.
+    print("split flags: " + probe(good + "0€"))
+    print("still up: " + probe(""))
+
+    # the same hazard in the other fields, each the right byte length.
+    print("split trace id: " + probe("00-" + TRACE_ID.substring(0, 29) + "€-" + SPAN_ID + "-01"))
+    print("split span id: " + probe("00-" + TRACE_ID + "-" + SPAN_ID.substring(0, 13) + "€-01"))
+    print("split version: " + probe("0€-" + TRACE_ID + "-" + SPAN_ID + "-01"))
+    print("still up: " + probe(""))
+
+    # a burst of them, in case the damage were cumulative rather than immediate.
+    mut i := 0
+    while i < 16:
+        probe(good + "€")
+        probe(good + "€0")
+        probe("€-" + TRACE_ID + "-" + SPAN_ID + "-01")
+        i = i + 1
+    print("still up: " + probe(""))
+
+    # rejecting everything would pass all of the above and silently break
+    # distributed tracing, so a valid header must still be joined.
+    print("sampled: " + probe(good + "01"))
+    print("unsampled: " + probe(good + "00"))
+
+    return 0

@@ -9,10 +9,12 @@
 # as an error rather than as a string quietly filled with replacement
 # characters. reach for a redis client that speaks bytes if you store blobs.
 #
-# i/o goes straight to the tcp_* builtins, the same ones std.io wraps; the
-# std.net.tcp module is a thin alias over them and isn't needed here.
+# reads go straight to the tcp_* builtins, the same ones std.io wraps. writes
+# go through std.net.tcp's write_all, because a single write syscall stops once
+# the send buffer is full and a large command has to resume from there.
 
 import std.bytes as bytes
+import std.net.tcp as tcp
 
 # replies come off an untrusted socket, so the length and count fields a server
 # advertises are bounded before we act on them: a hostile or buggy peer must not
@@ -200,6 +202,12 @@ impl Client:
         if depth > MAX_REPLY_DEPTH:
             fail "redis: reply nesting too deep"
         line := self.read_line()!
+        # read_line returns what came before the terminator, so a bare CRLF
+        # arrives as an empty line. indexing a String is strict — line[0] on an
+        # empty one stops the process — and a malformed reply must fail the call
+        # rather than take the program down with it.
+        if line.len() == 0:
+            fail "redis: empty reply line"
         tag := line[0]
         body := line.substring(1, line.len())
         if tag == "+":
@@ -236,7 +244,7 @@ impl Client:
         mut out := "*{args.len()}\r\n"
         for a in args:
             out = out + "${a.len()}\r\n{a}\r\n"
-        tcp_write(self.fd, out)!
+        tcp.write_all(self.fd, out)!
         reply := self.read_reply()!
         if reply_is_error(reply):
             fail "redis: {reply_text(reply)}"

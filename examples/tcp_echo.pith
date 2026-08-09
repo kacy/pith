@@ -1,12 +1,15 @@
 # tcp echo — start a server, connect a client, echo a message
 
+import std.net.tcp as tcp
+
 fn server(port: Int) -> String!:
-    server_fd := tcp_listen("127.0.0.1", port)!
-    defer tcp_close(server_fd)
-    client_fd := tcp_accept(server_fd)!
-    defer tcp_close(client_fd)
-    msg := tcp_read(client_fd, 1024)!
-    tcp_write(client_fd, msg)!
+    server_fd := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(server_fd)
+    client_fd := tcp.accept(server_fd)!
+    defer tcp.close(client_fd)
+    msg := tcp.read(client_fd, 1024)!
+    # write_all keeps going after a short write; write would drop the remainder.
+    tcp.write_all(client_fd, msg)!
     return ""
 
 fn run() -> String!:
@@ -22,10 +25,10 @@ fn run() -> String!:
     sleep(100)
 
     # connect and exchange data
-    connection_fd := tcp_connect("127.0.0.1", port)!
-    defer tcp_close(connection_fd)
-    tcp_write(connection_fd, "hello from pith")!
-    response := tcp_read(connection_fd, 1024)!
+    connection_fd := tcp.connect("127.0.0.1", port)!
+    defer tcp.close(connection_fd)
+    tcp.write_all(connection_fd, "hello from pith")!
+    response := tcp.read(connection_fd, 1024)!
     print("echo response: {response}")
 
     await server_task

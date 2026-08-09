@@ -17,6 +17,7 @@ import std.bytes as bytes
 import std.bits as bits
 import std.hash as hash
 import std.encoding as encoding
+import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
@@ -144,7 +145,7 @@ impl Conn:
     fn send_raw(data: Bytes) -> Int!:
         if self.secure:
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
-        return tcp_write_bytes(self.fd, data)!
+        return tcp.write_all_bytes(self.fd, data)!
 
     fn send_packet(seq: Int, payload: Bytes) -> Int!:
         out := bytes.buffer()

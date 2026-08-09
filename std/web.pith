@@ -847,13 +847,13 @@ impl FrameStream:
 # (END_STREAM + END_HEADERS). :authority is a fixed "localhost" — the app does
 # not route on it.
 fn send_h2c_get(fd: Int, path: String) -> Int!:
-    tcp_write_bytes(fd, bytes.from_string_utf8(H2C_PREFACE))!
+    tcp.write_all_bytes(fd, bytes.from_string_utf8(H2C_PREFACE))!
     no_settings: List[frames.Setting] := []
-    tcp_write_bytes(fd, frames.frame_bytes(frames.settings_frame(no_settings)!)!)!
+    tcp.write_all_bytes(fd, frames.frame_bytes(frames.settings_frame(no_settings)!)!)!
     encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
     fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "localhost")]
     block := encoder.encode(fields)
-    tcp_write_bytes(fd, frames.frame_bytes(frames.headers_frame(1, block, true, true))!)!
+    tcp.write_all_bytes(fd, frames.frame_bytes(frames.headers_frame(1, block, true, true))!)!
     return 0
 
 # read response frames until stream 1 ends, returning the DATA payload as text.

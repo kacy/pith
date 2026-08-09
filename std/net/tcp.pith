@@ -3,12 +3,15 @@
 # TCP client and server functionality. All I/O is blocking — use spawn for concurrency.
 # Connections are represented as plain Int file descriptors.
 #
-#   from std.net.tcp import connect, read, write, close
-import std.resilience as resilience
+#   from std.net.tcp import connect, read, write_all, close
+#
 #   fd := connect("127.0.0.1", 8080)!
-#   write(fd, "hello")!
+#   write_all(fd, "hello")!
 #   data := read(fd, 1024)!
 #   close(fd)
+
+import std.bytes as bytes
+import std.resilience as resilience
 
 # ===============================================================
 # Client Operations
@@ -105,12 +108,46 @@ pub fn read(fd: Int, max_bytes: Int) -> String!:
     return tcp_read(fd, max_bytes)
 
 # Writes data to a connection.
-# Returns the number of bytes written or fails on error.
+#
+# this is one write syscall, and it returns the number of bytes the kernel
+# accepted — which may be fewer than were offered. a socket has a bounded send
+# buffer, so a buffer larger than the space left in it is written in part and
+# the rest is not written at all. the count is the whole result: ignoring it
+# drops the tail silently, and the peer waits for bytes that will never come.
+# reach for write_all() unless you have a reason to handle the count yourself.
 #
 # as with read(), fd must be a socket: a write to a descriptor that is not one
 # would overwrite whatever file inherited the number, so it stops the process.
 pub fn write(fd: Int, data: String) -> Int!:
     return tcp_write(fd, data)
+
+# Writes every byte of data to a connection, and returns how many that was.
+#
+# a short write is normal rather than an error — the send buffer filled — so
+# this resumes from where the last one stopped and keeps going until the buffer
+# is out. only a write that accepts nothing at all ends it, and that means the
+# reader is gone.
+#
+# the loop runs on bytes, not on characters: a send buffer fills at whatever
+# byte offset it fills at, which may be in the middle of a multi-byte character,
+# and a String cannot be cut there.
+pub fn write_all(fd: Int, data: String) -> Int!:
+    return write_all_bytes(fd, bytes.from_string_utf8(data))
+
+# Writes every byte of data to a connection, and returns how many that was.
+# The Bytes form of write_all(); see it for the contract.
+pub fn write_all_bytes(fd: Int, data: Bytes) -> Int!:
+    total := data.len()
+    mut sent := 0
+    mut remaining := data
+    while sent < total:
+        wrote := tcp_write_bytes(fd, remaining)!
+        if wrote <= 0:
+            fail "tcp: connection closed after writing {sent} of {total} bytes"
+        sent = sent + wrote
+        if sent < total:
+            remaining = remaining.slice(wrote, remaining.len())
+    return sent
 
 # Set read timeout in milliseconds (0 = no timeout).
 # Connections default to 5 second timeout.
@@ -129,5 +166,11 @@ pub fn close(fd: Int):
 test "tcp wrappers report invalid descriptor errors":
     assert(read(-1, 8).is_err)
     assert(write(-1, "hello").is_err)
+    assert(write_all(-1, "hello").is_err)
+    assert(write_all_bytes(-1, bytes.from_string_utf8("hello")).is_err)
     set_timeout(-1, 1)
     close(-1)
+
+test "write_all on an empty buffer writes nothing and does not fail":
+    assert_eq(write_all(-1, "") catch -1, 0)
+    assert_eq(write_all_bytes(-1, bytes.empty()) catch -1, 0)

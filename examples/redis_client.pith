@@ -7,6 +7,7 @@
 # skip the mock entirely.
 
 import std.redis as redis
+import std.net.tcp as tcp
 
 # a stand-in redis: accept one connection, then reply to each command in turn
 # with a pre-baked RESP response. it does not parse the requests — the client
@@ -18,7 +19,7 @@ fn fake_redis(port: Int, replies: List[String]) -> Int!:
     defer tcp_close(conn)
     for reply in replies:
         request := tcp_read(conn, 4096)!
-        tcp_write(conn, reply)!
+        tcp.write_all(conn, reply)!
     return 0
 
 fn main() -> Int!:

@@ -1091,38 +1091,19 @@ fn write_all_string(writer: StringBuffer, data: String) -> Int!:
         remaining = remaining_after_write(remaining, wrote)
     return total
 
+# the text write_all loops all resume through their bytes counterpart rather
+# than re-slicing the String. a write stops at whatever byte offset the send
+# buffer or the pipe ran out at, and that offset can be in the middle of a
+# multi-byte character — which a String cannot be cut at, so resuming as text
+# would stop the process on the first non-ascii payload big enough to be split.
 fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
-    mut total := 0
-    mut remaining := data
-    while remaining.len() > 0:
-        wrote := writer.write(remaining)!
-        if wrote <= 0:
-            fail "write returned 0"
-        total = total + wrote
-        remaining = remaining_after_write(remaining, wrote)
-    return total
+    return write_all_tcp_stream_bytes(writer, encode_utf8(data))
 
 fn write_all_tcp_stream_ctx(writer: TcpStream, ctx: Context, data: String) -> Int!BlockingError:
-    mut total := 0
-    mut remaining := data
-    while remaining.len() > 0:
-        wrote := tcp_stream_write_ctx(writer, ctx, remaining)!
-        if wrote <= 0:
-            fail blocking_failed("write returned 0")
-        total = total + wrote
-        remaining = remaining_after_write(remaining, wrote)
-    return total
+    return write_all_tcp_stream_bytes_ctx(writer, ctx, encode_utf8(data))
 
 fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
-    mut total := 0
-    mut remaining := data
-    while remaining.len() > 0:
-        wrote := writer.write(remaining)!
-        if wrote <= 0:
-            fail "write returned 0"
-        total = total + wrote
-        remaining = remaining_after_write(remaining, wrote)
-    return total
+    return write_all_file_stream_bytes(writer, encode_utf8(data))
 
 fn copy_string(reader: StringReader, writer: StringBuffer) -> Int!:
     return copy_string_chunked(reader, writer, DEFAULT_CHUNK_SIZE)
@@ -1228,15 +1209,7 @@ pub fn append_file_text_chunked(path: String, data: String, chunk_size: Int) -> 
     return total
 
 fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:
-    mut total := 0
-    mut remaining := data
-    while remaining.len() > 0:
-        wrote := writer.write(remaining)!
-        if wrote <= 0:
-            fail "write returned 0"
-        total = total + wrote
-        remaining = remaining_after_write(remaining, wrote)
-    return total
+    return write_all_process_stdin_bytes(writer, encode_utf8(data))
 
 fn read_all_process_stdout(reader: ProcessStdout) -> String!:
     return read_all_process_stdout_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -1275,15 +1248,7 @@ fn process_stdin_write_ctx(writer: ProcessStdin, ctx: Context, data: String) -> 
     return wrote.ok
 
 fn write_all_process_stdin_ctx(writer: ProcessStdin, ctx: Context, data: String) -> Int!BlockingError:
-    mut total := 0
-    mut remaining := data
-    while remaining.len() > 0:
-        wrote := process_stdin_write_ctx(writer, ctx, remaining)!
-        if wrote <= 0:
-            fail blocking_failed("write returned 0")
-        total = total + wrote
-        remaining = remaining_after_write(remaining, wrote)
-    return total
+    return write_all_process_stdin_bytes_ctx(writer, ctx, encode_utf8(data))
 
 fn process_stdout_read_ctx(reader: ProcessStdout, ctx: Context, max_bytes: Int) -> String!BlockingError:
     task := spawn process_stdout_read_worker(reader, max_bytes)

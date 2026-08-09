@@ -38,10 +38,11 @@ mut native_server_client_ca_optional: Map[Int, Bool] := {}
 mut native_listener_config: Map[Int, Int] := {}
 
 # guards the whole config registry above, the two hook maps declared further
-# down, and the handle counter. the registry is not startup-only state: an https
-# client builds a fresh config for every request (see std.net.http), so one task
-# is allocating a handle and inserting while another is mid-handshake reading
-# the same maps and a third is removing from them in Config.close(). two tasks
+# down, the handle counter, and the root bundle caches below. the registry is
+# not startup-only state: an https client builds a fresh config for every
+# request (see std.net.http), so one task is allocating a handle and inserting
+# while another is mid-handshake reading the same maps and a third is removing
+# from them in Config.close(). two tasks
 # that read the counter together would also land on the same handle and share a
 # registry slot, so a handshake could pick up another config's certificate and
 # key. the lock only ever spans a single map operation — pem parsing,

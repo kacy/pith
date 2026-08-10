@@ -136,6 +136,45 @@ pass around tiny structs that only hold handles into that state. it is not the
 final forever shape, but it gives pith stable buffered and stateful io today
 without waiting on a larger ownership model.
 
+## the buffered text readers are one reader
+
+`BufferedStringReader`, `BufferedTcpStream`, `BufferedFileReader`,
+`BufferedProcessStdout` and `BufferedProcessStderr` are five wrapper types over
+one implementation. they differ in exactly one thing — which function a refill
+calls to get the next chunk — so a reader carries a source tag and there is a
+single `read`, `read_line` and `read_until` rather than five copies of each.
+
+the deadline-aware reads are the one split that is real. `read_ctx`,
+`read_line_ctx` and `read_until_ctx` return a different error type, and the
+context has to reach the source read itself, since waiting for a chunk is the
+only part of a buffered read that can block. so those are a second
+implementation, and a string reader and a file — neither of which blocks — do
+not offer them.
+
+two properties are worth knowing when reading that code, because both are easy
+to lose:
+
+- **the result is gathered, not appended.** a pith `String` is immutable, so
+  growing one in a loop rebuilds it on every step and reading n bytes costs on
+  the order of n squared. each read collects its pieces and joins them once.
+- **the buffer has a read cursor.** consuming from the front moves an integer;
+  it does not re-slice the bytes behind it. without that, taking a 60-byte line
+  out of a 4 KiB buffer copies the remaining 4 KiB, and reading that buffer one
+  byte at a time copies it 4096 times. the consumed prefix is dropped in one
+  step when the next chunk arrives, which is also what keeps the buffer from
+  growing without bound.
+
+`read_line` returns the line without its terminator, and strips a CR before the
+LF so a CRLF stream reads the same as an LF one. it tests the last **byte** for
+that CR: a `String` is indexed in bytes, so slicing the last byte off a line
+ending in any non-ascii character asks for the tail of a multi-byte character,
+which stops the process. a line ending in "é" is ordinary text and now reads
+back as ordinary text.
+
+`read(n)` is still counted in bytes, and n landing inside a multi-byte character
+is still an error rather than a silently corrupt string — use `std.text` when
+you want to read by character.
+
 ## stdlib consumers on the shared path
 
 the point of this work was not to stop at toy adapters.

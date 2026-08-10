@@ -1,0 +1,97 @@
+# a buffered reader must return the same thing however the source breaks the
+# stream up. that is the whole point of buffering, and it is the property a
+# rewrite of the buffering is most likely to break.
+#
+# the programme below runs every read the buffered text readers offer — a
+# partial read, an LF line, a CRLF line, an empty line, read_until with and
+# without its separator, a two-byte separator, a short read at end of stream,
+# and end of stream on both scanning reads. it runs against one fixed script at
+# a range of fill sizes. a fill size of one byte puts a read boundary at every
+# offset, which splits the CRLF and splits the two-byte separator.
+#
+# the utf-8 group at the end is a regression: `read_line` used to take the last
+# byte off the line with a substring to test it for CR, and a line ending in a
+# multi-byte character stopped the process rather than returning.
+
+import std.concurrent as concurrent
+import std.io as io
+
+SCRIPT := "abcdefgh\nline2\r\n\nA|B|C--Dtail"
+
+# every read the buffered text readers offer, in one pass over SCRIPT.
+fn transcript(chunk: Int) -> List[String]!:
+    r := io.string_reader(SCRIPT).buffered_chunked(chunk)
+    mut out := []
+    out.push("read4=[" + r.read(4)! + "]")
+    out.push("line=[" + r.read_line()! + "]")
+    out.push("crlf=[" + r.read_line()! + "]")
+    out.push("empty=[" + r.read_line()! + "]")
+    out.push("until=[" + r.read_until("|")! + "]")
+    out.push("until_incl=[" + r.read_until_including("|")! + "]")
+    out.push("until2=[" + r.read_until("--")! + "]")
+    out.push("read2=[" + r.read(2)! + "]")
+    out.push("read_over=[" + r.read(100)! + "]")
+    out.push("eof_line=[" + r.read_line()! + "]")
+    out.push("eof_until=[" + r.read_until("|")! + "]")
+    return out
+
+fn same(a: List[String], b: List[String]) -> Bool:
+    if a.len() != b.len():
+        return false
+    mut i := 0
+    while i < a.len():
+        if a[i] != b[i]:
+            return false
+        i = i + 1
+    return true
+
+fn main() -> Int!:
+    base := transcript(4096)!
+    mut i := 0
+    while i < base.len():
+        print(base[i])
+        i = i + 1
+
+    # the same programme at every fill size has to agree with it.
+    sizes := [1, 2, 3, 5, 7, 64, 4096]
+    mut s := 0
+    while s < sizes.len():
+        got := transcript(sizes[s])!
+        if same(base, got):
+            print("chunk " + sizes[s].to_string() + ": same")
+        else:
+            print("chunk " + sizes[s].to_string() + ": MISMATCH")
+            mut j := 0
+            while j < got.len():
+                if j >= base.len() or base[j] != got[j]:
+                    print("  " + j.to_string() + ": " + got[j])
+                j = j + 1
+        s = s + 1
+
+    # a line ending in a multi-byte character, with and without a CR before the
+    # newline, and a multi-byte separator. the fill size is left at the default
+    # here: a source read is counted in bytes, so a one-byte fill would cut the
+    # "é" in half before the buffering ever saw it.
+    utf8 := io.string_reader("aé\nbé\r\nxxéyy").buffered()
+    print("utf8_lf=[" + utf8.read_line()! + "]")
+    print("utf8_crlf=[" + utf8.read_line()! + "]")
+    print("utf8_sep=[" + utf8.read_until("é")! + "]")
+    print("utf8_rest=[" + utf8.read(2)! + "]")
+
+    # the deadline-aware reads on their data path: a deadline that is nowhere
+    # near expiring must not change what comes back. the existing coverage
+    # drives these only against a deadline that fires.
+    proc := io.spawn_process("printf 'ctx1\nctx2|ctx3'")!
+    reader := proc.stdout().buffered_chunked(1)
+    deadline := concurrent.with_timeout(concurrent.background(), 60000)
+    ctx_line := reader.read_line_ctx(deadline.0)
+    print("ctx_line ok=" + ctx_line.is_ok.to_string() + " [" + ctx_line.ok + "]")
+    ctx_until := reader.read_until_ctx(deadline.0, "|")
+    print("ctx_until ok=" + ctx_until.is_ok.to_string() + " [" + ctx_until.ok + "]")
+    ctx_read := reader.read_ctx(deadline.0, 4)
+    print("ctx_read ok=" + ctx_read.is_ok.to_string() + " [" + ctx_read.ok + "]")
+    ctx_eof := reader.read_line_ctx(deadline.0)
+    print("ctx_eof ok=" + ctx_eof.is_ok.to_string() + " [" + ctx_eof.ok + "]")
+    print("ctx_wait=" + proc.wait().to_string())
+    proc.close()
+    return 0

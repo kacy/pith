@@ -1,0 +1,136 @@
+# a read deadline has to mean the same thing on both backends.
+#
+# `tcp.set_timeout` writes `SO_RCVTIMEO`, which bounds a *blocking* read. the
+# os-thread backend makes one of those, so its deadlines have always worked. the
+# green backend — the default on linux — puts the socket in non-blocking mode,
+# gets EAGAIN, and hands the fd to the epoll reactor; that wait used to carry no
+# deadline at all, so every read timeout in the stdlib was inert in the default
+# configuration and a client that connected and said nothing pinned a task
+# forever.
+#
+# this drives the three cases over real sockets. it runs in the regression
+# corpus, which is checked under both backends against one expected file, so a
+# deadline that fires on one and not the other shows up as differing output
+# rather than as a green-only hang.
+#
+# the pipe case is here because the two share the retry loop: `SO_RCVTIMEO` is a
+# socket option and a child process's stdout has none, so a quiet child must
+# still be waited for rather than given up on.
+
+import std.net.tcp as tcp
+import std.os.process as process
+import std.time as time
+
+SILENT_PORT := 50947
+PATIENT_PORT := 50949
+CLEARED_PORT := 50951
+
+# the deadline under test. long enough that scheduling noise on a small box
+# cannot make a read look like it gave up early.
+TIMEOUT_MS := 300
+
+# how long the patient peers keep quiet before speaking. it is comfortably past
+# TIMEOUT_MS, so a read that outlasts it cannot be one that quietly kept some
+# deadline of its own.
+QUIET_MS := 900
+
+# ---------------------------------------------------------------------------
+# the peers
+# ---------------------------------------------------------------------------
+
+# connect and say nothing at all. the read here returns only when the server
+# gives up on us and closes, so this task ends on the server's decision rather
+# than on a guess about how long that decision takes.
+fn silent_peer(port: Int) -> Int!:
+    fd := tcp.connect("127.0.0.1", port)!
+    tcp.read(fd, 16) catch ""
+    tcp.close(fd)
+    return 0
+
+# connect, stay quiet well past the deadline the server is not supposed to have,
+# and then speak. the delay is the stimulus this case measures, not a wait for
+# something to be ready: the server is already parked in its read, and a longer
+# delay only makes the assertion below more true.
+fn patient_peer(port: Int) -> Int!:
+    fd := tcp.connect("127.0.0.1", port)!
+    sleep(QUIET_MS)
+    tcp.write_all(fd, "late")!
+    tcp.read(fd, 16) catch ""
+    tcp.close(fd)
+    return 0
+
+# ---------------------------------------------------------------------------
+# the cases
+# ---------------------------------------------------------------------------
+
+# a deadline is set and the peer never speaks: the read must fail, and it must
+# fail at roughly the deadline rather than never.
+fn a_deadline_ends_a_read_that_would_never_finish() -> Bool!:
+    listener := tcp.listen("127.0.0.1", SILENT_PORT)!
+    peer := spawn silent_peer(SILENT_PORT)
+    fd := tcp.accept(listener)!
+    tcp.set_timeout(fd, TIMEOUT_MS)
+    start := time.mono_millis()
+    result := tcp.read(fd, 64)
+    elapsed := time.mono_millis() - start
+    tcp.close(fd)
+    tcp.close(listener)
+    await peer
+    print("silent peer: read failed {result.is_err}")
+    # the band is generous in both directions. the floor is below the deadline
+    # because a millisecond clock and a reactor that fires on the tick can land
+    # a hair under it; the ceiling is only there to separate "gave up" from
+    # "waited forever", which is the whole question.
+    print("silent peer: waited for its deadline {elapsed >= TIMEOUT_MS - 100}")
+    print("silent peer: did not wait forever {elapsed < 10000}")
+    return true
+
+# no deadline is set, which is what nearly everything that reads a socket does:
+# the read must wait for as long as the peer takes.
+fn no_deadline_waits_for_the_peer() -> Bool!:
+    listener := tcp.listen("127.0.0.1", PATIENT_PORT)!
+    peer := spawn patient_peer(PATIENT_PORT)
+    fd := tcp.accept(listener)!
+    start := time.mono_millis()
+    text := tcp.read(fd, 64) catch ""
+    elapsed := time.mono_millis() - start
+    tcp.close(fd)
+    tcp.close(listener)
+    await peer
+    print("patient peer: read arrived {text == "late"}")
+    print("patient peer: outlasted a deadline it never had {elapsed >= QUIET_MS - 200}")
+    return true
+
+# a deadline set and then cleared is a deadline that is gone. zero means "wait
+# forever", the same as never having asked.
+fn a_cleared_deadline_waits_again() -> Bool!:
+    listener := tcp.listen("127.0.0.1", CLEARED_PORT)!
+    peer := spawn patient_peer(CLEARED_PORT)
+    fd := tcp.accept(listener)!
+    tcp.set_timeout(fd, TIMEOUT_MS)
+    tcp.set_timeout(fd, 0)
+    start := time.mono_millis()
+    text := tcp.read(fd, 64) catch ""
+    elapsed := time.mono_millis() - start
+    tcp.close(fd)
+    tcp.close(listener)
+    await peer
+    print("cleared deadline: read arrived {text == "late"}")
+    print("cleared deadline: waited past the cleared one {elapsed >= QUIET_MS - 200}")
+    return true
+
+# a child process's pipe shares this retry loop with sockets and must not have
+# picked up a deadline from it. the child says nothing for most of a second and
+# then speaks; the read has to still be there.
+fn a_quiet_pipe_is_still_waited_for() -> Bool!:
+    quiet := process.command("sh").args(["-c", "sleep 0.9; echo pipe"])
+    text := process.text_trimmed(quiet) catch ""
+    print("quiet child: output arrived {text == "pipe"}")
+    return true
+
+fn main() -> Int:
+    a_deadline_ends_a_read_that_would_never_finish() catch false
+    no_deadline_waits_for_the_peer() catch false
+    a_cleared_deadline_waits_again() catch false
+    a_quiet_pipe_is_still_waited_for() catch false
+    return 0

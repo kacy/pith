@@ -93,6 +93,38 @@ can be in the middle of a multi-byte character. a `String` cannot be cut there �
 slicing one at a non-boundary offset stops the process — so the text `write_all`
 helpers encode once and resume through their bytes counterpart.
 
+## a read waits forever unless you say otherwise
+
+a read on a socket has no deadline by default. it waits for its peer for as long
+as the peer takes, which is the right default for a connection you opened and
+expect an answer on, and the wrong one for a connection some stranger opened.
+
+`tcp.set_timeout(fd, ms)` — or `stream.set_timeout(ms)` on a `TcpStream` — bounds
+it. a read that reaches the deadline with nothing to show for it fails, and the
+error does not distinguish that from a connection that closed; both mean "no
+more bytes are coming". passing `0` (or less) clears the deadline and puts the
+socket back to waiting indefinitely. the deadline covers one read call rather
+than a whole conversation, so a read that returns bytes leaves the next one a
+full deadline again.
+
+it holds on both concurrency backends, and the mechanism is the same one on
+each: the deadline lives on the socket (`SO_RCVTIMEO`), so the os-thread backend
+gets it from the kernel bounding its blocking read, and the green backend reads
+the same value back and bounds its reactor wait by it. it used to hold on only
+the os-thread backend, which made every read timeout in the stdlib inert in the
+default configuration — a client that connected and sent nothing pinned a server
+task for good.
+
+two things it does not reach:
+
+- **a pipe.** `SO_RCVTIMEO` is a socket option, so a child process's stdout has
+  no deadline to set and a read on it waits for the child. bound a child with
+  `process.run_ctx`/`output_ctx` and a context deadline instead.
+- **a connect.** on the os-thread backend `connect` hands back a socket with a
+  five second read deadline already on it; on the green backend it does not. set
+  one explicitly on a client connection whose reads must be bounded rather than
+  relying on the difference.
+
 ## why the adapters are handle-backed
 
 pith structs are value types right now. that means a tiny adapter struct cannot

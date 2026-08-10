@@ -688,7 +688,12 @@ pub fn connect(host: String, port: Int) -> TcpStream!:
 pub fn from_fd(fd: Int) -> TcpStream:
     return tcp_stream_from_fd(fd)
 
-# set the socket timeout in milliseconds.
+# set how long a read on this socket may wait, in milliseconds. a read that
+# reaches the deadline with nothing to show for it fails; zero or less clears
+# the deadline and puts the socket back to waiting indefinitely, which is what
+# a socket that was never given one does.
+#
+# the deadline holds on both concurrency backends. see std.net.tcp.set_timeout.
 pub fn set_timeout(stream: TcpStream, ms: Int):
     tcp_stream_set_timeout(stream, ms)
 

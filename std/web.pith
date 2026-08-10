@@ -114,14 +114,15 @@ mut live_connections := AtomicInt(0)
 # not guaranteed; refuse_conn has that.
 #
 # this also decides how the cap behaves against a connection that stalls forever.
-# `tcp_set_timeout` is inert under the green runtime — the green read path waits
-# on the reactor with no deadline — so CONNECTION_TIMEOUT_MS does not reclaim a
-# stalled connection's slot there, and slots can be held indefinitely by clients
-# that never speak. under blocking that ends in a silent wedge: no accepts, no
-# answers, no signal. refusing turns the same situation into a server that still
-# answers every connection immediately, with a refusal counter climbing and the
-# live-connection gauge pinned at MAX_CONNECTIONS — which is the wedge's exact
-# signature, visible on a scrape.
+# CONNECTION_TIMEOUT_MS now reclaims such a slot on either backend — the green
+# read path reads the socket's own deadline and gives up at it, where it used to
+# park on the reactor with no deadline at all and hold the slot for good. so the
+# stall is bounded rather than permanent. refusing is still the right answer at
+# the cap, because a burst of clients that each stall for the full timeout would
+# otherwise queue behind the blocking accept: refusing keeps every peer getting
+# an immediate answer, with a refusal counter climbing and the live-connection
+# gauge pinned at MAX_CONNECTIONS — which is that situation's exact signature,
+# visible on a scrape.
 
 # the accept loops' own metrics, recorded by listen() and listen_tls() rather
 # than by the request middleware, so they exist on a bare() app too — a server
@@ -178,9 +179,11 @@ CAPACITY_BODY := "server at capacity"
 # peer that had already sent its request — which is most of them, since a cap
 # fires while the accept queue is full of connections that have been waiting —
 # may see a reset instead of the 503. draining the request first is what would
-# fix it, and there is no way to do that safely here: a read on a socket whose
-# peer sent nothing has no deadline under the green runtime and would park the
-# accept loop forever, which is the failure this whole design exists to avoid.
+# fix it, and there is no way to do that cheaply here. a read on a socket whose
+# peer sent nothing can be bounded — a deadline set on the fd is honoured on
+# either backend — but the bound is the cost: every refusal would hold the accept
+# loop for as long as the slowest silent peer takes to hit it, and a loop that
+# never waits is the property this whole design exists to keep.
 #
 # it is still worth writing. a peer that has not sent yet gets a clean FIN and
 # the real 503, and every other peer gets a reset — refused promptly, which is

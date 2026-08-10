@@ -64,6 +64,7 @@ never before:
 ```pith
 cfg := tls.server_config("certs/server.crt", "certs/server.key")!
 listener := tls.listen(host, 443, cfg)!
+shutdown.register_listener(listener.handle)
 # ... accept, spawning a task per connection, until a shutdown is requested ...
 shutdown.close_listener(listener.handle)   # free the port, and only the port
 drained := shutdown.drain_default()

@@ -6,8 +6,11 @@
 #      counted as in flight, *then* asks for a shutdown, and only then sends the
 #      client hello. the server's connection task reads the certificate and the
 #      private key out of the tls registry at that point — well after the accept
-#      loop stopped — so a listen loop that closed its config before draining
-#      would fail this handshake.
+#      loop stopped — so a listen loop that released its config before draining
+#      would fail this handshake. the count is taken at the accept, so the
+#      connection held open here is one whose task may not have run a single
+#      instruction yet: both the config *and* the listener's binding to it have
+#      to outlive the drain, not just the accept loop.
 #   2. the config is closed once the drain is over. tls.open_server_configs()
 #      counts the configs still holding a certificate; it has to come back to
 #      zero after the listen call returns, or the certificate pem and the key

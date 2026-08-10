@@ -117,7 +117,7 @@ and several subsystems compose without knowing about each other.
 | `request()` | begin a drain, from anywhere (a `/quit` route, a supervisor) |
 | `requested()` | whether a drain has begun — poll this in a long-lived handler |
 | `register_listener(fd)` / `close_listener(fd)` | listener registry; `close_listener` closes at most once |
-| `enter()` / `leave()` | bracket one unit of in-flight work |
+| `enter()` / `leave()` | bracket one unit of in-flight work — `enter()` on the accept loop, `leave()` from the task |
 | `expect_flush()` / `flush_done()` | a subsystem with shutdown work of its own |
 | `drain(deadline_ms)` | wait for both, returning what was left unfinished |
 | `set_drain_deadline(ms)` | the grace period every std server uses |
@@ -141,6 +141,27 @@ all of them, and through the same coordinator:
   which for a streaming method means the stream runs to its trailers — and, for
   one that would otherwise never get there, to a `UNAVAILABLE` status rather than
   a cut connection.
+
+### when a connection joins the count
+
+on the accept loop, in the same breath as the accept — not inside the task that
+serves it. between a `spawn` and the spawned task's first instruction a
+connection is invisible, and a drain landing in that window would see nothing
+outstanding and return, cutting off a client that had already been accepted.
+"every accepted connection finished" is the whole promise of a graceful drain,
+so the count starts at the accept.
+
+that leaves only one direction to be wrong in, and it is the safe one: work that
+is counted and then never runs holds its count up until the grace period
+expires, and `drain()` returns it as work it abandoned. bounded, and reported —
+where the other direction drops a connection silently. write your own accept
+loops the same way:
+
+```pith
+accepted := tcp.accept(fd)
+shutdown.enter()
+spawn serve(accepted.ok)   # serve() opens with `defer shutdown.leave()`
+```
 
 ## streams that never end
 

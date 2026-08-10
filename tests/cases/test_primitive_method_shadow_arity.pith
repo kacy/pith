@@ -1,0 +1,28 @@
+# the same-arity variant of the free-function-shadows-builtin-method clash:
+# a one-argument `fn to_int(x: Float)` matches the builtin's call shape
+# exactly, so a regression here runs the wrong body and produces a wrong
+# answer instead of a loud arity error. method syntax on a primitive binds
+# the builtin; the free function only ever answers a plain call.
+fn to_int(x: Float) -> Int:
+    return 999
+
+fn to_float(n: Int) -> Float:
+    return 999.0
+
+fn trim(text: String) -> String:
+    return "999"
+
+fn main():
+    a := (1.5).to_int()
+    print("{a}")
+    b := (2).to_float()
+    print("{b}")
+    s := "  spaced  "
+    t := s.trim()
+    print("[{t}]")
+    free_int := to_int(3.5)
+    print("{free_int}")
+    free_float := to_float(4)
+    print("{free_float}")
+    free_trim := trim("anything")
+    print(free_trim)

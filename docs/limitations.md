@@ -101,7 +101,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   classes, `\d \w \s` escapes, `* + ?` (greedy), alternation, capturing
   groups, and `^ $` anchors. it does not support `{n,m}` counts, lazy
   quantifiers, backreferences, or lookaround. matching is a pike vm, so
-  time is linear in the input for any pattern.
+  time is linear in the input for any pattern. it also matches **bytes,
+  not characters**: `.` and a class each consume one byte, so `.` on its
+  own does not match a two-byte character, while `..` and `[^,]+` match
+  one whole. a span that would end inside a character is reported as no
+  match at that position rather than cut through it, so non-ascii input
+  is safe to run patterns over — it just answers in bytes. ascii input
+  is unaffected, since every offset in it is a character boundary.
 - **gzip compresses with fixed huffman only** — `std.compress.gzip`
   reads any deflate stream (multi-member files included) and writes
   real compression (greedy lz77 over fixed huffman, stored-block

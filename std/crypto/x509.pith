@@ -519,11 +519,21 @@ fn name_constraints_permit_leaf(leaf: Certificate, ca: Certificate) -> Bool:
     return true
 
 # read two ascii digits at `start` as an integer.
+#
+# the bytes are read in place rather than sliced out. len() counts bytes and
+# substring() takes byte offsets, so the length check above proves nothing
+# about where these cuts land, and a cut through a multi-byte character stops
+# the process — during a handshake, on a certificate that has not been verified
+# yet and whose contents the peer chose. checking each byte is an ascii digit
+# proves exactly what the cut needed proving, and rejects the field either way.
 fn parse_two_digits(text: String, start: Int) -> Int!:
-    n := parse_int(text.substring(start, start + 2))
-    if n.is_err:
+    if start < 0 or start + 2 > text.len():
         fail "invalid der time digits"
-    return n.ok
+    tens := ord(text[start]) - 48
+    ones := ord(text[start + 1]) - 48
+    if tens < 0 or tens > 9 or ones < 0 or ones > 9:
+        fail "invalid der time digits"
+    return tens * 10 + ones
 
 # days from the unix epoch (1970-01-01) to a civil date, via howard hinnant's
 # well-known algorithm. valid for any proleptic gregorian date; certificate
@@ -904,6 +914,15 @@ test "x509 der time parses utctime and generalizedtime to epoch millis":
     assert_eq(der_time_to_epoch_ms("260721123456Z")!, der_time_to_epoch_ms("20260721123456Z")!)
     # a timestamp without the mandatory utc marker is rejected, not misread.
     assert(der_time_to_epoch_ms("20200101000000").is_err)
+    # a field that is the right length and ends in the marker but is not ascii
+    # digits. the digits used to be sliced two at a time, and a String is cut in
+    # bytes, so a multi-byte character straddling one of those cuts stopped the
+    # process — during a handshake, on a certificate nobody had verified yet.
+    # "7é101000000Z" is thirteen bytes with the character sitting across the
+    # first cut.
+    assert(der_time_to_epoch_ms("7é101000000Z").is_err)
+    # the same, fifteen bytes, for the generalizedtime branch.
+    assert(der_time_to_epoch_ms("2é01010000000Z").is_err)
 
 test "x509 rejects an expired certificate":
     expired := parse_pem(read_file("tests/live/fixtures/expired-localhost.crt")!)!

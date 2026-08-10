@@ -107,9 +107,11 @@ mut live_connections := AtomicInt(0)
 #
 # so these loops accept and refuse instead. a refused connection costs one write
 # and one close on the accept loop, never a task, so the memory the cap exists to
-# protect is still protected. the server stays diagnosable: it answers, it says
-# why, and a load balancer that sees 503 sheds to another instance rather than
-# waiting on a socket that will never reply.
+# protect is still protected. every peer gets an answer of some kind immediately
+# rather than a socket that never replies, so a load balancer sheds to another
+# instance instead of waiting — and the health check keeps being served, which is
+# the whole argument. how much of an answer the peer gets is the one part that is
+# not guaranteed; refuse_conn has that.
 #
 # this also decides how the cap behaves against a connection that stalls forever.
 # `tcp_set_timeout` is inert under the green runtime — the green read path waits

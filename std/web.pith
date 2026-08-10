@@ -616,14 +616,17 @@ impl App:
                 continue
             failures = 0
             spawn_tls_conn(app, listener.handle, accepted.ok)
-        # free the port before draining (see the plaintext listener above).
-        release_tls_listener(listener)
+        # free the port before draining (see the plaintext listener above), but
+        # only the port. the listener's binding to the tls config outlives the
+        # accept loop, because a connection accepted a moment before the
+        # shutdown has not necessarily reached its handshake yet — and the
+        # handshake finds the certificate and the key through that binding.
+        shutdown.close_listener(listener.handle)
         drained := shutdown.drain_default()
-        # this call built the config, so this call closes it — and only here,
-        # once the drain has finished. the listener merely borrowed it, and each
-        # connection task reads the certificate and key out of the registry when
-        # its own handshake gets that far, which is long after the accept that
-        # spawned it returned. see docs/tls.md.
+        # the drain is over, so every connection that borrowed the config has
+        # finished with it: drop the listener's binding, then close the config
+        # this call built. see docs/tls.md.
+        release_tls_listener(listener)
         config.close()
         return drained
 

@@ -1422,13 +1422,17 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
             continue
         failures = 0
         spawn_h2_tls_conn(listener.handle, accepted.ok, handler)
-    # free the port before draining (see listen_h2c above).
-    release_tls_listener(listener)
+    # free the port before draining (see listen_h2c above), but only the port.
+    # the listener's binding to the tls config outlives the accept loop: a
+    # connection accepted a moment before the shutdown has not necessarily
+    # reached its handshake yet, and the handshake finds the certificate and the
+    # key through that binding.
+    shutdown.close_listener(listener.handle)
     drained := shutdown.drain_default()
-    # this call built the config, so this call closes it — and only here, once
-    # the drain has finished. the listener merely borrowed it, and each
-    # connection task reads the certificate and key out of the registry when its
-    # own handshake gets that far. see docs/tls.md.
+    # the drain is over, so every connection that borrowed the config has
+    # finished with it: drop the listener's binding, then close the config this
+    # call built. see docs/tls.md.
+    release_tls_listener(listener)
     config.close()
     return drained
 
@@ -1548,10 +1552,11 @@ pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: Strin
             continue
         failures = 0
         spawn_h2_tls_streaming_conn(listener.handle, accepted.ok)
-    # free the port before draining (see listen_h2c above).
-    release_tls_listener(listener)
+    # free the port before draining, and drop the listener's binding to the tls
+    # config only once the drain is over — see listen_h2_tls.
+    shutdown.close_listener(listener.handle)
     drained := shutdown.drain_default()
-    # this call built the config, so this call closes it — see listen_h2_tls.
+    release_tls_listener(listener)
     config.close()
     return drained
 

@@ -56,22 +56,33 @@ transfer: `Listener.close()` gives the borrow back, and whoever called
 the timing is what makes a server different in practice. an accept loop hands
 each socket to its own task, and that task reads the certificate and the private
 key out of the registry when its own handshake reaches them — which can be a
-whole handshake timeout after the accept that spawned it returned. so a server
-closes its config once it has drained, never before:
+whole handshake timeout after the accept that spawned it returned, and which for
+a connection accepted just before the shutdown may not have happened at all yet.
+so a server gives the borrow back and closes its config once it has drained,
+never before:
 
 ```pith
 cfg := tls.server_config("certs/server.crt", "certs/server.key")!
 listener := tls.listen(host, 443, cfg)!
 # ... accept, spawning a task per connection, until a shutdown is requested ...
-listener.close()
+shutdown.close_listener(listener.handle)   # free the port, and only the port
 drained := shutdown.drain_default()
+tls.release_listener_config(listener)      # give the borrow back
 cfg.close()
 ```
 
-closing before the drain does not corrupt anything — a handle is never reissued,
-so the handshake that loses the race fails cleanly rather than reaching for
-another config's key — but it does turn working connections into failed ones on
-the way out, which is a worse shutdown than the leak it was fixing.
+the two halves of `Listener.close()` are split on purpose, and the split is the
+point. the socket goes first, because the replacement instance of a rolling
+deploy is waiting to bind that port and the drain can take the whole grace
+period. the listener's *binding* to the config goes last, because that binding
+is how a handshake finds the certificate — dropping it while a connection is
+still in the drain count is the same mistake as closing the config early, one
+step removed.
+
+either mistake corrupts nothing — a handle is never reissued, so a handshake
+that loses the race fails cleanly rather than reaching for another config's key
+— but both turn working connections into failed ones on the way out, which is a
+worse shutdown than the leak they were fixing.
 
 the std servers do this for you: `App.listen_tls`, `http2.listen_h2_tls` and its
 streaming twin each build a config, serve on it, and close it after their drain,

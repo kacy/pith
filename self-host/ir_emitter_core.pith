@@ -40,11 +40,11 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
-from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
+from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
@@ -230,12 +230,30 @@ mut ir_generic_dtor_base: Map[String, String] := {}
 mut ir_generic_dtor_args: Map[String, String] := {}
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
+# every module in the build, not just the emitted module's direct imports.
+# a method can live in an impl block a module away from both the struct's
+# declaration and the call site (std.io's impl FileStream, called on the
+# stream std.fs returned), so impl-method collection must see the whole
+# graph or the call lowers to a name no function carries.
+mut ir_all_module_roots: List[Int] := []
+mut ir_all_module_paths: List[String] := []
+# the resolved module path of the module currently being emitted ("" for the
+# entry file). lets an impl target in this module resolve to the module's own
+# declaration even when another module registered the same name globally.
+mut ir_current_module_path := ""
 mut ir_emit_tests := false
 mut ir_emitting_test_func := false
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
     ir_preloaded_import_paths = paths
+
+pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
+    ir_all_module_roots = roots
+    ir_all_module_paths = paths
+
+pub fn set_current_module_path(path: String):
+    ir_current_module_path = path
 
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
@@ -271,6 +289,7 @@ fn ir_reset_type_state():
     ir_struct_decl_nodes.clear()
     ir_struct_field_default_nodes.clear()
     ir_impl_methods.clear()
+    ir_impl_method_owner.clear()
     ir_import_renames = {}
     ir_func_returns.clear()
     ir_func_result_ok_kinds = {}
@@ -397,7 +416,7 @@ fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
         return ir_expr_legacy_result_kind(idx)
     obj_type := ir_method_receiver_type(node)
     method_name := ir_plain_method_name(node.value)
-    impl_name := ir_lookup_impl_method_name(obj_type, method_name)
+    impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
     if impl_name.len() > 0:
         declared_kind := ir_declared_callable_ir_retkind(impl_name)
         if declared_kind.len() > 0:
@@ -471,7 +490,7 @@ fn ir_result_ok_kind_for_expr(idx: Int) -> String:
             return ir_builtin_result_ok_kind(call_name)
         obj_type := ir_method_receiver_type(node)
         method_name := ir_plain_method_name(node.value)
-        impl_name := ir_lookup_impl_method_name(obj_type, method_name)
+        impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
         if impl_name.len() > 0 and ir_func_result_ok_kinds.contains_key(impl_name):
             return ir_retkind(ir_func_result_ok_kinds[impl_name])
         emit_name := ir_method_emit_name(method_name, obj_type)
@@ -738,7 +757,7 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         # fall back to the known-fresh list.
         mname := ir_plain_method_name(node.value)
         recv_type := ir_method_receiver_type(node)
-        if ir_lookup_impl_method_name(recv_type, mname).len() > 0:
+        if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
             return false
         # a builtin that takes the count on its own result hands back an owned
         # value whichever branch it ran (ir_method_result_retains_over_args).
@@ -1765,7 +1784,7 @@ fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
                     return declared_kind
             obj_type := ir_method_receiver_type(node)
             method_name := ir_plain_method_name(node.value)
-            impl_name := ir_lookup_impl_method_name(obj_type, method_name)
+            impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
             if impl_name.len() > 0:
                 declared_kind := ir_declared_callable_ir_retkind(impl_name)
                 if declared_kind.len() > 0:
@@ -4784,7 +4803,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     cf_struct := ir_strip_type_args(obj_type)
     if cf_struct.len() > 0:
         field_key := cf_struct + "." + mname
-        existing_method := ir_lookup_impl_method_name(obj_type, mname)
+        existing_method := ir_lookup_impl_method_for(node.children[0], obj_type, mname)
         if ir_struct_field_index_lookup.contains_key(field_key) and existing_method.len() == 0:
             recv_r := ir_expr(node.children[0])
             field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
@@ -4813,7 +4832,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     # version when src's type is itself a generic instance
     mut impl_name := ir_lookup_specialized_method(obj_type, mname)
     if impl_name.len() == 0:
-        impl_name = ir_lookup_impl_method_name(obj_type, mname)
+        impl_name = ir_lookup_impl_method_for(node.children[0], obj_type, mname)
     impl_dispatch := impl_name.len() > 0
     if impl_dispatch:
         emit_name = impl_name
@@ -6570,7 +6589,7 @@ fn ir_emit_for_stmt(node: Node):
         # without falling back to the base body's unresolved calls
         mut next_name := ir_lookup_specialized_method(iter_struct, "next")
         if next_name.len() == 0:
-            next_name = ir_lookup_impl_method_name(iter_struct, "next")
+            next_name = ir_lookup_impl_method_for(node.children[0], iter_struct, "next")
         if next_name.len() > 0:
             ir_emit_for_iterator_stmt(node, names, next_name)
             return
@@ -6983,6 +7002,49 @@ fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
             return ir_impl_methods[base_key]
     return ""
 
+# the receiver's checked declaration tid, or -1 when the checker never typed
+# the expression as a plain struct or enum — or typed it under a different
+# name than emission sees (a re-emitted generic body), in which case the tid
+# is stale and must not steer dispatch.
+fn ir_checked_receiver_tid(recv_idx: Int, type_name: String) -> Int:
+    if recv_idx < 0:
+        return 0 - 1
+    mut tid := c_get_expr_type(recv_idx)
+    if tid < 0:
+        return 0 - 1
+    mut info := get_type_info(tid)
+    if info.kind == "optional" or info.kind == "result":
+        if info.inner < 0:
+            return 0 - 1
+        tid = info.inner
+        info = get_type_info(tid)
+    if info.kind != "struct" and info.kind != "enum":
+        return 0 - 1
+    if info.name != type_name:
+        return 0 - 1
+    return tid
+
+# the impl method symbol for a call on this receiver expression. two modules
+# can each declare a struct with the receiver's name, and the name-keyed
+# table holds whichever registered last — only the receiver's checked tid
+# names the right declaration, so the tid key is tried first, mirroring how
+# field reads resolve (ir_try_checked_field_read). when the receiver's tid is
+# known but the name-keyed entry belongs to a different declaration, the
+# entry is refused rather than lowering a method against the wrong layout.
+# with no usable tid (generic bodies, emit-only receivers) the name-keyed
+# lookup answers as before.
+fn ir_lookup_impl_method_for(recv_idx: Int, type_name: String, method_name: String) -> String:
+    tid := ir_checked_receiver_tid(recv_idx, type_name)
+    if tid >= 0:
+        tid_key := ir_impl_tid_key(tid, method_name)
+        if ir_impl_methods.contains_key(tid_key):
+            return ir_impl_methods[tid_key]
+        name_key := ir_impl_method_key(type_name, method_name)
+        if ir_impl_method_owner.contains_key(name_key):
+            if ir_impl_method_owner[name_key] != tid:
+                return ""
+    return ir_lookup_impl_method_name(type_name, method_name)
+
 fn ir_collect_impl_methods(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
@@ -7389,6 +7451,37 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
     for default_idx in ir_inherited_default_indices(node):
         ir_record_impl_method_signature(impl_type, default_idx, get_node(default_idx), module_path)
 
+# the declaration an impl target names, resolved in the impl's own module
+# (falling back to the module currently being emitted, then the global
+# table). a generic base has no single tid and answers -1; so does a target
+# the module cannot see, and the method then stays name-keyed only.
+fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
+    if impl_type.contains("["):
+        return 0 - 1
+    mut path := module_path
+    if path.len() == 0:
+        path = ir_current_module_path
+    if path.len() > 0:
+        qualified := lookup_qualified_type_id(path, impl_type)
+        if qualified >= 0:
+            return qualified
+    return lookup_type_id(impl_type)
+
+# register one impl method under its name key and, when the impl target
+# resolves to a concrete declaration, under a tid key too. the name key
+# remembers its owner so dispatch on a same-named struct from another module
+# can refuse it; the owner tracks the latest name-key write so the key and
+# its owner always describe the same declaration.
+fn ir_register_impl_method_entry(impl_type: String, method_name: String, full_name: String, module_path: String):
+    key := ir_impl_method_key(impl_type, method_name)
+    ir_impl_methods.insert(key, full_name)
+    owner_tid := ir_impl_owner_tid(impl_type, module_path)
+    if owner_tid >= 0:
+        ir_impl_methods.insert(ir_impl_tid_key(owner_tid, method_name), full_name)
+        ir_impl_method_owner.insert(key, owner_tid)
+    elif ir_impl_method_owner.contains_key(key):
+        ir_impl_method_owner.remove(key)
+
 fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     method_name := method_node.value
     mut full_name := impl_type + "_" + method_name
@@ -7396,7 +7489,7 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
         full_name = ir_import_impl_method_name(module_path, impl_type, method_name)
     key := ir_impl_method_key(impl_type, method_name)
     ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx))
-    ir_impl_methods.insert(key, full_name)
+    ir_register_impl_method_entry(impl_type, method_name, full_name, module_path)
     ir_func_returns.insert(key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
 
@@ -7554,7 +7647,7 @@ fn ir_impl_func(idx: Int, impl_type: String):
     orig_name := node.value
     full_name := impl_type + "_" + orig_name
     method_key := ir_impl_method_key(impl_type, orig_name)
-    ir_impl_methods.insert(method_key, full_name)
+    ir_register_impl_method_entry(impl_type, orig_name, full_name, "")
 
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx) + 1
@@ -8136,18 +8229,32 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_struct_field_index_lookup.clear()
     ir_struct_decl_nodes.clear()
     ir_impl_methods.clear()
+    ir_impl_method_owner.clear()
     ir_interface_decl_index.clear()
     ir_assoc_bindings.clear()
     ir_type_assoc_names.clear()
     ir_register_known_import_structs()
 
+    # impl blocks (and the interfaces whose defaults they inherit) are
+    # collected from every module in the build, not just direct imports: a
+    # method can live in an impl a module away from both the struct's
+    # declaration and the call site, and a call the checker resolved must
+    # have a symbol to lower to. struct layout collection stays scoped to
+    # direct imports. falls back to the direct list when no full graph was
+    # provided.
+    mut method_roots := ir_all_module_roots
+    mut method_paths := ir_all_module_paths
+    if method_roots.len() == 0:
+        method_roots = ir_preloaded_import_roots
+        method_paths = ir_preloaded_import_paths
+
     # index every interface (imports + root) before any impl signatures are
     # collected, so an impl can find its interface's defaults regardless of
     # declaration order across modules
     mut iface_i := 0
-    while iface_i < ir_preloaded_import_roots.len():
-        ir_index_interfaces_in_root(ir_preloaded_import_roots[iface_i])
-        ir_collect_assoc_bindings_in_root(ir_preloaded_import_roots[iface_i])
+    while iface_i < method_roots.len():
+        ir_index_interfaces_in_root(method_roots[iface_i])
+        ir_collect_assoc_bindings_in_root(method_roots[iface_i])
         iface_i = iface_i + 1
     ir_index_interfaces_in_root(root_idx)
     ir_collect_assoc_bindings_in_root(root_idx)
@@ -8155,8 +8262,12 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
         ir_collect_struct_decls(ir_preloaded_import_roots[preload_i], false)
-        ir_collect_impl_methods(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
         preload_i = preload_i + 1
+
+    mut impl_i := 0
+    while impl_i < method_roots.len():
+        ir_collect_impl_methods(method_roots[impl_i], method_paths[impl_i])
+        impl_i = impl_i + 1
 
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)

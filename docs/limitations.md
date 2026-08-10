@@ -76,6 +76,16 @@ something here that now works, the page is stale and a fix to it is welcome.
   (E209). bind it to a name first (`f := instance.field; f(args)`).
   function values held in locals, globals, list/map/tuple elements, and
   returned from calls are all directly callable.
+- **duplicate method names across impl blocks** — a struct's methods can be
+  declared in more than one impl block, including a block in a different
+  module than the struct (std.fs adds methods to std.io's FileStream this
+  way), and every method resolves from any call site that can see the value.
+  method dispatch is per-declaration: two modules can each declare a struct
+  with the same name and a call binds only to the receiver's own methods
+  (E209 otherwise, even when the other struct has the method). the remaining
+  gap is two impl blocks giving the *same* struct the *same* method name —
+  that is not rejected, and which body wins depends on module order, so give
+  methods on a shared type distinct names.
 - **interface depth** — interfaces support method signatures, default
   methods (a member with a body that implementors inherit unless they
   override it), associated types (`type Item` on the interface, bound

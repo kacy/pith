@@ -1,0 +1,16 @@
+# two modules each declare `pub fn parser() -> Parser` over their own struct
+# Parser. the from-imported parser() must hand back ITS module's Parser — the
+# shared global name table holds whichever module registered last, and typing
+# the value with the wrong module's same-named struct either refuses methods
+# the value really has (only_a below) or binds describe() across layouts.
+# this is the shape that broke examples/grpc_catalog: binary.reader vs
+# protobuf.reader, both returning their own Reader.
+from samename_fnret_a import parser
+import samename_fnret_b as b
+
+fn main():
+    p := parser()
+    print(p.describe())
+    print(p.only_a())
+    q := b.parser()
+    print(q.describe())

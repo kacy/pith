@@ -1,0 +1,34 @@
+# a method can live in an impl block a module away from both the struct's
+# declaration and the call site: std.io declares FileStream and impls
+# read_all_chunked on it, std.fs returns the stream, and this file imports
+# only std.fs. the call must still lower to std.io's method body — it used to
+# pass the checker and then trap at runtime as an unresolvable call. the
+# process stdout reader exercises the same shape through std.os.process.
+import std.fs as fs
+import std.os.process as process
+
+fn main():
+    path := "/tmp/pith_crossmodule_impl_method.txt"
+    writer := fs.create(path) catch:
+        print("create failed")
+        return
+    writer.write_all("chunky data") catch:
+        print("write failed")
+        return
+    writer.close()
+
+    reader := fs.open(path) catch:
+        print("open failed")
+        return
+    text := reader.read_all_chunked(4) catch "ERR"
+    print(text)
+    reader.close()
+    fs.remove(path)
+
+    p := process.start_shell("printf buffered-line") catch:
+        print("spawn failed")
+        return
+    buffered := p.stdout().buffered()
+    line := buffered.read_line() catch "ERR"
+    print(line)
+    p.wait()

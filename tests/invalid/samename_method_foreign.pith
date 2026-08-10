@@ -1,0 +1,13 @@
+# two modules each declare a struct Gadget; only one of them has refresh().
+# calling refresh() on the other module's Gadget must be E209 naming the
+# receiver's type — a same-named struct elsewhere having the method used to
+# satisfy the lookup, lower against the wrong field layout, and read garbage
+# (or trap at runtime as an unresolvable call).
+import support.samename_has_method as has
+import support.samename_lacks_method as lacks
+
+fn main():
+    keep := has.make_has()
+    print(keep.refresh().to_string())
+    g := lacks.make_lacks()
+    print(g.refresh().to_string())

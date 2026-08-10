@@ -1,0 +1,13 @@
+# the other same-named struct: a different field layout on purpose, so a
+# method mis-bound across the two would read the wrong offsets and the golden
+# output would show it. count stays first so label() must skip past it.
+pub struct Widget:
+    pub count: Int
+    pub tag: String
+
+impl Widget:
+    fn label() -> String:
+        return "two:" + self.tag + ":" + self.count.to_string()
+
+pub fn make_two() -> Widget:
+    return Widget(9, "beta")

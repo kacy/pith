@@ -141,6 +141,9 @@ all of them, and through the same coordinator:
   which for a streaming method means the stream runs to its trailers — and, for
   one that would otherwise never get there, to a `UNAVAILABLE` status rather than
   a cut connection.
+- `std.prometheus` — `serve`. the scrape endpoint is a listener like any other:
+  it stops accepting on a shutdown request, and a scrape that was already
+  accepted gets the grace period to finish rather than being cut mid-response.
 
 ### when a connection joins the count
 

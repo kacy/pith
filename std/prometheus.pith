@@ -13,10 +13,15 @@
 #
 # the endpoint is read-only and pull-based: prometheus scrapes it on an interval,
 # so serve() just renders the current snapshot on each request.
+#
+# it drains like every other std listener (see std.shutdown and docs/signals.md):
+# a shutdown request stops the port accepting, and serve() returns once the
+# scrapes already accepted have finished or the grace period has expired.
 
 import std.metrics as metrics
 import std.net.http as http
 import std.net.tcp as tcp
+import std.shutdown as shutdown
 import std.time as time
 
 # prometheus's text-exposition format content type.
@@ -50,32 +55,75 @@ fn handle_scrape(fd: Int) -> Int!:
     return http.send(fd, http.not_found_response())
 
 # handle one scrape to completion on its own task: answer it, close the socket,
-# and release the concurrency permit. errors are swallowed so a slow or broken
-# client only affects its own connection, never the accept loop.
+# release the concurrency permit, and leave the drain count taken for it at the
+# accept. errors are swallowed so a slow or broken client only affects its own
+# connection, never the accept loop — and `defer` releases both halves on that
+# error path too, since a scrape that leaks its count holds the whole shutdown
+# open for the full grace period.
 fn serve_scrape(fd: Int):
+    defer shutdown.leave()
     defer scrape_slots.release()
     handle_scrape(fd) catch 0
     tcp_close(fd)
+
+# hand an accepted scrape socket to its own task, with the concurrency permit and
+# the drain count both taken here, on the accept loop.
+#
+# ## why the count is taken here and not inside the task
+#
+# between `spawn` and the spawned task's first instruction the scrape is
+# invisible: it has not entered, a drain sees nothing outstanding and returns
+# clean, and a prometheus scrape that was accepted moments before the shutdown
+# request gets its socket cut mid-response. counting from the accept can only
+# ever count too much — a task that never runs — and that costs at most the grace
+# period and is reported by `drain()`, where counting too little drops a scrape
+# silently. see docs/signals.md.
+fn spawn_scrape(fd: Int):
+    scrape_slots.acquire()
+    shutdown.enter()
+    spawn serve_scrape(fd)
 
 # serve the /metrics endpoint on host:port. this blocks in an accept loop, so run
 # it in the background: `spawn prometheus.serve("0.0.0.0", 9464)`. each scrape is
 # handled on its own task, up to MAX_CONCURRENT_SCRAPES at once, so a slow scrape
 # does not hold up the next one.
+#
+# it returns when a graceful shutdown is requested (see std.shutdown): the
+# listener stops accepting, the in-flight scrapes are given the configured grace
+# period to finish, and the return value is how much work was still unfinished
+# when that period expired — 0 for a clean drain. with no shutdown ever requested
+# this serves forever, as it always did.
 pub fn serve(host: String, port: Int) -> Int!:
-    fd := tcp_listen(host, port)!
-    # close the listener if the accept loop ever exits through an error.
-    defer tcp_close(fd)
+    # registering transfers the close to std.shutdown, so a drain and a normal
+    # teardown cannot both close the same fd number.
+    fd := shutdown.register_listener(tcp_listen(host, port)!)
+    # close the listener if the accept loop ever gives up: a listening socket
+    # nobody accepts from still passes a tcp health check, so leaving it open is
+    # how a scrape endpoint that stopped answering keeps looking alive.
+    defer shutdown.close_listener(fd)
     mut failures := 0
-    while true:
+    while not shutdown.requested():
         accepted := tcp.accept(fd)
         if accepted.is_err:
+            # a shutdown stops the listener out from under this accept, which is
+            # what wakes the parked loop promptly. that error is the drain
+            # beginning, not a failure to back off from.
+            if shutdown.requested():
+                break
             failures = failures + 1
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
-        scrape_slots.acquire()
-        spawn serve_scrape(accepted.ok)
-    return 0
+        spawn_scrape(accepted.ok)
+    # free the port before draining, not after: the replacement instance of a
+    # rolling deploy is waiting to bind it, and the drain can take the whole grace
+    # period. the defer above is then a no-op — close_listener closes at most
+    # once — and still covers the error exits. nothing else is released here:
+    # unlike a tls listener, a scrape borrows nothing from the listener that a
+    # teardown could pull out from under it — only its own socket and the
+    # process-wide metric registry, and neither is this call's to release.
+    shutdown.close_listener(fd)
+    return shutdown.drain_default()
 
 test "metrics_response carries the prometheus content type and current snapshot":
     metrics.reset()
@@ -94,13 +142,30 @@ test "metrics_response includes help text for described metrics":
     assert(rendered.contains("# HELP http_requests_total total http requests handled"))
     assert(rendered.contains("# TYPE http_requests_total counter"))
 
-# a background serve() for tests: swallow the (never-returned) result so it can be
-# spawned as a plain call. serve loops forever, so the test process reaps it on exit.
+# a background serve() for tests: swallow the result so it can be spawned as a
+# plain call. serve returns once a shutdown is requested, and the test process
+# reaps it on exit otherwise.
+#
+# -1 rather than 0 on the error exit, so a test can tell a shutdown-driven return
+# (the drain result, 0 when clean) from the accept loop giving up after a run of
+# failed accepts — which also ends the loop, and would otherwise look identical.
 fn serve_bg(port: Int) -> Int:
-    return serve("127.0.0.1", port) catch 0
+    return serve("127.0.0.1", port) catch -1
+
+# wait for a backgrounded serve() to have bound and registered its listener,
+# rather than sleeping a fixed interval and hoping it got there. bounded by a
+# deadline so a regression fails the assertion at the call site instead of
+# hanging the suite.
+fn listener_registered(deadline_ms: Int) -> Bool:
+    deadline := time.mono_millis() + deadline_ms
+    while shutdown.listeners() == 0:
+        if time.mono_millis() >= deadline:
+            return false
+        time.delay(shutdown.POLL_INTERVAL_MS)
+    return true
 
 # a minimal GET /metrics over a socket, returning the whole response text (or ""
-# on a connection failure). used to drive concurrent scrapes in the test below.
+# on a connection failure). used to drive concurrent scrapes in the tests below.
 fn raw_scrape(port: Int) -> String:
     connected := tcp.connect("127.0.0.1", port)
     if connected.is_err:
@@ -108,17 +173,27 @@ fn raw_scrape(port: Int) -> String:
     fd := connected.ok
     tcp.set_timeout(fd, 2000)
     crlf := chr(13) + chr(10)
-    tcp.write(fd, "GET /metrics HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
-    body := tcp.read(fd, 65536) catch ""
+    tcp.write_all(fd, "GET /metrics HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    # read to the end of the connection rather than once. the server closes the
+    # socket when it is done, so an empty read is the end of the response —
+    # judging a response by whatever its first read happened to contain is how
+    # an assertion becomes intermittent.
+    mut body := ""
+    while true:
+        chunk := tcp.read(fd, 65536) catch ""
+        if chunk == "":
+            break
+        body = body + chunk
     tcp.close(fd)
     return body
 
 test "serve answers several concurrent scrapes":
+    shutdown.reset()
     metrics.reset()
     metrics.counter("scrape_hits_total").describe("scrapes served", "1").inc()
     port := 19464
     spawn serve_bg(port)
-    time.delay(200) # let the listener bind before scraping
+    assert(listener_registered(5000))
 
     ta := spawn raw_scrape(port)
     tb := spawn raw_scrape(port)
@@ -133,3 +208,132 @@ test "serve answers several concurrent scrapes":
         assert(r.contains("200"))
         assert(r.contains("# HELP scrape_hits_total scrapes served"))
         assert(r.contains("scrape_hits_total 1"))
+    shutdown.reset()
+
+# --- accept-time drain registration ---
+#
+# the first of these drives spawn_scrape directly, over real sockets and without
+# an accept loop, so the drain count can be read in the window between the spawn
+# and the task's first instruction — the window the count exists to cover. the
+# accept loop's only other job is `tcp.accept`, which the helper does by hand.
+
+# open `count` connected socket pairs against a listener on `port` and return the
+# server-side fds. the client ends go onto `clients` so the test can close them
+# and let the scrape tasks finish; the listener is closed here, since every
+# connection it will ever carry has already been accepted.
+fn accepted_pairs(port: Int, count: Int, clients: List[Int]) -> List[Int]:
+    listener := tcp_listen("127.0.0.1", port) catch -1
+    assert(listener > 0)
+    mut served: List[Int] := []
+    mut i := 0
+    while i < count:
+        connected := tcp.connect("127.0.0.1", port)
+        assert(not connected.is_err)
+        clients.push(connected.ok)
+        accepted := tcp.accept(listener)
+        assert(not accepted.is_err)
+        served.push(accepted.ok)
+        i = i + 1
+    tcp_close(listener)
+    return served
+
+test "an accepted scrape is in the drain count before its task runs":
+    shutdown.reset()
+    metrics.reset()
+    mut clients: List[Int] := []
+    served := accepted_pairs(19465, 8, clients)
+    for fd in served:
+        spawn_scrape(fd)
+    # the count is taken on this task, so it is complete the instant the last
+    # hand-off returns — it cannot depend on how many of the eight tasks the
+    # runtime has got round to starting. with the count taken inside the task
+    # instead, most of these are still invisible here, and a shutdown landing now
+    # would drain to zero over eight scrapes that were accepted and never
+    # answered.
+    assert_eq(shutdown.inflight(), 8)
+    # none of them can finish: their peers are still open and have sent nothing,
+    # so every scrape is parked in read_request_bytes. the drain must give up at
+    # its deadline and report all eight rather than claim a clean shutdown.
+    assert_eq(shutdown.drain(20), 8)
+    for c in clients:
+        tcp_close(c)
+    # each task leaves exactly once, on the path where the scrape dies before its
+    # request head arrives: no double count, nothing left behind.
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(shutdown.inflight(), 0)
+    shutdown.reset()
+
+test "serve registers its listener and closes it on shutdown":
+    shutdown.reset()
+    metrics.reset()
+    port := 19466
+    server := spawn serve_bg(port)
+    assert(listener_registered(5000))
+    # registered, so request() can stop it accepting. unregistered, the port
+    # stayed open for the whole grace period and beyond.
+    assert_eq(shutdown.listeners(), 1)
+    shutdown.request()
+    # the accept loop ends of its own accord: request() shuts the listening
+    # socket down, which wakes the parked accept whichever way it is waiting. a 0
+    # is the drain's own result, so this is the graceful return and not the accept
+    # loop giving up (serve_bg reports that as -1).
+    drained := await server
+    assert_eq(drained, 0)
+    # and the listener is closed and unregistered, so the port refuses scrapes
+    # rather than answering them after the process said it was going away.
+    assert_eq(shutdown.listeners(), 0)
+    refused := tcp.connect("127.0.0.1", port)
+    assert(refused.is_err)
+    shutdown.reset()
+
+test "serve started after a shutdown request never accepts":
+    shutdown.reset()
+    metrics.reset()
+    shutdown.request()
+    port := 19468
+    server := spawn serve_bg(port)
+    # a listener bound after request() has already run is not in the registry
+    # that request() walked, so nothing will ever shut it down. testing the flag
+    # at the top of the loop is what keeps that server from parking in accept()
+    # for the rest of the process's life instead of returning.
+    drained := await server
+    assert_eq(drained, 0)
+    assert_eq(shutdown.listeners(), 0)
+    refused := tcp.connect("127.0.0.1", port)
+    assert(refused.is_err)
+    shutdown.reset()
+
+test "a scrape leaves the drain count exactly once, answered or aborted":
+    shutdown.reset()
+    metrics.reset()
+    metrics.counter("scrape_hits_total").describe("scrapes served", "1").inc()
+    port := 19467
+    server := spawn serve_bg(port)
+    assert(listener_registered(5000))
+
+    answered := raw_scrape(port)
+    assert(answered.contains("200"))
+    assert(answered.contains("scrape_hits_total 1"))
+    # a drain rather than a bare read of the count: the scrape task releases it
+    # in a `defer`, which need not have run by the time the client holds the
+    # body. this waits for it and reports a leak instead of racing one.
+    assert_eq(shutdown.drain(5000), 0)
+    # and exactly once, not twice — a double leave drives the count negative,
+    # which drain() also reports as 0.
+    assert_eq(shutdown.inflight(), 0)
+
+    # a scrape that dies before it sends a single byte: the read fails and the
+    # error path has to release its count too. a full scrape afterwards proves
+    # the loop has already accepted and handed off the aborted one — it accepts
+    # in order — so the drain below covers both, without a sleep.
+    aborted := tcp.connect("127.0.0.1", port)
+    assert(not aborted.is_err)
+    tcp.close(aborted.ok)
+    assert(raw_scrape(port).contains("200"))
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(shutdown.inflight(), 0)
+
+    shutdown.request()
+    remaining := await server
+    assert_eq(remaining, 0)
+    shutdown.reset()

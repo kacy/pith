@@ -99,6 +99,13 @@ lines) and 404s everything else. it's pull-based, so there's no interval to
 configure — prometheus scrapes on its own schedule. prometheus metrics and OTLP
 push are independent; use either, both, or neither.
 
+it drains like every other std listener (see [signals and graceful
+shutdown](signals.md)). on a shutdown request the port stops accepting, so a
+scrape that arrives after the signal is refused rather than answered by a process
+on its way out, and a scrape already in flight is finished inside the grace
+period rather than cut mid-response. `serve` then returns how much was still
+unfinished when that period expired — 0 for a clean drain.
+
 ## tracing
 
 a span is one timed unit of work: a name, a start and end, some attributes, a

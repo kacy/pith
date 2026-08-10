@@ -434,9 +434,8 @@ fn handle_conn(app: App, fd: Int):
 # invisible: it has not entered, a drain sees nothing outstanding and returns,
 # and a client that was accepted moments before the shutdown request gets its
 # socket cut with no response and no trace. listen() does not return until every
-# connection that got *accepted* has finished, which is the promise a graceful
-# drain makes; counting from the task's first instruction promises something
-# weaker and quietly.
+# connection that got *accepted* has finished — that is the promise. counting
+# from the task's first instruction keeps a weaker one, without saying so.
 #
 # the direction of the remaining error is deliberate. a task that never runs
 # holds a count nobody releases, and `drain()` gives up at the grace period and

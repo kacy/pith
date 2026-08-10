@@ -209,6 +209,15 @@ impl Client:
         if line.len() == 0:
             fail "redis: empty reply line"
         tag := line[0]
+        # every reply tag is one ascii byte, and that has to be established
+        # before the body is cut off the front. a String is cut in bytes, so
+        # cutting at offset 1 asks for the tail of whatever character starts the
+        # line — and a line that starts with a multi-byte character stopped the
+        # client process outright, uncatchably, while every other malformed
+        # reply in this parser came back as an ordinary error. the reply comes
+        # off a socket, so the server decides which one it is.
+        if tag != "+" and tag != "-" and tag != ":" and tag != "$" and tag != "*":
+            fail "redis: unexpected reply: {line}"
         body := line.substring(1, line.len())
         if tag == "+":
             return Reply.Status(body)

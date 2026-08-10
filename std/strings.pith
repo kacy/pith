@@ -72,12 +72,20 @@ pub fn is_whitespace(s: String) -> Bool:
 pub fn is_blank(s: String) -> Bool:
     return is_whitespace(s)
 
-fn contains_char(chars: String, c: String) -> Bool:
+# true when `needle`, one whole character, is one of the characters in `chars`.
+#
+# both sides are walked a character at a time rather than a byte at a time. a
+# byte-wise membership test says "©" and "é" have a byte in common, and the
+# trims below then move their cursor into the middle of a character and cut it
+# there — which stops the process outright. `trim_right_chars("aé", "©")` is two
+# perfectly ordinary strings and it used to do exactly that.
+fn contains_character(chars: String, needle: String) -> Bool:
     mut i := 0
     while i < chars.len():
-        if chars[i] == c:
+        stop := text.ceil_boundary(chars, i + 1)
+        if chars.substring(i, stop) == needle:
             return true
-        i = i + 1
+        i = stop
     return false
 
 fn starts_with_at(s: String, substr: String, start: Int) -> Bool:
@@ -131,18 +139,20 @@ pub fn trim_right(s: String) -> String:
 pub fn trim_left_chars(s: String, chars: String) -> String:
     mut start := 0
     while start < s.len():
-        if not contains_char(chars, s[start]):
+        stop := text.ceil_boundary(s, start + 1)
+        if not contains_character(chars, s.substring(start, stop)):
             break
-        start = start + 1
+        start = stop
     return s.substring(start, s.len())
 
 # removes trailing characters that appear in chars.
 pub fn trim_right_chars(s: String, chars: String) -> String:
     mut end := s.len()
     while end > 0:
-        if not contains_char(chars, s[end - 1]):
+        start := text.floor_boundary(s, end - 1)
+        if not contains_character(chars, s.substring(start, end)):
             break
-        end = end - 1
+        end = start
     return s.substring(0, end)
 
 # ---------------------------------------------------------------

@@ -419,6 +419,35 @@ fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
             return best
     return best
 
+# true when `at` is where a character starts.
+fn on_boundary(input: String, at: Int) -> Bool:
+    if at <= 0 or at >= input.len():
+        return true
+    code := ord(input[at])
+    return code < 128 or code >= 192
+
+# true when every offset the vm recorded lands where a character starts.
+#
+# the vm steps one byte at a time, so an instruction that accepts a single byte
+# — `.` and every negated class do — can leave a match ending halfway through a
+# multi-byte character. a String is cut in bytes and a cut inside a character
+# stops the process outright, so a span that does not line up with the text is
+# treated as no match at this position and the search moves on rather than
+# taking the program down: `compile(".")!.find("é")` used to end the process.
+#
+# what that leaves is a byte-oriented engine reported in a way text can survive.
+# `.` matches one byte, so on its own it does not match a two-byte character,
+# while `..`, `.+` and `[^,]+` match one whole. ascii is unaffected — every
+# offset in it is a boundary — which is every pattern and every input the
+# engine had tests for.
+fn slots_aligned(input: String, slots: List[Int]) -> Bool:
+    mut i := 0
+    while i < slots.len():
+        if slots[i] >= 0 and not on_boundary(input, slots[i]):
+            return false
+        i = i + 1
+    return true
+
 impl Regex:
     ## true when the pattern matches anywhere in the input.
     pub fn is_match(input: String) -> Bool:
@@ -429,7 +458,7 @@ impl Regex:
         mut start := 0
         while start <= input.len():
             slots := run_from(self, input, start)
-            if slots.len() >= 2:
+            if slots.len() >= 2 and slots_aligned(input, slots):
                 return Match(slots[0], slots[1], input.substring(slots[0], slots[1]))
             start = start + 1
         return none
@@ -440,7 +469,7 @@ impl Regex:
         mut start := 0
         while start <= input.len():
             slots := run_from(self, input, start)
-            if slots.len() >= 2:
+            if slots.len() >= 2 and slots_aligned(input, slots):
                 mut out: List[String] := []
                 mut g := 0
                 while g < self.ngroups:
@@ -461,7 +490,7 @@ impl Regex:
         mut start := 0
         while start <= input.len():
             slots := run_from(self, input, start)
-            if slots.len() >= 2:
+            if slots.len() >= 2 and slots_aligned(input, slots):
                 stop := slots[1]
                 out.push(Match(slots[0], stop, input.substring(slots[0], stop)))
                 if stop == slots[0]:

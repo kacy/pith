@@ -63,6 +63,10 @@ threadlocal mut buffered_text_reader_sources: Map[Int, Int] := {}
 threadlocal mut buffered_text_reader_chunk_sizes: Map[Int, Int] := {}
 threadlocal mut buffered_text_reader_cache: Map[Int, String] := {}
 threadlocal mut buffered_text_reader_cursors: Map[Int, Int] := {}
+# bytes of a character the last fill stopped in the middle of, waiting for the
+# rest of it to arrive. a source read is counted in bytes and ends wherever the
+# count lands, so this holds at most three bytes and is empty most of the time.
+threadlocal mut buffered_text_reader_partials: Map[Int, Bytes] := {}
 
 threadlocal mut next_buffered_string_writer_handle: Int := 1
 threadlocal mut buffered_string_writer_targets: Map[Int, Int] := {}
@@ -663,13 +667,19 @@ pub fn copy_n_bytes(reader: BytesCursor, writer: ByteBuffer, count: Int) -> Int!
     data := read_exact_bytes_cursor(reader, count)!
     return write_all_byte_buffer(writer, data)
 
-# write at most count characters from the input string.
+# write at most count bytes from the input string.
+#
+# the count is in bytes, as every count in this module is, and it can land
+# inside a multi-byte character. a character is never written in halves, so a
+# count that falls inside one stops before it and the write is that much
+# shorter — which is what "at most" already promised.
 pub fn write_n(writer: StringBuffer, data: String, count: Int) -> Int!:
     if count <= 0:
         return 0
     mut end := count
     if end > data.len():
         end = data.len()
+    end = boundary_at_or_before(data, end, 0)
     return write_all_string(writer, data.substring(0, end))
 
 # write at most count bytes from the input bytes.
@@ -977,6 +987,7 @@ fn allocate_buffered_text_reader_handle(kind: Int, source: Int, chunk_size: Int)
     buffered_text_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
     buffered_text_reader_cache.insert(handle, "")
     buffered_text_reader_cursors.insert(handle, 0)
+    buffered_text_reader_partials.insert(handle, bytes.empty())
     return handle
 
 fn allocate_buffered_string_reader_handle(source_handle: Int, chunk_size: Int) -> Int:
@@ -1036,6 +1047,51 @@ fn trim_trailing_cr(line: String) -> String:
     if ord(line[end - 1]) == 13:
         return line.substring(0, end - 1)
     return line
+
+# --- character boundaries ---------------------------------------------------
+#
+# every read and every write here is counted in bytes, and a String is indexed
+# in bytes, so the byte a transfer stops at is whatever byte the count landed
+# on — which can be inside a multi-byte character. slicing a String there is a
+# runtime trap that no catch can intercept, so nothing below stops at a byte
+# count without first moving to the character boundary beside it.
+#
+# the walk is over raw bytes and needs no unicode tables: in utf-8 a byte in
+# 0x80..0xBF continues a character and every other byte starts one, so the
+# boundary next to any offset is at most three bytes away.
+
+# true when the byte at `at` continues a character rather than starting one.
+fn continues_character(data: String, at: Int) -> Bool:
+    code := ord(data[at])
+    return code >= 128 and code < 192
+
+# the character boundary at or before `at`, and never before `floor`.
+#
+# `at` may be `data.len()`, which is a boundary and is not read.
+fn boundary_at_or_before(data: String, at: Int, floor: Int) -> Int:
+    mut back := at
+    while back > floor and back < data.len() and continues_character(data, back):
+        back = back - 1
+    return back
+
+# the character boundary at or after `at`.
+fn boundary_at_or_after(data: String, at: Int) -> Int:
+    mut ahead := at
+    while ahead < data.len() and continues_character(data, ahead):
+        ahead = ahead + 1
+    return ahead
+
+# where a read that asked to stop at byte `at` stops instead.
+#
+# the boundary before `at` keeps the read inside what was asked for. when that
+# boundary is the read's own start the read would come back empty, and an empty
+# read is how every caller here recognises end of stream, so a read that would
+# make no progress takes the whole character instead of none of it.
+fn read_stop(data: String, start: Int, at: Int) -> Int:
+    stop := boundary_at_or_before(data, at, start)
+    if stop > start:
+        return stop
+    return boundary_at_or_after(data, at)
 
 # byte offset of the first newline at or after `start`, or -1.
 #
@@ -1110,6 +1166,40 @@ fn text_source_read(kind: Int, source: Int, size: Int) -> String!:
         return process_stderr_read(ProcessStderr(source), size)
     return ""
 
+# read one chunk from `kind` as raw bytes.
+#
+# a source that is not text already hands back bytes and only becomes text
+# because something decoded it, and `size` bytes off a stream end wherever the
+# count lands — including halfway through a character, which is not a decodable
+# chunk. everything that reads a source to text goes through this instead, and
+# decodes on character boundaries of its own choosing.
+#
+# a string reader is the exception: its data is already text, so it slices on a
+# boundary itself and what comes back is always whole.
+fn text_source_read_bytes(kind: Int, source: Int, size: Int) -> Bytes!:
+    if kind == TEXT_SOURCE_STRING:
+        return encode_utf8(string_reader_read(StringReader(source), size)!)
+    elif kind == TEXT_SOURCE_TCP:
+        return tcp_stream_read_bytes(TcpStream(source), size)
+    elif kind == TEXT_SOURCE_FILE:
+        return file_stream_read_bytes(FileStream(source), size)
+    elif kind == TEXT_SOURCE_PROCESS_STDOUT:
+        return process_stdout_read_bytes(ProcessStdout(source), size)
+    elif kind == TEXT_SOURCE_PROCESS_STDERR:
+        return process_stderr_read_bytes(ProcessStderr(source), size)
+    return bytes.empty()
+
+# the deadline-aware twin of `text_source_read_bytes`. see `text_source_read_ctx`
+# for why the two cannot be one function.
+fn text_source_read_bytes_ctx(kind: Int, source: Int, ctx: Context, size: Int) -> Bytes!BlockingError:
+    if kind == TEXT_SOURCE_TCP:
+        return tcp_stream_read_bytes_ctx(TcpStream(source), ctx, size)
+    elif kind == TEXT_SOURCE_PROCESS_STDOUT:
+        return process_stdout_read_bytes_ctx(ProcessStdout(source), ctx, size)
+    elif kind == TEXT_SOURCE_PROCESS_STDERR:
+        return process_stderr_read_bytes_ctx(ProcessStderr(source), ctx, size)
+    return bytes.empty()
+
 # the deadline-aware twin of `text_source_read`.
 #
 # this cannot be folded into the function above: the error type is part of the
@@ -1127,27 +1217,35 @@ fn text_source_read_ctx(kind: Int, source: Int, ctx: Context, size: Int) -> Stri
 
 # drain a source to end-of-stream.
 #
-# the chunks are collected and joined once. appending each chunk to a growing
-# String instead would rebuild the whole result on every read, so draining n
-# bytes would copy on the order of n squared.
+# the bytes are gathered and decoded once at the end. decoding each chunk as it
+# arrived would reject the whole read whenever a chunk boundary fell inside a
+# character, which is an ordinary thing for a 4 KiB read of ordinary text to do:
+# a utf-8 file with one accent in it was unreadable through this path whenever
+# the accent straddled the boundary. a character split across two chunks is not
+# a decode error, it is two chunks.
 fn read_all_text_source(kind: Int, source: Int, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
-    parts := empty_string_parts()
-    mut chunk := text_source_read(kind, source, size)!
-    while chunk.len() > 0:
-        parts.push(chunk)
-        chunk = text_source_read(kind, source, size)!
-    return join_parts(parts)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := text_source_read_bytes(kind, source, size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = text_source_read_bytes(kind, source, size)!
+    return buf.bytes().to_string_utf8()!
 
 # the deadline-aware twin of `read_all_text_source`.
 fn read_all_text_source_ctx(kind: Int, source: Int, ctx: Context, chunk_size: Int) -> String!BlockingError:
     size := normalized_chunk_size(chunk_size)
-    parts := empty_string_parts()
-    mut chunk := text_source_read_ctx(kind, source, ctx, size)!
-    while chunk.len() > 0:
-        parts.push(chunk)
-        chunk = text_source_read_ctx(kind, source, ctx, size)!
-    return join_parts(parts)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := text_source_read_bytes_ctx(kind, source, ctx, size)!
+    while not chunk.is_empty():
+        written := buf.write(chunk)
+        if written.is_err:
+            fail blocking_failed(written.err)
+        chunk = text_source_read_bytes_ctx(kind, source, ctx, size)!
+    decoded := buf.bytes().to_string_utf8()
+    if decoded.is_err:
+        fail blocking_failed(decoded.err)
+    return decoded.ok
 
 fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -1361,6 +1459,11 @@ fn string_reader_read_internal(reader: StringReader, max_bytes: Int) -> String!:
     mut end := offset + max_bytes
     if end > data.len():
         end = data.len()
+    # the count can land inside a character; the read stops beside it. this is
+    # the one text source that slices rather than decoding, so it is the one
+    # that has to do this for itself — the others come back as bytes and are
+    # decoded a whole character at a time.
+    end = read_stop(data, offset, end)
     chunk := data.substring(offset, end)
     string_reader_offsets.insert(reader.handle, end)
     return chunk
@@ -1944,14 +2047,85 @@ fn buffered_text_reader_append(handle: Int, chunk: String):
         buffered_text_reader_cache.insert(handle, data.substring(cursor, data.len()) + chunk)
     buffered_text_reader_cursors.insert(handle, 0)
 
+fn buffered_text_reader_partial(handle: Int) -> Bytes:
+    if buffered_text_reader_partials.contains_key(handle):
+        return buffered_text_reader_partials[handle]
+    return bytes.empty()
+
+# how many bytes the character starting with `lead` occupies.
+fn character_width(lead: Int) -> Int:
+    if lead >= 240:
+        return 4
+    if lead >= 224:
+        return 3
+    return 2
+
+# the length of the longest prefix of `data` that ends on a character boundary
+# with no truncated character behind it.
+#
+# only the last three bytes can be in question: a utf-8 character is four bytes
+# at most, so the start of the last character is never further back than that.
+# malformed input is left alone and reported by the decode, which is the one
+# place that can tell the difference between a chunk that is short and a stream
+# that is not text.
+fn complete_character_prefix(data: Bytes) -> Int:
+    if data.is_empty():
+        return 0
+    mut lead := data.len() - 1
+    mut steps := 0
+    while lead > 0 and steps < 3 and continues_a_character(bytes.get(data, lead)):
+        lead = lead - 1
+        steps = steps + 1
+    first := bytes.get(data, lead)
+    if first < 192:
+        return data.len()
+    if data.len() - lead >= character_width(first):
+        return data.len()
+    return lead
+
+# true when a byte continues a character rather than starting one.
+fn continues_a_character(code: Int) -> Bool:
+    return code >= 128 and code < 192
+
+# decode as much of `arrived` as ends on a character boundary, holding the rest
+# back for the next fill.
+#
+# a source read stops at a byte count, so the last character in a chunk can be
+# missing its tail. decoding the chunk as it stands would call that a decode
+# error and lose the whole read, which is what a buffered reader over a utf-8
+# file used to do whenever an accented character straddled a 4 KiB boundary.
+fn buffered_text_decode(handle: Int, arrived: Bytes) -> String!:
+    held := buffered_text_reader_partial(handle)
+    mut data := arrived
+    if not held.is_empty():
+        data = bytes.concat(held, arrived)
+    cut := complete_character_prefix(data)
+    if cut >= data.len():
+        buffered_text_reader_partials.insert(handle, bytes.empty())
+        return data.to_string_utf8()!
+    buffered_text_reader_partials.insert(handle, data.slice(cut, data.len()))
+    return data.slice(0, cut).to_string_utf8()!
+
 fn buffered_text_fill(handle: Int) -> Int!:
     if not buffered_text_reader_live(handle):
         return 0
     kind := buffered_text_reader_kinds[handle]
     source := buffered_text_reader_sources[handle]
-    chunk := text_source_read(kind, source, buffered_text_reader_chunk_size(handle))!
-    buffered_text_reader_append(handle, chunk)
-    return chunk.len()
+    size := buffered_text_reader_chunk_size(handle)
+    # a read whose bytes were all the front of one character adds no text, and
+    # an empty fill is how every caller here recognises end of stream — so keep
+    # reading until there is a whole character to hand over, or the stream ends.
+    while true:
+        arrived := text_source_read_bytes(kind, source, size)!
+        if arrived.is_empty():
+            if not buffered_text_reader_partial(handle).is_empty():
+                fail "stream ended in the middle of a character"
+            return 0
+        chunk := buffered_text_decode(handle, arrived)!
+        if chunk.len() > 0:
+            buffered_text_reader_append(handle, chunk)
+            return chunk.len()
+    return 0
 
 # the deadline-aware twin of `buffered_text_fill`. this is the only place a
 # context reaches, and it has to: waiting for a chunk is the one part of a
@@ -1962,9 +2136,20 @@ fn buffered_text_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
         return 0
     kind := buffered_text_reader_kinds[handle]
     source := buffered_text_reader_sources[handle]
-    chunk := text_source_read_ctx(kind, source, ctx, buffered_text_reader_chunk_size(handle))!
-    buffered_text_reader_append(handle, chunk)
-    return chunk.len()
+    size := buffered_text_reader_chunk_size(handle)
+    while true:
+        arrived := text_source_read_bytes_ctx(kind, source, ctx, size)!
+        if arrived.is_empty():
+            if not buffered_text_reader_partial(handle).is_empty():
+                fail blocking_failed("stream ended in the middle of a character")
+            return 0
+        chunk := buffered_text_decode(handle, arrived)
+        if chunk.is_err:
+            fail blocking_failed(chunk.err)
+        if chunk.ok.len() > 0:
+            buffered_text_reader_append(handle, chunk.ok)
+            return chunk.ok.len()
+    return 0
 
 fn buffered_text_read_internal(handle: Int, max_bytes: Int) -> String!:
     if max_bytes <= 0:
@@ -1978,8 +2163,9 @@ fn buffered_text_read_internal(handle: Int, max_bytes: Int) -> String!:
     cursor := buffered_text_reader_cursor(handle)
     data := buffered_text_reader_data(handle)
     if data.len() - cursor >= max_bytes:
-        buffered_text_reader_cursors.insert(handle, cursor + max_bytes)
-        return data.substring(cursor, cursor + max_bytes)
+        stop := read_stop(data, cursor, cursor + max_bytes)
+        buffered_text_reader_cursors.insert(handle, stop)
+        return data.substring(cursor, stop)
 
     parts := empty_string_parts()
     mut got := 0
@@ -1996,9 +2182,18 @@ fn buffered_text_read_internal(handle: Int, max_bytes: Int) -> String!:
         avail := buf.len() - at
         if take > avail:
             take = avail
-        parts.push(buf.substring(at, at + take))
-        buffered_text_reader_cursors.insert(handle, at + take)
-        got = got + take
+        # what is left to ask for can be less than the next character is long.
+        # once something has been read that is simply where the read stops;
+        # only a read that has taken nothing at all takes the whole character,
+        # since coming back empty is how a caller recognises end of stream.
+        mut stop := boundary_at_or_before(buf, at + take, at)
+        if stop == at:
+            if got > 0:
+                return join_parts(parts)
+            stop = boundary_at_or_after(buf, at + take)
+        parts.push(buf.substring(at, stop))
+        buffered_text_reader_cursors.insert(handle, stop)
+        got = got + stop - at
     return join_parts(parts)
 
 fn buffered_text_read_internal_ctx(handle: Int, ctx: Context, max_bytes: Int) -> String!BlockingError:
@@ -2012,8 +2207,9 @@ fn buffered_text_read_internal_ctx(handle: Int, ctx: Context, max_bytes: Int) ->
     cursor := buffered_text_reader_cursor(handle)
     data := buffered_text_reader_data(handle)
     if data.len() - cursor >= max_bytes:
-        buffered_text_reader_cursors.insert(handle, cursor + max_bytes)
-        return data.substring(cursor, cursor + max_bytes)
+        stop := read_stop(data, cursor, cursor + max_bytes)
+        buffered_text_reader_cursors.insert(handle, stop)
+        return data.substring(cursor, stop)
 
     parts := empty_string_parts()
     mut got := 0
@@ -2030,9 +2226,15 @@ fn buffered_text_read_internal_ctx(handle: Int, ctx: Context, max_bytes: Int) ->
         avail := buf.len() - at
         if take > avail:
             take = avail
-        parts.push(buf.substring(at, at + take))
-        buffered_text_reader_cursors.insert(handle, at + take)
-        got = got + take
+        # see `buffered_text_read_internal`.
+        mut stop := boundary_at_or_before(buf, at + take, at)
+        if stop == at:
+            if got > 0:
+                return join_parts(parts)
+            stop = boundary_at_or_after(buf, at + take)
+        parts.push(buf.substring(at, stop))
+        buffered_text_reader_cursors.insert(handle, stop)
+        got = got + stop - at
     return join_parts(parts)
 
 fn buffered_text_read_line_internal(handle: Int) -> String!:
@@ -2100,12 +2302,19 @@ fn buffered_text_read_until_internal(handle: Int, sep: String, include_sep: Bool
             return join_parts(parts)
         # hold back one byte less than the separator, so a separator split
         # across two reads is still found once the second one lands.
+        #
+        # the hold-back is a byte count and can leave the flush stopping inside
+        # a character, so the flush stops at the boundary before that instead
+        # and the few bytes it did not take stay in the buffer. it must not
+        # round the other way: the bytes past that point are the ones being held
+        # back for the separator.
         keep := sep.len() - 1
         avail := data.len() - cursor
         if avail > keep:
-            flush_len := avail - keep
-            parts.push(data.substring(cursor, cursor + flush_len))
-            buffered_text_reader_cursors.insert(handle, cursor + flush_len)
+            stop := boundary_at_or_before(data, cursor + avail - keep, cursor)
+            if stop > cursor:
+                parts.push(data.substring(cursor, stop))
+                buffered_text_reader_cursors.insert(handle, stop)
         filled := buffered_text_fill(handle)!
         if filled <= 0:
             cursor = buffered_text_reader_cursor(handle)
@@ -2135,12 +2344,15 @@ fn buffered_text_read_until_internal_ctx(handle: Int, ctx: Context, sep: String,
                 parts.push(sep)
             buffered_text_reader_cursors.insert(handle, sep_pos + sep.len())
             return join_parts(parts)
+        # see `buffered_text_read_until_internal`: the hold-back is a byte count
+        # and the flush stops at the boundary before it.
         keep := sep.len() - 1
         avail := data.len() - cursor
         if avail > keep:
-            flush_len := avail - keep
-            parts.push(data.substring(cursor, cursor + flush_len))
-            buffered_text_reader_cursors.insert(handle, cursor + flush_len)
+            stop := boundary_at_or_before(data, cursor + avail - keep, cursor)
+            if stop > cursor:
+                parts.push(data.substring(cursor, stop))
+                buffered_text_reader_cursors.insert(handle, stop)
         filled := buffered_text_fill_ctx(handle, ctx)!
         if filled <= 0:
             cursor = buffered_text_reader_cursor(handle)

@@ -1,9 +1,19 @@
 # checker_methods.pith - method declaration registry
+#
+# declarations register under two kinds of key. the name key ("Type.method")
+# is how methods have always been found, but two modules can each declare a
+# struct with the same name, and a name key cannot say which of them a
+# declaration belongs to. so a declaration whose impl target resolves to a
+# concrete type also registers under a tid key ("#<tid>.method"), and the
+# name key remembers the owning tid so a lookup on a different declaration
+# of the same name can refuse it. only the tid can disambiguate.
 
 mut method_decl_index_map: Map[String, Int] := {}
+mut method_decl_owner_map: Map[String, Int] := {}
 
 pub fn checker_methods_reset():
     method_decl_index_map = {}
+    method_decl_owner_map = {}
 
 pub fn register_method_signature(key: String, node_idx: Int):
     method_decl_index_map.insert(key, node_idx)
@@ -14,4 +24,26 @@ pub fn has_method_declaration(key: String) -> Bool:
 pub fn get_method_declaration_index(key: String) -> Int:
     if method_decl_index_map.contains_key(key):
         return method_decl_index_map[key]
+    return - 1
+
+## the tid-keyed lookup key for a method on a specific declaration.
+pub fn method_tid_key(tid: Int, method_name: String) -> String:
+    return "#" + tid.to_string() + "." + method_name
+
+## record which declaration (by tid) a name-keyed entry belongs to. a later
+## registration under the same name key must overwrite the owner too, so the
+## key and its owner always describe the same declaration.
+pub fn register_method_owner(key: String, owner_tid: Int):
+    method_decl_owner_map.insert(key, owner_tid)
+
+## drop the recorded owner for a name key whose latest registration could not
+## resolve its impl target to a concrete type.
+pub fn clear_method_owner(key: String):
+    if method_decl_owner_map.contains_key(key):
+        method_decl_owner_map.remove(key)
+
+## the tid the name-keyed declaration belongs to, or -1 when unknown.
+pub fn method_declaration_owner(key: String) -> Int:
+    if method_decl_owner_map.contains_key(key):
+        return method_decl_owner_map[key]
     return - 1

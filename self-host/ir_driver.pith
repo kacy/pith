@@ -1,7 +1,7 @@
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena, get_node
-from ir_emitter import emit_ir, set_import_roots, set_test_mode
+from ir_emitter import emit_ir, set_import_roots, set_all_module_roots, set_current_module_path, set_test_mode
 from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, find_imports
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module
 from errors import render_diagnostics, has_errors
@@ -422,13 +422,26 @@ fn direct_module_roots(root: Int, roots_by_path: Map[String, Int]) -> List[Int]:
         deps.push(roots_by_path[mod_path])
     return deps
 
-fn emit_module_ir(root: Int, import_roots: List[Int], emit_tests: Bool) -> String:
+# hand the emitter every module in the build, so impl-method collection can
+# see an impl block that lives a module away from both the struct's
+# declaration and the call site (std.io's impl FileStream, called on the
+# stream std.fs returned). set once per build; per-module emission still
+# passes only the module's direct deps as its import roots.
+fn configure_all_module_roots(import_roots: List[Int]):
+    mut all_paths: List[String] := []
+    for import_root in import_roots:
+        all_paths.push(get_resolved_module_path(import_root))
+    set_all_module_roots(import_roots, all_paths)
+
+fn emit_module_ir(root: Int, import_roots: List[Int], module_path: String, emit_tests: Bool) -> String:
     configure_emitter(import_roots, emit_tests)
+    set_current_module_path(module_path)
     return emit_ir(root)
 
 fn emit_single_file(path: String, emit_tests: Bool) -> String!:
     parsed := parse_and_check(path)!
-    ir := emit_module_ir(parsed.root, parsed.import_roots, emit_tests)
+    configure_all_module_roots(parsed.import_roots)
+    ir := emit_module_ir(parsed.root, parsed.import_roots, "", emit_tests)
     print(ir)
     return ""
 
@@ -462,12 +475,13 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
     mut imported_init_funcs: List[String] := []
     mut all_ir: List[String] := []
     roots_by_path := module_root_map(import_roots)
+    configure_all_module_roots(import_roots)
     for import_root, i in import_roots:
         if should_skip_imported_module(import_root):
             continue
         module_path := get_resolved_module_path(import_root)
         module_deps := direct_module_roots(import_root, roots_by_path)
-        ir := emit_module_ir(import_root, module_deps, false)
+        ir := emit_module_ir(import_root, module_deps, module_path, false)
         renamed := rename_import_ir(ir, module_path, i)
         for init_func in renamed.init_funcs:
             imported_init_funcs.push(init_func)
@@ -475,7 +489,7 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
     # the root module keeps its own names. imported modules are already emitted
     # with stable qualified symbols, so the only remaining combined-file tweak
     # is to inject any imported init calls into main.
-    mut main_ir := emit_module_ir(root, direct_module_roots(root, roots_by_path), emit_tests)
+    mut main_ir := emit_module_ir(root, direct_module_roots(root, roots_by_path), "", emit_tests)
     main_ir = rewrite_main_ir(main_ir, imported_init_funcs)
     all_ir.push(main_ir)
 

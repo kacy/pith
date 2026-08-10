@@ -25,7 +25,7 @@ from checker_type_intern import intern_list_type, intern_set_type, intern_map_ty
 from checker_builtins import register_builtin_types
 from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
-from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index
+from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner
 
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
@@ -876,6 +876,21 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
     for sp in suppressed_params:
         suppress_unknown_type_for.remove(sp)
 
+# the concrete declaration an impl target names, resolved in the registering
+# module's own scope. a generic base ("Iter") has no single tid, and a target
+# the module cannot see resolves to nothing; both answer -1 and the method
+# stays name-keyed only, which degrades to the old behavior rather than
+# inventing a wrong owner.
+fn method_owner_type_id(type_name: String) -> Int:
+    if type_name.contains("["):
+        return 0 - 1
+    if has_generic_declaration(type_name):
+        return 0 - 1
+    scoped := resolve_type_name_module_scoped(type_name)
+    if scoped >= 0:
+        return scoped
+    return lookup_type_id(resolve_imported_type_name(type_name))
+
 fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool):
     mut method_name := node.value
     fn_tid := resolve_function_signature(node)
@@ -883,6 +898,17 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     method_type_map.insert(key, fn_tid)
     method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx)
+    # two modules can each declare a struct with this name, so the bare-name
+    # key cannot say whose method this is. register a tid-keyed entry for the
+    # declaration the impl target actually resolves to, and remember that
+    # owner on the name key so a same-named foreign struct cannot answer for
+    # it. keep the owner in step with the latest name-key write.
+    owner := method_owner_type_id(type_name)
+    if owner >= 0:
+        register_method_signature(method_tid_key(owner, method_name), node_idx)
+        register_method_owner(key, owner)
+    else:
+        clear_method_owner(key)
 
 # after all interfaces and impls are registered, an `impl Iface for T`
 # inherits every default method (a fn_decl member of the interface) that
@@ -919,8 +945,15 @@ fn fill_impl_defaults(node: Node):
         # member is a bare fn_sig and is skipped.
         if mn.kind == "fn_decl":
             key := concrete_name + "." + mn.value
-            # a method the type provides itself always wins over the default
-            if method_type_map.contains_key(key) == false:
+            # a method the type provides itself always wins over the default.
+            # ask by tid where the target resolves, so a same-named struct in
+            # another module can neither suppress this type's default nor
+            # stand in for a method it never declared.
+            owner := method_owner_type_id(concrete_name)
+            mut provides_own := method_type_map.contains_key(key)
+            if owner >= 0:
+                provides_own = has_method_declaration(method_tid_key(owner, mn.value))
+            if provides_own == false:
                 register_method_declaration(concrete_name, member, mn, true)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
@@ -1980,11 +2013,19 @@ fn iterator_element_type(iter_type: Int) -> Int:
     if info.kind != "struct":
         return 0 - 1
     type_name := get_type_name(iter_type)
-    mut next_key := type_name + ".next"
+    # the receiver's tid names the exact declaration; the name-keyed
+    # fallbacks stay for generic instances, but a next() belonging to a
+    # different declaration of the same name must not answer here.
+    mut next_key := method_tid_key(iter_type, "next")
     if has_method_declaration(next_key) == false:
-        base := extract_base_type_name(type_name)
-        if base != type_name:
-            next_key = base + ".next"
+        next_key = type_name + ".next"
+        if has_method_declaration(next_key) == false:
+            base := extract_base_type_name(type_name)
+            if base != type_name:
+                next_key = base + ".next"
+        next_owner := method_declaration_owner(next_key)
+        if next_owner >= 0 and next_owner != iter_type:
+            return 0 - 1
     if has_method_declaration(next_key) == false:
         return 0 - 1
     method_node := get_node(get_method_declaration_index(next_key))
@@ -2217,6 +2258,16 @@ fn current_module_imports_name(name: String) -> Bool:
             return true
     return false
 
+# the module a from-import in the current module names as the source of
+# `name`, or "". first matching entry wins; an aliased or wildcard import
+# leaves the name unresolved here and the caller keeps the global answer.
+fn from_import_source_module(name: String) -> String:
+    needle := current_checker_module_path + chr(9) + name + chr(9)
+    for entry in generic_named_import_entries:
+        if entry.starts_with(needle):
+            return entry.substring(needle.len(), entry.len())
+    return ""
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
@@ -2225,6 +2276,18 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         # across modules and die later in emission. builtins and the
         # current module's own names always pass.
         if binding_visible_from(scope_id, name, current_checker_module_path) == false:
+            # the shared global scope answers with whichever module
+            # registered the name last. a from-import names its source
+            # module, so prefer the declaration that module owns —
+            # otherwise two modules declaring the same function name
+            # (binary.reader / protobuf.reader) hand the caller the wrong
+            # signature, and every type derived from it is the wrong
+            # module's same-named struct.
+            source := from_import_source_module(name)
+            if source.len() > 0:
+                owned := lookup_binding_owned_by(scope_id, name, source)
+                if owned >= 0:
+                    return owned
             if current_module_imports_name(name) == false:
                 # a generic declaration never enters the binding table, so a
                 # module calling its own generic fn can land here when some
@@ -4130,16 +4193,26 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 return receiver_type
             vi = vi + 1
 
-    # user-defined methods. methods on a generic struct are registered under
-    # the base name (e.g. "Iter"), so fall back to that if the qualified name
-    # (e.g. "Iter[Int].next") doesn't match a declaration.
+    # user-defined methods. the receiver's checked tid names the exact
+    # declaration, so the tid key is tried first — two modules can declare a
+    # same-named struct and only the tid can tell their methods apart.
+    # methods on a generic struct are registered under the base name (e.g.
+    # "Iter"), so the name-keyed fallback remains: the qualified name
+    # ("Iter[Int].next"), then the base name. a name-keyed entry that
+    # belongs to a different declaration of the same name must not answer
+    # for this receiver; refusing it lets the E209 below name the type.
     type_name := get_type_name(dispatch_type)
-    mut key := type_name + "." + method_name
+    mut key := method_tid_key(dispatch_type, method_name)
     if has_method_declaration(key) == false:
-        base_name := extract_base_type_name(type_name)
-        if base_name != type_name:
-            key = base_name + "." + method_name
-    if has_method_declaration(key):
+        key = type_name + "." + method_name
+        if has_method_declaration(key) == false:
+            base_name := extract_base_type_name(type_name)
+            if base_name != type_name:
+                key = base_name + "." + method_name
+        owner := method_declaration_owner(key)
+        if owner >= 0 and owner != dispatch_type:
+            key = ""
+    if key.len() > 0 and has_method_declaration(key):
         method_node := get_node(get_method_declaration_index(key))
         # if the receiver is a generic struct instance, build a substitution
         # map (T -> Int, ...) so the method signature resolves concretely

@@ -1,0 +1,13 @@
+# two modules each declare a struct Widget with a label() method. method
+# dispatch must bind each call to the receiver's own declaration — by checked
+# type id, never by bare name. a regression that resolves by name binds one
+# receiver to the other module's method and reads the wrong field offsets,
+# which this golden output catches.
+import samename_method_one as one
+import samename_method_two as two
+
+fn main():
+    a := one.make_one()
+    b := two.make_two()
+    print(a.label())
+    print(b.label())

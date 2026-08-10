@@ -8,6 +8,10 @@ from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_call
 
 pub mut ir_func_returns: Map[String, String] := {} # function name -> return type hint
 pub mut ir_impl_methods: Map[String, String] := {}
+# which declaration (by checked tid) a name-keyed impl entry belongs to. two
+# modules can declare a same-named struct; the name key alone cannot say whose
+# method it holds, so dispatch consults this to refuse a foreign entry.
+pub mut ir_impl_method_owner: Map[String, Int] := {}
 pub mut ir_impl_method_specializations: Map[String, String] := {}
 # interface base name -> its interface_decl node index, so an impl can emit
 # the interface's default methods it did not override.
@@ -28,6 +32,12 @@ pub fn ir_resolve_assoc_type(impl_type: String, type_name: String) -> String:
 ## the lookup key for a method on a type: "Type.method".
 pub fn ir_impl_method_key(type_name: String, method_name: String) -> String:
     return type_name + "." + method_name
+
+## the tid-keyed lookup key for a method on a specific declaration. a bare
+## type name can belong to two modules' structs at once; the checked tid
+## names exactly one of them.
+pub fn ir_impl_tid_key(tid: Int, method_name: String) -> String:
+    return "#" + tid.to_string() + "." + method_name
 
 ## turn a type-qualified name into a legal ir symbol.
 pub fn ir_sanitize_symbol(name: String) -> String:

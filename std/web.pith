@@ -417,16 +417,33 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
 # serve one accepted connection to completion on its own task, then close it.
 # errors are swallowed so a broken client only ever affects its own connection.
 #
-# the enter/leave bracket is what a drain counts: listen() does not return until
-# every connection that got this far has finished, so a rolling deploy cannot
-# cut a response in half. `defer` releases the count on the error path too — a
-# connection that leaks its count holds the whole shutdown open for the full
-# grace period.
+# the drain count this releases was taken at the accept, in spawn_conn. `defer`
+# releases it on the error path too — a connection that leaks its count holds
+# the whole shutdown open for the full grace period.
 fn handle_conn(app: App, fd: Int):
-    shutdown.enter()
     defer shutdown.leave()
     tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     http.serve_connection_fd(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
+
+# hand an accepted socket to its own task, counted in the drain from the moment
+# it was accepted.
+#
+# ## why the count is taken here and not inside the task
+#
+# between `spawn` and the spawned task's first instruction the connection is
+# invisible: it has not entered, a drain sees nothing outstanding and returns,
+# and a client that was accepted moments before the shutdown request gets its
+# socket cut with no response and no trace. listen() does not return until every
+# connection that got *accepted* has finished — that is the promise. counting
+# from the task's first instruction keeps a weaker one, without saying so.
+#
+# the direction of the remaining error is deliberate. a task that never runs
+# holds a count nobody releases, and `drain()` gives up at the grace period and
+# returns it as work it abandoned — bounded, and reported. the other direction
+# drops a connection silently.
+fn spawn_conn(app: App, fd: Int):
+    shutdown.enter()
+    spawn handle_conn(app, fd)
 
 # serve one accepted tls connection: native http/2 when the client negotiated
 # alpn "h2", http/1.1 over the same tls session otherwise. either way the request
@@ -456,13 +473,18 @@ fn release_tls_listener(listener: tls.Listener):
     shutdown.close_listener(listener.handle)
     tls.release_listener_config(listener)
 
-# the drain bracket lives here rather than around the handshake alone, so a
-# connection counts as in flight from the moment it is accepted until it is
-# fully served — a handshake interrupted mid-shutdown is still a client waiting.
+# the whole of the tls connection, handshake included, under the drain count
+# taken for it at the accept: a handshake interrupted mid-shutdown is still a
+# client waiting.
 fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
-    shutdown.enter()
     defer shutdown.leave()
     handshake_and_serve_tls_conn(app, listener_handle, fd) catch false
+
+# hand an accepted tls socket to its own task, counted in the drain from the
+# accept — see spawn_conn for why the count cannot wait for the task to start.
+fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
+    shutdown.enter()
+    spawn handle_tls_socket(app, listener_handle, fd)
 
 impl App:
     # register a GET route. returns a new App, so calls chain:
@@ -541,7 +563,7 @@ impl App:
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
-            spawn handle_conn(app, accepted.ok)
+            spawn_conn(app, accepted.ok)
         # free the port before draining, not after: the replacement instance of
         # a rolling deploy is waiting to bind it, and the drain can take the
         # whole grace period. the defer above is then a no-op — close_listener
@@ -593,15 +615,18 @@ impl App:
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
-            spawn handle_tls_socket(app, listener.handle, accepted.ok)
-        # free the port before draining (see the plaintext listener above).
-        release_tls_listener(listener)
+            spawn_tls_conn(app, listener.handle, accepted.ok)
+        # free the port before draining (see the plaintext listener above), but
+        # only the port. the listener's binding to the tls config outlives the
+        # accept loop, because a connection accepted a moment before the
+        # shutdown has not necessarily reached its handshake yet — and the
+        # handshake finds the certificate and the key through that binding.
+        shutdown.close_listener(listener.handle)
         drained := shutdown.drain_default()
-        # this call built the config, so this call closes it — and only here,
-        # once the drain has finished. the listener merely borrowed it, and each
-        # connection task reads the certificate and key out of the registry when
-        # its own handshake gets that far, which is long after the accept that
-        # spawned it returned. see docs/tls.md.
+        # the drain is over, so every connection that borrowed the config has
+        # finished with it: drop the listener's binding, then close the config
+        # this call built. see docs/tls.md.
+        release_tls_listener(listener)
         config.close()
         return drained
 
@@ -991,3 +1016,89 @@ test "the circuit middleware trips on 5xx and recovers through its probe":
     # the half-open probe is a real request; a 200 closes the circuit.
     assert_eq(shielded(always_pong, req).status, 200)
     assert_eq(shielded(always_pong, req).status, 200)
+
+# --- accept-time drain registration ---
+#
+# these drive spawn_conn / spawn_tls_conn directly, over real sockets and
+# without an accept loop, so the drain count can be read in the window between
+# the spawn and the task's first instruction — the window the count exists to
+# cover. an accept loop's only other job is tcp.accept, which is what these do
+# by hand.
+
+# open `count` connected socket pairs against a listener on `port` and return the
+# server-side fds. the client ends go onto `clients` so the test can close them
+# and let the connection tasks finish.
+fn accepted_pairs(port: Int, count: Int, clients: List[Int]) -> List[Int]:
+    listener := tcp_listen("127.0.0.1", port) catch -1
+    assert(listener > 0)
+    mut served: List[Int] := []
+    mut i := 0
+    while i < count:
+        connected := tcp.connect("127.0.0.1", port)
+        assert(not connected.is_err)
+        clients.push(connected.ok)
+        accepted := tcp.accept(listener)
+        assert(not accepted.is_err)
+        served.push(accepted.ok)
+        i = i + 1
+    tcp_close(listener)
+    return served
+
+test "an accepted connection is in the drain count before its task runs":
+    shutdown.reset()
+    app := new().get("/", always_pong)
+    mut clients: List[Int] := []
+    served := accepted_pairs(18991, 8, clients)
+    for fd in served:
+        spawn_conn(app, fd)
+    # taken on this task, so the count is complete the instant the last hand-off
+    # returns, however many of the eight tasks have actually started. with the
+    # count taken inside the task, most of these are invisible here — and a
+    # shutdown landing now would report a clean drain over eight clients that
+    # were accepted and never answered.
+    assert_eq(shutdown.inflight(), 8)
+    # nothing can finish while the peers hold their sockets open and send
+    # nothing, so a drain gives up at its deadline and reports all eight.
+    assert_eq(shutdown.drain(20), 8)
+    for c in clients:
+        tcp_close(c)
+    # every task leaves exactly once, including on this path where the request
+    # never arrived: no double count and nothing left behind.
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(shutdown.inflight(), 0)
+    shutdown.reset()
+
+test "an accepted tls connection is in the drain count before its handshake starts":
+    shutdown.reset()
+    app := new().get("/", always_pong)
+    config := tls.server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["h2", "http/1.1"])
+    bound := tls.listen("127.0.0.1", 18992, config)
+    assert(not bound.is_err)
+    listener := bound.ok
+    mut clients: List[Int] := []
+    mut served: List[Int] := []
+    mut i := 0
+    while i < 4:
+        # plain tcp peers that never send a client hello: every handshake parks
+        # on its first read, so no task can reach its `leave`.
+        connected := tcp.connect("127.0.0.1", 18992)
+        assert(not connected.is_err)
+        clients.push(connected.ok)
+        accepted := tls.accept_socket(listener)
+        assert(not accepted.is_err)
+        served.push(accepted.ok)
+        i = i + 1
+    for fd in served:
+        spawn_tls_conn(app, listener.handle, fd)
+    # a connection still mid-handshake when a shutdown lands is a client waiting
+    # for an answer, so it counts from the accept like any other.
+    assert_eq(shutdown.inflight(), 4)
+    for c in clients:
+        tcp_close(c)
+    # the handshakes fail once their peers are gone, and that path leaves the
+    # count exactly once too.
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(shutdown.inflight(), 0)
+    release_tls_listener(listener)
+    config.close()
+    shutdown.reset()

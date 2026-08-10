@@ -675,9 +675,9 @@ has no such decoupling: a request needs a connection, so a loop that stops
 accepting stops answering *everything*, including the load balancer's probe and
 your `/healthz`. an orchestrator then kills the process for being unresponsive at
 exactly the moment it is healthy and full, and the replacement comes up into the
-same load. refusing keeps the server reachable, and lets a load balancer that
-sees a 503 shed to another instance instead of waiting on a socket that will
-never answer.
+same load. refusing keeps the server reachable, and a load balancer that gets an
+immediate answer — a 503 or a reset — sheds to another instance instead of
+waiting on a socket that will never reply.
 
 `listen_h2c` is not part of this budget — it delegates to `std.net.http2.server`
 and is bounded by that module's own cap of 512.

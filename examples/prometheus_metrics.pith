@@ -2,9 +2,13 @@
 #
 # in a real app you spawn the endpoint and let prometheus scrape it:
 #     import std.prometheus as prometheus
+#     import std.shutdown as shutdown
+#     shutdown.on_signals() catch 0
 #     spawn prometheus.serve("0.0.0.0", 9464)
-# prometheus then GETs http://host:9464/metrics on its scrape interval. here we
-# just register a few labeled metrics and print exactly what a scrape returns.
+# prometheus then GETs http://host:9464/metrics on its scrape interval, and on a
+# SIGTERM the endpoint stops accepting and finishes the scrape it is mid-way
+# through. here we just register a few labeled metrics and print exactly what a
+# scrape returns.
 import std.metrics as metrics
 
 fn main() -> Int!:

@@ -15,10 +15,17 @@
 //! every function works whichever backend is running. off a green task there is
 //! no coroutine to suspend, so a would-block waits in `poll` — which is what
 //! the blocking fd these calls replaced did anyway.
+//!
+//! a wait is bounded by the socket's own timeout option. the os-thread backend
+//! gets that for free — its fd is blocking, so `SO_RCVTIMEO` bounds the syscall
+//! in the kernel — and the retry loops here read the same option back and hand
+//! it to the wait, so a read deadline means the same thing on either backend
+//! instead of being inert on the one that is the default.
 
 use crate::concurrency::green;
 use crate::netpoll;
 use std::os::unix::io::RawFd;
+use std::time::{Duration, Instant};
 
 /// the current errno as a plain int.
 pub(crate) fn errno() -> i32 {
@@ -106,6 +113,42 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
     }
 }
 
+/// read one of the socket timeout options off `fd` as milliseconds, returning
+/// `-1` for "no deadline" — which covers the option being unset, the fd not
+/// being a socket, and the call failing for any other reason. `-1` is the safe
+/// answer to all three: it is what every caller that never set a timeout wants,
+/// and it is what this path did before it asked at all.
+///
+/// a sub-millisecond timeout rounds up to 1 ms rather than down to 0, because
+/// `0` means "do not wait" to `wait_ready` and would turn a 500 µs deadline into
+/// an instant failure.
+fn socket_timeout_ms(fd: i64, option: libc::c_int) -> i64 {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    // SAFETY: getsockopt writing a `timeval` of exactly the length we declare,
+    // on an fd pith owns for the duration of the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd as i32,
+            libc::SOL_SOCKET,
+            option,
+            &mut tv as *mut libc::timeval as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return -1;
+    }
+    if tv.tv_sec == 0 && tv.tv_usec == 0 {
+        return -1;
+    }
+    let ms = (tv.tv_sec as i64).saturating_mul(1000) + (tv.tv_usec as i64) / 1000;
+    std::cmp::max(1, ms)
+}
+
 /// what kind of thing an fd refers to, which is to say which syscall pair moves
 /// its bytes.
 ///
@@ -167,12 +210,103 @@ impl Channel {
         }
     }
 
+    /// how long a would-block wait on this fd may last, in milliseconds, or
+    /// `-1` to wait forever.
+    ///
+    /// the kernel is the source of truth. `pith_tcp_set_timeout` writes
+    /// `SO_RCVTIMEO`, and the os-thread backend's blocking read has always got
+    /// its deadline by handing the syscall over to the kernel that holds it, so
+    /// reading it back here is the same number by construction rather than a
+    /// second copy of it that has to be kept in step.
+    ///
+    /// it is also what makes a recycled descriptor safe. the kernel gives a
+    /// closed fd's number straight to the next `open`, and clears the socket
+    /// options with it; a `fd -> deadline` table in the runtime would instead
+    /// hand a fresh connection the timeout of the one that used to hold its
+    /// number, silently, and only under load.
+    fn timeout_ms(self, fd: i64, read: bool) -> i64 {
+        match self {
+            // `SO_RCVTIMEO` is a socket option and a pipe is not a socket:
+            // there is nothing to read, and nothing sets a deadline on a child
+            // process's stdout in the first place. a pipe read waits for its
+            // writer, as it always has.
+            Channel::Pipe => -1,
+            Channel::Socket => socket_timeout_ms(
+                fd,
+                if read {
+                    libc::SO_RCVTIMEO
+                } else {
+                    libc::SO_SNDTIMEO
+                },
+            ),
+        }
+    }
+
     /// stop the process if `err` says this fd is not a socket. a no-op for a
     /// pipe, which never asks the question.
     fn check(self, fd: i64, err: i32, operation: &str) {
         if matches!(self, Channel::Socket) && err == libc::ENOTSOCK {
             report_not_a_socket(fd, operation);
         }
+    }
+}
+
+/// the time one retry loop may spend waiting for its fd: asked for the first
+/// time the loop would block, then spent down across the retries after it.
+///
+/// two properties, both of which the shape exists for.
+///
+/// the timeout is only ever asked for on the path that is about to park, so a
+/// read that finds its bytes already there pays nothing for it. the extra
+/// `getsockopt` lands exactly where the caller was going to sleep anyway.
+///
+/// and a wake with nothing behind it cannot restart the clock. the caller asked
+/// for one bounded read, not an unbounded series of bounded waits, so a retry
+/// gets what is left of the original budget rather than a fresh copy of it —
+/// which is also how `SO_RCVTIMEO` bounds the blocking read this mirrors.
+#[derive(Clone, Copy)]
+enum WaitBudget {
+    /// the loop has not blocked yet, so nothing has been asked for.
+    Unasked,
+    /// no deadline. a pipe, or a socket with no timeout set — which is most of
+    /// them, and everything that never calls `set_timeout`.
+    Forever,
+    /// give up once this instant passes.
+    Until(Instant),
+}
+
+impl WaitBudget {
+    /// wait for `fd` to become ready within what is left of the budget,
+    /// resolving the budget from the fd on the first call. returns
+    /// `wait_ready`'s tri-state, with `0` also covering a budget already spent.
+    fn wait(&mut self, fd: i64, read: bool, channel: Channel) -> i64 {
+        let resolved = match *self {
+            WaitBudget::Unasked => {
+                let budget = match channel.timeout_ms(fd, read) {
+                    ms if ms > 0 => {
+                        WaitBudget::Until(Instant::now() + Duration::from_millis(ms as u64))
+                    }
+                    _ => WaitBudget::Forever,
+                };
+                *self = budget;
+                budget
+            }
+            settled => settled,
+        };
+        let remaining = match resolved {
+            WaitBudget::Until(at) => {
+                let now = Instant::now();
+                if at <= now {
+                    return 0;
+                }
+                // round any sub-millisecond remainder up: `0` would mean "do not
+                // wait", which is a timeout the deadline has not reached yet.
+                let left = at.duration_since(now).as_millis().min(i64::MAX as u128) as i64;
+                std::cmp::max(1, left)
+            }
+            _ => -1,
+        };
+        wait_ready(fd, read, remaining)
     }
 }
 
@@ -219,10 +353,14 @@ pub(crate) fn socket_read_yielding(fd: i64, size: usize) -> Option<Vec<u8>> {
 }
 
 /// read up to `size` bytes, yielding on would-block until data arrives, the
-/// writer closes (returns an empty vec — real EOF), or a hard error (returns
-/// `None`). mirrors the blocking path's contract: 0 bytes is EOF, not an error.
+/// socket's read deadline expires, the writer closes (returns an empty vec —
+/// real EOF), or a hard error (returns `None`). mirrors the blocking path's
+/// contract exactly: 0 bytes is EOF, not an error, and an expired deadline is
+/// `None`, which is what `socket_read_blocking` makes of the `EAGAIN` its
+/// `SO_RCVTIMEO` produces.
 fn read_channel(fd: i64, size: usize, channel: Channel) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; size];
+    let mut budget = WaitBudget::Unasked;
     loop {
         // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is owned
         // by pith for the duration of this call.
@@ -234,8 +372,9 @@ fn read_channel(fd: i64, size: usize, channel: Channel) -> Option<Vec<u8>> {
         let err = errno();
         channel.check(fd, err, "read");
         if is_would_block(err) {
-            // nothing ready — yield to the reactor and retry when readable.
-            if wait_ready(fd, true, -1) != 1 {
+            // nothing ready — yield to the reactor and retry when readable, or
+            // give up once the socket's read deadline runs out.
+            if budget.wait(fd, true, channel) != 1 {
                 return None;
             }
             continue;
@@ -262,13 +401,21 @@ pub(crate) fn socket_write_yielding(fd: i64, data: &[u8]) -> i64 {
 
 /// write one buffer: one write syscall, yielding only if it would block with
 /// nothing written yet. returns the bytes written (a partial count is returned
-/// as-is — callers loop), or `0` for a real error or closed reader. it never
-/// returns `0` for a would-block: `0` must mean closed/EOF only, so a
-/// would-block waits and retries until at least one byte goes out.
+/// as-is — callers loop), or `0` for a real error, a closed reader, or a send
+/// deadline that expired — which is again what the blocking path reports for
+/// the `EAGAIN` an expired `SO_SNDTIMEO` gives it. it never returns `0` for an
+/// ordinary would-block: `0` must mean closed/EOF only, so a would-block waits
+/// and retries until at least one byte goes out.
+///
+/// nothing in pith sets `SO_SNDTIMEO` today, so this budget resolves to "wait
+/// forever" on every socket the runtime has. it is read anyway so that the two
+/// directions stay the same shape: a send deadline, if one is ever set, must
+/// bound a green write exactly as it already bounds an os-thread one.
 fn write_channel(fd: i64, data: &[u8], channel: Channel) -> i64 {
     if data.is_empty() {
         return 0;
     }
+    let mut budget = WaitBudget::Unasked;
     loop {
         // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is
         // owned by pith for the duration of this call.
@@ -283,7 +430,7 @@ fn write_channel(fd: i64, data: &[u8], channel: Channel) -> i64 {
         let err = errno();
         channel.check(fd, err, "write");
         if is_would_block(err) {
-            if wait_ready(fd, false, -1) != 1 {
+            if budget.wait(fd, false, channel) != 1 {
                 return 0;
             }
             continue;
@@ -473,6 +620,162 @@ mod tests {
         close(b);
         assert_eq!(socket_read_errno(a), libc::EBADF);
         assert_eq!(socket_write_errno(a), libc::EBADF);
+    }
+
+    // -----------------------------------------------------------------------
+    // read deadlines.
+    //
+    // these run off a green task, so `wait_ready` takes its `poll` branch — the
+    // deadline arithmetic is the same either way, and this keeps the tests free
+    // of a reactor. the end-to-end green case lives in
+    // tests/cases/test_socket_read_timeout.pith, which runs on both backends.
+    // -----------------------------------------------------------------------
+
+    /// write `SO_RCVTIMEO` directly, in microseconds, for the cases
+    /// `pith_tcp_set_timeout`'s millisecond argument cannot express.
+    fn set_read_timeout_micros(fd: RawFd, usec: i64) {
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: usec as libc::suseconds_t,
+        };
+        // SAFETY: setsockopt with a `timeval` of the length we declare.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+    }
+
+    /// the fact the whole fix rests on: `SO_RCVTIMEO` is still recorded on a
+    /// non-blocking socket, and reads back. the option has no *effect* on a
+    /// non-blocking syscall — which is the bug — but the kernel keeps it, so it
+    /// is a usable place to have put the deadline.
+    ///
+    /// it does not read back byte-identical to what was written: linux stores
+    /// the timeout in jiffies, so it comes back rounded up to the tick (250 ms
+    /// reads as 252 on a 250 Hz kernel). that is the deadline the blocking
+    /// backend actually waits, so taking the kernel's number rather than a
+    /// remembered one is the more faithful answer, not a lossy one. the
+    /// assertion is therefore a band: never shorter than asked, never
+    /// meaningfully longer.
+    #[test]
+    fn a_read_deadline_is_readable_back_off_a_non_blocking_socket() {
+        let (a, b) = socket_pair();
+        set_nonblocking(a);
+        crate::network::pith_tcp_set_timeout(a as i64, 250);
+        let deadline = Channel::Socket.timeout_ms(a as i64, true);
+        assert!((250..300).contains(&deadline), "read back {deadline} ms");
+        // one direction only, and only the socket it was set on.
+        assert_eq!(Channel::Socket.timeout_ms(a as i64, false), -1);
+        assert_eq!(Channel::Socket.timeout_ms(b as i64, true), -1);
+        // and clearing it puts the socket back to waiting forever.
+        crate::network::pith_tcp_set_timeout(a as i64, 0);
+        assert_eq!(Channel::Socket.timeout_ms(a as i64, true), -1);
+        close(a);
+        close(b);
+    }
+
+    /// a sub-millisecond deadline must not round down to `0`, which `wait_ready`
+    /// reads as "do not wait" and would answer with an instant timeout. the
+    /// kernel's own jiffy rounding usually settles this first — 500 µs comes
+    /// back as a whole tick — but the guard is what makes that a property
+    /// rather than a coincidence of the host's HZ.
+    #[test]
+    fn a_sub_millisecond_deadline_rounds_up_rather_than_to_no_wait_at_all() {
+        let (a, b) = socket_pair();
+        set_read_timeout_micros(a, 500);
+        let deadline = Channel::Socket.timeout_ms(a as i64, true);
+        assert!(deadline >= 1, "a 500 us deadline read back as {deadline} ms");
+        close(a);
+        close(b);
+    }
+
+    /// a pipe has no deadline to read — `SO_RCVTIMEO` is a socket option — so a
+    /// child process's stdout waits for its writer exactly as it always has.
+    #[test]
+    fn a_pipe_has_no_deadline_and_keeps_waiting_forever() {
+        let (read_end, write_end) = pipe();
+        assert_eq!(Channel::Pipe.timeout_ms(read_end as i64, true), -1);
+        assert_eq!(Channel::Pipe.timeout_ms(write_end as i64, false), -1);
+        // even on a descriptor that *is* a socket with a deadline set, the pipe
+        // channel does not go looking for one.
+        let (a, b) = socket_pair();
+        crate::network::pith_tcp_set_timeout(a as i64, 250);
+        assert_eq!(Channel::Pipe.timeout_ms(a as i64, true), -1);
+        close(a);
+        close(b);
+        close(read_end);
+        close(write_end);
+    }
+
+    /// an idle socket with a deadline gives up on it, and reports the giving up
+    /// exactly as the blocking backend does: `None`.
+    #[test]
+    fn an_idle_socket_read_gives_up_at_its_deadline_on_both_paths() {
+        let (a, b) = socket_pair();
+        set_nonblocking(a);
+        crate::network::pith_tcp_set_timeout(a as i64, 150);
+        crate::network::pith_tcp_set_timeout(b as i64, 150);
+
+        let start = Instant::now();
+        // the yielding path: the one that used to wait forever here.
+        assert!(socket_read_yielding(a as i64, 16).is_none());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(120), "gave up after {waited:?}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+
+        // and the blocking path, whose answer it has to match. `b` is left
+        // blocking, so this is `SO_RCVTIMEO` doing the work in the kernel.
+        assert!(socket_read_blocking(b as i64, 16).is_none());
+
+        close(a);
+        close(b);
+    }
+
+    /// the budget is spent down across retries rather than reset by each one: a
+    /// second wait on an exhausted budget gives up at once instead of buying
+    /// another full deadline. without this a socket that keeps waking with
+    /// nothing behind it would never reach its deadline at all.
+    #[test]
+    fn a_retry_gets_what_is_left_of_the_deadline_not_a_fresh_one() {
+        let (a, b) = socket_pair();
+        set_nonblocking(a);
+        crate::network::pith_tcp_set_timeout(a as i64, 150);
+        let mut budget = WaitBudget::Unasked;
+
+        let start = Instant::now();
+        assert_eq!(budget.wait(a as i64, true, Channel::Socket), 0);
+        assert!(start.elapsed() >= Duration::from_millis(120));
+
+        let retry = Instant::now();
+        assert_eq!(budget.wait(a as i64, true, Channel::Socket), 0);
+        let spent = retry.elapsed();
+        assert!(spent < Duration::from_millis(50), "retry waited {spent:?}");
+
+        close(a);
+        close(b);
+    }
+
+    /// no deadline set still means wait forever, which is what nearly every
+    /// socket in the stdlib is: the budget resolves to `Forever` and the wait it
+    /// asks for is the unbounded one.
+    #[test]
+    fn a_socket_with_no_deadline_still_waits_forever() {
+        let (a, b) = socket_pair();
+        set_nonblocking(a);
+        let mut budget = WaitBudget::Unasked;
+        // ready immediately, so this does not actually block — what is being
+        // checked is which deadline it resolved before waiting.
+        assert_eq!(socket_write_yielding(b as i64, b"x"), 1);
+        assert_eq!(budget.wait(a as i64, true, Channel::Socket), 1);
+        assert!(matches!(budget, WaitBudget::Forever));
+        close(a);
+        close(b);
     }
 
     // -----------------------------------------------------------------------

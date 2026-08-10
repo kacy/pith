@@ -559,6 +559,12 @@ route stays one series instead of thousands:
 - `http_server_requests_in_flight{method,route}` — a gauge of in-flight requests
 - `http_server_duration_ms{method,route}` — a request-duration histogram
 
+the accept loop records two more, unlabeled, about connections rather than
+requests — `http_server_connections` and
+`http_server_connections_refused_total`. those come from `listen` itself, so a
+`web.bare()` app has them even though it has no request middleware; [how many at
+once](#how-many-at-once) covers what they mean.
+
 these live in memory and are always on: they need no setup and cost a map update per
 request. `web.new()` also registers `GET /metrics`, which renders every `std.metrics`
 series as prometheus text, so a scraper reads them straight off your server:
@@ -638,6 +644,58 @@ accepted in between, which is as much as it can tell from the outside. that
 matters because a listener that has quietly stopped accepting still answers a
 tcp health check — the socket is open, the kernel is filling the backlog, and
 nobody is serving.
+
+### how many at once
+
+`listen` and `listen_tls` serve at most 512 connections at a time, between them.
+a task costs a stack and its buffers, so a loop that spawns one per accept with
+no ceiling lets a client trade cheap sockets for expensive server memory: open
+them faster than they complete and the server runs out.
+
+past the cap the loop keeps accepting and refuses immediately — `503 Service
+Unavailable` with `Retry-After: 1`, written by the accept loop itself, no task
+spawned. over tls the socket is closed instead, before the handshake: saying 503
+in http would mean completing the key exchange first, which is the expensive work
+being refused.
+
+the 503 is best-effort. closing a socket that still holds unread data resets it
+rather than finishing it cleanly, and a client that gets a reset drops what it had
+buffered — so a peer that had already sent its request, which is most of them when
+a cap is firing, sees a connection error instead of the status line. draining the
+request first is what would fix that, and it cannot be done without a read that
+has no deadline under the green runtime, which would park the accept loop for
+good. so treat the refusal metric as the signal and the 503 as a courtesy to the
+clients that happen to be waiting.
+
+this is deliberately not what the http/2 server does, which waits for a
+connection to end before accepting another. the difference is the protocol. an
+http/2 connection multiplexes, so requests keep arriving on connections that are
+already open and a loop that stops accepting still serves at full rate. http/1.1
+has no such decoupling: a request needs a connection, so a loop that stops
+accepting stops answering *everything*, including the load balancer's probe and
+your `/healthz`. an orchestrator then kills the process for being unresponsive at
+exactly the moment it is healthy and full, and the replacement comes up into the
+same load. refusing keeps the server reachable, and lets a load balancer that
+sees a 503 shed to another instance instead of waiting on a socket that will
+never answer.
+
+`listen_h2c` is not part of this budget — it delegates to `std.net.http2.server`
+and is bounded by that module's own cap of 512.
+
+two metrics make the cap visible. both are recorded by the accept loop rather
+than the request middleware, so a `web.bare()` app has them too:
+
+- `http_server_connections` — a gauge of connections being served right now
+- `http_server_connections_refused_total` — a counter of connections turned away
+
+a refusal counter that is climbing is the cap shedding load, which is what it is
+for. a gauge pinned at 512 with no requests flowing is the other case: slots held
+by connections that are not going anywhere. under the green runtime that is worth
+knowing about, because the idle timeout that would otherwise reclaim them does not
+fire there — the green read path waits on the reactor with no deadline — so a
+client that connects and then says nothing holds its slot until it disconnects.
+the gauge is what tells you, and the server keeps answering every new connection
+either way, which it would not if the loop had blocked.
 
 ## http/2
 

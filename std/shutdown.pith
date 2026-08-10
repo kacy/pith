@@ -23,8 +23,9 @@
 ##   `shutdown(2)` on each, which both stops new connections and wakes the
 ##   waiting accept loop immediately — no polling for the flag. the loop still
 ##   closes its own listener, so nothing closes an fd another task is using.
-## - **in-flight work.** each connection task brackets itself with
-##   `enter()`/`leave()`, so `drain()` knows when the last one is done.
+## - **in-flight work.** a server calls `enter()` on its accept loop, the moment
+##   a connection is accepted, and the task it hands that connection to calls
+##   `leave()` when it is done — so `drain()` knows when the last one is out.
 ## - **flushes.** a subsystem with its own shutdown work — the telemetry
 ##   exporter is the one in std — calls `expect_flush()` up front and
 ##   `flush_done()` when it has finished. `drain()` waits for those too, which
@@ -157,8 +158,16 @@ pub fn listeners() -> Int:
     mu.unlock()
     return n
 
-## mark one unit of in-flight work started. a server calls this as a connection
-## task begins; `drain()` will not report a clean shutdown until it leaves.
+## mark one unit of in-flight work started; `drain()` will not report a clean
+## shutdown until it leaves.
+##
+## call it *before* handing the work to a task, not as the task's first act.
+## between a `spawn` and the spawned task's first instruction the work is
+## invisible: it has not entered, a drain landing in that window sees nothing
+## outstanding and returns, and the connection it was about to serve is cut with
+## no response and no trace. counting from the accept can only ever count too
+## much — work that never starts — and that costs at most the grace period and
+## is reported by `drain()`, where counting too little loses a client silently.
 pub fn enter():
     mu.lock()
     inflight_count = inflight_count + 1

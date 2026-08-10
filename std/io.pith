@@ -1148,31 +1148,17 @@ fn find_bytes_sep(data: Bytes, sep: Bytes) -> Int:
         i = i + 1
     return 0 - 1
 
-# read one chunk from whichever source `kind` names.
+# read one chunk from whichever source `kind` names, as raw bytes.
 #
 # the five sources are the only thing that ever differed between the `read_all`
 # loops and between the buffered readers' fills, so naming the source with a tag
 # leaves one copy of each loop instead of one per source.
-fn text_source_read(kind: Int, source: Int, size: Int) -> String!:
-    if kind == TEXT_SOURCE_STRING:
-        return string_reader_read(StringReader(source), size)
-    elif kind == TEXT_SOURCE_TCP:
-        return tcp_stream_read(TcpStream(source), size)
-    elif kind == TEXT_SOURCE_FILE:
-        return file_stream_read(FileStream(source), size)
-    elif kind == TEXT_SOURCE_PROCESS_STDOUT:
-        return process_stdout_read(ProcessStdout(source), size)
-    elif kind == TEXT_SOURCE_PROCESS_STDERR:
-        return process_stderr_read(ProcessStderr(source), size)
-    return ""
-
-# read one chunk from `kind` as raw bytes.
 #
-# a source that is not text already hands back bytes and only becomes text
-# because something decoded it, and `size` bytes off a stream end wherever the
-# count lands — including halfway through a character, which is not a decodable
-# chunk. everything that reads a source to text goes through this instead, and
-# decodes on character boundaries of its own choosing.
+# the chunk comes back as bytes and not as text. four of these sources are byte
+# streams that only become text because something decoded them, and `size` bytes
+# off a stream end wherever the count lands — including halfway through a
+# character, which is not a decodable chunk on its own. so the decode belongs to
+# the caller, which knows where it wants its boundaries.
 #
 # a string reader is the exception: its data is already text, so it slices on a
 # boundary itself and what comes back is always whole.
@@ -1189,8 +1175,12 @@ fn text_source_read_bytes(kind: Int, source: Int, size: Int) -> Bytes!:
         return process_stderr_read_bytes(ProcessStderr(source), size)
     return bytes.empty()
 
-# the deadline-aware twin of `text_source_read_bytes`. see `text_source_read_ctx`
-# for why the two cannot be one function.
+# the deadline-aware twin of `text_source_read_bytes`.
+#
+# this cannot be folded into the function above: the error type is part of the
+# signature, and the context has to reach the read itself so a blocked source
+# gives up when the deadline passes rather than when the peer eventually speaks.
+# a string reader and a file never block, so neither takes a context.
 fn text_source_read_bytes_ctx(kind: Int, source: Int, ctx: Context, size: Int) -> Bytes!BlockingError:
     if kind == TEXT_SOURCE_TCP:
         return tcp_stream_read_bytes_ctx(TcpStream(source), ctx, size)
@@ -1199,21 +1189,6 @@ fn text_source_read_bytes_ctx(kind: Int, source: Int, ctx: Context, size: Int) -
     elif kind == TEXT_SOURCE_PROCESS_STDERR:
         return process_stderr_read_bytes_ctx(ProcessStderr(source), ctx, size)
     return bytes.empty()
-
-# the deadline-aware twin of `text_source_read`.
-#
-# this cannot be folded into the function above: the error type is part of the
-# signature, and the context has to reach the read itself so a blocked source
-# gives up when the deadline passes rather than when the peer eventually speaks.
-# a string reader and a file never block, so neither takes a context.
-fn text_source_read_ctx(kind: Int, source: Int, ctx: Context, size: Int) -> String!BlockingError:
-    if kind == TEXT_SOURCE_TCP:
-        return tcp_stream_read_ctx(TcpStream(source), ctx, size)
-    elif kind == TEXT_SOURCE_PROCESS_STDOUT:
-        return process_stdout_read_ctx(ProcessStdout(source), ctx, size)
-    elif kind == TEXT_SOURCE_PROCESS_STDERR:
-        return process_stderr_read_ctx(ProcessStderr(source), ctx, size)
-    return ""
 
 # drain a source to end-of-stream.
 #

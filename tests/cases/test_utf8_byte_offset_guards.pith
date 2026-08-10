@@ -1,0 +1,152 @@
+# a byte offset is not a character boundary.
+#
+# a pith String is indexed in bytes, `len()` counts bytes and `substring()`
+# takes byte offsets, so a length check never proves an offset falls on a
+# character boundary. cutting a string through the middle of a multi-byte
+# character is a runtime trap: the process ends with exit 1 and no catch can
+# intercept it.
+#
+# every line below ended the process before the guard it exercises existed.
+# each one is ordinary text — an accented word, two accents that differ in
+# their second byte, a copyright sign — not a malformed or hostile encoding.
+# the point of running them from `main` rather than from a `test` block is that
+# a trap would take this programme down and the expected output would not match.
+
+import std.fs as fs
+import std.io as io
+import std.json as json
+import std.os.process as process
+import std.regex as regex
+import std.strings as strings
+import std.testing as testing
+import std.text.scanner as scanner
+import std.toml as toml
+
+# a document that is not json must come back as a parse error, not as a dead
+# process. the value parser probed for `true`/`false`/`null` by slicing four
+# bytes off the input, and four bytes past "abc" is the middle of the accent.
+# a json body arrives from the network unauthenticated, so this one was
+# reachable by anyone who could reach the server.
+fn json_and_toml():
+    # parse returns -1 for a document it could not read, and a node handle
+    # otherwise. what matters here is that it returns at all.
+    print("json abcé rejected=" + (json.parse("abcé") == 0 - 1).to_string())
+    print("json accented string ok=" + (json.parse(chr(34) + "café" + chr(34)) >= 0).to_string())
+    print("json true ok=" + (json.parse("true") >= 0).to_string())
+    print("toml abcé rejected=" + (toml.parse("a = abcé") == 0 - 1).to_string())
+    print("toml true ok=" + (toml.parse("a = true") >= 0).to_string())
+
+# a set of characters to trim is a set of characters, not a set of bytes.
+# "©" and "é" share no character but do share the byte 0xA9, and matching that
+# byte pulled the cursor into the middle of the accent.
+fn trimming():
+    print("trim_right ©=[" + strings.trim_right_chars("aé", "©") + "]")
+    print("trim_left ©=[" + strings.trim_left_chars("éa", "©") + "]")
+    print("trim_right é=[" + strings.trim_right_chars("aé", "é") + "]")
+    print("trim_right ascii=[" + strings.trim_right_chars("axx", "x") + "]")
+
+# the regex vm steps one byte at a time, so `.` can stop halfway through a
+# character. a span that does not line up with the text is no match rather
+# than a dead process; a span that covers the whole character still matches.
+fn regexes() -> Int!:
+    dot := regex.compile(".")!
+    print("dot on é matches=" + dot.is_match("é").to_string())
+    print("dot on cafe matches=" + dot.is_match("cafe").to_string())
+    two := regex.compile("..")!
+    print("two dots on é=[" + two.find("é").unwrap_or(regex.Match(0, 0, "")).text + "]")
+    word := regex.compile("[a-z]+")!
+    print("word in café=[" + word.find("café").unwrap_or(regex.Match(0, 0, "")).text + "]")
+    print("replace_all in café=[" + regex.compile("a")!.replace_all("café", "4") + "]")
+    return 0
+
+# the scanner's cursor is measured in characters. it used to advance one byte
+# per character and then slice wherever that reached.
+fn scanning():
+    taken := scanner.take_until(scanner.new("é:x"), ":")
+    print("take_until é=[" + taken.slice.text + "]")
+    print("remaining=[" + scanner.remaining(taken.cursor) + "]")
+    line := scanner.take_line(scanner.new("héllo" + chr(10) + "next"))
+    print("take_line=[" + line.slice.text + "] col=" + line.cursor.col.to_string())
+    print("peek after two=[" + scanner.peek(scanner.advance_by(scanner.new("héllo"), 2)) + "]")
+
+# a read is counted in bytes and can ask to stop inside a character. it stops
+# at the boundary beside the count instead, and a read that would come back
+# empty takes the whole character rather than looking like end of stream.
+fn reading() -> Int!:
+    print("string reader read(2)=[" + io.string_reader("héllo").read(2)! + "]")
+    print("string reader read(1)=[" + io.string_reader("éllo").read(1)! + "]")
+    print("buffered read(2)=[" + io.string_reader("héllo").buffered().read(2)! + "]")
+    print("buffered read_until=[" + io.string_reader("abéZZ").buffered_chunked(4).read_until("ZZ")! + "]")
+
+    buf := io.string_buffer()
+    wrote := io.write_n(buf, "héllo", 2)!
+    print("write_n(2)=" + wrote.to_string())
+    return 0
+
+# a chunk boundary that falls inside a character is not a decode error, it is
+# two chunks. reading a utf-8 file in pieces used to fail outright whenever one
+# accented character straddled a 4 KiB boundary.
+fn chunked_reads() -> Int!:
+    mut parts := []
+    mut i := 0
+    while i < 4095:
+        parts.push("a")
+        i = i + 1
+    parts.push("é")
+    parts.push("tail")
+    straddling := parts.join("")
+
+    whole := io.string_reader(straddling).read_all_chunked(4096)!
+    print("read_all chunked len=" + whole.len().to_string())
+
+    line := io.string_reader(straddling).buffered_chunked(4096).read_line()!
+    print("buffered line len=" + line.len().to_string())
+
+    # the same through a source that hands back bytes rather than text. this is
+    # the half that used to come back as "bytes_to_string_utf8 failed": the read
+    # decoded each 4 KiB chunk on its own, and the chunk ended mid-character.
+    path := "/tmp/pith_utf8_boundary.txt"
+    fs.write(path, straddling)!
+    print("file whole len=" + fs.read(path)!.len().to_string())
+    print("file chunked len=" + io.read_file_text_chunked(path, 4096)!.len().to_string())
+
+    proc := io.spawn_process("cat " + path)!
+    out := proc.stdout().read_all()!
+    print("process out len=" + out.len().to_string())
+    print("process wait=" + proc.wait().to_string())
+    proc.close()
+
+    stream := fs.open(path)!
+    reader := stream.buffered_reader_chunked(4096)
+    print("file buffered line len=" + reader.read_line()!.len().to_string())
+    stream.close()
+
+    # std.fs and std.os.process keep their own copies of these loops, so they
+    # need their own coverage: the ones above run std.io's.
+    handle := fs.open(path)!
+    print("fs stream read_all len=" + handle.read_all()!.len().to_string())
+    handle.close()
+
+    child := process.start_shell("cat " + path)!
+    print("os.process out len=" + child.stdout().read_all()!.len().to_string())
+    print("os.process wait=" + child.wait().to_string())
+    child.close()
+
+    print("removed=" + fs.remove(path).to_string())
+    return 0
+
+# two strings that differ inside the same character report a difference rather
+# than stopping the run they are part of.
+fn reporting():
+    print("difference=" + testing.text_difference("é", "ê"))
+    print("difference ascii=" + testing.text_difference("abc", "abd"))
+
+fn main() -> Int!:
+    json_and_toml()
+    trimming()
+    regexes()!
+    scanning()
+    reading()!
+    chunked_reads()!
+    reporting()
+    return 0

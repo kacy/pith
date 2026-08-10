@@ -48,6 +48,40 @@ data in one may slice it anywhere; only real text has boundaries to respect.
 if you are slicing arbitrary bytes, use `Bytes`, which is what the rest of the
 standard library does.
 
+## a length check does not make an offset safe
+
+the abort is correct and the caller is what needs fixing, so it is worth naming
+the mistake that produces one. `len()` counts bytes and `substring` takes byte
+offsets, so **a length check never proves an offset falls on a character
+boundary**. `s.len() >= 2` says nothing about where character two starts.
+neither does "this field is thirteen characters by the spec", when the field
+came off a socket and the spec is the peer's to ignore.
+
+three things do prove it:
+
+- **an ascii byte you matched.** an ascii byte can never appear inside a
+  multi-byte character, so the position of one is always a boundary. this
+  covers most parsing: `index_of("=")`, a scan that stops on `:`, a cursor that
+  only moved across digits it checked. it is why slicing at a delimiter is safe
+  without thinking about it.
+- **an ascii prefix or suffix you matched.** `starts_with("Bearer ")` proves
+  offset 7 is a boundary; `ends_with("Z")` proves `len - 1` is.
+- **a boundary helper.** `text.floor_boundary`, `text.ceil_boundary`,
+  `text.byte_offset_of` and the `std.text` slicing functions answer the question
+  directly.
+
+what does not prove it: a fixed offset on unvalidated input, an arithmetic index
+like `len - 1` behind nothing but a length check, a count of bytes read or
+written, or a position from a scan that steps one byte at a time over arbitrary
+text. when you have one of those and need to cut, either move to the boundary
+beside it or read the byte in place with `s[i]`, which returns one byte and
+never cuts anything.
+
+comparing is the common case, and comparing does not need a cut at all. testing
+whether a word sits at a position by slicing it out is the shape that produced
+the worst of these: compare the bytes one at a time instead, which is both safe
+and cheaper.
+
 ## picking a unit
 
 three units, in increasing order of how much they cost and how closely they

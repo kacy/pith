@@ -148,4 +148,10 @@ fn main() -> Int!:
     print(run_script(17518, ["*10485761\r\n"], 65536)![0])
     print(run_script(17519, [repeat("*1\r\n", 66) + ":1\r\n"], 65536)![0])
     print(run_script(17520, [repeat("x", 70000)], 65536)![0])
+
+    # a reply line that starts with a multi-byte character. the body used to be
+    # cut off the front before the tag was established as one of the five ascii
+    # tags, and a String is cut in bytes, so the cut landed inside the character
+    # and ended the client process — uncatchably, on two bytes the server chose.
+    print(run_script(17521, ["é\r\n"], 65536)![0])
     return 0

@@ -204,6 +204,32 @@ pub fn ir_runtime_call_name(name: String) -> String:
         return "pith_cstring_eq"
     return name
 
+## whether an emitter receiver type names a primitive, whose methods are all
+## builtins the runtime provides.
+pub fn ir_obj_type_is_primitive(obj_type: String) -> Bool:
+    return obj_type == "string" or obj_type == "bytes" or obj_type == "int" or obj_type == "float" or obj_type == "bool"
+
+## the runtime call name for a builtin method on a primitive receiver. the
+## consumer resolves a bare call name through the user function table first,
+## so a free function sharing the name captured the method call: with
+## `fn to_int(text: String, fallback: Int)` in the build, `(1.5).to_int()`
+## passed one argument to a two-argument function — and with a same-arity
+## `fn to_int(x: Float)` it silently ran the wrong body. the receiver's
+## checked type already chose the builtin; naming the runtime symbol keeps
+## that choice closed. most names route through ir_runtime_call_name — the
+## same mapping an unshadowed call would get at emission — and the four
+## whose short abi key IS the method name get their full symbol here.
+pub fn ir_primitive_method_call_name(emit_name: String) -> String:
+    if emit_name == "to_int":
+        return "pith_float_to_int"
+    if emit_name == "to_float":
+        return "pith_int_to_float"
+    if emit_name == "pad_left":
+        return "pith_cstring_pad_left"
+    if emit_name == "pad_right":
+        return "pith_cstring_pad_right"
+    return ir_runtime_call_name(emit_name)
+
 fn ir_method_string_emit_name(mname: String) -> String:
     if mname == "len":
         return "string_len"

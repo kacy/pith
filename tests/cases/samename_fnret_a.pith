@@ -1,0 +1,16 @@
+# one of two modules that both declare a struct Parser and a pub fn parser().
+# test_samename_fn_return from-imports THIS module's parser, so the value it
+# returns must carry this Parser — with its own methods — even though the
+# other module registers the same names later.
+pub struct Parser:
+    pub tag: String
+
+impl Parser:
+    fn describe() -> String:
+        return "a:" + self.tag
+
+    fn only_a() -> String:
+        return "only-a"
+
+pub fn parser() -> Parser:
+    return Parser("first")

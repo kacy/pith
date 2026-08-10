@@ -2258,6 +2258,16 @@ fn current_module_imports_name(name: String) -> Bool:
             return true
     return false
 
+# the module a from-import in the current module names as the source of
+# `name`, or "". first matching entry wins; an aliased or wildcard import
+# leaves the name unresolved here and the caller keeps the global answer.
+fn from_import_source_module(name: String) -> String:
+    needle := current_checker_module_path + chr(9) + name + chr(9)
+    for entry in generic_named_import_entries:
+        if entry.starts_with(needle):
+            return entry.substring(needle.len(), entry.len())
+    return ""
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
@@ -2266,6 +2276,18 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         # across modules and die later in emission. builtins and the
         # current module's own names always pass.
         if binding_visible_from(scope_id, name, current_checker_module_path) == false:
+            # the shared global scope answers with whichever module
+            # registered the name last. a from-import names its source
+            # module, so prefer the declaration that module owns —
+            # otherwise two modules declaring the same function name
+            # (binary.reader / protobuf.reader) hand the caller the wrong
+            # signature, and every type derived from it is the wrong
+            # module's same-named struct.
+            source := from_import_source_module(name)
+            if source.len() > 0:
+                owned := lookup_binding_owned_by(scope_id, name, source)
+                if owned >= 0:
+                    return owned
             if current_module_imports_name(name) == false:
                 # a generic declaration never enters the binding table, so a
                 # module calling its own generic fn can land here when some

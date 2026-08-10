@@ -50,6 +50,16 @@ pub(crate) fn set_nonblocking(fd: RawFd) {
     }
 }
 
+/// the longest wait anything here asks for, in milliseconds — a shade under 25
+/// days.
+///
+/// `poll` takes its timeout as an `int` and has always been clamped to this, and
+/// the reactor turns its timeout into an `Instant` deadline, where a duration
+/// past what the clock can represent overflows the addition rather than
+/// expressing anything a caller meant. clamping is the honest reading either
+/// way: at this length a wait and a wait that never ends are the same wait.
+const MAX_WAIT_MS: i64 = i32::MAX as i64;
+
 /// poll a single fd until it is ready, times out, or errors. the blocking wait
 /// every non-green caller uses, and the whole story on platforms without the
 /// epoll reactor (see `netpoll_fallback`).
@@ -104,6 +114,10 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }
+    // a negative timeout is "wait forever" and passes through; a positive one is
+    // clamped here rather than in each branch, so neither the reactor's deadline
+    // arithmetic nor `poll`'s `int` sees a value it cannot hold.
+    let timeout_ms = std::cmp::min(timeout_ms, MAX_WAIT_MS);
     match green::current_task() {
         Some(task) => netpoll::wait_io(fd as RawFd, read, timeout_ms, task),
         None => {
@@ -146,7 +160,7 @@ fn socket_timeout_ms(fd: i64, option: libc::c_int) -> i64 {
         return -1;
     }
     let ms = (tv.tv_sec as i64).saturating_mul(1000) + (tv.tv_usec as i64) / 1000;
-    std::cmp::max(1, ms)
+    std::cmp::max(1, ms).min(MAX_WAIT_MS)
 }
 
 /// what kind of thing an fd refers to, which is to say which syscall pair moves
@@ -757,6 +771,24 @@ mod tests {
         let spent = retry.elapsed();
         assert!(spent < Duration::from_millis(50), "retry waited {spent:?}");
 
+        close(a);
+        close(b);
+    }
+
+    /// a wait longer than the clock can express is clamped rather than carried
+    /// into arithmetic that cannot hold it: the reactor turns a timeout into
+    /// `Instant::now() + d`, and that addition panics on a duration past the
+    /// clock's range. `pith_tcp_wait_readable` passes its argument straight
+    /// through, so the value is a caller's to choose.
+    ///
+    /// off a green task this takes the `poll` branch, so what it pins is the
+    /// argument surviving the clamp — the reactor branch needs a green task and
+    /// is covered by the clamp being in `wait_ready` rather than in either arm.
+    #[test]
+    fn an_absurd_wait_is_clamped_rather_than_overflowing_a_deadline() {
+        let (a, b) = socket_pair();
+        assert_eq!(socket_write_yielding(b as i64, b"x"), 1);
+        assert_eq!(wait_ready(a as i64, true, i64::MAX), 1);
         close(a);
         close(b);
     }

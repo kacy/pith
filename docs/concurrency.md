@@ -216,7 +216,15 @@ are started somewhere that cannot keep the handles.
 
 `Semaphore(n)` caps how many tasks may be inside a region at once:
 `sem.acquire()` takes a permit and waits if none is free, `sem.release()`
-returns one. `std.prometheus` uses one to bound concurrent scrapes.
+returns one. `std.prometheus` uses one to bound concurrent scrapes, and
+`std.net.http2.server` uses one to bound concurrent connections.
+
+reach for a semaphore when the caller should wait, and for an `AtomicInt` in a
+`compare_set` loop when it must not — waiting is the whole of what a semaphore
+adds over a counter, and there is no non-blocking way to take a permit. that is
+the choice `std.web`'s accept loops make: they cap connections on a counter and
+refuse past it, because a loop parked on a permit is a server that has stopped
+answering, health check included.
 
 all four park rather than spin, so a blocked green task frees its worker
 for other tasks instead of holding it.

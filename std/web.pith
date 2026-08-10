@@ -59,6 +59,150 @@ import std.shutdown as shutdown
 # milliseconds. keeps a stalled client from tying up a task forever.
 CONNECTION_TIMEOUT_MS := 5000
 
+# the most connections listen() and listen_tls() serve at once. every connection
+# costs a task with a pooled stack plus its buffers, so an accept loop with no
+# ceiling lets a client trade cheap sockets for expensive server memory: open
+# them faster than they complete and the task count grows without bound. the
+# number matches the http/2 server's cap, so the front doors of one program agree
+# on what "too many" means.
+#
+# the budget is per accept loop family, not per process: this bounds the two
+# loops web owns (listen and listen_tls, which share the counter below), while
+# listen_h2c delegates to std.net.http2.server and is bounded by that module's
+# own permits.
+MAX_CONNECTIONS := 512
+
+# how many connections the two web accept loops are serving right now, against
+# MAX_CONNECTIONS. an AtomicInt rather than a Semaphore on purpose: a semaphore's
+# whole point is that acquire() *waits*, and the decision below is that these
+# loops must never wait. what is left when the waiting is removed is a counter,
+# so that is what this is.
+#
+# it lives as a module global rather than something an accept loop owns because
+# the compiler cannot yet hand a sync-primitive value to a spawned task, and the
+# connection task is where the slot is given back. `mut` is only how a global
+# holding a constructed value is declared — the binding is never reassigned.
+mut live_connections := AtomicInt(0)
+
+# ## what happens at the cap, and why it is not what http/2 does
+#
+# the http/2 accept loops block: they wait on a permit before accepting again,
+# which applies backpressure and lets the kernel backlog absorb the overflow.
+# copying that here would be wrong, because the same mechanism has a different
+# consequence on the two protocols.
+#
+# an http/2 connection is a multiplexer. requests arrive on connections that are
+# already open, so an accept loop that stops accepting keeps serving requests at
+# full rate — including a health check on any established connection. blocking
+# costs new peers their connection and nothing else.
+#
+# http/1.1 has no such decoupling. a request needs a connection, and past the
+# first keep-alive burst a new request needs a new accept. an accept loop that
+# stops accepting stops answering *everything*: the load balancer's probe, the
+# orchestrator's liveness check, `GET /healthz`. the process is then killed for
+# being unresponsive at exactly the moment it is healthy and full — and the
+# replacement comes up into the same load. worse, a tcp-level probe still
+# succeeds against a backlogged listener, so the failure reports itself
+# inconsistently depending on how it is measured.
+#
+# so these loops accept and refuse instead. a refused connection costs one write
+# and one close on the accept loop, never a task, so the memory the cap exists to
+# protect is still protected. every peer gets an answer of some kind immediately
+# rather than a socket that never replies, so a load balancer sheds to another
+# instance instead of waiting — and the health check keeps being served, which is
+# the whole argument. how much of an answer the peer gets is the one part that is
+# not guaranteed; refuse_conn has that.
+#
+# this also decides how the cap behaves against a connection that stalls forever.
+# `tcp_set_timeout` is inert under the green runtime — the green read path waits
+# on the reactor with no deadline — so CONNECTION_TIMEOUT_MS does not reclaim a
+# stalled connection's slot there, and slots can be held indefinitely by clients
+# that never speak. under blocking that ends in a silent wedge: no accepts, no
+# answers, no signal. refusing turns the same situation into a server that still
+# answers every connection immediately, with a refusal counter climbing and the
+# live-connection gauge pinned at MAX_CONNECTIONS — which is the wedge's exact
+# signature, visible on a scrape.
+
+# the accept loops' own metrics, recorded by listen() and listen_tls() rather
+# than by the request middleware, so they exist on a bare() app too — a server
+# that opted out of per-request observability still needs to know it is turning
+# clients away. both are process-wide and unlabeled, because the cap they
+# describe is one budget shared by the two loops.
+#
+#   * OBS_CONNECTIONS pinned at MAX_CONNECTIONS with no requests flowing is a
+#     stalled-connection wedge.
+#   * OBS_CONNECTIONS_REFUSED climbing is the cap actively shedding load.
+OBS_CONNECTIONS := "http_server_connections"
+OBS_CONNECTIONS_REFUSED := "http_server_connections_refused_total"
+
+# claim one of the MAX_CONNECTIONS slots, reporting whether there was one free.
+# compare_set in a retry loop rather than store(load() + 1): the two web accept
+# loops can run in the same process, and a lost increment is a cap that drifts
+# upward forever.
+fn claim_connection_slot() -> Bool:
+    mut settled := false
+    while not settled:
+        live := live_connections.load()
+        if live >= MAX_CONNECTIONS:
+            return false
+        settled = live_connections.compare_set(live, live + 1)
+    metrics.gauge(OBS_CONNECTIONS).add(1.0)
+    return true
+
+# give a slot back. every path that takes one pairs with this through a `defer`
+# on the connection task, alongside the drain count's `leave()` — a slot that
+# leaks lowers the ceiling permanently, and the server wedges hours later with no
+# trace of why.
+fn release_connection_slot():
+    mut settled := false
+    while not settled:
+        live := live_connections.load()
+        settled = live_connections.compare_set(live, live - 1)
+    metrics.gauge(OBS_CONNECTIONS).add(0.0 - 1.0)
+
+# what a refused plaintext connection is told. short and fixed: this is written
+# by the accept loop, so its cost is paid by every other pending connection.
+CAPACITY_BODY := "server at capacity"
+
+# refuse an accepted connection: a complete 503 and a close, written inline on
+# the accept loop. no task is spawned, which is the point — spawning one to say
+# "no" would cost the memory the cap exists to save. the response is a couple of
+# hundred bytes into a fresh socket's send buffer, so the write cannot block even
+# against a peer that never reads, and a failure to write is ignored: the client
+# is going away either way.
+#
+# ## the 503 is best-effort, and that is not a hedge
+#
+# closing a socket that still has unread data in its receive queue sends RST
+# rather than FIN, and a client that gets RST discards what it had buffered. so a
+# peer that had already sent its request — which is most of them, since a cap
+# fires while the accept queue is full of connections that have been waiting —
+# may see a reset instead of the 503. draining the request first is what would
+# fix it, and there is no way to do that safely here: a read on a socket whose
+# peer sent nothing has no deadline under the green runtime and would park the
+# accept loop forever, which is the failure this whole design exists to avoid.
+#
+# it is still worth writing. a peer that has not sent yet gets a clean FIN and
+# the real 503, and every other peer gets a reset — refused promptly, which is
+# the property that matters, and exactly what the tls path gives everyone. the
+# response can only improve on the reset, never replace it, so the operator's
+# signal is the refusal counter rather than anything the client reports.
+fn refuse_conn(fd: Int):
+    crlf := chr(13) + chr(10)
+    head := "HTTP/1.1 503 Service Unavailable" + crlf + "Content-Type: text/plain" + crlf + "Content-Length: " + CAPACITY_BODY.len().to_string() + crlf + "Retry-After: 1" + crlf + "Connection: close" + crlf + crlf
+    tcp.write_all(fd, head + CAPACITY_BODY) catch 0
+    tcp_close(fd)
+    metrics.counter(OBS_CONNECTIONS_REFUSED).inc()
+
+# refuse an accepted tls connection by closing the socket. there is no 503 to
+# send: saying it in http would mean completing a handshake first, and the
+# handshake — an asymmetric key exchange and a certificate — is the expensive
+# work being refused. a client sees the connection close before its hello is
+# answered, which is what any tls front door does when it is out of capacity.
+fn refuse_tls_conn(fd: Int):
+    tcp_close(fd)
+    metrics.counter(OBS_CONNECTIONS_REFUSED).inc()
+
 # an incoming request, handed to every route handler. `raw` is the underlying
 # std.net.http request if you need headers, cookies, or the body as bytes;
 # `params` holds the path parameters the router pulled out of the pattern; and
@@ -417,16 +561,28 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
 # serve one accepted connection to completion on its own task, then close it.
 # errors are swallowed so a broken client only ever affects its own connection.
 #
-# the drain count this releases was taken at the accept, in spawn_conn. `defer`
-# releases it on the error path too — a connection that leaks its count holds
-# the whole shutdown open for the full grace period.
+# the drain count and the concurrency slot this releases were both taken at the
+# accept, in spawn_conn. `defer` releases them on the error path too — a
+# connection that leaks its count holds the whole shutdown open for the full
+# grace period, and one that leaks its slot lowers the cap for the life of the
+# process.
+#
+# the slot is given back before the drain count (defers run last-written-first),
+# so a drain that reports zero has already returned every slot: the two cannot
+# disagree in the window a caller looks at them.
 fn handle_conn(app: App, fd: Int):
     defer shutdown.leave()
+    defer release_connection_slot()
     tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     http.serve_connection_fd(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
 
 # hand an accepted socket to its own task, counted in the drain from the moment
-# it was accepted.
+# it was accepted — or refuse it, if the server is already at MAX_CONNECTIONS.
+#
+# the slot is claimed first, and a refusal returns before anything else is taken.
+# nothing between the claim and the spawn can fail, so there is no path that
+# holds a slot without a task to give it back; the same is true of the drain
+# count, which is why the claim is the outer of the two.
 #
 # ## why the count is taken here and not inside the task
 #
@@ -442,6 +598,9 @@ fn handle_conn(app: App, fd: Int):
 # returns it as work it abandoned — bounded, and reported. the other direction
 # drops a connection silently.
 fn spawn_conn(app: App, fd: Int):
+    if not claim_connection_slot():
+        refuse_conn(fd)
+        return
     shutdown.enter()
     spawn handle_conn(app, fd)
 
@@ -473,16 +632,22 @@ fn release_tls_listener(listener: tls.Listener):
     shutdown.close_listener(listener.handle)
     tls.release_listener_config(listener)
 
-# the whole of the tls connection, handshake included, under the drain count
-# taken for it at the accept: a handshake interrupted mid-shutdown is still a
-# client waiting.
+# the whole of the tls connection, handshake included, under the drain count and
+# the concurrency slot taken for it at the accept: a handshake interrupted
+# mid-shutdown is still a client waiting, and a handshake that never finishes is
+# still a connection occupying the server.
 fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
     defer shutdown.leave()
+    defer release_connection_slot()
     handshake_and_serve_tls_conn(app, listener_handle, fd) catch false
 
 # hand an accepted tls socket to its own task, counted in the drain from the
-# accept — see spawn_conn for why the count cannot wait for the task to start.
+# accept — see spawn_conn for why the count cannot wait for the task to start,
+# and for why reaching MAX_CONNECTIONS refuses rather than stalls the loop.
 fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
+    if not claim_connection_slot():
+        refuse_tls_conn(fd)
+        return
     shutdown.enter()
     spawn handle_tls_socket(app, listener_handle, fd)
 
@@ -537,6 +702,11 @@ impl App:
     # bind host:port and serve, one task per connection. this blocks, so it is
     # usually the last thing main does; spawn it if you need to keep going.
     #
+    # at most MAX_CONNECTIONS connections are served at once. past that the loop
+    # keeps accepting and answers 503 immediately rather than stalling, so the
+    # server stays reachable — and diagnosable — while it is full;
+    # `http_server_connections_refused_total` counts what it turned away.
+    #
     # it returns when a graceful shutdown is requested (see std.shutdown): the
     # listener stops accepting, the in-flight connections are given the
     # configured grace period to finish, and the return value is how much work
@@ -589,6 +759,10 @@ impl App:
     # way every request runs through dispatch, so the app behaves exactly as it
     # does on the plaintext listen. `cert` and `key` are paths to pem files. this
     # blocks, like listen; spawn it if you need to keep going.
+    #
+    # it shares listen's MAX_CONNECTIONS budget. a connection past the cap is
+    # closed before its handshake — the certificate work is the expensive thing
+    # being refused, and there is no way to say 503 without doing it first.
     fn listen_tls(host: String, port: Int, cert: String, key: String) -> Int!:
         app := self
         config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
@@ -1099,6 +1273,163 @@ test "an accepted tls connection is in the drain count before its handshake star
     # count exactly once too.
     assert_eq(shutdown.drain(5000), 0)
     assert_eq(shutdown.inflight(), 0)
+    release_tls_listener(listener)
+    config.close()
+    shutdown.reset()
+
+# --- the concurrent-connection cap ---
+#
+# these drive spawn_conn directly, like the drain tests above, so the accept
+# loop's decision at the cap can be read without an accept loop and without
+# waiting for one to bind. the cap is MAX_CONNECTIONS, and holding that many real
+# sockets open would cost more file descriptors than a test should: instead the
+# counter is filled to one below the cap through the same claim these loops use,
+# so the two connections that follow straddle it exactly.
+
+# take `n` slots the way an accept loop would, asserting each one is granted.
+fn hold_connection_slots(n: Int):
+    mut taken := 0
+    while taken < n:
+        assert(claim_connection_slot())
+        taken = taken + 1
+
+# hand `n` slots back, undoing hold_connection_slots.
+fn drop_connection_slots(n: Int):
+    mut given := 0
+    while given < n:
+        release_connection_slot()
+        given = given + 1
+
+# send a request on an already-connected socket and return the response body.
+# the peer is a socket this test accepted itself, so there is nothing to connect.
+fn request_on(fd: Int, path: String) -> String:
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    return read_response_body(fd)
+
+# read whatever a refused peer was sent, head included. the refusal is one small
+# write followed by a close, so a single read gets all of it and there is nothing
+# to wait for.
+fn read_raw_response(fd: Int) -> String:
+    raw := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    return raw
+
+test "at the connection cap the accept loop refuses instead of blocking, and serves again after":
+    shutdown.reset()
+    app := new().get("/", always_pong)
+    baseline := live_connections.load()
+    hold_connection_slots(MAX_CONNECTIONS - 1 - baseline)
+    mut clients: List[Int] := []
+    served := accepted_pairs(19010, 2, clients)
+    refused_before := metrics.counter(OBS_CONNECTIONS_REFUSED).value()
+
+    # the last free slot: admitted, and it becomes a task counted in the drain.
+    spawn_conn(app, served[0])
+    assert_eq(shutdown.inflight(), 1)
+    # one past the cap. the hand-off returns rather than parking on a permit —
+    # if it blocked, this test would never reach the next line, which is the
+    # whole difference from what the http/2 loops do.
+    spawn_conn(app, served[1])
+    # no second task, and no second place in the drain: the refusal cost a write
+    # and a close on this task.
+    assert_eq(shutdown.inflight(), 1)
+    assert_eq(metrics.counter(OBS_CONNECTIONS_REFUSED).value() - refused_before, 1.0)
+
+    # the refused client is told why, in http. it has sent nothing, so its
+    # receive queue is empty and the close is a clean FIN — the case where the
+    # 503 survives. a peer that had already sent a request gets a reset instead;
+    # see refuse_conn on why that cannot be helped from here.
+    refusal := read_raw_response(clients[1])
+    assert(refusal.contains("503 Service Unavailable"))
+    assert(refusal.contains(CAPACITY_BODY))
+    # the admitted one is served normally, at the same moment.
+    assert_eq(request_on(clients[0], "/"), "pong")
+    assert_eq(shutdown.drain(5000), 0)
+
+    # with the held slots given back the cap is whole again, and the next
+    # connection is admitted rather than refused — the cap sheds load, it does
+    # not latch.
+    drop_connection_slots(MAX_CONNECTIONS - 1 - baseline)
+    assert_eq(live_connections.load(), baseline)
+    mut after_clients: List[Int] := []
+    after := accepted_pairs(19011, 1, after_clients)
+    spawn_conn(app, after[0])
+    assert_eq(shutdown.inflight(), 1)
+    assert_eq(request_on(after_clients[0], "/"), "pong")
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(live_connections.load(), baseline)
+    shutdown.reset()
+
+test "a finished connection gives its slot back, so a burst does not ratchet the cap down":
+    shutdown.reset()
+    app := new().get("/", always_pong)
+    baseline := live_connections.load()
+    mut clients: List[Int] := []
+    served := accepted_pairs(19012, 6, clients)
+    for fd in served:
+        spawn_conn(app, fd)
+    # claimed on this task, before the spawn, so the count is exact here however
+    # many of the six tasks have started.
+    assert_eq(live_connections.load() - baseline, 6)
+    for c in clients:
+        assert_eq(request_on(c, "/"), "pong")
+    # every task ran its defers: the drain reporting zero is the ordering
+    # guarantee that the slots went back first. this is the leak case — a slot
+    # kept here is a cap that shrinks with every burst until the server refuses
+    # everything, hours later, with nothing to point at.
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(live_connections.load(), baseline)
+    shutdown.reset()
+
+# connect to a tls listener over plain tcp and accept the socket, without sending
+# a client hello: the handshake, if one is reached at all, parks on its first
+# read. returns the client fd and the accepted server fd.
+fn tls_socket_pair(listener: tls.Listener, port: Int, clients: List[Int]) -> Int:
+    connected := tcp.connect("127.0.0.1", port)
+    assert(not connected.is_err)
+    clients.push(connected.ok)
+    accepted := tls.accept_socket(listener)
+    assert(not accepted.is_err)
+    return accepted.ok
+
+test "a tls connection holds a slot through its handshake and is refused past the cap":
+    shutdown.reset()
+    app := new().get("/", always_pong)
+    config := tls.server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["h2", "http/1.1"])
+    bound := tls.listen("127.0.0.1", 19013, config)
+    assert(not bound.is_err)
+    listener := bound.ok
+    baseline := live_connections.load()
+
+    # an admitted tls connection occupies a slot from the accept, before its
+    # handshake has read a byte — a client that never completes one is still a
+    # connection the server is carrying.
+    mut clients: List[Int] := []
+    spawn_tls_conn(app, listener.handle, tls_socket_pair(listener, 19013, clients))
+    assert_eq(live_connections.load() - baseline, 1)
+    assert_eq(shutdown.inflight(), 1)
+    # the handshake fails once its peer is gone, and that path gives the slot
+    # back like any other — the failure path is the one that matters here,
+    # because it is the one a hostile client picks.
+    tcp_close(clients[0])
+    assert_eq(shutdown.drain(5000), 0)
+    assert_eq(live_connections.load(), baseline)
+
+    # now full. the next connection is closed rather than handshaked.
+    hold_connection_slots(MAX_CONNECTIONS - baseline)
+    mut refused_clients: List[Int] := []
+    server_fd := tls_socket_pair(listener, 19013, refused_clients)
+    refused_before := metrics.counter(OBS_CONNECTIONS_REFUSED).value()
+    spawn_tls_conn(app, listener.handle, server_fd)
+    # no task, no drain count, and no handshake — the certificate work is exactly
+    # what the cap is refusing to spend.
+    assert_eq(shutdown.inflight(), 0)
+    assert_eq(metrics.counter(OBS_CONNECTIONS_REFUSED).value() - refused_before, 1.0)
+    # the peer sees end-of-stream rather than a server hello.
+    assert_eq(read_raw_response(refused_clients[0]), "")
+    drop_connection_slots(MAX_CONNECTIONS - baseline)
+    assert_eq(live_connections.load(), baseline)
     release_tls_listener(listener)
     config.close()
     shutdown.reset()

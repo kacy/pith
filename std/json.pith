@@ -202,6 +202,27 @@ fn get_char_at(position: Int) -> String:
         return ""
     return parser_input[position]
 
+# true when `word` sits at `at` in the input.
+#
+# the comparison is byte by byte rather than against a slice. len() counts
+# bytes and substring() takes byte offsets, so slicing `word.len()` bytes out
+# of the input to compare them would cut through whatever character happens to
+# straddle that offset, and a cut through a character stops the process outright
+# — no catch can intercept it. the literal probes below run on any value
+# position, before anything has established that the bytes there are ascii, so
+# a document with a multi-byte character in the wrong place used to end the
+# process instead of failing to parse. indexing reads one byte and never cuts
+# anything, so it is safe wherever a slice is not.
+fn literal_at(at: Int, word: String) -> Bool:
+    if at + word.len() > parser_input.len():
+        return false
+    mut i := 0
+    while i < word.len():
+        if ord(parser_input[at + i]) != ord(word[i]):
+            return false
+        i = i + 1
+    return true
+
 # Returns true if a node handle points at a node that is still allocated.
 # node ids are never reused, so a handle left over from a reclaimed scope is
 # simply absent from the pool rather than aliasing some later document's node.
@@ -741,20 +762,20 @@ fn parse_value_node() -> Int:
         return idx
 
     # boolean true
-    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "true":
+    if literal_at(parser_position, "true"):
         parser_position = parser_position + 4
         idx := allocate_node("bool")
         boolean_values.insert(idx, true)
         return idx
 
     # boolean false
-    if parser_position + 5 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 5) == "false":
+    if literal_at(parser_position, "false"):
         parser_position = parser_position + 5
         idx := allocate_node("bool")
         return idx
 
     # null
-    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "null":
+    if literal_at(parser_position, "null"):
         parser_position = parser_position + 4
         idx := allocate_node("null")
         return idx

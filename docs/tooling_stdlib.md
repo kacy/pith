@@ -28,6 +28,12 @@ use `find_matches` when you need to know which pattern matched a file, and
 tracks byte position plus 1-based line and column while callers peek, advance,
 and take slices.
 
+the cursor moves in **characters**. `pos` is a byte offset — that is how a
+`String` is indexed — but it only ever lands where a character starts, `peek`
+returns one whole character, and `col` counts characters. that matters because
+a slice taken at a position inside a multi-byte character is not a slice, it is
+a runtime abort.
+
 ```pith
 import std.text.scanner as scanner
 

@@ -1,4 +1,13 @@
 # std.text.scanner - small cursor helpers for source-like text
+#
+# the cursor is measured in characters, not in bytes. `pos` is a byte offset —
+# it has to be, since that is how a String is indexed — but it only ever lands
+# on a character boundary, and `col` counts characters. that distinction used to
+# exist only in this comment: peek read one byte, advance moved one byte, and
+# the first slice taken at a position inside a multi-byte character stopped the
+# process, which `take_until(new("é:"), ":")` did on its very first check.
+
+import std.text as text
 
 # a cursor into source text with 1-based line and column positions.
 pub struct Cursor:
@@ -28,24 +37,46 @@ pub fn new(source: String) -> Cursor:
 pub fn done(cursor: Cursor) -> Bool:
     return cursor.pos >= cursor.source.len()
 
+# the byte offset just past the character starting at `at`.
+fn character_end(source: String, at: Int) -> Int:
+    return text.ceil_boundary(source, at + 1)
+
 # return the current character, or an empty string at eof.
 pub fn peek(cursor: Cursor) -> String:
     return peek_at(cursor, 0)
 
-# return the character at cursor plus offset, or an empty string out of bounds.
+# return the character `offset` characters after the cursor, or an empty string
+# out of bounds.
 pub fn peek_at(cursor: Cursor, offset: Int) -> String:
-    pos := cursor.pos + offset
-    if pos < 0 or pos >= cursor.source.len():
+    if offset < 0:
         return ""
-    return cursor.source[pos]
+    mut at := cursor.pos
+    mut stepped := 0
+    while stepped < offset and at < cursor.source.len():
+        at = character_end(cursor.source, at)
+        stepped = stepped + 1
+    if at >= cursor.source.len():
+        return ""
+    return cursor.source.substring(at, character_end(cursor.source, at))
 
 # return true when prefix appears at the current cursor position.
+#
+# the comparison is byte by byte rather than against a slice: `prefix.len()`
+# bytes past the cursor is wherever that count lands, and slicing the source
+# there cuts whatever character straddles it in half, which is a hard error.
+# a scan looking for ":" must not stop the process because the text it is
+# scanning happens to contain an accent.
 pub fn starts_with(cursor: Cursor, prefix: String) -> Bool:
     if prefix.len() == 0:
         return true
     if cursor.pos + prefix.len() > cursor.source.len():
         return false
-    return cursor.source.substring(cursor.pos, cursor.pos + prefix.len()) == prefix
+    mut i := 0
+    while i < prefix.len():
+        if ord(cursor.source[cursor.pos + i]) != ord(prefix[i]):
+            return false
+        i = i + 1
+    return true
 
 fn scanner_slice_from(start: Cursor, end: Cursor) -> Slice:
     return Slice(start.source.substring(start.pos, end.pos), start.pos, end.pos, start.line, start.col)
@@ -54,12 +85,17 @@ fn scanner_advance_line(cursor: Cursor, width: Int) -> Cursor:
     return Cursor(cursor.source, cursor.pos + width, cursor.line + 1, 1)
 
 # advance by one character.
+#
+# a character is one to four bytes, so the cursor moves by the width of the one
+# it is standing on. moving by one byte would leave it inside that character,
+# and every slice taken from there is a cut through the middle of one.
 pub fn advance(cursor: Cursor) -> Cursor:
     if done(cursor):
         return cursor
+    width := character_end(cursor.source, cursor.pos) - cursor.pos
     if peek(cursor) == chr(10):
-        return scanner_advance_line(cursor, 1)
-    return Cursor(cursor.source, cursor.pos + 1, cursor.line, cursor.col + 1)
+        return scanner_advance_line(cursor, width)
+    return Cursor(cursor.source, cursor.pos + width, cursor.line, cursor.col + 1)
 
 # advance by count characters.
 pub fn advance_by(cursor: Cursor, count: Int) -> Cursor:

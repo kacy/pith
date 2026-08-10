@@ -168,6 +168,13 @@ pub fn assert_err_contains(message: String, part: String):
 ## where two strings first differ, with a little of each side for context.
 ## reporting the two lengths — which is what this used to do — tells you
 ## nothing about a mismatch four hundred characters in.
+##
+## the scan compares bytes, so two strings that differ inside the same
+## multi-byte character stop on a byte that is not a character boundary. the
+## report is cut at the boundary before that, because a String cannot be cut
+## anywhere else: `assert_eq_text("é", "ê")` — the same lead byte, different
+## second byte — used to stop the whole test process instead of reporting a
+## difference.
 pub fn text_difference(got: String, want: String) -> String:
     mut i := 0
     mut limit := got.len()
@@ -176,14 +183,31 @@ pub fn text_difference(got: String, want: String) -> String:
     while i < limit and got[i] == want[i]:
         i = i + 1
     if i == limit:
-        return "identical for {limit} chars, then got {got.len()} chars total, want {want.len()}"
-    return "first differ at char {i}: got " + chr(34) + window(got, i) + chr(34) + ", want " + chr(34) + window(want, i) + chr(34)
+        return "identical for {limit} bytes, then got {got.len()} bytes total, want {want.len()}"
+    return "first differ at byte {i}: got " + chr(34) + window(got, character_start(got, i)) + chr(34) + ", want " + chr(34) + window(want, character_start(want, i)) + chr(34)
 
-# up to sixteen characters of `text` from `at`, so a report stays readable.
+# the start of the character `at` falls inside, so a report is cut where a
+# String can be cut.
+fn character_start(text: String, at: Int) -> Int:
+    mut back := at
+    while back > 0 and back < text.len() and continues_character(text, back):
+        back = back - 1
+    return back
+
+fn continues_character(text: String, at: Int) -> Bool:
+    code := ord(text[at])
+    return code >= 128 and code < 192
+
+# up to sixteen bytes of `text` from `at`, ending on a character boundary so a
+# report never asks for half of one.
 fn window(text: String, at: Int) -> String:
+    if at >= text.len():
+        return ""
     mut end := at + 16
     if end > text.len():
         end = text.len()
+    while end > at and end < text.len() and continues_character(text, end):
+        end = end - 1
     return text.substring(at, end)
 
 # assert that a file exists.

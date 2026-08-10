@@ -171,9 +171,36 @@ ending in any non-ascii character asks for the tail of a multi-byte character,
 which stops the process. a line ending in "é" is ordinary text and now reads
 back as ordinary text.
 
-`read(n)` is still counted in bytes, and n landing inside a multi-byte character
-is still an error rather than a silently corrupt string — use `std.text` when
-you want to read by character.
+## a byte count is not a character boundary
+
+every transfer here is counted in bytes, because that is what a read and a write
+are. a `String` is also indexed in bytes — but it can only be **cut** where a
+character starts, and cutting one anywhere else stops the process outright.
+those two facts meet wherever a count decides where a string ends, and the rule
+throughout `std.io` is that the count says how far to go and the boundary beside
+it says where to stop.
+
+`read(n)` reads at most n bytes and stops at the last character boundary at or
+before n. a read that would come back empty because n fell inside the very first
+character takes that whole character instead: an empty read is how every caller
+recognises end of stream, so a read must never make no progress. `write_n` is
+the same rule without the exception — it writes at most n bytes ending on a
+boundary, and a count that falls inside the first character writes nothing.
+`read_until`'s hold-back flush stops at a boundary too, and holds the odd byte
+or two over to the next round.
+
+the same count shows up once more from the other side. a source read of n bytes
+ends wherever n lands, so the last character in a chunk can be missing its tail.
+that chunk is not decodable on its own, and decoding chunk by chunk used to call
+an ordinary character split across two reads a decode error — reading a file or
+a child's output as text failed outright whenever one accent straddled a 4 KiB
+boundary. the whole-stream reads gather bytes and decode once; the buffered
+readers hold an incomplete trailing character back and decode it with the next
+chunk. a stream that ends mid-character is still an error, because that is
+genuinely truncated text.
+
+use `std.text` when you want to count characters rather than bytes; `read(n)`
+and `write_n` still take a byte budget, they just spend it in whole characters.
 
 ## stdlib consumers on the shared path
 

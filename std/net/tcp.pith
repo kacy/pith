@@ -150,7 +150,23 @@ pub fn write_all_bytes(fd: Int, data: Bytes) -> Int!:
     return sent
 
 # Set read timeout in milliseconds (0 = no timeout).
-# Connections default to 5 second timeout.
+#
+# a read that reaches the deadline with nothing to show for it fails, exactly as
+# a closed connection does — the error does not distinguish them. zero or less
+# clears the deadline, so the socket waits indefinitely again, which is what a
+# socket that was never given one does.
+#
+# the deadline means the same thing on both concurrency backends. it is stored on
+# the socket itself (SO_RCVTIMEO), so the os-thread backend gets it from the
+# kernel bounding its blocking read, and the green backend reads the same value
+# back and bounds its reactor wait by it. the deadline covers one read call, not
+# the whole conversation: a read that returns bytes leaves the next one a fresh
+# deadline.
+#
+# one thing it does not cover: connect() on the os-thread backend installs a five
+# second read deadline of its own on the sockets it returns, where the green
+# backend leaves them with none. set this explicitly on a client connection whose
+# reads must be bounded rather than relying on that.
 pub fn set_timeout(fd: Int, ms: Int):
     tcp_set_timeout(fd, ms)
 

@@ -1,0 +1,105 @@
+# sixty-four clients that connect and say nothing must not take /metrics away.
+#
+# std.prometheus serves at most MAX_CONCURRENT_SCRAPES (64) scrapes at once, and
+# the accept loop *blocks* on that semaphore rather than refusing — so a permit
+# that is never given back is a permit gone for good. handle_scrape bounds each
+# scrape's read at 2000 ms to make sure that cannot happen.
+#
+# under the green backend that bound used to be inert: `tcp_set_timeout` writes
+# SO_RCVTIMEO, which only bounds a blocking read, and the green path parked on
+# the reactor with no deadline. sixty-four idle connections therefore held every
+# permit forever and /metrics stopped answering — the endpoint an operator
+# checks to find out what is wrong being the one that stops replying.
+#
+# so: fill every slot with silence, then ask for a scrape and require an answer.
+# a scrape that has to wait for the deadline to reclaim a slot is the correct
+# behaviour and is what the elapsed-time check below asserts; a scrape that never
+# comes back is the wedge.
+
+import std.metrics as metrics
+import std.net.tcp as tcp
+import std.prometheus as prometheus
+import std.shutdown as shutdown
+import std.time as time
+
+PORT := 50953
+
+# std.prometheus.MAX_CONCURRENT_SCRAPES, which is not exported. every one of
+# these is a permit held by a client that will never send a request.
+IDLE_SCRAPERS := 64
+
+# handle_scrape's own bound, which is what has to reclaim the permits.
+SCRAPE_TIMEOUT_MS := 2000
+
+# a wedge hangs rather than failing, so bound the whole case and say so.
+WATCHDOG_MS := 40000
+
+fn watchdog():
+    time.delay(WATCHDOG_MS)
+    print("FAIL /metrics never answered with the slots full")
+    exit(1)
+
+# ask for /metrics on a fresh connection and return the whole response. the read
+# deadline here is the client's own patience, generously past the time the
+# server needs to reclaim a slot.
+fn scrape_once(port: Int) -> String!:
+    fd := tcp.connect("127.0.0.1", port)!
+    defer tcp.close(fd)
+    tcp.set_timeout(fd, 20000)
+    tcp.write_all(fd, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")!
+    mut buffer := ""
+    while true:
+        chunk := tcp.read(fd, 4096) catch ""
+        if chunk == "":
+            break
+        buffer = buffer + chunk
+    return buffer
+
+# spawn takes a call to a function in this module, so the endpoint gets a
+# one-line wrapper to be spawned through.
+fn serve_metrics() -> Int!:
+    return prometheus.serve("127.0.0.1", PORT)
+
+fn run() -> Bool!:
+    metrics.reset()
+    metrics.counter("scrapes_seen_total").inc()
+
+    srv := spawn serve_metrics()
+    # wait on the listener actually existing rather than on a fixed delay: serve
+    # registers its socket with std.shutdown before it accepts anything.
+    while shutdown.listeners() == 0:
+        time.delay(5)
+
+    # fill every permit with a connection that never speaks. these are held open
+    # by this task, not by spawned ones, so nothing here depends on 64 tasks
+    # being scheduled in any particular order.
+    mut idle := []
+    mut opened := 0
+    while opened < IDLE_SCRAPERS:
+        idle.push(tcp.connect("127.0.0.1", PORT)!)
+        opened = opened + 1
+    print("idle connections opened: {idle.len() == IDLE_SCRAPERS}")
+
+    start := time.mono_millis()
+    body := scrape_once(PORT)!
+    elapsed := time.mono_millis() - start
+
+    print("metrics answered: {body.contains("200 OK")}")
+    print("snapshot rendered: {body.contains("scrapes_seen_total")}")
+    # a scrape that came back instantly would mean the slots were never full,
+    # which would make the rest of this case prove nothing.
+    print("waited for a slot to be reclaimed: {elapsed >= SCRAPE_TIMEOUT_MS / 2}")
+    print("did not wait forever: {elapsed < WATCHDOG_MS}")
+
+    mut i := 0
+    while i < idle.len():
+        tcp.close(idle[i])
+        i = i + 1
+    shutdown.request()
+    await srv
+    return true
+
+fn main() -> Int:
+    spawn watchdog()
+    run() catch false
+    return 0

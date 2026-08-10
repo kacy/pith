@@ -318,6 +318,17 @@ heap instead of blocking the worker, so a task sleeping out a backoff — or a
 `select` idling between probes — costs nothing but its own time. that reactor
 is also why the default is linux-only; see "which backend to use".
 
+a read deadline survives that translation. `tcp.set_timeout` stores the deadline
+on the socket itself, and the reactor wait is bounded by it: a read that reaches
+the deadline with nothing to show for it fails, which is exactly what happens on
+os threads, where the kernel enforces the same stored value on the blocking read.
+that is what stops a client that connects and never speaks from holding a task
+forever, and it is what every server-side bound in the stdlib rests on —
+`std.web`'s connection timeout, the http/2 server's, the tls handshake deadline,
+`std.prometheus`'s scrape timeout. a socket with no deadline set, which is most
+of them, waits indefinitely as it always has, and a child process's pipe has no
+such deadline to set at all.
+
 name resolution and file i/o get there by a different route. `getaddrinfo` is
 synchronous and there is nothing to poll, and a regular file is always reported
 ready by epoll however slow the disk behind it is, so neither can yield to the

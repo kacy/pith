@@ -85,7 +85,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   (E209 otherwise, even when the other struct has the method). the remaining
   gap is two impl blocks giving the *same* struct the *same* method name —
   that is not rejected, and which body wins depends on module order, so give
-  methods on a shared type distinct names.
+  methods on a shared type distinct names. a free function sharing a name
+  with a builtin method on a primitive receiver does not capture the method
+  either: `(1.5).to_int()` is the Float builtin even with a `fn to_int(text,
+  fallback)` in the build, and the free function answers only plain calls.
+  method syntax never reaches a free function (there is no ufcs) — a
+  primitive receiver resolves builtins, everything else resolves methods.
 - **interface depth** — interfaces support method signatures, default
   methods (a member with a body that implementors inherit unless they
   override it), associated types (`type Item` on the interface, bound

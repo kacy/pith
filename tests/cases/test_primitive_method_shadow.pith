@@ -1,0 +1,33 @@
+# free functions sharing a name with a builtin method on a primitive receiver
+# must not capture the method call: the receiver's checked type resolves the
+# builtin, so `(1.5).to_int()` truncates the float even with a two-argument
+# `fn to_int` in scope (a regression binds the free function and passes one
+# argument to a two-argument function). the reverse stays true too — the free
+# function is still callable as a plain call.
+fn to_int(text: String, fallback: Int) -> Int:
+    if text == "7":
+        return 7
+    return fallback
+
+fn to_float(label: String, fallback: Float) -> Float:
+    return fallback
+
+fn trim(text: String, edge: String) -> String:
+    return text + edge
+
+fn main():
+    a := (1.5).to_int()
+    print("{a}")
+    b := (7).to_string()
+    print(b)
+    c := (2).to_float()
+    print("{c}")
+    s := "  spaced  "
+    t := s.trim()
+    print("[{t}]")
+    free_int := to_int("7", 0)
+    print("{free_int}")
+    free_float := to_float("x", 2.5)
+    print("{free_float}")
+    free_trim := trim("a", "b")
+    print(free_trim)

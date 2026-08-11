@@ -1,0 +1,91 @@
+# a generic struct whose fields are a list of function values returning the
+# type parameter and a list of generic structs carrying one, built by
+# constructor functions (including a closure capturing the type parameter and
+# an explicit type argument on a zero-argument constructor), then iterated and
+# invoked inside a function bound by an interface with an associated type.
+# this is the command-struct shape std.term.app is built on.
+
+struct TimerSpec[M]:
+    pub ms: Int
+    pub repeat: Bool
+    pub make: fn(Int) -> M
+
+struct Cmd[M]:
+    pub quit: Bool
+    pub runs: List[fn() -> M]
+    pub timers: List[TimerSpec[M]]
+
+fn none_of[M]() -> Cmd[M]:
+    return Cmd(quit: false, runs: [], timers: [])
+
+fn quit_of[M]() -> Cmd[M]:
+    return Cmd(quit: true, runs: [], timers: [])
+
+# a closure capturing the generic parameter: emit is run-with-a-constant.
+fn emit_of[M](m: M) -> Cmd[M]:
+    return Cmd(quit: false, runs: [fn() => m], timers: [])
+
+fn run_of[M](f: fn() -> M) -> Cmd[M]:
+    return Cmd(quit: false, runs: [f], timers: [])
+
+fn tick_of[M](ms: Int, f: fn(Int) -> M) -> Cmd[M]:
+    return Cmd(quit: false, runs: [], timers: [TimerSpec(ms: ms, repeat: false, make: f)])
+
+# batch flattens at construction, so the type never nests into itself.
+fn batch_of[M](cmds: List[Cmd[M]]) -> Cmd[M]:
+    mut quit := false
+    mut runs: List[fn() -> M] := []
+    mut timers: List[TimerSpec[M]] := []
+    for c in cmds:
+        if c.quit:
+            quit = true
+        for r in c.runs:
+            runs.push(r)
+        for t in c.timers:
+            timers.push(t)
+    return Cmd(quit: quit, runs: runs, timers: timers)
+
+interface App:
+    type Msg
+    fn update(m: Msg) -> Cmd[Msg]
+    fn view() -> String
+
+struct Counter:
+    pub count: Int
+
+impl App for Counter:
+    type Msg = Int
+    fn update(m: Int) -> Cmd[Int]:
+        self.count = self.count + m
+        if self.count >= 20:
+            return quit_of[Int]()
+        if m == 3:
+            return batch_of[Int]([emit_of(5), run_of(fn() => 6), tick_of(80, fn(t: Int) => t)])
+        return none_of[Int]()
+
+    fn view() -> String:
+        return "count={self.count}"
+
+fn drive[A: App](app: A, msgs: List[A.Msg]) -> String:
+    mut queue: List[A.Msg] := []
+    for m in msgs:
+        queue.push(m)
+    mut timer_count := 0
+    mut i := 0
+    while i < queue.len() and i < 50:
+        m := queue[i]
+        i = i + 1
+        cmd := app.update(m)
+        if cmd.quit:
+            return app.view() + " QUIT timers={timer_count}"
+        for r in cmd.runs:
+            queue.push(r())
+        for t in cmd.timers:
+            mk := t.make
+            timer_count = timer_count + 1
+            queue.push(mk(t.ms))
+    return app.view() + " DONE timers={timer_count}"
+
+fn main():
+    c := Counter(count: 0)
+    print("{drive(c, [1, 3, 2])}")

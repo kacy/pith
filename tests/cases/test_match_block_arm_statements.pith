@@ -1,0 +1,47 @@
+# match arms take a block body: statements that mutate state, multiple lines,
+# and returns. string subjects match with | alternatives in both statement and
+# expression position. inline `=> return x` is not a form — return needs the
+# block body.
+
+enum Msg:
+    Inc
+    Dec
+    Label(String)
+
+struct Model:
+    pub count: Int
+    pub name: String
+
+fn apply(m: Model, msg: Msg):
+    match msg:
+        Msg.Inc =>
+            m.count = m.count + 1
+        Msg.Dec =>
+            m.count = m.count - 1
+        Msg.Label(s) =>
+            m.name = s
+            m.count = 0
+
+fn keyword(s: String) -> Int:
+    match s:
+        "+" | "k" =>
+            return 1
+        "-" | "j" =>
+            return 0 - 1
+        _ =>
+            return 0
+
+fn keyword_expr(s: String) -> Int:
+    return match s:
+        "+" | "k" => 1
+        "-" | "j" => 0 - 1
+        _ => 0
+
+fn main():
+    m := Model(count: 5, name: "x")
+    apply(m, Msg.Inc)
+    apply(m, Msg.Inc)
+    apply(m, Msg.Label("done"))
+    print("{m.count} {m.name}")
+    print("{keyword(\"+\")} {keyword(\"j\")} {keyword(\"z\")}")
+    print("{keyword_expr(\"k\")} {keyword_expr(\"-\")} {keyword_expr(\"q\")}")

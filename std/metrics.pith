@@ -80,18 +80,21 @@ fn unit_of(bare: String) -> String:
 # escape help text for a prometheus `# HELP` line: backslash and newline only
 # (unlike a label value, a double-quote needs no escaping here).
 fn escape_help(text: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made escaping quadratic in the text.
+    mut parts: List[String] := []
     mut i := 0
     while i < text.len():
         c := text[i]
         if c == chr(92):
-            out = out + chr(92) + chr(92)
+            parts.push(chr(92) + chr(92))
         elif c == chr(10):
-            out = out + chr(92) + "n"
+            parts.push(chr(92) + "n")
         else:
-            out = out + c
+            parts.push(c)
         i = i + 1
-    return out
+    return parts.join("")
 
 # label names follow the same rule as metric names.
 fn normalize_label_name(name: String) -> String:
@@ -99,20 +102,23 @@ fn normalize_label_name(name: String) -> String:
 
 # escape a label value for prometheus text: backslash, double-quote, newline.
 fn escape_label_value(value: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made escaping quadratic in the value.
+    mut parts: List[String] := []
     mut i := 0
     while i < value.len():
         c := value[i]
         if c == chr(92):
-            out = out + chr(92) + chr(92)
+            parts.push(chr(92) + chr(92))
         elif c == chr(34):
-            out = out + chr(92) + chr(34)
+            parts.push(chr(92) + chr(34))
         elif c == chr(10):
-            out = out + chr(92) + "n"
+            parts.push(chr(92) + "n")
         else:
-            out = out + c
+            parts.push(c)
         i = i + 1
-    return out
+    return parts.join("")
 
 # build the {k="v",...} suffix from [k1,v1,k2,v2,...] with keys sorted so a label
 # set has one canonical series key regardless of argument order. empty -> "".
@@ -191,11 +197,15 @@ fn metric_name_char(c: String) -> String:
 fn normalize_metric_name(name: String) -> String:
     if name == "":
         return "metric"
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made normalizing quadratic in the name.
+    mut parts: List[String] := []
     mut i := 0
     while i < name.len():
-        out = out + metric_name_char(name[i])
+        parts.push(metric_name_char(name[i]))
         i = i + 1
+    out := parts.join("")
     if out == "":
         return "metric"
     if out[0] >= "0" and out[0] <= "9":

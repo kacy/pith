@@ -235,7 +235,12 @@ fn encoding_b64_decode_utf8(input: String) -> String!:
     return b64_decode_utf8(input)
 
 fn b32_encode_with(input: Bytes, table: String, padded: Bool) -> String:
-    mut result := ""
+    # appending one alphabet character at a time to the result string
+    # recopied the whole accumulated string, which made base32 encoding
+    # quadratic in the input; a byte buffer keeps each append constant.
+    alphabet := bytes.from_string_utf8(table)
+    out := bytes.buffer_with_capacity((input.len() + 4) / 5 * 8)
+    defer out.free()
     mut buffer := 0
     mut bits_left := 0
     mut i := 0
@@ -244,17 +249,20 @@ fn b32_encode_with(input: Bytes, table: String, padded: Bool) -> String:
         bits_left = bits_left + 8
         while bits_left >= 5:
             index := buffer / pow2(bits_left - 5)
-            result = result + table[index % 32]
+            out.write_byte(alphabet[index % 32])
             bits_left = bits_left - 5
             buffer = buffer % pow2(bits_left)
         i = i + 1
     if bits_left > 0:
         index := buffer * pow2(5 - bits_left)
-        result = result + table[index % 32]
+        out.write_byte(alphabet[index % 32])
     if padded:
-        while result.len() % 8 != 0:
-            result = result + "="
-    return result
+        while out.len() % 8 != 0:
+            out.write_word(PAD_BYTE, 1)
+    # every byte written above came from an ascii alphabet or is "=", so the
+    # decode cannot fail; an empty result would be a visible total failure
+    # rather than a silently wrong encoding.
+    return out.bytes().to_string_utf8() catch ""
 
 fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) -> Bytes!:
     cleaned := clean_encoded(input, ignore_ws)!
@@ -345,19 +353,27 @@ pub fn base58_encode(input: Bytes) -> String:
             carry = carry / 58
         i = i + 1
 
-    mut result := ""
+    # appending one alphabet character at a time to the result string
+    # recopied the whole accumulated string, which made base58 encoding
+    # quadratic in the output; a byte buffer keeps each append constant.
+    table := bytes.from_string_utf8(alphabet)
+    out := bytes.buffer_with_capacity(zeroes + digits.len())
+    defer out.free()
     i = 0
     while i < zeroes:
-        result = result + alphabet[0]
+        out.write_byte(table[0])
         i = i + 1
 
     mut j := digits.len() - 1
     while j >= 0 and digits.get(j) == 0:
         j = j - 1
     while j >= 0:
-        result = result + alphabet[digits.get(j)]
+        out.write_byte(table[digits.get(j)])
         j = j - 1
-    return result
+    # every byte written above came from an ascii alphabet, so the decode
+    # cannot fail; an empty result would be a visible total failure rather
+    # than a silently wrong encoding.
+    return out.bytes().to_string_utf8() catch ""
 
 # decode bitcoin base58 into bytes.
 pub fn base58_decode(input: String) -> Bytes!:
@@ -413,13 +429,21 @@ fn hex_nibble(c: String) -> Int:
     return - 1
 
 fn hex_with(input: Bytes, digits: String) -> String:
-    mut result := ""
+    # appending each digit pair to the result string recopied the whole
+    # accumulated string, which made hex encoding quadratic in the input.
+    # both digits of a byte pack into one two-byte buffer append.
+    table := bytes.from_string_utf8(digits)
+    out := bytes.buffer_with_capacity(input.len() * 2)
+    defer out.free()
     mut position := 0
     while position < input.len():
         byte_value := input[position]
-        result = result + digits[byte_value / 16] + digits[byte_value % 16]
+        out.write_word(table[byte_value / 16] + table[byte_value % 16] * 256, 2)
         position = position + 1
-    return result
+    # every byte written above came from an ascii digit table, so the decode
+    # cannot fail; an empty result would be a visible total failure rather
+    # than a silently wrong encoding.
+    return out.bytes().to_string_utf8() catch ""
 
 # encode bytes as lowercase hexadecimal.
 pub fn to_hex(input: Bytes) -> String:

@@ -492,8 +492,12 @@ fn message_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderFie
 # character in an error message writes a field value a compliant client must
 # reject, which turns a readable error into a broken response.
 fn percent_encode(text: String) -> String:
-    hex_digits := "0123456789ABCDEF"
-    mut out := ""
+    hex_digits := bytes.from_string_utf8("0123456789ABCDEF")
+    # appending to the result string one character at a time recopied the
+    # whole accumulated string on every append, which made encoding quadratic
+    # in the message; a byte buffer keeps each append constant.
+    out := bytes.buffer_with_capacity(text.len())
+    defer out.free()
     mut i := 0
     while i < text.len():
         c := text[i]
@@ -501,31 +505,41 @@ fn percent_encode(text: String) -> String:
         # it to the 0-255 the escape needs.
         code := bits.band(ord(c), 255)
         if code >= 32 and code <= 126 and c != "%":
-            out = out + c
+            out.write_byte(code)
         else:
-            out = out + "%" + hex_digits[code / 16] + hex_digits[code % 16]
+            out.write_byte(37)
+            out.write_byte(hex_digits[code / 16])
+            out.write_byte(hex_digits[code % 16])
         i = i + 1
-    return out
+    # every byte written above is printable ascii or an ascii escape, so the
+    # decode cannot fail; an empty result would be a visible total failure
+    # rather than a silently wrong encoding.
+    return out.bytes().to_string_utf8() catch ""
 
 # the inverse. a malformed escape is left as written rather than dropped, so a
 # server that never encoded its message still reads back as itself.
 fn percent_decode(text: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which made
+    # decoding quadratic in the message. a list survives a decoded byte that
+    # is not valid utf-8, which a byte-buffer round-trip through utf-8
+    # validation would not.
+    mut parts: List[String] := []
     mut i := 0
     while i < text.len():
         if text[i] == "%" and i + 2 < text.len():
             high := percent_nibble(text[i + 1])
             low := percent_nibble(text[i + 2])
             if high >= 0 and low >= 0:
-                out = out + chr(high * 16 + low)
+                parts.push(chr(high * 16 + low))
                 i = i + 3
             else:
-                out = out + text[i]
+                parts.push(text[i])
                 i = i + 1
         else:
-            out = out + text[i]
+            parts.push(text[i])
             i = i + 1
-    return out
+    return parts.join("")
 
 fn percent_nibble(c: String) -> Int:
     if c >= "0" and c <= "9":

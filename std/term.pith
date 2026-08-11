@@ -71,7 +71,10 @@ pub fn italic(s: String) -> String:
 # Strip all ANSI escape codes from a string
 pub fn strip(s: String) -> String:
     esc := chr(27)
-    mut result := ""
+    # collect the kept characters and join once at the end: appending each
+    # one to the result string recopied everything accumulated so far, which
+    # made stripping quadratic in the input.
+    mut parts: List[String] := []
     mut in_esc := false
     for c in s:
         if c == esc:
@@ -79,8 +82,8 @@ pub fn strip(s: String) -> String:
         elif in_esc and c == "m":
             in_esc = false
         elif not in_esc:
-            result = result + c
-    return result
+            parts.push(c)
+    return parts.join("")
 
 test "term colors and styles wrap ansi codes":
     esc := chr(27)

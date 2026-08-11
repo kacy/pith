@@ -354,20 +354,23 @@ fn needs_console_quotes(value: String) -> Bool:
     return value.contains(" ") or value.contains(chr(9)) or value.contains(chr(10)) or value.contains(chr(34))
 
 fn console_escape(value: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made escaping quadratic in the value.
+    mut parts: List[String] := []
     mut i := 0
     while i < value.len():
         c := value[i]
         if c == chr(34):
-            out = out + chr(92) + chr(34)
+            parts.push(chr(92) + chr(34))
         elif c == chr(92):
-            out = out + chr(92) + chr(92)
+            parts.push(chr(92) + chr(92))
         elif c == chr(10):
-            out = out + chr(92) + "n"
+            parts.push(chr(92) + "n")
         else:
-            out = out + c
+            parts.push(c)
         i = i + 1
-    return out
+    return parts.join("")
 
 fn render_console_field(field: Field) -> String:
     if field.kind == "raw":
@@ -390,20 +393,23 @@ fn render_console_fields(fields: List[Field]) -> String:
     return " " + parts.join(" ")
 
 fn json_escape(text: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made escaping quadratic in the text.
+    mut parts: List[String] := []
     mut i := 0
     while i < text.len():
         c := text[i]
         if c == chr(34):
-            out = out + chr(92) + chr(34)
+            parts.push(chr(92) + chr(34))
         elif c == chr(92):
-            out = out + chr(92) + chr(92)
+            parts.push(chr(92) + chr(92))
         elif c == chr(10):
-            out = out + chr(92) + "n"
+            parts.push(chr(92) + "n")
         else:
-            out = out + c
+            parts.push(c)
         i = i + 1
-    return out
+    return parts.join("")
 
 fn json_string_field(name: String, value: String) -> String:
     return chr(34) + name + chr(34) + ":" + chr(34) + json_escape(value) + chr(34)

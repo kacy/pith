@@ -78,10 +78,13 @@ MAX_CONNECTIONS := 512
 # loops must never wait. what is left when the waiting is removed is a counter,
 # so that is what this is.
 #
-# it lives as a module global rather than something an accept loop owns because
-# the compiler cannot yet hand a sync-primitive value to a spawned task, and the
-# connection task is where the slot is given back. `mut` is only how a global
-# holding a constructed value is declared — the binding is never reassigned.
+# it lives as a module global because the connection task is where the slot is
+# given back, so the counter must outlive any one accept loop and be the same
+# instance both loops and every connection task see. (it once had to be a global
+# because a sync-primitive could not be handed to a spawned task as an argument;
+# that is fixed, but a single shared instance is naturally a global.) `mut` is
+# only how a global holding a constructed value is declared — the binding is
+# never reassigned.
 mut live_connections := AtomicInt(0)
 
 # ## what happens at the cap, and why it is not what http/2 does
@@ -358,9 +361,11 @@ fn with_mw(middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> htt
 # the pieces the chain runner walks: the middleware list and the route handler at
 # the bottom. bundling them in a struct lets the `next` closure below close over
 # a single struct value and an index, rather than over the bare middleware and
-# handler fn-values — the compiler miscompiles a closure that captures a fn-value
-# held in a variable, but capturing a struct whose fields we read and call in
-# place is fine.
+# handler fn-values. capturing a fn-value held in a variable into a closure once
+# miscompiled (the captured name lost its type, so a call through it was mistaken
+# for a construction and never invoked); that is fixed and the natural onion fold
+# now compiles, but the single-struct capture is kept as the clearer shape —
+# `next` closes over one Chain value and an index instead of two bare fn-values.
 struct Chain:
     middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
     handler: fn(Request) -> http.HttpResponse
@@ -527,8 +532,9 @@ fn pattern_for_path(app: App, req: http.HttpRequestBytes) -> String:
     return ""
 
 # what an OPTIONS request is answered with: 204 and the methods the path
-# accepts. capturing a struct rather than the bare string is the same
-# workaround Chain exists for.
+# accepts. it closes over a small struct rather than the bare string for the
+# same reason Chain does — a matter of shape now that the closure-capture bug it
+# once worked around is fixed.
 struct Options:
     allow: String
 

@@ -96,8 +96,10 @@ MAX_CONNECTIONS := 512
 
 # the in-flight permits, shared between the accept loops and the connection
 # tasks. a Semaphore is safe to share across threads; it lives as a module
-# global rather than a spawned-task argument (which the compiler cannot yet
-# dispatch for a sync-primitive type). it is `mut` only because that is how a
+# global because the accept loops and every connection task share this one
+# instance. (it once had to be a global because a sync-primitive could not be
+# handed to a spawned task as an argument; that is fixed, but a single shared
+# instance is naturally a global.) it is `mut` only because that is how a
 # global holding a constructed value is declared — the binding itself is never
 # reassigned, and the permit count is the semaphore's own synchronized state.
 mut connection_slots := Semaphore(MAX_CONNECTIONS)
@@ -175,9 +177,10 @@ OUT_RESPONSE := 1
 #
 # a response's headers are carried as (stream_id, header fields) rather than as a
 # whole http.HttpResponse on purpose: the handler flattens the response to plain
-# header fields before queuing, so no Map crosses the task boundary — passing a
-# struct with a Map field through a channel currently corrupts it. the encoding
-# still happens on the writer, so the encoder stays single-owner. the response
+# header fields before queuing, so the encoding happens on the writer and the
+# encoder stays single-owner. flattening also once sidestepped a bug where a
+# struct with a Map field was corrupted crossing a channel; that is fixed, but the
+# single-owner encoder is reason enough to keep the shape. the response
 # body is not carried here: the handler streams it as flow-controlled DATA frames
 # (OUT_RAW) after the headers, so the writer never blocks on a send window.
 struct Outbound:
@@ -456,17 +459,21 @@ impl Server:
     # frames the reader produces; if the writer has fully wedged, applying
     # backpressure to the reader is the correct response anyway.
     #
-    # this uses a blocking send rather than try_send on purpose: try_send does not
-    # yet copy a struct payload correctly (successive try_sends alias one slot), so
-    # the outbound Outbound items would collapse to the last one enqueued.
+    # this uses a blocking send rather than try_send on purpose: a full outbound
+    # queue means the writer has wedged, and blocking then applies the correct
+    # backpressure to the reader (see above). a try_send here once also miscopied a
+    # struct payload — successive try_sends aliased one slot, collapsing the
+    # Outbound items to the last enqueued — but that is fixed; the backpressure is
+    # the reason the blocking send stays.
     fn enqueue_frame(frame: frames.Frame):
         wire := frames.frame_bytes(frame)
         if wire.is_err:
             return
-        # the Outbound is built inline rather than through a helper: a struct
-        # passed by value into a helper and then placed in a constructor loses its
-        # nested heap fields (here the wire Bytes), so the item is assembled at the
-        # send site where the fields stay live.
+        # the Outbound is built inline here. a struct passed by value into a helper
+        # and then placed in a constructor once lost its nested heap fields (here
+        # the wire Bytes); that is fixed — raw_item, just above, does exactly this
+        # shape and reads back intact — so this could route through raw_item too. it
+        # is left inline for now, a mechanical simplification to make on its own.
         self.outbound.send(Outbound(OUT_RAW, wire.ok, 0, no_fields(), false))
 
     # reset a stream: tell the client and drop it from the table.

@@ -196,18 +196,21 @@ pub fn title(s: String) -> String:
 
 # swaps the case of each ascii letter.
 pub fn swap_case(s: String) -> String:
-    mut result := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made swapping quadratic in the input.
+    mut parts: List[String] := []
     mut i := 0
     while i < s.len():
         c := s[i]
         if is_upper(c):
-            result = result + c.to_lower()
+            parts.push(c.to_lower())
         elif is_lower(c):
-            result = result + c.to_upper()
+            parts.push(c.to_upper())
         else:
-            result = result + c
+            parts.push(c)
         i = i + 1
-    return result
+    return parts.join("")
 
 # compares two strings for equality, ignoring ascii case.
 #
@@ -467,12 +470,15 @@ pub fn trim_suffix(s: String, suffix: String) -> String:
 # ---------------------------------------------------------------
 
 fn repeat_text(text: String, times: Int) -> String:
-    mut result := ""
+    # collect the copies and join once at the end: appending one copy at a
+    # time recopied the whole accumulated string, which made a wide pad
+    # quadratic in its width.
+    mut parts: List[String] := []
     mut i := 0
     while i < times:
-        result = result + text
+        parts.push(text)
         i = i + 1
-    return result
+    return parts.join("")
 
 # centers the string in a field of the given width.
 pub fn center(s: String, width: Int) -> String:
@@ -495,12 +501,15 @@ pub fn zfill(s: String, width: Int) -> String:
 # instead would turn any multi-byte character into an invalid sequence.
 pub fn reverse(s: String) -> String:
     parts := text.chars(s)
-    mut result := ""
+    # collect the characters in reverse order and join once at the end:
+    # appending each one to the result string recopied everything accumulated
+    # so far, which made reversal quadratic in the input.
+    mut reversed: List[String] := []
     mut i := parts.len() - 1
     while i >= 0:
-        result = result + parts[i]
+        reversed.push(parts[i])
         i = i - 1
-    return result
+    return reversed.join("")
 
 # ---------------------------------------------------------------
 # Safe indexing and extraction

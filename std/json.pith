@@ -412,38 +412,41 @@ fn json_utf8_encode(code: Int) -> String:
 # quotes). returns the decoded text and whether every escape was valid.
 # rfc 8259 escapes only; a \u surrogate pair combines into one code point.
 fn json_unescape_text(raw: String) -> (String, Bool):
-    mut out := ""
+    # collect the pieces and join once at the end: appending to the result
+    # string one character at a time recopied everything accumulated so far
+    # on every append, so a string full of escapes decoded in quadratic time.
+    mut parts: List[String] := []
     mut i := 0
     while i < raw.len():
         c := raw[i]
         if c != chr(92):
-            out = out + c
+            parts.push(c)
             i = i + 1
             continue
         if i + 1 >= raw.len():
-            return (out, false)
+            return (parts.join(""), false)
         e := raw[i + 1]
         if e == chr(34) or e == chr(92) or e == "/":
-            out = out + e
+            parts.push(e)
         elif e == "b":
-            out = out + chr(8)
+            parts.push(chr(8))
         elif e == "f":
-            out = out + chr(12)
+            parts.push(chr(12))
         elif e == "n":
-            out = out + chr(10)
+            parts.push(chr(10))
         elif e == "r":
-            out = out + chr(13)
+            parts.push(chr(13))
         elif e == "t":
-            out = out + chr(9)
+            parts.push(chr(9))
         elif e == "u":
             if i + 5 >= raw.len():
-                return (out, false)
+                return (parts.join(""), false)
             mut code := 0
             mut d := 0
             while d < 4:
                 digit := json_hex_digit_value(raw[i + 2 + d])
                 if digit < 0:
-                    return (out, false)
+                    return (parts.join(""), false)
                 code = code * 16 + digit
                 d = d + 1
             i = i + 6
@@ -451,27 +454,27 @@ fn json_unescape_text(raw: String) -> (String, Bool):
             # the pair combines into one supplementary code point.
             if code >= 0xD800 and code <= 0xDBFF:
                 if i + 5 >= raw.len() or raw[i] != chr(92) or raw[i + 1] != "u":
-                    return (out, false)
+                    return (parts.join(""), false)
                 mut low := 0
                 d = 0
                 while d < 4:
                     digit := json_hex_digit_value(raw[i + 2 + d])
                     if digit < 0:
-                        return (out, false)
+                        return (parts.join(""), false)
                     low = low * 16 + digit
                     d = d + 1
                 if low < 0xDC00 or low > 0xDFFF:
-                    return (out, false)
+                    return (parts.join(""), false)
                 code = 0x10000 + (code - 0xD800) * 1024 + (low - 0xDC00)
                 i = i + 6
             elif code >= 0xDC00 and code <= 0xDFFF:
-                return (out, false)
-            out = out + json_utf8_encode(code)
+                return (parts.join(""), false)
+            parts.push(json_utf8_encode(code))
             continue
         else:
-            return (out, false)
+            return (parts.join(""), false)
         i = i + 2
-    return (out, true)
+    return (parts.join(""), true)
 
 fn json_byte_read_string(input: Bytes, pos: Int) -> JsonByteString:
     if pos < 0 or pos >= input.len() or input[pos] != 34:

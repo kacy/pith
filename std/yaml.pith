@@ -420,12 +420,15 @@ fn utf8_encode(code: Int) -> String:
 
 # decodes the body of a double-quoted scalar (the text between the quotes).
 fn decode_double_quoted(body: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, so a
+    # scalar full of escapes decoded in quadratic time.
+    mut parts: List[String] := []
     mut i := 0
     while i < body.len():
         c := body[i]
         if c != chr(92):
-            out = out + c
+            parts.push(c)
             i = i + 1
             continue
         if i + 1 >= body.len():
@@ -433,25 +436,25 @@ fn decode_double_quoted(body: String) -> String:
             return ""
         e := body[i + 1]
         if e == "n":
-            out = out + chr(10)
+            parts.push(chr(10))
         elif e == "t":
-            out = out + chr(9)
+            parts.push(chr(9))
         elif e == "r":
-            out = out + chr(13)
+            parts.push(chr(13))
         elif e == "0":
-            out = out + chr(0)
+            parts.push(chr(0))
         elif e == "a":
-            out = out + chr(7)
+            parts.push(chr(7))
         elif e == "b":
-            out = out + chr(8)
+            parts.push(chr(8))
         elif e == "f":
-            out = out + chr(12)
+            parts.push(chr(12))
         elif e == "v":
-            out = out + chr(11)
+            parts.push(chr(11))
         elif e == "e":
-            out = out + chr(27)
+            parts.push(chr(27))
         elif e == chr(34) or e == chr(92) or e == "/" or e == " ":
-            out = out + e
+            parts.push(e)
         elif e == "u":
             if i + 5 >= body.len():
                 yaml_fail("truncated \\u escape in a double-quoted scalar")
@@ -465,29 +468,32 @@ fn decode_double_quoted(body: String) -> String:
                     return ""
                 code = code * 16 + digit
                 d = d + 1
-            out = out + utf8_encode(code)
+            parts.push(utf8_encode(code))
             i = i + 6
             continue
         else:
             yaml_fail("unknown escape \\" + e + " in a double-quoted scalar")
             return ""
         i = i + 2
-    return out
+    return parts.join("")
 
 # decodes the body of a single-quoted scalar. the only escape is a doubled
 # quote, and backslashes are literal.
 fn decode_single_quoted(body: String) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made decoding quadratic in the scalar.
+    mut parts: List[String] := []
     mut i := 0
     while i < body.len():
         c := body[i]
         if c == "'" and i + 1 < body.len() and body[i + 1] == "'":
-            out = out + "'"
+            parts.push("'")
             i = i + 2
             continue
-        out = out + c
+        parts.push(c)
         i = i + 1
-    return out
+    return parts.join("")
 
 # the text of a quoted scalar, with its quotes removed and escapes applied.
 fn decode_quoted(text: String) -> String:
@@ -874,12 +880,15 @@ fn parse_inline_value(text: String) -> Int:
 # ===============================================================
 
 fn repeat_newlines(count: Int) -> String:
-    mut out := ""
+    # collect the pieces and join once at the end: appending one newline at a
+    # time recopied the whole accumulated string, so a long run of blank
+    # lines in a block scalar cost quadratic time.
+    mut parts: List[String] := []
     mut i := 0
     while i < count:
-        out = out + chr(10)
+        parts.push(chr(10))
         i = i + 1
-    return out
+    return parts.join("")
 
 # reads a `|` or `>` block whose header is `header` and whose owning key sits
 # at `parent_indent`.

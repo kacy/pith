@@ -12,6 +12,8 @@
 #   path(u)        # "/api"
 #   encode("hello world")  # "hello%20world"
 
+import std.bytes as bytes
+
 # ===============================================================
 # URL
 # ===============================================================
@@ -217,21 +219,30 @@ fn is_unreserved(c: String) -> Bool:
 # Percent-encodes a string per RFC 3986.
 # Unreserved characters are left as-is, all others become %XX.
 pub fn encode(input: String) -> String:
-    hex_digits := "0123456789abcdef"
-    mut result := ""
+    hex_digits := bytes.from_string_utf8("0123456789abcdef")
+    # appending to the result string one character at a time recopied the whole
+    # accumulated string on every append, which made encoding quadratic in the
+    # input; a byte buffer keeps each append constant.
+    out := bytes.buffer_with_capacity(input.len())
+    defer out.free()
     mut position := 0
     while position < input.len():
         character := input[position]
         if is_unreserved(character):
-            result = result + character
+            out.write_byte(ord(character))
         if not is_unreserved(character):
             # a bare ord() sign-extends, so every byte above 0x7F came back
             # negative and indexed off the front of the digit table. percent
             # encoding is defined over bytes, so mask it back to 0-255.
             char_value := bit_and(ord(character), 255)
-            result = result + "%" + hex_digits[char_value / 16] + hex_digits[char_value % 16]
+            out.write_byte(37)
+            out.write_byte(hex_digits[char_value / 16])
+            out.write_byte(hex_digits[char_value % 16])
         position = position + 1
-    return result
+    # every byte written above is unreserved ascii or an ascii escape, so the
+    # decode cannot fail; an empty result would be a visible total failure
+    # rather than a silently wrong encoding.
+    return out.bytes().to_string_utf8() catch ""
 
 # Converts a hex digit character to its numeric value.
 fn hex_digit(c: String) -> Int:
@@ -246,7 +257,12 @@ fn hex_digit(c: String) -> Int:
 # Percent-decodes a string, converting %XX sequences to characters.
 # Also converts "+" to space (application/x-www-form-urlencoded).
 pub fn decode(input: String) -> String:
-    mut result := ""
+    # collect the pieces and join once at the end: appending to the result
+    # string directly recopied everything accumulated so far on every append,
+    # which made decoding quadratic in the input. a list survives a decoded
+    # byte that is not valid utf-8 (say "%ff"), which a byte-buffer round-trip
+    # through utf-8 validation would not.
+    mut parts: List[String] := []
     mut position := 0
     while position < input.len():
         # these were three sequential ifs. after the escape branch consumed a
@@ -257,18 +273,18 @@ pub fn decode(input: String) -> String:
             high_nibble := hex_digit(input[position + 1])
             low_nibble := hex_digit(input[position + 2])
             if high_nibble >= 0 and low_nibble >= 0:
-                result = result + chr(high_nibble * 16 + low_nibble)
+                parts.push(chr(high_nibble * 16 + low_nibble))
                 position = position + 3
             else:
-                result = result + input[position]
+                parts.push(input[position])
                 position = position + 1
         elif input[position] == "+":
-            result = result + " "
+            parts.push(" ")
             position = position + 1
         else:
-            result = result + input[position]
+            parts.push(input[position])
             position = position + 1
-    return result
+    return parts.join("")
 
 test "percent coding survives non-ascii and a trailing escape":
     # a bare ord() sign-extends, so every byte above 0x7F indexed off the

@@ -9,12 +9,15 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-the short version, all on the same 2-core machine, rerun 2026-08-08 after the
-august ownership and hardening work. the concurrency rows are the green
-backend, which is the default on linux; rows marked `PITH_GREEN=0` are the
-os-thread opt-out, kept for contrast. the go, rust and zig columns double as
-canaries — they are the same programs as in the 2026-07-29 run, so when one of
-them moves it is the machine that moved and not the language:
+the short version, all on the same 2-core machine, rerun 2026-08-08 and
+reconfirmed 2026-08-11 (every row within run-to-run noise, comparators
+reproducing their published figures — the one thing that moved was a weak-
+reference leak, found and fixed on the rerun, in cyclic_graph below). the
+concurrency rows are the green backend, which is the default on linux; rows
+marked `PITH_GREEN=0` are the os-thread opt-out, kept for contrast. the go,
+rust and zig columns double as canaries — they are the same programs as in the
+2026-07-29 run, so when one of them moves it is the machine that moved and not
+the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
@@ -652,6 +655,18 @@ this is the escape hatch for the one thing reference counting can't do
 on its own. pith has no cycle collector by design (no gc pauses); a
 `weak` field is a non-owning reference that reads back as `none` once
 its target is freed. see docs/ownership.md.
+
+the weak-edge row was not always flat. a rerun on 2026-08-11 caught it
+climbing linearly — ~120 mb at a million rings — where this table had
+long claimed 2. a `weak` field initialized to `none` was storing a
+freshly-allocated optional tuple and taking a weak reference to it, but
+nothing released that tuple's strong count, so every instance of any
+struct with a `weak` field leaked one header-sized allocation. the
+constructor now stores a bare `0` for a `none` weak field, and the row
+is flat again — the same 2 mb at 100k, 500k and a million rings. the
+`leak_weak_field` growth case guards it. the lesson worth keeping: the
+leak-growth gate had no weak-bearing shape, so a headline claim drifted
+false for weeks with every other benchmark still passing.
 
 `bench/closure_error` — the workload the collection benchmarks don't
 reach: closures built, captured, called, and dropped every iteration,

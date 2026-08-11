@@ -195,8 +195,8 @@ fn no_fields() -> List[hpack.HeaderField]:
     fields: List[hpack.HeaderField] := []
     return fields
 
-# a pre-serialized control frame for the writer to send as-is. only ever called
-# with empty bytes as an unwrap_or default, so the by-value helper move is safe.
+# a pre-serialized frame for the writer to send as-is: control frames, and the
+# DATA frames the body path produces.
 fn raw_item(wire: Bytes) -> Outbound:
     return Outbound(OUT_RAW, wire, 0, no_fields(), false)
 
@@ -469,12 +469,7 @@ impl Server:
         wire := frames.frame_bytes(frame)
         if wire.is_err:
             return
-        # the Outbound is built inline here. a struct passed by value into a helper
-        # and then placed in a constructor once lost its nested heap fields (here
-        # the wire Bytes); that is fixed — raw_item, just above, does exactly this
-        # shape and reads back intact — so this could route through raw_item too. it
-        # is left inline for now, a mechanical simplification to make on its own.
-        self.outbound.send(Outbound(OUT_RAW, wire.ok, 0, no_fields(), false))
+        self.outbound.send(raw_item(wire.ok))
 
     # reset a stream: tell the client and drop it from the table.
     fn reset(stream_id: Int, error_code: Int):
@@ -810,7 +805,7 @@ fn send_stream_data(server: Server, stream_id: Int, data: Bytes, end_stream: Boo
             wire := frames.frame_bytes(frames.data_frame(stream_id, bytes.empty(), true))
             if wire.is_err:
                 return 0
-            server.outbound.send(Outbound(OUT_RAW, wire.ok, 0, no_fields(), false))
+            server.outbound.send(raw_item(wire.ok))
         return 0
     mut off := 0
     while off < total:
@@ -826,9 +821,7 @@ fn send_stream_data(server: Server, stream_id: Int, data: Bytes, end_stream: Boo
         wire := frames.frame_bytes(frames.data_frame(stream_id, data.slice(off, stop), last and end_stream))
         if wire.is_err:
             return off
-        # OUT_RAW is built inline at the send site: a by-value struct moved into a
-        # constructor inside a helper loses its nested heap fields (the wire Bytes).
-        if not server.outbound.send(Outbound(OUT_RAW, wire.ok, 0, no_fields(), false)):
+        if not server.outbound.send(raw_item(wire.ok)):
             return off
         off = stop
     return off

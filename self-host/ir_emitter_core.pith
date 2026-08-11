@@ -106,15 +106,23 @@ mut ir_rc_local_kinds: List[String] := []
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
 # cleanup by default, which leaks the owned payload at slot 8 (and the error at
 # slot 16). these two lists track, per function, the tuple locals whose EVERY use
-# is a flag check (`.is_ok`/`.is_err`/`== none`) or a borrowing `.ok`/`.err`
-# read — uses that leave the tuple holding the count it was built with, so the
-# cleanup path is the payload's only releaser. for those the cleanup releases
-# the live payload before freeing the shell. a local with any other use (`!`,
-# `catch`, `unwrap_or`, passed to a call, returned, bound, matched, iterated,
-# ...) is left out and keeps the shell-only behavior, which may still leak but
+# is a flag check (`.is_ok`/`.is_err`/`== none`), a borrowing `.ok`/`.err`
+# read, a result extraction, or an argument of a same-module call whose body
+# provably only reads the parameter — uses that leave the tuple holding the
+# count it was built with, so the cleanup path is the payload's only releaser.
+# for those the cleanup releases the live payload before freeing the shell. a
+# local with any other use (returned, bound, matched, iterated, captured, ...)
+# is left out and keeps the shell-only behavior, which may still leak but
 # can never double-free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
+# the module root emit_ir is currently lowering: the cascade walk reads a
+# same-module callee's declaration through it to judge an argument borrow
+# (ir_tuple_call_arg_is_borrow). and the (callee, param) pairs that walk is
+# already inside, so a recursive call chain answers "not safe" instead of
+# looping.
+mut ir_tuple_walk_root: Int := 0 - 1
+mut ir_tuple_borrow_walk_active: List[String] := []
 
 # --- module globals collected during the prepass ---
 
@@ -919,6 +927,11 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # per extraction. `is_result` gates them because the OPTIONAL unwrap_or moves
 # a borrowed subject's count out to the extracted value instead of retaining
 # a new one; cascading such a local would release a count it no longer holds.
+#
+# one whitelisted position lives in the walk instead of here: an argument of a
+# same-module call whose body provably only reads the parameter
+# (ir_tuple_call_uses_safe) — the parser wraps arguments in `arg` nodes, so
+# this per-parent check never sees the call they belong to.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
     if is_result and parent.kind == "method_call" and parent.children.len() > 0:
         recv := get_node(parent.children[0])
@@ -977,9 +990,133 @@ fn ir_subtree_mentions_ident(idx: Int, name: String) -> Bool:
             return true
     return false
 
+# the walk's view of one call node. an argument that is exactly the tracked
+# name is a borrow only when ir_tuple_call_arg_is_borrow can prove the callee
+# never keeps it; the callee position and every deeper subtree are judged by
+# the ordinary rules.
+fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
+    # a named argument may land in any declared position, so a positional
+    # argument's index is only trustworthy when the call has no named ones
+    mut has_named := false
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "arg" and cn.value.len() > 0:
+            has_named = true
+    for child, i in node.children:
+        cn := get_node(child)
+        if i == 0:
+            # the callee position: a fn value named `name` cannot be a tuple
+            # local, and nothing here may wave it through
+            if cn.kind == "ident" and cn.value == name:
+                return false
+            if cn.kind != "ident":
+                if not ir_tuple_uses_all_safe(child, name, is_result):
+                    return false
+        else:
+            mut expr_idx := child
+            mut arg_name := ""
+            if cn.kind == "arg":
+                arg_name = cn.value
+                if cn.children.len() > 0:
+                    expr_idx = cn.children[0]
+                else:
+                    expr_idx = 0 - 1
+            if expr_idx >= 0:
+                en := get_node(expr_idx)
+                if en.kind == "ident" and en.value == name:
+                    if has_named and arg_name.len() == 0:
+                        return false
+                    if not ir_tuple_call_arg_is_borrow(node, i - 1, arg_name, is_result):
+                        return false
+                elif not ir_tuple_uses_all_safe(expr_idx, name, is_result):
+                    return false
+    return true
+
+# true when handing the tracked tuple local to this call argument leaves the
+# caller the payload's sole owner at cleanup. that needs the callee's body:
+# only a function declared in the module being emitted qualifies, and its body
+# must pass this same walk for the receiving parameter — so a callee that
+# stores, returns, sends, or captures the parameter (any use the whitelist
+# does not cover) answers "not safe", and the local keeps shell-only cleanup.
+# everything unresolvable stays excluded the same way: an imported callee
+# (its body may be checked against another module's names, so it is not
+# walked), a struct or enum construction (stores every argument), a builtin
+# or closure-typed callee (no declaration to read), a `mut`/`ref` parameter,
+# and a recursive chain already being walked. erring that way keeps the leak
+# the cascade has always tolerated and can never free a live payload.
+#
+# the callee's own extractions are safe on a borrowed parameter for a RESULT:
+# `!`, `catch` and `unwrap_or` classify a named operand as borrowed and retain
+# the payload they hand out (see ir_emit_result_unwrap_or). the OPTIONAL
+# unwrap_or instead TRANSFERS the borrowed shell's payload count out, so an
+# optional parameter that is extracted must disqualify the argument — which
+# the walk's `is_result` gate on those clauses already does.
+fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
+    callee := ir_resolve_static_callee(node.children[0])
+    if callee.imported or callee.name.len() == 0:
+        return false
+    if ir_struct_names.contains_key(callee.name) or ir_boxed_enums.contains_key(callee.name):
+        return false
+    decl_idx := ir_tuple_walk_fn_decl(callee.name)
+    if decl_idx < 0:
+        return false
+    param := ir_tuple_walk_param_name(decl_idx, arg_pos, arg_name)
+    if param.len() == 0:
+        return false
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return false
+    walk_key := callee.name + "/" + param
+    if ir_tuple_borrow_walk_active.contains(walk_key):
+        return false
+    ir_tuple_borrow_walk_active.push(walk_key)
+    safe := ir_tuple_uses_all_safe(body_idx, param, is_result)
+    ir_tuple_borrow_walk_active.remove(ir_tuple_borrow_walk_active.len() - 1)
+    return safe
+
+# the declaration of a bare-named function in the module being emitted, or -1.
+# ir_root_items unwraps `pub`, so public declarations resolve too.
+fn ir_tuple_walk_fn_decl(fname: String) -> Int:
+    if ir_tuple_walk_root < 0:
+        return 0 - 1
+    for item_idx in ir_root_items(ir_tuple_walk_root):
+        item := get_node(item_idx)
+        if ir_is_fn_decl_kind(item.kind) and item.value == fname:
+            return item_idx
+    return 0 - 1
+
+# the declared parameter a call argument lands in: a named argument by its own
+# name, a positional one by index among the param nodes. a `mut` or `ref`
+# modifier is folded into the param node's value after a space; such a
+# parameter is not a plain borrow, so the space makes the lookup miss and the
+# argument stays excluded.
+fn ir_tuple_walk_param_name(decl_idx: Int, arg_pos: Int, arg_name: String) -> String:
+    decl := get_node(decl_idx)
+    mut pi := 0
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if arg_name.len() > 0:
+                if cn.value == arg_name:
+                    return arg_name
+            elif pi == arg_pos:
+                if cn.value.split(" ").len() > 1:
+                    return ""
+                return cn.value
+            pi = pi + 1
+    return ""
+
+fn ir_tuple_walk_fn_body(decl_idx: Int) -> Int:
+    decl := get_node(decl_idx)
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "body" and cn.children.len() > 0:
+            return cn.children[0]
+    return 0 - 1
+
 # walk the subtree: every occurrence of ident `name` must appear as the child of
-# a whitelisted parent. any other appearance (bound, returned, passed, unwrapped,
-# matched, iterated, ...) makes cascade unsafe and returns false.
+# a whitelisted parent. any other appearance (bound, returned, matched,
+# iterated, ...) makes cascade unsafe and returns false.
 fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     node := get_node(idx)
     # a lambda that mentions the local captures the three-slot shell and retains
@@ -989,6 +1126,11 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # see, so rule the local out for the whole lambda.
     if node.kind == "lambda":
         return not ir_subtree_mentions_ident(idx, name)
+    # a spawned call runs on another task that can outlive this frame, so an
+    # argument there is not a borrow bounded by this function's cleanup order.
+    # any mention below a spawn rules the local out, the same as a capture.
+    if node.kind == "spawn":
+        return not ir_subtree_mentions_ident(idx, name)
     # the whitelist covers `.ok`/`.err` as READS. on the left of an `=` the same
     # syntax is a write into the tuple, which would replace the payload the
     # cascade expects to own, so any mention of the name in an assignment target
@@ -996,6 +1138,11 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     if node.kind == "assignment" and node.children.len() > 0:
         if ir_subtree_mentions_ident(node.children[0], name):
             return false
+    # a call gets its own walk: the parser wraps every argument in an "arg"
+    # node, so the judgment needs the whole call in view, not the wrapper the
+    # generic loop below would hand ir_tuple_use_is_whitelisted.
+    if node.kind == "call" and node.children.len() > 0:
+        return ir_tuple_call_uses_safe(node, name, is_result)
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
@@ -8372,6 +8519,7 @@ fn ir_finish_module_emit():
 # functions in declaration order.
 pub fn emit_ir(root_idx: Int) -> String:
     ir_reset()
+    ir_tuple_walk_root = root_idx
 
     root := get_node(root_idx)
     mut preload_i := 0

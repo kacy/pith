@@ -1125,6 +1125,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_nested_generic_sort_ownership \
 	tests/cases/test_list_transform_ownership \
 	tests/cases/test_result_unwrap_or_fallback_leak \
+	tests/cases/test_result_arg_borrow_leak \
 	tests/cases/test_borrowed_operand_extraction \
 	tests/cases/test_unwrap_or_borrowed_fallback \
 	tests/cases/test_task_result_payloads \

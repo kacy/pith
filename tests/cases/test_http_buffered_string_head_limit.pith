@@ -1,0 +1,30 @@
+import std.io as io
+import std.net.http as http
+
+fn main() -> Int!:
+    crlf := chr(13) + chr(10)
+
+    # a single line longer than the head limit, with no CRLF ever arriving.
+    # the head-total check alone never fires on this shape — the per-line
+    # bound has to refuse it instead of buffering the line without limit.
+    mut big := "x"
+    while big.len() < http.MAX_HEADER_BYTES + 16:
+        big = big + big
+
+    flood := http.read_request_buffered(io.string_reader("GET " + big).buffered_chunked(64))
+    print(flood.is_err.to_string())
+    print(flood.err)
+
+    # the same flood as a header line after a well-formed request line.
+    header_flood := http.read_request_buffered(io.string_reader("GET / HTTP/1.1" + crlf + "X-Big: " + big).buffered_chunked(64))
+    print(header_flood.is_err.to_string())
+    print(header_flood.err)
+
+    # a well-formed request still parses through the same reader.
+    raw := "POST /submit HTTP/1.1" + crlf + "Host: example.com" + crlf + "Content-Length: 5" + crlf + crlf + "hello"
+    req := http.read_request_buffered(io.string_reader(raw).buffered_chunked(3))!
+    print(http.method(req))
+    print(http.path(req))
+    print(http.get_header(req, "host"))
+    print(http.body(req))
+    return 0

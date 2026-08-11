@@ -1,0 +1,48 @@
+# a CRLF-less request head flooded through the legacy string request reader.
+#
+# read_request_buffered reads its head one line at a time. read_line accumulates
+# a pending line without limit until a newline arrives, so a single endless line
+# used to buffer the whole flood before anything checked the head size. the
+# reader now bounds each head line at MAX_HEADER_BYTES and fails there, so no
+# matter how long the fed line is, the reader holds at most the cap and gives it
+# all back on the failure.
+#
+# this churns one oversized-line read per round. each round must fail at the
+# limit and free everything it buffered; a per-round leak — a buffer the failing
+# read forgot to drop — shows up as resident growth between the two round
+# counts. the fed line is fixed at several times the cap so the reader's own
+# buffering, not the input string, is what a regression would have to grow.
+#
+# valgrind sees none of it: the reader's buffer sits in a handle-keyed registry
+# and reads as "still reachable" rather than lost.
+import leakprobe as probe
+import std.io as io
+import std.net.http as http
+
+fn round(line: String) -> Int:
+    result := http.read_request_buffered(io.string_reader(line).buffered_chunked(64))
+    if result.is_err:
+        return 0
+    return 1
+
+fn main():
+    # one line, no CRLF, just past the head cap. built once so its size is
+    # constant across rounds and only the reader's per-round work can vary. the
+    # reader fails at the cap, so a longer line would only add input bytes, not
+    # reader work — the cap is where a leaked buffer would sit.
+    mut line := "GET "
+    while line.len() < http.MAX_HEADER_BYTES + 16:
+        line = line + line
+    # each round drives the reader over the whole cap one character at a time,
+    # so the round count is scaled well down — a per-round buffer leak is the
+    # size of the cap, so a few hundred extra rounds already dwarf the limit.
+    rounds := probe.rounds() / 2000
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(line)
+        i = i + 1
+    if acc != 0:
+        print("a flood was accepted")
+    kb := probe.peak_kb()
+    print("{kb}")

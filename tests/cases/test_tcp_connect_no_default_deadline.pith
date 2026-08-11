@@ -1,0 +1,102 @@
+# a client socket fresh out of connect() has no read deadline, on either backend.
+#
+# the os-thread connect path used to install a five second read deadline of its
+# own on every socket it returned, where the green path (the default) never did:
+# the same client program blocked forever under green and gave up at 5s under
+# PITH_GREEN=0. this drives the connect-side socket — the accept side is
+# test_socket_read_timeout's job — through both halves of the contract:
+#
+# - no deadline set: the read outlasts the old 5s default and gets the bytes.
+#   the quiet period is deliberately past five seconds, so a connect path that
+#   grows a default deadline again fails this case rather than passing by luck.
+# - an explicit tcp.set_timeout: the read gives up at roughly that deadline.
+#
+# it runs in the regression corpus, which is checked under both backends against
+# one expected file, so a connect default on one backend and not the other shows
+# up as differing output.
+
+import std.net.tcp as tcp
+import std.time as time
+
+PATIENT_PORT := 50955
+SILENT_PORT := 50957
+
+# how long the patient server keeps quiet before speaking. comfortably past the
+# five seconds the os-thread connect path used to impose, so a read that
+# outlasts it cannot be one that quietly kept a connect-time deadline.
+QUIET_MS := 5600
+
+# the explicit deadline under test. long enough that scheduling noise on a
+# small box cannot make a read look like it gave up early.
+TIMEOUT_MS := 300
+
+# ---------------------------------------------------------------------------
+# the peers
+# ---------------------------------------------------------------------------
+
+# accept, stay quiet well past the deadline the client is not supposed to have,
+# then speak. the delay is the stimulus this case measures: the client is
+# already parked in its read, and a longer delay only makes the assertion truer.
+fn patient_server(listener: Int) -> Int!:
+    fd := tcp.accept(listener)!
+    sleep(QUIET_MS)
+    tcp.write_all(fd, "late")!
+    tcp.read(fd, 16) catch ""
+    tcp.close(fd)
+    return 0
+
+# accept and say nothing at all. the read here returns only when the client
+# gives up on us and closes, so this task ends on the client's decision rather
+# than on a guess about how long that decision takes.
+fn silent_server(listener: Int) -> Int!:
+    fd := tcp.accept(listener)!
+    tcp.read(fd, 16) catch ""
+    tcp.close(fd)
+    return 0
+
+# ---------------------------------------------------------------------------
+# the cases
+# ---------------------------------------------------------------------------
+
+# no deadline is set on the connected socket: the read must wait for as long as
+# the server takes, including past the 5s the os-thread path used to impose.
+fn a_fresh_connection_waits_for_the_server() -> Bool!:
+    listener := tcp.listen("127.0.0.1", PATIENT_PORT)!
+    server := spawn patient_server(listener)
+    fd := tcp.connect("127.0.0.1", PATIENT_PORT)!
+    start := time.mono_millis()
+    text := tcp.read(fd, 64) catch ""
+    elapsed := time.mono_millis() - start
+    tcp.close(fd)
+    await server
+    tcp.close(listener)
+    print("fresh connection: read arrived {text == "late"}")
+    print("fresh connection: outlasted a deadline it never had {elapsed >= QUIET_MS - 200}")
+    return true
+
+# an explicit deadline on the connected socket must still end a read the server
+# never answers, at roughly the deadline rather than never.
+fn an_explicit_deadline_still_ends_a_read() -> Bool!:
+    listener := tcp.listen("127.0.0.1", SILENT_PORT)!
+    server := spawn silent_server(listener)
+    fd := tcp.connect("127.0.0.1", SILENT_PORT)!
+    tcp.set_timeout(fd, TIMEOUT_MS)
+    start := time.mono_millis()
+    result := tcp.read(fd, 64)
+    elapsed := time.mono_millis() - start
+    tcp.close(fd)
+    await server
+    tcp.close(listener)
+    print("explicit deadline: read failed {result.is_err}")
+    # the band is generous in both directions. the floor is below the deadline
+    # because a millisecond clock and a reactor that fires on the tick can land
+    # a hair under it; the ceiling is only there to separate "gave up" from
+    # "waited forever", which is the whole question.
+    print("explicit deadline: waited for its deadline {elapsed >= TIMEOUT_MS - 100}")
+    print("explicit deadline: did not wait forever {elapsed < 5000}")
+    return true
+
+fn main() -> Int:
+    a_fresh_connection_waits_for_the_server() catch false
+    an_explicit_deadline_still_ends_a_read() catch false
+    return 0

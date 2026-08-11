@@ -44,6 +44,7 @@ cases=(
   tests/leaks/leak_yaml_parse
   tests/leaks/leak_sql_numeric
   tests/leaks/leak_none_lowering
+  tests/leaks/leak_weak_field
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood
 )

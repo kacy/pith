@@ -242,6 +242,19 @@ if payload < 0:
     return http.server_error_response()
 ```
 
+### request-size bounds
+
+every request reader bounds how much one request can make the server buffer, so
+a hostile client cannot exhaust memory with an endless head or an over-large
+body. the head — the request line plus the header fields — is capped at
+`http.MAX_HEADER_BYTES`, and the body at `http.MAX_REQUEST_BODY`. the cap holds
+across every reader: the fd path (`read_request`, `read_request_bytes`), the
+buffered readers (`read_request_buffered_bytes`, the legacy string-form
+`read_request_buffered`), and the tls accept loop. a head that grows past the
+cap fails even when it arrives as a single line with no line break, so no reader
+accumulates an unbounded line before the total is checked. the serve loops turn
+those failures into `431` / `413` responses and close the connection.
+
 ## streaming responses
 
 for larger bodies, you can stream the response instead of building one big

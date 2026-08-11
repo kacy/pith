@@ -115,15 +115,14 @@ the os-thread backend, which made every read timeout in the stdlib inert in the
 default configuration — a client that connected and sent nothing pinned a server
 task for good.
 
-two things it does not reach:
+one thing it does not reach: a pipe. `SO_RCVTIMEO` is a socket option, so a
+child process's stdout has no deadline to set and a read on it waits for the
+child. bound a child with `process.run_ctx`/`output_ctx` and a context deadline
+instead.
 
-- **a pipe.** `SO_RCVTIMEO` is a socket option, so a child process's stdout has
-  no deadline to set and a read on it waits for the child. bound a child with
-  `process.run_ctx`/`output_ctx` and a context deadline instead.
-- **a connect.** on the os-thread backend `connect` hands back a socket with a
-  five second read deadline already on it; on the green backend it does not. set
-  one explicitly on a client connection whose reads must be bounded rather than
-  relying on the difference.
+and one thing nothing sets for you: a fresh connection has no read deadline, on
+either backend. `connect` hands back a socket that waits indefinitely, so a
+client whose reads must be bounded sets one explicitly.
 
 ## why the adapters are handle-backed
 

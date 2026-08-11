@@ -163,10 +163,9 @@ pub fn write_all_bytes(fd: Int, data: Bytes) -> Int!:
 # the whole conversation: a read that returns bytes leaves the next one a fresh
 # deadline.
 #
-# one thing it does not cover: connect() on the os-thread backend installs a five
-# second read deadline of its own on the sockets it returns, where the green
-# backend leaves them with none. set this explicitly on a client connection whose
-# reads must be bounded rather than relying on that.
+# a fresh connection starts with no deadline on either backend: connect() hands
+# back a socket that waits indefinitely. set this explicitly on a client
+# connection whose reads must be bounded.
 pub fn set_timeout(fd: Int, ms: Int):
     tcp_set_timeout(fd, ms)
 

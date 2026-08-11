@@ -33,11 +33,13 @@ PROMETHEUS_CONTENT_TYPE := "text/plain; version=0.0.4; charset=utf-8"
 MAX_CONCURRENT_SCRAPES := 64
 
 # the in-flight permits, shared between the accept loop and the scrape tasks. a
-# Semaphore is safe to share across threads; it lives as a module global rather
-# than a spawned-task argument (which the compiler can't yet dispatch for a
-# sync-primitive type). it is `mut` only because that is how a global holding a
-# constructed value is declared — the binding itself is never reassigned, and
-# the permit count is the semaphore's own synchronized state.
+# Semaphore is safe to share across threads; it lives as a module global because
+# the accept loop and every scrape task share this one instance. (it once had to
+# be a global because a sync-primitive could not be handed to a spawned task as an
+# argument; that is fixed, but a single shared instance is naturally a global.) it
+# is `mut` only because that is how a global holding a constructed value is
+# declared — the binding itself is never reassigned, and the permit count is the
+# semaphore's own synchronized state.
 mut scrape_slots := Semaphore(MAX_CONCURRENT_SCRAPES)
 
 # the /metrics response for the current metric snapshot.

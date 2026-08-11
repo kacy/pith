@@ -59,10 +59,12 @@ pub DEFAULT_POOL_SIZE := 8
 # DEFAULT_POOL_SIZE. it fails on an unknown scheme or a missing host.
 pub fn parse_url(url: String) -> Dsn!:
     # parsed with builtin string methods (index_of/substring/split) rather than
-    # std.strings, on purpose: the per-driver adapter that calls this holds a
-    # driver pool across a module boundary, and exercising std.strings on that
-    # call path currently miscompiles the pooled connection. the builtin ops are
-    # unaffected, so the whole db layer stays clear of std.strings.
+    # std.strings. this once had to avoid std.strings: the per-driver adapter that
+    # calls this holds a driver pool across a module boundary, and exercising
+    # std.strings on that call path miscompiled the pooled connection. that is
+    # fixed, so the choice is now inertia — the builtin ops cover the small parse
+    # here, and moving to std.strings is a mechanical change to measure on its own
+    # rather than fold into a comment cleanup.
     scheme_at := url.index_of("://")
     if scheme_at < 0:
         fail "db: url has no scheme: {url}"

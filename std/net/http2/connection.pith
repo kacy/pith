@@ -506,8 +506,11 @@ MODE_THREADED := 2
 # a multiplexed http/2 client over one connection. many request() calls share
 # it. the mutex guards the stream table, the id counter, the closed/going-away
 # flags, and the last stream the peer promised to serve; the channels are
-# already safe to use across tasks. `active` mirrors the stream-table keys
-# because Map[Int, _].keys() does not yet enumerate int keys.
+# already safe to use across tasks. `active` mirrors the stream-table keys as an
+# ordered List[Int]. it once had to exist because Map[Int, _].keys() did not
+# enumerate int keys; that is fixed, but the explicit list is load-bearing in its
+# own right — a dozen call sites iterate it, and it keeps a deterministic order
+# keys() does not promise — so it stays until a switch to keys() is measured.
 #
 # --- the inline fast-path ---
 #

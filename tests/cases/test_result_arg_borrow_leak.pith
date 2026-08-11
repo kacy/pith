@@ -1,0 +1,62 @@
+# passing a raw `T!`/`T?` local to a same-module function must not leak its
+# payload.
+#
+# a call argument is a borrow when the callee's body provably only reads the
+# parameter: the callee takes no count of its own, and a result extraction
+# there retains what it hands out. such a local stays cascade-eligible, so
+# the caller's cleanup releases the payload the shell owns. before, appearing
+# as a call argument disqualified the local outright, cleanup freed only the
+# three-slot shell, and one payload leaked per call — about 9 mb over the
+# 200k rounds below, against a flat footprint near 3 mb.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.strings as strings
+
+fn make(i: Int) -> Bytes!:
+    if i % 4 == 3:
+        fail "err-payload-{i}"
+    return bytes.from_string_utf8("a payload wide enough to notice if it leaks")
+
+fn maybe(i: Int) -> Bytes?:
+    if i % 4 == 3:
+        return none
+    return bytes.from_string_utf8("an optional payload wide enough to notice")
+
+fn read_result(r: Bytes!) -> Int:
+    if r.is_err:
+        return 0
+    return r.ok.len()
+
+fn probe_opt(o: Bytes?) -> Int:
+    if o == none:
+        return 0
+    return 1
+
+fn hwm_kb() -> Int:
+    status := fs.read_file("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM"):
+            for part in line.split(" "):
+                v := strings.parse_int(part).unwrap_or(0 - 1)
+                if v > 0:
+                    return v
+    return 0
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 200000:
+        x := make(i)
+        total = total + read_result(x)
+        o := maybe(i)
+        total = total + probe_opt(o)
+        i = i + 1
+    peak := hwm_kb()
+    # a per-iteration leak of the ~90-byte payload pair adds ~18 mb over 200k
+    # iterations; flat sits near 3 mb. 20 mb is a margin a real leak blows
+    # through and normal variance never reaches.
+    if peak < 20000:
+        print("flat total=" + total.to_string())
+    else:
+        print("leaked peak_kb=" + peak.to_string())

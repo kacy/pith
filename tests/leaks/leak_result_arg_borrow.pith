@@ -1,0 +1,42 @@
+# a result/optional local handed to a same-module function that only reads
+# it. the argument position must keep the local cascade-eligible: the callee
+# borrows the shell and retains anything it hands out, so the caller's
+# cleanup stays the payload's sole owner. before, an argument use forced
+# shell-only cleanup and one payload (or error string) leaked per round.
+import std.bytes as bytes
+import leakprobe as probe
+
+fn make_payload(i: Int) -> Bytes!:
+    if i % 4 == 3:
+        fail "err-{i}"
+    return bytes.from_string_utf8("heap-payload-{i}")
+
+fn maybe_payload(i: Int) -> Bytes?:
+    if i % 4 == 3:
+        return none
+    return bytes.from_string_utf8("optional-payload-{i}")
+
+fn read_result(r: Bytes!) -> Int:
+    if r.is_err:
+        return 0
+    return r.ok.len()
+
+fn probe_opt(o: Bytes?) -> Int:
+    if o == none:
+        return 0
+    return 1
+
+fn churn_round(i: Int):
+    r := make_payload(i)
+    mut total := read_result(r)
+    o := maybe_payload(i)
+    total = total + probe_opt(o)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

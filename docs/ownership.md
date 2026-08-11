@@ -379,18 +379,33 @@ gaps, all bounded leaks rather than dangling pointers:
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a
   probe (`.is_ok`, `.is_err`, `== none`), a payload read (`.ok`, `.err`),
-  or — for a result — an extraction (`r.unwrap_or(d)`, `r catch d`, `r!`)
-  releases its payload: a probe never touches it, a read borrows, and an
-  extraction hands its consumer a freshly retained count, so in every
-  case the local is still the last owner of the count the shell arrived
-  with. any other use leaks as before — passed to a call, returned
-  whole, bound by `if let`, or captured by a closure, which takes the
-  shell and not the payload. one more shape stays on the leak side:
-  rebinding one name to results of different payload types (`r :=
-  await ta` then `r := await tb` where the two tasks return different
-  `T!`s) — the cleanup path is keyed by name and cannot pick one payload
-  shape, so it frees only the shell. bind results of different types to
-  different names.
+  an argument of a same-module call whose body provably only reads the
+  parameter, or — for a result — an extraction (`r.unwrap_or(d)`,
+  `r catch d`, `r!`) releases its payload: a probe never touches it, a
+  read borrows, a qualifying callee takes no count of its own (and
+  retains anything a result extraction hands out), and an extraction
+  hands its consumer a freshly retained count, so in every case the
+  local is still the last owner of the count the shell arrived with.
+  the call-argument entry is judged by walking the callee's declaration
+  with the same use rules as the local itself, transitively through
+  same-module forwarding — so a callee that stores, returns, sends, or
+  captures the parameter disqualifies the argument, and an imported,
+  builtin, constructor, or closure-typed callee (whose body cannot be
+  walked) is never a qualifying position. only a bare-name free-function
+  call qualifies; a method-call argument (`obj.foo(r)`) stays on the leak
+  side, since resolving the receiver's method to a body is a separate
+  question left unwalked. any other use leaks as before
+  — returned whole, bound by `if let`, passed across a module boundary,
+  or captured by a closure, which takes the shell and not the payload.
+  an optional extracted *inside* the callee (`o.unwrap_or(d)`) also
+  disqualifies the argument, deliberately: that extraction transfers the
+  borrowed shell's payload count out, so the caller is no longer the
+  payload's owner. one more shape stays on the leak side: rebinding one
+  name to results of different payload types (`r := await ta` then
+  `r := await tb` where the two tasks return different `T!`s) — the
+  cleanup path is keyed by name and cannot pick one payload shape, so it
+  frees only the shell. bind results of different types to different
+  names.
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.

@@ -40,6 +40,7 @@ cases=(
   tests/leaks/leak_fn_value
   tests/leaks/leak_task_result_payload
   tests/leaks/leak_result_extraction
+  tests/leaks/leak_result_arg_borrow
   tests/leaks/leak_yaml_parse
   tests/leaks/leak_sql_numeric
   tests/leaks/leak_none_lowering

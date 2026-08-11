@@ -221,7 +221,9 @@ pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     let connect_addr = format!("{}:{}", host, port);
     match TcpStream::connect(&connect_addr) {
         Ok(stream) => {
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            // no read deadline: a fresh connection waits indefinitely, exactly as
+            // the green path leaves it. a client that wants bounded reads sets
+            // one explicitly via tcp.set_timeout.
             // disable nagle's algorithm: request/response protocols (http, grpc,
             // the db drivers) write small frames and then wait for a reply, which
             // otherwise collides with the peer's delayed acks for a ~40ms stall

@@ -1,0 +1,17 @@
+# a generic worker function monomorphizes through spawn: the channel and the
+# function value both carry the type parameter, and the spawned task calls
+# the function and sends the result back.
+
+fn worker[M](ch: Channel[M], f: fn() -> M):
+    ch.send(f())
+
+fn make() -> Int:
+    return 99
+
+fn main():
+    ch := Channel[Int](1)
+    f := fn() => make()
+    t := spawn worker(ch, f)
+    v := ch.recv()
+    await t
+    print("{v.unwrap_or(0)}")

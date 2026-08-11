@@ -1,0 +1,37 @@
+# an interface method may return a generic enum applied to the associated
+# type, and a generic function bound by that interface can match the result
+# and hand back the payload. block-bodied match arms carry statements and
+# returns; the payload binding is the bare type parameter, which is the one
+# payload shape a monomorphized generic fn can bind (see docs/limitations.md).
+
+enum Wrapper[M]:
+    Empty
+    Got(M)
+
+interface App:
+    type Msg
+    fn update(m: Msg) -> Wrapper[Msg]
+
+struct Counter:
+    pub count: Int
+
+impl App for Counter:
+    type Msg = Int
+    fn update(m: Int) -> Wrapper[Int]:
+        self.count = self.count + m
+        return Wrapper.Got(self.count)
+
+fn step[A: App](app: A, m: A.Msg) -> A.Msg?:
+    r := app.update(m)
+    match r:
+        Wrapper.Empty =>
+            return none
+        Wrapper.Got(v) =>
+            return v
+    return none
+
+fn main():
+    c := Counter(count: 10)
+    x := step(c, 5)
+    y := step(c, 2)
+    print("{x.unwrap_or(0)} {y.unwrap_or(0)}")

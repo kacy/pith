@@ -1,0 +1,30 @@
+# a default method coexists with an associated type on the same interface, as
+# long as the default's own signature does not name the associated type — a
+# default whose signature mentions it is rejected (E202), which is why
+# init-style hooks that produce Msg-typed values must be required methods.
+
+enum Wrapper[M]:
+    Empty
+    Got(M)
+
+interface App:
+    type Msg
+    fn update(m: Msg) -> Wrapper[Msg]
+    fn name() -> String:
+        return "app"
+
+struct Counter:
+    pub count: Int
+
+impl App for Counter:
+    type Msg = Int
+    fn update(m: Int) -> Wrapper[Int]:
+        self.count = self.count + m
+        return Wrapper.Got(self.count)
+
+fn describe[A: App](app: A) -> String:
+    return app.name()
+
+fn main():
+    c := Counter(count: 0)
+    print("{describe(c)}")

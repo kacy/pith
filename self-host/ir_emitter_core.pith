@@ -557,7 +557,7 @@ fn ir_struct_field_is_weak(struct_name: String, field_name: String) -> Bool:
 # slot holds — no owning tuple, which is what keeps the ring from cycling.
 fn ir_emit_weak_payload(val_idx: Int) -> Int:
     vnode := get_node(val_idx)
-    if vnode.kind == "none":
+    if vnode.kind == "none_lit" or vnode.kind == "none":
         zero_r := ir_reg()
         ir_emit("iconst " + zero_r.to_string() + " 0")
         return zero_r

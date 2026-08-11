@@ -1,0 +1,35 @@
+# a struct with a `weak` field, built and dropped every round. a weak field
+# initialized to `none` used to store a freshly-allocated optional tuple and
+# take a weak reference to it, but nothing ever released that tuple's strong
+# count — so every instance of any weak-bearing struct leaked one header-sized
+# allocation. a parent<->child ring (next owns forward, parent refers back
+# weakly) leaked ~2 allocations per round and grew ~120 mb over a million
+# rounds; the fix stores a bare 0 for a `none` weak field, and the working set
+# is now the ring alive at once.
+#
+# this is the shape docs/performance.md's cyclic_graph benchmark measures: with
+# the leak it climbs linearly, and flat is the whole point of `weak` being the
+# escape hatch for reference cycles.
+import leakprobe as probe
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+fn build_ring(seed: Int) -> Int:
+    a := Node(value: seed, next: none, parent: none)
+    b := Node(value: seed + 1, next: none, parent: none)
+    a.next = b
+    b.parent = a
+    return a.value + b.value
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + build_ring(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

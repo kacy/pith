@@ -107,23 +107,28 @@ fn entity_for(byte: Int) -> String:
 # >= 0x80, so no character is ever split by an entity and non-ascii text is
 # copied through whole.
 pub fn escape(input: String) -> String:
+    # collect the runs and entities in a list and join once at the end:
+    # appending each piece to the result string recopied everything
+    # accumulated so far, which made escaping quadratic in the number of
+    # entities — input that alternates a plain character with an escaped one
+    # hit the worst case.
     length := input.len()
-    mut out := ""
+    mut parts: List[String] := []
     mut copied := 0
     mut position := 0
     while position < length:
         entity := entity_for(ord(input[position]))
         if entity != "":
             if position > copied:
-                out = out + input.substring(copied, position)
-            out = out + entity
+                parts.push(input.substring(copied, position))
+            parts.push(entity)
             copied = position + 1
         position = position + 1
     if copied == 0:
         return input
     if copied < length:
-        out = out + input.substring(copied, length)
-    return out
+        parts.push(input.substring(copied, length))
+    return parts.join("")
 
 # Whether `input` contains a character `escape` would rewrite.
 #
@@ -161,14 +166,17 @@ fn scheme_allowed(scheme: String) -> Bool:
 # happily run. stripping first means the allowlist sees the same scheme the
 # browser will.
 fn strip_url_noise(input: String) -> String:
-    mut out := ""
+    # collect the kept characters and join once at the end: appending each
+    # one to the result string recopied everything accumulated so far, which
+    # made stripping quadratic in the url.
+    mut parts: List[String] := []
     mut position := 0
     while position < input.len():
         byte := ord(input[position])
         if byte > 32 and byte != 127:
-            out = out + input[position]
+            parts.push(input[position])
         position = position + 1
-    return out
+    return parts.join("")
 
 # true when `input` begins with a sequence a browser may read as the start of
 # a protocol-relative url, which navigates off-site under the current scheme.

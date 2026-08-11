@@ -1,0 +1,56 @@
+# the string builders that used to accumulate with `s = s + piece` in a loop:
+# url percent coding, json string unescaping, template rendering, and html
+# escaping. each value here is pinned against an external oracle (python's
+# urllib/json/binascii and the rfc test vectors), so a rewrite of the
+# accumulation strategy that changes a single output byte fails this test.
+
+import std.net.url as url
+import std.json as json
+import std.encoding as encoding
+import std.bytes as bytes
+import std.template as template
+import std.html as html
+
+fn main() -> Int!:
+    # rfc 3986 percent coding, non-ascii included; matches urllib.parse
+    print("urlenc " + url.encode("hello world/Ärger?a=b&c=+~. 日本"))
+    print("urldec " + url.decode("hello%20world%2f%C3%84rger+%2B%zz%"))
+    print("urlround " + url.decode(url.encode("Ärger 日本 a+b%c")))
+
+    # json string escapes through parse, surrogate pair included; matches
+    # python json.loads
+    parsed := json.parse("[\"a\\n\\t\\u00e9\\ud83d\\ude00\\\"\\\\\\/ z\\u0041\"]")
+    print("jsonun " + json.get_string(json.array_get(parsed, 0)))
+
+    # hex over every byte value; matches binascii.hexlify
+    all_bytes := bytes.buffer_with_capacity(256)
+    defer all_bytes.free()
+    mut i := 0
+    while i < 256:
+        all_bytes.write_byte(i)!
+        i = i + 1
+    hex_all := encoding.to_hex(all_bytes.bytes())
+    print("hexlen {hex_all.len()}")
+    print("hexhead " + hex_all.substring(0, 32))
+    print("hextail " + hex_all.substring(hex_all.len() - 16, hex_all.len()))
+
+    # rfc 4648 base32 test vectors
+    print("b32 " + encoding.base32_encode(bytes.from_string_utf8("foobar")) + " " + encoding.base32_encode(bytes.from_string_utf8("f")))
+    print("b32hex " + encoding.base32_hex_encode(bytes.from_string_utf8("foobar")))
+
+    # base58 bitcoin alphabet
+    print("b58 " + encoding.base58_encode(bytes.from_string_utf8("hello")))
+
+    # html escape rewrites all five characters and passes non-ascii through
+    print("html " + html.escape("<a href=\"x\">&'日本'</a>"))
+
+    # a template for loop escapes each row
+    items := template.list()
+    items.push_text("<b>")
+    items.push_text("a&b")
+    items.push_text("ü")
+    data := template.context()
+    data.set_child("items", items)
+    page := template.render_string("<ul><% for item in items %><li><%= item %></li><% end %></ul>", data) catch "TEMPLATE_ERR"
+    print("template " + page)
+    return 0

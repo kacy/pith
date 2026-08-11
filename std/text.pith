@@ -300,17 +300,23 @@ pub fn char_offsets(s: String) -> List[Int]:
 
 # join characters back into one string.
 pub fn from_chars(parts: List[String]) -> String:
-    mut out := ""
+    # join in one pass: appending each character to the result string
+    # recopied everything accumulated so far, which made rebuilding a string
+    # from its characters quadratic in the input.
+    mut collected: List[String] := []
     for part in parts:
-        out = out + part
-    return out
+        collected.push(part)
+    return collected.join("")
 
 # build a string from code points. fails on any value `encode` rejects.
 pub fn from_code_points(points: List[Int]) -> String!:
-    mut out := ""
+    # collect the encoded characters and join once at the end: appending each
+    # one to the result string recopied everything accumulated so far, which
+    # made building from code points quadratic in the input.
+    mut parts: List[String] := []
     for point in points:
-        out = out + encode(point)!
-    return out
+        parts.push(encode(point)!)
+    return parts.join("")
 
 # ---------------------------------------------------------------------------
 # character-indexed access
@@ -395,16 +401,19 @@ pub fn truncate_with(s: String, max_chars: Int, suffix: String) -> String:
 pub fn sanitize(s: String) -> String:
     if is_valid(s):
         return s
-    mut out := ""
+    # collect the pieces and join once at the end: appending each character
+    # to the result string recopied everything accumulated so far, which
+    # made repair quadratic in the input.
+    mut parts: List[String] := []
     mut position := 0
     while position < s.len():
         step := decode_step(s, position)
         if step.code_point < 0:
-            out = out + replacement_char()
+            parts.push(replacement_char())
         else:
-            out = out + s.substring(position, position + step.size)
+            parts.push(s.substring(position, position + step.size))
         position = position + step.size
-    return out
+    return parts.join("")
 
 # ---------------------------------------------------------------------------
 # case folding
@@ -450,20 +459,23 @@ pub fn fold_code_point(code_point: Int) -> Int:
 # folding would close that gap, at the cost of a mapping that changes length;
 # see the module header.
 pub fn fold(s: String) -> String:
-    mut out := ""
+    # collect the folded characters and join once at the end: appending each
+    # one to the result string recopied everything accumulated so far, which
+    # made folding quadratic in the input.
+    mut parts: List[String] := []
     mut position := 0
     while position < s.len():
         step := decode_step(s, position)
         if step.code_point < 0:
-            out = out + replacement_char()
+            parts.push(replacement_char())
         else:
             folded := fold_code_point(step.code_point)
             if folded == step.code_point:
-                out = out + s.substring(position, position + step.size)
+                parts.push(s.substring(position, position + step.size))
             else:
-                out = out + encode(folded).unwrap_or(replacement_char())
+                parts.push(encode(folded).unwrap_or(replacement_char()))
         position = position + step.size
-    return out
+    return parts.join("")
 
 # compare two strings ignoring case, the whole way up unicode rather than just
 # through ascii.

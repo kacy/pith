@@ -570,12 +570,15 @@ pub fn join_with(list: List[String], sep: String) -> String:
     n := list.len()
     if n == 0:
         return ""
-    mut result := list[0]
-    mut i := 1
+    # copy into a local list and join once: appending each element to the
+    # result string recopied everything accumulated so far, which made the
+    # join quadratic in the total length.
+    mut parts: List[String] := []
+    mut i := 0
     while i < n:
-        result = result + sep + list[i]
+        parts.push(list[i])
         i = i + 1
-    return result
+    return parts.join(sep)
 
 test "collection constructors and aggregations work":
     nums := range(1, 5)

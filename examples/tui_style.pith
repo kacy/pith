@@ -1,0 +1,17 @@
+# std.term.style styles and arranges terminal blocks as pure strings: build
+# a bordered card, join blocks side by side, stack them — and because the
+# geometry is display columns rather than bytes, cjk text keeps the borders
+# straight. everything renders to a plain string, which is why this example
+# (and every widget snapshot test above it) runs without a terminal.
+import std.term.style as style
+
+fn main():
+    card := style.new().pad(1).border(style.BORDER_ROUNDED).render("orders\n1,204")
+    tall := style.new().border(style.BORDER_NORMAL).render("a\nb\nc\nd")
+    print(style.join_h([card, tall], style.TOP))
+    print("")
+    print(style.new().align(style.CENTER).min_width(20).border(style.BORDER_DOUBLE).render("centered"))
+    print("")
+    print(style.new().border(style.BORDER_NORMAL).render("日本語\nok"))
+    dims := style.measure(card)
+    print("card is {dims.0}x{dims.1}")

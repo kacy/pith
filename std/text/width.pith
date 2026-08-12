@@ -20,6 +20,7 @@ import std.text as text
 import std.text.graphemes as graphemes
 import std.text.tables as tables
 import std.text.width_tables as width_tables
+import std.strings as strings
 
 # regional indicators: a pair of these is a flag, rendered two columns wide.
 RI_FIRST := 127462
@@ -104,14 +105,7 @@ pub fn center(s: String, cols: Int) -> String:
     return spaces(left) + s + spaces(gap - left)
 
 fn spaces(n: Int) -> String:
-    if n <= 0:
-        return ""
-    mut parts: List[String] := []
-    mut i := 0
-    while i < n:
-        parts.push(" ")
-        i = i + 1
-    return parts.join("")
+    return strings.repeat(" ", n)
 
 # cut to at most `max_cols` columns, never splitting a grapheme cluster: a
 # two-column character that does not fit entirely is dropped, so the result
@@ -125,6 +119,10 @@ pub fn truncate_to(s: String, max_cols: Int) -> String:
 pub fn truncate_to_with(s: String, max_cols: Int, suffix: String) -> String:
     if of(s) <= max_cols:
         return s
+    if of(suffix) >= max_cols:
+        # the suffix alone would blow the budget; cut it instead, so the
+        # promise "never wider than max_cols" holds even for a tiny box.
+        return truncate_to(suffix, max_cols)
     budget := max_cols - of(suffix)
     mut used := 0
     mut kept: List[String] := []
@@ -194,3 +192,7 @@ test "truncation never splits a wide character":
     assert_eq(truncate_to("hello", 10), "hello")
     assert_eq(truncate_to_with("hello world", 8, "…"), "hello w…")
     assert_eq(truncate_to_with("日本語です", 7, "…"), "日本語…")
+    # a suffix wider than the whole budget is itself cut, so the promise
+    # "never wider than max_cols" holds even for a one-column box
+    assert_eq(truncate_to_with("hello", 1, "..."), ".")
+    assert_eq(of(truncate_to_with("hello", 2, "...")), 2)

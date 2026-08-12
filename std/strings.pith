@@ -469,7 +469,8 @@ pub fn trim_suffix(s: String, suffix: String) -> String:
 # Padding and reversal
 # ---------------------------------------------------------------
 
-fn repeat_text(text: String, times: Int) -> String:
+# the string repeated `times` times; zero or negative counts give "".
+pub fn repeat(text: String, times: Int) -> String:
     # collect the copies and join once at the end: appending one copy at a
     # time recopied the whole accumulated string, which made a wide pad
     # quadratic in its width.
@@ -491,7 +492,7 @@ pub fn center_with(s: String, width: Int, fill: String) -> String:
     total_pad := width - s.len()
     left_pad := total_pad / 2
     right_pad := total_pad - left_pad
-    return repeat_text(fill, left_pad) + s + repeat_text(fill, right_pad)
+    return repeat(fill, left_pad) + s + repeat(fill, right_pad)
 
 # pads the string with zeros on the left.
 pub fn zfill(s: String, width: Int) -> String:
@@ -777,3 +778,8 @@ test "string prefix suffix helpers remove known parts":
     assert_eq(common_prefix(["pith.toml", "pith.lock", "pith.json"]), "pith.")
     assert_eq(common_suffix(["build.log", "debug.log", "trace.log"]), ".log")
     assert_eq(indent_nonempty("a" + chr(10) + chr(10) + "b", "> "), "> a" + chr(10) + chr(10) + "> b")
+
+test "repeat copies a string and clamps non-positive counts":
+    assert_eq(repeat("ab", 3), "ababab")
+    assert_eq(repeat(" ", 0), "")
+    assert_eq(repeat("x", 0 - 2), "")

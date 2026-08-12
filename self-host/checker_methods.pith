@@ -26,6 +26,14 @@ pub fn get_method_declaration_index(key: String) -> Int:
         return method_decl_index_map[key]
     return - 1
 
+## every registered method key, name-keyed ("Type.method") and
+## tid-keyed ("#<tid>.method") alike, in registration order.
+pub fn all_method_keys() -> List[String]:
+    mut keys: List[String] := []
+    for key in method_decl_index_map.keys():
+        keys.push(key)
+    return keys
+
 ## the tid-keyed lookup key for a method on a specific declaration.
 pub fn method_tid_key(tid: Int, method_name: String) -> String:
     return "#" + tid.to_string() + "." + method_name

@@ -61,10 +61,10 @@ fn sort_diagnostics(diags: List[Diagnostic]) -> List[Diagnostic]:
             sorted.push(d)
     return sorted
 
-# the byte length of the token starting at 1-based col on this line, or
-# 0 when no token starts there. the line is lexed alone, so token
-# columns are columns within the line.
-fn token_length_at(line_text: String, col: Int) -> Int:
+## the byte length of the token starting at 1-based col on this line,
+## or 0 when no token starts there. the line is lexed alone, so token
+## columns are columns within the line.
+pub fn token_length_at(line_text: String, col: Int) -> Int:
     toks := lex_all(line_text)
     for tok in toks:
         if tok.current_line == 1 and tok.current_column == col:
@@ -158,6 +158,11 @@ pub fn run_analysis(uri: String) -> List[String]:
             last_published_counts.insert(open_path, file_diags.len())
     return bodies
 
+## whether the last analysis ran the checker to completion, so the
+## type cache and definition map describe the current node arena.
+pub fn analysis_is_checked() -> Bool:
+    return analyzed_checked
+
 ## make the compiler state describe this document, re-running analysis
 ## when the last run was for another document or the text changed since.
 ## returns any publishDiagnostics bodies a re-run produced.
@@ -223,8 +228,8 @@ fn symbol_kind_number(node_kind: String) -> Int:
         return 11
     return 0
 
-# a declaration name without any generic parameter brackets.
-fn bare_symbol_name(value: String) -> String:
+## a declaration name without any generic parameter brackets.
+pub fn bare_symbol_name(value: String) -> String:
     bracket := value.index_of("[")
     if bracket >= 0:
         return value.substring(0, bracket)
@@ -255,11 +260,11 @@ fn name_ends_at(line: String, end: Int) -> Bool:
         return false
     return true
 
-# where a top-level declaration's name sits in the source: ast nodes
-# carry the position of their last token, so the name is found by
-# scanning lines for the declaring keyword instead. returns the name's
-# 1-based line and byte column, or line 0 when no line matches.
-fn find_decl_position(text: String, node_kind: String, name: String) -> PithPos:
+## where a top-level declaration's name sits in the source: ast nodes
+## carry the position of their last token, so the name is found by
+## scanning lines for the declaring keyword instead. returns the name's
+## 1-based line and byte column, or line 0 when no line matches.
+pub fn find_decl_position(text: String, node_kind: String, name: String) -> PithPos:
     keyword := decl_keyword(node_kind)
     plain := keyword + " " + name
     public := "pub " + plain

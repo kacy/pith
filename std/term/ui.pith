@@ -1,0 +1,348 @@
+# std.term.ui — the widget set for terminal applications
+#
+# widgets render application state as blocks of text: an App's view()
+# composes them with std.term.style and hands the result to the runtime.
+# display widgets are plain functions from state to string; the module
+# grows in layers, and this one carries text, boxes, and indicators —
+# wrapped paragraphs with styled spans, titled blocks, progress bars,
+# spinners, tab rows, and the help line built from an App's keybindings.
+#
+#   bar := ui.progress(20)
+#   frame := ui.block().with_title("sync").render(bar.view(0.4))
+#
+# every widget measures in display columns via std.text.width, so cjk text
+# and emoji lay out correctly, and every widget renders to a plain string —
+# which is why each one is a snapshot test away.
+import std.term.app as app
+import std.term.style as style
+import std.text.width as width
+
+# ---------------------------------------------------------------
+# text: spans, wrapping, paragraphs
+# ---------------------------------------------------------------
+
+# one styled run of text inside a paragraph.
+pub struct Span:
+    pub text: String
+    pub st: style.Style
+
+# a span with the neutral style.
+pub fn span(text: String) -> Span:
+    return Span(text: text, st: style.new())
+
+# a span with an explicit style.
+pub fn styled(text: String, st: style.Style) -> Span:
+    return Span(text: text, st: st)
+
+# word-wrap plain text to `cols` columns: words fill greedily, a word wider
+# than the whole line breaks at a character boundary rather than
+# overflowing, and width 0 or less gives "". whitespace collapses to
+# single spaces — this is paragraph text, not preformatted text.
+pub fn wrap(text: String, cols: Int) -> String:
+    return paragraph([span(text)], cols)
+
+# word-wrap styled spans to `cols` columns, each word keeping its span's
+# style across line breaks. the seams between spans are break
+# opportunities like any space; whitespace collapses to single spaces.
+pub fn paragraph(spans: List[Span], cols: Int) -> String:
+    if cols <= 0:
+        return ""
+    # flatten to (word, style) pairs, splitting overlong words to fit
+    mut words: List[String] := []
+    mut word_spans: List[Int] := []
+    mut span_index := 0
+    for s in spans:
+        flat := s.text.replace("\n", " ").replace("\t", " ")
+        for w in flat.split(" "):
+            if w == "":
+                continue
+            for piece in split_to_fit(w, cols):
+                words.push(piece)
+                word_spans.push(span_index)
+        span_index = span_index + 1
+    # greedy fill
+    mut lines: List[String] := []
+    mut line: List[String] := []
+    mut used := 0
+    mut i := 0
+    while i < words.len():
+        w := words[i]
+        wcols := width.of(w)
+        mut needed := wcols
+        if used > 0:
+            needed = wcols + 1
+        if used > 0 and used + needed > cols:
+            lines.push(line.join(""))
+            line = []
+            used = 0
+            needed = wcols
+        if used > 0:
+            line.push(" ")
+        line.push(render_word(spans, word_spans[i], w))
+        used = used + needed
+        i = i + 1
+    if line.len() > 0:
+        lines.push(line.join(""))
+    return lines.join("\n")
+
+fn render_word(spans: List[Span], index: Int, w: String) -> String:
+    return spans[index].st.render(w)
+
+# split one word into pieces no wider than `cols`, never inside a cluster.
+fn split_to_fit(w: String, cols: Int) -> List[String]:
+    if width.of(w) <= cols:
+        return [w]
+    mut pieces: List[String] := []
+    mut rest := w
+    while width.of(rest) > cols:
+        head := width.truncate_to(rest, cols)
+        if head.len() == 0:
+            # a single cluster wider than the line: emit it anyway rather
+            # than looping forever; the terminal will clip it.
+            pieces.push(rest)
+            return pieces
+        pieces.push(head)
+        rest = rest.substring(head.len(), rest.len())
+    if rest.len() > 0:
+        pieces.push(rest)
+    return pieces
+
+# ---------------------------------------------------------------
+# block: a titled border around content
+# ---------------------------------------------------------------
+
+# a bordered box with an optional title on the top edge. sizes to its
+# content; use style.place first for a fixed-size box.
+pub struct Block:
+    pub border_kind: Int
+    pub title: String
+    pub st: style.Style
+
+# a block with a normal border and no title.
+pub fn block() -> Block:
+    return Block(border_kind: style.BORDER_NORMAL, title: "", st: style.new())
+
+impl Block:
+    # set the title shown on the top edge, truncated to fit.
+    fn with_title(t: String) -> Block:
+        return Block(border_kind: self.border_kind, title: t, st: self.st)
+
+    # choose the border character set (a style.BORDER_ kind).
+    fn with_border(kind: Int) -> Block:
+        return Block(border_kind: kind, title: self.title, st: self.st)
+
+    # style applied to the content (the border stays plain).
+    fn with_style(s: style.Style) -> Block:
+        return Block(border_kind: self.border_kind, title: self.title, st: s)
+
+    # draw the box around content. the title becomes part of the top edge,
+    # and the box widens to fit it — a title is part of the box's identity,
+    # so it is never cut; constrain the whole block with style.place or a
+    # min_width when a fixed size matters.
+    fn render(content: String) -> String:
+        if self.title == "":
+            return self.st.border(self.border_kind).render(content)
+        title_w := width.of(self.title)
+        boxed := self.st.min_width(title_w + 1).border(self.border_kind).render(content)
+        lines := boxed.split("\n")
+        top := lines[0]
+        inner := width.of(top) - 2
+        b := style.border_of(self.border_kind)
+        remaining := inner - title_w - 1
+        lines[0] = b.tl + b.h + self.title + repeat_edge(b.h, remaining) + b.tr
+        return lines.join("\n")
+
+fn repeat_edge(edge: String, count: Int) -> String:
+    mut parts: List[String] := []
+    mut i := 0
+    while i < count:
+        parts.push(edge)
+        i = i + 1
+    return parts.join("")
+
+# ---------------------------------------------------------------
+# indicators: progress and spinner
+# ---------------------------------------------------------------
+
+# a horizontal progress bar. view(ratio) clamps to 0..1 and fills
+# proportionally; show_percent appends the number.
+pub struct Progress:
+    pub bar_cols: Int
+    pub full: String
+    pub empty: String
+    pub show_percent: Bool
+
+# a progress bar `cols` columns wide with the block-character fill.
+pub fn progress(cols: Int) -> Progress:
+    return Progress(bar_cols: cols, full: "█", empty: "░", show_percent: true)
+
+impl Progress:
+    # the bar at `ratio` full, clamped to 0..1.
+    fn view(ratio: Float) -> String:
+        mut r := ratio
+        if r < 0.0:
+            r = 0.0
+        if r > 1.0:
+            r = 1.0
+        filled := ((r * self.bar_cols.to_float()) + 0.5).to_int()
+        mut parts: List[String] := []
+        mut i := 0
+        while i < self.bar_cols:
+            if i < filled:
+                parts.push(self.full)
+            else:
+                parts.push(self.empty)
+            i = i + 1
+        bar := parts.join("")
+        if not self.show_percent:
+            return bar
+        pct := (r * 100.0 + 0.5).to_int()
+        return bar + " {pct}%"
+
+# an animated activity marker: hold one in the model, advance() it from an
+# every() timer, and render view() into the frame.
+pub struct Spinner:
+    pub frames: List[String]
+    mut frame: Int
+
+# the braille-dot spinner.
+pub fn spinner() -> Spinner:
+    return Spinner(frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], frame: 0)
+
+# a spinner with custom frames.
+pub fn spinner_with(frames: List[String]) -> Spinner:
+    return Spinner(frames: frames, frame: 0)
+
+impl Spinner:
+    # step to the next frame, wrapping.
+    fn advance():
+        if self.frames.len() > 0:
+            self.frame = (self.frame + 1) % self.frames.len()
+
+    # the current frame.
+    fn view() -> String:
+        if self.frames.len() == 0:
+            return ""
+        return self.frames[self.frame]
+
+# ---------------------------------------------------------------
+# tabs and help
+# ---------------------------------------------------------------
+
+# one row of tab titles with the active one marked, truncated to `cols`
+# with an ellipsis when the row overflows. the active index is state the
+# application owns; out-of-range clamps.
+pub fn tabs(titles: List[String], active: Int, cols: Int) -> String:
+    if titles.len() == 0:
+        return ""
+    mut idx := active
+    if idx < 0:
+        idx = 0
+    if idx >= titles.len():
+        idx = titles.len() - 1
+    mut parts: List[String] := []
+    mut i := 0
+    while i < titles.len():
+        if i == idx:
+            parts.push("[" + titles[i] + "]")
+        else:
+            parts.push(" " + titles[i] + " ")
+        i = i + 1
+    return width.truncate_to_with(parts.join(" "), cols, "…")
+
+# the one-line key help a status bar shows: "q quit • / filter", built
+# from an application's bindings and truncated to `cols`.
+pub fn help_short(bindings: List[app.Binding], cols: Int) -> String:
+    mut parts: List[String] := []
+    for b in bindings:
+        parts.push(b.help_key + " " + b.help_desc)
+    return width.truncate_to_with(parts.join(" • "), cols, "…")
+
+# the full help view: one line per binding, keys right-padded to align the
+# descriptions into a column.
+pub fn help_full(bindings: List[app.Binding], cols: Int) -> String:
+    mut widest := 0
+    for b in bindings:
+        w := width.of(b.help_key)
+        if w > widest:
+            widest = w
+    mut lines: List[String] := []
+    for b in bindings:
+        line := width.pad_right(b.help_key, widest) + "  " + b.help_desc
+        lines.push(width.truncate_to_with(line, cols, "…"))
+    return lines.join("\n")
+
+# -- tests --------------------------------------------------------------
+
+test "wrap fills greedily and breaks overlong words at clusters":
+    assert_eq(wrap("the quick brown fox", 10), "the quick\nbrown fox")
+    assert_eq(wrap("hi", 10), "hi")
+    assert_eq(wrap("", 10), "")
+    assert_eq(wrap("abc", 0), "")
+    # an overlong word splits at a character boundary
+    assert_eq(wrap("abcdefgh", 3), "abc\ndef\ngh")
+    # a cjk word splits between characters, never mid-cell
+    assert_eq(wrap("日本語です", 4), "日本\n語で\nす")
+
+test "paragraph keeps span styles across line breaks":
+    e := chr(27)
+    red := style.new().fg(1)
+    out := paragraph([styled("alpha beta", red), span("plain")], 5)
+    lines := out.split("\n")
+    assert_eq(lines.len(), 3)
+    # both styled words carry the style, on their own lines
+    assert_eq(lines[0], e + "[0;38;5;1malpha" + e + "[0m")
+    assert_eq(lines[1], e + "[0;38;5;1mbeta" + e + "[0m")
+    assert_eq(lines[2], "plain")
+
+test "block draws a titled border and widens to fit the title":
+    b := block().with_title("log")
+    out := b.render("hi")
+    assert_eq(out, "┌─log┐\n│hi  │\n└────┘")
+    # a title wider than the content widens the whole box
+    wide := block().with_title("very long title").render("abc")
+    parts := wide.split("\n")
+    assert_eq(parts[0], "┌─very long title┐")
+    assert_eq(width.of(parts[1]), width.of(parts[0]))
+    # no title renders the plain border
+    assert_eq(block().render("x"), "┌─┐\n│x│\n└─┘")
+
+test "progress clamps fills proportionally and shows percent":
+    p := progress(4)
+    assert_eq(p.view(0.5), "██░░ 50%")
+    assert_eq(p.view(0.0), "░░░░ 0%")
+    assert_eq(p.view(1.0), "████ 100%")
+    assert_eq(p.view(2.0), "████ 100%")
+    assert_eq(p.view(0.0 - 1.0), "░░░░ 0%")
+    quiet := Progress(bar_cols: 2, full: "#", empty: "-", show_percent: false)
+    assert_eq(quiet.view(0.5), "#-")
+
+test "spinner advances and wraps":
+    s := spinner_with(["a", "b", "c"])
+    assert_eq(s.view(), "a")
+    s.advance()
+    assert_eq(s.view(), "b")
+    s.advance()
+    s.advance()
+    assert_eq(s.view(), "a")
+    empty := spinner_with([])
+    empty.advance()
+    assert_eq(empty.view(), "")
+
+test "tabs mark the active title clamp and truncate":
+    assert_eq(tabs(["one", "two"], 0, 40), "[one]  two ")
+    assert_eq(tabs(["one", "two"], 1, 40), " one  [two]")
+    # out-of-range active clamps
+    assert_eq(tabs(["one", "two"], 9, 40), " one  [two]")
+    empty: List[String] := []
+    assert_eq(tabs(empty, 0, 40), "")
+    narrow := tabs(["alpha", "beta", "gamma"], 0, 10)
+    assert(width.of(narrow) <= 10)
+    assert(narrow.contains("…"))
+
+test "help renders the short line and the aligned column":
+    bindings := [app.binding(["q"], "q", "quit"), app.binding(["up", "k"], "↑/k", "move up")]
+    assert_eq(help_short(bindings, 40), "q quit • ↑/k move up")
+    assert(help_short(bindings, 10).contains("…"))
+    full := help_full(bindings, 40)
+    assert_eq(full, "q    quit\n↑/k  move up")

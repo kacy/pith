@@ -132,4 +132,46 @@ dropped rather than leaked as text. garbage never wedges the state machine.
 
 `size()` returns `(cols, rows)` for the window. it is a point-in-time query;
 to track resizes, arm `SIGWINCH` through `std.signal` and re-query when it
-fires. the session layer will bundle that wiring.
+fires — or use the session, which bundles that wiring.
+
+## the session
+
+`std.term.session` ties the pieces into one object: raw mode entered, the
+requested modes applied (alternate screen and bracketed paste by default,
+mouse and focus reporting opt-in), the hardware cursor hidden, the resize
+signal armed, and two tasks feeding one ordered event stream.
+
+```pith
+import std.term.session as session
+
+fn main() -> Int!:
+    t := session.open()!
+    defer t.close()
+    while true:
+        got := t.events.recv()
+        if let ev = got:
+            match ev:
+                Event.KeyPress(k) =>
+                    if input.key_name(k) == "q":
+                        return 0
+                Event.Resize(cols, rows) =>
+                    redraw(cols, rows)
+                Event.Closed =>
+                    return 0
+                _ =>
+                    continue
+    return 0
+```
+
+the stream carries keys, mouse, pastes, focus changes, `Resize` with the new
+size already queried, `Signal` for extras armed through `Options.signals`,
+and one final `Closed` when the terminal goes away. output goes through the
+session's buffered `write`/`flush`, one syscall per frame. `close()` undoes
+everything in reverse order and is idempotent — call it from a `defer` so it
+runs on every exit path.
+
+two things the session deliberately does not do: it does not own time (an
+animating application selects over the event channel and its own
+`concurrent.ticker`), and it does not share the signal queue — the session
+owns all signal interest for the process, so `std.shutdown.on_signals`
+cannot run alongside it. see [signals.md](signals.md).

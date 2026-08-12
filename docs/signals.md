@@ -68,6 +68,13 @@ signals only where you also handle them. `shutdown.on_signals()` pairs the two i
 one call so this cannot be got wrong by accident; reach for `signal.notify()`
 directly only when you are writing the waiting side yourself.
 
+the queue itself is process-global: `signal.wait` drains one pipe, so exactly
+one loop in a process can wait on signals. a terminal session
+(`std.term.session`) runs such a loop for the resize signal, which means a
+tui cannot also use `shutdown.on_signals` — route extra signals through the
+session's `Options.signals` and they arrive as `Event.Signal(n)` on its
+event stream instead. see [terminal.md](terminal.md).
+
 ## the one signal pith disarms for you
 
 `SIGPIPE`. writing to a socket whose peer has gone raises it, and its default

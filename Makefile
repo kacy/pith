@@ -1314,6 +1314,10 @@ cli-regressions-only:
 	set -e; \
 	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   check failure"; else echo "FAIL check failure"; fail=$$((fail+1)); fi; \
 	set +e; \
+	out=$$(./target/release/pith check --json "$$tmpdir/bad.pith" 2>/dev/null); \
+	set -e; \
+	case "$$out" in '['*'"code":"E'*) pass=$$((pass+1)); echo "ok   check --json diagnostics";; *) echo "FAIL check --json diagnostics"; fail=$$((fail+1));; esac; \
+	set +e; \
 	./target/release/pith test tests/cases/test_test_declarations.pith >/dev/null 2>&1; \
 	status=$$?; \
 	set -e; \

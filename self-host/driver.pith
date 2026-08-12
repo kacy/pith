@@ -5,7 +5,7 @@
 
 from lexer import lex_all
 from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
-from ast import get_node, reset_arena
+from ast import get_node, node_count, reset_arena
 from checker import initialize_checker, c_run_module
 from errors import Diagnostic
 # note: codegen removed — compilation handled by Cranelift native backend
@@ -80,11 +80,81 @@ mut files_being_checked: Map[String, Bool] := {}
 
 # stdlib root - set before resolving imports
 mut stdlib_root_directory: String := ""
+# the stdlib root never moves while a process lives, and finding it
+# costs up to twenty exec() probes — a long-lived tool re-running the
+# pipeline per keystroke pays that every run without this cache
+mut cached_stdlib_root := ""
+mut stdlib_root_known := false
 mut driver_parse_diagnostics: List[Diagnostic] := []
 mut resolved_module_paths: Map[Int, String] := {}
 mut resolved_module_files: Map[Int, String] := {}
 mut package_dependency_loaded: Map[String, Bool] := {}
 mut package_dependency_roots: Map[String, String] := {}
+
+# in-memory replacements for on-disk sources. a tool holding unsaved
+# editor buffers points the front end at them here; a path with no
+# overlay reads from disk as before. overlays survive init_driver on
+# purpose — they describe the caller's world, not one run's state.
+mut source_overlays: Map[String, String] := {}
+
+## replace what the compiler reads for `path` without touching disk.
+pub fn set_source_overlay(path: String, content: String):
+    source_overlays.insert(path, content)
+
+## drop one path's overlay.
+pub fn clear_source_overlay(path: String):
+    source_overlays.remove(path)
+
+## drop every overlay.
+pub fn clear_source_overlays():
+    source_overlays = {}
+
+## read a source file, honouring overlays.
+pub fn dr_read_source(path: String) -> String!:
+    if source_overlays.contains_key(path):
+        return source_overlays[path]
+    return read_file(path)!
+
+# a path exists if an overlay stands in for it or the file is on disk
+fn dr_source_exists(path: String) -> Bool:
+    if source_overlays.contains_key(path):
+        return true
+    return file_exists(path)
+
+# which file each contiguous slice of the node arena came from. every
+# parse appends contiguously, so (start, end, file) triples recorded
+# around each parse attribute any node index to its source file —
+# something a Node cannot say for itself.
+mut module_range_starts: List[Int] := []
+mut module_range_ends: List[Int] := []
+mut module_range_files: List[String] := []
+
+fn record_module_node_range(start: Int, end: Int, file: String):
+    if end <= start:
+        return
+    module_range_starts.push(start)
+    module_range_ends.push(end)
+    module_range_files.push(file)
+
+## the file whose parse produced this node, or "" when the node falls
+## outside every recorded range. range starts ascend in parse order,
+## so a binary search finds the candidate range.
+pub fn file_for_node(idx: Int) -> String:
+    mut lo := 0
+    mut hi := module_range_starts.len() - 1
+    mut found := 0 - 1
+    while lo <= hi:
+        mid := (lo + hi) / 2
+        if module_range_starts[mid] <= idx:
+            found = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if found < 0:
+        return ""
+    if idx < module_range_ends[found]:
+        return module_range_files[found]
+    return ""
 
 fn dr_join_path(base: String, child: String) -> String:
     if child.len() == 0:
@@ -332,7 +402,7 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         # would return an error result that vanished on the way out, so
         # `import fs` (should be `std.fs`) checked clean and emitted
         # nothing. report it here as a proper diagnostic instead.
-        if not file_exists(file_path):
+        if not dr_source_exists(file_path):
             pos := dr_import_position(root_idx, mod_path)
             driver_parse_diagnostics = [Diagnostic("error", "E247", "cannot find module '" + mod_path + "'", source_path, pos.0, pos.1, "check the module path; standard modules are imported as std.<name>")]
             return roots
@@ -353,12 +423,14 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
             read_file("__import_cycle_error__")!
         files_being_checked.insert(file_path, true)
         visited_files.insert(file_path, true)
-        content := read_file(file_path)!
+        content := dr_read_source(file_path)!
         tokens := lex_all(content)
+        range_start := node_count()
         mod_root := parse_with_file(tokens, file_path)
         if parser_has_errors():
             driver_parse_diagnostics = parser_diagnostics()
             return roots
+        record_module_node_range(range_start, node_count(), file_path)
         resolved_module_paths.insert(mod_root, mod_path)
         resolved_module_files.insert(mod_root, file_path)
         sub_roots := resolve_imports(mod_root, file_path)!
@@ -377,7 +449,10 @@ pub fn mark_visited(path: String):
 # initialize driver state for import resolution.
 # sets up stdlib root and resets the visited and checking maps.
 pub fn init_driver(source_path: String):
-    stdlib_root_directory = dr_find_stdlib_root(source_path)
+    if not stdlib_root_known:
+        cached_stdlib_root = dr_find_stdlib_root(source_path)
+        stdlib_root_known = true
+    stdlib_root_directory = cached_stdlib_root
     visited_files = {}
     files_being_checked = {}
     driver_parse_diagnostics = []
@@ -385,6 +460,12 @@ pub fn init_driver(source_path: String):
     resolved_module_files = {}
     package_dependency_loaded = {}
     package_dependency_roots = {}
+    # every caller parses the entry file before calling init_driver, so
+    # the arena's current contents are exactly the root module's nodes
+    module_range_starts = []
+    module_range_ends = []
+    module_range_files = []
+    record_module_node_range(0, node_count(), source_path)
     mark_visited(source_path)
 
 pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:

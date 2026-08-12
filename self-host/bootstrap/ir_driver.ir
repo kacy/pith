@@ -5186,6 +5186,13 @@ ret 3
 iconst 5 0
 ret 5
 endfunc
+func ast_node_count 0 int
+load 0 ast_nodes
+call 1 pith_list_len int 1 0
+ret 1
+iconst 2 0
+ret 2
+endfunc
 func ast_node_kind 1 string
 param idx
 load 1 ast_nodes
@@ -190472,11 +190479,17 @@ struct Diagnostic severity code message file line col fix
 global driver_visited_files map
 global driver_files_being_checked map
 global driver_stdlib_root_directory str:m53s69
+global driver_cached_stdlib_root str:m53s69
+global driver_stdlib_root_known 0
 global driver_driver_parse_diagnostics list
 global driver_resolved_module_paths map
 global driver_resolved_module_files map
 global driver_package_dependency_loaded map
 global driver_package_dependency_roots map
+global driver_source_overlays map
+global driver_module_range_starts list
+global driver_module_range_ends list
+global driver_module_range_files list
 global driver_module_aliases map
 func driver___init_globals_53 0 int
 call 0 pith_map_new_default map 0
@@ -190494,121 +190507,129 @@ store driver_package_dependency_loaded 5
 call 6 pith_map_new_cstr_val map 0
 store driver_package_dependency_roots 6
 call 7 pith_map_new_cstr_val map 0
-store driver_module_aliases 7
-iconst 8 0
-ret 8
-endfunc
-func driver___opt_dtor_struct 1 void
-param p
-load 9 p
-field 10 9 8 unknown value
-call 11 pith_struct_release void 1 10
+store driver_source_overlays 7
+call 8 pith_list_new_default list 0
+store driver_module_range_starts 8
+call 9 pith_list_new_default list 0
+store driver_module_range_ends 9
+call 10 pith_list_new_cstr list 0
+store driver_module_range_files 10
+call 11 pith_map_new_cstr_val map 0
+store driver_module_aliases 11
 iconst 12 0
 ret 12
 endfunc
-func driver___opt_dtor_list 1 void
+func driver___opt_dtor_struct 1 void
 param p
 load 13 p
 field 14 13 8 unknown value
-call 15 pith_list_release_handle void 1 14
+call 15 pith_struct_release void 1 14
 iconst 16 0
 ret 16
 endfunc
-func driver___opt_dtor_map 1 void
+func driver___opt_dtor_list 1 void
 param p
 load 17 p
 field 18 17 8 unknown value
-call 19 pith_map_release_handle void 1 18
+call 19 pith_list_release_handle void 1 18
 iconst 20 0
 ret 20
 endfunc
-func driver___opt_dtor_set 1 void
+func driver___opt_dtor_map 1 void
 param p
 load 21 p
 field 22 21 8 unknown value
-call 23 pith_set_release_handle void 1 22
+call 23 pith_map_release_handle void 1 22
 iconst 24 0
 ret 24
 endfunc
-func driver___opt_dtor_bytes 1 void
+func driver___opt_dtor_set 1 void
 param p
 load 25 p
 field 26 25 8 unknown value
-call 27 pith_bytes_release void 1 26
+call 27 pith_set_release_handle void 1 26
 iconst 28 0
 ret 28
 endfunc
-func driver___opt_dtor_closure 1 void
+func driver___opt_dtor_bytes 1 void
 param p
 load 29 p
 field 30 29 8 unknown value
-call 31 pith_closure_release void 1 30
+call 31 pith_bytes_release void 1 30
 iconst 32 0
 ret 32
 endfunc
-func driver___dtor_Node 1 void
+func driver___opt_dtor_closure 1 void
 param p
 load 33 p
-field 34 33 0 unknown kind
-call 35 pith_cstring_release void 1 34
-field 36 33 8 unknown value
-call 37 pith_cstring_release void 1 36
-field 38 33 16 unknown children
-call 39 pith_list_release_handle void 1 38
-iconst 40 0
-ret 40
+field 34 33 8 unknown value
+call 35 pith_closure_release void 1 34
+iconst 36 0
+ret 36
+endfunc
+func driver___dtor_Node 1 void
+param p
+load 37 p
+field 38 37 0 unknown kind
+call 39 pith_cstring_release void 1 38
+field 40 37 8 unknown value
+call 41 pith_cstring_release void 1 40
+field 42 37 16 unknown children
+call 43 pith_list_release_handle void 1 42
+iconst 44 0
+ret 44
 endfunc
 func driver___dtor_Token 1 void
 param p
-load 41 p
-field 42 41 0 unknown kind
-call 43 pith_cstring_release void 1 42
-field 44 41 8 unknown value
-call 45 pith_cstring_release void 1 44
-iconst 46 0
-ret 46
+load 45 p
+field 46 45 0 unknown kind
+call 47 pith_cstring_release void 1 46
+field 48 45 8 unknown value
+call 49 pith_cstring_release void 1 48
+iconst 50 0
+ret 50
 endfunc
 func driver___dtor_TypeInfo 1 void
 param p
-load 47 p
-field 48 47 0 unknown kind
-call 49 pith_cstring_release void 1 48
-field 50 47 8 unknown name
-call 51 pith_cstring_release void 1 50
-field 52 47 16 unknown fields
-call 53 pith_list_release_handle void 1 52
-field 54 47 24 unknown field_types
-call 55 pith_list_release_handle void 1 54
-field 56 47 32 unknown field_pub
+load 51 p
+field 52 51 0 unknown kind
+call 53 pith_cstring_release void 1 52
+field 54 51 8 unknown name
+call 55 pith_cstring_release void 1 54
+field 56 51 16 unknown fields
 call 57 pith_list_release_handle void 1 56
-field 58 47 40 unknown field_mut
+field 58 51 24 unknown field_types
 call 59 pith_list_release_handle void 1 58
-field 60 47 48 unknown param_types
+field 60 51 32 unknown field_pub
 call 61 pith_list_release_handle void 1 60
-field 62 47 88 unknown elements
+field 62 51 40 unknown field_mut
 call 63 pith_list_release_handle void 1 62
-field 64 47 96 unknown variants
+field 64 51 48 unknown param_types
 call 65 pith_list_release_handle void 1 64
-field 66 47 104 unknown variant_types
+field 66 51 88 unknown elements
 call 67 pith_list_release_handle void 1 66
-iconst 68 0
-ret 68
+field 68 51 96 unknown variants
+call 69 pith_list_release_handle void 1 68
+field 70 51 104 unknown variant_types
+call 71 pith_list_release_handle void 1 70
+iconst 72 0
+ret 72
 endfunc
 func driver___dtor_Diagnostic 1 void
 param p
-load 69 p
-field 70 69 0 unknown severity
-call 71 pith_cstring_release void 1 70
-field 72 69 8 unknown code
-call 73 pith_cstring_release void 1 72
-field 74 69 16 unknown message
+load 73 p
+field 74 73 0 unknown severity
 call 75 pith_cstring_release void 1 74
-field 76 69 24 unknown file
+field 76 73 8 unknown code
 call 77 pith_cstring_release void 1 76
-field 78 69 48 unknown fix
+field 78 73 16 unknown message
 call 79 pith_cstring_release void 1 78
-iconst 80 0
-ret 80
+field 80 73 24 unknown file
+call 81 pith_cstring_release void 1 80
+field 82 73 48 unknown fix
+call 83 pith_cstring_release void 1 82
+iconst 84 0
+ret 84
 endfunc
 func driver_get_directory 1 string
 param path
@@ -191123,6 +191144,231 @@ call 202 pith_cstring_release void 1 201
 iconst 203 0
 ret 203
 endfunc
+func driver_set_source_overlay 2 void
+param path
+param content
+load 2 driver_source_overlays
+load 3 path
+load 4 content
+call 5 map_insert void 3 2 3 4
+iconst 6 0
+ret 6
+endfunc
+func driver_clear_source_overlay 1 void
+param path
+load 1 driver_source_overlays
+load 2 path
+call 3 map_remove void 2 1 2
+iconst 4 0
+ret 4
+endfunc
+func driver_clear_source_overlays 0 void
+call 0 pith_map_new_cstr_val map 0
+store driver_source_overlays 0
+iconst 1 0
+ret 1
+endfunc
+func driver_dr_read_source 1 tuple
+param path
+load 1 driver_source_overlays
+load 2 path
+call 3 contains_key bool 2 1 2
+brif 3 L66 L67
+label L66
+load 4 driver_source_overlays
+load 5 path
+call 7 map_get_opt tuple 2 4 5
+field 8 7 0 bool is_some
+brif 8 L68 L69
+label L68
+field 9 7 8 string value
+call 10 pith_struct_release void 1 7
+jmp L70
+label L69
+call 11 pith_struct_release void 1 7
+strref 12 m53s882
+iconst 13 0
+iconst 14 3
+call 15 pith_struct_alloc struct:tuple 1 14
+sstore 15 0 13
+sstore 15 1 13
+sstore 15 2 12
+ret 15
+label L70
+call 16 pith_cstring_retain void 1 9
+iconst 17 1
+iconst 18 0
+iconst 19 3
+call 20 pith_struct_alloc struct:tuple 1 19
+sstore 20 0 17
+sstore 20 1 9
+sstore 20 2 18
+ret 20
+label L67
+label L65
+load 21 path
+call 22 read_file string 1 21
+iconst 23 0
+neq 24 22 23
+brif 24 L71 L72
+label L71
+iconst 25 1
+iconst 26 0
+iconst 27 3
+call 28 pith_struct_alloc struct:tuple 1 27
+sstore 28 0 25
+sstore 28 1 22
+sstore 28 2 26
+store __legacy_result_23_71 28
+jmp L73
+label L72
+strref 29 m53s852
+iconst 30 0
+iconst 31 3
+call 32 pith_struct_alloc struct:tuple 1 31
+sstore 32 0 30
+sstore 32 1 30
+sstore 32 2 29
+store __legacy_result_23_71 32
+label L73
+load 33 __legacy_result_23_71
+field 34 33 0 bool is_ok
+brif 34 L74 L75
+label L74
+field 35 33 8 string ok
+call 36 pith_struct_release void 1 33
+jmp L76
+label L75
+ret 33
+label L76
+iconst 37 1
+iconst 38 0
+iconst 39 3
+call 40 pith_struct_alloc struct:tuple 1 39
+sstore 40 0 37
+sstore 40 1 35
+sstore 40 2 38
+ret 40
+iconst 41 0
+ret 41
+endfunc
+func driver_dr_source_exists 1 bool
+param path
+load 1 driver_source_overlays
+load 2 path
+call 3 contains_key bool 2 1 2
+brif 3 L78 L79
+label L78
+iconst 4 1
+ret 4
+label L79
+label L77
+load 5 path
+call 6 file_exists bool 1 5
+ret 6
+iconst 7 0
+ret 7
+endfunc
+func driver_record_module_node_range 3 void
+param start
+param end
+param file
+load 3 end
+load 4 start
+lte 5 3 4
+brif 5 L81 L82
+label L81
+iconst 6 0
+ret 6
+label L82
+label L80
+load 7 driver_module_range_starts
+load 8 start
+call 9 pith_list_push_value void 2 7 8
+load 10 driver_module_range_ends
+load 11 end
+call 12 pith_list_push_value void 2 10 11
+load 13 driver_module_range_files
+load 14 file
+call 15 pith_list_push_value void 2 13 14
+iconst 16 0
+ret 16
+endfunc
+func driver_file_for_node 1 string
+param idx
+iconst 1 0
+store lo 1
+load 2 driver_module_range_starts
+call 3 pith_list_len int 1 2
+iconst 4 1
+sub 5 3 4
+store hi 5
+iconst 6 0
+iconst 7 1
+sub 8 6 7
+store found 8
+label L83
+load 9 lo
+load 10 hi
+lte 11 9 10
+brif 11 L84 L85
+label L84
+load 12 lo
+load 13 hi
+add 14 12 13
+iconst 15 2
+div 16 14 15
+store mid 16
+load 17 driver_module_range_starts
+load 18 mid
+call 19 pith_list_get_value_strict int 2 17 18
+load 20 idx
+lte 21 19 20
+brif 21 L87 L88
+label L87
+load 22 mid
+store found 22
+load 23 mid
+iconst 24 1
+add 25 23 24
+store lo 25
+jmp L86
+label L88
+load 26 mid
+iconst 27 1
+sub 28 26 27
+store hi 28
+label L86
+jmp L83
+label L85
+load 29 found
+iconst 30 0
+lt 31 29 30
+brif 31 L90 L91
+label L90
+strref 32 m53s69
+ret 32
+label L91
+label L89
+load 33 idx
+load 34 driver_module_range_ends
+load 35 found
+call 36 pith_list_get_value_strict int 2 34 35
+lt 37 33 36
+brif 37 L93 L94
+label L93
+load 38 driver_module_range_files
+load 39 found
+call 40 pith_list_get_value_strict string 2 38 39
+call 41 pith_cstring_retain void 1 40
+ret 40
+label L94
+label L92
+strref 42 m53s69
+ret 42
+iconst 43 0
+ret 43
+endfunc
 func driver_dr_join_path 2 string
 param base
 param child
@@ -191130,47 +191376,47 @@ load 2 child
 call 3 string_len int 1 2
 iconst 4 0
 eq 5 3 4
-brif 5 L66 L67
-label L66
+brif 5 L96 L97
+label L96
 load 6 base
 call 7 pith_cstring_retain void 1 6
 ret 6
-label L67
-label L65
+label L97
+label L95
 load 8 child
 strref 9 m53s48
 call 10 pith_cstring_starts_with bool 2 8 9
 call 11 pith_cstring_release void 1 9
-brif 10 L69 L70
-label L69
+brif 10 L99 L100
+label L99
 load 12 child
 call 13 pith_cstring_retain void 1 12
 ret 12
-label L70
-label L68
+label L100
+label L98
 iconst 14 0
-store __or_14_74 14
+store __or_14_104 14
 load 15 base
 strref 16 m53s69
 call 17 pith_cstring_eq bool 2 15 16
 call 18 pith_cstring_release void 1 16
-store __or_14_74 17
-brif 17 L75 L74
-label L74
+store __or_14_104 17
+brif 17 L105 L104
+label L104
 load 19 base
 strref 20 m53s16
 call 21 pith_cstring_eq bool 2 19 20
 call 22 pith_cstring_release void 1 20
-store __or_14_74 21
-label L75
-load 23 __or_14_74
-brif 23 L72 L73
-label L72
+store __or_14_104 21
+label L105
+load 23 __or_14_104
+brif 23 L102 L103
+label L102
 load 24 child
 call 25 pith_cstring_retain void 1 24
 ret 24
-label L73
-label L71
+label L103
+label L101
 load 26 base
 strref 27 m53s48
 concat 28 26 27
@@ -191212,16 +191458,16 @@ call 4 pith_cstring_trim string 1 3
 call 5 pith_cstring_release void 1 2
 store trimmed 4
 iconst 6 0
-store __and_6_79 6
+store __and_6_109 6
 iconst 7 0
-store __and_7_79 7
+store __and_7_109 7
 load 8 trimmed
 call 9 string_len int 1 8
 iconst 10 2
 gte 11 9 10
-store __and_7_79 11
-brif 11 L79 L80
-label L79
+store __and_7_109 11
+brif 11 L109 L110
+label L109
 load 12 trimmed
 iconst 13 0
 call 14 pith_cstring_char_at_strict string 2 12 13
@@ -191230,12 +191476,12 @@ call 16 chr string 1 15
 call 17 pith_cstring_eq bool 2 14 16
 call 18 pith_cstring_release void 1 14
 call 19 pith_cstring_release void 1 16
-store __and_7_79 17
-label L80
-load 20 __and_7_79
-store __and_6_79 20
-brif 20 L81 L82
-label L81
+store __and_7_109 17
+label L110
+load 20 __and_7_109
+store __and_6_109 20
+brif 20 L111 L112
+label L111
 load 21 trimmed
 load 22 trimmed
 call 23 string_len int 1 22
@@ -191247,11 +191493,11 @@ call 28 chr string 1 27
 call 29 pith_cstring_eq bool 2 26 28
 call 30 pith_cstring_release void 1 26
 call 31 pith_cstring_release void 1 28
-store __and_6_79 29
-label L82
-load 32 __and_6_79
-brif 32 L77 L78
-label L77
+store __and_6_109 29
+label L112
+load 32 __and_6_109
+brif 32 L107 L108
+label L107
 load 33 trimmed
 iconst 34 1
 load 35 trimmed
@@ -191262,8 +191508,8 @@ call 39 pith_cstring_substring string 3 33 34 38
 load 40 trimmed
 call 41 pith_cstring_release void 1 40
 ret 39
-label L78
-label L76
+label L108
+label L106
 load 42 trimmed
 ret 42
 load 43 trimmed
@@ -191295,16 +191541,16 @@ load 15 prefix
 call 16 pith_cstring_starts_with bool 2 14 15
 iconst 18 1
 sub 17 18 16
-brif 17 L84 L85
-label L84
+brif 17 L114 L115
+label L114
 strref 19 m53s69
 load 20 trimmed
 call 21 pith_cstring_release void 1 20
 load 22 prefix
 call 23 pith_cstring_release void 1 22
 ret 19
-label L85
-label L83
+label L115
+label L113
 load 24 trimmed
 strref 25 m53s22
 call 26 pith_cstring_index_of int 2 24 25
@@ -191313,16 +191559,16 @@ store eq 26
 load 28 eq
 iconst 29 0
 lt 30 28 29
-brif 30 L87 L88
-label L87
+brif 30 L117 L118
+label L117
 strref 31 m53s69
 load 32 trimmed
 call 33 pith_cstring_release void 1 32
 load 34 prefix
 call 35 pith_cstring_release void 1 34
 ret 31
-label L88
-label L86
+label L118
+label L116
 load 36 trimmed
 load 37 eq
 iconst 38 1
@@ -191359,12 +191605,12 @@ call 7 pith_cstring_release void 1 4
 store dir 6
 iconst 8 0
 store depth 8
-label L89
+label L119
 load 9 depth
 iconst 10 20
 lt 11 9 10
-brif 11 L90 L91
-label L90
+brif 11 L120 L121
+label L120
 load 12 manifest
 load 13 dir
 call 14 driver_dr_manifest_path string 1 13
@@ -191372,16 +191618,16 @@ call 15 pith_cstring_release void 1 12
 store manifest 14
 load 16 manifest
 call 17 file_exists bool 1 16
-brif 17 L93 L94
-label L93
+brif 17 L123 L124
+label L123
 load 18 dir
 load 19 manifest
 call 20 pith_cstring_release void 1 19
 load 21 parent
 call 22 pith_cstring_release void 1 21
 ret 18
-label L94
-label L92
+label L124
+label L122
 load 23 parent
 load 24 dir
 call 25 driver_get_directory string 1 24
@@ -191390,11 +191636,11 @@ store parent 25
 load 27 parent
 load 28 dir
 call 29 pith_cstring_eq bool 2 27 28
-brif 29 L96 L97
-label L96
-jmp L91
-label L97
-label L95
+brif 29 L126 L127
+label L126
+jmp L121
+label L127
+label L125
 load 30 dir
 load 31 parent
 call 32 pith_cstring_retain void 1 31
@@ -191404,8 +191650,8 @@ load 34 depth
 iconst 35 1
 add 36 34 35
 store depth 36
-jmp L89
-label L91
+jmp L119
+label L121
 strref 37 m53s69
 load 38 dir
 call 39 pith_cstring_release void 1 38
@@ -191440,8 +191686,8 @@ load 8 manifest_path
 call 9 file_exists bool 1 8
 iconst 11 1
 sub 10 11 9
-brif 10 L99 L100
-label L99
+brif 10 L129 L130
+label L129
 load 12 package_root
 strref 13 m53s822
 call 14 driver_dr_join_path string 2 12 13
@@ -191453,15 +191699,15 @@ call 19 pith_cstring_release void 1 18
 load 20 root
 call 21 pith_cstring_release void 1 20
 ret 14
-label L100
-label L98
+label L130
+label L128
 load 22 manifest
 load 23 manifest_path
 call 24 read_file string 1 23
 iconst 25 0
 neq 26 24 25
-brif 26 L101 L102
-label L101
+brif 26 L131 L132
+label L131
 iconst 27 1
 iconst 28 0
 iconst 29 3
@@ -191469,9 +191715,9 @@ call 30 pith_struct_alloc struct:tuple 1 29
 sstore 30 0 27
 sstore 30 1 24
 sstore 30 2 28
-store __legacy_result_25_101 30
-jmp L103
-label L102
+store __legacy_result_25_131 30
+jmp L133
+label L132
 strref 31 m53s852
 iconst 32 0
 iconst 33 3
@@ -191479,24 +191725,24 @@ call 34 pith_struct_alloc struct:tuple 1 33
 sstore 34 0 32
 sstore 34 1 32
 sstore 34 2 31
-store __legacy_result_25_101 34
-label L103
-load 35 __legacy_result_25_101
+store __legacy_result_25_131 34
+label L133
+load 35 __legacy_result_25_131
 field 36 35 0 bool is_ok
-brif 36 L104 L105
-label L104
+brif 36 L134 L135
+label L134
 field 37 35 8 string ok
 call 38 pith_struct_release void 1 35
-store __unwrap_or_37_104 37
-jmp L106
-label L105
+store __unwrap_or_37_134 37
+jmp L136
+label L135
 strref 39 m53s69
 field 40 35 16 string err
 call 41 pith_cstring_release void 1 40
 call 42 pith_struct_release void 1 35
-store __unwrap_or_37_104 39
-label L106
-load 43 __unwrap_or_37_104
+store __unwrap_or_37_134 39
+label L136
+load 43 __unwrap_or_37_134
 call 44 pith_cstring_retain void 1 43
 call 45 pith_cstring_release void 1 22
 store manifest 43
@@ -191510,12 +191756,12 @@ iconst 52 0
 store __for_idx_437 52
 store __for_len_437 51
 store __for_iter_437 49
-label L107
+label L137
 load 53 __for_idx_437
 load 54 __for_len_437
 lt 55 53 54
-brif 55 L108 L110
-label L108
+brif 55 L138 L140
+label L138
 load 56 __for_iter_437
 load 57 __for_idx_437
 call 58 pith_list_get_value_unchecked string 2 56 57
@@ -191531,8 +191777,8 @@ load 65 root
 call 66 string_len int 1 65
 iconst 67 0
 gt 68 66 67
-brif 68 L112 L113
-label L112
+brif 68 L142 L143
+label L142
 load 69 package_root
 load 70 root
 call 71 driver_dr_join_path string 2 69 70
@@ -191545,15 +191791,15 @@ call 77 pith_cstring_release void 1 76
 load 78 root
 call 79 pith_cstring_release void 1 78
 ret 71
-label L113
-label L111
-label L109
+label L143
+label L141
+label L139
 load 80 __for_idx_437
 iconst 81 1
 add 82 80 81
 store __for_idx_437 82
-jmp L107
-label L110
+jmp L137
+label L140
 load 83 __for_iter_437
 call 84 pith_list_release_handle void 1 83
 load 85 package_root
@@ -191590,16 +191836,16 @@ store path_pos 5
 load 7 path_pos
 iconst 8 0
 lt 9 7 8
-brif 9 L115 L116
-label L115
+brif 9 L145 L146
+label L145
 strref 10 m53s69
 load 11 rest
 call 12 pith_cstring_release void 1 11
 load 13 after
 call 14 pith_cstring_release void 1 13
 ret 10
-label L116
-label L114
+label L146
+label L144
 load 15 rest
 load 16 value
 load 17 path_pos
@@ -191618,16 +191864,16 @@ store eq 26
 load 28 eq
 iconst 29 0
 lt 30 28 29
-brif 30 L118 L119
-label L118
+brif 30 L148 L149
+label L148
 strref 31 m53s69
 load 32 rest
 call 33 pith_cstring_release void 1 32
 load 34 after
 call 35 pith_cstring_release void 1 34
 ret 31
-label L119
-label L117
+label L149
+label L147
 load 36 after
 load 37 rest
 load 38 eq
@@ -191644,16 +191890,16 @@ load 47 after
 call 48 string_len int 1 47
 iconst 49 0
 eq 50 48 49
-brif 50 L121 L122
-label L121
+brif 50 L151 L152
+label L151
 strref 51 m53s69
 load 52 rest
 call 53 pith_cstring_release void 1 52
 load 54 after
 call 55 pith_cstring_release void 1 54
 ret 51
-label L122
-label L120
+label L152
+label L150
 load 56 after
 iconst 57 0
 call 58 pith_cstring_char_at_strict string 2 56 57
@@ -191662,17 +191908,17 @@ call 60 chr string 1 59
 call 61 pith_cstring_eq bool 2 58 60
 call 62 pith_cstring_release void 1 58
 call 63 pith_cstring_release void 1 60
-brif 61 L124 L125
-label L124
+brif 61 L154 L155
+label L154
 iconst 64 1
 store end 64
-label L126
+label L156
 load 65 end
 load 66 after
 call 67 string_len int 1 66
 lt 68 65 67
-brif 68 L127 L128
-label L127
+brif 68 L157 L158
+label L157
 load 69 after
 load 70 end
 call 71 pith_cstring_char_at_strict string 2 69 70
@@ -191681,8 +191927,8 @@ call 73 chr string 1 72
 call 74 pith_cstring_eq bool 2 71 73
 call 75 pith_cstring_release void 1 71
 call 76 pith_cstring_release void 1 73
-brif 74 L130 L131
-label L130
+brif 74 L160 L161
+label L160
 load 77 after
 iconst 78 1
 load 79 end
@@ -191692,41 +191938,41 @@ call 82 pith_cstring_release void 1 81
 load 83 after
 call 84 pith_cstring_release void 1 83
 ret 80
-label L131
-label L129
+label L161
+label L159
 load 85 end
 iconst 86 1
 add 87 85 86
 store end 87
-jmp L126
-label L128
+jmp L156
+label L158
 strref 88 m53s69
 load 89 rest
 call 90 pith_cstring_release void 1 89
 load 91 after
 call 92 pith_cstring_release void 1 91
 ret 88
-label L125
-label L123
+label L155
+label L153
 iconst 93 0
 store end 93
-label L132
+label L162
 load 94 end
 load 95 after
 call 96 string_len int 1 95
 lt 97 94 96
-brif 97 L133 L134
-label L133
+brif 97 L163 L164
+label L163
 iconst 98 0
-store __or_98_138 98
+store __or_98_168 98
 load 99 after
 load 100 end
 call 101 pith_cstring_byte_at int 2 99 100
 iconst 102 44
 eq 103 101 102
-store __or_98_138 103
-brif 103 L139 L138
-label L138
+store __or_98_168 103
+brif 103 L169 L168
+label L168
 load 104 after
 load 105 end
 call 106 pith_cstring_char_at_strict string 2 104 105
@@ -191735,20 +191981,20 @@ call 108 chr string 1 107
 call 109 pith_cstring_eq bool 2 106 108
 call 110 pith_cstring_release void 1 106
 call 111 pith_cstring_release void 1 108
-store __or_98_138 109
-label L139
-load 112 __or_98_138
-brif 112 L136 L137
-label L136
-jmp L134
-label L137
-label L135
+store __or_98_168 109
+label L169
+load 112 __or_98_168
+brif 112 L166 L167
+label L166
+jmp L164
+label L167
+label L165
 load 113 end
 iconst 114 1
 add 115 113 114
 store end 115
-jmp L132
-label L134
+jmp L162
+label L164
 load 116 after
 iconst 117 0
 load 118 end
@@ -191780,14 +192026,14 @@ load 6 trimmed
 call 7 string_len int 1 6
 iconst 8 0
 eq 9 7 8
-brif 9 L141 L142
-label L141
+brif 9 L171 L172
+label L171
 strref 10 m53s69
 load 11 trimmed
 call 12 pith_cstring_release void 1 11
 ret 10
-label L142
-label L140
+label L172
+label L170
 load 13 trimmed
 iconst 14 0
 call 15 pith_cstring_char_at_strict string 2 13 14
@@ -191796,15 +192042,15 @@ call 17 chr string 1 16
 call 18 pith_cstring_eq bool 2 15 17
 call 19 pith_cstring_release void 1 15
 call 20 pith_cstring_release void 1 17
-brif 18 L144 L145
-label L144
+brif 18 L174 L175
+label L174
 load 21 trimmed
 call 22 driver_dr_strip_quotes string 1 21
 load 23 trimmed
 call 24 pith_cstring_release void 1 23
 ret 22
-label L145
-label L143
+label L175
+label L173
 load 25 trimmed
 iconst 26 0
 call 27 pith_cstring_char_at_strict string 2 25 26
@@ -191813,15 +192059,15 @@ call 29 chr string 1 28
 call 30 pith_cstring_eq bool 2 27 29
 call 31 pith_cstring_release void 1 27
 call 32 pith_cstring_release void 1 29
-brif 30 L147 L148
-label L147
+brif 30 L177 L178
+label L177
 load 33 trimmed
 call 34 driver_dr_extract_braced_path string 1 33
 load 35 trimmed
 call 36 pith_cstring_release void 1 35
 ret 34
-label L148
-label L146
+label L178
+label L176
 strref 37 m53s69
 load 38 trimmed
 call 39 pith_cstring_release void 1 38
@@ -191864,8 +192110,8 @@ load 8 path
 call 9 file_exists bool 1 8
 iconst 11 1
 sub 10 11 9
-brif 10 L150 L151
-label L150
+brif 10 L180 L181
+label L180
 load 12 manifest
 call 13 pith_cstring_release void 1 12
 load 14 trimmed
@@ -191880,15 +192126,15 @@ load 22 root
 call 23 pith_cstring_release void 1 22
 iconst 24 0
 ret 24
-label L151
-label L149
+label L181
+label L179
 load 25 manifest
 load 26 path
 call 27 read_file string 1 26
 iconst 28 0
 neq 29 27 28
-brif 29 L152 L153
-label L152
+brif 29 L182 L183
+label L182
 iconst 30 1
 iconst 31 0
 iconst 32 3
@@ -191896,9 +192142,9 @@ call 33 pith_struct_alloc struct:tuple 1 32
 sstore 33 0 30
 sstore 33 1 27
 sstore 33 2 31
-store __legacy_result_28_152 33
-jmp L154
-label L153
+store __legacy_result_28_182 33
+jmp L184
+label L183
 strref 34 m53s852
 iconst 35 0
 iconst 36 3
@@ -191906,24 +192152,24 @@ call 37 pith_struct_alloc struct:tuple 1 36
 sstore 37 0 35
 sstore 37 1 35
 sstore 37 2 34
-store __legacy_result_28_152 37
-label L154
-load 38 __legacy_result_28_152
+store __legacy_result_28_182 37
+label L184
+load 38 __legacy_result_28_182
 field 39 38 0 bool is_ok
-brif 39 L155 L156
-label L155
+brif 39 L185 L186
+label L185
 field 40 38 8 string ok
 call 41 pith_struct_release void 1 38
-store __unwrap_or_40_155 40
-jmp L157
-label L156
+store __unwrap_or_40_185 40
+jmp L187
+label L186
 strref 42 m53s69
 field 43 38 16 string err
 call 44 pith_cstring_release void 1 43
 call 45 pith_struct_release void 1 38
-store __unwrap_or_40_155 42
-label L157
-load 46 __unwrap_or_40_155
+store __unwrap_or_40_185 42
+label L187
+load 46 __unwrap_or_40_185
 call 47 pith_cstring_retain void 1 46
 call 48 pith_cstring_release void 1 25
 store manifest 46
@@ -191939,12 +192185,12 @@ iconst 56 0
 store __for_idx_438 56
 store __for_len_438 55
 store __for_iter_438 53
-label L158
+label L188
 load 57 __for_idx_438
 load 58 __for_len_438
 lt 59 57 58
-brif 59 L159 L161
-label L159
+brif 59 L189 L191
+label L189
 load 60 __for_iter_438
 load 61 __for_idx_438
 call 62 pith_list_get_value_unchecked string 2 60 61
@@ -191955,55 +192201,55 @@ call 65 pith_cstring_trim string 1 64
 call 66 pith_cstring_release void 1 63
 store trimmed 65
 iconst 67 0
-store __or_67_165 67
+store __or_67_195 67
 load 68 trimmed
 call 69 string_len int 1 68
 iconst 70 0
 eq 71 69 70
-store __or_67_165 71
-brif 71 L166 L165
-label L165
+store __or_67_195 71
+brif 71 L196 L195
+label L195
 load 72 trimmed
 strref 73 m53s92
 call 74 pith_cstring_starts_with bool 2 72 73
 call 75 pith_cstring_release void 1 73
-store __or_67_165 74
-label L166
-load 76 __or_67_165
-brif 76 L163 L164
-label L163
-jmp L160
-label L164
-label L162
+store __or_67_195 74
+label L196
+load 76 __or_67_195
+brif 76 L193 L194
+label L193
+jmp L190
+label L194
+label L192
 iconst 77 0
-store __and_77_170 77
+store __and_77_200 77
 load 78 trimmed
 strref 79 m53s8
 call 80 pith_cstring_starts_with bool 2 78 79
 call 81 pith_cstring_release void 1 79
-store __and_77_170 80
-brif 80 L170 L171
-label L170
+store __and_77_200 80
+brif 80 L200 L201
+label L200
 load 82 trimmed
 strref 83 m53s6
 call 84 pith_cstring_ends_with bool 2 82 83
 call 85 pith_cstring_release void 1 83
-store __and_77_170 84
-label L171
-load 86 __and_77_170
-brif 86 L168 L169
-label L168
+store __and_77_200 84
+label L201
+load 86 __and_77_200
+brif 86 L198 L199
+label L198
 load 87 trimmed
 strref 88 m53s820
 call 89 pith_cstring_eq bool 2 87 88
 call 90 pith_cstring_release void 1 88
 store in_dependencies 89
-jmp L160
-label L169
-label L167
+jmp L190
+label L199
+label L197
 load 91 in_dependencies
-brif 91 L173 L174
-label L173
+brif 91 L203 L204
+label L203
 load 92 trimmed
 strref 93 m53s22
 call 94 pith_cstring_index_of int 2 92 93
@@ -192012,11 +192258,11 @@ store eq 94
 load 96 eq
 iconst 97 0
 lt 98 96 97
-brif 98 L176 L177
-label L176
-jmp L160
-label L177
-label L175
+brif 98 L206 L207
+label L206
+jmp L190
+label L207
+label L205
 load 99 dep_name
 load 100 trimmed
 iconst 101 0
@@ -192039,23 +192285,23 @@ call 116 pith_cstring_release void 1 114
 call 117 pith_cstring_release void 1 107
 store dep_path 115
 iconst 118 0
-store __and_118_181 118
+store __and_118_211 118
 load 119 dep_name
 call 120 string_len int 1 119
 iconst 121 0
 gt 122 120 121
-store __and_118_181 122
-brif 122 L181 L182
-label L181
+store __and_118_211 122
+brif 122 L211 L212
+label L211
 load 123 dep_path
 call 124 string_len int 1 123
 iconst 125 0
 gt 126 124 125
-store __and_118_181 126
-label L182
-load 127 __and_118_181
-brif 127 L179 L180
-label L179
+store __and_118_211 126
+label L212
+load 127 __and_118_211
+brif 127 L209 L210
+label L209
 load 128 key
 load 129 package_root
 load 130 dep_name
@@ -192072,19 +192318,19 @@ load 138 driver_package_dependency_roots
 load 139 key
 load 140 root
 call 141 map_insert void 3 138 139 140
-jmp L178
-label L180
-label L178
-jmp L172
-label L174
-label L172
-label L160
+jmp L208
+label L210
+label L208
+jmp L202
+label L204
+label L202
+label L190
 load 142 __for_idx_438
 iconst 143 1
 add 144 142 143
 store __for_idx_438 144
-jmp L158
-label L161
+jmp L188
+label L191
 load 145 __for_iter_438
 call 146 pith_list_release_handle void 1 145
 load 147 manifest
@@ -192110,25 +192356,25 @@ load 2 package_root
 strref 3 m53s69
 call 4 pith_cstring_eq bool 2 2 3
 call 5 pith_cstring_release void 1 3
-brif 4 L184 L185
-label L184
+brif 4 L214 L215
+label L214
 load 6 lock_path
 call 7 pith_cstring_release void 1 6
 iconst 8 0
 ret 8
-label L185
-label L183
+label L215
+label L213
 load 9 driver_package_dependency_loaded
 load 10 package_root
 call 11 contains_key bool 2 9 10
-brif 11 L187 L188
-label L187
+brif 11 L217 L218
+label L217
 load 12 lock_path
 call 13 pith_cstring_release void 1 12
 iconst 14 0
 ret 14
-label L188
-label L186
+label L218
+label L216
 load 15 driver_package_dependency_loaded
 load 16 package_root
 iconst 17 1
@@ -192140,8 +192386,8 @@ call 22 pith_cstring_release void 1 19
 store lock_path 21
 load 23 lock_path
 call 24 file_exists bool 1 23
-brif 24 L190 L191
-label L190
+brif 24 L220 L221
+label L220
 load 25 package_root
 load 26 lock_path
 call 27 driver_dr_load_dependency_file void 2 25 26
@@ -192149,8 +192395,8 @@ load 28 lock_path
 call 29 pith_cstring_release void 1 28
 iconst 30 0
 ret 30
-label L191
-label L189
+label L221
+label L219
 load 31 package_root
 load 32 package_root
 call 33 driver_dr_manifest_path string 1 32
@@ -192171,13 +192417,13 @@ store dot 3
 load 5 dot
 iconst 6 0
 lt 7 5 6
-brif 7 L193 L194
-label L193
+brif 7 L223 L224
+label L223
 load 8 mod_path
 call 9 pith_cstring_retain void 1 8
 ret 8
-label L194
-label L192
+label L224
+label L222
 load 10 mod_path
 iconst 11 0
 load 12 dot
@@ -192202,16 +192448,16 @@ load 8 package_root
 strref 9 m53s69
 call 10 pith_cstring_eq bool 2 8 9
 call 11 pith_cstring_release void 1 9
-brif 10 L196 L197
-label L196
+brif 10 L226 L227
+label L226
 strref 12 m53s69
 load 13 package_root
 call 14 pith_cstring_release void 1 13
 load 15 key
 call 16 pith_cstring_release void 1 15
 ret 12
-label L197
-label L195
+label L227
+label L225
 load 17 package_root
 call 18 driver_dr_load_package_dependencies void 1 17
 load 19 key
@@ -192223,8 +192469,8 @@ store key 22
 load 24 driver_package_dependency_roots
 load 25 key
 call 26 contains_key bool 2 24 25
-brif 26 L199 L200
-label L199
+brif 26 L229 L230
+label L229
 load 27 driver_package_dependency_roots
 load 28 key
 call 29 map_get_strict string 2 27 28
@@ -192234,8 +192480,8 @@ call 32 pith_cstring_release void 1 31
 load 33 key
 call 34 pith_cstring_release void 1 33
 ret 29
-label L200
-label L198
+label L230
+label L228
 strref 35 m53s69
 load 36 package_root
 call 37 pith_cstring_release void 1 36
@@ -192273,8 +192519,8 @@ load 14 dep_root
 strref 15 m53s69
 call 16 pith_cstring_eq bool 2 14 15
 call 17 pith_cstring_release void 1 15
-brif 16 L202 L203
-label L202
+brif 16 L232 L233
+label L232
 strref 18 m53s69
 load 19 dep_name
 call 20 pith_cstring_release void 1 19
@@ -192283,13 +192529,13 @@ call 22 pith_cstring_release void 1 21
 load 23 rest
 call 24 pith_cstring_release void 1 23
 ret 18
-label L203
-label L201
+label L233
+label L231
 load 25 mod_path
 load 26 dep_name
 call 27 pith_cstring_eq bool 2 25 26
-brif 27 L205 L206
-label L205
+brif 27 L235 L236
+label L235
 load 28 dep_root
 call 29 driver_dr_root_file_for_package string 1 28
 load 30 dep_name
@@ -192299,8 +192545,8 @@ call 33 pith_cstring_release void 1 32
 load 34 rest
 call 35 pith_cstring_release void 1 34
 ret 29
-label L206
-label L204
+label L236
+label L234
 load 36 rest
 load 37 mod_path
 load 38 dep_name
@@ -192358,8 +192604,8 @@ load 12 dir
 strref 13 m53s16
 call 14 pith_cstring_eq bool 2 12 13
 call 15 pith_cstring_release void 1 13
-brif 14 L208 L209
-label L208
+brif 14 L238 L239
+label L238
 load 16 rel_path
 strref 17 m53s819
 concat 18 16 17
@@ -192369,8 +192615,8 @@ call 21 pith_cstring_release void 1 20
 load 22 dir
 call 23 pith_cstring_release void 1 22
 ret 18
-label L209
-label L207
+label L239
+label L237
 load 24 dir
 strref 25 m53s48
 concat 26 24 25
@@ -192417,8 +192663,8 @@ call 15 pith_cstring_eq bool 2 12 13
 iconst 16 1
 sub 14 16 15
 call 17 pith_cstring_release void 1 13
-brif 14 L211 L212
-label L211
+brif 14 L241 L242
+label L241
 load 18 driver_stdlib_root_directory
 strref 19 m53s48
 concat 20 18 19
@@ -192435,14 +192681,14 @@ call 30 pith_cstring_release void 1 29
 load 31 dir
 call 32 pith_cstring_release void 1 31
 ret 26
-label L212
-label L210
+label L242
+label L240
 load 33 dir
 strref 34 m53s16
 call 35 pith_cstring_eq bool 2 33 34
 call 36 pith_cstring_release void 1 34
-brif 35 L214 L215
-label L214
+brif 35 L244 L245
+label L244
 load 37 rel_path
 strref 38 m53s819
 concat 39 37 38
@@ -192452,8 +192698,8 @@ call 42 pith_cstring_release void 1 41
 load 43 dir
 call 44 pith_cstring_release void 1 43
 ret 39
-label L215
-label L213
+label L245
+label L243
 load 45 dir
 strref 46 m53s48
 concat 47 45 46
@@ -192485,23 +192731,23 @@ store local_file 2
 iconst 3 0
 store dep_file 3
 iconst 4 0
-store __or_4_219 4
+store __or_4_249 4
 load 5 mod_path
 strref 6 m53s818
 call 7 pith_cstring_starts_with bool 2 5 6
 call 8 pith_cstring_release void 1 6
-store __or_4_219 7
-brif 7 L220 L219
-label L219
+store __or_4_249 7
+brif 7 L250 L249
+label L249
 load 9 mod_path
 strref 10 m53s817
 call 11 pith_cstring_eq bool 2 9 10
 call 12 pith_cstring_release void 1 10
-store __or_4_219 11
-label L220
-load 13 __or_4_219
-brif 13 L217 L218
-label L217
+store __or_4_249 11
+label L250
+load 13 __or_4_249
+brif 13 L247 L248
+label L247
 load 14 mod_path
 load 15 source_path
 call 16 driver_dr_std_module_file string 2 14 15
@@ -192510,8 +192756,8 @@ call 18 pith_cstring_release void 1 17
 load 19 dep_file
 call 20 pith_cstring_release void 1 19
 ret 16
-label L218
-label L216
+label L248
+label L246
 load 21 local_file
 load 22 mod_path
 load 23 source_path
@@ -192520,14 +192766,14 @@ call 25 pith_cstring_release void 1 21
 store local_file 24
 load 26 local_file
 call 27 file_exists bool 1 26
-brif 27 L222 L223
-label L222
+brif 27 L252 L253
+label L252
 load 28 local_file
 load 29 dep_file
 call 30 pith_cstring_release void 1 29
 ret 28
-label L223
-label L221
+label L253
+label L251
 load 31 dep_file
 load 32 mod_path
 load 33 source_path
@@ -192538,14 +192784,14 @@ load 36 dep_file
 call 37 string_len int 1 36
 iconst 38 0
 gt 39 37 38
-brif 39 L225 L226
-label L225
+brif 39 L255 L256
+label L255
 load 40 dep_file
 load 41 local_file
 call 42 pith_cstring_release void 1 41
 ret 40
-label L226
-label L224
+label L256
+label L254
 load 43 local_file
 load 44 dep_file
 call 45 pith_cstring_release void 1 44
@@ -192581,8 +192827,8 @@ store key 8
 load 10 driver_package_dependency_roots
 load 11 key
 call 12 contains_key bool 2 10 11
-brif 12 L228 L229
-label L228
+brif 12 L258 L259
+label L258
 load 13 driver_package_dependency_roots
 load 14 key
 call 15 map_get_strict string 2 13 14
@@ -192590,8 +192836,8 @@ call 16 pith_cstring_retain void 1 15
 load 17 key
 call 18 pith_cstring_release void 1 17
 ret 15
-label L229
-label L227
+label L259
+label L257
 strref 19 m53s69
 load 20 key
 call 21 pith_cstring_release void 1 20
@@ -192627,12 +192873,12 @@ iconst 17 0
 store __for_idx_439 17
 store __for_len_439 16
 store __for_iter_439 15
-label L230
+label L260
 load 18 __for_idx_439
 load 19 __for_len_439
 lt 20 18 19
-brif 20 L231 L233
-label L231
+brif 20 L261 L263
+label L261
 load 21 __for_iter_439
 load 22 __for_idx_439
 call 23 pith_list_get_value_unchecked string 2 21 22
@@ -192640,8 +192886,8 @@ store __loopvar_439_key 23
 load 24 __loopvar_439_key
 load 25 prefix
 call 26 pith_cstring_starts_with bool 2 24 25
-brif 26 L235 L236
-label L235
+brif 26 L265 L266
+label L265
 load 27 names
 load 28 __loopvar_439_key
 load 29 prefix
@@ -192650,16 +192896,16 @@ load 31 __loopvar_439_key
 call 32 string_len int 1 31
 call 33 pith_cstring_substring string 3 28 30 32
 call 34 pith_list_push_value_owned void 2 27 33
-jmp L234
-label L236
-label L234
-label L232
+jmp L264
+label L266
+label L264
+label L262
 load 35 __for_idx_439
 iconst 36 1
 add 37 35 36
 store __for_idx_439 37
-jmp L230
-label L233
+jmp L260
+label L263
 load 38 __for_iter_439
 call 39 pith_list_release_handle void 1 38
 load 40 names
@@ -192687,12 +192933,12 @@ iconst 7 0
 store __for_idx_440 7
 store __for_len_440 6
 store __for_iter_440 5
-label L237
+label L267
 load 8 __for_idx_440
 load 9 __for_len_440
 lt 10 8 9
-brif 10 L238 L240
-label L238
+brif 10 L268 L270
+label L268
 load 11 __for_iter_440
 load 12 __for_idx_440
 call 13 pith_cstring_char_at string 2 11 12
@@ -192701,8 +192947,8 @@ load 14 __loopvar_440_ch
 strref 15 m53s16
 call 16 pith_cstring_eq bool 2 14 15
 call 17 pith_cstring_release void 1 15
-brif 16 L242 L243
-label L242
+brif 16 L272 L273
+label L272
 load 18 result
 load 19 result
 strref 20 m53s48
@@ -192710,22 +192956,22 @@ concat 21 19 20
 call 22 pith_cstring_release void 1 20
 call 23 pith_cstring_release void 1 18
 store result 21
-jmp L241
-label L243
+jmp L271
+label L273
 load 24 result
 load 25 result
 load 26 __loopvar_440_ch
 concat 27 25 26
 call 28 pith_cstring_release void 1 24
 store result 27
-label L241
-label L239
+label L271
+label L269
 load 29 __for_idx_440
 iconst 30 1
 add 31 29 30
 store __for_idx_440 31
-jmp L237
-label L240
+jmp L267
+label L270
 load 32 result
 ret 32
 load 33 result
@@ -192748,12 +192994,12 @@ call 7 pith_cstring_release void 1 4
 store dir 6
 iconst 8 0
 store depth 8
-label L244
+label L274
 load 9 depth
 iconst 10 20
 lt 11 9 10
-brif 11 L245 L246
-label L245
+brif 11 L275 L276
+label L275
 load 12 test_path
 load 13 dir
 strref 14 m53s816
@@ -192771,16 +193017,16 @@ store result 22
 load 24 result
 iconst 25 0
 eq 26 24 25
-brif 26 L248 L249
-label L248
+brif 26 L278 L279
+label L278
 load 27 dir
 load 28 test_path
 call 29 pith_cstring_release void 1 28
 load 30 parent
 call 31 pith_cstring_release void 1 30
 ret 27
-label L249
-label L247
+label L279
+label L277
 load 32 parent
 load 33 dir
 call 34 driver_get_directory string 1 33
@@ -192789,11 +193035,11 @@ store parent 34
 load 36 parent
 load 37 dir
 call 38 pith_cstring_eq bool 2 36 37
-brif 38 L251 L252
-label L251
-jmp L246
-label L252
-label L250
+brif 38 L281 L282
+label L281
+jmp L276
+label L282
+label L280
 load 39 dir
 load 40 parent
 call 41 pith_cstring_retain void 1 40
@@ -192803,8 +193049,8 @@ load 43 depth
 iconst 44 1
 add 45 43 44
 store depth 45
-jmp L244
-label L246
+jmp L274
+label L276
 strref 46 m53s69
 load 47 dir
 call 48 pith_cstring_release void 1 47
@@ -192849,8 +193095,8 @@ load 13 driver_driver_parse_diagnostics
 call 14 pith_list_len int 1 13
 iconst 15 0
 gt 16 14 15
-brif 16 L254 L255
-label L254
+brif 16 L284 L285
+label L284
 load 17 roots
 iconst 18 1
 iconst 19 0
@@ -192874,8 +193120,8 @@ call 33 pith_list_release_handle void 1 32
 load 34 sub_roots
 call 35 pith_list_release_handle void 1 34
 ret 21
-label L255
-label L253
+label L285
+label L283
 load 36 imports
 load 37 root_idx
 call 38 driver_find_imports list_string 1 37
@@ -192887,12 +193133,12 @@ iconst 42 0
 store __for_idx_441 42
 store __for_len_441 41
 store __for_iter_441 40
-label L256
+label L286
 load 43 __for_idx_441
 load 44 __for_len_441
 lt 45 43 44
-brif 45 L257 L259
-label L257
+brif 45 L287 L289
+label L287
 load 46 __for_iter_441
 load 47 __for_idx_441
 call 48 pith_list_get_value_unchecked string 2 46 47
@@ -192904,11 +193150,11 @@ call 52 driver_dr_resolve_module_file string 2 50 51
 call 53 pith_cstring_release void 1 49
 store file_path 52
 load 54 file_path
-call 55 file_exists bool 1 54
+call 55 driver_dr_source_exists bool 1 54
 iconst 57 1
 sub 56 57 55
-brif 56 L261 L262
-label L261
+brif 56 L291 L292
+label L291
 load 58 pos
 load 59 root_idx
 load 60 __loopvar_441_mod_path
@@ -192970,21 +193216,21 @@ call 103 pith_list_release_handle void 1 102
 load 104 sub_roots
 call 105 pith_list_release_handle void 1 104
 ret 91
-label L262
-label L260
+label L292
+label L290
 load 106 driver_visited_files
 load 107 file_path
 call 108 contains_key bool 2 106 107
-brif 108 L264 L265
-label L264
-jmp L258
-label L265
-label L263
+brif 108 L294 L295
+label L294
+jmp L288
+label L295
+label L293
 load 109 driver_files_being_checked
 load 110 file_path
 call 111 contains_key bool 2 109 110
-brif 111 L267 L268
-label L267
+brif 111 L297 L298
+label L297
 load 112 cycle_msg
 strref 113 m53s811
 load 114 file_path
@@ -192999,12 +193245,12 @@ iconst 121 0
 store __for_idx_442 121
 store __for_len_442 120
 store __for_iter_442 119
-label L269
+label L299
 load 122 __for_idx_442
 load 123 __for_len_442
 lt 124 122 123
-brif 124 L270 L272
-label L270
+brif 124 L300 L302
+label L300
 load 125 __for_iter_442
 load 126 __for_idx_442
 call 127 pith_list_get_value_unchecked string 2 125 126
@@ -193019,13 +193265,13 @@ concat 134 131 133
 call 135 pith_cstring_release void 1 131
 call 136 pith_cstring_release void 1 128
 store cycle_msg 134
-label L271
+label L301
 load 137 __for_idx_442
 iconst 138 1
 add 139 137 138
 store __for_idx_442 139
-jmp L269
-label L272
+jmp L299
+label L302
 load 140 __for_iter_442
 call 141 pith_list_release_handle void 1 140
 strref 142 m53s809
@@ -193039,8 +193285,8 @@ call 149 read_file string 1 148
 call 150 pith_cstring_release void 1 148
 iconst 151 0
 neq 152 149 151
-brif 152 L273 L274
-label L273
+brif 152 L303 L304
+label L303
 iconst 153 1
 iconst 154 0
 iconst 155 3
@@ -193048,9 +193294,9 @@ call 156 pith_struct_alloc struct:tuple 1 155
 sstore 156 0 153
 sstore 156 1 149
 sstore 156 2 154
-store __legacy_result_151_273 156
-jmp L275
-label L274
+store __legacy_result_151_303 156
+jmp L305
+label L304
 strref 157 m53s852
 iconst 158 0
 iconst 159 3
@@ -193058,16 +193304,16 @@ call 160 pith_struct_alloc struct:tuple 1 159
 sstore 160 0 158
 sstore 160 1 158
 sstore 160 2 157
-store __legacy_result_151_273 160
-label L275
-load 161 __legacy_result_151_273
+store __legacy_result_151_303 160
+label L305
+load 161 __legacy_result_151_303
 field 162 161 0 bool is_ok
-brif 162 L276 L277
-label L276
+brif 162 L306 L307
+label L306
 field 163 161 8 string ok
 call 164 pith_struct_release void 1 161
-jmp L278
-label L277
+jmp L308
+label L307
 load 165 roots
 call 166 pith_list_release_handle void 1 165
 load 167 imports
@@ -193085,11 +193331,11 @@ call 178 pith_list_release_handle void 1 177
 load 179 sub_roots
 call 180 pith_list_release_handle void 1 179
 ret 161
-label L278
+label L308
 call 181 pith_cstring_release void 1 163
-jmp L266
-label L268
-label L266
+jmp L296
+label L298
+label L296
 load 182 driver_files_being_checked
 load 183 file_path
 iconst 184 1
@@ -193100,247 +193346,229 @@ iconst 188 1
 call 189 map_insert void 3 186 187 188
 load 190 content
 load 191 file_path
-call 192 read_file string 1 191
-iconst 193 0
-neq 194 192 193
-brif 194 L279 L280
-label L279
-iconst 195 1
-iconst 196 0
-iconst 197 3
-call 198 pith_struct_alloc struct:tuple 1 197
-sstore 198 0 195
-sstore 198 1 192
-sstore 198 2 196
-store __legacy_result_193_279 198
-jmp L281
-label L280
-strref 199 m53s852
-iconst 200 0
-iconst 201 3
-call 202 pith_struct_alloc struct:tuple 1 201
-sstore 202 0 200
-sstore 202 1 200
-sstore 202 2 199
-store __legacy_result_193_279 202
-label L281
-load 203 __legacy_result_193_279
-field 204 203 0 bool is_ok
-brif 204 L282 L283
-label L282
-field 205 203 8 string ok
-call 206 pith_struct_release void 1 203
-jmp L284
-label L283
-load 207 roots
-call 208 pith_list_release_handle void 1 207
-load 209 imports
-call 210 pith_list_release_handle void 1 209
-load 211 file_path
-call 212 pith_cstring_release void 1 211
-load 213 pos
-call 214 pith_struct_release void 1 213
-load 215 cycle_msg
-call 216 pith_cstring_release void 1 215
-load 217 content
-call 218 pith_cstring_release void 1 217
-load 219 tokens
-call 220 pith_list_release_handle void 1 219
-load 221 sub_roots
-call 222 pith_list_release_handle void 1 221
-ret 203
-label L284
-call 223 pith_cstring_release void 1 190
-store content 205
-load 224 tokens
-load 225 content
-call 226 lexer_lex_all list 1 225
-call 227 pith_list_release_handle void 1 224
-store tokens 226
-load 228 tokens
-load 229 file_path
-call 230 parser_parse_with_file int 2 228 229
-store mod_root 230
-call 231 parser_parser_has_errors bool 0
-brif 231 L286 L287
-label L286
-call 232 parser_parser_diagnostics list 0
-store driver_driver_parse_diagnostics 232
-load 233 roots
-iconst 234 1
-iconst 235 0
-iconst 236 3
-call 237 pith_struct_alloc struct:tuple 1 236
-sstore 237 0 234
-sstore 237 1 233
-sstore 237 2 235
-load 238 imports
+call 192 driver_dr_read_source tuple 1 191
+field 193 192 0 bool is_ok
+brif 193 L309 L310
+label L309
+field 194 192 8 string ok
+call 195 pith_struct_release void 1 192
+jmp L311
+label L310
+load 196 roots
+call 197 pith_list_release_handle void 1 196
+load 198 imports
+call 199 pith_list_release_handle void 1 198
+load 200 file_path
+call 201 pith_cstring_release void 1 200
+load 202 pos
+call 203 pith_struct_release void 1 202
+load 204 cycle_msg
+call 205 pith_cstring_release void 1 204
+load 206 content
+call 207 pith_cstring_release void 1 206
+load 208 tokens
+call 209 pith_list_release_handle void 1 208
+load 210 sub_roots
+call 211 pith_list_release_handle void 1 210
+ret 192
+label L311
+call 212 pith_cstring_release void 1 190
+store content 194
+load 213 tokens
+load 214 content
+call 215 lexer_lex_all list 1 214
+call 216 pith_list_release_handle void 1 213
+store tokens 215
+call 217 ast_node_count int 0
+store range_start 217
+load 218 tokens
+load 219 file_path
+call 220 parser_parse_with_file int 2 218 219
+store mod_root 220
+call 221 parser_parser_has_errors bool 0
+brif 221 L313 L314
+label L313
+call 222 parser_parser_diagnostics list 0
+store driver_driver_parse_diagnostics 222
+load 223 roots
+iconst 224 1
+iconst 225 0
+iconst 226 3
+call 227 pith_struct_alloc struct:tuple 1 226
+sstore 227 0 224
+sstore 227 1 223
+sstore 227 2 225
+load 228 imports
+call 229 pith_list_release_handle void 1 228
+load 230 file_path
+call 231 pith_cstring_release void 1 230
+load 232 pos
+call 233 pith_struct_release void 1 232
+load 234 cycle_msg
+call 235 pith_cstring_release void 1 234
+load 236 content
+call 237 pith_cstring_release void 1 236
+load 238 tokens
 call 239 pith_list_release_handle void 1 238
-load 240 file_path
-call 241 pith_cstring_release void 1 240
-load 242 pos
-call 243 pith_struct_release void 1 242
-load 244 cycle_msg
-call 245 pith_cstring_release void 1 244
-load 246 content
-call 247 pith_cstring_release void 1 246
-load 248 tokens
-call 249 pith_list_release_handle void 1 248
-load 250 sub_roots
-call 251 pith_list_release_handle void 1 250
-ret 237
-label L287
-label L285
-load 252 driver_resolved_module_paths
-load 253 mod_root
-load 254 __loopvar_441_mod_path
-call 255 map_insert_ikey void 3 252 253 254
-load 256 driver_resolved_module_files
-load 257 mod_root
-load 258 file_path
-call 259 map_insert_ikey void 3 256 257 258
-load 260 sub_roots
-load 261 mod_root
-load 262 file_path
-call 263 driver_resolve_imports tuple 2 261 262
-field 264 263 0 bool is_ok
-brif 264 L288 L289
-label L288
-field 265 263 8 list ok
-call 266 pith_struct_release void 1 263
-jmp L290
-label L289
-load 267 roots
-call 268 pith_list_release_handle void 1 267
-load 269 imports
-call 270 pith_list_release_handle void 1 269
-load 271 file_path
+load 240 sub_roots
+call 241 pith_list_release_handle void 1 240
+ret 227
+label L314
+label L312
+load 242 range_start
+call 243 ast_node_count int 0
+load 244 file_path
+call 245 driver_record_module_node_range void 3 242 243 244
+load 246 driver_resolved_module_paths
+load 247 mod_root
+load 248 __loopvar_441_mod_path
+call 249 map_insert_ikey void 3 246 247 248
+load 250 driver_resolved_module_files
+load 251 mod_root
+load 252 file_path
+call 253 map_insert_ikey void 3 250 251 252
+load 254 sub_roots
+load 255 mod_root
+load 256 file_path
+call 257 driver_resolve_imports tuple 2 255 256
+field 258 257 0 bool is_ok
+brif 258 L315 L316
+label L315
+field 259 257 8 list ok
+call 260 pith_struct_release void 1 257
+jmp L317
+label L316
+load 261 roots
+call 262 pith_list_release_handle void 1 261
+load 263 imports
+call 264 pith_list_release_handle void 1 263
+load 265 file_path
+call 266 pith_cstring_release void 1 265
+load 267 pos
+call 268 pith_struct_release void 1 267
+load 269 cycle_msg
+call 270 pith_cstring_release void 1 269
+load 271 content
 call 272 pith_cstring_release void 1 271
-load 273 pos
-call 274 pith_struct_release void 1 273
-load 275 cycle_msg
-call 276 pith_cstring_release void 1 275
-load 277 content
-call 278 pith_cstring_release void 1 277
-load 279 tokens
-call 280 pith_list_release_handle void 1 279
-load 281 sub_roots
-call 282 pith_list_release_handle void 1 281
-ret 263
-label L290
-call 283 pith_list_release_handle void 1 260
-store sub_roots 265
-load 284 driver_driver_parse_diagnostics
-call 285 pith_list_len int 1 284
-iconst 286 0
-gt 287 285 286
-brif 287 L292 L293
-label L292
-load 288 roots
-iconst 289 1
-iconst 290 0
-iconst 291 3
-call 292 pith_struct_alloc struct:tuple 1 291
-sstore 292 0 289
-sstore 292 1 288
-sstore 292 2 290
-load 293 imports
-call 294 pith_list_release_handle void 1 293
-load 295 file_path
+load 273 tokens
+call 274 pith_list_release_handle void 1 273
+load 275 sub_roots
+call 276 pith_list_release_handle void 1 275
+ret 257
+label L317
+call 277 pith_list_release_handle void 1 254
+store sub_roots 259
+load 278 driver_driver_parse_diagnostics
+call 279 pith_list_len int 1 278
+iconst 280 0
+gt 281 279 280
+brif 281 L319 L320
+label L319
+load 282 roots
+iconst 283 1
+iconst 284 0
+iconst 285 3
+call 286 pith_struct_alloc struct:tuple 1 285
+sstore 286 0 283
+sstore 286 1 282
+sstore 286 2 284
+load 287 imports
+call 288 pith_list_release_handle void 1 287
+load 289 file_path
+call 290 pith_cstring_release void 1 289
+load 291 pos
+call 292 pith_struct_release void 1 291
+load 293 cycle_msg
+call 294 pith_cstring_release void 1 293
+load 295 content
 call 296 pith_cstring_release void 1 295
-load 297 pos
-call 298 pith_struct_release void 1 297
-load 299 cycle_msg
-call 300 pith_cstring_release void 1 299
-load 301 content
-call 302 pith_cstring_release void 1 301
-load 303 tokens
-call 304 pith_list_release_handle void 1 303
-load 305 sub_roots
-call 306 pith_list_release_handle void 1 305
-ret 292
-label L293
-label L291
-load 307 driver_files_being_checked
-load 308 file_path
-call 309 map_remove void 2 307 308
-load 310 sub_roots
-call 311 pith_auto_len int 1 310
-iconst 312 0
-store __for_idx_443 312
-store __for_len_443 311
-store __for_iter_443 310
-label L294
-load 313 __for_idx_443
-load 314 __for_len_443
-lt 315 313 314
-brif 315 L295 L297
-label L295
-load 316 __for_iter_443
-load 317 __for_idx_443
-call 318 pith_list_get_value unknown 2 316 317
-store __loopvar_443_sr 318
+load 297 tokens
+call 298 pith_list_release_handle void 1 297
+load 299 sub_roots
+call 300 pith_list_release_handle void 1 299
+ret 286
+label L320
+label L318
+load 301 driver_files_being_checked
+load 302 file_path
+call 303 map_remove void 2 301 302
+load 304 sub_roots
+call 305 pith_auto_len int 1 304
+iconst 306 0
+store __for_idx_443 306
+store __for_len_443 305
+store __for_iter_443 304
+label L321
+load 307 __for_idx_443
+load 308 __for_len_443
+lt 309 307 308
+brif 309 L322 L324
+label L322
+load 310 __for_iter_443
+load 311 __for_idx_443
+call 312 pith_list_get_value unknown 2 310 311
+store __loopvar_443_sr 312
+load 313 roots
+load 314 __loopvar_443_sr
+call 315 pith_list_push_value void 2 313 314
+label L323
+load 316 __for_idx_443
+iconst 317 1
+add 318 316 317
+store __for_idx_443 318
+jmp L321
+label L324
 load 319 roots
-load 320 __loopvar_443_sr
+load 320 mod_root
 call 321 pith_list_push_value void 2 319 320
-label L296
-load 322 __for_idx_443
+label L288
+load 322 __for_idx_441
 iconst 323 1
 add 324 322 323
-store __for_idx_443 324
-jmp L294
-label L297
+store __for_idx_441 324
+jmp L286
+label L289
 load 325 roots
-load 326 mod_root
-call 327 pith_list_push_value void 2 325 326
-label L258
-load 328 __for_idx_441
-iconst 329 1
-add 330 328 329
-store __for_idx_441 330
-jmp L256
-label L259
-load 331 roots
-iconst 332 1
-iconst 333 0
-iconst 334 3
-call 335 pith_struct_alloc struct:tuple 1 334
-sstore 335 0 332
-sstore 335 1 331
-sstore 335 2 333
-load 336 imports
-call 337 pith_list_release_handle void 1 336
-load 338 file_path
+iconst 326 1
+iconst 327 0
+iconst 328 3
+call 329 pith_struct_alloc struct:tuple 1 328
+sstore 329 0 326
+sstore 329 1 325
+sstore 329 2 327
+load 330 imports
+call 331 pith_list_release_handle void 1 330
+load 332 file_path
+call 333 pith_cstring_release void 1 332
+load 334 pos
+call 335 pith_struct_release void 1 334
+load 336 cycle_msg
+call 337 pith_cstring_release void 1 336
+load 338 content
 call 339 pith_cstring_release void 1 338
-load 340 pos
-call 341 pith_struct_release void 1 340
-load 342 cycle_msg
-call 343 pith_cstring_release void 1 342
-load 344 content
-call 345 pith_cstring_release void 1 344
-load 346 tokens
+load 340 tokens
+call 341 pith_list_release_handle void 1 340
+load 342 sub_roots
+call 343 pith_list_release_handle void 1 342
+ret 329
+load 344 roots
+call 345 pith_list_release_handle void 1 344
+load 346 imports
 call 347 pith_list_release_handle void 1 346
-load 348 sub_roots
-call 349 pith_list_release_handle void 1 348
-ret 335
-load 350 roots
-call 351 pith_list_release_handle void 1 350
-load 352 imports
-call 353 pith_list_release_handle void 1 352
-load 354 file_path
+load 348 file_path
+call 349 pith_cstring_release void 1 348
+load 350 pos
+call 351 pith_struct_release void 1 350
+load 352 cycle_msg
+call 353 pith_cstring_release void 1 352
+load 354 content
 call 355 pith_cstring_release void 1 354
-load 356 pos
-call 357 pith_struct_release void 1 356
-load 358 cycle_msg
-call 359 pith_cstring_release void 1 358
-load 360 content
-call 361 pith_cstring_release void 1 360
-load 362 tokens
-call 363 pith_list_release_handle void 1 362
-load 364 sub_roots
-call 365 pith_list_release_handle void 1 364
-iconst 366 0
-ret 366
+load 356 tokens
+call 357 pith_list_release_handle void 1 356
+load 358 sub_roots
+call 359 pith_list_release_handle void 1 358
+iconst 360 0
+ret 360
 endfunc
 func driver_mark_visited 1 void
 param path
@@ -193353,29 +193581,54 @@ ret 5
 endfunc
 func driver_init_driver 1 void
 param source_path
-load 1 driver_stdlib_root_directory
-load 2 source_path
-call 3 driver_dr_find_stdlib_root string 1 2
-call 4 pith_cstring_release void 1 1
-store driver_stdlib_root_directory 3
-call 5 pith_map_new_default map 0
-store driver_visited_files 5
-call 6 pith_map_new_default map 0
-store driver_files_being_checked 6
-call 7 pith_list_new_struct list 0
-store driver_driver_parse_diagnostics 7
-call 8 pith_map_new_int_cstr_val map_int 0
-store driver_resolved_module_paths 8
-call 9 pith_map_new_int_cstr_val map_int 0
-store driver_resolved_module_files 9
-call 10 pith_map_new_default map 0
-store driver_package_dependency_loaded 10
-call 11 pith_map_new_cstr_val map 0
-store driver_package_dependency_roots 11
-load 12 source_path
-call 13 driver_mark_visited void 1 12
-iconst 14 0
-ret 14
+load 1 driver_stdlib_root_known
+iconst 3 1
+sub 2 3 1
+brif 2 L326 L327
+label L326
+load 4 driver_cached_stdlib_root
+load 5 source_path
+call 6 driver_dr_find_stdlib_root string 1 5
+call 7 pith_cstring_release void 1 4
+store driver_cached_stdlib_root 6
+iconst 8 1
+store driver_stdlib_root_known 8
+jmp L325
+label L327
+label L325
+load 9 driver_stdlib_root_directory
+load 10 driver_cached_stdlib_root
+call 11 pith_cstring_retain void 1 10
+call 12 pith_cstring_release void 1 9
+store driver_stdlib_root_directory 10
+call 13 pith_map_new_default map 0
+store driver_visited_files 13
+call 14 pith_map_new_default map 0
+store driver_files_being_checked 14
+call 15 pith_list_new_struct list 0
+store driver_driver_parse_diagnostics 15
+call 16 pith_map_new_int_cstr_val map_int 0
+store driver_resolved_module_paths 16
+call 17 pith_map_new_int_cstr_val map_int 0
+store driver_resolved_module_files 17
+call 18 pith_map_new_default map 0
+store driver_package_dependency_loaded 18
+call 19 pith_map_new_cstr_val map 0
+store driver_package_dependency_roots 19
+call 20 pith_list_new_default list 0
+store driver_module_range_starts 20
+call 21 pith_list_new_default list 0
+store driver_module_range_ends 21
+call 22 pith_list_new_cstr list 0
+store driver_module_range_files 22
+iconst 23 0
+call 24 ast_node_count int 0
+load 25 source_path
+call 26 driver_record_module_node_range void 3 23 24 25
+load 27 source_path
+call 28 driver_mark_visited void 1 27
+iconst 29 0
+ret 29
 endfunc
 func driver_get_driver_parse_diagnostics 0 list
 load 0 driver_driver_parse_diagnostics
@@ -193398,15 +193651,15 @@ param root_idx
 load 1 driver_resolved_module_paths
 load 2 root_idx
 call 3 map_contains_ikey bool 2 1 2
-brif 3 L299 L300
-label L299
+brif 3 L329 L330
+label L329
 load 4 driver_resolved_module_paths
 load 5 root_idx
 call 6 map_get_ikey_strict string 2 4 5
 call 7 pith_cstring_retain void 1 6
 ret 6
-label L300
-label L298
+label L330
+label L328
 strref 8 m53s69
 ret 8
 iconst 9 0
@@ -193417,15 +193670,15 @@ param root_idx
 load 1 driver_resolved_module_files
 load 2 root_idx
 call 3 map_contains_ikey bool 2 1 2
-brif 3 L302 L303
-label L302
+brif 3 L332 L333
+label L332
 load 4 driver_resolved_module_files
 load 5 root_idx
 call 6 map_get_ikey_strict string 2 4 5
 call 7 pith_cstring_retain void 1 6
 ret 6
-label L303
-label L301
+label L333
+label L331
 strref 8 m53s69
 ret 8
 iconst 9 0

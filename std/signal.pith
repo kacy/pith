@@ -36,6 +36,9 @@ pub SIGINT := 2
 pub SIGQUIT := 3
 ## terminate — the polite "stop now" every orchestrator sends first.
 pub SIGTERM := 15
+## window size changed — the terminal was resized. a tui arms this and
+## re-queries the size when it fires; see docs/terminal.md.
+pub SIGWINCH := 28
 
 ## the highest signal number this module will arm. signals are encoded as bit
 ## positions in an Int mask, so bit 63 is the ceiling.
@@ -58,6 +61,8 @@ pub fn name(sig: Int) -> String:
         return "SIGQUIT"
     if sig == SIGTERM:
         return "SIGTERM"
+    if sig == SIGWINCH:
+        return "SIGWINCH"
     return "SIG" + sig.to_string()
 
 ## fold a list of signal numbers into the bitmask the runtime takes. fails on a
@@ -129,6 +134,8 @@ test "signal names cover the shutdown trio and fall back for the rest":
     assert_eq(name(SIGINT), "SIGINT")
     assert_eq(name(SIGHUP), "SIGHUP")
     assert_eq(name(SIGQUIT), "SIGQUIT")
+    assert_eq(name(SIGWINCH), "SIGWINCH")
+    assert_eq(SIGWINCH, 28)
     assert_eq(name(9), "SIG9")
 
 test "the shutdown trio is the three signals an orchestrator sends":

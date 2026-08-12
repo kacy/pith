@@ -191,6 +191,7 @@ pith check <file>        type check (--json for machine output)
 pith fmt <file>          format (--check to verify)
 pith lint <file>         conventions (--json available)
 pith doc <file>          docs (--check verifies pub items documented)
+pith lsp                 language server over stdio (diagnostics, hover, symbols, formatting)
 pith lex / parse         token stream / ast, for the curious
 pith package <cmd>       check/test/lint/doc/deps/lock/install/inspect
 ```

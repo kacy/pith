@@ -111,7 +111,7 @@ fn run_cli() {
             println!("Pith Cranelift Compiler v{}", env!("CARGO_PKG_VERSION"));
             println!("Using IR path: source → ir_emitter.pith → ir_consumer.rs → native");
         }
-        "fmt" | "lint" | "doc" | "new" | "package" => {
+        "fmt" | "lint" | "doc" | "new" | "package" | "lsp" => {
             delegate_to_frontend(&args[1..]);
         }
         "help" | "--help" | "-h" => {
@@ -139,6 +139,7 @@ fn print_usage() {
     println!("  doc [args...]      Generate or search documentation");
     println!("  package [args...]  Run package-level check/test/lint/doc");
     println!("  new [args...]      Create a new project");
+    println!("  lsp                Run the language server over stdio");
     println!("  parse <file.pith>    Parse and display AST");
     println!("  lex <file.pith>      Tokenize and display token stream");
     println!("  version            Display version information");

@@ -1,0 +1,638 @@
+# std.term.input — terminal input, decoded from bytes to events
+#
+# a terminal in raw mode delivers keystrokes as bytes: printable characters
+# as themselves, control keys as low bytes, and everything else — arrows,
+# function keys, the mouse, pasted text — as escape sequences. this module
+# turns those bytes into typed events with a push parser: feed it whatever
+# arrived, get back every event those bytes completed, and let it hold the
+# tail of an unfinished sequence until more bytes come.
+#
+#   p := input.parser()
+#   for ev in input.feed(p, chunk):
+#       match ev:
+#           input.Event.KeyPress(k) =>
+#               print(input.key_name(k))
+#           _ => pass_on(ev)
+#
+# the parser never touches the terminal, so every shape it decodes is
+# testable from a byte literal. the one ambiguity bytes cannot resolve is a
+# lone escape: ESC alone is the escape key, but ESC is also how every
+# sequence starts. the session layer resolves it by time — when a read
+# times out while pending() is true, flush() turns the held prefix into
+# its literal reading.
+import std.bytes as bytes
+
+# modifier bits on Key.mods and MouseEvent.mods.
+pub MOD_SHIFT := 1
+pub MOD_ALT := 2
+pub MOD_CTRL := 4
+
+# a key identity: a printable character (one grapheme) or a named key.
+# ctrl-c arrives as Char("c") with MOD_CTRL set, not as a separate code.
+pub enum KeyCode:
+    Char(String)
+    Enter
+    Tab
+    Backspace
+    Escape
+    Up
+    Down
+    Left
+    Right
+    Home
+    End
+    PageUp
+    PageDown
+    Insert
+    Delete
+    F(Int)
+
+# one key press: what was pressed plus the modifier bits held with it.
+pub struct Key:
+    pub code: KeyCode
+    pub mods: Int
+
+# what a mouse event reports happening.
+pub enum MouseKind:
+    Press
+    Release
+    Drag
+    Move
+    ScrollUp
+    ScrollDown
+
+# one mouse event in the sgr-1006 encoding: 0-based cell coordinates,
+# button 0 left / 1 middle / 2 right / -1 none, and the modifier bits.
+pub struct MouseEvent:
+    pub kind: MouseKind
+    pub button: Int
+    pub col: Int
+    pub row: Int
+    pub mods: Int
+
+# everything a terminal session can hand an application. KeyPress, Mouse,
+# Paste, FocusIn and FocusOut come from this parser; Resize, Signal and
+# Closed are emitted by the session layer, which owns the file descriptor
+# and the signal wiring.
+pub enum Event:
+    KeyPress(Key)
+    Mouse(MouseEvent)
+    Paste(String)
+    Resize(Int, Int)
+    FocusIn
+    FocusOut
+    Signal(Int)
+    Closed
+
+# parser states. ground is "not inside anything".
+ST_GROUND := 0
+ST_ESC := 1
+ST_CSI := 2
+ST_SS3 := 3
+ST_OSC := 4
+ST_OSC_ESC := 5
+ST_UTF8 := 6
+ST_PASTE := 7
+
+# the push parser. holds at most one unfinished sequence between feeds; a
+# paste additionally accumulates its payload until the closing marker.
+pub struct Parser:
+    mut state: Int
+    mut seq: List[Int]        # bytes of the sequence being collected
+    mut utf8_need: Int        # continuation bytes still expected
+    mut alt: Bool             # an esc prefix is pending on the next key
+    mut paste_buf: List[Int]  # paste payload collected so far
+    mut paste_match: Int      # how much of the paste terminator has matched
+
+# a fresh parser with nothing pending.
+pub fn parser() -> Parser:
+    return Parser(state: ST_GROUND, seq: [], utf8_need: 0, alt: false, paste_buf: [], paste_match: 0)
+
+# does the parser hold an unfinished sequence? when a read times out with
+# this true, call flush() to resolve the ambiguity.
+pub fn pending(p: Parser) -> Bool:
+    return p.state != ST_GROUND
+
+# feed raw bytes; returns every event they completed, possibly none. an
+# unfinished sequence at the end of the chunk stays held for the next feed.
+pub fn feed(p: Parser, data: Bytes) -> List[Event]:
+    mut out: List[Event] := []
+    mut i := 0
+    n := data.len()
+    while i < n:
+        b := bytes.get(data, i)
+        i = i + 1
+        if p.state == ST_GROUND:
+            ground_byte(p, b, out)
+        elif p.state == ST_ESC:
+            esc_byte(p, b, out)
+        elif p.state == ST_CSI:
+            csi_byte(p, b, out)
+        elif p.state == ST_SS3:
+            ss3_byte(p, b, out)
+        elif p.state == ST_OSC:
+            if b == 7:
+                to_ground(p)
+            elif b == 27:
+                p.state = ST_OSC_ESC
+        elif p.state == ST_OSC_ESC:
+            if b == 92:
+                to_ground(p)
+            else:
+                # an esc that did not close the title rejoins the body.
+                p.state = ST_OSC
+        elif p.state == ST_UTF8:
+            utf8_byte(p, b, out)
+        else:
+            paste_byte(p, b, out)
+    return out
+
+# resolve a held prefix after an idle gap: a lone esc becomes the escape
+# key, esc-esc pending alt becomes alt+esc, and a truncated csi, ss3, osc or
+# utf-8 sequence is dropped — its bytes were never a complete anything, and
+# leaking them as text would corrupt the application's input. an open paste
+# stays open: its end is a marker, not a timeout.
+pub fn flush(p: Parser) -> List[Event]:
+    mut out: List[Event] := []
+    if p.state == ST_ESC:
+        mods := alt_mods(p)
+        out.push(Event.KeyPress(Key(code: KeyCode.Escape, mods: mods)))
+        to_ground(p)
+    elif p.state == ST_CSI or p.state == ST_SS3 or p.state == ST_OSC or p.state == ST_OSC_ESC or p.state == ST_UTF8:
+        to_ground(p)
+    return out
+
+fn to_ground(p: Parser):
+    p.state = ST_GROUND
+    p.seq = []
+    p.utf8_need = 0
+    p.alt = false
+
+# take the pending alt flag, clearing it.
+fn alt_mods(p: Parser) -> Int:
+    if p.alt:
+        p.alt = false
+        return MOD_ALT
+    return 0
+
+fn push_key(out: List[Event], code: KeyCode, mods: Int):
+    out.push(Event.KeyPress(Key(code: code, mods: mods)))
+
+fn ground_byte(p: Parser, b: Int, out: List[Event]):
+    mods := alt_mods(p)
+    if b == 27:
+        p.state = ST_ESC
+        # an alt prefix that ran into another esc was a lone escape key.
+        if mods != 0:
+            push_key(out, KeyCode.Escape, 0)
+    elif b == 13 or b == 10:
+        push_key(out, KeyCode.Enter, mods)
+    elif b == 9:
+        push_key(out, KeyCode.Tab, mods)
+    elif b == 127 or b == 8:
+        push_key(out, KeyCode.Backspace, mods)
+    elif b >= 1 and b <= 26:
+        # ctrl-a .. ctrl-z arrive as bytes 1..26
+        push_key(out, KeyCode.Char(chr(96 + b)), mods + MOD_CTRL)
+    elif b >= 32 and b <= 126:
+        push_key(out, KeyCode.Char(chr(b)), mods)
+    elif b >= 194 and b <= 244:
+        # utf-8 lead byte: 2, 3 or 4 bytes total
+        p.state = ST_UTF8
+        p.seq = [b]
+        if b >= 240:
+            p.utf8_need = 3
+        elif b >= 224:
+            p.utf8_need = 2
+        else:
+            p.utf8_need = 1
+        if mods != 0:
+            p.alt = true
+    # anything else — nul, stray continuation bytes, unmapped controls — is
+    # dropped: garbage must never wedge the state machine.
+
+fn esc_byte(p: Parser, b: Int, out: List[Event]):
+    if b == 91:
+        p.state = ST_CSI
+        p.seq = []
+    elif b == 79:
+        p.state = ST_SS3
+    elif b == 93:
+        p.state = ST_OSC
+    elif b == 27:
+        # esc esc: the first was the escape key, the second starts over.
+        push_key(out, KeyCode.Escape, 0)
+    else:
+        # esc followed by an ordinary byte is alt + that key.
+        p.state = ST_GROUND
+        p.alt = true
+        ground_byte(p, b, out)
+
+fn utf8_byte(p: Parser, b: Int, out: List[Event]):
+    if b < 128 or b > 191:
+        # not a continuation byte: the sequence was invalid. drop it and
+        # reprocess this byte from ground so real input is not lost.
+        mods := alt_mods(p)
+        to_ground(p)
+        if mods != 0:
+            p.alt = true
+        ground_byte(p, b, out)
+        return
+    p.seq.push(b)
+    p.utf8_need = p.utf8_need - 1
+    if p.utf8_need == 0:
+        mods := alt_mods(p)
+        arr := bytes.array()
+        for v in p.seq:
+            arr.push(v) catch 0
+        ch := bytes.to_string_utf8(arr.bytes()) catch ""
+        to_ground(p)
+        if ch != "":
+            push_key(out, KeyCode.Char(ch), mods)
+
+fn csi_byte(p: Parser, b: Int, out: List[Event]):
+    if b >= 64 and b <= 126:
+        decode_csi(p, b, out)
+        # decode_csi may have moved into paste; otherwise return to ground.
+        if p.state == ST_CSI:
+            to_ground(p)
+    elif p.seq.len() > 64:
+        # no real sequence is this long; drop it rather than buffer forever.
+        to_ground(p)
+    else:
+        p.seq.push(b)
+
+# split the collected csi parameter bytes into numbers. "1;5" -> [1, 5];
+# an empty or missing field reads as 0.
+fn csi_params(p: Parser) -> List[Int]:
+    mut params: List[Int] := []
+    mut cur := 0
+    mut any := false
+    for b in p.seq:
+        if b >= 48 and b <= 57:
+            cur = cur * 10 + (b - 48)
+            any = true
+        elif b == 59:
+            params.push(cur)
+            cur = 0
+            any = true
+    if any:
+        params.push(cur)
+    return params
+
+fn param_at(params: List[Int], index: Int, dflt: Int) -> Int:
+    if index < params.len():
+        return params[index]
+    return dflt
+
+# xterm packs modifiers as (bits + 1) in the second parameter: 2 shift,
+# 3 alt, 5 ctrl, and sums for combinations.
+fn param_mods(params: List[Int], index: Int) -> Int:
+    m := param_at(params, index, 1)
+    if m <= 1:
+        return 0
+    return m - 1
+
+fn decode_csi(p: Parser, final: Int, out: List[Event]):
+    # sgr mouse reports start with '<'
+    if p.seq.len() > 0 and p.seq[0] == 60 and (final == 77 or final == 109):
+        decode_mouse(p, final == 77, out)
+        return
+    params := csi_params(p)
+    mods := param_mods(params, 1)
+    if final == 65:
+        push_key(out, KeyCode.Up, mods)
+    elif final == 66:
+        push_key(out, KeyCode.Down, mods)
+    elif final == 67:
+        push_key(out, KeyCode.Right, mods)
+    elif final == 68:
+        push_key(out, KeyCode.Left, mods)
+    elif final == 72:
+        push_key(out, KeyCode.Home, mods)
+    elif final == 70:
+        push_key(out, KeyCode.End, mods)
+    elif final == 90:
+        # csi Z is shift-tab
+        push_key(out, KeyCode.Tab, MOD_SHIFT)
+    elif final == 73:
+        out.push(Event.FocusIn)
+    elif final == 79:
+        out.push(Event.FocusOut)
+    elif final == 126:
+        decode_tilde(p, params, out)
+    # any other final byte is a sequence this layer has no meaning for;
+    # it is consumed and dropped.
+
+# csi <number> ~ : editing keys, function keys, and the paste markers.
+fn decode_tilde(p: Parser, params: List[Int], out: List[Event]):
+    num := param_at(params, 0, 0)
+    mods := param_mods(params, 1)
+    if num == 200:
+        p.state = ST_PASTE
+        p.paste_buf = []
+        p.paste_match = 0
+        return
+    code := tilde_code(num)
+    if let c = code:
+        push_key(out, c, mods)
+
+fn tilde_code(num: Int) -> KeyCode?:
+    if num == 1 or num == 7:
+        return KeyCode.Home
+    if num == 2:
+        return KeyCode.Insert
+    if num == 3:
+        return KeyCode.Delete
+    if num == 4 or num == 8:
+        return KeyCode.End
+    if num == 5:
+        return KeyCode.PageUp
+    if num == 6:
+        return KeyCode.PageDown
+    if num >= 11 and num <= 15:
+        return KeyCode.F(num - 10)
+    if num >= 17 and num <= 21:
+        return KeyCode.F(num - 11)
+    if num == 23 or num == 24:
+        return KeyCode.F(num - 12)
+    return none
+
+# sgr-1006: csi < b ; x ; y M/m with 1-based coordinates. M is press (or
+# drag, scroll, move — packed into b), m is release.
+fn decode_mouse(p: Parser, is_press: Bool, out: List[Event]):
+    # drop the leading '<' before splitting parameters
+    p.seq = p.seq.slice(1, p.seq.len())
+    params := csi_params(p)
+    b := param_at(params, 0, 0)
+    col := param_at(params, 1, 1) - 1
+    row := param_at(params, 2, 1) - 1
+    mut mods := 0
+    if (b / 4) % 2 == 1:
+        mods = mods + MOD_SHIFT
+    if (b / 8) % 2 == 1:
+        mods = mods + MOD_ALT
+    if (b / 16) % 2 == 1:
+        mods = mods + MOD_CTRL
+    low := b % 4
+    mut button := low
+    if low == 3:
+        button = 0 - 1
+    mut kind := MouseKind.Press
+    if b >= 64:
+        if b % 2 == 0:
+            kind = MouseKind.ScrollUp
+        else:
+            kind = MouseKind.ScrollDown
+        button = 0 - 1
+    elif (b / 32) % 2 == 1:
+        if button < 0:
+            kind = MouseKind.Move
+        else:
+            kind = MouseKind.Drag
+    elif not is_press:
+        kind = MouseKind.Release
+    out.push(Event.Mouse(MouseEvent(kind: kind, button: button, col: col, row: row, mods: mods)))
+
+fn ss3_byte(p: Parser, b: Int, out: List[Event]):
+    to_ground(p)
+    if b == 65:
+        push_key(out, KeyCode.Up, 0)
+    elif b == 66:
+        push_key(out, KeyCode.Down, 0)
+    elif b == 67:
+        push_key(out, KeyCode.Right, 0)
+    elif b == 68:
+        push_key(out, KeyCode.Left, 0)
+    elif b == 72:
+        push_key(out, KeyCode.Home, 0)
+    elif b == 70:
+        push_key(out, KeyCode.End, 0)
+    elif b >= 80 and b <= 83:
+        push_key(out, KeyCode.F(b - 79), 0)
+    # anything else: the pair is consumed and dropped.
+
+# the paste terminator, esc [ 2 0 1 ~, matched incrementally so it can
+# arrive split across feeds.
+PASTE_END := [27, 91, 50, 48, 49, 126]
+
+fn paste_byte(p: Parser, b: Int, out: List[Event]):
+    if b == PASTE_END[p.paste_match]:
+        p.paste_match = p.paste_match + 1
+        if p.paste_match == 6:
+            arr := bytes.array()
+            for v in p.paste_buf:
+                arr.push(v) catch 0
+            content := bytes.to_string_utf8(arr.bytes()) catch ""
+            p.paste_buf = []
+            p.paste_match = 0
+            to_ground(p)
+            out.push(Event.Paste(content))
+        return
+    # a false start on the terminator: the matched prefix was payload.
+    mut j := 0
+    while j < p.paste_match:
+        p.paste_buf.push(PASTE_END[j])
+        j = j + 1
+    p.paste_match = 0
+    if b == 27:
+        p.paste_match = 1
+    else:
+        p.paste_buf.push(b)
+
+# the canonical name of a key: "a", "enter", "shift+tab", "ctrl+alt+x",
+# "f5". modifiers come in ctrl, alt, shift order; named keys are lowercase.
+# keybinding tables match against these names.
+pub fn key_name(k: Key) -> String:
+    mut parts: List[String] := []
+    if (k.mods / MOD_CTRL) % 2 == 1:
+        parts.push("ctrl")
+    if (k.mods / MOD_ALT) % 2 == 1:
+        parts.push("alt")
+    if k.mods % 2 == 1:
+        parts.push("shift")
+    parts.push(code_name(k.code))
+    return parts.join("+")
+
+fn code_name(code: KeyCode) -> String:
+    return match code:
+        KeyCode.Char(c) => c
+        KeyCode.Enter => "enter"
+        KeyCode.Tab => "tab"
+        KeyCode.Backspace => "backspace"
+        KeyCode.Escape => "esc"
+        KeyCode.Up => "up"
+        KeyCode.Down => "down"
+        KeyCode.Left => "left"
+        KeyCode.Right => "right"
+        KeyCode.Home => "home"
+        KeyCode.End => "end"
+        KeyCode.PageUp => "pgup"
+        KeyCode.PageDown => "pgdn"
+        KeyCode.Insert => "insert"
+        KeyCode.Delete => "delete"
+        KeyCode.F(n) => "f{n}"
+
+# a compact readable form of any event, for logs and tests: "key:ctrl+c",
+# "mouse:press:0@10,5", "paste:8 bytes", "resize:80x24".
+pub fn describe(ev: Event) -> String:
+    return match ev:
+        Event.KeyPress(k) => "key:" + key_name(k)
+        Event.Mouse(m) => "mouse:" + mouse_kind_name(m.kind) + ":{m.button}@{m.col},{m.row}" + mods_suffix(m.mods)
+        Event.Paste(s) => "paste:{s.len()} bytes"
+        Event.Resize(cols, rows) => "resize:{cols}x{rows}"
+        Event.FocusIn => "focus:in"
+        Event.FocusOut => "focus:out"
+        Event.Signal(n) => "signal:{n}"
+        Event.Closed => "closed"
+
+fn mouse_kind_name(kind: MouseKind) -> String:
+    return match kind:
+        MouseKind.Press => "press"
+        MouseKind.Release => "release"
+        MouseKind.Drag => "drag"
+        MouseKind.Move => "move"
+        MouseKind.ScrollUp => "scrollup"
+        MouseKind.ScrollDown => "scrolldown"
+
+fn mods_suffix(mods: Int) -> String:
+    if mods == 0:
+        return ""
+    return "+m{mods}"
+
+# -- test helpers -------------------------------------------------------
+
+fn feed_all(p: Parser, byte_values: List[Int]) -> List[String]:
+    arr := bytes.array()
+    for v in byte_values:
+        arr.push(v) catch 0
+    mut names: List[String] := []
+    for ev in feed(p, arr.bytes()):
+        names.push(describe(ev))
+    return names
+
+fn one(p: Parser, byte_values: List[Int]) -> String:
+    names := feed_all(p, byte_values)
+    if names.len() != 1:
+        return "expected 1 event, got {names.len()}"
+    return names[0]
+
+test "plain characters and control keys decode":
+    p := parser()
+    assert_eq(one(p, [97]), "key:a")
+    assert_eq(one(p, [13]), "key:enter")
+    assert_eq(one(p, [9]), "key:tab")
+    assert_eq(one(p, [127]), "key:backspace")
+    assert_eq(one(p, [3]), "key:ctrl+c")
+    assert_eq(one(p, [26]), "key:ctrl+z")
+    assert_eq(feed_all(p, [104, 105]).join(","), "key:h,key:i")
+
+test "utf8 characters decode even split across feeds":
+    p := parser()
+    # é is 0xc3 0xa9
+    assert_eq(one(p, [195, 169]), "key:é")
+    assert_eq(feed_all(p, [195]).len(), 0)
+    assert(pending(p))
+    assert_eq(one(p, [169]), "key:é")
+    assert_eq(pending(p), false)
+    # 日 is e6 97 a5
+    assert_eq(one(p, [230, 151, 165]), "key:日")
+
+test "arrows and named keys in csi and ss3 form":
+    p := parser()
+    assert_eq(one(p, [27, 91, 65]), "key:up")
+    assert_eq(one(p, [27, 91, 68]), "key:left")
+    assert_eq(one(p, [27, 79, 66]), "key:down")
+    assert_eq(one(p, [27, 91, 72]), "key:home")
+    assert_eq(one(p, [27, 91, 51, 126]), "key:delete")
+    assert_eq(one(p, [27, 91, 53, 126]), "key:pgup")
+    assert_eq(one(p, [27, 91, 54, 126]), "key:pgdn")
+    assert_eq(one(p, [27, 91, 50, 126]), "key:insert")
+
+test "modifier parameters and shift-tab decode":
+    p := parser()
+    # esc [ 1 ; 5 C = ctrl-right
+    assert_eq(one(p, [27, 91, 49, 59, 53, 67]), "key:ctrl+right")
+    # esc [ 1 ; 2 A = shift-up
+    assert_eq(one(p, [27, 91, 49, 59, 50, 65]), "key:shift+up")
+    # esc [ Z = shift-tab
+    assert_eq(one(p, [27, 91, 90]), "key:shift+tab")
+    # esc [ 3 ; 3 ~ = alt-delete
+    assert_eq(one(p, [27, 91, 51, 59, 51, 126]), "key:alt+delete")
+
+test "function keys decode across both ranges":
+    p := parser()
+    assert_eq(one(p, [27, 79, 80]), "key:f1")
+    assert_eq(one(p, [27, 79, 83]), "key:f4")
+    assert_eq(one(p, [27, 91, 49, 53, 126]), "key:f5")
+    assert_eq(one(p, [27, 91, 50, 48, 126]), "key:f9")
+    assert_eq(one(p, [27, 91, 50, 52, 126]), "key:f12")
+
+test "alt prefixes a key and lone escape needs the flush":
+    p := parser()
+    # esc x = alt-x
+    assert_eq(one(p, [27, 120]), "key:alt+x")
+    # a lone esc is held until flush resolves it
+    assert_eq(feed_all(p, [27]).len(), 0)
+    assert(pending(p))
+    mut names: List[String] := []
+    for ev in flush(p):
+        names.push(describe(ev))
+    assert_eq(names.join(","), "key:esc")
+    assert_eq(pending(p), false)
+
+test "sgr mouse events decode with kinds and modifiers":
+    p := parser()
+    # press left at (10, 5) 1-based -> (9, 4) 0-based
+    assert_eq(one(p, [27, 91, 60, 48, 59, 49, 48, 59, 53, 77]), "mouse:press:0@9,4")
+    # release the same
+    assert_eq(one(p, [27, 91, 60, 48, 59, 49, 48, 59, 53, 109]), "mouse:release:0@9,4")
+    # drag with left held: 32 + 0
+    assert_eq(one(p, [27, 91, 60, 51, 50, 59, 50, 59, 51, 77]), "mouse:drag:0@1,2")
+    # scroll up is 64
+    assert_eq(one(p, [27, 91, 60, 54, 52, 59, 49, 59, 49, 77]), "mouse:scrollup:-1@0,0")
+    # ctrl+press: 16 + 0
+    assert_eq(one(p, [27, 91, 60, 49, 54, 59, 49, 59, 49, 77]), "mouse:press:0@0,0+m4")
+
+test "bracketed paste collects the payload including esc bytes":
+    p := parser()
+    # esc [ 200 ~ h i esc [ 201 ~
+    start := [27, 91, 50, 48, 48, 126]
+    finish := [27, 91, 50, 48, 49, 126]
+    assert_eq(feed_all(p, start).len(), 0)
+    assert_eq(feed_all(p, [104, 105]).len(), 0)
+    names := feed_all(p, finish)
+    assert_eq(names.join(","), "paste:2 bytes")
+    # a paste containing a bare esc that is not the terminator
+    assert_eq(feed_all(p, start).len(), 0)
+    assert_eq(feed_all(p, [27, 120]).len(), 0)
+    names2 := feed_all(p, finish)
+    assert_eq(names2.join(","), "paste:2 bytes")
+
+test "focus events and titles decode or vanish":
+    p := parser()
+    assert_eq(one(p, [27, 91, 73]), "focus:in")
+    assert_eq(one(p, [27, 91, 79]), "focus:out")
+    # an osc title is swallowed whole, bel-terminated
+    title := [27, 93, 48, 59, 104, 105, 7, 97]
+    assert_eq(feed_all(p, title).join(","), "key:a")
+
+test "garbage and truncated sequences never wedge the parser":
+    p := parser()
+    # stray continuation bytes are dropped
+    assert_eq(feed_all(p, [128, 190]).len(), 0)
+    # a truncated csi followed by a flush loses only itself
+    assert_eq(feed_all(p, [27, 91, 49]).len(), 0)
+    assert_eq(flush(p).len(), 0)
+    assert_eq(one(p, [98]), "key:b")
+    # an invalid utf8 sequence drops and the next real byte still decodes
+    assert_eq(feed_all(p, [195, 65]).join(","), "key:A")
+    # an unknown csi final byte is consumed silently
+    assert_eq(feed_all(p, [27, 91, 49, 112]).len(), 0)
+    assert_eq(one(p, [99]), "key:c")
+
+test "key names order modifiers and cover named keys":
+    assert_eq(key_name(Key(code: KeyCode.Char("x"), mods: MOD_CTRL + MOD_ALT)), "ctrl+alt+x")
+    assert_eq(key_name(Key(code: KeyCode.Tab, mods: MOD_SHIFT)), "shift+tab")
+    assert_eq(key_name(Key(code: KeyCode.F(11), mods: 0)), "f11")
+    assert_eq(key_name(Key(code: KeyCode.PageDown, mods: 0)), "pgdn")

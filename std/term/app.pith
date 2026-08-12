@@ -1,0 +1,446 @@
+# std.term.app — the elm architecture for terminal applications
+#
+# an application is a struct with three duties: turn a terminal event into
+# a state change (returning any side effects as a command), fold deferred
+# messages the same way, and render its state as a frame. the runtime owns
+# everything else — the session, the event loop, timers, and repainting
+# only the lines that changed:
+#
+#   enum CounterMsg:
+#       Inc
+#       Tick
+#
+#   struct Counter:
+#       mut count: Int
+#
+#   impl app.App for Counter:
+#       type Msg = CounterMsg
+#       fn init() -> app.Cmd[CounterMsg]:
+#           return app.every(1000, fn(t: Int) => CounterMsg.Tick)
+#       fn on_event(ev: Event) -> app.Cmd[CounterMsg]:
+#           ...match keys, usually calling self.update(...)...
+#       fn update(msg: CounterMsg) -> app.Cmd[CounterMsg]:
+#           ...mutate self, return a command...
+#       fn view() -> String:
+#           return "count: {self.count}"
+#
+#   app.run(Counter(count: 0))!
+#
+# on_event owns the event-to-message dispatch — usually a match that calls
+# update — because the application's message type is its own business; the
+# runtime only ever sees commands. update and view are total: anything
+# that can fail runs inside a command whose closure folds the error into a
+# message.
+#
+# this runtime is single-tasked: command work runs between frames on the
+# ui turn, and timers fire from the event loop itself. perform() is
+# therefore for quick work — a closure that blocks holds the next frame
+# back exactly as long as it runs. everything but run() works without a
+# terminal: drive() feeds a scripted event list through the same cycle and
+# returns every frame, which is how an application is tested.
+import std.term.ansi as ansi
+import std.term.input as input
+from std.term.input import Event
+import std.term.session as session
+
+# a deferred message from a timer: fire after (or every) `ms`, building the
+# message from the current unix-millisecond clock.
+pub struct TimerSpec[M]:
+    pub ms: Int
+    pub repeat: Bool
+    pub make: fn(Int) -> M
+
+# a command: the side effects one update requested. opaque by convention —
+# build with the constructors, hand back to the runtime. internally it is
+# already flat: batching concatenates, so commands never nest.
+pub struct Cmd[M]:
+    pub stop: Bool
+    pub runs: List[fn() -> M]
+    pub timers: List[TimerSpec[M]]
+
+# the command that does nothing — the usual return from update. the type
+# parameter cannot be inferred from no arguments, so name it at the call:
+# nothing[CounterMsg]().
+pub fn nothing[M]() -> Cmd[M]:
+    return Cmd(stop: false, runs: [], timers: [])
+
+# end the application: the loop exits and the terminal is restored.
+pub fn quit[M]() -> Cmd[M]:
+    return Cmd(stop: true, runs: [], timers: [])
+
+# feed a message back into update on this same turn, after the current
+# update returns.
+pub fn emit[M](m: M) -> Cmd[M]:
+    return Cmd(stop: false, runs: [fn() => m], timers: [])
+
+# defer work off the current update: the closure runs between frames and
+# its return value goes through update. fold failures into the message —
+# the closure must be total — and keep it quick: this runtime is
+# single-tasked, so a slow closure holds back the next frame.
+pub fn perform[M](f: fn() -> M) -> Cmd[M]:
+    return Cmd(stop: false, runs: [f], timers: [])
+
+# deliver f(now_ms) once, after `ms` milliseconds.
+pub fn after[M](ms: Int, f: fn(Int) -> M) -> Cmd[M]:
+    return Cmd(stop: false, runs: [], timers: [TimerSpec(ms: ms, repeat: false, make: f)])
+
+# deliver f(now_ms) every `ms` milliseconds until the application quits.
+# the usual driver for a spinner or a clock.
+pub fn every[M](ms: Int, f: fn(Int) -> M) -> Cmd[M]:
+    return Cmd(stop: false, runs: [], timers: [TimerSpec(ms: ms, repeat: true, make: f)])
+
+# several commands as one: a quit anywhere wins, and the work of all of
+# them is carried flat.
+pub fn batch[M](cmds: List[Cmd[M]]) -> Cmd[M]:
+    mut stop := false
+    mut runs: List[fn() -> M] := []
+    mut timers: List[TimerSpec[M]] := []
+    for c in cmds:
+        if c.stop:
+            stop = true
+        for r in c.runs:
+            runs.push(r)
+        for t in c.timers:
+            timers.push(t)
+    return Cmd(stop: stop, runs: runs, timers: timers)
+
+# a terminal application. implement this for your model struct; the
+# runtime drives the cycle. on_event owns the event-to-message dispatch
+# (its body is your concrete code, where match and optionals behave as
+# usual); update handles the deferred messages commands produce. init is
+# required rather than defaulted because an interface default cannot name
+# the associated type.
+pub interface App:
+    type Msg
+    fn init() -> Cmd[Msg]
+    fn on_event(ev: Event) -> Cmd[Msg]
+    fn update(msg: Msg) -> Cmd[Msg]
+    fn view() -> String
+
+# how the runtime behaves; runopts() gives the defaults.
+pub struct RunOpts:
+    pub ctrl_c_quits: Bool
+    pub max_chain: Int
+    pub session_options: session.Options
+
+# the defaults: ctrl-c quits before reaching the application, a command
+# chain is cut after 64 messages per turn, and the session opens with its
+# own defaults (alternate screen, bracketed paste).
+pub fn runopts() -> RunOpts:
+    return RunOpts(ctrl_c_quits: true, max_chain: 64, session_options: session.default_options())
+
+# ---------------------------------------------------------------
+# keybindings
+# ---------------------------------------------------------------
+
+# one action's keys plus the line the help widget shows for it. keys are
+# the canonical names input.key_name produces: "q", "ctrl+c", "shift+tab".
+pub struct Binding:
+    pub keys: List[String]
+    pub help_key: String
+    pub help_desc: String
+
+# a binding for `keys`, displayed in help as `help_key` and `help_desc`.
+pub fn binding(keys: List[String], help_key: String, help_desc: String) -> Binding:
+    return Binding(keys: keys, help_key: help_key, help_desc: help_desc)
+
+impl Binding:
+    # does this key press match one of the binding's names?
+    fn matches(k: input.Key) -> Bool:
+        name := input.key_name(k)
+        for candidate in self.keys:
+            if candidate == name:
+                return true
+        return false
+
+# ---------------------------------------------------------------
+# the line-diff renderer
+# ---------------------------------------------------------------
+
+# the escape output that turns the previous frame into the next, repainting
+# only changed lines. pure, so frame transitions are testable as strings:
+# a full repaint clears the screen first (the resize path); otherwise each
+# changed line gets one cursor move and a clear, and lines the new frame no
+# longer has are blanked. returns the output and the new frame's lines.
+pub fn render_diff(prev: List[String], frame: String, full: Bool) -> (String, List[String]):
+    next_lines := frame.split("\n")
+    mut parts: List[String] := []
+    if full or prev.len() == 0:
+        parts.push(ansi.clear_screen())
+        mut i := 0
+        while i < next_lines.len():
+            parts.push(ansi.cursor_to(0, i) + next_lines[i])
+            i = i + 1
+        return (parts.join(""), next_lines)
+    mut i := 0
+    while i < next_lines.len():
+        changed := i >= prev.len() or prev[i] != next_lines[i]
+        if changed:
+            parts.push(ansi.cursor_to(0, i) + ansi.clear_line() + next_lines[i])
+        i = i + 1
+    mut j := next_lines.len()
+    while j < prev.len():
+        parts.push(ansi.cursor_to(0, j) + ansi.clear_line())
+        j = j + 1
+    return (parts.join(""), next_lines)
+
+# ---------------------------------------------------------------
+# the command interpreter
+# ---------------------------------------------------------------
+
+# the runtime's running state: armed timers as parallel lists (each spec
+# beside its next due time), and whether the application asked to stop.
+# one value threads through the whole loop, headless or live.
+struct Engine[M]:
+    mut stopped: Bool
+    mut timer_specs: List[TimerSpec[M]]
+    mut timer_due: List[Int]
+
+fn engine[M]() -> Engine[M]:
+    return Engine(stopped: false, timer_specs: [], timer_due: [])
+
+# interpret one command: run its immediate work inline, feeding each
+# message back through update (bounded so an emit loop cannot spin), and
+# arm its timers relative to `now`.
+fn interpret[A: App](application: A, first: Cmd[A.Msg], eng: Engine[A.Msg], now: Int, max_chain: Int):
+    mut pending: List[fn() -> A.Msg] := []
+    absorb(first, eng, now, pending)
+    mut steps := 0
+    mut i := 0
+    while i < pending.len() and not eng.stopped:
+        steps = steps + 1
+        if steps > max_chain:
+            return
+        f := pending[i]
+        i = i + 1
+        cmd := application.update(f())
+        absorb(cmd, eng, now, pending)
+
+# fold one command's parts into the engine: stop wins, immediate work
+# queues, timers arm from `now`.
+fn absorb[M](cmd: Cmd[M], eng: Engine[M], now: Int, pending: List[fn() -> M]):
+    if cmd.stop:
+        eng.stopped = true
+    for r in cmd.runs:
+        pending.push(r)
+    for spec in cmd.timers:
+        eng.timer_specs.push(spec)
+        eng.timer_due.push(now + spec.ms)
+
+# fire every timer due at `now`, feeding its message through update.
+# one-shot timers disarm; repeating ones rearm from now.
+fn fire_due[A: App](application: A, eng: Engine[A.Msg], now: Int, max_chain: Int):
+    mut i := 0
+    while i < eng.timer_specs.len() and not eng.stopped:
+        if eng.timer_due[i] <= now:
+            spec := eng.timer_specs[i]
+            mk := spec.make
+            cmd := application.update(mk(now))
+            if spec.repeat:
+                eng.timer_due[i] = now + spec.ms
+                i = i + 1
+            else:
+                eng.timer_specs.remove(i)
+                eng.timer_due.remove(i)
+            interpret(application, cmd, eng, now, max_chain)
+        else:
+            i = i + 1
+
+# ---------------------------------------------------------------
+# the loop, headless and real
+# ---------------------------------------------------------------
+
+# what a headless run produced: every rendered frame in order (the initial
+# frame first), and whether the application quit before the script ran out.
+pub struct DriveResult:
+    pub frames: List[String]
+    pub quit: Bool
+
+# run the application against a scripted event list, no terminal involved:
+# init runs first, each event goes through on_event, command work runs
+# inline so its messages arrive deterministically, and timers are armed but
+# never fire (a script has no clock). view() is captured after init and
+# after every event. this is how applications are tested.
+pub fn drive[A: App](application: A, events: List[Event]) -> DriveResult:
+    opts := runopts()
+    eng := engine[A.Msg]()
+    now := time()
+    mut frames: List[String] := []
+    interpret(application, application.init(), eng, now, opts.max_chain)
+    frames.push(application.view())
+    if eng.stopped:
+        return DriveResult(frames: frames, quit: true)
+    for ev in events:
+        interpret(application, application.on_event(ev), eng, now, opts.max_chain)
+        frames.push(application.view())
+        if eng.stopped:
+            return DriveResult(frames: frames, quit: true)
+    return DriveResult(frames: frames, quit: false)
+
+# run the application against the real terminal until it quits: open the
+# session, restore the terminal on every exit path, fire due timers, fold
+# events through on_event, and repaint only changed lines.
+pub fn run[A: App](application: A) -> Int!:
+    return run_with(application, runopts())!
+
+# run with explicit options.
+pub fn run_with[A: App](application: A, opts: RunOpts) -> Int!:
+    t := session.open_with(opts.session_options)!
+    defer t.close()
+    eng := engine[A.Msg]()
+    interpret(application, application.init(), eng, time(), opts.max_chain)
+    if eng.stopped:
+        return 0
+    painted := render_diff([], application.view(), true)
+    t.write(painted.0)
+    t.flush()!
+    mut prev := painted.1
+    while not eng.stopped:
+        fire_due(application, eng, time(), opts.max_chain)
+        if eng.stopped:
+            return 0
+        # wait briefly for one event, so timers keep firing on an idle
+        # keyboard. the placeholder for a timed-out wait is FocusIn with a
+        # sentinel meaning below: it never reaches the application.
+        got := select:
+            ev := t.events.recv() => ev
+            timeout 20 => Event.FocusIn
+        was_timeout := match got:
+            Event.FocusIn => true
+            _ => false
+        mut full := false
+        if not was_timeout:
+            quit_now := match got:
+                Event.KeyPress(k) => opts.ctrl_c_quits and input.key_name(k) == "ctrl+c"
+                Event.Closed => true
+                _ => false
+            if quit_now:
+                return 0
+            full = match got:
+                Event.Resize(_, _) => true
+                _ => false
+            interpret(application, application.on_event(got), eng, time(), opts.max_chain)
+            if eng.stopped:
+                return 0
+        painted2 := render_diff(prev, application.view(), full)
+        if painted2.0 != "":
+            t.write(painted2.0)
+            t.flush()!
+        prev = painted2.1
+    return 0
+
+# -- tests --------------------------------------------------------------
+
+enum ProbeMsg:
+    Bump
+    Double
+    Halt
+
+struct Probe:
+    mut count: Int
+
+impl App for Probe:
+    type Msg = ProbeMsg
+    fn init() -> Cmd[ProbeMsg]:
+        return emit(ProbeMsg.Bump)
+    fn on_event(ev: Event) -> Cmd[ProbeMsg]:
+        match ev:
+            Event.KeyPress(k) =>
+                name := input.key_name(k)
+                if name == "b":
+                    return self.update(ProbeMsg.Bump)
+                if name == "d":
+                    return self.update(ProbeMsg.Double)
+                if name == "q":
+                    return self.update(ProbeMsg.Halt)
+                return nothing[ProbeMsg]()
+            _ =>
+                return nothing[ProbeMsg]()
+        return nothing[ProbeMsg]()
+    fn update(msg: ProbeMsg) -> Cmd[ProbeMsg]:
+        match msg:
+            ProbeMsg.Bump =>
+                self.count = self.count + 1
+            ProbeMsg.Double =>
+                self.count = self.count * 2
+                return emit(ProbeMsg.Bump)
+            ProbeMsg.Halt =>
+                return quit[ProbeMsg]()
+        return nothing[ProbeMsg]()
+    fn view() -> String:
+        return "count={self.count}"
+
+fn key_event(name: String) -> Event:
+    return Event.KeyPress(input.Key(code: input.KeyCode.Char(name), mods: 0))
+
+test "drive runs init dispatches events and folds emit chains":
+    p := Probe(count: 0)
+    got := drive(p, [key_event("b"), key_event("d"), key_event("z")])
+    # init's emit bumped to 1 before the first frame; "d" doubles then
+    # emits a bump; "z" dispatches to nothing and re-renders unchanged.
+    assert_eq(got.frames.join(","), "count=1,count=2,count=5,count=5")
+    assert_eq(got.quit, false)
+
+test "drive stops at quit and reports it":
+    p := Probe(count: 0)
+    got := drive(p, [key_event("q"), key_event("b")])
+    assert_eq(got.quit, true)
+    # the quit frame is captured; the event after it never runs.
+    assert_eq(got.frames.len(), 2)
+    assert_eq(p.count, 1)
+
+test "a command chain runs its follow-on messages inline":
+    p := Probe(count: 0)
+    eng := engine[ProbeMsg]()
+    # Double's update emits Bump: 0 * 2 = 0, then + 1.
+    interpret(p, emit(ProbeMsg.Double), eng, 0, 64)
+    assert_eq(p.count, 1)
+    assert_eq(eng.stopped, false)
+
+test "timers arm from commands and fire when due":
+    p := Probe(count: 0)
+    eng := engine[ProbeMsg]()
+    interpret(p, after(100, fn(t: Int) => ProbeMsg.Bump), eng, 1000, 64)
+    assert_eq(eng.timer_specs.len(), 1)
+    # not due yet
+    fire_due(p, eng, 1050, 64)
+    assert_eq(p.count, 0)
+    # due: fires once and disarms
+    fire_due(p, eng, 1100, 64)
+    assert_eq(p.count, 1)
+    assert_eq(eng.timer_specs.len(), 0)
+    # a repeating timer rearms and fires again
+    interpret(p, every(50, fn(t: Int) => ProbeMsg.Bump), eng, 2000, 64)
+    fire_due(p, eng, 2050, 64)
+    fire_due(p, eng, 2100, 64)
+    assert_eq(p.count, 3)
+    assert_eq(eng.timer_specs.len(), 1)
+
+test "batch flattens and a quit anywhere wins":
+    b := batch[ProbeMsg]([nothing[ProbeMsg](), emit(ProbeMsg.Bump), quit[ProbeMsg]()])
+    assert_eq(b.stop, true)
+    assert_eq(b.runs.len(), 1)
+    both := batch[ProbeMsg]([after(100, fn(t: Int) => ProbeMsg.Bump), every(50, fn(t: Int) => ProbeMsg.Bump)])
+    assert_eq(both.timers.len(), 2)
+    assert_eq(both.timers[0].repeat, false)
+    assert_eq(both.timers[1].repeat, true)
+
+test "render_diff repaints only changed lines":
+    e := chr(27)
+    first := render_diff([], "a\nb", false)
+    assert(first.0.starts_with(e + "[2J"))
+    assert_eq(first.1.join("|"), "a|b")
+    second := render_diff(first.1, "a\nc", false)
+    assert_eq(second.0, e + "[2;1H" + e + "[2K" + "c")
+    # an unchanged frame writes nothing
+    third := render_diff(second.1, "a\nc", false)
+    assert_eq(third.0, "")
+    # a shorter frame blanks the lines it no longer has
+    fourth := render_diff(second.1, "a", false)
+    assert_eq(fourth.0, e + "[2;1H" + e + "[2K")
+
+test "bindings match canonical key names":
+    quit_binding := binding(["q", "ctrl+c"], "q", "quit")
+    assert(quit_binding.matches(input.Key(code: input.KeyCode.Char("q"), mods: 0)))
+    assert(quit_binding.matches(input.Key(code: input.KeyCode.Char("c"), mods: input.MOD_CTRL)))
+    assert_eq(quit_binding.matches(input.Key(code: input.KeyCode.Char("x"), mods: 0)), false)

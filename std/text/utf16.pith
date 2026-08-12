@@ -1,0 +1,127 @@
+# std.text.utf16 — utf-16 code-unit offsets over utf-8 strings
+#
+# pith stores text as utf-8 and measures it in bytes; the language server
+# protocol and the javascript world measure positions in utf-16 code units.
+# the two units have no fixed relationship: é is two bytes but one unit,
+# 𝄞 is four bytes and two units (a surrogate pair). this module converts
+# between them.
+#
+#   import std.text.utf16 as utf16
+#   utf16.length("héllo")              # 5
+#   utf16.length("a𝄞b")                # 4
+#   utf16.to_byte_offset("a𝄞b", 3)!    # 5
+#   utf16.from_byte_offset("a𝄞b", 5)!  # 3
+#
+# an undecodable byte counts as one unit, the same as the replacement
+# character it would decode to, so a malformed string converts in both
+# directions instead of trapping.
+
+import std.text as text
+from std.text import Decoded
+
+# decode at an offset, or report a one-byte step with a negative code point
+# when the bytes are undecodable — the same walking rule std.text uses.
+fn decode_step(s: String, byte_index: Int) -> Decoded:
+    return text.decode_at(s, byte_index).unwrap_or(Decoded(0 - 1, 1))
+
+# code points outside the basic multilingual plane encode as a surrogate
+# pair; everything else — including the stand-in for an undecodable byte —
+# is a single unit.
+fn unit_width(code_point: Int) -> Int:
+    if code_point >= 65536:
+        return 2
+    return 1
+
+# the number of utf-16 code units needed to encode the string.
+pub fn length(s: String) -> Int:
+    mut units := 0
+    mut i := 0
+    while i < s.len():
+        d := decode_step(s, i)
+        units = units + unit_width(d.code_point)
+        i = i + d.size
+    return units
+
+# the byte offset reached after `units` utf-16 code units. fails when
+# `units` is negative, counts past the end of the string, or stops between
+# the two halves of a surrogate pair.
+pub fn to_byte_offset(s: String, units: Int) -> Int!:
+    if units < 0:
+        fail "utf-16 offset {units} is negative"
+    mut remaining := units
+    mut i := 0
+    while remaining > 0:
+        if i >= s.len():
+            fail "utf-16 offset {units} is past the end of the string"
+        d := decode_step(s, i)
+        w := unit_width(d.code_point)
+        if w > remaining:
+            fail "utf-16 offset {units} splits a surrogate pair"
+        remaining = remaining - w
+        i = i + d.size
+    return i
+
+# the utf-16 code-unit offset of a byte offset. fails when the offset is
+# negative, past the end of the string, or inside a multi-byte character.
+pub fn from_byte_offset(s: String, byte_offset: Int) -> Int!:
+    if byte_offset < 0:
+        fail "byte offset {byte_offset} is negative"
+    if byte_offset > s.len():
+        fail "byte offset {byte_offset} is past the end of the string"
+    mut units := 0
+    mut i := 0
+    while i < byte_offset:
+        d := decode_step(s, i)
+        if i + d.size > byte_offset:
+            fail "byte offset {byte_offset} is inside a multi-byte character"
+        units = units + unit_width(d.code_point)
+        i = i + d.size
+    return units
+
+test "utf16 length counts code units":
+    assert_eq(length(""), 0)
+    assert_eq(length("hello"), 5)
+    # é is two bytes but one unit; cjk are three bytes and one unit
+    assert_eq(length("héllo"), 5)
+    assert_eq(length("日本"), 2)
+    # an astral code point is four bytes and one surrogate pair
+    assert_eq(length("𝄞"), 2)
+    assert_eq(length("a𝄞b"), 4)
+    # a bare continuation byte is undecodable and counts as one unit
+    assert_eq(length(chr(128)), 1)
+
+test "utf16 offsets convert to byte offsets":
+    s := "a𝄞b"
+    assert_eq(to_byte_offset(s, 0)!, 0)
+    assert_eq(to_byte_offset(s, 1)!, 1)
+    assert_eq(to_byte_offset(s, 3)!, 5)
+    assert_eq(to_byte_offset(s, 4)!, 6)
+    mid_pair := to_byte_offset(s, 2)
+    assert(mid_pair.is_err)
+    past := to_byte_offset(s, 5)
+    assert(past.is_err)
+    negative := to_byte_offset(s, 0 - 1)
+    assert(negative.is_err)
+
+test "byte offsets convert to utf16 offsets":
+    s := "a𝄞b"
+    assert_eq(from_byte_offset(s, 0)!, 0)
+    assert_eq(from_byte_offset(s, 1)!, 1)
+    assert_eq(from_byte_offset(s, 5)!, 3)
+    assert_eq(from_byte_offset(s, 6)!, 4)
+    inside := from_byte_offset(s, 3)
+    assert(inside.is_err)
+    past := from_byte_offset(s, 7)
+    assert(past.is_err)
+    negative := from_byte_offset(s, 0 - 1)
+    assert(negative.is_err)
+
+test "utf16 conversions round trip at every unit boundary":
+    s := "héllo 日本 𝄞 end"
+    mut u := 0
+    while u <= length(s):
+        b := to_byte_offset(s, u)
+        # the only unconvertible unit offset is the middle of a pair
+        if not b.is_err:
+            assert_eq(from_byte_offset(s, b.ok)!, u)
+        u = u + 1

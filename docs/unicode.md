@@ -99,6 +99,13 @@ combining acute accent is two scalar values but one thing a reader sees, and
 a family emoji is several. when you are truncating a display name or a chat
 message, graphemes are the honest unit.
 
+there is a fourth unit pith never uses for its own strings but has to speak at
+protocol boundaries: the utf-16 code unit, which the language server protocol
+and the javascript world count positions in. `std.text.utf16` converts between
+utf-16 offsets and byte offsets (`length`, `to_byte_offset`,
+`from_byte_offset`); a code point outside the basic multilingual plane counts
+as two units, everything else as one.
+
 ## validation at the edge
 
 bytes arriving from a socket, a file, or a form field are not text until you

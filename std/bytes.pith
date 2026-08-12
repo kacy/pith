@@ -62,6 +62,35 @@ pub fn concat(left: Bytes, right: Bytes) -> Bytes:
 pub fn eq(left: Bytes, right: Bytes) -> Bool:
     return bytes_eq(left, right)
 
+# the byte offset of the first occurrence of `needle` in `data`, or -1 when
+# absent. an empty needle is reported as absent rather than matching
+# everywhere.
+pub fn index_of(data: Bytes, needle: Bytes) -> Int:
+    if needle.is_empty():
+        return 0 - 1
+    if data.len() < needle.len():
+        return 0 - 1
+    mut i := 0
+    while i + needle.len() <= data.len():
+        mut matched := true
+        mut j := 0
+        while j < needle.len():
+            if get(data, i + j) != get(needle, j):
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return 0 - 1
+
+# true when `data` begins with `prefix`. an empty prefix is a prefix of
+# everything.
+pub fn starts_with(data: Bytes, prefix: Bytes) -> Bool:
+    if prefix.len() > data.len():
+        return false
+    return eq(slice(data, 0, prefix.len()), prefix)
+
 fn decode_utf8_result(data: Bytes) -> String!Utf8DecodeError:
     text := bytes_to_string_utf8(data)
     if text.is_err:
@@ -296,3 +325,17 @@ test "byte buffers append ranges and packed words":
     assert(not out.write_word(0, 0))
     assert(not out.write_word(0, 9))
     out.free()
+
+test "bytes index_of and starts_with":
+    data := from_string_utf8("content-length: 42")
+    assert_eq(index_of(data, from_string_utf8("length")), 8)
+    assert_eq(index_of(data, from_string_utf8(": ")), 14)
+    assert_eq(index_of(data, from_string_utf8("42")), 16)
+    assert_eq(index_of(data, from_string_utf8("nope")), 0 - 1)
+    assert_eq(index_of(data, empty()), 0 - 1)
+    # the scan must not anchor on the first partial match
+    assert_eq(index_of(from_string_utf8("aab"), from_string_utf8("ab")), 1)
+    assert(starts_with(data, from_string_utf8("content")))
+    assert(not starts_with(data, from_string_utf8("length")))
+    assert(starts_with(data, empty()))
+    assert(not starts_with(empty(), from_string_utf8("x")))

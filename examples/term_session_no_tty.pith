@@ -1,0 +1,16 @@
+# a terminal session refuses to open when there is no terminal — which is
+# exactly the situation this example runs in: the example harness pipes
+# stdout, so open() must fail cleanly before touching any terminal state.
+# the failure exercises the real open path up to its first guard, and a
+# program that wants to support both a tty and a pipe branches on exactly
+# this error.
+import std.term.session as session
+
+fn main():
+    r := session.open()
+    if r.is_ok:
+        t := r.ok
+        t.close()
+        print("opened a terminal session")
+    else:
+        print("no terminal: {r.err}")

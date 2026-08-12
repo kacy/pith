@@ -1,0 +1,237 @@
+# std.term.session — the terminal as one object with one event stream
+#
+# a tui needs four things wired together: the terminal in raw mode, the
+# screen in a known state, every kind of input merged into one ordered
+# stream, and a guarantee the terminal comes back when the program ends.
+# open() does all four — it enters raw mode, applies the requested modes,
+# arms the resize signal, and spawns the tasks that turn bytes and signals
+# into events on one channel:
+#
+#   t := session.open()!
+#   defer t.close()
+#   for ev in next_events(t):        # t.events.recv() in a loop
+#       match ev: ...
+#
+# the stream carries key presses, mouse reports, pastes, focus changes,
+# Resize (with the new size already queried), Signal for any extra signals
+# the options armed, and one final Closed when the terminal goes away.
+# ticks are deliberately not merged: the session does not own time. an
+# application that animates selects over this channel and its own ticker.
+#
+# ★ the session owns ALL signal interest for the process. pith's signal
+# queue is global — signal.wait drains one pipe — so a program cannot run
+# std.shutdown.on_signals (or its own signal.wait loop) alongside an open
+# session. route extra signals through Options.signals instead; they arrive
+# as Event.Signal(n) on the stream.
+import std.signal as signal
+import std.term.ansi as ansi
+import std.term.input as input
+from std.term.input import Event
+import std.term.tty as tty
+
+# how the session opens the terminal. default_options() enables the
+# alternate screen and bracketed paste, leaves mouse and focus reporting
+# off, arms no extra signals, and resolves a lone escape after 30ms.
+pub struct Options:
+    pub alt_screen: Bool
+    pub mouse: Bool
+    pub bracketed_paste: Bool
+    pub focus_events: Bool
+    pub signals: List[Int]
+    pub esc_timeout_ms: Int
+
+# the defaults described on Options.
+pub fn default_options() -> Options:
+    return Options(alt_screen: true, mouse: false, bracketed_paste: true, focus_events: false, signals: [], esc_timeout_ms: 30)
+
+# an open terminal session: the merged event stream, the last known size,
+# and a buffered writer. create with open() or open_with(); always close().
+pub struct Terminal:
+    pub events: Channel[Event]
+    mut cols: Int
+    mut rows: Int
+    mut running: Bool
+    mut closed: Bool
+    opts: Options
+    mut pending_out: List[String]
+    mut reader: Task[Int]
+    mut waiter: Task[Int]
+
+# how long the reader sleeps per poll when nothing is pending. bounded so
+# close() never waits on a read parked forever against an idle terminal.
+IDLE_READ_MS := 500
+
+# open the terminal with the default options.
+pub fn open() -> Terminal!:
+    return open_with(default_options())!
+
+# open the terminal: verify stdin and stdout are a tty, enter raw mode,
+# apply the requested modes, hide the hardware cursor, query the size, arm
+# the resize signal plus any extras, and start the reader and signal tasks.
+# fails without touching terminal state when there is no terminal to open.
+pub fn open_with(opts: Options) -> Terminal!:
+    if not tty.is_tty(0) or not tty.is_tty(1):
+        fail "stdin and stdout must be a terminal"
+    if not tty.raw_enter():
+        fail "could not enter raw mode"
+    tty.write_str(enter_sequence(opts))!
+    dims := tty.size()!
+    mut armed := [signal.SIGWINCH]
+    for s in opts.signals:
+        armed.push(s)
+    signal.notify(armed)!
+    t := Terminal(events: Channel[Event](64), cols: dims.0, rows: dims.1, running: true, closed: false, opts: opts, pending_out: [], reader: spawn zero(), waiter: spawn zero())
+    r := spawn reader_loop(t)
+    w := spawn signal_loop(t)
+    t.reader = r
+    t.waiter = w
+    return t
+
+# a placeholder task so the struct fields are never unset; it finishes
+# immediately and is replaced before open_with returns.
+fn zero() -> Int:
+    return 0
+
+# the escape sequences a session's options turn on, in one write.
+fn enter_sequence(opts: Options) -> String:
+    mut parts: List[String] := []
+    if opts.alt_screen:
+        parts.push(ansi.alt_screen_enter())
+    parts.push(ansi.cursor_hide())
+    if opts.mouse:
+        parts.push(ansi.mouse_enable())
+    if opts.bracketed_paste:
+        parts.push(ansi.paste_enable())
+    if opts.focus_events:
+        parts.push(ansi.focus_enable())
+    return parts.join("")
+
+# the reverse of enter_sequence, in the reverse order.
+fn leave_sequence(opts: Options) -> String:
+    mut parts: List[String] := []
+    if opts.focus_events:
+        parts.push(ansi.focus_disable())
+    if opts.bracketed_paste:
+        parts.push(ansi.paste_disable())
+    if opts.mouse:
+        parts.push(ansi.mouse_disable())
+    parts.push(ansi.cursor_show())
+    if opts.alt_screen:
+        parts.push(ansi.alt_screen_leave())
+    return parts.join("")
+
+# the reader task: bytes from the terminal through the push parser onto the
+# event channel. a timed-out read with a sequence pending resolves the
+# ambiguity via flush; a failed read means the terminal is gone, which ends
+# the stream with one Closed.
+fn reader_loop(t: Terminal) -> Int:
+    p := input.parser()
+    while t.running:
+        mut wait_ms := IDLE_READ_MS
+        if input.pending(p):
+            wait_ms = t.opts.esc_timeout_ms
+        r := tty.read(4096, wait_ms)
+        if not r.is_ok:
+            if t.running:
+                t.events.send(Event.Closed)
+            return 0
+        data := r.ok
+        if data.len() == 0:
+            if input.pending(p):
+                for ev in input.flush(p):
+                    t.events.send(ev)
+        else:
+            for ev in input.feed(p, data):
+                t.events.send(ev)
+    return 0
+
+# the signal task: SIGWINCH becomes Resize with the size already re-queried
+# (and the session's cols/rows updated first, so size() is fresh by the time
+# the event is read); any other armed signal is passed through.
+fn signal_loop(t: Terminal) -> Int:
+    while t.running:
+        sig := signal.wait(IDLE_READ_MS)
+        if sig <= 0:
+            continue
+        if not t.running:
+            return 0
+        if sig == signal.SIGWINCH:
+            r := tty.size()
+            if r.is_ok:
+                dims := r.ok
+                t.cols = dims.0
+                t.rows = dims.1
+                t.events.send(Event.Resize(dims.0, dims.1))
+        else:
+            t.events.send(Event.Signal(sig))
+    return 0
+
+impl Terminal:
+    # the last known terminal size as (cols, rows), updated before each
+    # Resize event is delivered.
+    fn size() -> (Int, Int):
+        return (self.cols, self.rows)
+
+    # queue output; nothing reaches the terminal until flush(). a frame is
+    # composed of many small writes, and one syscall per frame beats one
+    # per fragment.
+    fn write(s: String):
+        self.pending_out.push(s)
+
+    # write everything queued in one call. returns the byte count.
+    fn flush() -> Int!:
+        if self.pending_out.len() == 0:
+            return 0
+        joined := self.pending_out.join("")
+        self.pending_out = []
+        return tty.write_str(joined)!
+
+    # restore the terminal and stop the session: leave the modes in reverse
+    # order, show the cursor, exit raw mode, and wait for the reader and
+    # signal tasks to notice. idempotent — a defer and an explicit call can
+    # both run. the tasks poll every half second, so close can take up to
+    # that long to fully reap them.
+    fn close():
+        if self.closed:
+            return
+        self.closed = true
+        self.running = false
+        self.pending_out = []
+        tty.write_str(leave_sequence(self.opts)) catch 0
+        tty.restore()
+        await self.reader
+        await self.waiter
+
+test "open fails cleanly when stdin is not a terminal":
+    # the fork-per-test harness runs with stdin piped, so the real open path
+    # is exercised up to its first guard and must fail without entering raw
+    # mode or leaving any state behind.
+    r := open()
+    assert_eq(r.is_ok, false)
+    assert(r.err.contains("terminal"))
+
+test "enter and leave sequences mirror each other per option":
+    e := chr(27)
+    everything := Options(alt_screen: true, mouse: true, bracketed_paste: true, focus_events: true, signals: [], esc_timeout_ms: 30)
+    enter := enter_sequence(everything)
+    leave := leave_sequence(everything)
+    # every mode turned on is turned off
+    assert(enter.contains(e + "[?1049h"))
+    assert(leave.contains(e + "[?1049l"))
+    assert(enter.contains(e + "[?1002h"))
+    assert(leave.contains(e + "[?1002l"))
+    assert(enter.contains(e + "[?2004h"))
+    assert(leave.contains(e + "[?2004l"))
+    assert(enter.contains(e + "[?1004h"))
+    assert(leave.contains(e + "[?1004l"))
+    # the cursor hides on the way in and shows on the way out
+    assert(enter.contains(e + "[?25l"))
+    assert(leave.contains(e + "[?25h"))
+    # leave undoes the alternate screen last, after the cursor is shown
+    assert(leave.ends_with(e + "[?1049l"))
+
+test "minimal options produce minimal sequences":
+    bare := Options(alt_screen: false, mouse: false, bracketed_paste: false, focus_events: false, signals: [], esc_timeout_ms: 30)
+    e := chr(27)
+    assert_eq(enter_sequence(bare), e + "[?25l")
+    assert_eq(leave_sequence(bare), e + "[?25h")

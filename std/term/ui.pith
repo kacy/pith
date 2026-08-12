@@ -14,6 +14,8 @@
 # and emoji lay out correctly, and every widget renders to a plain string —
 # which is why each one is a snapshot test away.
 import std.term.app as app
+import std.term.input as input
+from std.term.input import KeyCode
 import std.term.style as style
 import std.text.width as width
 
@@ -346,3 +348,420 @@ test "help renders the short line and the aligned column":
     assert(help_short(bindings, 10).contains("…"))
     full := help_full(bindings, 40)
     assert_eq(full, "q    quit\n↑/k  move up")
+
+# ---------------------------------------------------------------
+# scrolling components: viewport, list, table
+#
+# these hold cursor and scroll state, so they are structs the application
+# embeds in its model: forward key events with key(), which reports whether
+# it consumed the event, and read selection state back after. components
+# mutate in place and never produce commands — what a selection means is
+# the application's business.
+# ---------------------------------------------------------------
+
+# a scrollable window over multi-line content. lines wider than the
+# viewport are truncated (no horizontal scroll in this version).
+pub struct Viewport:
+    pub cols: Int
+    pub rows: Int
+    pub offset: Int
+    mut lines: List[String]
+
+# a viewport of the given size with no content yet.
+pub fn viewport(cols: Int, rows: Int) -> Viewport:
+    return Viewport(cols: cols, rows: rows, offset: 0, lines: [])
+
+impl Viewport:
+    # replace the content, clamping the scroll position into the new bounds.
+    fn set_content(s: String):
+        self.lines = s.split("\n")
+        self.scroll_to(self.offset)
+
+    # scroll so `line` is the top row, clamped into range.
+    fn scroll_to(line: Int):
+        mut top := line
+        limit := self.lines.len() - self.rows
+        if top > limit:
+            top = limit
+        if top < 0:
+            top = 0
+        self.offset = top
+
+    # scroll by a delta, clamped.
+    fn scroll_by(delta: Int):
+        self.scroll_to(self.offset + delta)
+
+    fn to_top():
+        self.scroll_to(0)
+
+    fn to_bottom():
+        self.scroll_to(self.lines.len())
+
+    # is the last content line visible?
+    fn at_bottom() -> Bool:
+        return self.offset + self.rows >= self.lines.len()
+
+    # scroll position as 0..100, for a status line.
+    fn percent() -> Int:
+        limit := self.lines.len() - self.rows
+        if limit <= 0:
+            return 100
+        return (self.offset * 100) / limit
+
+    # standard scrolling keys: arrows and j/k by one, pgup/pgdn by a page,
+    # home/end to the ends. returns whether the key was consumed.
+    fn key(k: input.Key) -> Bool:
+        name := input.key_name(k)
+        if name == "down" or name == "j":
+            self.scroll_by(1)
+            return true
+        if name == "up" or name == "k":
+            self.scroll_by(0 - 1)
+            return true
+        if name == "pgdn":
+            self.scroll_by(self.rows)
+            return true
+        if name == "pgup":
+            self.scroll_by(0 - self.rows)
+            return true
+        if name == "home":
+            self.to_top()
+            return true
+        if name == "end":
+            self.to_bottom()
+            return true
+        return false
+
+    # exactly `rows` lines, truncated to `cols`, short content padded with
+    # blank lines so the block has a stable shape.
+    fn view() -> String:
+        mut out: List[String] := []
+        mut r := 0
+        while r < self.rows:
+            i := self.offset + r
+            mut line := ""
+            if i < self.lines.len():
+                line = width.truncate_to(self.lines[i], self.cols)
+            out.push(line)
+            r = r + 1
+        return out.join("\n")
+
+# a scrollable, selectable list of items. the cursor line is marked with a
+# prefix, and the scroll window follows the cursor.
+pub struct ListView:
+    mut items: List[String]
+    pub cursor: Int
+    pub offset: Int
+    pub rows: Int
+    pub focused: Bool
+    pub prefix: String
+
+# a list showing `rows` items at a time, cursor on the first.
+pub fn list_view(items: List[String], rows: Int) -> ListView:
+    return ListView(items: items, cursor: 0, offset: 0, rows: rows, focused: true, prefix: "> ")
+
+impl ListView:
+    # replace the items, clamping cursor and scroll into the new bounds.
+    fn set_items(items: List[String]):
+        self.items = items
+        if self.cursor >= items.len():
+            self.cursor = items.len() - 1
+        if self.cursor < 0:
+            self.cursor = 0
+        self.follow()
+
+    # the selected item, or none when the list is empty.
+    fn selected() -> String?:
+        if self.items.len() == 0:
+            return none
+        return self.items[self.cursor]
+
+    # the selected index, or none when the list is empty.
+    fn selected_index() -> Int?:
+        if self.items.len() == 0:
+            return none
+        return self.cursor
+
+    fn focus():
+        self.focused = true
+
+    fn blur():
+        self.focused = false
+
+    # cursor movement: arrows and j/k, pgup/pgdn, home/end. returns whether
+    # the key was consumed.
+    fn key(k: input.Key) -> Bool:
+        if self.items.len() == 0:
+            return false
+        name := input.key_name(k)
+        mut target := self.cursor
+        if name == "down" or name == "j":
+            target = self.cursor + 1
+        elif name == "up" or name == "k":
+            target = self.cursor - 1
+        elif name == "pgdn":
+            target = self.cursor + self.rows
+        elif name == "pgup":
+            target = self.cursor - self.rows
+        elif name == "home":
+            target = 0
+        elif name == "end":
+            target = self.items.len() - 1
+        else:
+            return false
+        if target < 0:
+            target = 0
+        if target >= self.items.len():
+            target = self.items.len() - 1
+        self.cursor = target
+        self.follow()
+        return true
+
+    # keep the invariant offset <= cursor < offset + rows.
+    fn follow():
+        if self.cursor < self.offset:
+            self.offset = self.cursor
+        if self.cursor >= self.offset + self.rows:
+            self.offset = self.cursor - self.rows + 1
+
+    # `rows` lines, the cursor line prefixed (and only when focused), each
+    # truncated to `cols`. an empty list renders blank lines.
+    fn view(cols: Int) -> String:
+        pad := width.of(self.prefix)
+        mut out: List[String] := []
+        mut r := 0
+        while r < self.rows:
+            i := self.offset + r
+            mut line := ""
+            if i < self.items.len():
+                if self.focused and i == self.cursor:
+                    line = self.prefix + self.items[i]
+                else:
+                    line = width.pad_left("", pad) + self.items[i]
+                line = width.truncate_to(line, cols)
+            out.push(line)
+            r = r + 1
+        return out.join("\n")
+
+# a table with a header row and a selectable body. column widths come from
+# the widest cell (display columns, so cjk data aligns), or from
+# with_widths; ragged rows render empty cells.
+pub struct TableView:
+    pub headers: List[String]
+    mut rows_data: List[List[String]]
+    pub fixed: List[Int]
+    pub cursor: Int
+    pub offset: Int
+    pub body_rows: Int
+    pub focused: Bool
+
+# a table showing `body_rows` rows at a time.
+pub fn table(headers: List[String], rows_data: List[List[String]], body_rows: Int) -> TableView:
+    return TableView(headers: headers, rows_data: rows_data, fixed: [], cursor: 0, offset: 0, body_rows: body_rows, focused: true)
+
+impl TableView:
+    # fix column widths instead of sizing to content; 0 keeps auto for that
+    # column.
+    fn with_widths(w: List[Int]) -> TableView:
+        return TableView(headers: self.headers, rows_data: self.rows_data, fixed: w, cursor: self.cursor, offset: self.offset, body_rows: self.body_rows, focused: self.focused)
+
+    # the selected row, or none when the table is empty.
+    fn selected_row() -> List[String]?:
+        if self.rows_data.len() == 0:
+            return none
+        return self.rows_data[self.cursor]
+
+    # same cursor keys as a list. returns whether the key was consumed.
+    fn key(k: input.Key) -> Bool:
+        if self.rows_data.len() == 0:
+            return false
+        name := input.key_name(k)
+        mut target := self.cursor
+        if name == "down" or name == "j":
+            target = self.cursor + 1
+        elif name == "up" or name == "k":
+            target = self.cursor - 1
+        elif name == "home":
+            target = 0
+        elif name == "end":
+            target = self.rows_data.len() - 1
+        else:
+            return false
+        if target < 0:
+            target = 0
+        if target >= self.rows_data.len():
+            target = self.rows_data.len() - 1
+        self.cursor = target
+        if self.cursor < self.offset:
+            self.offset = self.cursor
+        if self.cursor >= self.offset + self.body_rows:
+            self.offset = self.cursor - self.body_rows + 1
+        return true
+
+    # one cell, padded to its column width; a ragged row reads as empty.
+    fn cell(row: List[String], col: Int) -> String:
+        if col < row.len():
+            return row[col]
+        return ""
+
+    # the width of column `col`: fixed if set, else the widest cell.
+    fn col_width(col: Int) -> Int:
+        if col < self.fixed.len() and self.fixed[col] > 0:
+            return self.fixed[col]
+        mut widest := width.of(self.cell(self.headers, col))
+        for row in self.rows_data:
+            w := width.of(self.cell(row, col))
+            if w > widest:
+                widest = w
+        return widest
+
+    # header, then `body_rows` rows with the cursor row marked "> ".
+    fn view() -> String:
+        cols := self.headers.len()
+        mut widths: List[Int] := []
+        mut c := 0
+        while c < cols:
+            widths.push(self.col_width(c))
+            c = c + 1
+        mut out: List[String] := []
+        out.push("  " + render_row(self.headers, widths))
+        mut r := 0
+        while r < self.body_rows:
+            i := self.offset + r
+            if i < self.rows_data.len():
+                mut mark := "  "
+                if self.focused and i == self.cursor:
+                    mark = "> "
+                out.push(mark + render_row(self.rows_data[i], widths))
+            else:
+                out.push("")
+            r = r + 1
+        return out.join("\n")
+
+fn render_row(row: List[String], widths: List[Int]) -> String:
+    mut cells: List[String] := []
+    mut c := 0
+    while c < widths.len():
+        mut text := ""
+        if c < row.len():
+            text = row[c]
+        cells.push(width.pad_right(width.truncate_to(text, widths[c]), widths[c]))
+        c = c + 1
+    return cells.join("  ")
+
+# ---------------------------------------------------------------
+# focus
+# ---------------------------------------------------------------
+
+# which of n interactive widgets owns the keyboard. the application matches
+# on `active` in on_event and forwards keys to exactly one widget; wire
+# tab/shift+tab to next()/prev().
+pub struct FocusRing:
+    pub count: Int
+    pub active: Int
+
+# a ring over `count` widgets, the first active.
+pub fn focus_ring(count: Int) -> FocusRing:
+    return FocusRing(count: count, active: 0)
+
+impl FocusRing:
+    fn next():
+        if self.count > 0:
+            self.active = (self.active + 1) % self.count
+
+    fn prev():
+        if self.count > 0:
+            self.active = (self.active + self.count - 1) % self.count
+
+fn press_key(name: String) -> input.Key:
+    return input.Key(code: input.KeyCode.Char(name), mods: 0)
+
+fn named_key(code: KeyCode) -> input.Key:
+    return input.Key(code: code, mods: 0)
+
+test "viewport scrolls clamps and pads to its shape":
+    v := viewport(4, 2)
+    v.set_content("one\ntwo\nthree\nfour")
+    assert_eq(v.view(), "one\ntwo")
+    assert(v.key(press_key("j")))
+    assert_eq(v.view(), "two\nthre")
+    v.to_bottom()
+    assert_eq(v.offset, 2)
+    assert(v.at_bottom())
+    assert_eq(v.percent(), 100)
+    v.to_top()
+    assert_eq(v.percent(), 0)
+    # scrolling past the ends clamps
+    v.scroll_by(0 - 5)
+    assert_eq(v.offset, 0)
+    # short content pads with blank lines
+    short := viewport(8, 3)
+    short.set_content("only")
+    assert_eq(short.view(), "only\n\n")
+
+test "list follows the cursor and reports selection":
+    l := list_view(["a", "b", "c", "d"], 2)
+    assert_eq(l.selected().unwrap_or(""), "a")
+    assert_eq(l.view(10), "> a\n  b")
+    assert(l.key(press_key("j")))
+    assert(l.key(press_key("j")))
+    # the window followed: offset <= cursor < offset + rows
+    assert_eq(l.cursor, 2)
+    assert_eq(l.offset, 1)
+    assert_eq(l.view(10), "  b\n> c")
+    l.key(named_key(KeyCode.End))
+    assert_eq(l.selected().unwrap_or(""), "d")
+    l.key(named_key(KeyCode.Home))
+    assert_eq(l.cursor, 0)
+    # blurred, the cursor mark disappears
+    l.blur()
+    assert_eq(l.view(10), "  a\n  b")
+
+test "an empty list selects none and consumes nothing":
+    empty: List[String] := []
+    l := list_view(empty, 2)
+    assert(l.selected() == none)
+    assert(l.selected_index() == none)
+    assert_eq(l.key(press_key("j")), false)
+    assert_eq(l.view(10), "\n")
+    # set_items rescues the cursor into the new bounds
+    l.set_items(["x"])
+    assert_eq(l.selected().unwrap_or(""), "x")
+
+test "table sizes columns by display width and marks the cursor":
+    t := table(["name", "qty"], [["apples", "3"], ["日本", "12"], ["z", "1"]], 3)
+    out := t.view()
+    lines := out.split("\n")
+    assert_eq(lines[0], "  name    qty")
+    assert_eq(lines[1], "> apples  3  ")
+    assert_eq(lines[2], "  日本    12 ")
+    # every row is the same visible width — cjk cells pad to equal columns
+    assert_eq(width.of(lines[1]), width.of(lines[2]))
+    t.key(press_key("j"))
+    picked := t.selected_row()
+    if let row = picked:
+        assert_eq(row[0], "日本")
+    else:
+        assert(false)
+
+test "table handles ragged rows and fixed widths":
+    t := table(["a", "b"], [["one"], ["two", "2"]], 2).with_widths([5, 0])
+    lines := t.view().split("\n")
+    # the ragged first row renders an empty second cell
+    assert_eq(lines[1], "> one     ")
+    assert_eq(width.of(lines[1]), width.of(lines[2]))
+    empty_rows: List[List[String]] := []
+    bare := table(["h"], empty_rows, 1)
+    assert(bare.selected_row() == none)
+    assert_eq(bare.key(press_key("j")), false)
+
+test "focus ring cycles both directions":
+    f := focus_ring(3)
+    assert_eq(f.active, 0)
+    f.next()
+    f.next()
+    assert_eq(f.active, 2)
+    f.next()
+    assert_eq(f.active, 0)
+    f.prev()
+    assert_eq(f.active, 2)

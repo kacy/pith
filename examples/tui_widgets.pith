@@ -2,6 +2,7 @@
 # so a whole dashboard prints deterministically — the same property that
 # makes each widget a snapshot test. this file grows as widget layers land.
 import std.term.app as app
+import std.term.input as input
 import std.term.style as style
 import std.term.ui as ui
 
@@ -20,3 +21,16 @@ fn main():
     print(ui.help_short(bindings, 60))
     print("")
     print(ui.help_full(bindings, 40))
+    print("")
+    l := ui.list_view(["alpha", "beta", "gamma", "delta"], 3)
+    l.key(input.Key(code: input.KeyCode.Char("j"), mods: 0))
+    print(ui.block().with_title("items").render(l.view(12)))
+    print("")
+    t := ui.table(["name", "qty"], [["apples", "3"], ["日本", "12"], ["pears", "7"]], 3)
+    t.key(input.Key(code: input.KeyCode.Char("j"), mods: 0))
+    print(t.view())
+    print("")
+    v := ui.viewport(14, 2)
+    v.set_content("line one\nline two\nline three")
+    v.scroll_by(1)
+    print(ui.block().with_title("scroll {v.percent()}%").render(v.view()))

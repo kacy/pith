@@ -66,6 +66,12 @@ vim.lsp.start({
 })
 ```
 
+## editors
+
+ready-made wiring for neovim and vs code — including the minimal
+extension in `tooling/editors/vscode/` — is in
+[editors.md](editors.md).
+
 ## transcript tests
 
 `tests/lsp/cases/*.jsonl` hold one raw json-rpc message per line, no

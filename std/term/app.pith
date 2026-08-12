@@ -283,49 +283,79 @@ pub fn drive[A: App](application: A, events: List[Event]) -> DriveResult:
 pub fn run[A: App](application: A) -> Int!:
     return run_with(application, runopts())!
 
+# the terminal touchpoints of run_with live in these non-generic helpers:
+# a generic function is re-emitted into its caller's module, where the
+# session module's types are not in scope, so the generic body itself must
+# not open, read, paint, or close the terminal directly. these helpers stay
+# in this module and are called by name, which resolves fine.
+fn open_terminal(opts: RunOpts) -> session.Terminal!:
+    return session.open_with(opts.session_options)!
+
+fn close_terminal(t: session.Terminal):
+    t.close()
+
+# wait briefly for one event, so timers keep firing on an idle keyboard.
+# the placeholder for a timed-out wait is FocusIn with a sentinel meaning:
+# callers treat it as "no event" and it never reaches the application.
+fn wait_terminal_event(t: session.Terminal) -> Event:
+    picked := select:
+        ev := t.events.recv() => (1, ev)
+        timeout 20 => (0, none)
+    if picked.0 == 0:
+        return Event.FocusIn
+    # a recv that yields nothing means the channel itself is gone; report it
+    # as Closed so the loop quits instead of spinning on a dead session.
+    return picked.1.unwrap_or(Event.Closed)
+
+fn paint_terminal(t: session.Terminal, chunk: String) -> Int!:
+    t.write(chunk)
+    t.flush()!
+    return 0
+
+# classify one event for the run loop: (idle, quit, full_repaint). matching
+# on the event stays out of the generic body for the same reason as the
+# session calls above — payload bindings in a re-emitted generic body do
+# not survive the trip into the caller's module.
+fn classify_event(got: Event, ctrl_c_quits: Bool) -> (Bool, Bool, Bool):
+    idle := match got:
+        Event.FocusIn => true
+        _ => false
+    quit_now := match got:
+        Event.KeyPress(k) => ctrl_c_quits and input.key_name(k) == "ctrl+c"
+        Event.Closed => true
+        _ => false
+    full := match got:
+        Event.Resize(_, _) => true
+        _ => false
+    return (idle, quit_now, full)
+
 # run with explicit options.
 pub fn run_with[A: App](application: A, opts: RunOpts) -> Int!:
-    t := session.open_with(opts.session_options)!
-    defer t.close()
+    t := open_terminal(opts)!
+    defer close_terminal(t)
     eng := engine[A.Msg]()
     interpret(application, application.init(), eng, time(), opts.max_chain)
     if eng.stopped:
         return 0
     painted := render_diff([], application.view(), true)
-    t.write(painted.0)
-    t.flush()!
+    paint_terminal(t, painted.0)!
     mut prev := painted.1
     while not eng.stopped:
         fire_due(application, eng, time(), opts.max_chain)
         if eng.stopped:
             return 0
-        # wait briefly for one event, so timers keep firing on an idle
-        # keyboard. the placeholder for a timed-out wait is FocusIn with a
-        # sentinel meaning below: it never reaches the application.
-        got := select:
-            ev := t.events.recv() => ev
-            timeout 20 => Event.FocusIn
-        was_timeout := match got:
-            Event.FocusIn => true
-            _ => false
-        mut full := false
-        if not was_timeout:
-            quit_now := match got:
-                Event.KeyPress(k) => opts.ctrl_c_quits and input.key_name(k) == "ctrl+c"
-                Event.Closed => true
-                _ => false
-            if quit_now:
+        got := wait_terminal_event(t)
+        cls := classify_event(got, opts.ctrl_c_quits)
+        full := cls.2
+        if not cls.0:
+            if cls.1:
                 return 0
-            full = match got:
-                Event.Resize(_, _) => true
-                _ => false
             interpret(application, application.on_event(got), eng, time(), opts.max_chain)
             if eng.stopped:
                 return 0
         painted2 := render_diff(prev, application.view(), full)
         if painted2.0 != "":
-            t.write(painted2.0)
-            t.flush()!
+            paint_terminal(t, painted2.0)!
         prev = painted2.1
     return 0
 

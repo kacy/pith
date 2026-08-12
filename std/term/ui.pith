@@ -16,7 +16,9 @@
 import std.term.app as app
 import std.term.input as input
 from std.term.input import KeyCode
+import std.term.ansi as ansi
 import std.term.style as style
+import std.text as text
 import std.text.width as width
 
 # ---------------------------------------------------------------
@@ -765,3 +767,414 @@ test "focus ring cycles both directions":
     assert_eq(f.active, 0)
     f.prev()
     assert_eq(f.active, 2)
+
+# ---------------------------------------------------------------
+# editors: single-line input and multi-line textarea
+#
+# both track their cursor in characters and render it in columns, drawn as
+# a reverse-video cell — the session hides the hardware cursor. neither
+# implements undo, selection, clipboard integration, soft wrap, or word
+# motions in this version; each is additive later.
+# ---------------------------------------------------------------
+
+# the reverse-video cell that stands in for the cursor.
+fn cursor_cell(ch: String) -> String:
+    mut shown := ch
+    if shown == "":
+        shown = " "
+    return ansi.sgr(ansi.COLOR_DEFAULT, ansi.COLOR_DEFAULT, ansi.ATTR_REVERSE) + shown + ansi.reset()
+
+# insert `piece` into `s` at character index `at`.
+fn insert_at(s: String, at: Int, piece: String) -> String:
+    n := text.char_count(s)
+    return text.slice(s, 0, at) + piece + text.slice(s, at, n)
+
+# remove one character at index `at`.
+fn remove_at(s: String, at: Int) -> String:
+    n := text.char_count(s)
+    return text.slice(s, 0, at) + text.slice(s, at + 1, n)
+
+# a single-line text field. hold one in the model, forward keys and pastes
+# while it is focused, and read value back.
+pub struct Input:
+    mut value: String
+    pub cursor: Int
+    pub cols: Int
+    pub placeholder: String
+    pub focused: Bool
+    pub masked: Bool
+
+# an empty input rendered `cols` columns wide.
+pub fn text_input(cols: Int) -> Input:
+    return Input(value: "", cursor: 0, cols: cols, placeholder: "", focused: true, masked: false)
+
+impl Input:
+    # replace the contents, cursor to the end.
+    fn set_value(s: String):
+        self.value = s
+        self.cursor = text.char_count(s)
+
+    fn focus():
+        self.focused = true
+
+    fn blur():
+        self.focused = false
+
+    # editing keys: printable characters insert at the cursor, backspace
+    # and delete remove around it, left/right/home/end move it. returns
+    # whether the key was consumed.
+    fn key(k: input.Key) -> Bool:
+        if k.mods != 0:
+            return false
+        match k.code:
+            KeyCode.Char(c) =>
+                self.value = insert_at(self.value, self.cursor, c)
+                self.cursor = self.cursor + 1
+                return true
+            KeyCode.Backspace =>
+                if self.cursor > 0:
+                    self.value = remove_at(self.value, self.cursor - 1)
+                    self.cursor = self.cursor - 1
+                return true
+            KeyCode.Delete =>
+                if self.cursor < text.char_count(self.value):
+                    self.value = remove_at(self.value, self.cursor)
+                return true
+            KeyCode.Left =>
+                if self.cursor > 0:
+                    self.cursor = self.cursor - 1
+                return true
+            KeyCode.Right =>
+                if self.cursor < text.char_count(self.value):
+                    self.cursor = self.cursor + 1
+                return true
+            KeyCode.Home =>
+                self.cursor = 0
+                return true
+            KeyCode.End =>
+                self.cursor = text.char_count(self.value)
+                return true
+            _ =>
+                return false
+        return false
+
+    # insert pasted text at the cursor as one edit.
+    fn paste(s: String):
+        self.value = insert_at(self.value, self.cursor, s)
+        self.cursor = self.cursor + text.char_count(s)
+
+    # the field, one line: masked if asked, the placeholder dimly when
+    # empty and blurred, the cursor cell drawn only while focused, and a
+    # window that keeps the cursor visible when the value overflows.
+    fn view() -> String:
+        if self.value == "" and not self.focused and self.placeholder != "":
+            return width.truncate_to(ansi.sgr(ansi.COLOR_DEFAULT, ansi.COLOR_DEFAULT, ansi.ATTR_DIM) + self.placeholder + ansi.reset(), self.cols + 16)
+        mut shown := self.value
+        if self.masked:
+            shown = strings_repeat_mask(text.char_count(self.value))
+        n := text.char_count(shown)
+        # window in characters: keep the cursor inside the visible span.
+        # character windows approximate column windows well enough for a
+        # single line; wide characters shrink the visible span, never hide
+        # the cursor.
+        mut start := 0
+        if self.cursor >= self.cols:
+            start = self.cursor - self.cols + 1
+        visible := text.slice(shown, start, n)
+        cut := width.truncate_to(visible, self.cols)
+        if not self.focused:
+            return cut
+        cur := self.cursor - start
+        shown_n := text.char_count(cut)
+        before := text.slice(cut, 0, cur)
+        at := text.slice(cut, cur, min_int(cur + 1, shown_n))
+        after := text.slice(cut, min_int(cur + 1, shown_n), shown_n)
+        return before + cursor_cell(at) + after
+
+fn strings_repeat_mask(n: Int) -> String:
+    mut parts: List[String] := []
+    mut i := 0
+    while i < n:
+        parts.push("•")
+        i = i + 1
+    return parts.join("")
+
+fn min_int(a: Int, b: Int) -> Int:
+    if a < b:
+        return a
+    return b
+
+# a multi-line editor. printable characters insert, enter splits the line,
+# backspace at column zero joins with the line above, delete at line end
+# joins with the line below, arrows remember the column they want across
+# short lines, and the view scrolls to follow the cursor.
+pub struct TextArea:
+    mut lines: List[String]
+    pub row: Int
+    pub col: Int
+    pub cols: Int
+    pub rows: Int
+    pub focused: Bool
+    mut top: Int
+    mut want_col: Int
+
+# an empty textarea of the given size.
+pub fn textarea(cols: Int, rows: Int) -> TextArea:
+    return TextArea(lines: [""], row: 0, col: 0, cols: cols, rows: rows, focused: true, top: 0, want_col: 0)
+
+impl TextArea:
+    # the whole buffer, lines joined with newlines.
+    fn value() -> String:
+        return self.lines.join("\n")
+
+    # replace the buffer, cursor to the start.
+    fn set_value(s: String):
+        self.lines = s.split("\n")
+        self.row = 0
+        self.col = 0
+        self.top = 0
+        self.want_col = 0
+
+    fn focus():
+        self.focused = true
+
+    fn blur():
+        self.focused = false
+
+    fn current_line() -> String:
+        return self.lines[self.row]
+
+    # editing and movement keys; returns whether the key was consumed.
+    fn key(k: input.Key) -> Bool:
+        if k.mods != 0:
+            return false
+        match k.code:
+            KeyCode.Char(c) =>
+                self.lines[self.row] = insert_at(self.current_line(), self.col, c)
+                self.col = self.col + 1
+                self.want_col = self.col
+            KeyCode.Enter =>
+                line := self.current_line()
+                n := text.char_count(line)
+                self.lines[self.row] = text.slice(line, 0, self.col)
+                self.lines.insert(self.row + 1, text.slice(line, self.col, n))
+                self.row = self.row + 1
+                self.col = 0
+                self.want_col = 0
+            KeyCode.Backspace =>
+                if self.col > 0:
+                    self.lines[self.row] = remove_at(self.current_line(), self.col - 1)
+                    self.col = self.col - 1
+                elif self.row > 0:
+                    above := self.lines[self.row - 1]
+                    joined := above + self.current_line()
+                    self.col = text.char_count(above)
+                    self.lines[self.row - 1] = joined
+                    self.lines.remove(self.row)
+                    self.row = self.row - 1
+                self.want_col = self.col
+            KeyCode.Delete =>
+                line := self.current_line()
+                if self.col < text.char_count(line):
+                    self.lines[self.row] = remove_at(line, self.col)
+                elif self.row + 1 < self.lines.len():
+                    self.lines[self.row] = line + self.lines[self.row + 1]
+                    self.lines.remove(self.row + 1)
+            KeyCode.Left =>
+                if self.col > 0:
+                    self.col = self.col - 1
+                elif self.row > 0:
+                    self.row = self.row - 1
+                    self.col = text.char_count(self.current_line())
+                self.want_col = self.col
+            KeyCode.Right =>
+                if self.col < text.char_count(self.current_line()):
+                    self.col = self.col + 1
+                elif self.row + 1 < self.lines.len():
+                    self.row = self.row + 1
+                    self.col = 0
+                self.want_col = self.col
+            KeyCode.Up =>
+                if self.row > 0:
+                    self.row = self.row - 1
+                    self.clamp_col()
+            KeyCode.Down =>
+                if self.row + 1 < self.lines.len():
+                    self.row = self.row + 1
+                    self.clamp_col()
+            KeyCode.PageUp =>
+                self.row = max_int(0, self.row - self.rows)
+                self.clamp_col()
+            KeyCode.PageDown =>
+                self.row = min_int(self.lines.len() - 1, self.row + self.rows)
+                self.clamp_col()
+            KeyCode.Home =>
+                self.col = 0
+                self.want_col = 0
+            KeyCode.End =>
+                self.col = text.char_count(self.current_line())
+                self.want_col = self.col
+            _ =>
+                return false
+        self.follow_cursor()
+        return true
+
+    # after a vertical move, land on the remembered column, clamped to the
+    # new line's length.
+    fn clamp_col():
+        self.col = min_int(self.want_col, text.char_count(self.current_line()))
+
+    # keep the cursor row inside the visible window.
+    fn follow_cursor():
+        if self.row < self.top:
+            self.top = self.row
+        if self.row >= self.top + self.rows:
+            self.top = self.row - self.rows + 1
+
+    # insert pasted text at the cursor, splitting on its newlines.
+    fn paste(s: String):
+        pieces := s.split("\n")
+        mut i := 0
+        while i < pieces.len():
+            piece := pieces[i]
+            self.lines[self.row] = insert_at(self.current_line(), self.col, piece)
+            self.col = self.col + text.char_count(piece)
+            if i + 1 < pieces.len():
+                line := self.current_line()
+                n := text.char_count(line)
+                self.lines[self.row] = text.slice(line, 0, self.col)
+                self.lines.insert(self.row + 1, text.slice(line, self.col, n))
+                self.row = self.row + 1
+                self.col = 0
+            i = i + 1
+        self.want_col = self.col
+        self.follow_cursor()
+
+    # `rows` lines with the cursor drawn on its line while focused; each
+    # line truncated to `cols`, the cursor line windowed so the cursor
+    # stays visible.
+    fn view() -> String:
+        mut out: List[String] := []
+        mut r := 0
+        while r < self.rows:
+            i := self.top + r
+            mut line := ""
+            if i < self.lines.len():
+                if self.focused and i == self.row:
+                    line = self.render_cursor_line()
+                else:
+                    line = width.truncate_to(self.lines[i], self.cols)
+            out.push(line)
+            r = r + 1
+        return out.join("\n")
+
+    fn render_cursor_line() -> String:
+        line := self.current_line()
+        n := text.char_count(line)
+        mut start := 0
+        if self.col >= self.cols:
+            start = self.col - self.cols + 1
+        visible := text.slice(line, start, n)
+        cut := width.truncate_to(visible, self.cols)
+        shown_n := text.char_count(cut)
+        cur := self.col - start
+        before := text.slice(cut, 0, cur)
+        at := text.slice(cut, cur, min_int(cur + 1, shown_n))
+        after := text.slice(cut, min_int(cur + 1, shown_n), shown_n)
+        return before + cursor_cell(at) + after
+
+fn max_int(a: Int, b: Int) -> Int:
+    if a > b:
+        return a
+    return b
+
+fn type_text(field: Input, s: String):
+    for c in s:
+        field.key(input.Key(code: KeyCode.Char(c), mods: 0))
+
+test "input edits at the cursor and reports its value":
+    f := text_input(20)
+    type_text(f, "hello")
+    assert_eq(f.value, "hello")
+    f.key(named_key(KeyCode.Left))
+    f.key(named_key(KeyCode.Left))
+    f.key(input.Key(code: KeyCode.Char("X"), mods: 0))
+    assert_eq(f.value, "helXlo")
+    f.key(named_key(KeyCode.Backspace))
+    assert_eq(f.value, "hello")
+    f.key(named_key(KeyCode.Delete))
+    assert_eq(f.value, "helo")
+    f.key(named_key(KeyCode.Home))
+    f.key(named_key(KeyCode.Delete))
+    assert_eq(f.value, "elo")
+    f.paste("yy")
+    assert_eq(f.value, "yyelo")
+    assert_eq(f.cursor, 2)
+
+test "input renders a cursor cell and masks when asked":
+    e := chr(27)
+    f := text_input(10)
+    type_text(f, "ab")
+    # the cursor sits after the text, drawn over a space
+    assert_eq(f.view(), "ab" + e + "[0;7m " + e + "[0m")
+    f.key(named_key(KeyCode.Left))
+    assert_eq(f.view(), "a" + e + "[0;7mb" + e + "[0m")
+    f.blur()
+    assert_eq(f.view(), "ab")
+    f.masked = true
+    assert_eq(f.view(), "••")
+
+test "input windows long values around the cursor":
+    f := text_input(4)
+    type_text(f, "abcdefgh")
+    # cursor at 8, window starts at 5: shows fgh + cursor space
+    shown := f.view()
+    plain := strip_test(shown)
+    assert_eq(plain, "fgh ")
+
+fn strip_test(s: String) -> String:
+    return ansi.strip(s)
+
+test "textarea edits split join and remember the column":
+    t := textarea(20, 3)
+    type_area(t, "one")
+    t.key(named_key(KeyCode.Enter))
+    type_area(t, "second")
+    assert_eq(t.value(), "one\nsecond")
+    # backspace at column zero joins with the line above
+    t.key(named_key(KeyCode.Home))
+    t.key(named_key(KeyCode.Backspace))
+    assert_eq(t.value(), "onesecond")
+    assert_eq(t.col, 3)
+    # split it again and walk up with a remembered column
+    t.key(named_key(KeyCode.Enter))
+    assert_eq(t.value(), "one\nsecond")
+    t.key(named_key(KeyCode.End))
+    t.key(named_key(KeyCode.Up))
+    # want_col 6 clamps to "one" length 3
+    assert_eq(t.col, 3)
+    t.key(named_key(KeyCode.Down))
+    assert_eq(t.col, 6)
+    # delete at line end joins with the line below
+    t.key(named_key(KeyCode.Up))
+    t.key(named_key(KeyCode.Delete))
+    assert_eq(t.value(), "onesecond")
+
+fn type_area(t: TextArea, s: String):
+    for c in s:
+        t.key(input.Key(code: KeyCode.Char(c), mods: 0))
+
+test "textarea paste splits lines and the view follows the cursor":
+    t := textarea(10, 2)
+    t.paste("a\nb\nc\nd")
+    assert_eq(t.value(), "a\nb\nc\nd")
+    assert_eq(t.row, 3)
+    # the window followed to keep row 3 visible in 2 rows
+    assert_eq(t.top, 2)
+    view := ansi.strip(t.view())
+    # the cursor cell renders as a space after the final character
+    assert_eq(view, "c\nd ")
+    # page up moves by a window and clamps
+    t.key(named_key(KeyCode.PageUp))
+    t.key(named_key(KeyCode.PageUp))
+    assert_eq(t.row, 0)

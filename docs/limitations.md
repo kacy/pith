@@ -133,7 +133,9 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## tooling
 
-- **no language server** — there is no lsp; editor support is limited to syntax.
+- **editor support is early** — `pith lsp` covers diagnostics, hover, document
+  symbols, and formatting; no go-to-definition or completion yet. see
+  [docs/lsp.md](lsp.md) for what works.
 - **no package registry** — dependencies are local path entries in `pith.toml`;
   there is no fetch, lock, or hosted index yet.
 - **no debugger** — runtime stack traces are thin and there is no stepping.

@@ -1,0 +1,348 @@
+# lsp_features.pith — analysis, diagnostics, hover, symbols, formatting
+#
+# each language feature reads the compiler's state after a front-end
+# run: diagnostics render the checker's findings as publishDiagnostics
+# notifications, hover reads the expression type cache, documentSymbol
+# walks the ast root, and formatting diffs against fmt_source. one
+# analysis is valid at a time — the node arena and type cache describe
+# only the most recent run_check_pipeline call — so every feature goes
+# through ensure_analyzed first.
+
+from check_pipeline import run_check_pipeline
+from driver import file_for_node
+from checker import c_get_expr_type
+from types import get_type_name, TID_ERR
+from ast import get_node, node_count
+from errors import Diagnostic
+from lexer import lex_all
+from formatter import fmt_source
+from lsp_state import PithPos, uri_to_path, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
+import std.json as json
+import std.lsp.protocol as protocol
+
+# at most this many diagnostics publish per file; an unparsable file can
+# produce hundreds and the first few are the actionable ones.
+MAX_DIAGNOSTICS_PER_FILE := 20
+
+# which document the compiler state currently describes, and whether the
+# checker ran for it (a parse or import failure stops before checking,
+# leaving the type cache stale).
+mut analyzed_uri := ""
+mut analyzed_root := 0 - 1
+mut analyzed_checked := false
+
+# how many diagnostics were last published per uri, so a document whose
+# problems disappear gets one clearing publish instead of silence.
+mut last_published_counts: Map[String, Int] := {}
+
+# ---------------------------------------------------------------
+# diagnostics
+# ---------------------------------------------------------------
+
+fn severity_number(severity: String) -> Int:
+    if severity == "warning":
+        return 2
+    return 1
+
+# insertion sort by (line, col, code); diagnostic lists are short.
+fn sort_diagnostics(diags: List[Diagnostic]) -> List[Diagnostic]:
+    mut sorted: List[Diagnostic] := []
+    for d in diags:
+        mut inserted := false
+        mut i := 0
+        while i < sorted.len() and not inserted:
+            s := sorted[i]
+            after := d.line < s.line or (d.line == s.line and (d.col < s.col or (d.col == s.col and d.code < s.code)))
+            if after:
+                sorted.insert(i, d)
+                inserted = true
+            i = i + 1
+        if not inserted:
+            sorted.push(d)
+    return sorted
+
+# the byte length of the token starting at 1-based col on this line, or
+# 0 when no token starts there. the line is lexed alone, so token
+# columns are columns within the line.
+fn token_length_at(line_text: String, col: Int) -> Int:
+    toks := lex_all(line_text)
+    for tok in toks:
+        if tok.current_line == 1 and tok.current_column == col:
+            return tok.len
+    return 0
+
+# one diagnostic as a json object, with a range spanning the token at
+# its position when one is found there.
+fn diagnostic_json(d: Diagnostic, text: String, mode: String) -> Int:
+    start := line_col_to_lsp_pos(text, d.line, d.col, mode)
+    mut end_col := d.col
+    span := token_length_at(text_line(text, start.line), d.col)
+    if span > 0:
+        end_col = d.col + span
+    end := line_col_to_lsp_pos(text, d.line, end_col, mode)
+    range := json.make_object()
+    start_obj := json.make_object()
+    json.object_set(start_obj, "line", json.make_int(start.line))
+    json.object_set(start_obj, "character", json.make_int(start.character))
+    end_obj := json.make_object()
+    json.object_set(end_obj, "line", json.make_int(end.line))
+    json.object_set(end_obj, "character", json.make_int(end.character))
+    json.object_set(range, "start", start_obj)
+    json.object_set(range, "end", end_obj)
+    obj := json.make_object()
+    json.object_set(obj, "range", range)
+    json.object_set(obj, "severity", json.make_int(severity_number(d.severity)))
+    if d.code != "":
+        json.object_set(obj, "code", json.make_string(d.code))
+    json.object_set(obj, "source", json.make_string("pith"))
+    json.object_set(obj, "message", json.make_string(d.message))
+    return obj
+
+# an encoded publishDiagnostics notification for one uri.
+fn publish_body(uri: String, diags: List[Diagnostic], mode: String) -> String:
+    text := document_text(uri)
+    arr := json.make_array()
+    mut seen: Map[String, Bool] := {}
+    mut emitted := 0
+    for d in sort_diagnostics(diags):
+        key := "{d.line}:" + d.code
+        if seen.contains_key(key):
+            continue
+        seen.insert(key, true)
+        if emitted >= MAX_DIAGNOSTICS_PER_FILE:
+            break
+        json.array_push(arr, diagnostic_json(d, text, mode))
+        emitted = emitted + 1
+    params := json.make_object()
+    json.object_set(params, "uri", json.make_string(uri))
+    json.object_set(params, "diagnostics", arr)
+    return protocol.notification_body("textDocument/publishDiagnostics", params)
+
+## run the front end for one document and build the publishDiagnostics
+## notifications that fall out: always one for the analyzed document,
+## and one per other open document that has findings now or had some at
+## its last publish. bodies are encoded strings, so they stay valid
+## after the caller closes its json scope.
+pub fn run_analysis(uri: String) -> List[String]:
+    path := uri_to_path(uri)
+    mut bodies: List[String] := []
+    outcome := run_check_pipeline(path) catch:
+        return bodies
+    clear_dirty_if(uri)
+    analyzed_uri = uri
+    analyzed_root = outcome.root
+    analyzed_checked = outcome.parse_ok and outcome.import_ok
+    mode := get_position_encoding()
+
+    # group findings by the file they point at
+    mut by_path: Map[String, List[Diagnostic]] := {}
+    for d in outcome.diags:
+        mut file := d.file
+        if file == "":
+            file = path
+        if by_path.contains_key(file):
+            by_path[file].push(d)
+        else:
+            by_path.insert(file, [d])
+
+    for open_uri in open_document_uris():
+        open_path := uri_to_path(open_uri)
+        mut file_diags: List[Diagnostic] := []
+        if by_path.contains_key(open_path):
+            file_diags = by_path[open_path]
+        mut previous := 0
+        if last_published_counts.contains_key(open_path):
+            previous = last_published_counts[open_path]
+        if open_uri == uri or file_diags.len() > 0 or previous > 0:
+            bodies.push(publish_body(open_uri, file_diags, mode))
+            last_published_counts.insert(open_path, file_diags.len())
+    return bodies
+
+## make the compiler state describe this document, re-running analysis
+## when the last run was for another document or the text changed since.
+## returns any publishDiagnostics bodies a re-run produced.
+pub fn ensure_analyzed(uri: String) -> List[String]:
+    if analyzed_uri == uri and not dirty_is(uri):
+        mut none_needed: List[String] := []
+        return none_needed
+    return run_analysis(uri)
+
+# ---------------------------------------------------------------
+# hover
+# ---------------------------------------------------------------
+
+## the hover result for a position as a json handle, or -1 for null.
+## finds the typed expression node starting closest before the position
+## on its line and reports the checker's type for it.
+pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
+    if not analyzed_checked:
+        return 0 - 1
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    mut best_idx := 0 - 1
+    mut best_col := 0 - 1
+    total := node_count()
+    mut i := 0
+    while i < total:
+        node := get_node(i)
+        if node.line == pos.line and node.col <= pos.col and file_for_node(i) == path:
+            tid := c_get_expr_type(i)
+            if tid != TID_ERR and tid >= 0:
+                # a later start is a tighter fit; at the same start the
+                # lower index is the leaf, parents being added after
+                # their children
+                if node.col > best_col or (node.col == best_col and i < best_idx):
+                    best_idx = i
+                    best_col = node.col
+        i = i + 1
+    if best_idx < 0:
+        return 0 - 1
+    name := get_type_name(c_get_expr_type(best_idx))
+    if name == "" or name == "<error>":
+        return 0 - 1
+    contents := json.make_object()
+    json.object_set(contents, "kind", json.make_string("plaintext"))
+    json.object_set(contents, "value", json.make_string(name))
+    result := json.make_object()
+    json.object_set(result, "contents", contents)
+    return result
+
+# ---------------------------------------------------------------
+# document symbols
+# ---------------------------------------------------------------
+
+fn symbol_kind_number(node_kind: String) -> Int:
+    if node_kind == "fn_decl":
+        return 12
+    if node_kind == "struct_decl":
+        return 23
+    if node_kind == "enum_decl":
+        return 10
+    if node_kind == "interface_decl":
+        return 11
+    return 0
+
+# a declaration name without any generic parameter brackets.
+fn bare_symbol_name(value: String) -> String:
+    bracket := value.index_of("[")
+    if bracket >= 0:
+        return value.substring(0, bracket)
+    return value
+
+fn decl_keyword(node_kind: String) -> String:
+    if node_kind == "fn_decl":
+        return "fn"
+    if node_kind == "struct_decl":
+        return "struct"
+    if node_kind == "enum_decl":
+        return "enum"
+    return "interface"
+
+# true when the name at this byte offset ends there as an identifier —
+# the next byte is not part of a longer name.
+fn name_ends_at(line: String, end: Int) -> Bool:
+    if end >= line.len():
+        return true
+    c := ord(line[end])
+    if c >= 97 and c <= 122:
+        return false
+    if c >= 65 and c <= 90:
+        return false
+    if c >= 48 and c <= 57:
+        return false
+    if c == 95:
+        return false
+    return true
+
+# where a top-level declaration's name sits in the source: ast nodes
+# carry the position of their last token, so the name is found by
+# scanning lines for the declaring keyword instead. returns the name's
+# 1-based line and byte column, or line 0 when no line matches.
+fn find_decl_position(text: String, node_kind: String, name: String) -> PithPos:
+    keyword := decl_keyword(node_kind)
+    plain := keyword + " " + name
+    public := "pub " + plain
+    total := text_line_count(text)
+    mut line0 := 0
+    while line0 < total:
+        line := text_line(text, line0)
+        mut name_col := 0 - 1
+        if line.starts_with(plain):
+            name_col = keyword.len() + 1
+        elif line.starts_with(public):
+            name_col = keyword.len() + 5
+        if name_col >= 0 and name_ends_at(line, name_col + name.len()):
+            return PithPos(line0 + 1, name_col + 1)
+        line0 = line0 + 1
+    return PithPos(0, 0)
+
+## the flat symbol list for a document as a json array handle: one
+## SymbolInformation entry per top-level fn, struct, enum, and
+## interface declaration.
+pub fn document_symbols(uri: String) -> Int:
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    mode := get_position_encoding()
+    arr := json.make_array()
+    if analyzed_root < 0:
+        return arr
+    root := get_node(analyzed_root)
+    for child_idx in root.children:
+        if file_for_node(child_idx) != path:
+            continue
+        child := get_node(child_idx)
+        kind_num := symbol_kind_number(child.kind)
+        if kind_num == 0:
+            continue
+        name := bare_symbol_name(child.value)
+        mut at := find_decl_position(text, child.kind, name)
+        if at.line == 0:
+            at = PithPos(child.line, child.col)
+        start := line_col_to_lsp_pos(text, at.line, at.col, mode)
+        end := line_col_to_lsp_pos(text, at.line, at.col + name.len(), mode)
+        range := json.make_object()
+        start_obj := json.make_object()
+        json.object_set(start_obj, "line", json.make_int(start.line))
+        json.object_set(start_obj, "character", json.make_int(start.character))
+        end_obj := json.make_object()
+        json.object_set(end_obj, "line", json.make_int(end.line))
+        json.object_set(end_obj, "character", json.make_int(end.character))
+        json.object_set(range, "start", start_obj)
+        json.object_set(range, "end", end_obj)
+        location := json.make_object()
+        json.object_set(location, "uri", json.make_string(uri))
+        json.object_set(location, "range", range)
+        entry := json.make_object()
+        json.object_set(entry, "name", json.make_string(name))
+        json.object_set(entry, "kind", json.make_int(kind_num))
+        json.object_set(entry, "location", location)
+        json.array_push(arr, entry)
+    return arr
+
+# ---------------------------------------------------------------
+# formatting
+# ---------------------------------------------------------------
+
+## the edits that format a document: an empty array when the text is
+## already formatted, otherwise one edit replacing the whole document.
+pub fn formatting_edits(uri: String) -> Int:
+    text := document_text(uri)
+    arr := json.make_array()
+    formatted := fmt_source(text)
+    if formatted == text:
+        return arr
+    start_obj := json.make_object()
+    json.object_set(start_obj, "line", json.make_int(0))
+    json.object_set(start_obj, "character", json.make_int(0))
+    end_obj := json.make_object()
+    json.object_set(end_obj, "line", json.make_int(text_line_count(text) + 1))
+    json.object_set(end_obj, "character", json.make_int(0))
+    range := json.make_object()
+    json.object_set(range, "start", start_obj)
+    json.object_set(range, "end", end_obj)
+    edit := json.make_object()
+    json.object_set(edit, "range", range)
+    json.object_set(edit, "newText", json.make_string(formatted))
+    json.array_push(arr, edit)
+    return arr

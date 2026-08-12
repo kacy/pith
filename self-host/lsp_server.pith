@@ -1,0 +1,306 @@
+# lsp_server.pith — the pith language server: loop, routing, lifecycle
+#
+# a single-task server speaking the language server protocol over
+# stdio. one loop reads frames from fd 0, handles each message
+# synchronously, and writes every response frame straight to fd 1 —
+# no spawned tasks, so nothing can interleave with the protocol
+# stream. analysis is debounced: a document change marks the world
+# dirty, and the loop runs the front end when 300ms pass without
+# input. PITH_LSP_NO_DEBOUNCE=1 analyzes immediately after every
+# didOpen/didChange/didSave instead, which is what the transcript
+# tests run under.
+#
+# fd 1 is the protocol channel, so nothing here may print(): a stray
+# newline corrupts the frame stream.
+
+from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
+from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, formatting_edits
+from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
+import std.lsp.transport as transport
+import std.json as json
+import std.bytes as bytes
+import std.term.tty as tty
+
+# lifecycle state: initialize must come first, shutdown is remembered
+# so exit can report whether the client followed the protocol.
+mut server_initialized := false
+mut shutdown_seen := false
+mut exit_requested := false
+mut exit_code := 0
+
+# when set, analysis runs inside the didOpen/didChange/didSave handler
+# instead of on the debounce timeout.
+mut no_debounce := false
+
+# ---------------------------------------------------------------
+# output
+# ---------------------------------------------------------------
+
+# frame a message body and write it to the protocol channel.
+fn write_body(body: String):
+    _n := tty.write(transport.encode_frame(bytes.from_string_utf8(body))) catch 0
+
+fn write_bodies(bodies: List[String]):
+    for body in bodies:
+        write_body(body)
+
+# ---------------------------------------------------------------
+# initialize
+# ---------------------------------------------------------------
+
+# the position encoding to negotiate: utf-8 only when the client
+# offers it in capabilities.general.positionEncodings.
+fn negotiate_encoding(params: Int) -> String:
+    if params < 0:
+        return "utf-16"
+    capabilities := json.object_get(params, "capabilities")
+    if capabilities < 0:
+        return "utf-16"
+    general := json.object_get(capabilities, "general")
+    if general < 0:
+        return "utf-16"
+    encodings := json.object_get(general, "positionEncodings")
+    if encodings < 0 or json.type_of(encodings) != "array":
+        return "utf-16"
+    mut i := 0
+    while i < json.array_len(encodings):
+        entry := json.array_get(encodings, i)
+        if json.type_of(entry) == "string" and json.get_string(entry) == "utf-8":
+            return "utf-8"
+        i = i + 1
+    return "utf-16"
+
+fn handle_initialize(m: Message):
+    mode := negotiate_encoding(m.params)
+    set_position_encoding(mode)
+    caps := json.make_object()
+    json.object_set(caps, "positionEncoding", json.make_string(mode))
+    json.object_set(caps, "textDocumentSync", json.make_int(1))
+    json.object_set(caps, "hoverProvider", json.make_bool(true))
+    json.object_set(caps, "documentSymbolProvider", json.make_bool(true))
+    json.object_set(caps, "documentFormattingProvider", json.make_bool(true))
+    info := json.make_object()
+    json.object_set(info, "name", json.make_string("pith-lsp"))
+    json.object_set(info, "version", json.make_string("0.1.0"))
+    result := json.make_object()
+    json.object_set(result, "capabilities", caps)
+    json.object_set(result, "serverInfo", info)
+    server_initialized = true
+    write_body(response_body(m.id, m.id_text, m.id_is_text, result))
+
+# ---------------------------------------------------------------
+# requests
+# ---------------------------------------------------------------
+
+# the uri under params.textDocument, or "".
+fn params_uri(params: Int) -> String:
+    if params < 0:
+        return ""
+    doc := json.object_get(params, "textDocument")
+    if doc < 0:
+        return ""
+    return json.object_get_string_or(doc, "uri", "")
+
+fn handle_hover(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    position := json.object_get(m.params, "position")
+    mut line := 0
+    mut character := 0
+    if position >= 0:
+        line = json.object_get_int_or(position, "line", 0)
+        character = json.object_get_int_or(position, "character", 0)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, hover_result(uri, line, character)))
+
+fn handle_document_symbol(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    write_body(response_body(m.id, m.id_text, m.id_is_text, document_symbols(uri)))
+
+fn handle_formatting(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_body(response_body(m.id, m.id_text, m.id_is_text, formatting_edits(uri)))
+
+fn handle_request(m: Message):
+    if m.method == "initialize":
+        handle_initialize(m)
+        return
+    if not server_initialized:
+        write_body(error_body(m.id, m.id_text, m.id_is_text, SERVER_NOT_INITIALIZED, "server not initialized"))
+        return
+    if m.method == "shutdown":
+        shutdown_seen = true
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    if m.method == "textDocument/hover":
+        handle_hover(m)
+        return
+    if m.method == "textDocument/documentSymbol":
+        handle_document_symbol(m)
+        return
+    if m.method == "textDocument/formatting":
+        handle_formatting(m)
+        return
+    write_body(error_body(m.id, m.id_text, m.id_is_text, METHOD_NOT_FOUND, "unknown method: " + m.method))
+
+# ---------------------------------------------------------------
+# notifications
+# ---------------------------------------------------------------
+
+# analyze one document now and publish what falls out; the immediate
+# path used under PITH_LSP_NO_DEBOUNCE.
+fn analyze_now(uri: String):
+    write_bodies(run_analysis(uri))
+
+fn handle_did_open(params: Int):
+    if params < 0:
+        return
+    doc := json.object_get(params, "textDocument")
+    if doc < 0:
+        return
+    uri := json.object_get_string_or(doc, "uri", "")
+    if uri == "":
+        return
+    text := json.object_get_string_or(doc, "text", "")
+    version := json.object_get_int_or(doc, "version", 0)
+    lsp_open_document(uri, text, version)
+    if no_debounce:
+        analyze_now(uri)
+
+fn handle_did_change(params: Int):
+    uri := params_uri(params)
+    if uri == "" or not document_is_open(uri):
+        return
+    changes := json.object_get(params, "contentChanges")
+    if changes < 0 or json.type_of(changes) != "array" or json.array_len(changes) == 0:
+        return
+    # full sync: the last change carries the whole new text
+    change := json.array_get(changes, json.array_len(changes) - 1)
+    text := json.object_get_string_or(change, "text", "")
+    doc := json.object_get(params, "textDocument")
+    mut version := 0
+    if doc >= 0:
+        version = json.object_get_int_or(doc, "version", 0)
+    lsp_change_document(uri, text, version)
+    if no_debounce:
+        analyze_now(uri)
+
+fn handle_did_save(params: Int):
+    uri := params_uri(params)
+    if uri == "" or not document_is_open(uri):
+        return
+    mut text := ""
+    mut has_text := false
+    if params >= 0 and json.object_has(params, "text"):
+        text = json.object_get_string_or(params, "text", "")
+        has_text = true
+    lsp_save_document(uri, text, has_text)
+    if no_debounce:
+        analyze_now(uri)
+
+fn handle_notification(m: Message):
+    if m.method == "exit":
+        exit_requested = true
+        exit_code = 1
+        if shutdown_seen:
+            exit_code = 0
+        return
+    if m.method == "initialized":
+        return
+    if m.method == "$/cancelRequest":
+        # v1 handles every request synchronously; nothing is ever queued
+        return
+    if not server_initialized:
+        # the spec drops notifications received before initialize
+        return
+    if m.method == "textDocument/didOpen":
+        handle_did_open(m.params)
+        return
+    if m.method == "textDocument/didChange":
+        handle_did_change(m.params)
+        return
+    if m.method == "textDocument/didSave":
+        handle_did_save(m.params)
+        return
+    if m.method == "textDocument/didClose":
+        lsp_close_document(params_uri(m.params))
+        return
+    # unknown notifications are ignored by design
+
+# ---------------------------------------------------------------
+# the loop
+# ---------------------------------------------------------------
+
+# handle one raw message body inside its own json scope, so a long
+# session's arena stays bounded.
+fn handle_body(body: String):
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    m := parse_message(body)
+    if m.kind == "invalid":
+        mut code := INVALID_REQUEST
+        if m.error_text == "body is not valid json":
+            code = PARSE_ERROR
+        write_body(error_body(0 - 1, "", false, code, m.error_text))
+        return
+    if m.kind == "request":
+        handle_request(m)
+        return
+    if m.kind == "notification":
+        handle_notification(m)
+        return
+    # stray responses have nothing waiting on them in v1
+
+# the debounce timeout fired: analyze the document that changed.
+fn debounced_analysis():
+    uri := take_dirty()
+    if uri == "":
+        return
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    analyze_now(uri)
+
+## run the language server over stdio until the client says exit or
+## the stream closes. returns the process exit code: 0 after a proper
+## shutdown/exit handshake, 1 otherwise.
+pub fn run_lsp_server() -> Int:
+    no_debounce = env("PITH_LSP_NO_DEBOUNCE") == "1"
+    reader := transport.reader()
+    while not exit_requested:
+        # a pending analysis shortens the wait so the debounce fires;
+        # an idle server just keeps listening
+        mut wait_ms := 1000
+        if has_dirty():
+            wait_ms = 300
+        chunk := tty.read(65536, wait_ms) catch:
+            # stdin closed: the client is gone
+            if shutdown_seen:
+                return 0
+            return 1
+        if bytes.len(chunk) == 0:
+            # nothing arrived before the timeout
+            if has_dirty():
+                debounced_analysis()
+            continue
+        reader.feed(chunk)
+        mut more := true
+        while more and not exit_requested:
+            body := reader.next()
+            if body == none:
+                more = false
+            else:
+                text := bytes.to_string_utf8(body.unwrap_or(bytes.empty())) catch ""
+                handle_body(text)
+        if reader.error() != "":
+            # framing is unrecoverable once the header stream is corrupt
+            return 1
+    return exit_code

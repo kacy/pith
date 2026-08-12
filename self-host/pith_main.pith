@@ -25,6 +25,7 @@
 #   pith package inspect [pkg] inspect current package or dependency
 #   pith package context [pkg] emit an agent-readable package summary
 #   pith new <name>           scaffold new package
+#   pith lsp                  run the language server over stdio
 #   pith lex <file.pith>        print token stream
 #   pith parse <file.pith>      print AST
 #   pith version              print version
@@ -42,6 +43,7 @@ from linter import lint_module
 from errors import Diagnostic, render_diagnostics, render_diagnostics_json, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
+from lsp_server import run_lsp_server
 
 # ---------------------------------------------------------------
 # native backend passthrough
@@ -341,6 +343,7 @@ fn print_help():
     print("  package inspect [pkg]  inspect current package or dependency")
     print("  package context [pkg]  emit agent-readable package context")
     print("  new <name>             scaffold new package")
+    print("  lsp                    run the language server over stdio")
     print("  lex <file.pith>          print token stream")
     print("  parse <file.pith>        print AST")
     print("  version                print version")
@@ -447,6 +450,10 @@ fn run_cli() -> String!:
             print("usage: pith new <name>")
             exit(1)
         _result := cmd_new(a[2])!
+        return ""
+
+    if command == "lsp":
+        exit(run_lsp_server())
         return ""
 
     if a.len() < 3:

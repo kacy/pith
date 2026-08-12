@@ -1,0 +1,416 @@
+# std.term.style — composable styling and layout for terminal blocks
+#
+# a widget renders a block: a multi-line string whose visible geometry is
+# measured in columns. this module styles those blocks (colors, attributes,
+# padding, borders, margins) and arranges them (join side by side, stack,
+# place inside a box) — all as pure string functions, so a layout snapshot
+# is an assert_eq away.
+#
+#   import std.term.style as style
+#   card := style.new().fg(6).bold().pad(1).border(style.BORDER_ROUNDED).render("hi")
+#   page := style.join_h([card, other], style.TOP)
+#
+# every builder returns a new Style, so a base style can be shared and
+# specialised without mutation. all geometry is display columns via
+# std.text.width, and measurement strips escape sequences first, so styled
+# and plain blocks lay out identically.
+import std.term.ansi as ansi
+import std.text.width as width
+
+# horizontal alignment for join_v, place, and width-constrained rendering.
+pub LEFT := 0
+pub CENTER := 1
+pub RIGHT := 2
+
+# vertical alignment for join_h and place.
+pub TOP := 0
+pub MIDDLE := 1
+pub BOTTOM := 2
+
+# border character sets for Style.border().
+pub BORDER_NONE := 0
+pub BORDER_NORMAL := 1
+pub BORDER_ROUNDED := 2
+pub BORDER_DOUBLE := 3
+pub BORDER_THICK := 4
+
+# one box-drawing character set: the four corners plus the two edges.
+pub struct Border:
+    pub tl: String
+    pub tr: String
+    pub bl: String
+    pub br: String
+    pub h: String
+    pub v: String
+
+# the character set for a border kind; BORDER_NONE gets empty strings.
+pub fn border_of(kind: Int) -> Border:
+    if kind == BORDER_NORMAL:
+        return Border(tl: "┌", tr: "┐", bl: "└", br: "┘", h: "─", v: "│")
+    if kind == BORDER_ROUNDED:
+        return Border(tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│")
+    if kind == BORDER_DOUBLE:
+        return Border(tl: "╔", tr: "╗", bl: "╚", br: "╝", h: "═", v: "║")
+    if kind == BORDER_THICK:
+        return Border(tl: "┏", tr: "┓", bl: "┗", br: "┛", h: "━", v: "┃")
+    return Border(tl: "", tr: "", bl: "", br: "", h: "", v: "")
+
+# a text style plus a box model, applied inner to outer: colors and
+# attributes on the text, then padding, then the border, then the margin.
+# fields are set through the builders; new() gives the neutral style.
+pub struct Style:
+    mut fg_c: Int
+    mut bg_c: Int
+    mut attr_bits: Int
+    mut pad_t: Int
+    mut pad_r: Int
+    mut pad_b: Int
+    mut pad_l: Int
+    mut mar_t: Int
+    mut mar_r: Int
+    mut mar_b: Int
+    mut mar_l: Int
+    mut min_w: Int
+    mut min_h: Int
+    mut halign: Int
+    mut bord: Int
+    mut bord_fg: Int
+
+# the neutral style: default colors, no attributes, no box.
+pub fn new() -> Style:
+    return Style(fg_c: ansi.COLOR_DEFAULT, bg_c: ansi.COLOR_DEFAULT, attr_bits: 0, pad_t: 0, pad_r: 0, pad_b: 0, pad_l: 0, mar_t: 0, mar_r: 0, mar_b: 0, mar_l: 0, min_w: 0, min_h: 0, halign: LEFT, bord: BORDER_NONE, bord_fg: ansi.COLOR_DEFAULT)
+
+fn dup(s: Style) -> Style:
+    return Style(fg_c: s.fg_c, bg_c: s.bg_c, attr_bits: s.attr_bits, pad_t: s.pad_t, pad_r: s.pad_r, pad_b: s.pad_b, pad_l: s.pad_l, mar_t: s.mar_t, mar_r: s.mar_r, mar_b: s.mar_b, mar_l: s.mar_l, min_w: s.min_w, min_h: s.min_h, halign: s.halign, bord: s.bord, bord_fg: s.bord_fg)
+
+impl Style:
+    # foreground color: 0..255 indexed or ansi.rgb() packed 24-bit.
+    fn fg(c: Int) -> Style:
+        d := dup(self)
+        d.fg_c = c
+        return d
+
+    # background color, same encoding as fg.
+    fn bg(c: Int) -> Style:
+        d := dup(self)
+        d.bg_c = c
+        return d
+
+    fn bold() -> Style:
+        return self.attr(ansi.ATTR_BOLD)
+
+    fn italic() -> Style:
+        return self.attr(ansi.ATTR_ITALIC)
+
+    fn underline() -> Style:
+        return self.attr(ansi.ATTR_UNDERLINE)
+
+    fn dim() -> Style:
+        return self.attr(ansi.ATTR_DIM)
+
+    fn reverse() -> Style:
+        return self.attr(ansi.ATTR_REVERSE)
+
+    fn strike() -> Style:
+        return self.attr(ansi.ATTR_STRIKE)
+
+    # add one ansi.ATTR_ bit; the named builders above cover the usual ones.
+    fn attr(bit: Int) -> Style:
+        d := dup(self)
+        if (d.attr_bits / bit) % 2 == 0:
+            d.attr_bits = d.attr_bits + bit
+        return d
+
+    # padding inside the border, clockwise from the top.
+    fn padding(t: Int, r: Int, b: Int, l: Int) -> Style:
+        d := dup(self)
+        d.pad_t = t
+        d.pad_r = r
+        d.pad_b = b
+        d.pad_l = l
+        return d
+
+    # the same padding on all four sides.
+    fn pad(all: Int) -> Style:
+        return self.padding(all, all, all, all)
+
+    # margin outside the border, clockwise from the top.
+    fn margin(t: Int, r: Int, b: Int, l: Int) -> Style:
+        d := dup(self)
+        d.mar_t = t
+        d.mar_r = r
+        d.mar_b = b
+        d.mar_l = l
+        return d
+
+    # a minimum content width in columns; shorter text is aligned into it.
+    fn min_width(w: Int) -> Style:
+        d := dup(self)
+        d.min_w = w
+        return d
+
+    # a minimum content height in lines; shorter text is padded below.
+    fn min_height(h: Int) -> Style:
+        d := dup(self)
+        d.min_h = h
+        return d
+
+    # how lines align inside the content width: LEFT, CENTER, or RIGHT.
+    fn align(a: Int) -> Style:
+        d := dup(self)
+        d.halign = a
+        return d
+
+    # draw a border around the padded content: one of the BORDER_ kinds.
+    fn border(kind: Int) -> Style:
+        d := dup(self)
+        d.bord = kind
+        return d
+
+    # the border's own color, separate from the text's.
+    fn border_fg(c: Int) -> Style:
+        d := dup(self)
+        d.bord_fg = c
+        return d
+
+    # apply the style to text, inner to outer: align each line into the
+    # content width, color the text, pad, border, margin. multi-line input
+    # keeps its line structure; the result is a rectangular block.
+    fn render(s: String) -> String:
+        lines := s.split("\n")
+        mut content_w := self.min_w
+        for line in lines:
+            w := visible_width(line)
+            if w > content_w:
+                content_w = w
+        mut rows: List[String] := []
+        styled := self.fg_c != ansi.COLOR_DEFAULT or self.bg_c != ansi.COLOR_DEFAULT or self.attr_bits != 0
+        for line in lines:
+            aligned := align_line(line, content_w, self.halign)
+            if styled:
+                rows.push(ansi.sgr(self.fg_c, self.bg_c, self.attr_bits) + aligned + ansi.reset())
+            else:
+                rows.push(aligned)
+        while rows.len() < self.min_h:
+            rows.push(spaces(content_w))
+        rows = apply_padding(rows, content_w, self.pad_t, self.pad_r, self.pad_b, self.pad_l)
+        if self.bord != BORDER_NONE:
+            rows = apply_border(rows, content_w + self.pad_l + self.pad_r, border_of(self.bord), self.bord_fg)
+        rows = apply_margin(rows, self.mar_t, self.mar_r, self.mar_b, self.mar_l)
+        return rows.join("\n")
+
+fn spaces(n: Int) -> String:
+    if n <= 0:
+        return ""
+    mut parts: List[String] := []
+    mut i := 0
+    while i < n:
+        parts.push(" ")
+        i = i + 1
+    return parts.join("")
+
+# the columns a line occupies on screen, with escape sequences ignored.
+fn visible_width(line: String) -> Int:
+    return width.of(ansi.strip(line))
+
+fn align_line(line: String, cols: Int, halign: Int) -> String:
+    gap := cols - visible_width(line)
+    if gap <= 0:
+        return line
+    if halign == RIGHT:
+        return spaces(gap) + line
+    if halign == CENTER:
+        left := gap / 2
+        return spaces(left) + line + spaces(gap - left)
+    return line + spaces(gap)
+
+fn apply_padding(rows: List[String], content_w: Int, t: Int, r: Int, b: Int, l: Int) -> List[String]:
+    mut out: List[String] := []
+    inner_w := content_w + l + r
+    mut i := 0
+    while i < t:
+        out.push(spaces(inner_w))
+        i = i + 1
+    for row in rows:
+        out.push(spaces(l) + row + spaces(r))
+    mut j := 0
+    while j < b:
+        out.push(spaces(inner_w))
+        j = j + 1
+    return out
+
+fn apply_border(rows: List[String], inner_w: Int, b: Border, fg: Int) -> List[String]:
+    mut h_run: List[String] := []
+    mut i := 0
+    while i < inner_w:
+        h_run.push(b.h)
+        i = i + 1
+    edge := h_run.join("")
+    mut top := b.tl + edge + b.tr
+    mut side := b.v
+    mut bottom := b.bl + edge + b.br
+    if fg != ansi.COLOR_DEFAULT:
+        paint := ansi.sgr(fg, ansi.COLOR_DEFAULT, 0)
+        top = paint + top + ansi.reset()
+        side = paint + b.v + ansi.reset()
+        bottom = paint + bottom + ansi.reset()
+    mut out: List[String] := [top]
+    for row in rows:
+        out.push(side + row + side)
+    out.push(bottom)
+    return out
+
+fn apply_margin(rows: List[String], t: Int, r: Int, b: Int, l: Int) -> List[String]:
+    if t == 0 and r == 0 and b == 0 and l == 0:
+        return rows
+    mut w := 0
+    for row in rows:
+        vw := visible_width(row)
+        if vw > w:
+            w = vw
+    mut out: List[String] := []
+    mut i := 0
+    while i < t:
+        out.push("")
+        i = i + 1
+    for row in rows:
+        out.push(spaces(l) + row + spaces(r))
+    mut j := 0
+    while j < b:
+        out.push("")
+        j = j + 1
+    return out
+
+# the visible size of a block as (columns of the widest line, line count).
+pub fn measure(s: String) -> (Int, Int):
+    lines := s.split("\n")
+    mut w := 0
+    for line in lines:
+        vw := visible_width(line)
+        if vw > w:
+            w = vw
+    return (w, lines.len())
+
+# join blocks side by side, each keeping its own width, aligned TOP, MIDDLE,
+# or BOTTOM against the tallest. the blocks' lines are padded so columns
+# stay straight even when a block's lines differ in width.
+pub fn join_h(blocks: List[String], valign: Int) -> String:
+    mut split_blocks: List[List[String]] := []
+    mut widths: List[Int] := []
+    mut tallest := 0
+    for b in blocks:
+        lines := b.split("\n")
+        dims := measure(b)
+        split_blocks.push(lines)
+        widths.push(dims.0)
+        if lines.len() > tallest:
+            tallest = lines.len()
+    mut rows: List[String] := []
+    mut r := 0
+    while r < tallest:
+        mut parts: List[String] := []
+        mut bi := 0
+        while bi < split_blocks.len():
+            lines := split_blocks[bi]
+            offset := valign_offset(tallest, lines.len(), valign)
+            src := r - offset
+            mut cell := ""
+            if src >= 0 and src < lines.len():
+                cell = lines[src]
+            parts.push(align_line(cell, widths[bi], LEFT))
+            bi = bi + 1
+        rows.push(parts.join(""))
+        r = r + 1
+    return rows.join("\n")
+
+fn valign_offset(total: Int, count: Int, valign: Int) -> Int:
+    gap := total - count
+    if gap <= 0:
+        return 0
+    if valign == BOTTOM:
+        return gap
+    if valign == MIDDLE:
+        return gap / 2
+    return 0
+
+# stack blocks vertically, aligning each LEFT, CENTER, or RIGHT against the
+# widest.
+pub fn join_v(blocks: List[String], halign: Int) -> String:
+    mut widest := 0
+    for b in blocks:
+        dims := measure(b)
+        if dims.0 > widest:
+            widest = dims.0
+    mut rows: List[String] := []
+    for b in blocks:
+        for line in b.split("\n"):
+            rows.push(align_line(line, widest, halign))
+    return rows.join("\n")
+
+# place a block inside a w-by-h box with both alignments — the workhorse for
+# positioning a widget inside a pane. a block larger than the box keeps its
+# own size rather than being cut; truncation is the widget's decision.
+pub fn place(s: String, w: Int, h: Int, halign: Int, valign: Int) -> String:
+    lines := s.split("\n")
+    offset := valign_offset(h, lines.len(), valign)
+    mut rows: List[String] := []
+    mut r := 0
+    mut total := h
+    if lines.len() > h:
+        total = lines.len()
+    while r < total:
+        src := r - offset
+        mut cell := ""
+        if src >= 0 and src < lines.len():
+            cell = lines[src]
+        rows.push(align_line(cell, w, halign))
+        r = r + 1
+    return rows.join("\n")
+
+test "render aligns lines pads and borders":
+    block := new().pad(1).border(BORDER_NORMAL).render("hi")
+    expected := "┌────┐\n│    │\n│ hi │\n│    │\n└────┘"
+    assert_eq(block, expected)
+
+test "multi-line render squares the block and honors alignment":
+    b := new().align(RIGHT).render("a\nlong")
+    assert_eq(b, "   a\nlong")
+    c := new().align(CENTER).min_width(6).render("ab")
+    assert_eq(c, "  ab  ")
+
+test "styled render wraps each line and measurement ignores the escapes":
+    styled := new().fg(1).bold().render("hi")
+    e := chr(27)
+    assert_eq(styled, e + "[0;1;38;5;1mhi" + e + "[0m")
+    dims := measure(styled)
+    assert_eq(dims.0, 2)
+    assert_eq(dims.1, 1)
+
+test "wide characters keep borders straight":
+    block := new().border(BORDER_NORMAL).render("日本\nab")
+    expected := "┌────┐\n│日本│\n│ab  │\n└────┘"
+    assert_eq(block, expected)
+
+test "join_h aligns blocks of unequal height":
+    left := "1\n2\n3"
+    right := "x"
+    assert_eq(join_h([left, right], TOP), "1x\n2 \n3 ")
+    assert_eq(join_h([left, right], MIDDLE), "1 \n2x\n3 ")
+    assert_eq(join_h([left, right], BOTTOM), "1 \n2 \n3x")
+
+test "join_v aligns blocks of unequal width":
+    assert_eq(join_v(["ab", "x"], LEFT), "ab\nx ")
+    assert_eq(join_v(["ab", "x"], RIGHT), "ab\n x")
+    assert_eq(join_v(["abcd", "x"], CENTER), "abcd\n x  ")
+
+test "place centers a block in a larger box":
+    got := place("ab", 6, 3, CENTER, MIDDLE)
+    assert_eq(got, "      \n  ab  \n      ")
+
+test "margins surround the border and builders never mutate the base":
+    base := new().border(BORDER_NORMAL)
+    boxed := base.margin(1, 0, 0, 2).render("x")
+    assert_eq(boxed, "\n  ┌─┐\n  │x│\n  └─┘")
+    # the base style is unchanged by the margin builder
+    plain := base.render("x")
+    assert_eq(plain, "┌─┐\n│x│\n└─┘")

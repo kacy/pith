@@ -93,6 +93,41 @@ final byte, window titles to either terminator, three-byte ss3 sequences —
 so asserting on the visible text of a frame works no matter what the frame
 contains. `examples/term_strip.pith` shows both directions.
 
+## input events
+
+`std.term.input` decodes the bytes a raw-mode terminal delivers into typed
+events with a push parser: feed it whatever a read returned, get back every
+event those bytes completed, and let it hold the tail of an unfinished
+sequence until more bytes arrive.
+
+```pith
+import std.term.input as input
+
+p := input.parser()
+for ev in input.feed(p, chunk):
+    match ev:
+        input.Event.KeyPress(k) =>
+            handle(input.key_name(k))   # "a", "ctrl+c", "shift+tab", "f5"
+        input.Event.Paste(s) =>
+            insert(s)
+        _ =>
+            pass_on(ev)
+```
+
+it decodes printable and control keys, arrows and function keys in both
+their csi and ss3 forms with xterm modifier parameters, sgr-encoded mouse
+reports on 0-based cells, bracketed paste as one event (the terminator is
+matched incrementally, so a paste split across reads still closes), focus
+changes, and utf-8 characters split across feeds. `key_name` renders the
+canonical names keybinding tables match against.
+
+the one ambiguity bytes cannot resolve is a lone escape: ESC alone is the
+escape key, but ESC also starts every sequence. the parser holds it, and
+when a read times out while `pending()` is true, `flush()` resolves the
+held prefix — a lone esc becomes the escape key, a truncated sequence is
+dropped rather than leaked as text. garbage never wedges the state machine.
+`examples/term_input_parse.pith` decodes every shape from byte literals.
+
 ## size and resize
 
 `size()` returns `(cols, rows)` for the window. it is a point-in-time query;

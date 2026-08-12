@@ -1,0 +1,17 @@
+# std.term.ansi builds terminal escape sequences as plain strings and strips
+# them back out with a parser that walks the real escape grammar. the old
+# stripper only understood color codes; this one also removes cursor moves,
+# window titles, and mode switches — everything a tui frame contains — so
+# tests can assert on the visible text of a frame.
+import std.term.ansi as ansi
+from std.term import red, bold
+
+fn main():
+    frame := ansi.cursor_to(0, 0) + ansi.clear_line() + red("FAIL") + " " + bold("retry")
+    print("visible: {ansi.strip(frame)}")
+
+    titled := chr(27) + "]0;window title" + chr(7) + "body text"
+    print("titled: {ansi.strip(titled)}")
+
+    styled := ansi.sgr(ansi.rgb(255, 0, 128), ansi.COLOR_DEFAULT, ansi.ATTR_BOLD) + "deep pink" + ansi.reset()
+    print("styled: {ansi.strip(styled)}")

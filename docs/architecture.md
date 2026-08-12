@@ -86,6 +86,13 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 - self-hosted CLI: `self-host/pith_main.pith`
 - native backend CLI: `cranelift/cli/src/main.rs`
 
+### change language server behavior
+
+- server loop and routing: `self-host/lsp_server.pith`
+- documents and position conversion: `self-host/lsp_state.pith`
+- diagnostics/hover/symbols/formatting: `self-host/lsp_features.pith`
+- framing and json-rpc envelope: `std/lsp/transport.pith`, `std/lsp/protocol.pith`
+
 ## mental model for new contributors
 
 start at the CLI entrypoint, then follow one command end to end:

@@ -1,0 +1,322 @@
+# lsp_state.pith — open documents, uri mapping, and position conversion
+#
+# the language server's mutable world lives here: which documents the
+# client holds open, their current text and versions, and which one
+# changed most recently. every conversion between lsp positions and the
+# compiler's line/column convention goes through this module so the
+# off-by-one and unit rules live in exactly one place.
+#
+# conventions: lsp lines are 0-based and characters count utf-16 code
+# units (or utf-8 bytes when the client negotiated utf-8); pith lines
+# are 1-based and columns are 1-based byte offsets within the line.
+# out-of-range positions clamp instead of failing, matching the lsp
+# spec's tolerance for stale client positions.
+
+from driver import set_source_overlay, clear_source_overlay
+import std.text.utf16 as utf16
+
+# open documents keyed by uri, holding the client's current text.
+mut open_docs: Map[String, String] := {}
+mut doc_versions: Map[String, Int] := {}
+
+# the reverse mapping from filesystem path back to the uri the client
+# opened it under, so diagnostics for a path publish to the right uri
+# without re-encoding.
+mut uri_by_path: Map[String, String] := {}
+
+# the uri of the document that changed since the last analysis, or ""
+# when nothing is waiting. v1 analyzes one document at a time — the
+# most recently changed one.
+mut dirty_uri := ""
+
+# the negotiated position encoding: "utf-16" unless the client offered
+# "utf-8" during initialize.
+mut position_encoding := "utf-16"
+
+## record the encoding negotiated during initialize.
+pub fn set_position_encoding(mode: String):
+    position_encoding = mode
+
+## the negotiated position encoding, "utf-16" or "utf-8".
+pub fn get_position_encoding() -> String:
+    return position_encoding
+
+# ---------------------------------------------------------------
+# uri handling
+# ---------------------------------------------------------------
+
+# the value of one hex digit, or -1 for a byte that is not hex.
+fn hex_digit_value(c: Int) -> Int:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    return 0 - 1
+
+## decode %XX escapes byte by byte; anything unescaped passes through.
+pub fn percent_decode(s: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < s.len():
+        c := ord(s[i])
+        mut consumed := false
+        if c == 37 and i + 2 < s.len():
+            hi := hex_digit_value(ord(s[i + 1]))
+            lo := hex_digit_value(ord(s[i + 2]))
+            if hi >= 0 and lo >= 0:
+                out = out + chr(hi * 16 + lo)
+                i = i + 3
+                consumed = true
+        if not consumed:
+            out = out + s[i]
+            i = i + 1
+    return out
+
+## the filesystem path behind a file:// uri: scheme stripped, percent
+## escapes decoded. a uri with another scheme comes back decoded but
+## otherwise untouched.
+pub fn uri_to_path(uri: String) -> String:
+    mut rest := uri
+    if rest.starts_with("file://"):
+        rest = rest.substring(7, rest.len())
+    return percent_decode(rest)
+
+## the uri a path was opened under, or a plain file:// uri when the
+## path never came from the client.
+pub fn path_to_uri(path: String) -> String:
+    if uri_by_path.contains_key(path):
+        return uri_by_path[path]
+    return "file://" + path
+
+# ---------------------------------------------------------------
+# open documents
+# ---------------------------------------------------------------
+
+## track a newly opened document and overlay its text for the compiler.
+pub fn lsp_open_document(uri: String, text: String, version: Int):
+    open_docs.insert(uri, text)
+    doc_versions.insert(uri, version)
+    uri_by_path.insert(uri_to_path(uri), uri)
+    set_source_overlay(uri_to_path(uri), text)
+    dirty_uri = uri
+
+## replace a document's text after a full-sync change.
+pub fn lsp_change_document(uri: String, text: String, version: Int):
+    open_docs.insert(uri, text)
+    doc_versions.insert(uri, version)
+    set_source_overlay(uri_to_path(uri), text)
+    dirty_uri = uri
+
+## note a save; when the client included text, adopt it.
+pub fn lsp_save_document(uri: String, text: String, has_text: Bool):
+    if has_text:
+        open_docs.insert(uri, text)
+        set_source_overlay(uri_to_path(uri), text)
+    dirty_uri = uri
+
+## forget a closed document and drop its overlay.
+pub fn lsp_close_document(uri: String):
+    open_docs.remove(uri)
+    doc_versions.remove(uri)
+    uri_by_path.remove(uri_to_path(uri))
+    clear_source_overlay(uri_to_path(uri))
+    if dirty_uri == uri:
+        dirty_uri = ""
+
+## whether the client currently holds this uri open.
+pub fn document_is_open(uri: String) -> Bool:
+    return open_docs.contains_key(uri)
+
+## the current text of an open document, or "" for an unknown uri.
+pub fn document_text(uri: String) -> String:
+    if open_docs.contains_key(uri):
+        return open_docs[uri]
+    return ""
+
+## every uri the client holds open.
+pub fn open_document_uris() -> List[String]:
+    mut uris: List[String] := []
+    for uri in open_docs.keys():
+        uris.push(uri)
+    return uris
+
+## the uri waiting for analysis, cleared by the caller; "" when clean.
+pub fn take_dirty() -> String:
+    uri := dirty_uri
+    dirty_uri = ""
+    return uri
+
+## whether a document changed since the last analysis.
+pub fn has_dirty() -> Bool:
+    return dirty_uri != ""
+
+## whether this particular document is the one waiting for analysis.
+pub fn dirty_is(uri: String) -> Bool:
+    return dirty_uri == uri
+
+## clear the dirty marker when it points at this document, leaving a
+## different document's pending analysis alone.
+pub fn clear_dirty_if(uri: String):
+    if dirty_uri == uri:
+        dirty_uri = ""
+
+# ---------------------------------------------------------------
+# position conversion
+# ---------------------------------------------------------------
+
+## a compiler position: 1-based line, 1-based byte column.
+pub struct PithPos:
+    pub line: Int
+    pub col: Int
+
+## a protocol position: 0-based line, character in negotiated units.
+pub struct LspPos:
+    pub line: Int
+    pub character: Int
+
+## how many lines the text has; an empty text still has one.
+pub fn text_line_count(text: String) -> Int:
+    mut n := 1
+    mut i := 0
+    while i < text.len():
+        if ord(text[i]) == 10:
+            n = n + 1
+        i = i + 1
+    return n
+
+## the text of the 0-based line, without its newline. a trailing \r from
+## crlf endings is kept — columns here are byte offsets, and the lexer
+## sees the same byte.
+pub fn text_line(text: String, line0: Int) -> String:
+    mut current := 0
+    mut start := 0
+    mut i := 0
+    while i < text.len():
+        if ord(text[i]) == 10:
+            if current == line0:
+                return text.substring(start, i)
+            current = current + 1
+            start = i + 1
+        i = i + 1
+    return text.substring(start, text.len())
+
+# character offset within a line to a byte offset, clamped to the line.
+fn character_to_byte(line_text: String, character: Int, mode: String) -> Int:
+    mut ch := character
+    if ch < 0:
+        ch = 0
+    if mode == "utf-8":
+        if ch > line_text.len():
+            return line_text.len()
+        return ch
+    units := utf16.length(line_text)
+    if ch > units:
+        ch = units
+    # a position landing between the halves of a surrogate pair backs
+    # up one unit to the pair's start instead of failing
+    return utf16.to_byte_offset(line_text, ch) catch (utf16.to_byte_offset(line_text, ch - 1) catch line_text.len())
+
+# byte offset within a line to a character offset, clamped to the line.
+fn byte_to_character(line_text: String, byte_off: Int, mode: String) -> Int:
+    mut b := byte_off
+    if b < 0:
+        b = 0
+    if b > line_text.len():
+        b = line_text.len()
+    if mode == "utf-8":
+        return b
+    # a byte offset inside a multi-byte character backs up to the
+    # character's start
+    mut ch := 0 - 1
+    while ch < 0 and b >= 0:
+        ch = utf16.from_byte_offset(line_text, b) catch (0 - 1)
+        if ch < 0:
+            b = b - 1
+    if ch < 0:
+        return 0
+    return ch
+
+## an lsp position to the compiler's 1-based line and byte column,
+## clamped into the document.
+pub fn lsp_pos_to_line_col(text: String, line0: Int, character: Int, mode: String) -> PithPos:
+    mut l := line0
+    if l < 0:
+        l = 0
+    last := text_line_count(text) - 1
+    if l > last:
+        l = last
+    lt := text_line(text, l)
+    return PithPos(l + 1, character_to_byte(lt, character, mode) + 1)
+
+## a compiler position to an lsp position, clamped into the document.
+pub fn line_col_to_lsp_pos(text: String, line1: Int, col1: Int, mode: String) -> LspPos:
+    mut l := line1 - 1
+    if l < 0:
+        l = 0
+    last := text_line_count(text) - 1
+    if l > last:
+        l = last
+    lt := text_line(text, l)
+    return LspPos(l, byte_to_character(lt, col1 - 1, mode))
+
+test "percent decoding handles escapes, case, and passthrough":
+    assert_eq(percent_decode("plain"), "plain")
+    assert_eq(percent_decode("a%20b"), "a b")
+    assert_eq(percent_decode("a%2Fb"), "a/b")
+    assert_eq(percent_decode("a%2fb"), "a/b")
+    # a multi-byte character decodes byte by byte
+    assert_eq(percent_decode("%C3%A9"), "é")
+    # a truncated or malformed escape passes through untouched
+    assert_eq(percent_decode("100%"), "100%")
+    assert_eq(percent_decode("%zz"), "%zz")
+
+test "uri_to_path strips the scheme and decodes":
+    assert_eq(uri_to_path("file:///home/u/x.pith"), "/home/u/x.pith")
+    assert_eq(uri_to_path("file:///home/u/my%20file.pith"), "/home/u/my file.pith")
+    assert_eq(uri_to_path("/already/a/path.pith"), "/already/a/path.pith")
+
+test "lsp positions convert to 1-based byte columns":
+    text := "fn main():\n    x := 1\n"
+    p := lsp_pos_to_line_col(text, 1, 4, "utf-16")
+    assert_eq(p.line, 2)
+    assert_eq(p.col, 5)
+    # line and character past the end clamp instead of failing
+    over := lsp_pos_to_line_col(text, 99, 99, "utf-16")
+    assert_eq(over.line, 3)
+    assert_eq(over.col, 1)
+
+test "utf-16 characters count units, not bytes":
+    # 𝄞 is four bytes and two utf-16 units; é is two bytes and one unit
+    text := "a𝄞b é\n"
+    p := lsp_pos_to_line_col(text, 0, 3, "utf-16")
+    assert_eq(p.line, 1)
+    assert_eq(p.col, 6)
+    back := line_col_to_lsp_pos(text, 1, 6, "utf-16")
+    assert_eq(back.line, 0)
+    assert_eq(back.character, 3)
+    # a character landing mid-pair backs up to the pair's start
+    mid := lsp_pos_to_line_col(text, 0, 2, "utf-16")
+    assert_eq(mid.col, 2)
+
+test "utf-8 mode counts characters as bytes":
+    text := "a𝄞b\n"
+    p := lsp_pos_to_line_col(text, 0, 5, "utf-8")
+    assert_eq(p.col, 6)
+    back := line_col_to_lsp_pos(text, 1, 6, "utf-8")
+    assert_eq(back.character, 5)
+
+test "document lifecycle tracks text, dirtiness, and uris":
+    uri := "file:///tmp/lsp_state_test.pith"
+    lsp_open_document(uri, "fn main():\n    pass\n", 1)
+    assert(document_is_open(uri))
+    assert(has_dirty())
+    assert_eq(take_dirty(), uri)
+    assert(not has_dirty())
+    lsp_change_document(uri, "fn main():\n    print(\"x\")\n", 2)
+    assert_eq(document_text(uri), "fn main():\n    print(\"x\")\n")
+    assert_eq(path_to_uri("/tmp/lsp_state_test.pith"), uri)
+    lsp_close_document(uri)
+    assert(not document_is_open(uri))
+    assert(not has_dirty())

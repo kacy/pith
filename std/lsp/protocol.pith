@@ -104,10 +104,14 @@ pub fn parse_message(body: String) -> Message:
     return invalid("not a request, notification, or response")
 
 # an id json node matching how the id arrived: a string node when
-# id_is_text, an integer node otherwise.
+# id_is_text, an integer node otherwise. a negative integer id stands
+# for "no id was decodable" and encodes as the spec's null id, which is
+# how an error response answers an unparsable request.
 fn id_node(id: Int, id_text: String, id_is_text: Bool) -> Int:
     if id_is_text:
         return json.make_string(id_text)
+    if id < 0:
+        return json.make_null()
     return json.make_int(id)
 
 fn envelope() -> Int:
@@ -231,6 +235,12 @@ test "response bodies round-trip and a -1 result encodes null":
     assert_eq(named.kind, "response")
     assert(named.id_is_text)
     assert_eq(named.id_text, "req-2")
+
+test "a negative integer id encodes as the null id":
+    body := error_body(0 - 1, "", false, PARSE_ERROR, "bad json")
+    assert(body.contains("\"id\":null"))
+    m := parse_message(body)
+    assert_eq(m.kind, "response")
 
 test "an error body carries the code and message":
     body := error_body(2, "", false, METHOD_NOT_FOUND, "unknown method")

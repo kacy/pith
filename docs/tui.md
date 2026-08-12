@@ -3,8 +3,83 @@
 pith's terminal-ui stack lives under `std.term`. the foundation —
 raw mode, escape sequences, input events, the session — is documented in
 [terminal.md](terminal.md); this page covers the layers an application
-builds with. it grows as the stack lands: styling and layout are here now,
-the widget set and the application runtime arrive next.
+builds with: the elm-style runtime and styling now, the widget set next.
+
+## the application runtime
+
+`std.term.app` is the elm architecture: an application is a struct with a
+message type, an event handler, an update, and a view — the runtime owns
+the session, the loop, timers, and repainting only changed lines.
+
+```pith
+import std.term.app as app
+from std.term.app import App, Cmd
+import std.term.input as input
+from std.term.input import Event
+
+enum Msg:
+    Inc
+    Halt
+
+struct Counter:
+    mut count: Int
+
+impl App for Counter:
+    type Msg = Msg
+    fn init() -> Cmd[Msg]:
+        return app.nothing[Msg]()
+    fn on_event(ev: Event) -> Cmd[Msg]:
+        match ev:
+            Event.KeyPress(k) =>
+                if input.key_name(k) == "+":
+                    return self.update(Msg.Inc)
+                if input.key_name(k) == "q":
+                    return self.update(Msg.Halt)
+                return app.nothing[Msg]()
+            _ =>
+                return app.nothing[Msg]()
+        return app.nothing[Msg]()
+    fn update(msg: Msg) -> Cmd[Msg]:
+        match msg:
+            Msg.Inc =>
+                self.count = self.count + 1
+            Msg.Halt =>
+                return app.quit[Msg]()
+        return app.nothing[Msg]()
+    fn view() -> String:
+        return "count: {self.count}"
+
+fn main() -> Int!:
+    return app.run(Counter(count: 0))!
+```
+
+`on_event` owns the event-to-message dispatch — usually a match that calls
+`update` — because the message type is the application's own business; the
+runtime only ever sees commands. import `App` and `Cmd` unqualified, as
+shown: an impl names its interface bare, and a cross-module generic
+annotation needs the unqualified name.
+
+### commands
+
+`update` and `view` are total. side effects are command values the runtime
+interprets: `nothing[Msg]()`, `quit[Msg]()`, `emit(m)` (a follow-up message
+this turn), `perform(f)` (deferred work whose return value becomes a
+message — fold errors into the message, the closure must be total),
+`after(ms, f)` and `every(ms, f)` (timers building a message from the
+clock), and `batch([...])`. zero-argument constructors name the message
+type explicitly — the parameter cannot be inferred from nothing.
+
+this runtime is single-tasked: command work runs between frames and timers
+fire from the event loop, so a `perform` closure that blocks holds the
+next frame back exactly as long as it runs. keep them quick.
+
+### testing an application
+
+`drive(application, events)` runs the same cycle headless over a scripted
+event list and returns every frame plus whether the application quit —
+deterministic, no terminal, `assert_eq` on strings.
+`examples/tui_counter.pith` is exactly that shape, and its output is a ci
+golden.
 
 ## styling and layout
 

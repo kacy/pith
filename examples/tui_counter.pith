@@ -1,0 +1,67 @@
+# the elm architecture in std.term.app: a model struct, an event handler
+# that dispatches keys to messages, an update that folds them, and a view.
+# app.run() would drive this against a real terminal; here app.drive() runs
+# the exact same cycle over a scripted event list and returns every frame —
+# which is why an application built this way is testable in ci, and why
+# this example is deterministic.
+import std.term.app as app
+from std.term.app import App, Cmd
+import std.term.input as input
+from std.term.input import Event
+
+enum CounterMsg:
+    Inc
+    Dec
+    Reset
+    Halt
+
+struct Counter:
+    mut count: Int
+
+impl App for Counter:
+    type Msg = CounterMsg
+
+    fn init() -> Cmd[CounterMsg]:
+        return app.nothing[CounterMsg]()
+
+    fn on_event(ev: Event) -> Cmd[CounterMsg]:
+        match ev:
+            Event.KeyPress(k) =>
+                name := input.key_name(k)
+                if name == "+":
+                    return self.update(CounterMsg.Inc)
+                if name == "-":
+                    return self.update(CounterMsg.Dec)
+                if name == "r":
+                    return self.update(CounterMsg.Reset)
+                if name == "q":
+                    return self.update(CounterMsg.Halt)
+                return app.nothing[CounterMsg]()
+            _ =>
+                return app.nothing[CounterMsg]()
+        return app.nothing[CounterMsg]()
+
+    fn update(msg: CounterMsg) -> Cmd[CounterMsg]:
+        match msg:
+            CounterMsg.Inc =>
+                self.count = self.count + 1
+            CounterMsg.Dec =>
+                self.count = self.count - 1
+            CounterMsg.Reset =>
+                self.count = 0
+            CounterMsg.Halt =>
+                return app.quit[CounterMsg]()
+        return app.nothing[CounterMsg]()
+
+    fn view() -> String:
+        return "count: {self.count}   (+/- change, r reset, q quit)"
+
+fn press(name: String) -> Event:
+    return Event.KeyPress(input.Key(code: input.KeyCode.Char(name), mods: 0))
+
+fn main():
+    keys := [press("+"), press("+"), press("+"), press("-"), press("r"), press("+"), press("q")]
+    result := app.drive(Counter(count: 0), keys)
+    for frame in result.frames:
+        print(frame)
+    print("quit: {result.quit}")

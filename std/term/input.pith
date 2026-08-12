@@ -20,6 +20,7 @@
 # sequence starts. the session layer resolves it by time — when a read
 # times out while pending() is true, flush() turns the held prefix into
 # its literal reading.
+import std.bits as bits
 import std.bytes as bytes
 
 # modifier bits on Key.mods and MouseEvent.mods.
@@ -368,11 +369,11 @@ fn decode_mouse(p: Parser, is_press: Bool, out: List[Event]):
     col := param_at(params, 1, 1) - 1
     row := param_at(params, 2, 1) - 1
     mut mods := 0
-    if (b / 4) % 2 == 1:
+    if bits.band(b, 4) != 0:
         mods = mods + MOD_SHIFT
-    if (b / 8) % 2 == 1:
+    if bits.band(b, 8) != 0:
         mods = mods + MOD_ALT
-    if (b / 16) % 2 == 1:
+    if bits.band(b, 16) != 0:
         mods = mods + MOD_CTRL
     low := b % 4
     mut button := low
@@ -385,7 +386,7 @@ fn decode_mouse(p: Parser, is_press: Bool, out: List[Event]):
         else:
             kind = MouseKind.ScrollDown
         button = 0 - 1
-    elif (b / 32) % 2 == 1:
+    elif bits.band(b, 32) != 0:
         if button < 0:
             kind = MouseKind.Move
         else:
@@ -445,11 +446,11 @@ fn paste_byte(p: Parser, b: Int, out: List[Event]):
 # keybinding tables match against these names.
 pub fn key_name(k: Key) -> String:
     mut parts: List[String] := []
-    if (k.mods / MOD_CTRL) % 2 == 1:
+    if bits.band(k.mods, MOD_CTRL) != 0:
         parts.push("ctrl")
-    if (k.mods / MOD_ALT) % 2 == 1:
+    if bits.band(k.mods, MOD_ALT) != 0:
         parts.push("alt")
-    if k.mods % 2 == 1:
+    if bits.band(k.mods, MOD_SHIFT) != 0:
         parts.push("shift")
     parts.push(code_name(k.code))
     return parts.join("+")

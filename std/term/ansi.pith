@@ -13,6 +13,7 @@
 #
 # coordinates are 0-based here and translated to the terminal's 1-based form
 # at the boundary, so layout math never carries the off-by-one.
+import std.bits as bits
 
 # colors are one Int: this sentinel for the terminal's default, 0..255 for
 # the indexed palette, and rgb() packs 24-bit color above that range.
@@ -143,17 +144,17 @@ pub fn focus_disable() -> String:
 # COLOR_DEFAULT, 0) is a bare reset.
 pub fn sgr(fg: Int, bg: Int, attrs: Int) -> String:
     mut parts: List[String] := ["0"]
-    if attrs % 2 == 1:
+    if bits.band(attrs, ATTR_BOLD) != 0:
         parts.push("1")
-    if (attrs / ATTR_DIM) % 2 == 1:
+    if bits.band(attrs, ATTR_DIM) != 0:
         parts.push("2")
-    if (attrs / ATTR_ITALIC) % 2 == 1:
+    if bits.band(attrs, ATTR_ITALIC) != 0:
         parts.push("3")
-    if (attrs / ATTR_UNDERLINE) % 2 == 1:
+    if bits.band(attrs, ATTR_UNDERLINE) != 0:
         parts.push("4")
-    if (attrs / ATTR_REVERSE) % 2 == 1:
+    if bits.band(attrs, ATTR_REVERSE) != 0:
         parts.push("7")
-    if (attrs / ATTR_STRIKE) % 2 == 1:
+    if bits.band(attrs, ATTR_STRIKE) != 0:
         parts.push("9")
     if fg >= TRUECOLOR_BASE:
         packed := fg - TRUECOLOR_BASE

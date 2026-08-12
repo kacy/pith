@@ -1,0 +1,303 @@
+# std.lsp.transport — content-length framing for language-server streams
+#
+# the language server protocol moves messages as a small header block —
+# "Content-Length: N", a blank line — followed by exactly N bytes of body.
+# this module is the byte layer only: a FrameReader accumulates chunks from
+# any transport and yields complete bodies, and encode_frame wraps a body
+# for the wire. no file descriptors, no tasks; feed it bytes, get bytes.
+#
+#   import std.lsp.transport as transport
+#
+#   r := transport.reader()
+#   r.feed(chunk_from_anywhere)
+#   body := r.next()          # none until a full frame is buffered
+#
+# header names match case-insensitively, unknown headers such as
+# Content-Type are ignored, and both \r\n and bare \n line endings are
+# accepted. a header block that completes without a parsable content-length
+# — or one declaring a body over 64 MiB — poisons the reader: next() keeps
+# returning none and error() says why.
+
+import std.bytes as bytes
+
+# the largest body a frame may declare; a corrupt length past this poisons
+# the reader instead of ballooning the buffer.
+MAX_BODY_BYTES := 64 * 1024 * 1024
+
+# a carriage return + line feed pair; pith string literals have no \r escape.
+fn crlf() -> String:
+    return chr(13) + chr(10)
+
+fn is_blank_byte(b: Int) -> Bool:
+    return b == 32 or b == 9
+
+# an incremental reader that turns a stream of byte chunks into message
+# bodies. consumed bytes are dropped on every feed, so the buffer only ever
+# holds the frame in progress.
+pub struct FrameReader:
+    mut buf: Bytes
+    mut pos: Int
+    mut err: String
+
+# a fresh reader with an empty buffer.
+pub fn reader() -> FrameReader:
+    return FrameReader(bytes.empty(), 0, "")
+
+# true when the header name in buf[start, end) is content-length, matched
+# case-insensitively with surrounding blanks trimmed.
+fn is_content_length(buf: Bytes, start: Int, end: Int) -> Bool:
+    name := "content-length"
+    mut s := start
+    mut e := end
+    while s < e and is_blank_byte(bytes.get(buf, s)):
+        s = s + 1
+    while e > s and is_blank_byte(bytes.get(buf, e - 1)):
+        e = e - 1
+    if e - s != name.len():
+        return false
+    mut i := 0
+    while i < name.len():
+        mut b := bytes.get(buf, s + i)
+        if b >= 65 and b <= 90:
+            b = b + 32
+        if b != ord(name[i]):
+            return false
+        i = i + 1
+    return true
+
+# parse the decimal value in buf[start, end), blanks trimmed. returns the
+# value, clamped just past MAX_BODY_BYTES when absurdly large so the caller
+# reports it as oversized, or -1 when the value is empty or not a number.
+fn parse_length_value(buf: Bytes, start: Int, end: Int) -> Int:
+    mut s := start
+    mut e := end
+    while s < e and is_blank_byte(bytes.get(buf, s)):
+        s = s + 1
+    while e > s and is_blank_byte(bytes.get(buf, e - 1)):
+        e = e - 1
+    if s >= e:
+        return 0 - 1
+    mut value := 0
+    mut i := s
+    while i < e:
+        b := bytes.get(buf, i)
+        if b < 48 or b > 57:
+            return 0 - 1
+        value = value * 10 + (b - 48)
+        if value > MAX_BODY_BYTES:
+            return MAX_BODY_BYTES + 1
+        i = i + 1
+    return value
+
+# classify one header line: the declared length for a content-length line,
+# -1 for any other name: value header, -2 for a line with no colon or a
+# content-length value that is not a number.
+fn parse_header_line(buf: Bytes, start: Int, end: Int) -> Int:
+    mut colon := 0 - 1
+    mut i := start
+    while i < end and colon < 0:
+        if bytes.get(buf, i) == 58:
+            colon = i
+        i = i + 1
+    if colon < 0:
+        return 0 - 2
+    if not is_content_length(buf, start, colon):
+        return 0 - 1
+    value := parse_length_value(buf, colon + 1, end)
+    if value < 0:
+        return 0 - 2
+    return value
+
+impl FrameReader:
+    # append a chunk of incoming bytes. already-consumed bytes are dropped
+    # here, so the buffer never grows past the unread tail plus the chunk.
+    fn feed(chunk: Bytes):
+        if bytes.len(chunk) == 0:
+            return
+        if self.pos > 0:
+            self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
+            self.pos = 0
+            return
+        self.buf = bytes.concat(self.buf, chunk)
+
+    # "" until a malformed header block is seen; after that, the reason the
+    # reader stopped. a poisoned reader never yields another frame.
+    fn error() -> String:
+        return self.err
+
+    # the next complete message body, consuming it, or none when the buffer
+    # does not yet hold a full frame. a header block that completes without
+    # a parsable content-length, or that declares a body over 64 MiB,
+    # poisons the reader — see error().
+    fn next() -> Bytes?:
+        if self.err != "":
+            return none
+        total := bytes.len(self.buf)
+        # stray \r\n or blanks between frames are filler, not a header block
+        mut skipping := true
+        while skipping and self.pos < total:
+            b := bytes.get(self.buf, self.pos)
+            if b == 13 or b == 10 or b == 32 or b == 9:
+                self.pos = self.pos + 1
+            else:
+                skipping = false
+        # walk complete lines until the blank line that ends the header block
+        mut i := self.pos
+        mut line_start := self.pos
+        mut length := 0 - 1
+        mut body_start := 0 - 1
+        while i < total and body_start < 0:
+            if bytes.get(self.buf, i) == 10:
+                mut line_end := i
+                if line_end > line_start and bytes.get(self.buf, line_end - 1) == 13:
+                    line_end = line_end - 1
+                if line_end == line_start:
+                    body_start = i + 1
+                else:
+                    parsed := parse_header_line(self.buf, line_start, line_end)
+                    if parsed == 0 - 2:
+                        self.err = "malformed header line in frame header block"
+                        return none
+                    if parsed >= 0:
+                        length = parsed
+                line_start = i + 1
+            i = i + 1
+        if body_start < 0:
+            return none
+        if length < 0:
+            self.err = "frame header block has no content-length header"
+            return none
+        if length > MAX_BODY_BYTES:
+            self.err = "declared content-length exceeds the {MAX_BODY_BYTES} byte body limit"
+            return none
+        if total - body_start < length:
+            return none
+        body := bytes.slice(self.buf, body_start, body_start + length)
+        self.pos = body_start + length
+        return body
+
+# wrap a message body for the wire: "Content-Length: N", a blank line, and
+# the body, with \r\n line endings. N counts bytes, not characters.
+pub fn encode_frame(body: Bytes) -> Bytes:
+    out := bytes.buffer()
+    out.write_string_utf8("Content-Length: {bytes.len(body)}" + crlf() + crlf()) catch 0
+    out.write(body) catch 0
+    return out.take_bytes()
+
+fn body_text(m: Bytes?) -> String:
+    return bytes.to_string_utf8(m.unwrap_or(bytes.empty())) catch "<undecodable>"
+
+test "a frame fed whole comes back as its body":
+    r := reader()
+    r.feed(encode_frame(bytes.from_string_utf8("hello")))
+    assert_eq(body_text(r.next()), "hello")
+    assert(r.next() == none)
+    assert_eq(r.error(), "")
+
+test "a frame fed byte at a time completes only at the last byte":
+    data := encode_frame(bytes.from_string_utf8("hi"))
+    r := reader()
+    mut i := 0
+    while i < bytes.len(data) - 1:
+        r.feed(bytes.slice(data, i, i + 1))
+        assert(r.next() == none)
+        i = i + 1
+    r.feed(bytes.slice(data, bytes.len(data) - 1, bytes.len(data)))
+    assert_eq(body_text(r.next()), "hi")
+
+test "two frames in one chunk come back in order":
+    chunk := bytes.concat(
+        encode_frame(bytes.from_string_utf8("first")),
+        encode_frame(bytes.from_string_utf8("second")),
+)
+    r := reader()
+    r.feed(chunk)
+    assert_eq(body_text(r.next()), "first")
+    assert_eq(body_text(r.next()), "second")
+    assert(r.next() == none)
+
+test "a frame split at the header body boundary waits for the body":
+    header := bytes.from_string_utf8("Content-Length: 4" + crlf() + crlf())
+    r := reader()
+    r.feed(header)
+    assert(r.next() == none)
+    r.feed(bytes.from_string_utf8("body"))
+    assert_eq(body_text(r.next()), "body")
+
+test "an extra content-type header is ignored":
+    mut raw := "Content-Length: 2" + crlf()
+    raw = raw + "Content-Type: application/vscode-jsonrpc; charset=utf-8" + crlf()
+    raw = raw + crlf() + "ok"
+    r := reader()
+    r.feed(bytes.from_string_utf8(raw))
+    assert_eq(body_text(r.next()), "ok")
+
+test "the header name matches case-insensitively":
+    r := reader()
+    r.feed(bytes.from_string_utf8("content-length: 3" + crlf() + crlf() + "low"))
+    assert_eq(body_text(r.next()), "low")
+
+test "bare newline line endings are accepted":
+    r := reader()
+    r.feed(bytes.from_string_utf8("Content-Length: 4\n\nbare"))
+    assert_eq(body_text(r.next()), "bare")
+
+test "stray blank lines between frames are skipped":
+    chunk := bytes.concat(
+        encode_frame(bytes.from_string_utf8("a")),
+        bytes.concat(
+            bytes.from_string_utf8(crlf() + crlf()),
+            encode_frame(bytes.from_string_utf8("b")),
+),
+)
+    r := reader()
+    r.feed(chunk)
+    assert_eq(body_text(r.next()), "a")
+    assert_eq(body_text(r.next()), "b")
+
+test "a garbage header block poisons the reader with a message":
+    r := reader()
+    r.feed(bytes.from_string_utf8("this is not a header" + crlf() + crlf()))
+    assert(r.next() == none)
+    assert(r.error() != "")
+    # poisoned: a good frame after the garbage is never yielded
+    r.feed(encode_frame(bytes.from_string_utf8("late")))
+    assert(r.next() == none)
+
+test "a missing content-length poisons the reader":
+    r := reader()
+    r.feed(bytes.from_string_utf8("Content-Type: text/plain" + crlf() + crlf()))
+    assert(r.next() == none)
+    assert(r.error() != "")
+
+test "an unparsable content-length poisons the reader":
+    r := reader()
+    r.feed(bytes.from_string_utf8("Content-Length: nope" + crlf() + crlf()))
+    assert(r.next() == none)
+    assert(r.error() != "")
+
+test "an oversized declared length poisons the reader":
+    r := reader()
+    r.feed(bytes.from_string_utf8("Content-Length: 999999999999" + crlf() + crlf()))
+    assert(r.next() == none)
+    assert(r.error().contains("limit"))
+
+test "encode_frame round-trips through the reader":
+    body := bytes.from_string_utf8("{{\"jsonrpc\":\"2.0\"}}")
+    r := reader()
+    r.feed(encode_frame(body))
+    got := r.next()
+    assert(got != none)
+    assert(bytes.eq(got.unwrap_or(bytes.empty()), body))
+
+test "the declared length counts bytes of a multi-byte body":
+    s := "héllo 𝄞"
+    body := bytes.from_string_utf8(s)
+    framed := encode_frame(body)
+    # é is two bytes and 𝄞 is four, so the byte length exceeds the
+    # character count and the header must carry the byte figure
+    assert(bytes.len(body) > 7)
+    assert(bytes.index_of(framed, bytes.from_string_utf8("Content-Length: {bytes.len(body)}")) == 0)
+    r := reader()
+    r.feed(framed)
+    assert_eq(body_text(r.next()), s)

@@ -88,6 +88,34 @@ the structs stay simple on purpose: severity, message, optional span, and an
 optional fix string. that makes it useful for compiler-adjacent tools without
 coupling every caller to compiler internals.
 
+## editor wire protocol
+
+`std.lsp.transport` and `std.lsp.protocol` are the wire layer for editor
+tooling: Content-Length framing over bytes, and the json-rpc 2.0 envelope
+over `std.json` handles. both are pure data-plane layers — no sockets, no
+tasks — so a server loop can be tested entirely with in-memory bytes.
+
+```pith
+import std.lsp.transport as transport
+import std.lsp.protocol as protocol
+
+r := transport.reader()
+r.feed(chunk)
+body := r.next()
+
+m := protocol.parse_message(bytes.to_string_utf8(body.unwrap_or(bytes.empty()))!)
+if m.kind == "request":
+    reply := protocol.response_body(m.id, m.id_text, m.id_is_text, result)
+```
+
+the reader tolerates what editors actually send — case-insensitive header
+names, extra headers like Content-Type, bare `\n` line endings — and
+poisons itself with a message from `error()` when a header block is
+malformed or declares a body over 64 MiB, so a corrupt length cannot
+balloon memory. `parse_message` classifies bodies as request,
+notification, response, or invalid with a reason, and the `*_body`
+builders produce the matching outgoing envelopes.
+
 ## testing helpers
 
 `std.testing` now includes a few helpers for stdlib and self-hosting tests:

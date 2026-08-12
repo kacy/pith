@@ -1323,6 +1323,11 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   test declarations fail"; else echo "FAIL test declarations fail"; fail=$$((fail+1)); fi; \
+	printf 'fn BadName():\n    return\n\nfn main():\n    BadName()\n' > "$$tmpdir/lint_pos.pith"; \
+	set +e; \
+	lint_out=$$(./target/release/pith lint --json "$$tmpdir/lint_pos.pith" 2>/dev/null); \
+	set -e; \
+	case "$$lint_out" in *'"code":"E300"'*'"line":0'*) echo "FAIL lint --json positions"; fail=$$((fail+1));; *'"code":"E300"'*'"line":'*) pass=$$((pass+1)); echo "ok   lint --json positions";; *) echo "FAIL lint --json positions"; fail=$$((fail+1));; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

@@ -1,0 +1,90 @@
+# std.term.tty — raw terminal access: mode, size, and byte i/o
+#
+# the thin pith face over the six terminal builtins. everything here talks to
+# the controlling terminal directly: raw mode swaps line-editing for byte
+# delivery, size asks the kernel for the window, read waits for bytes with a
+# timeout, and write puts bytes on the screen exactly as given — no newline,
+# no buffering. the higher layers (std.term.input, std.term.session) build the
+# event stream and lifecycle on top; programs normally want those, not this.
+#
+#   from std.term.tty import is_tty, raw_enter, restore, write_str
+#   if is_tty(0):
+#       raw_enter()
+#       write_str("\x1b...")   # cursor moves land exactly where sent
+#       restore()
+#
+# entering raw mode arms a process-exit hook that restores the terminal and
+# resets the screen even when the runtime traps, so a crash mid-frame hands
+# back a working shell. a SIGKILL or a segfault bypasses that hook; `reset`
+# at the shell recovers.
+import std.bytes as bytes
+
+# read this much per read call unless the caller asks for less. one terminal
+# burst (a paste, a mouse drag) fits comfortably; anything longer arrives on
+# the next call.
+READ_CHUNK := 4096
+
+# is this file descriptor a terminal? 0 is stdin, 1 is stdout.
+pub fn is_tty(fd: Int) -> Bool:
+    return term_is_tty(fd)
+
+# switch stdin to raw mode: no line buffering, no echo, no signal keys —
+# ctrl-c arrives as byte 3, one keypress per byte. saves the current state
+# the first time so restore() can put it back; calling it twice keeps the
+# original saved state. false when stdin is not a terminal.
+pub fn raw_enter() -> Bool:
+    return term_raw_enter(0)
+
+# put the terminal back the way raw_enter() found it. safe to call any number
+# of times, including when raw mode was never entered.
+pub fn restore() -> Bool:
+    return term_restore(0)
+
+# the terminal size as (cols, rows). fails when stdout is not a terminal or
+# the kernel cannot say — after a resize signal this is how the new size is
+# learned.
+pub fn size() -> (Int, Int)!:
+    packed := term_size(1)
+    if packed < 0:
+        fail "not a terminal"
+    return (packed % 65536, packed / 65536)
+
+# read whatever bytes the terminal has, waiting up to timeout_ms for the
+# first one (-1 waits forever). an empty Bytes means the timeout passed with
+# nothing typed — normal, and how escape-sequence ambiguity gets resolved. a
+# failure means the terminal is gone (end of file or a read error), and the
+# session is over.
+pub fn read(max: Int, timeout_ms: Int) -> Bytes!:
+    got := term_read(0, max, timeout_ms)!
+    return got
+
+# read with the default chunk size.
+pub fn read_chunk(timeout_ms: Int) -> Bytes!:
+    return read(READ_CHUNK, timeout_ms)!
+
+# write bytes to the terminal exactly as given, looping until every byte is
+# out. returns the count written. no newline is appended.
+pub fn write(data: Bytes) -> Int!:
+    n := term_write(1, data)
+    if n < 0:
+        fail "terminal write failed"
+    return n
+
+# write a string's utf-8 bytes to the terminal. the plain-text counterpart of
+# write(); print() is not usable here because it always appends a newline.
+pub fn write_str(s: String) -> Int!:
+    return write(bytes.from_string_utf8(s))!
+
+test "is_tty is false for a non-terminal fd":
+    # the test harness runs with stdin piped, and fd -1 is never a terminal.
+    assert_eq(is_tty(0 - 1), false)
+
+test "restore with nothing saved is a clean no-op":
+    assert_eq(restore(), true)
+
+test "read fails or times out off a terminal rather than trapping":
+    # under the fork-per-test harness stdin is not a tty; a zero-timeout read
+    # must come back promptly as either an empty chunk or a clean failure —
+    # never a hang or a trap.
+    got := read(16, 0) catch bytes.from_string_utf8("")
+    assert(got.len() >= 0)

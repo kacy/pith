@@ -66,6 +66,7 @@ pub mod platform;
 pub mod process;
 pub mod process_io;
 pub mod signals;
+pub mod terminal;
 pub mod runtime_core;
 pub mod string;
 pub mod string_list;

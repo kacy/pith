@@ -22,6 +22,20 @@ what `pith check` reports.
   interface declarations.
 - **formatting** — one whole-document edit produced by the same
   formatter as `pith fmt`, or no edits when the text is already clean.
+- **definition** — go-to-definition through the checker's use-site ->
+  declaration map: local bindings, function calls, user method calls,
+  generic calls, and qualified module calls, across module boundaries
+  (the location's uri points into the imported file when the
+  declaration lives there).
+- **references** — all uses resolving to the declaration under the
+  cursor, sorted by (file, line, column); the declaration itself joins
+  when the client sends `includeDeclaration`. the cursor may sit on a
+  use or on the declaration line itself.
+- **completion** — triggered on `.` or on demand. after a `.` the
+  receiver's type is looked up heuristically and its struct fields and
+  methods are offered; anywhere else, every binding name from the last
+  run plus the language keywords, filtered by the word prefix under
+  the cursor. plain `{label, kind}` items, capped at 200.
 
 ## how it works
 
@@ -48,6 +62,7 @@ the modules:
   compiler's 1-based byte columns)
 - `self-host/lsp_features.pith` — diagnostics, hover, symbols,
   formatting
+- `self-host/lsp_navigation.pith` — definition, references, completion
 
 ## running it
 
@@ -91,8 +106,28 @@ files; eyeball every line before freezing a new expectation.
 
 ## current limitations
 
-- no go-to-definition, references, rename, or completion yet;
-  go-to-definition is the next planned feature.
+- no rename or workspace-wide symbol search yet.
+- completion is heuristic and reads the last completed analysis, on
+  purpose: mid-edit text usually does not parse, so the request never
+  re-runs the front end. right after a change (or when the last run
+  failed to parse), the type cache and binding names describe the
+  previous text and member completion can miss or misattribute the
+  receiver. the receiver itself is found by walking the line's bytes
+  back over identifier, `)`, and `]` characters — chains through
+  string indexing or arbitrary expressions may not resolve, in which
+  case every known method name is offered instead.
+- definition and references only know what the checker recorded:
+  local bindings, function calls, user method calls, generic calls,
+  and module-qualified calls. a method or module call is keyed on its
+  call node, which sits at the call's last token — the cursor
+  resolves such a call from its closing token, while the cursor on
+  the method name itself resolves the receiver.
+- a local binding's declaration node is its initializer's last token,
+  so definition and the includeDeclaration entry point at the
+  initializer on the binding line, not at the name.
+- method declarations inside `impl` blocks are located by their node
+  position (the end of the method body), because the declaration-line
+  scan only recognizes top-level declarations.
 - analysis blocks the loop for its duration (typically 10ms-1.2s);
   incoming messages wait in the pipe buffer meanwhile. a
   snapshot/multi-task split is a later, measured change.

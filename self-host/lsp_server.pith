@@ -15,6 +15,7 @@
 
 from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
 from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, formatting_edits
+from lsp_navigation import definition_location, references_locations, completion_items
 from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
 import std.lsp.transport as transport
 import std.json as json
@@ -79,6 +80,13 @@ fn handle_initialize(m: Message):
     json.object_set(caps, "hoverProvider", json.make_bool(true))
     json.object_set(caps, "documentSymbolProvider", json.make_bool(true))
     json.object_set(caps, "documentFormattingProvider", json.make_bool(true))
+    json.object_set(caps, "definitionProvider", json.make_bool(true))
+    json.object_set(caps, "referencesProvider", json.make_bool(true))
+    triggers := json.make_array()
+    json.array_push(triggers, json.make_string("."))
+    completion := json.make_object()
+    json.object_set(completion, "triggerCharacters", triggers)
+    json.object_set(caps, "completionProvider", completion)
     info := json.make_object()
     json.object_set(info, "name", json.make_string("pith-lsp"))
     json.object_set(info, "version", json.make_string("0.1.0"))
@@ -101,19 +109,61 @@ fn params_uri(params: Int) -> String:
         return ""
     return json.object_get_string_or(doc, "uri", "")
 
+# the position under params.position; PositionOut carries defaults of 0
+# when the params are malformed.
+struct PositionOut:
+    line: Int
+    character: Int
+
+fn params_position(params: Int) -> PositionOut:
+    position := json.object_get(params, "position")
+    mut line := 0
+    mut character := 0
+    if position >= 0:
+        line = json.object_get_int_or(position, "line", 0)
+        character = json.object_get_int_or(position, "character", 0)
+    return PositionOut(line, character)
+
 fn handle_hover(m: Message):
     uri := params_uri(m.params)
     if not document_is_open(uri):
         write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
         return
     write_bodies(ensure_analyzed(uri))
-    position := json.object_get(m.params, "position")
-    mut line := 0
-    mut character := 0
-    if position >= 0:
-        line = json.object_get_int_or(position, "line", 0)
-        character = json.object_get_int_or(position, "character", 0)
-    write_body(response_body(m.id, m.id_text, m.id_is_text, hover_result(uri, line, character)))
+    at := params_position(m.params)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, hover_result(uri, at.line, at.character)))
+
+fn handle_definition(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    at := params_position(m.params)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, definition_location(uri, at.line, at.character)))
+
+fn handle_references(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    at := params_position(m.params)
+    mut include_decl := false
+    context := json.object_get(m.params, "context")
+    if context >= 0:
+        include_decl = json.object_get_bool_or(context, "includeDeclaration", false)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, references_locations(uri, at.line, at.character, include_decl)))
+
+# completion reads the last analysis on purpose: the text at the cursor
+# is usually mid-edit and would not parse, so no ensure_analyzed here.
+fn handle_completion(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    at := params_position(m.params)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, completion_items(uri, at.line, at.character)))
 
 fn handle_document_symbol(m: Message):
     uri := params_uri(m.params)
@@ -149,6 +199,15 @@ fn handle_request(m: Message):
         return
     if m.method == "textDocument/formatting":
         handle_formatting(m)
+        return
+    if m.method == "textDocument/definition":
+        handle_definition(m)
+        return
+    if m.method == "textDocument/references":
+        handle_references(m)
+        return
+    if m.method == "textDocument/completion":
+        handle_completion(m)
         return
     write_body(error_body(m.id, m.id_text, m.id_is_text, METHOD_NOT_FOUND, "unknown method: " + m.method))
 

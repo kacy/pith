@@ -78,6 +78,23 @@ pub fn define_binding_at(scope_id: Int, name: String, type_id: Int, is_mut: Bool
     binding_module_tags.push(defining_module)
     binding_decl_nodes.push(decl_node)
 
+## every binding name the last run defined, builtins included, in
+## definition order. tooling reads this for completion; names repeat
+## when several scopes bind the same one.
+pub fn all_binding_names() -> List[String]:
+    mut names: List[String] := []
+    for name in binding_names:
+        names.push(name)
+    return names
+
+## the type id recorded for each binding, parallel to
+## all_binding_names.
+pub fn all_binding_types() -> List[Int]:
+    mut tids: List[Int] := []
+    for tid in binding_types:
+        tids.push(tid)
+    return tids
+
 ## the module that defined the binding a lookup would find, or "".
 ## true when any binding of the name reachable from the scope was
 ## defined by the given module or by the builtins ("") — a name can

@@ -1,0 +1,351 @@
+# lsp_navigation.pith — definition, references, and completion
+#
+# navigation reads the compiler state the last front-end run left
+# behind: the checker's use-site -> declaration map answers definition
+# and references, and the expression type cache plus the scope arena's
+# binding names feed completion. everything here is a view over that
+# state — the server runs ensure_analyzed before definition and
+# references, while completion deliberately reads the last analysis
+# as-is, because the text at the cursor is usually mid-edit and would
+# not parse.
+#
+# positions follow the ast convention: a node sits at its last token's
+# start, so a declaration's editor position comes from the same
+# declaration-line scan documentSymbol uses, falling back to the raw
+# node position when the scan finds nothing.
+
+from checker import get_definition_of, c_get_expr_type
+from checker_methods import all_method_keys
+from scope import all_binding_names, all_binding_types
+from driver import file_for_node, dr_read_source
+from types import get_type_name, get_type_info, TID_ERR
+from ast import get_node, node_count
+from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
+from lsp_features import analysis_is_checked, find_decl_position, token_length_at, bare_symbol_name
+import std.json as json
+
+# completion responses stop growing past this many items.
+MAX_COMPLETION_ITEMS := 200
+
+# a resolved source position with everything a Location needs.
+struct Site:
+    path: String
+    line: Int
+    col: Int
+    len: Int
+
+# ---------------------------------------------------------------
+# shared helpers
+# ---------------------------------------------------------------
+
+# the text of any file the last analysis touched: open documents come
+# back through the driver's overlays, everything else from disk.
+fn file_text(path: String) -> String:
+    return dr_read_source(path) catch ""
+
+# a Location json object for a site.
+fn location_json(site: Site) -> Int:
+    text := file_text(site.path)
+    mode := get_position_encoding()
+    start := line_col_to_lsp_pos(text, site.line, site.col, mode)
+    end := line_col_to_lsp_pos(text, site.line, site.col + site.len, mode)
+    start_obj := json.make_object()
+    json.object_set(start_obj, "line", json.make_int(start.line))
+    json.object_set(start_obj, "character", json.make_int(start.character))
+    end_obj := json.make_object()
+    json.object_set(end_obj, "line", json.make_int(end.line))
+    json.object_set(end_obj, "character", json.make_int(end.character))
+    range := json.make_object()
+    json.object_set(range, "start", start_obj)
+    json.object_set(range, "end", end_obj)
+    location := json.make_object()
+    json.object_set(location, "uri", json.make_string(path_to_uri(site.path)))
+    json.object_set(location, "range", range)
+    return location
+
+fn is_named_decl(kind: String) -> Bool:
+    return kind == "fn_decl" or kind == "struct_decl" or kind == "enum_decl" or kind == "interface_decl"
+
+# where a declaration lands for the editor: named declarations scan
+# their file for the declaring line, everything else (bindings, whose
+# decl node is the initializer) uses the node position itself, spanning
+# the token found there.
+fn decl_site(decl_idx: Int) -> Site:
+    path := file_for_node(decl_idx)
+    node := get_node(decl_idx)
+    text := file_text(path)
+    if is_named_decl(node.kind):
+        name := bare_symbol_name(node.value)
+        at := find_decl_position(text, node.kind, name)
+        if at.line > 0:
+            return Site(path, at.line, at.col, name.len())
+    span := token_length_at(text_line(text, node.line - 1), node.col)
+    return Site(path, node.line, node.col, span)
+
+# the definition_of key under the cursor: the use node on the cursor's
+# line, in the cursor's file, whose column is nearest at or before the
+# cursor. call-node entries participate like any other key — a call
+# node sits at its last token, so the cursor resolves a call from its
+# closing token onward. -1 when the line holds no use.
+fn use_node_at(path: String, pos: PithPos) -> Int:
+    defs := get_definition_of()
+    mut best := 0 - 1
+    mut best_col := 0 - 1
+    for use_idx in defs.keys():
+        node := get_node(use_idx)
+        if node.line == pos.line and node.col <= pos.col and file_for_node(use_idx) == path:
+            if node.col > best_col or (node.col == best_col and use_idx < best):
+                best = use_idx
+                best_col = node.col
+    return best
+
+# ---------------------------------------------------------------
+# definition
+# ---------------------------------------------------------------
+
+## the definition Location for the symbol at a position as a json
+## handle, or -1 for null. the declaration may live in another module's
+## file; the uri points wherever it is.
+pub fn definition_location(uri: String, line0: Int, character: Int) -> Int:
+    if not analysis_is_checked():
+        return 0 - 1
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    use_idx := use_node_at(path, pos)
+    if use_idx < 0:
+        return 0 - 1
+    defs := get_definition_of()
+    site := decl_site(defs[use_idx])
+    if site.path == "" or site.line == 0:
+        return 0 - 1
+    return location_json(site)
+
+# ---------------------------------------------------------------
+# references
+# ---------------------------------------------------------------
+
+# the declaration node the cursor refers to: through a use under the
+# cursor when there is one, otherwise a declaration whose scanned
+# declaration line is the cursor's line (the cursor sits on the
+# declaration itself). -1 when neither matches.
+fn decl_node_at(path: String, pos: PithPos) -> Int:
+    use_idx := use_node_at(path, pos)
+    defs := get_definition_of()
+    if use_idx >= 0:
+        return defs[use_idx]
+    mut best := 0 - 1
+    for key in defs.keys():
+        decl_idx := defs[key]
+        if decl_idx == best:
+            continue
+        site := decl_site(decl_idx)
+        if site.path == path and site.line == pos.line:
+            if best < 0 or decl_idx < best:
+                best = decl_idx
+    return best
+
+# insertion sort by (path, line, col); reference lists are short.
+fn sort_sites(sites: List[Site]) -> List[Site]:
+    mut sorted: List[Site] := []
+    for s in sites:
+        mut inserted := false
+        mut i := 0
+        while i < sorted.len() and not inserted:
+            t := sorted[i]
+            before := s.path < t.path or (s.path == t.path and (s.line < t.line or (s.line == t.line and s.col < t.col)))
+            if before:
+                sorted.insert(i, s)
+                inserted = true
+            i = i + 1
+        if not inserted:
+            sorted.push(s)
+    return sorted
+
+## every Location referencing the symbol at a position, as a json array
+## sorted by (file, line, col). the declaration itself joins the list
+## when include_decl is set. empty when the cursor resolves to nothing.
+pub fn references_locations(uri: String, line0: Int, character: Int, include_decl: Bool) -> Int:
+    arr := json.make_array()
+    if not analysis_is_checked():
+        return arr
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    decl_idx := decl_node_at(path, pos)
+    if decl_idx < 0:
+        return arr
+    defs := get_definition_of()
+    mut sites: List[Site] := []
+    for use_idx in defs.keys():
+        if defs[use_idx] != decl_idx:
+            continue
+        node := get_node(use_idx)
+        use_path := file_for_node(use_idx)
+        span := token_length_at(text_line(file_text(use_path), node.line - 1), node.col)
+        sites.push(Site(use_path, node.line, node.col, span))
+    if include_decl:
+        d := decl_site(decl_idx)
+        if d.line > 0:
+            sites.push(d)
+    mut last_key := ""
+    for s in sort_sites(sites):
+        key := s.path + ":{s.line}:{s.col}"
+        if key == last_key:
+            continue
+        last_key = key
+        json.array_push(arr, location_json(s))
+    return arr
+
+# ---------------------------------------------------------------
+# completion
+# ---------------------------------------------------------------
+
+fn is_ident_byte(c: Int) -> Bool:
+    if c >= 97 and c <= 122:
+        return true
+    if c >= 65 and c <= 90:
+        return true
+    if c >= 48 and c <= 57:
+        return true
+    return c == 95
+
+# bytes a member-completion receiver may end or continue with: the
+# heuristic walks back over identifiers, call/index closers.
+fn is_receiver_byte(c: Int) -> Bool:
+    if is_ident_byte(c):
+        return true
+    return c == 41 or c == 93
+
+# a candidate entry packs "label<TAB>kind" so lists of candidates sort
+# by label with a plain string sort.
+fn item_entry(label: String, kind: Int) -> String:
+    return label + chr(9) + kind.to_string()
+
+fn entry_label(entry: String) -> String:
+    tab := entry.index_of(chr(9))
+    if tab < 0:
+        return entry
+    return entry.substring(0, tab)
+
+fn entry_kind(entry: String) -> Int:
+    tab := entry.index_of(chr(9))
+    if tab < 0:
+        return 6
+    suffix := entry.substring(tab + 1, entry.len())
+    if suffix == "3":
+        return 3
+    if suffix == "5":
+        return 5
+    if suffix == "14":
+        return 14
+    return 6
+
+# the method name behind a registry key ("Type.method" or
+# "#<tid>.method"); type names never contain a dot.
+fn method_name_of(key: String) -> String:
+    dot := key.index_of(".")
+    if dot < 0:
+        return key
+    return key.substring(dot + 1, key.len())
+
+# member completion after a '.': resolve the receiver's type from the
+# expression cache and offer its fields and methods; with no resolvable
+# type, offer every known method name.
+fn member_entries(path: String, line1: Int, line_text: String, dot_off: Int) -> List[String]:
+    mut recv_start := dot_off
+    while recv_start > 0 and is_receiver_byte(ord(line_text[recv_start - 1])):
+        recv_start = recv_start - 1
+    mut best := 0 - 1
+    mut best_col := 0 - 1
+    if recv_start < dot_off:
+        total := node_count()
+        mut i := 0
+        while i < total:
+            node := get_node(i)
+            if node.line == line1 and node.col > recv_start and node.col <= dot_off and file_for_node(i) == path:
+                tid := c_get_expr_type(i)
+                if tid >= 0 and tid != TID_ERR:
+                    # the node starting latest inside the receiver span
+                    # is the receiver expression itself
+                    if node.col > best_col or (node.col == best_col and i < best):
+                        best = i
+                        best_col = node.col
+            i = i + 1
+    mut entries: List[String] := []
+    if best >= 0:
+        tid := c_get_expr_type(best)
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for field in info.fields:
+                entries.push(item_entry(field, 5))
+        prefix := bare_symbol_name(get_type_name(tid)) + "."
+        for key in all_method_keys():
+            if key.starts_with(prefix):
+                entries.push(item_entry(method_name_of(key), 3))
+        return entries
+    for key in all_method_keys():
+        entries.push(item_entry(method_name_of(key), 3))
+    return entries
+
+fn completion_keywords() -> List[String]:
+    return ["fn", "struct", "enum", "interface", "impl", "if", "elif", "else", "while", "for", "in", "match", "return", "spawn", "await", "select", "defer", "errdefer", "test", "pub", "mut", "import", "from", "catch", "fail", "break", "continue", "true", "false", "none", "and", "or", "not", "timeout", "default"]
+
+# identifier completion: every binding name the last run defined
+# (module aliases and builtins included), then the keywords. bindings
+# whose type is a function complete as functions.
+fn identifier_entries() -> List[String]:
+    mut entries: List[String] := []
+    names := all_binding_names()
+    tids := all_binding_types()
+    for name, i in names:
+        mut kind := 6
+        if i < tids.len() and get_type_info(tids[i]).kind == "function":
+            kind = 3
+        entries.push(item_entry(name, kind))
+    for keyword in completion_keywords():
+        entries.push(item_entry(keyword, 14))
+    return entries
+
+## completion items for a position as a json array of CompletionItem
+## {label, kind}: member completion when the word under the cursor
+## follows a '.', identifier completion otherwise. items filter by the
+## word's byte prefix, dedupe by label, sort, and cap at 200.
+pub fn completion_items(uri: String, line0: Int, character: Int) -> Int:
+    arr := json.make_array()
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    line_text := text_line(text, pos.line - 1)
+    mut cursor := pos.col - 1
+    if cursor > line_text.len():
+        cursor = line_text.len()
+    mut word_start := cursor
+    while word_start > 0 and is_ident_byte(ord(line_text[word_start - 1])):
+        word_start = word_start - 1
+    word := line_text.substring(word_start, cursor)
+    mut entries: List[String] := []
+    if word_start > 0 and ord(line_text[word_start - 1]) == 46:
+        entries = member_entries(path, pos.line, line_text, word_start - 1)
+    else:
+        entries = identifier_entries()
+    mut seen: Map[String, Bool] := {}
+    mut kept: List[String] := []
+    for entry in entries:
+        label := entry_label(entry)
+        if not label.starts_with(word):
+            continue
+        if seen.contains_key(label):
+            continue
+        seen.insert(label, true)
+        kept.push(entry)
+    mut emitted := 0
+    for entry in kept.sort():
+        if emitted >= MAX_COMPLETION_ITEMS:
+            break
+        item := json.make_object()
+        json.object_set(item, "label", json.make_string(entry_label(entry)))
+        json.object_set(item, "kind", json.make_int(entry_kind(entry)))
+        json.array_push(arr, item)
+        emitted = emitted + 1
+    return arr

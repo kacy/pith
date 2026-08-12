@@ -364,9 +364,11 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     use pith_codegen::finalize_module;
     use pith_codegen::ir_consumer::compile_from_ir;
 
-    validate_combined_ir_contract(ir_text)?;
-
+    // dump before validating: the dump exists to debug bad IR, so it must
+    // fire even when — especially when — the contract check rejects it
     dump_ir_if_requested(ir_text);
+
+    validate_combined_ir_contract(ir_text)?;
 
     let mut codegen = create_codegen().map_err(|e| format!("Error creating codegen: {}", e))?;
     let runtime_funcs = pith_codegen::declare_runtime_functions(&mut codegen.module)

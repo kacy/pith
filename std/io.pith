@@ -1130,23 +1130,7 @@ fn find_sep_from(data: String, sep: String, start: Int) -> Int:
     return 0 - 1
 
 fn find_bytes_sep(data: Bytes, sep: Bytes) -> Int:
-    if sep.is_empty():
-        return 0 - 1
-    if data.len() < sep.len():
-        return 0 - 1
-    mut i := 0
-    while i + sep.len() <= data.len():
-        mut matched := true
-        mut j := 0
-        while j < sep.len():
-            if bytes.get(data, i + j) != bytes.get(sep, j):
-                matched = false
-                break
-            j = j + 1
-        if matched:
-            return i
-        i = i + 1
-    return 0 - 1
+    return bytes.index_of(data, sep)
 
 # read one chunk from whichever source `kind` names, as raw bytes.
 #
@@ -1960,7 +1944,6 @@ fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
     io_registry_mu.unlock()
     return wrote
 
-
 # ---------------------------------------------------------------------------
 # buffered text readers
 #
@@ -2337,7 +2320,6 @@ fn buffered_text_read_until_internal_ctx(handle: Int, ctx: Context, sep: String,
                 buffered_text_reader_clear(handle)
             return join_parts(parts)
     return join_parts(parts)
-
 
 fn buffered_string_reader_read_internal(reader: BufferedStringReader, max_bytes: Int) -> String!:
     return buffered_text_read_internal(reader.handle, max_bytes)

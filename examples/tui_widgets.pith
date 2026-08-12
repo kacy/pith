@@ -1,0 +1,22 @@
+# the std.term.ui widget gallery: every widget renders to a plain string,
+# so a whole dashboard prints deterministically — the same property that
+# makes each widget a snapshot test. this file grows as widget layers land.
+import std.term.app as app
+import std.term.style as style
+import std.term.ui as ui
+
+fn main():
+    print(ui.block().with_title("wrap").render(ui.wrap("the quick brown fox jumps over the lazy dog", 16)))
+    print("")
+    bar := ui.progress(20)
+    print(ui.block().with_title("sync").render(bar.view(0.4)))
+    print("")
+    s := ui.spinner()
+    s.advance()
+    print("working {s.view()}")
+    print("")
+    print(ui.tabs(["files", "search", "help"], 1, 40))
+    bindings := [app.binding(["q"], "q", "quit"), app.binding(["tab"], "tab", "next pane"), app.binding(["/"], "/", "filter")]
+    print(ui.help_short(bindings, 60))
+    print("")
+    print(ui.help_full(bindings, 40))

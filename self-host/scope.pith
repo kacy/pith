@@ -26,6 +26,9 @@ mut binding_mutable_flags: List[Bool] := []
 # the entry file), so the checker can tell a name resolved through a
 # genuine import from one that leaked across the shared global scope
 mut binding_module_tags: List[String] := []
+# each binding remembers the AST node that declared it (-1 when there is
+# no source node, e.g. builtins), so tooling can answer go-to-definition
+mut binding_decl_nodes: List[Int] := []
 mut defining_module := ""
 
 ## set the module path tagged onto bindings defined from here on.
@@ -48,6 +51,7 @@ pub fn reset_scope_arena():
     binding_types = []
     binding_mutable_flags = []
     binding_module_tags = []
+    binding_decl_nodes = []
     defining_module = ""
 
 # create a new scope, return its index
@@ -61,13 +65,18 @@ pub fn create_scope(parent: Int) -> Int:
     scope_entries.push(ScopeEntry(parent, ret_type, in_lp))
     return scope_entries.len() - 1
 
-# define a binding in a scope
+# define a binding in a scope with no source node (builtins)
 pub fn define_binding(scope_id: Int, name: String, type_id: Int, is_mut: Bool):
+    define_binding_at(scope_id, name, type_id, is_mut, -1)
+
+# define a binding in a scope, remembering the AST node that declared it
+pub fn define_binding_at(scope_id: Int, name: String, type_id: Int, is_mut: Bool, decl_node: Int):
     binding_scope_ids.push(scope_id)
     binding_names.push(name)
     binding_types.push(type_id)
     binding_mutable_flags.push(is_mut)
     binding_module_tags.push(defining_module)
+    binding_decl_nodes.push(decl_node)
 
 ## the module that defined the binding a lookup would find, or "".
 ## true when any binding of the name reachable from the scope was
@@ -142,6 +151,20 @@ pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
 pub fn set_binding_type_at(index: Int, type_id: Int):
     if index >= 0 and index < binding_types.len():
         binding_types[index] = type_id
+
+## the declaration node of the binding a lookup from this scope would
+## find, or -1 for a builtin or an unknown name.
+pub fn lookup_binding_decl_node(scope_id: Int, name: String) -> Int:
+    mut i := binding_scope_ids.len() - 1
+    while i >= 0:
+        if binding_scope_ids[i] == scope_id:
+            if binding_names_equal(binding_names[i], name):
+                return binding_decl_nodes[i]
+        i = i - 1
+    entry := scope_entries[scope_id]
+    if entry.parent >= 0:
+        return lookup_binding_decl_node(entry.parent, name)
+    return - 1
 
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # search bindings in reverse order (latest first) for this scope

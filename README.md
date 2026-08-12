@@ -167,7 +167,9 @@ backoff, rate limiting, circuit breaking — shared by the web middleware and
 the protocol clients, see [docs/resilience.md](docs/resilience.md)),
 observability (trace,
 prometheus, otlp, obs — opentelemetry traces and metrics, see
-[docs/telemetry.md](docs/telemetry.md)), and lazy iterators (std.iter).
+[docs/telemetry.md](docs/telemetry.md)), terminal uis (std.term — raw
+mode, input events, styling, widgets, and an elm-style application
+runtime, see [docs/tui.md](docs/tui.md)), and lazy iterators (std.iter).
 
 ## proof it's usable
 

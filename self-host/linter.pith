@@ -12,24 +12,28 @@
 
 from ast import Node, get_node
 from errors import Diagnostic
+from std.strings import lines_keep_empty
 
 # ---------------------------------------------------------------
 # diagnostics
 # ---------------------------------------------------------------
 
 mut l_diagnostics: List[Diagnostic] := []
+mut l_file := ""
 
-fn report_linter_warning(code: String, message: String):
-    l_diagnostics.push(Diagnostic("warning", code, message, "", 0, 0, ""))
+fn report_linter_warning(code: String, message: String, line: Int, col: Int):
+    l_diagnostics.push(Diagnostic("warning", code, message, l_file, line, col, ""))
 
 # ---------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------
 
 # run all lint rules on a checked module AST.
-# source is needed for doc comment detection.
-pub fn lint_module(root_idx: Int, source: String) -> List[Diagnostic]:
+# source is needed for doc comment detection; file is stamped onto
+# every diagnostic so tools can attribute the warning.
+pub fn lint_module(root_idx: Int, source: String, file: String) -> List[Diagnostic]:
     l_diagnostics = []
+    l_file = file
     root := get_node(root_idx)
     for child in root.children:
         lint_top_level(child, source)
@@ -50,18 +54,18 @@ fn lint_top_level(node_idx: Int, source: String):
     if inner.kind == "fn_decl":
         lint_fn_decl(inner, inner_idx, is_pub, source)
     elif inner.kind == "struct_decl":
-        check_pascal_case(inner.value, "struct")
+        check_pascal_case(inner.value, "struct", inner.line, inner.col)
     elif inner.kind == "enum_decl":
-        check_pascal_case(inner.value, "enum")
+        check_pascal_case(inner.value, "enum", inner.line, inner.col)
     elif inner.kind == "interface_decl":
-        check_pascal_case(inner.value, "interface")
+        check_pascal_case(inner.value, "interface", inner.line, inner.col)
     elif inner.kind == "type_alias":
-        check_pascal_case(inner.value, "type alias")
+        check_pascal_case(inner.value, "type alias", inner.line, inner.col)
     elif inner.kind == "impl_decl":
         lint_impl_decl(inner, source)
     elif inner.kind == "binding":
         name := l_extract_binding_name(inner.value)
-        check_snake_case(name, "variable")
+        check_snake_case(name, "variable", inner.line, inner.col)
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
 
@@ -73,7 +77,7 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
 
     # E300: function name must be snake_case (skip main)
     if name != "main":
-        check_snake_case(name, "function")
+        check_snake_case(name, "function", node.line, node.col)
 
     # E304: public function missing doc comment
     if is_pub:
@@ -103,7 +107,7 @@ fn lint_impl_decl(node: Node, source: String):
         if actual.kind == "fn_decl":
             name := actual.value
             # E300: method name must be snake_case
-            check_snake_case(name, "method")
+            check_snake_case(name, "method", actual.line, actual.col)
             # E304: public method missing doc comment
             if is_pub:
                 check_doc_comment(name, actual_idx, source)
@@ -117,11 +121,11 @@ fn lint_impl_decl(node: Node, source: String):
 # E300: snake_case for functions and variables
 # ---------------------------------------------------------------
 
-fn check_snake_case(name: String, kind: String):
+fn check_snake_case(name: String, kind: String, line: Int, col: Int):
     if name == "" or name == "_":
         return
     if not is_snake_case(name):
-        report_linter_warning("E300", kind + " '" + name + "' should be snake_case")
+        report_linter_warning("E300", kind + " '" + name + "' should be snake_case", line, col)
 
 fn is_snake_case(name: String) -> Bool:
     if name.len() == 0:
@@ -142,11 +146,11 @@ fn is_snake_case(name: String) -> Bool:
 # E301: PascalCase for types
 # ---------------------------------------------------------------
 
-fn check_pascal_case(name: String, kind: String):
+fn check_pascal_case(name: String, kind: String, line: Int, col: Int):
     if name == "":
         return
     if not is_pascal_case(name):
-        report_linter_warning("E301", kind + " '" + name + "' should be PascalCase")
+        report_linter_warning("E301", kind + " '" + name + "' should be PascalCase", line, col)
 
 fn is_pascal_case(name: String) -> Bool:
     if name.len() == 0:
@@ -171,10 +175,12 @@ fn is_pascal_case(name: String) -> Bool:
 # ---------------------------------------------------------------
 
 fn check_doc_comment(name: String, node_idx: Int, source: String):
-    # since self-hosted AST nodes don't have line numbers,
-    # search source for "fn <name>" or "pub fn <name>" to find
-    # the declaration line, then check for a comment above it.
-    lines := source.split(chr(10))
+    # the doc comment lives on the line above the declaration, so the
+    # declaration is found by text search — a node's position points at
+    # the declaration, not at the blank or comment line before it. the
+    # blank-preserving split keeps indices equal to real line numbers;
+    # plain split drops empty lines and shifts everything above a gap.
+    lines := lines_keep_empty(source)
     # search for the function declaration by looking for "fn name("
     search := "fn " + name + "("
     mut found_line := 0 - 1
@@ -187,7 +193,7 @@ fn check_doc_comment(name: String, node_idx: Int, source: String):
     # check line before the declaration for a comment
     prev := lines[found_line - 1].trim()
     if prev.len() == 0 or prev[0] != "#":
-        report_linter_warning("E304", "public function '" + name + "' is missing a doc comment")
+        report_linter_warning("E304", "public function '" + name + "' is missing a doc comment", found_line + 1, 0)
 
 # ---------------------------------------------------------------
 # E305: indentation depth exceeds 4 levels
@@ -201,7 +207,7 @@ fn lint_block_depth(node: Node, depth: Int):
                 lint_stmt_depth(stmt, depth)
         elif cn.kind == "if" or cn.kind == "while" or cn.kind == "for" or cn.kind == "match":
             if depth >= 5:
-                report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
+                report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring", cn.line, cn.col)
             lint_block_depth(cn, depth + 1)
         else:
             lint_stmt_depth(child, depth)
@@ -210,7 +216,7 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
     node := get_node(node_idx)
     if node.kind == "if" or node.kind == "while" or node.kind == "for_in" or node.kind == "match":
         if depth >= 5:
-            report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
+            report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring", node.line, node.col)
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "body" or cn.kind == "block" or cn.kind == "else" or cn.kind == "elif":

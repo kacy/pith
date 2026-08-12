@@ -89,7 +89,9 @@ fn run_cli() {
                 eprintln!("Error: check requires a file argument");
                 std::process::exit(1);
             }
-            check_file(&args[2]);
+            // forward every argument, not just args[2]: `check --json <file>`
+            // used to hand "--json" to the frontend as the path.
+            delegate_to_frontend(&args[1..]);
         }
         "parse" => {
             if args.len() < 3 {
@@ -557,31 +559,6 @@ mod tests {
     fn rejects_field_without_offset() {
         let ir = "field 2 1 Point name\n";
         assert!(validate_combined_ir_contract(ir).is_err());
-    }
-}
-
-fn check_file(path: &str) {
-    let compiler = match find_self_hosted_compiler() {
-        Some(c) => c,
-        None => {
-            eprintln!("Self-hosted compiler not found");
-            std::process::exit(1);
-        }
-    };
-
-    let output = Command::new(&compiler)
-        .args(["check", path])
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to run self-hosted compiler: {}", e);
-            std::process::exit(1);
-        });
-
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-
-    if !output.status.success() {
-        std::process::exit(output.status.code().unwrap_or(1));
     }
 }
 

@@ -1,0 +1,270 @@
+# std.term.ansi — terminal escape sequences, built and taken apart
+#
+# every terminal capability a tui uses is a short escape sequence: move the
+# cursor, clear a region, switch screens, style a run of text. this module
+# builds those sequences as plain strings — nothing here touches the
+# terminal, so callers compose a frame and hand it to std.term.tty (or a
+# test) in one piece. it also strips them back out, with a parser that walks
+# the real escape grammar rather than guessing.
+#
+#   import std.term.ansi as ansi
+#   frame := ansi.cursor_to(0, 0) + ansi.clear_line() + "hello"
+#   plain := ansi.strip(frame)     # "hello"
+#
+# coordinates are 0-based here and translated to the terminal's 1-based form
+# at the boundary, so layout math never carries the off-by-one.
+
+# colors are one Int: this sentinel for the terminal's default, 0..255 for
+# the indexed palette, and rgb() packs 24-bit color above that range.
+pub COLOR_DEFAULT := 0 - 1
+
+# style attribute bits for sgr(), combined with +.
+pub ATTR_BOLD := 1
+pub ATTR_DIM := 2
+pub ATTR_ITALIC := 4
+pub ATTR_UNDERLINE := 8
+pub ATTR_REVERSE := 16
+pub ATTR_STRIKE := 32
+
+# where packed 24-bit colors start: values at or above this are
+# TRUECOLOR_BASE + r*65536 + g*256 + b.
+TRUECOLOR_BASE := 16777216
+
+# pack a 24-bit color for sgr(); each channel is clamped to 0..255.
+pub fn rgb(r: Int, g: Int, b: Int) -> Int:
+    return TRUECOLOR_BASE + clamp_channel(r) * 65536 + clamp_channel(g) * 256 + clamp_channel(b)
+
+fn clamp_channel(v: Int) -> Int:
+    if v < 0:
+        return 0
+    if v > 255:
+        return 255
+    return v
+
+fn esc() -> String:
+    return chr(27)
+
+fn csi(body: String) -> String:
+    return esc() + "[" + body
+
+# ---------------------------------------------------------------
+# cursor
+# ---------------------------------------------------------------
+
+# move the cursor to (col, row), 0-based from the top-left cell.
+pub fn cursor_to(col: Int, row: Int) -> String:
+    return csi("{row + 1};{col + 1}H")
+
+# move the cursor up n rows in place.
+pub fn cursor_up(n: Int) -> String:
+    return csi("{n}A")
+
+# move the cursor down n rows in place.
+pub fn cursor_down(n: Int) -> String:
+    return csi("{n}B")
+
+# move the cursor right n columns.
+pub fn cursor_right(n: Int) -> String:
+    return csi("{n}C")
+
+# move the cursor left n columns.
+pub fn cursor_left(n: Int) -> String:
+    return csi("{n}D")
+
+# hide the hardware cursor; a tui draws its own.
+pub fn cursor_hide() -> String:
+    return csi("?25l")
+
+# show the hardware cursor again.
+pub fn cursor_show() -> String:
+    return csi("?25h")
+
+# ---------------------------------------------------------------
+# clearing
+# ---------------------------------------------------------------
+
+# clear the whole screen and home the cursor.
+pub fn clear_screen() -> String:
+    return csi("2J") + cursor_to(0, 0)
+
+# clear the line the cursor is on, leaving the cursor where it is.
+pub fn clear_line() -> String:
+    return csi("2K")
+
+# clear from the cursor to the end of its line.
+pub fn clear_to_end() -> String:
+    return csi("0K")
+
+# ---------------------------------------------------------------
+# modes: alternate screen, mouse, paste, focus
+# ---------------------------------------------------------------
+
+# switch to the alternate screen buffer, preserving the shell's scrollback.
+pub fn alt_screen_enter() -> String:
+    return csi("?1049h")
+
+# return to the normal screen buffer.
+pub fn alt_screen_leave() -> String:
+    return csi("?1049l")
+
+# report mouse presses, releases, and drags in the sgr-1006 encoding — the
+# form std.term.input decodes; the legacy byte encoding is never enabled.
+pub fn mouse_enable() -> String:
+    return csi("?1002h") + csi("?1006h")
+
+# stop mouse reporting.
+pub fn mouse_disable() -> String:
+    return csi("?1006l") + csi("?1002l")
+
+# bracket pasted text in markers so a paste arrives as one event instead of
+# a burst of keystrokes.
+pub fn paste_enable() -> String:
+    return csi("?2004h")
+
+# stop bracketing pastes.
+pub fn paste_disable() -> String:
+    return csi("?2004l")
+
+# report focus gained and lost as input events.
+pub fn focus_enable() -> String:
+    return csi("?1004h")
+
+# stop focus reporting.
+pub fn focus_disable() -> String:
+    return csi("?1004l")
+
+# ---------------------------------------------------------------
+# styling
+# ---------------------------------------------------------------
+
+# one sgr sequence setting foreground, background, and attribute bits in a
+# single burst. COLOR_DEFAULT for either color leaves it at the terminal
+# default; attrs is a sum of the ATTR_ bits; sgr(COLOR_DEFAULT,
+# COLOR_DEFAULT, 0) is a bare reset.
+pub fn sgr(fg: Int, bg: Int, attrs: Int) -> String:
+    mut parts: List[String] := ["0"]
+    if attrs % 2 == 1:
+        parts.push("1")
+    if (attrs / ATTR_DIM) % 2 == 1:
+        parts.push("2")
+    if (attrs / ATTR_ITALIC) % 2 == 1:
+        parts.push("3")
+    if (attrs / ATTR_UNDERLINE) % 2 == 1:
+        parts.push("4")
+    if (attrs / ATTR_REVERSE) % 2 == 1:
+        parts.push("7")
+    if (attrs / ATTR_STRIKE) % 2 == 1:
+        parts.push("9")
+    if fg >= TRUECOLOR_BASE:
+        packed := fg - TRUECOLOR_BASE
+        parts.push("38;2;{packed / 65536};{(packed / 256) % 256};{packed % 256}")
+    elif fg >= 0:
+        parts.push("38;5;{fg}")
+    if bg >= TRUECOLOR_BASE:
+        packed := bg - TRUECOLOR_BASE
+        parts.push("48;2;{packed / 65536};{(packed / 256) % 256};{packed % 256}")
+    elif bg >= 0:
+        parts.push("48;5;{bg}")
+    return csi(parts.join(";") + "m")
+
+# clear all styling back to the terminal default.
+pub fn reset() -> String:
+    return csi("0m")
+
+# ---------------------------------------------------------------
+# strip
+# ---------------------------------------------------------------
+
+# remove every escape sequence from a string, walking the ecma-48 grammar:
+# csi sequences run through parameter and intermediate bytes to one final
+# byte (any of them, not just the sgr 'm'), osc sequences run to a bel or an
+# esc-backslash terminator, ss3 and other two-byte escapes drop both bytes,
+# and a truncated sequence at the end of the string is dropped rather than
+# leaked. plain text, including multi-byte characters, passes through.
+pub fn strip(s: String) -> String:
+    mut parts: List[String] := []
+    # states: 0 ground, 1 saw esc, 2 in csi, 3 in osc, 4 osc saw esc,
+    # 5 ss3 (one more byte to swallow)
+    mut state := 0
+    for c in s:
+        if state == 0:
+            if c == chr(27):
+                state = 1
+            else:
+                parts.push(c)
+        elif state == 1:
+            if c == "[":
+                state = 2
+            elif c == "]":
+                state = 3
+            elif c == "O":
+                # ss3: esc O plus one final byte.
+                state = 5
+            else:
+                # every other esc-x pair: swallow the byte and return to
+                # ground.
+                state = 0
+        elif state == 5:
+            state = 0
+        elif state == 2:
+            # csi body: parameters 0-9 ; : ? and intermediates end at the
+            # first byte in the final range @ .. ~.
+            o := ord(c)
+            if o >= 64 and o <= 126:
+                state = 0
+        elif state == 3:
+            if c == chr(7):
+                state = 0
+            elif c == chr(27):
+                state = 4
+        else:
+            # osc terminator esc-backslash; anything else returns to the osc
+            # body (an esc inside an osc payload is already malformed, so
+            # rejoining the body is the forgiving reading).
+            if c == "\\":
+                state = 0
+            else:
+                state = 3
+    return parts.join("")
+
+test "cursor and clear sequences take zero-based coordinates":
+    e := chr(27)
+    assert_eq(cursor_to(0, 0), e + "[1;1H")
+    assert_eq(cursor_to(9, 4), e + "[5;10H")
+    assert_eq(cursor_up(2), e + "[2A")
+    assert_eq(clear_line(), e + "[2K")
+    assert_eq(clear_screen(), e + "[2J" + e + "[1;1H")
+
+test "sgr composes attributes and both color forms":
+    e := chr(27)
+    assert_eq(reset(), e + "[0m")
+    assert_eq(sgr(COLOR_DEFAULT, COLOR_DEFAULT, 0), e + "[0m")
+    assert_eq(sgr(1, COLOR_DEFAULT, ATTR_BOLD), e + "[0;1;38;5;1m")
+    assert_eq(sgr(COLOR_DEFAULT, 236, ATTR_DIM + ATTR_UNDERLINE), e + "[0;2;4;48;5;236m")
+    assert_eq(sgr(rgb(255, 0, 128), COLOR_DEFAULT, 0), e + "[0;38;2;255;0;128m")
+    assert_eq(rgb(300, 0 - 5, 128), rgb(255, 0, 128))
+
+test "strip removes sgr and cursor sequences alike":
+    e := chr(27)
+    styled := sgr(2, COLOR_DEFAULT, ATTR_BOLD) + "hi" + reset()
+    assert_eq(strip(styled), "hi")
+    moved := cursor_to(3, 7) + "at" + cursor_up(1) + "top" + clear_line()
+    assert_eq(strip(moved), "attop")
+
+test "strip handles osc titles with both terminators":
+    e := chr(27)
+    bel_title := e + "]0;my title" + chr(7) + "after"
+    assert_eq(strip(bel_title), "after")
+    st_title := e + "]2;other" + e + "\\" + "tail"
+    assert_eq(strip(st_title), "tail")
+
+test "strip drops ss3 pairs and truncated sequences":
+    e := chr(27)
+    assert_eq(strip(e + "OP" + "f1"), "f1")
+    # a csi cut off at the end of the string never leaks its bytes.
+    assert_eq(strip("done" + e + "[12;3"), "done")
+    assert_eq(strip("x" + e), "x")
+
+test "strip passes multi-byte characters through untouched":
+    s := sgr(1, COLOR_DEFAULT, 0) + "héllo 日本" + reset()
+    assert_eq(strip(s), "héllo 日本")

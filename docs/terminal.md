@@ -69,6 +69,30 @@ positioning depends on sending exactly the bytes meant — which is the
 capability `print()` deliberately does not offer. `examples/term_write.pith`
 shows three writes forming one line.
 
+## escape sequences
+
+`std.term.ansi` builds the sequences a tui writes — all as plain strings, so
+frames compose and snapshot in tests without a terminal anywhere near them:
+
+```pith
+import std.term.ansi as ansi
+
+frame := ansi.cursor_to(0, 0) + ansi.clear_line()
+       + ansi.sgr(ansi.rgb(255, 0, 128), ansi.COLOR_DEFAULT, ansi.ATTR_BOLD)
+       + "deep pink" + ansi.reset()
+```
+
+coordinates are 0-based and translated to the terminal's 1-based form at the
+boundary. colors are one `Int`: `COLOR_DEFAULT`, `0..255` for the indexed
+palette, or `rgb(r, g, b)` for 24-bit. mouse reporting is enabled in the
+sgr-1006 encoding only, which is the form the input parser will decode.
+
+the same module strips sequences back out. `ansi.strip` (which
+`term.strip` now delegates to) walks the real escape grammar — csi to any
+final byte, window titles to either terminator, three-byte ss3 sequences —
+so asserting on the visible text of a frame works no matter what the frame
+contains. `examples/term_strip.pith` shows both directions.
+
 ## size and resize
 
 `size()` returns `(cols, rows)` for the window. it is a point-in-time query;

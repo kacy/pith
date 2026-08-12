@@ -1,0 +1,243 @@
+# std.lsp.protocol — the json-rpc 2.0 envelope for language servers
+#
+# every language-server message is a json-rpc 2.0 object: a request carries
+# a method and an id, a notification a method and no id, a response an id
+# and a result or error. this module classifies incoming bodies into that
+# shape and builds outgoing ones. it is the layer between
+# std.lsp.transport, which moves opaque bodies, and a server's handlers,
+# which care about methods and params.
+#
+#   import std.lsp.protocol as protocol
+#
+#   m := protocol.parse_message(body)
+#   if m.kind == "request":
+#       reply := protocol.response_body(m.id, m.id_text, m.id_is_text, result)
+#
+# params and results are std.json handles, so they live in the caller's
+# threadlocal json arena; scope them with std.json's open_scope/close_scope
+# when parsing in a loop.
+
+import std.json as json
+
+# the body was not parsable json at all.
+pub PARSE_ERROR := 0 - 32700
+
+# the body was json but not a valid request object.
+pub INVALID_REQUEST := 0 - 32600
+
+# the requested method does not exist on this server.
+pub METHOD_NOT_FOUND := 0 - 32601
+
+# the params do not fit the method's signature.
+pub INVALID_PARAMS := 0 - 32602
+
+# the server failed internally while handling a valid request.
+pub INTERNAL_ERROR := 0 - 32603
+
+# a request arrived before the initialize handshake completed.
+pub SERVER_NOT_INITIALIZED := 0 - 32002
+
+# the client cancelled the request before a reply was sent.
+pub REQUEST_CANCELLED := 0 - 32800
+
+# one classified json-rpc message. kind is "request", "notification",
+# "response", or "invalid". ids may be integers or strings on the wire:
+# id holds an integer id (-1 when absent), id_text holds a string id
+# ("" otherwise), and id_is_text records which one applies. method is ""
+# for responses, params is a json handle or -1 when absent, and error_text
+# says why a message is invalid.
+pub struct Message:
+    pub kind: String
+    pub id: Int
+    pub id_text: String
+    pub id_is_text: Bool
+    pub method: String
+    pub params: Int
+    pub error_text: String
+
+fn invalid(reason: String) -> Message:
+    return Message("invalid", 0 - 1, "", false, "", 0 - 1, reason)
+
+# classify a message body per json-rpc 2.0: a request has a method and an
+# id, a notification a method and no id, a response an id plus a result or
+# error member and no method. anything else — unparsable json, a missing
+# jsonrpc field, a non-string method, a fractional id — comes back with
+# kind "invalid" and the reason in error_text.
+pub fn parse_message(body: String) -> Message:
+    root := json.parse(body)
+    if root < 0:
+        return invalid("body is not valid json")
+    if json.type_of(root) != "object":
+        return invalid("body is not a json object")
+    if json.object_get_string_or(root, "jsonrpc", "") != "2.0":
+        return invalid("jsonrpc field is missing or not \"2.0\"")
+    mut id := 0 - 1
+    mut id_text := ""
+    mut id_is_text := false
+    mut has_id := false
+    id_handle := json.object_get(root, "id")
+    if id_handle >= 0:
+        id_type := json.type_of(id_handle)
+        if id_type == "int":
+            id = json.get_int(id_handle)
+            has_id = true
+        elif id_type == "string":
+            id_text = json.get_string(id_handle)
+            id_is_text = true
+            has_id = true
+        elif id_type == "null":
+            # an error response about an undecodable request carries id null
+            has_id = true
+        else:
+            return invalid("id must be an integer or a string")
+    params := json.object_get(root, "params")
+    method_handle := json.object_get(root, "method")
+    if method_handle >= 0:
+        if json.type_of(method_handle) != "string":
+            return invalid("method is not a string")
+        method := json.get_string(method_handle)
+        if has_id:
+            return Message("request", id, id_text, id_is_text, method, params, "")
+        return Message("notification", id, id_text, id_is_text, method, params, "")
+    if has_id and (json.object_has(root, "result") or json.object_has(root, "error")):
+        return Message("response", id, id_text, id_is_text, "", 0 - 1, "")
+    return invalid("not a request, notification, or response")
+
+# an id json node matching how the id arrived: a string node when
+# id_is_text, an integer node otherwise.
+fn id_node(id: Int, id_text: String, id_is_text: Bool) -> Int:
+    if id_is_text:
+        return json.make_string(id_text)
+    return json.make_int(id)
+
+fn envelope() -> Int:
+    obj := json.make_object()
+    json.object_set(obj, "jsonrpc", json.make_string("2.0"))
+    return obj
+
+# an encoded success response. result is a json handle; pass -1 for a null
+# result — the spec requires the result member even when there is nothing
+# to say.
+pub fn response_body(id: Int, id_text: String, id_is_text: Bool, result: Int) -> String:
+    obj := envelope()
+    json.object_set(obj, "id", id_node(id, id_text, id_is_text))
+    if result < 0:
+        json.object_set(obj, "result", json.make_null())
+    else:
+        json.object_set(obj, "result", result)
+    return json.encode(obj)
+
+# an encoded error response carrying one of the code constants above (or
+# any method-specific code) and a human-readable message.
+pub fn error_body(id: Int, id_text: String, id_is_text: Bool, code: Int, message: String) -> String:
+    obj := envelope()
+    json.object_set(obj, "id", id_node(id, id_text, id_is_text))
+    err := json.make_object()
+    json.object_set(err, "code", json.make_int(code))
+    json.object_set(err, "message", json.make_string(message))
+    json.object_set(obj, "error", err)
+    return json.encode(obj)
+
+# an encoded notification: a method with no id, so no reply is expected.
+# params is a json handle; pass -1 to omit the member.
+pub fn notification_body(method: String, params: Int) -> String:
+    obj := envelope()
+    json.object_set(obj, "method", json.make_string(method))
+    if params >= 0:
+        json.object_set(obj, "params", params)
+    return json.encode(obj)
+
+# an encoded request with an integer id. params is a json handle; pass -1
+# to omit the member.
+pub fn request_body(id: Int, method: String, params: Int) -> String:
+    obj := envelope()
+    json.object_set(obj, "id", json.make_int(id))
+    json.object_set(obj, "method", json.make_string(method))
+    if params >= 0:
+        json.object_set(obj, "params", params)
+    return json.encode(obj)
+
+test "a request with an integer id classifies as a request":
+    m := parse_message("{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{{}}}}")
+    assert_eq(m.kind, "request")
+    assert_eq(m.id, 7)
+    assert(not m.id_is_text)
+    assert_eq(m.method, "initialize")
+    assert(m.params >= 0)
+    assert_eq(json.type_of(m.params), "object")
+
+test "a request with a string id keeps the id text":
+    m := parse_message("{{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"shutdown\"}}")
+    assert_eq(m.kind, "request")
+    assert(m.id_is_text)
+    assert_eq(m.id_text, "abc-1")
+    assert_eq(m.id, 0 - 1)
+    assert_eq(m.params, 0 - 1)
+
+test "a method without an id classifies as a notification":
+    m := parse_message("{{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}}")
+    assert_eq(m.kind, "notification")
+    assert_eq(m.method, "initialized")
+    assert_eq(m.id, 0 - 1)
+
+test "an id with a result and no method classifies as a response":
+    m := parse_message("{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}}")
+    assert_eq(m.kind, "response")
+    assert_eq(m.id, 3)
+    assert_eq(m.method, "")
+
+test "an error response with a string id classifies as a response":
+    m := parse_message("{{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"error\":{{\"code\":-32601,\"message\":\"no\"}}}}")
+    assert_eq(m.kind, "response")
+    assert(m.id_is_text)
+    assert_eq(m.id_text, "x")
+
+test "invalid bodies come back with a reason":
+    assert_eq(parse_message("not json").kind, "invalid")
+    assert(parse_message("not json").error_text != "")
+    # a json scalar is not an envelope
+    assert_eq(parse_message("42").kind, "invalid")
+    # missing jsonrpc member
+    assert_eq(parse_message("{{\"id\":1,\"method\":\"m\"}}").kind, "invalid")
+    # wrong jsonrpc version
+    assert_eq(parse_message("{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"m\"}}").kind, "invalid")
+    # method must be a string
+    assert_eq(parse_message("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":5}}").kind, "invalid")
+    # a fractional id fits neither integer nor string
+    assert_eq(parse_message("{{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"m\"}}").kind, "invalid")
+    # an id alone with neither result nor error is not a response
+    assert_eq(parse_message("{{\"jsonrpc\":\"2.0\",\"id\":1}}").kind, "invalid")
+
+test "request and notification bodies round-trip through parse_message":
+    params := json.make_object()
+    json.object_set(params, "line", json.make_int(3))
+    req := parse_message(request_body(9, "textDocument/hover", params))
+    assert_eq(req.kind, "request")
+    assert_eq(req.id, 9)
+    assert_eq(req.method, "textDocument/hover")
+    assert_eq(json.object_get_int(req.params, "line"), 3)
+    note := parse_message(notification_body("exit", 0 - 1))
+    assert_eq(note.kind, "notification")
+    assert_eq(note.method, "exit")
+    assert_eq(note.params, 0 - 1)
+
+test "response bodies round-trip and a -1 result encodes null":
+    body := response_body(4, "", false, 0 - 1)
+    assert(body.contains("\"result\":null"))
+    m := parse_message(body)
+    assert_eq(m.kind, "response")
+    assert_eq(m.id, 4)
+    named := parse_message(response_body(0 - 1, "req-2", true, json.make_int(6)))
+    assert_eq(named.kind, "response")
+    assert(named.id_is_text)
+    assert_eq(named.id_text, "req-2")
+
+test "an error body carries the code and message":
+    body := error_body(2, "", false, METHOD_NOT_FOUND, "unknown method")
+    m := parse_message(body)
+    assert_eq(m.kind, "response")
+    root := json.parse(body)
+    err := json.object_get(root, "error")
+    assert(err >= 0)
+    assert_eq(json.object_get_int(err, "code"), 0 - 32601)
+    assert_eq(json.object_get_string(err, "message"), "unknown method")

@@ -1,0 +1,23 @@
+# display width is the terminal's unit of measure, and it is neither bytes
+# nor characters: 日本 is 6 bytes, 2 characters, and 4 columns. std.text.width
+# counts columns — grapheme-aware, so a flag pair is one cluster two columns
+# wide — and pads and truncates against that count, which is what makes
+# terminal tables line up when the data is not ascii.
+import std.text as text
+import std.text.width as width
+
+fn main() -> Int!:
+    print("bytes chars cols  text")
+    for s in ["hello", "日本", "café", "ｗｉｄｅ"]:
+        cols := width.of(s)
+        chars := text.char_count(s)
+        print("{s.len()}     {chars}     {cols}     {s}")
+
+    flag := text.encode(127482)! + text.encode(127480)!
+    print("flag: cols={width.of(flag)}")
+
+    print("[" + width.pad_right("日", 6) + "]")
+    print("[" + width.pad_left("ab", 6) + "]")
+    print("[" + width.center("日本", 8) + "]")
+    print(width.truncate_to_with("日本語です", 7, "…"))
+    return 0

@@ -232,7 +232,56 @@ def build_compositions(decompositions):
 # ---------------------------------------------------------------------------
 
 
-def verify(pairs, runs, class_map, class_runs, decompositions, compositions):
+
+# ---------------------------------------------------------------------------
+# display width
+# ---------------------------------------------------------------------------
+
+
+def build_width_ranges():
+    """Wide and zero-width code points, as (start, count) runs.
+
+    Wide is East Asian Width W and F -- the code points a terminal renders
+    across two cells. Ambiguous (A) stays narrow, matching wcwidth's default
+    and modern terminal behaviour.
+
+    Zero-width is nonspacing and enclosing marks (Mn, Me) plus format
+    characters (Cf) except U+00AD soft hyphen, which terminals render as a
+    visible hyphen. Controls are handled by the caller, not the table.
+    """
+    wide = set()
+    for fields in ucd_rows(fetch("EastAsianWidth.txt")):
+        spec, width = fields[0], fields[1]
+        if width not in ("W", "F"):
+            continue
+        if ".." in spec:
+            lo, hi = spec.split("..")
+            wide.update(range(int(lo, 16), int(hi, 16) + 1))
+        else:
+            wide.add(int(spec, 16))
+
+    zero = set()
+    for code in range(0x110000):
+        category = unicodedata.category(chr(code))
+        if category in ("Mn", "Me") or (category == "Cf" and code != 0x00AD):
+            zero.add(code)
+
+    def runs(codes):
+        ordered = sorted(codes)
+        out = []
+        index = 0
+        while index < len(ordered):
+            end = index + 1
+            while end < len(ordered) and ordered[end] == ordered[end - 1] + 1:
+                end += 1
+            out.append((ordered[index], end - index))
+            index = end
+        return out
+
+    return wide, runs(wide), zero, runs(zero)
+
+
+def verify(pairs, runs, class_map, class_runs, decompositions, compositions, wide, wide_runs, zero, zero_runs):
     """Check every emitted table against python's unicodedata."""
     # case folding runs must reproduce the pair list exactly, and nothing else
     expanded = {}
@@ -276,6 +325,19 @@ def verify(pairs, runs, class_map, class_runs, decompositions, compositions):
     for first, second, composed in compositions:
         if unicodedata.normalize("NFC", chr(first) + chr(second)) != chr(composed):
             raise SystemExit(f"composition mismatch for {first:04X}+{second:04X}")
+
+    # width runs must reproduce their source sets exactly, and the wide set
+    # must agree with python's independent east_asian_width
+    for name, codes, run_list in (("wide", wide, wide_runs), ("zero-width", zero, zero_runs)):
+        expanded_width = set()
+        for start, count in run_list:
+            expanded_width.update(range(start, start + count))
+        if expanded_width != codes:
+            raise SystemExit(f"{name} runs do not reproduce the source set")
+    for code in range(0x110000):
+        is_wide = unicodedata.east_asian_width(chr(code)) in ("W", "F")
+        if is_wide != (code in wide):
+            raise SystemExit(f"east asian width mismatch at {code:04X}")
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +550,31 @@ def main():
     class_map, class_runs = build_combining_classes()
     decompositions, decomposition_records = build_decompositions()
     composition_records = build_compositions(decompositions)
+    wide, wide_runs, zero, zero_runs = build_width_ranges()
 
-    verify(pairs, fold_runs, class_map, class_runs, decompositions, composition_records)
+    verify(pairs, fold_runs, class_map, class_runs, decompositions, composition_records, wide, wide_runs, zero, zero_runs)
+
+
+    width_size = emit(
+        os.path.join(STD_TEXT, "width_tables.pith"),
+        UNICODE_VERSION,
+        [
+            (
+                "WIDE_RUNS",
+                "code points a terminal renders across two cells, as (start, count).\n"
+                "east asian width W and F; Ambiguous stays narrow.",
+                2,
+                pack(wide_runs, 2),
+            ),
+            (
+                "ZERO_RUNS",
+                "code points that occupy no cell of their own, as (start, count).\n"
+                "categories Mn and Me, plus Cf except U+00AD soft hyphen.",
+                2,
+                pack(zero_runs, 2),
+            ),
+        ],
+    )
 
     case_size = emit(
         os.path.join(STD_TEXT, "case_tables.pith"),

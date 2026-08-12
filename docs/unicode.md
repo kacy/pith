@@ -253,6 +253,30 @@ of `GraphemeBreakTest.txt` run as a colocated test, from data the generator
 packs into the tables, so regenerating for a new unicode release re-verifies
 the segmenter rather than just replacing its data.
 
+## display width, for terminal layout
+
+a terminal cell is a fourth unit, alongside bytes, characters and graphemes:
+日 fills two columns, a combining accent fills none, and a family emoji built
+from several code points fills two. `std.text.width` counts columns and lays
+text out against that count:
+
+```pith
+import std.text.width as width
+
+width.of("日本")                        # 4 — two columns per character
+width.pad_right("日", 5)                # "日   "
+width.center("abc", 6)                  # " abc  "
+width.truncate_to_with("日本語です", 7, "…")  # "日本語…"
+```
+
+counting is grapheme-aware: a flag pair measures 2, an accented letter 1, and
+truncation never splits a cluster — a two-column character that half-fits is
+dropped, so the result can come up one column short but never overflows.
+widths follow east asian width with Ambiguous counted narrow (wcwidth's
+default); variation selector 16 forces emoji presentation and two columns.
+the byte-based padders in `std.strings` are unchanged — they are for byte
+work, and terminal layout should use this module instead.
+
 ## the tables
 
 the case folding and normalization data is generated from the unicode
@@ -283,8 +307,9 @@ constant compiles in about a second and costs nothing at startup.
 | case folding | 205 runs (from 1457 pairs) | 4.0 KB |
 | combining classes, decompositions, compositions | 388 + 2061 + 941 | 42.0 KB |
 | grapheme break properties, plus the conformance cases | 733 ranges + 3009 | 25.0 KB |
+| display width (wide and zero-width runs) | 120 + 356 runs | 4.7 KB |
 
-71 KB in total, all of it compiled in rather than loaded, and none of it
+76 KB in total, all of it compiled in rather than loaded, and none of it
 touched by a program that does not call into these functions.
 
 ## what is not here

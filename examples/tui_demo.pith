@@ -1,0 +1,105 @@
+# the interactive tour of the terminal-ui stack: a dashboard with tabs, a
+# selectable list, a text input, a multi-line note, a live spinner, and a
+# help bar, with tab cycling focus between the interactive panes. run it on
+# a real terminal:
+#
+#     pith run examples/tui_demo.pith
+#
+# this example has no expected output on purpose — it needs a terminal and
+# a human, which the example harness has neither of. everything it composes
+# is exercised headlessly by the widget snapshot tests and the drive()-based
+# examples; this file exists so a person can feel the stack.
+import std.term.app as app
+from std.term.app import App, Cmd
+import std.term.input as input
+from std.term.input import Event, KeyCode
+import std.term.style as style
+import std.term.ui as ui
+
+enum DemoMsg:
+    Spin
+    Cycle
+    Halt
+    Forward(input.Key)
+
+struct Demo:
+    mut ring: ui.FocusRing
+    mut items: ui.ListView
+    mut name: ui.Input
+    mut note: ui.TextArea
+    mut spin: ui.Spinner
+
+fn new_demo() -> Demo:
+    items := ui.list_view(["build", "test", "deploy", "observe", "scale"], 4)
+    name := ui.text_input(18)
+    note := ui.textarea(24, 4)
+    note.blur()
+    name.blur()
+    return Demo(ring: ui.focus_ring(3), items: items, name: name, note: note, spin: ui.spinner())
+
+impl App for Demo:
+    type Msg = DemoMsg
+
+    fn init() -> Cmd[DemoMsg]:
+        return app.every(90, fn(t: Int) => DemoMsg.Spin)
+
+    fn on_event(ev: Event) -> Cmd[DemoMsg]:
+        match ev:
+            Event.KeyPress(k) =>
+                name := input.key_name(k)
+                if name == "q" and self.ring.active != 1 and self.ring.active != 2:
+                    return self.update(DemoMsg.Halt)
+                if name == "tab":
+                    return self.update(DemoMsg.Cycle)
+                return self.update(DemoMsg.Forward(k))
+            Event.Paste(s) =>
+                if self.ring.active == 1:
+                    self.name.paste(s)
+                if self.ring.active == 2:
+                    self.note.paste(s)
+                return app.nothing[DemoMsg]()
+            _ =>
+                return app.nothing[DemoMsg]()
+        return app.nothing[DemoMsg]()
+
+    fn update(msg: DemoMsg) -> Cmd[DemoMsg]:
+        match msg:
+            DemoMsg.Spin =>
+                self.spin.advance()
+            DemoMsg.Cycle =>
+                self.ring.next()
+                self.items.blur()
+                self.name.blur()
+                self.note.blur()
+                if self.ring.active == 0:
+                    self.items.focus()
+                elif self.ring.active == 1:
+                    self.name.focus()
+                else:
+                    self.note.focus()
+            DemoMsg.Halt =>
+                return app.quit[DemoMsg]()
+            DemoMsg.Forward(k) =>
+                if self.ring.active == 0:
+                    self.items.key(k)
+                elif self.ring.active == 1:
+                    self.name.key(k)
+                else:
+                    self.note.key(k)
+        return app.nothing[DemoMsg]()
+
+    fn view() -> String:
+        tabs := ui.tabs(["tasks", "name", "note"], self.ring.active, 40)
+        left := ui.block().with_title("tasks").render(self.items.view(14))
+        middle := ui.block().with_title("name").render(self.name.view())
+        right := ui.block().with_title("note").render(self.note.view())
+        panes := style.join_h([left, style.join_v([middle, right], style.LEFT)], style.TOP)
+        picked := self.items.selected()
+        chosen := picked.unwrap_or("-")
+        status := "{self.spin.view()} selected: {chosen}"
+        bindings := [app.binding(["tab"], "tab", "switch pane"), app.binding(["q"], "q", "quit")]
+        help := ui.help_short(bindings, 60)
+        return style.join_v([tabs, panes, status, help], style.LEFT)
+
+fn main() -> Int!:
+    return app.run(new_demo())!

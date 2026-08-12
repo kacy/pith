@@ -7,9 +7,9 @@
 
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
-from ast import reset_arena
+from ast import reset_arena, get_node
 from driver import init_driver, resolve_imports, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node
-from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module
+from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of
 from errors import Diagnostic
 
 ## one front-end run's result. a parse failure carries the parser's
@@ -51,6 +51,18 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
     diags := c_run_module(root)
     return CheckOutcome(true, true, diags, root, import_roots)
 
+## the checker's use-site -> declaration map rendered by position, one
+## "useLine:useCol -> defLine:defCol" entry per resolution, sorted so
+## callers and tests see a deterministic order.
+pub fn definition_pairs() -> List[String]:
+    defs := get_definition_of()
+    mut pairs: List[String] := []
+    for use_idx in defs.keys():
+        use_node := get_node(use_idx)
+        def_node := get_node(defs[use_idx])
+        pairs.push(use_node.line.to_string() + ":" + use_node.col.to_string() + " -> " + def_node.line.to_string() + ":" + def_node.col.to_string())
+    return pairs.sort()
+
 test "pipeline checks a program held only in an overlay":
     set_source_overlay("__overlay_ok.pith", "fn main():\n    print(\"hi\")\n")
     outcome := run_check_pipeline("__overlay_ok.pith")!
@@ -72,6 +84,56 @@ test "pipeline reports parse failures without checking":
     outcome := run_check_pipeline("__overlay_parse.pith")!
     assert(not outcome.parse_ok)
     assert(outcome.diags.len() > 0)
+    clear_source_overlays()
+
+test "definition map links uses of a local back to its binding":
+    set_source_overlay("__overlay_defs.pith", "fn main():\n    x := 41\n    y := x + x\n    print(y.to_string())\n")
+    outcome := run_check_pipeline("__overlay_defs.pith")!
+    assert(outcome.parse_ok)
+    assert_eq(outcome.diags.len(), 0)
+    pairs := definition_pairs()
+    assert_eq(pairs.len(), 3)
+    # both uses of x on line 3 resolve to the line-2 binding, and the
+    # use of y on line 4 resolves to the line-3 binding. a binding node
+    # sits at its last token's start, so "x := 41" lands on the 41
+    assert(pairs[0].starts_with("3:") and pairs[0].ends_with("-> 2:10"))
+    assert(pairs[1].starts_with("3:") and pairs[1].ends_with("-> 2:10"))
+    assert(pairs[2].starts_with("4:") and pairs[2].ends_with("-> 3:14"))
+    clear_source_overlays()
+
+test "definition map links a call to the function it names":
+    set_source_overlay("__overlay_call.pith", "fn helper() -> Int:\n    return 7\n\nfn main():\n    print(helper().to_string())\n")
+    outcome := run_check_pipeline("__overlay_call.pith")!
+    assert(outcome.parse_ok)
+    assert_eq(outcome.diags.len(), 0)
+    pairs := definition_pairs()
+    # the callee ident on line 5 resolves to the helper declaration; a
+    # declaration node carries the position of its last token, so the
+    # definition lands on line 2 (the end of helper's body)
+    assert_eq(pairs.len(), 1)
+    assert(pairs[0].starts_with("5:"))
+    assert(pairs[0].ends_with("-> 2:12"))
+    clear_source_overlays()
+
+test "definition map crosses modules through a qualified call":
+    set_source_overlay("__overlay_dhelper.pith", "pub fn seven() -> Int:\n    return 7\n")
+    set_source_overlay("__overlay_dmain.pith", "import __overlay_dhelper\n\nfn main():\n    print(__overlay_dhelper.seven().to_string())\n")
+    outcome := run_check_pipeline("__overlay_dmain.pith")!
+    assert(outcome.parse_ok)
+    assert(outcome.import_ok)
+    assert_eq(outcome.diags.len(), 0)
+    defs := get_definition_of()
+    # the qualified call in main resolves to the helper's declaration,
+    # which lives in the helper module's file
+    mut found := false
+    for use_idx in defs.keys():
+        def_idx := defs[use_idx]
+        if file_for_node(def_idx) == "__overlay_dhelper.pith":
+            assert_eq(file_for_node(use_idx), "__overlay_dmain.pith")
+            # the declaration node sits at its last token, line 2
+            assert_eq(get_node(def_idx).line, 2)
+            found = true
+    assert(found)
     clear_source_overlays()
 
 test "file_for_node attributes nodes to the module that parsed them":

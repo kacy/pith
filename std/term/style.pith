@@ -15,6 +15,8 @@
 # std.text.width, and measurement strips escape sequences first, so styled
 # and plain blocks lay out identically.
 import std.term.ansi as ansi
+import std.bits as bits
+import std.strings as strings
 import std.text.width as width
 
 # horizontal alignment for join_v, place, and width-constrained rendering.
@@ -117,7 +119,7 @@ impl Style:
     # add one ansi.ATTR_ bit; the named builders above cover the usual ones.
     fn attr(bit: Int) -> Style:
         d := dup(self)
-        if (d.attr_bits / bit) % 2 == 0:
+        if bits.band(d.attr_bits, bit) == 0:
             d.attr_bits = d.attr_bits + bit
         return d
 
@@ -200,14 +202,7 @@ impl Style:
         return rows.join("\n")
 
 fn spaces(n: Int) -> String:
-    if n <= 0:
-        return ""
-    mut parts: List[String] := []
-    mut i := 0
-    while i < n:
-        parts.push(" ")
-        i = i + 1
-    return parts.join("")
+    return strings.repeat(" ", n)
 
 # the columns a line occupies on screen, with escape sequences ignored.
 fn visible_width(line: String) -> Int:
@@ -240,12 +235,7 @@ fn apply_padding(rows: List[String], content_w: Int, t: Int, r: Int, b: Int, l: 
     return out
 
 fn apply_border(rows: List[String], inner_w: Int, b: Border, fg: Int) -> List[String]:
-    mut h_run: List[String] := []
-    mut i := 0
-    while i < inner_w:
-        h_run.push(b.h)
-        i = i + 1
-    edge := h_run.join("")
+    edge := strings.repeat(b.h, inner_w)
     mut top := b.tl + edge + b.tr
     mut side := b.v
     mut bottom := b.bl + edge + b.br

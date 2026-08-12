@@ -137,11 +137,11 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **no package registry** — dependencies are local path entries in `pith.toml`;
   there is no fetch, lock, or hosted index yet.
 - **no debugger** — runtime stack traces are thin and there is no stepping.
-- **diagnostic columns are approximate** — the line a diagnostic reports is
-  right and the source line printed under it is right, but the caret lands to
-  the right of the token it means. a token's recorded column is stamped after
-  the lexer has consumed it, so every column in the compiler is off by roughly
-  the token's own width. the line number is the part to trust.
+- **a diagnostic points at its construct's last token** — columns are exact
+  now (a token's recorded position is where it starts, and the caret lands on
+  it), but a node's position is the position of the last token that formed it,
+  so an error about a whole expression points at its closing token rather than
+  its first.
 - **an error inside a string interpolation reports at line 1** — the expression
   in `"{f(x)}"` is parsed as its own fragment and carries no position from the
   enclosing file, so a type error in it lands on line 1 rather than on the line

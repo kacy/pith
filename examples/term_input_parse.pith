@@ -1,0 +1,35 @@
+# terminal input arrives as bytes: printable characters as themselves,
+# arrows and function keys as escape sequences, a paste as a bracketed
+# burst. std.term.input decodes them with a push parser that never touches
+# the terminal — feed it bytes, get events — which is why this example can
+# demonstrate every shape from byte literals, deterministically.
+import std.bytes as bytes
+import std.term.input as input
+
+fn show(p: input.Parser, label: String, byte_values: List[Int]):
+    arr := bytes.array()
+    for v in byte_values:
+        arr.push(v) catch 0
+    mut names: List[String] := []
+    for ev in input.feed(p, arr.bytes()):
+        names.push(input.describe(ev))
+    print("{label}: {names.join(\", \")}")
+
+fn main():
+    p := input.parser()
+    show(p, "text      ", [104, 105])
+    show(p, "ctrl-c    ", [3])
+    show(p, "up arrow  ", [27, 91, 65])
+    show(p, "ctrl-right", [27, 91, 49, 59, 53, 67])
+    show(p, "f5        ", [27, 91, 49, 53, 126])
+    show(p, "alt-x     ", [27, 120])
+    show(p, "accented  ", [195, 169])
+    show(p, "mouse     ", [27, 91, 60, 48, 59, 49, 48, 59, 53, 77])
+    show(p, "paste     ", [27, 91, 50, 48, 48, 126, 104, 105, 27, 91, 50, 48, 49, 126])
+
+    # a lone escape is ambiguous until an idle gap resolves it
+    show(p, "lone esc  ", [27])
+    mut names: List[String] := []
+    for ev in input.flush(p):
+        names.push(input.describe(ev))
+    print("after gap : {names.join(\", \")}")

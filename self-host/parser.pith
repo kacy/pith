@@ -5,7 +5,7 @@
 #
 # usage: import from parse_main.pith or call parse() directly
 
-from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_count, load_tokens, load_token_snapshot
+from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot
 from ast import Node, add_node, add_leaf, get_node
 from errors import Diagnostic
 
@@ -196,6 +196,24 @@ fn snapshot_token_cols() -> List[Int]:
         i = i + 1
     return snapshot
 
+fn snapshot_token_offsets() -> List[Int]:
+    mut snapshot: List[Int] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_offset(i))
+        i = i + 1
+    return snapshot
+
+fn snapshot_token_lens() -> List[Int]:
+    mut snapshot: List[Int] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_len(i))
+        i = i + 1
+    return snapshot
+
 # safe EOF token for empty token list cases
 # ---------------------------------------------------------------
 # token navigation
@@ -204,16 +222,18 @@ fn snapshot_token_cols() -> List[Int]:
 fn advance_token() -> Token:
     tc := tok_count()
     if tc == 0:
-        return Token("eof", "", 0, 0)
+        return Token("eof", "", 0, 0, 0, 0)
     while current_token_position < tc:
         k := tok_kind(current_token_position)
         v := tok_value(current_token_position)
         l := tok_line(current_token_position)
         c := tok_col(current_token_position)
+        o := tok_offset(current_token_position)
+        n := tok_len(current_token_position)
         current_token_position = current_token_position + 1
         if k != "comment":
-            return Token(k, v, l, c)
-    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1))
+            return Token(k, v, l, c, o, n)
+    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1), tok_offset(tc - 1), tok_len(tc - 1))
 
 fn check(kind: String) -> Bool:
     return _cur_tok_kind() == kind
@@ -232,13 +252,13 @@ fn expect(kind: String) -> Token:
     pos := parser_error_position()
     if cur_kind == "eof":
         parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
-        return Token(kind, "", pos.0, pos.1)
+        return Token(kind, "", pos.0, pos.1, 0, 0)
     if cur_kind == "err":
         parser_report_lexer_error_here()
     else:
         parser_report_error_at(pos.0, pos.1, "E240", "expected " + kind + " but found " + cur_kind, "")
     advance_token()
-    return Token(kind, "", pos.0, pos.1)
+    return Token(kind, "", pos.0, pos.1, 0, 0)
 
 fn skip_newlines():
     while _cur_tok_kind() == "newline":
@@ -1078,6 +1098,8 @@ fn parse_interp_expr(text: String) -> Int:
     saved_values := snapshot_token_values()
     saved_lines := snapshot_token_lines()
     saved_cols := snapshot_token_cols()
+    saved_offsets := snapshot_token_offsets()
+    saved_lens := snapshot_token_lens()
     saved_pos := current_token_position
     saved_depth := recursion_depth
 
@@ -1090,7 +1112,7 @@ fn parse_interp_expr(text: String) -> Int:
     result := parse_expression()
 
     # restore parser state
-    load_token_snapshot(saved_kinds, saved_values, saved_lines, saved_cols)
+    load_token_snapshot(saved_kinds, saved_values, saved_lines, saved_cols, saved_offsets, saved_lens)
     current_token_position = saved_pos
     recursion_depth = saved_depth
 

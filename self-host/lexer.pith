@@ -15,6 +15,10 @@ pub struct Token:
     pub value: String
     pub current_line: Int
     pub current_column: Int
+    # byte offset of the first character and byte length of the lexeme;
+    # zero-length for synthesized and end-of-input tokens
+    pub offset: Int
+    pub len: Int
 
 mut LBRACE := ""
 mut RBRACE := ""
@@ -151,8 +155,9 @@ fn source_char(pos: Int) -> String:
 fn advance() -> String:
     character := source_char(current_position)
     current_position = current_position + 1
-    current_column = current_column + 1
-    # Track current_line and column position
+    # one character, one column — this used to also increment
+    # unconditionally above the branch, so every character consumed
+    # through advance() moved the column by two
     if is_newline_char(character):
         current_line = current_line + 1
         current_column = 0
@@ -214,14 +219,43 @@ mut current_token_kind := ""
 mut current_token_value := ""
 mut current_token_line := 0
 mut current_token_column := 0
+mut current_token_offset := 0
+mut current_token_len := 0
+
+# where the token being scanned starts. captured before the scan consumes
+# anything, so emit() reports the position a reader would point at — the
+# token's first character — rather than wherever the scan finished, which
+# used to put every column off by roughly the token's own width.
+mut token_start_line := 1
+mut token_start_column := 1
+mut token_start_offset := 0
+
+fn mark_token_start():
+    token_start_line = current_line
+    # current_column counts consumed characters, so the next character —
+    # the token's first — sits at the 1-based column one past it. a
+    # 1-based column is also what the caret renderer needs to point at
+    # the token rather than beside it.
+    token_start_column = current_column + 1
+    token_start_offset = current_position
 
 fn emit(kind: String, value: String):
     current_token_kind = kind
     current_token_value = value
-    current_token_line = current_line
-    current_token_column = current_column
+    current_token_line = token_start_line
+    current_token_column = token_start_column
+    current_token_offset = token_start_offset
+    mut length := current_position - token_start_offset
+    if length < 0:
+        length = 0
+    current_token_len = length
 
 fn next_token():
+    # synthetic tokens — dedents, queued interpolation pieces, indent,
+    # newline, eof — take the position the lexer is sitting at when they
+    # are produced
+    mark_token_start()
+
     # step 1: drain pending dedents
     if pending_dedents > 0:
         pending_dedents = pending_dedents - 1
@@ -302,6 +336,8 @@ fn next_token():
         next_token()
         return
 
+    # the real token starts here, after any leading spaces
+    mark_token_start()
     character := peek()
 
     # step 7: dispatch on character
@@ -960,11 +996,16 @@ pub fn init_lexer(src: String):
     pending_token_lines = []
     pending_token_columns = []
     pending_dedents = 0
+    token_start_line = 1
+    token_start_column = 1
+    token_start_offset = 0
 
 mut _tok_kinds: List[String] := []
 mut _tok_values: List[String] := []
 mut _tok_lines: List[Int] := []
 mut _tok_cols: List[Int] := []
+mut _tok_offsets: List[Int] := []
+mut _tok_lens: List[Int] := []
 
 pub fn tok_kind(i: Int) -> String:
     return _tok_kinds[i]
@@ -974,6 +1015,10 @@ pub fn tok_line(i: Int) -> Int:
     return _tok_lines[i]
 pub fn tok_col(i: Int) -> Int:
     return _tok_cols[i]
+pub fn tok_offset(i: Int) -> Int:
+    return _tok_offsets[i]
+pub fn tok_len(i: Int) -> Int:
+    return _tok_lens[i]
 pub fn tok_count() -> Int:
     return _tok_kinds.len()
 
@@ -982,17 +1027,23 @@ pub fn load_tokens(token_list: List[Token]):
     _tok_values = []
     _tok_lines = []
     _tok_cols = []
+    _tok_offsets = []
+    _tok_lens = []
     for tok in token_list:
         _tok_kinds.push(tok.kind)
         _tok_values.push(tok.value)
         _tok_lines.push(tok.current_line)
         _tok_cols.push(tok.current_column)
+        _tok_offsets.push(tok.offset)
+        _tok_lens.push(tok.len)
 
-pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: List[Int], cols: List[Int]):
+pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: List[Int], cols: List[Int], offsets: List[Int], lens: List[Int]):
     _tok_kinds = []
     _tok_values = []
     _tok_lines = []
     _tok_cols = []
+    _tok_offsets = []
+    _tok_lens = []
     for kind in kinds:
         _tok_kinds.push(kind)
     for value in values:
@@ -1001,6 +1052,10 @@ pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: Lis
         _tok_lines.push(line)
     for col in cols:
         _tok_cols.push(col)
+    for off in offsets:
+        _tok_offsets.push(off)
+    for ln in lens:
+        _tok_lens.push(ln)
 
 pub fn lex_all(src: String) -> List[Token]:
     init_lexer(src)
@@ -1008,15 +1063,19 @@ pub fn lex_all(src: String) -> List[Token]:
     _tok_values = []
     _tok_lines = []
     _tok_cols = []
+    _tok_offsets = []
+    _tok_lens = []
     mut tokens: List[Token] := []
     mut keep_going := true
     while keep_going:
         next_token()
-        tokens.push(Token(current_token_kind, current_token_value, current_token_line, current_token_column))
+        tokens.push(Token(current_token_kind, current_token_value, current_token_line, current_token_column, current_token_offset, current_token_len))
         _tok_kinds.push(current_token_kind)
         _tok_values.push(current_token_value)
         _tok_lines.push(current_token_line)
         _tok_cols.push(current_token_column)
+        _tok_offsets.push(current_token_offset)
+        _tok_lens.push(current_token_len)
         if current_token_kind == "eof":
             keep_going = false
     return tokens

@@ -1449,26 +1449,48 @@ fn json_object_set(obj: Int, key: String, val: Int):
 # Public API — Encoder
 # ===============================================================
 
-# writes a json-escaped string into a string buffer.
+# true for the bytes a json string cannot carry raw: the quote, the
+# backslash, and every control byte below 0x20 (rfc 8259).
+fn json_needs_escape(b: Int) -> Bool:
+    return b == 34 or b == 92 or b < 32
+
+# the escape sequence for one such byte. \n, \r and \t keep their short
+# forms; the rest of the control range becomes \u00XX.
+fn json_escape_form(b: Int) -> String:
+    if b == 34:
+        return "\\\""
+    if b == 92:
+        return "\\\\"
+    if b == 10:
+        return "\\n"
+    if b == 13:
+        return "\\r"
+    if b == 9:
+        return "\\t"
+    hex := "0123456789abcdef"
+    return "\\u00" + hex[b / 16] + hex[b % 16]
+
+# writes a json-escaped string into a string buffer. the scan is byte-level
+# (ord(s[i]) reads a byte without allocating) and unescaped runs are flushed
+# whole, so text with nothing to escape costs one substring. run boundaries
+# always sit on ascii escape bytes, so the slices cannot split a multi-byte
+# character. bytes at or above 0x80 read back sign-extended and negative;
+# they are utf-8 lead or continuation bytes and must pass through raw.
 fn write_escaped_string(out: StringBuffer, s: String) -> Int!:
-    mut total := out.write_all(chr(34))!
+    mut total := out.write_all("\"")!
+    mut run_start := 0
     mut i := 0
     while i < s.len():
-        c := s[i]
-        if c == chr(34):
-            total = total + out.write_all(chr(92) + chr(34))!
-        if c == chr(92):
-            total = total + out.write_all(chr(92) + chr(92))!
-        if c == chr(10):
-            total = total + out.write_all(chr(92) + "n")!
-        if c == chr(13):
-            total = total + out.write_all(chr(92) + "r")!
-        if c == chr(9):
-            total = total + out.write_all(chr(92) + "t")!
-        if c != chr(34) and c != chr(92) and c != chr(10) and c != chr(13) and c != chr(9):
-            total = total + out.write_all(c)!
+        b := ord(s[i])
+        if b >= 0 and json_needs_escape(b):
+            if i > run_start:
+                total = total + out.write_all(s.substring(run_start, i))!
+            total = total + out.write_all(json_escape_form(b))!
+            run_start = i + 1
         i = i + 1
-    total = total + out.write_all(chr(34))!
+    if i > run_start:
+        total = total + out.write_all(s.substring(run_start, i))!
+    total = total + out.write_all("\"")!
     return total
 
 fn json_write(out: StringBuffer, handle: Int) -> Int!:
@@ -1520,29 +1542,21 @@ fn json_encode_result(handle: Int) -> String!:
     json_write(out, handle)!
     return out.string()
 
+# the byte-buffer twin of write_escaped_string, kept in the same shape.
 fn write_escaped_bytes(out: ByteBuffer, s: String) -> Int!:
     mut total := out.write_byte(34)!
+    mut run_start := 0
     mut i := 0
     while i < s.len():
-        c := s[i]
-        if c == chr(34):
-            total = total + out.write_byte(92)!
-            total = total + out.write_byte(34)!
-        if c == chr(92):
-            total = total + out.write_byte(92)!
-            total = total + out.write_byte(92)!
-        if c == chr(10):
-            total = total + out.write_byte(92)!
-            total = total + out.write_byte(110)!
-        if c == chr(13):
-            total = total + out.write_byte(92)!
-            total = total + out.write_byte(114)!
-        if c == chr(9):
-            total = total + out.write_byte(92)!
-            total = total + out.write_byte(116)!
-        if c != chr(34) and c != chr(92) and c != chr(10) and c != chr(13) and c != chr(9):
-            total = total + out.write_string_utf8(c)!
+        b := ord(s[i])
+        if b >= 0 and json_needs_escape(b):
+            if i > run_start:
+                total = total + out.write_string_utf8(s.substring(run_start, i))!
+            total = total + out.write_string_utf8(json_escape_form(b))!
+            run_start = i + 1
         i = i + 1
+    if i > run_start:
+        total = total + out.write_string_utf8(s.substring(run_start, i))!
     total = total + out.write_byte(34)!
     return total
 
@@ -1939,3 +1953,42 @@ test "parse decodes string escapes":
     # a lone surrogate half and a bad escape are malformed, not text
     assert_eq(type_of(parse("{{\"u\":\"\\ud800\"}}")), "invalid")
     assert_eq(type_of(parse("{{\"u\":\"\\q\"}}")), "invalid")
+
+test "encode escapes every control byte":
+    # rfc 8259 forbids a raw byte below 0x20 inside a json string. \n, \r
+    # and \t keep their short forms; the rest must appear as \u00XX.
+    assert_eq(encode(make_string(chr(8))), "\"\\u0008\"")
+    assert_eq(encode(make_string(chr(12))), "\"\\u000c\"")
+    assert_eq(encode(make_string(chr(27))), "\"\\u001b\"")
+    assert_eq(encode(make_string(chr(31))), "\"\\u001f\"")
+    assert_eq(encode(make_string(chr(10))), "\"\\n\"")
+    assert_eq(encode(make_string(chr(13))), "\"\\r\"")
+    assert_eq(encode(make_string(chr(9))), "\"\\t\"")
+    # every control byte round-trips through parse and never appears raw in
+    # the encoded form. byte 0 cannot occur in a pith string, so the scan
+    # starts at 1.
+    mut i := 1
+    while i < 32:
+        original := "a" + chr(i) + "b"
+        encoded := encode(make_string(original))
+        mut j := 0
+        while j < encoded.len():
+            assert(ord(encoded[j]) >= 32)
+            j = j + 1
+        assert_eq(get_string(parse(encoded)), original)
+        i = i + 1
+
+test "encode leaves multi-byte text unescaped":
+    # bytes at or above 0x80 are utf-8 lead or continuation bytes and pass
+    # through raw — a sign-extended (negative) byte read must not be taken
+    # for a control byte. é is two bytes, 😀 is four.
+    s := "café 😀"
+    assert_eq(encode(make_string(s)), "\"" + s + "\"")
+    assert_eq(get_string(parse(encode(make_string(s)))), s)
+
+test "encode_bytes matches encode on text that needs escaping":
+    tricky := "a\"b\\c" + chr(10) + chr(8) + "é 😀 end"
+    node := make_string(tricky)
+    encoded := encode_bytes(node)!
+    assert_eq(encoded.to_string_utf8()!, encode(node))
+    assert_eq(get_string(parse(encode(node))), tricky)

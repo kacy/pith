@@ -1,0 +1,14 @@
+# std.term.tty gives a program the one thing print() cannot: writing to the
+# terminal without a newline. a TUI positions the cursor and paints cells, so
+# every byte has to land exactly as sent — here three separate writes produce
+# one line, and the final newline is ours, not the runtime's.
+#
+# the write path is fd-generic, so this works with stdout piped (as the
+# example harness runs it) just as well as on a live terminal.
+from std.term.tty import write_str
+
+fn main() -> Int!:
+    write_str("a")!
+    write_str("b")!
+    write_str("c\n")!
+    return 0

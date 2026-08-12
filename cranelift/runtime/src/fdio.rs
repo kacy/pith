@@ -67,6 +67,15 @@ pub(crate) fn poll_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }
+    poll_wait_any_fd(fd, events, timeout_ms)
+}
+
+/// `poll_wait` for any non-negative fd, including 0. same body, minus the
+/// no-handle guard; see `wait_ready_unguarded` for why the split exists.
+fn poll_wait_any_fd(fd: i64, events: i16, timeout_ms: i64) -> i64 {
+    if fd < 0 {
+        return -1;
+    }
     let mut poll_fd = libc::pollfd {
         fd: fd as i32,
         events,
@@ -114,6 +123,17 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }
+    wait_ready_unguarded(fd, read, timeout_ms)
+}
+
+/// `wait_ready` without the `fd <= 0` guard, for the one caller that
+/// legitimately waits on fd 0: the terminal builtins reading stdin. `0` is a
+/// "no handle" sentinel throughout the socket code, so the guard stays on
+/// `wait_ready` itself — this seam exists precisely so it never weakens.
+pub(crate) fn wait_ready_unguarded(fd: i64, read: bool, timeout_ms: i64) -> i64 {
+    if fd < 0 {
+        return -1;
+    }
     // a negative timeout is "wait forever" and passes through; a positive one is
     // clamped here rather than in each branch, so neither the reactor's deadline
     // arithmetic nor `poll`'s `int` sees a value it cannot hold.
@@ -122,7 +142,7 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
         Some(task) => netpoll::wait_io(fd as RawFd, read, timeout_ms, task),
         None => {
             let events = if read { libc::POLLIN } else { libc::POLLOUT };
-            poll_wait(fd, events, timeout_ms)
+            poll_wait_any_fd(fd, events, timeout_ms)
         }
     }
 }

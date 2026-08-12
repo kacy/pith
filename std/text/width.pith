@@ -1,0 +1,196 @@
+# std.text.width — display width, the terminal's unit of measure
+#
+# a terminal cell is neither a byte nor a character: 日 fills two columns,
+# a combining accent fills none, and a family emoji built from four code
+# points and three joiners fills two. anything that lays text out in a
+# terminal — padding a column, truncating to a box — has to count columns,
+# which is what this module does. the byte-based helpers in std.strings are
+# the wrong tool for that job and stay as they are for byte work.
+#
+#   import std.text.width as width
+#   width.of("hello")        # 5
+#   width.of("日本")          # 4
+#   width.pad_right("日", 5)  # "日   " — three spaces after a two-column char
+#
+# widths follow unicode 15.1.0 east asian width, with Ambiguous counted
+# narrow — wcwidth's default and what modern terminals render. counting is
+# grapheme-aware: a cluster is measured as one unit, so a flag pair is 2 and
+# an accented letter is 1.
+import std.text as text
+import std.text.graphemes as graphemes
+import std.text.tables as tables
+import std.text.width_tables as width_tables
+
+# regional indicators: a pair of these is a flag, rendered two columns wide.
+RI_FIRST := 127462
+RI_LAST := 127487
+
+ZWJ := 8205
+VARIATION_SELECTOR_16 := 65039
+
+fn in_runs(table: String, count: Int, cp: Int) -> Bool:
+    run := tables.find_containing(table, 2, count, cp)
+    if run < 0:
+        return false
+    start := tables.field(table, run, 0, 2)
+    span := tables.field(table, run, 1, 2)
+    return cp < start + span
+
+# the display width of one code point: 2 for east asian wide and fullwidth,
+# 0 for combining marks, format characters, and c0/c1 controls, 1 for
+# everything else. for text as the user sees it, prefer of_grapheme —
+# a cluster's width is not the sum of its code points'.
+pub fn of_code_point(cp: Int) -> Int:
+    if cp < 32:
+        return 0
+    if cp >= 127 and cp <= 159:
+        return 0
+    if in_runs(width_tables.ZERO_RUNS, width_tables.zero_runs_count(), cp):
+        return 0
+    if in_runs(width_tables.WIDE_RUNS, width_tables.wide_runs_count(), cp):
+        return 2
+    return 1
+
+# the display width of one grapheme cluster: a regional-indicator pair
+# (a flag) is 2, variation selector 16 anywhere in the cluster requests
+# emoji presentation and makes it 2 (this covers keycaps built on a plain
+# digit), a pictographic sequence joined with zwj is 2, and anything else is
+# as wide as its widest code point — which makes a combining sequence 1 and
+# a lone zero-width character 0.
+pub fn of_grapheme(g: String) -> Int:
+    cps := text.code_points(g)
+    if cps.len() == 0:
+        return 0
+    first := cps[0]
+    if cps.len() >= 2 and first >= RI_FIRST and first <= RI_LAST:
+        return 2
+    mut widest := 0
+    mut has_zwj := false
+    for cp in cps:
+        if cp == VARIATION_SELECTOR_16:
+            return 2
+        if cp == ZWJ:
+            has_zwj = true
+        w := of_code_point(cp)
+        if w > widest:
+            widest = w
+    if has_zwj and graphemes.is_pictographic(first):
+        return 2
+    return widest
+
+# the display width of a string, summed over its grapheme clusters.
+pub fn of(s: String) -> Int:
+    mut total := 0
+    for g in graphemes.split(s):
+        total = total + of_grapheme(g)
+    return total
+
+# pad on the right to `cols` columns. text already that wide or wider comes
+# back unchanged — padding never truncates.
+pub fn pad_right(s: String, cols: Int) -> String:
+    return s + spaces(cols - of(s))
+
+# pad on the left to `cols` columns.
+pub fn pad_left(s: String, cols: Int) -> String:
+    return spaces(cols - of(s)) + s
+
+# center in `cols` columns, with the extra column on the right when the
+# remaining space is odd.
+pub fn center(s: String, cols: Int) -> String:
+    gap := cols - of(s)
+    if gap <= 0:
+        return s
+    left := gap / 2
+    return spaces(left) + s + spaces(gap - left)
+
+fn spaces(n: Int) -> String:
+    if n <= 0:
+        return ""
+    mut parts: List[String] := []
+    mut i := 0
+    while i < n:
+        parts.push(" ")
+        i = i + 1
+    return parts.join("")
+
+# cut to at most `max_cols` columns, never splitting a grapheme cluster: a
+# two-column character that does not fit entirely is dropped, so the result
+# can come up one column short but never overflows.
+pub fn truncate_to(s: String, max_cols: Int) -> String:
+    return truncate_to_with(s, max_cols, "")
+
+# truncate_to with a suffix (an ellipsis, usually) that fits inside the
+# budget: text within the limit comes back whole, text over it is cut so
+# that content plus suffix never exceeds `max_cols`.
+pub fn truncate_to_with(s: String, max_cols: Int, suffix: String) -> String:
+    if of(s) <= max_cols:
+        return s
+    budget := max_cols - of(suffix)
+    mut used := 0
+    mut kept: List[String] := []
+    for g in graphemes.split(s):
+        w := of_grapheme(g)
+        if used + w > budget:
+            break
+        used = used + w
+        kept.push(g)
+    return kept.join("") + suffix
+
+test "ascii is one column per character":
+    assert_eq(of("hello"), 5)
+    assert_eq(of(""), 0)
+    assert_eq(of_code_point(65), 1)
+
+test "cjk characters are two columns":
+    assert_eq(of_grapheme("日"), 2)
+    assert_eq(of("日本"), 4)
+    assert_eq(of("a日b"), 4)
+    # fullwidth latin is wide too
+    assert_eq(of("Ａ"), 2)
+
+test "combining marks add no width":
+    # e + combining acute is one cluster, one column
+    composed := "e" + (text.encode(769) catch "e")
+    assert_eq(of(composed), 1)
+    assert_eq(of_code_point(769), 0)
+
+test "controls and zero-width characters measure zero":
+    assert_eq(of_code_point(9), 0)
+    assert_eq(of_code_point(27), 0)
+    # zero width space (Cf)
+    assert_eq(of_code_point(8203), 0)
+    # soft hyphen renders, so it keeps its column
+    assert_eq(of_code_point(173), 1)
+
+fn cp(code_point: Int) -> String:
+    return text.encode(code_point) catch ""
+
+test "emoji sequences are two columns":
+    # a flag is a regional indicator pair
+    flag := cp(127482) + cp(127480)
+    assert_eq(of(flag), 2)
+    # a person emoji alone is wide
+    assert_eq(of(cp(128104)), 2)
+    # family: three pictographs joined by zwj measure as one two-column cluster
+    family := cp(128104) + cp(8205) + cp(128105) + cp(8205) + cp(128102)
+    assert_eq(graphemes.count(family), 1)
+    assert_eq(of(family), 2)
+    # digit + vs16 + combining keycap renders as one emoji keycap
+    keycap := "1" + cp(65039) + cp(8419)
+    assert_eq(of(keycap), graphemes.count(keycap) * 2)
+
+test "padding counts columns not bytes":
+    assert_eq(pad_right("日", 5), "日   ")
+    assert_eq(pad_left("ab", 4), "  ab")
+    assert_eq(center("日", 6), "  日  ")
+    assert_eq(center("abc", 6), " abc  ")
+    # already wide enough: unchanged
+    assert_eq(pad_right("hello", 3), "hello")
+
+test "truncation never splits a wide character":
+    assert_eq(truncate_to("日本語", 4), "日本")
+    # a wide char that half-fits is dropped, coming up one column short
+    assert_eq(truncate_to("日本語", 5), "日本")
+    assert_eq(truncate_to("hello", 10), "hello")
+    assert_eq(truncate_to_with("hello world", 8, "…"), "hello w…")
+    assert_eq(truncate_to_with("日本語です", 7, "…"), "日本語…")

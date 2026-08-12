@@ -35,6 +35,7 @@ from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, c_diagnostics_to_json
+from check_pipeline import CheckOutcome, run_check_pipeline
 from printer import print_ast
 from formatter import fmt_source
 from linter import lint_module
@@ -119,44 +120,29 @@ fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, pr
 
 fn cmd_check(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
-    tokens := lex_all(source)
-    reset_arena()
-    root := parse_with_file(tokens, path)
+    outcome := run_check_pipeline(path)!
 
-    if parser_has_errors():
-        diags := parser_diagnostics()
+    if not outcome.parse_ok:
         if json_mode:
-            print(render_diagnostics_json(diags))
+            print(render_diagnostics_json(outcome.diags))
         else:
-            print(render_diagnostics(diags, source))
+            print(render_diagnostics(outcome.diags, source))
         exit(1)
 
-    init_driver(path)
-    import_roots := resolve_imports(root, path)!
-    if driver_has_parse_errors():
-        diags := get_driver_parse_diagnostics()
+    if not outcome.import_ok:
         if json_mode:
-            print(render_diagnostics_json(diags))
+            print(render_diagnostics_json(outcome.diags))
         else:
-            print(render_diagnostics_for_path(diags, path, source)!)
+            print(render_diagnostics_for_path(outcome.diags, path, source)!)
         exit(1)
-
-    initialize_checker(path)
-    for imp_root in import_roots:
-        set_checker_module_path(get_resolved_module_path(imp_root))
-        set_checker_file_path(get_resolved_module_file(imp_root))
-        c_run_module(imp_root)
-    set_checker_module_path("")
-    set_checker_file_path(path)
-    diags := c_run_module(root)
 
     if json_mode:
-        print(c_diagnostics_to_json(diags))
+        print(c_diagnostics_to_json(outcome.diags))
     else:
-        if has_errors(diags):
+        if has_errors(outcome.diags):
             # diagnostics may span modules; render each against its own
             # source so excerpts quote the right file
-            print(render_diagnostics_for_path(diags, path, source)!)
+            print(render_diagnostics_for_path(outcome.diags, path, source)!)
             exit(1)
         else:
             print("ok")
@@ -187,37 +173,23 @@ fn cmd_fmt(path: String, check_mode: Bool) -> String!:
 
 fn cmd_lint(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
-    tokens := lex_all(source)
-    reset_arena()
-    root := parse_with_file(tokens, path)
+    outcome := run_check_pipeline(path)!
 
-    if parser_has_errors():
-        diags := parser_diagnostics()
+    if not outcome.parse_ok:
         if json_mode:
-            print(render_diagnostics_json(diags))
+            print(render_diagnostics_json(outcome.diags))
         else:
-            print(render_diagnostics(diags, source))
+            print(render_diagnostics(outcome.diags, source))
         exit(1)
 
-    init_driver(path)
-    import_roots := resolve_imports(root, path)!
-    if driver_has_parse_errors():
-        diags := get_driver_parse_diagnostics()
+    if not outcome.import_ok:
         if json_mode:
-            print(render_diagnostics_json(diags))
+            print(render_diagnostics_json(outcome.diags))
         else:
-            print(render_diagnostics_for_path(diags, path, source)!)
+            print(render_diagnostics_for_path(outcome.diags, path, source)!)
         exit(1)
-    initialize_checker(path)
-    for imp_root in import_roots:
-        set_checker_module_path(get_resolved_module_path(imp_root))
-        set_checker_file_path(get_resolved_module_file(imp_root))
-        c_run_module(imp_root)
-    set_checker_module_path("")
-    set_checker_file_path(path)
-    c_run_module(root)
 
-    diags := lint_module(root, source, path)
+    diags := lint_module(outcome.root, source, path)
 
     if json_mode:
         print(render_diagnostics_json(diags))

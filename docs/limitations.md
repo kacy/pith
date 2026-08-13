@@ -161,27 +161,24 @@ correctness story:
   gone.
 - memory reclamation is compiler-emitted reference counting (see the readme's
   memory section). closures are reference counted and freed like other heap
-  values. the deliberate gaps that remain: strong reference cycles leak, but a
-  struct graph can break its own cycle with a `weak` field (see
+  values. the one structural gap that remains: strong reference cycles leak,
+  but a struct graph can break its own cycle with a `weak` field (see
   docs/ownership.md) — the only cycle with no weak escape hatch today is a
   closure that captures a binding reaching back to it, since closure captures
-  cannot yet be weak. container element removal leaks until the container dies,
-  and error-path early returns skip cleanup. all are bounded-leak by design —
-  the discipline never produces a dangling pointer in exchange.
-- reading an optional that is synthesized rather than stored can leak a small
-  optional box per read. a `weak` field read builds a fresh optional to carry
-  the liveness result; the common consumers — `!= none` / `== none` and
-  `.value()` — now free that shell once the value is extracted, so the common
-  idiom no longer leaks. an indexed read of a collection whose element type is a
-  struct (`items[i]` where `items` is `List[Node]`) still synthesizes an optional
-  that is not reclaimed. a stored optional field read does not synthesize and
-  does not leak. the leak is bounded per read and never dangles; reclaiming the
-  remaining synthesized-optional temporaries is a known follow-up.
-- a fresh optional written straight into an argument is not released — about 64
-  bytes per call, whether it comes from a bare `none` (`f(none)`), from a call
-  (`f(maybe(i))`), or from a plain value widened into an optional parameter
-  (`f(3)`). the widened form also holds the count on its payload, so a heap
-  payload passed that way (`f(Point(1))`, `f(some_list)`) is held by the
+  cannot yet be weak. the leak is bounded by design — the discipline never
+  produces a dangling pointer in exchange. (removing an element from a
+  container, returning early on an error path, and indexed reads of
+  `List[Struct]` were all listed here once; each was fixed and each is now
+  pinned flat by the leak-growth gate, measured at two round counts.)
+- a fresh optional written straight into an argument is released when it came
+  from a call — `f(maybe(i))` reclaims, because the emitter can prove through
+  the callee's body that the caller stayed the shell's sole owner (see
+  docs/ownership.md). the shapes still on the leak side, about 64 bytes per
+  call each: a bare `none` (`f(none)`), a plain value widened into an optional
+  parameter (`f(3)`), a call-produced optional handed to a *method*
+  (`obj.take(maybe(i))`), and a callee the walk cannot read or that extracts
+  an rc payload. the widened form also holds the count on its payload, so a
+  heap payload passed that way (`f(Point(1))`, `f(some_list)`) is held by the
   optional that leaks. binding it first (`v: Int? := 3` then `f(v)`) is
   reclaimed normally, so the local is the workaround on a hot path.
 - a collection literal whose element type is an optional (`List[Int?]`,

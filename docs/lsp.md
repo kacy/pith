@@ -55,6 +55,27 @@ what `pith check` reports.
   a binding whose name cannot be matched to exactly one `name :=` on
   its declaration line is skipped rather than guessed at, which also
   skips multi-line initializers.
+- **rename** — `textDocument/rename` resolves the declaration the way
+  references does and returns one WorkspaceEdit covering every
+  reference plus the declaration's own identifier, grouped per file
+  across the walked module closure. `textDocument/prepareRename`
+  answers with the identifier's range, or null when the cursor is not
+  on a renameable symbol. a rename to an empty string or anything that
+  is not a plain identifier (first byte alpha or `_`, the rest
+  alphanumeric or `_`) is refused with null.
+- **code actions** — one quickfix per diagnostic in the request whose
+  compiler fix is mechanically applicable. today that is exactly
+  E216's "declare with 'mut'", which returns a WorkspaceEdit inserting
+  `mut ` in front of the binding. every other fix the compiler
+  attaches is prose advice ("import it from the module that defines
+  it", "use ? to unwrap an optional value"); those stay in the
+  diagnostic message and produce no action, because an action without
+  an edit is a button that does nothing.
+- **workspace symbols** — `workspace/symbol` lists top-level fn,
+  struct, enum, and interface declarations across every file the last
+  analysis walked (the analyzed document and its transitive imports),
+  filtered by a case-insensitive (ascii) substring match on the query;
+  an empty query matches everything. capped at 200 entries.
 
 ## how it works
 
@@ -80,8 +101,9 @@ the modules:
   position conversion (lsp 0-based utf-16/utf-8 characters vs the
   compiler's 1-based byte columns)
 - `self-host/lsp_features.pith` — diagnostics, hover, symbols,
-  formatting
-- `self-host/lsp_navigation.pith` — definition, references, completion
+  workspace symbols, code actions, formatting
+- `self-host/lsp_navigation.pith` — definition, references,
+  completion, rename
 - `self-host/lsp_tokens.pith` — semantic tokens, signature help, and
   inlay hints
 
@@ -127,7 +149,30 @@ files; eyeball every line before freezing a new expectation.
 
 ## current limitations
 
-- no rename or workspace-wide symbol search yet.
+- rename covers what the definition map covers: local bindings,
+  parameters, and directly-called functions, structs, enums, and
+  interfaces resolved by the checker. it does not rename struct
+  fields, module names, or anything inside a string or comment. a
+  symbol with a reference the server cannot pin to the identifier's
+  token — methods and module-qualified calls, whose use-def entries
+  are keyed on the call node at the call's closing token — is refused
+  outright (null from both prepareRename and rename) rather than
+  renamed partially, because editing the declaration but not such a
+  call site would break the program silently. a binding's declaration
+  identifier is found by scanning its declaring line for the first
+  whole-word occurrence of the name, which picks the wrong occurrence
+  in the pathological case of a declaration line reusing the name
+  earlier as a different symbol.
+- code actions apply only fixes that name an exact mechanical edit;
+  the one shape today is E216's "declare with 'mut'". prose-advice
+  fixes produce no action, and a diagnostic the client echoes back
+  after further edits (so it no longer matches the last analysis) is
+  ignored.
+- workspace/symbol reads the last completed analysis as-is — it names
+  no document, so it cannot re-analyze — and only sees the analyzed
+  document's import closure, not unrelated files in the workspace.
+  results cap at 200 entries; the substring match is ascii
+  case-insensitive.
 - completion is heuristic and reads the last completed analysis, on
   purpose: mid-edit text usually does not parse, so the request never
   re-runs the front end. right after a change (or when the last run

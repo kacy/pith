@@ -14,8 +14,8 @@
 # newline corrupts the frame stream.
 
 from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
-from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, formatting_edits
-from lsp_navigation import definition_location, references_locations, completion_items
+from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, workspace_symbols, code_actions, formatting_edits
+from lsp_navigation import definition_location, references_locations, completion_items, prepare_rename_range, rename_workspace_edit
 from lsp_tokens import semantic_token_legend, semantic_tokens_full, signature_help, inlay_hints
 from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
 import std.lsp.transport as transport
@@ -105,6 +105,15 @@ fn handle_initialize(m: Message):
     json.object_set(signature, "triggerCharacters", sig_triggers)
     json.object_set(caps, "signatureHelpProvider", signature)
     json.object_set(caps, "inlayHintProvider", json.make_bool(true))
+    rename := json.make_object()
+    json.object_set(rename, "prepareProvider", json.make_bool(true))
+    json.object_set(caps, "renameProvider", rename)
+    action_kinds := json.make_array()
+    json.array_push(action_kinds, json.make_string("quickfix"))
+    code_action := json.make_object()
+    json.object_set(code_action, "codeActionKinds", action_kinds)
+    json.object_set(caps, "codeActionProvider", code_action)
+    json.object_set(caps, "workspaceSymbolProvider", json.make_bool(true))
     info := json.make_object()
     json.object_set(info, "name", json.make_string("pith-lsp"))
     json.object_set(info, "version", json.make_string("0.1.0"))
@@ -235,6 +244,43 @@ fn handle_inlay_hint(m: Message):
             end_line = json.object_get_int_or(end, "line", 0)
     write_body(response_body(m.id, m.id_text, m.id_is_text, inlay_hints(uri, start_line, end_line)))
 
+fn handle_prepare_rename(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    at := params_position(m.params)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, prepare_rename_range(uri, at.line, at.character)))
+
+fn handle_rename(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    at := params_position(m.params)
+    new_name := json.object_get_string_or(m.params, "newName", "")
+    write_body(response_body(m.id, m.id_text, m.id_is_text, rename_workspace_edit(uri, at.line, at.character, new_name)))
+
+# code actions match the request's diagnostics against the last run's,
+# so the analysis must describe this document first.
+fn handle_code_action(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    write_body(response_body(m.id, m.id_text, m.id_is_text, code_actions(uri, m.params)))
+
+# workspace/symbol names no document, so it reads whatever the last
+# analysis walked as-is; before any analysis the list is empty.
+fn handle_workspace_symbol(m: Message):
+    mut query := ""
+    if m.params >= 0:
+        query = json.object_get_string_or(m.params, "query", "")
+    write_body(response_body(m.id, m.id_text, m.id_is_text, workspace_symbols(query)))
+
 fn handle_request(m: Message):
     if m.method == "initialize":
         handle_initialize(m)
@@ -272,6 +318,18 @@ fn handle_request(m: Message):
         return
     if m.method == "textDocument/inlayHint":
         handle_inlay_hint(m)
+        return
+    if m.method == "textDocument/prepareRename":
+        handle_prepare_rename(m)
+        return
+    if m.method == "textDocument/rename":
+        handle_rename(m)
+        return
+    if m.method == "textDocument/codeAction":
+        handle_code_action(m)
+        return
+    if m.method == "workspace/symbol":
+        handle_workspace_symbol(m)
         return
     write_body(error_body(m.id, m.id_text, m.id_is_text, METHOD_NOT_FOUND, "unknown method: " + m.method))
 

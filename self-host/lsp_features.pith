@@ -3,10 +3,11 @@
 # each language feature reads the compiler's state after a front-end
 # run: diagnostics render the checker's findings as publishDiagnostics
 # notifications, hover reads the expression type cache, documentSymbol
-# walks the ast root, and formatting diffs against fmt_source. one
-# analysis is valid at a time — the node arena and type cache describe
-# only the most recent run_check_pipeline call — so every feature goes
-# through ensure_analyzed first.
+# and workspace/symbol walk the module roots, code actions replay the
+# checker's fix suggestions, and formatting diffs against fmt_source.
+# one analysis is valid at a time — the node arena and type cache
+# describe only the most recent run_check_pipeline call — so every
+# feature goes through ensure_analyzed first.
 
 from check_pipeline import run_check_pipeline
 from driver import file_for_node, dr_read_source
@@ -16,7 +17,7 @@ from ast import get_node, node_count
 from errors import Diagnostic
 from lexer import lex_all
 from formatter import fmt_source
-from lsp_state import PithPos, uri_to_path, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
+from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 import std.json as json
 import std.lsp.protocol as protocol
@@ -25,12 +26,25 @@ import std.lsp.protocol as protocol
 # produce hundreds and the first few are the actionable ones.
 MAX_DIAGNOSTICS_PER_FILE := 20
 
+# workspace/symbol responses stop growing past this many entries.
+MAX_WORKSPACE_SYMBOLS := 200
+
+# the fix text check_assignment attaches to E216; the one fix shape a
+# code action can apply mechanically.
+MUT_FIX_PREFIX := "declare with 'mut': mut "
+
 # which document the compiler state currently describes, and whether the
 # checker ran for it (a parse or import failure stops before checking,
 # leaving the type cache stale).
 mut analyzed_uri := ""
 mut analyzed_root := 0 - 1
+mut analyzed_import_roots: List[Int] := []
 mut analyzed_checked := false
+
+# the last run's diagnostics grouped by the file they point at, kept so
+# a codeAction request can recover the fix text its diagnostics carried
+# — published diagnostics do not round-trip the fix field.
+mut last_diags_by_path: Map[String, List[Diagnostic]] := {}
 
 # how many diagnostics were last published per uri, so a document whose
 # problems disappear gets one clearing publish instead of silence.
@@ -132,6 +146,7 @@ pub fn run_analysis(uri: String) -> List[String]:
     clear_dirty_if(uri)
     analyzed_uri = uri
     analyzed_root = outcome.root
+    analyzed_import_roots = outcome.import_roots
     analyzed_checked = outcome.parse_ok and outcome.import_ok
     mode := get_position_encoding()
 
@@ -157,6 +172,7 @@ pub fn run_analysis(uri: String) -> List[String]:
         if open_uri == uri or file_diags.len() > 0 or previous > 0:
             bodies.push(publish_body(open_uri, file_diags, mode))
             last_published_counts.insert(open_path, file_diags.len())
+    last_diags_by_path = by_path
     return bodies
 
 ## whether the last analysis ran the checker to completion, so the
@@ -351,6 +367,14 @@ pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
 # document symbols
 # ---------------------------------------------------------------
 
+# a top-level entry unwrapped: a `pub` declaration is a marker node
+# holding the real declaration as its only child.
+fn unwrap_pub(child_idx: Int) -> Int:
+    node := get_node(child_idx)
+    if node.kind == "pub" and node.children.len() == 1:
+        return node.children[0]
+    return child_idx
+
 fn symbol_kind_number(node_kind: String) -> Int:
     if node_kind == "fn_decl":
         return 12
@@ -394,6 +418,29 @@ fn name_ends_at(line: String, end: Int) -> Bool:
         return false
     return true
 
+## true when the identifier starting exactly at 1-based byte col is
+## name — the byte before is not part of an identifier and the byte
+## after the name is not either.
+pub fn word_starts_at(line_text: String, col: Int, name: String) -> Bool:
+    idx := col - 1
+    if idx < 0 or name.len() == 0 or idx + name.len() > line_text.len():
+        return false
+    if line_text.substring(idx, idx + name.len()) != name:
+        return false
+    if idx > 0 and is_ident_byte(ord(line_text[idx - 1])):
+        return false
+    return name_ends_at(line_text, idx + name.len())
+
+## the first 1-based byte column where name occurs in a line as a
+## whole identifier, or 0 when it never does.
+pub fn word_col_in_line(line_text: String, name: String) -> Int:
+    mut col := 1
+    while col + name.len() - 1 <= line_text.len():
+        if word_starts_at(line_text, col, name):
+            return col
+        col = col + 1
+    return 0
+
 ## where a top-level declaration's name sits in the source: ast nodes
 ## carry the position of their last token, so the name is found by
 ## scanning lines for the declaring keyword instead. returns the name's
@@ -422,6 +469,33 @@ pub fn find_decl_position(text: String, node_kind: String, name: String) -> Pith
         line0 = line0 + 1
     return PithPos(0, 0)
 
+# one SymbolInformation object {name, kind, location} for a declaration
+# in a file's text, locating the name by the declaration-line scan and
+# falling back to the node position when the scan finds nothing.
+fn symbol_information_json(uri: String, text: String, node_kind: String, kind_num: Int, name: String, fallback: PithPos, mode: String) -> Int:
+    mut at := find_decl_position(text, node_kind, name)
+    if at.line == 0:
+        at = fallback
+    start := line_col_to_lsp_pos(text, at.line, at.col, mode)
+    end := line_col_to_lsp_pos(text, at.line, at.col + name.len(), mode)
+    range := json.make_object()
+    start_obj := json.make_object()
+    json.object_set(start_obj, "line", json.make_int(start.line))
+    json.object_set(start_obj, "character", json.make_int(start.character))
+    end_obj := json.make_object()
+    json.object_set(end_obj, "line", json.make_int(end.line))
+    json.object_set(end_obj, "character", json.make_int(end.character))
+    json.object_set(range, "start", start_obj)
+    json.object_set(range, "end", end_obj)
+    location := json.make_object()
+    json.object_set(location, "uri", json.make_string(uri))
+    json.object_set(location, "range", range)
+    entry := json.make_object()
+    json.object_set(entry, "name", json.make_string(name))
+    json.object_set(entry, "kind", json.make_int(kind_num))
+    json.object_set(entry, "location", location)
+    return entry
+
 ## the flat symbol list for a document as a json array handle: one
 ## SymbolInformation entry per top-level fn, struct, enum, and
 ## interface declaration.
@@ -436,33 +510,155 @@ pub fn document_symbols(uri: String) -> Int:
     for child_idx in root.children:
         if file_for_node(child_idx) != path:
             continue
-        child := get_node(child_idx)
+        child := get_node(unwrap_pub(child_idx))
         kind_num := symbol_kind_number(child.kind)
         if kind_num == 0:
             continue
         name := bare_symbol_name(child.value)
-        mut at := find_decl_position(text, child.kind, name)
-        if at.line == 0:
-            at = PithPos(child.line, child.col)
-        start := line_col_to_lsp_pos(text, at.line, at.col, mode)
-        end := line_col_to_lsp_pos(text, at.line, at.col + name.len(), mode)
-        range := json.make_object()
-        start_obj := json.make_object()
-        json.object_set(start_obj, "line", json.make_int(start.line))
-        json.object_set(start_obj, "character", json.make_int(start.character))
-        end_obj := json.make_object()
-        json.object_set(end_obj, "line", json.make_int(end.line))
-        json.object_set(end_obj, "character", json.make_int(end.character))
-        json.object_set(range, "start", start_obj)
-        json.object_set(range, "end", end_obj)
-        location := json.make_object()
-        json.object_set(location, "uri", json.make_string(uri))
-        json.object_set(location, "range", range)
-        entry := json.make_object()
-        json.object_set(entry, "name", json.make_string(name))
-        json.object_set(entry, "kind", json.make_int(kind_num))
-        json.object_set(entry, "location", location)
+        entry := symbol_information_json(uri, text, child.kind, kind_num, name, PithPos(child.line, child.col), mode)
         json.array_push(arr, entry)
+    return arr
+
+## SymbolInformation entries for the top-level fn, struct, enum, and
+## interface declarations across every file the last analysis walked —
+## the analyzed document and each module it imported, transitively.
+## the query filters names by case-insensitive (ascii) substring; ""
+## matches everything. capped at 200 entries.
+pub fn workspace_symbols(query: String) -> Int:
+    arr := json.make_array()
+    if analyzed_root < 0:
+        return arr
+    mode := get_position_encoding()
+    needle := query.to_lower()
+    mut roots: List[Int] := [analyzed_root]
+    for imp_root in analyzed_import_roots:
+        roots.push(imp_root)
+    mut emitted := 0
+    for root_idx in roots:
+        root := get_node(root_idx)
+        for child_idx in root.children:
+            if emitted >= MAX_WORKSPACE_SYMBOLS:
+                continue
+            decl_idx := unwrap_pub(child_idx)
+            child := get_node(decl_idx)
+            kind_num := symbol_kind_number(child.kind)
+            if kind_num == 0:
+                continue
+            name := bare_symbol_name(child.value)
+            if needle != "" and not name.to_lower().contains(needle):
+                continue
+            path := file_for_node(decl_idx)
+            if path == "":
+                continue
+            text := dr_read_source(path) catch ""
+            entry := symbol_information_json(path_to_uri(path), text, child.kind, kind_num, name, PithPos(child.line, child.col), mode)
+            json.array_push(arr, entry)
+            emitted = emitted + 1
+    return arr
+
+# ---------------------------------------------------------------
+# code actions
+# ---------------------------------------------------------------
+
+# a Position json object from a compiler position.
+fn position_json(text: String, line: Int, col: Int, mode: String) -> Int:
+    at := line_col_to_lsp_pos(text, line, col, mode)
+    obj := json.make_object()
+    json.object_set(obj, "line", json.make_int(at.line))
+    json.object_set(obj, "character", json.make_int(at.character))
+    return obj
+
+# the fix text of the stored diagnostic matching a client diagnostic:
+# same code, same start position once the stored line/col converts to
+# the negotiated encoding. "" when nothing matches — the client may
+# hold diagnostics from a text this analysis no longer describes.
+fn fix_for_client_diagnostic(d: Int, stored: List[Diagnostic], text: String, mode: String) -> String:
+    code := json.object_get_string_or(d, "code", "")
+    if code == "":
+        return ""
+    range := json.object_get(d, "range")
+    if range < 0:
+        return ""
+    start := json.object_get(range, "start")
+    if start < 0:
+        return ""
+    line0 := json.object_get_int_or(start, "line", 0 - 1)
+    character := json.object_get_int_or(start, "character", 0 - 1)
+    mut fix := ""
+    for s in stored:
+        if fix == "" and s.code == code and s.fix != "":
+            at := line_col_to_lsp_pos(text, s.line, s.col, mode)
+            if at.line == line0 and at.character == character:
+                fix = s.fix
+    return fix
+
+# the quickfix action applying E216's "declare with 'mut'" suggestion:
+# a WorkspaceEdit inserting "mut " in front of the binding the checker
+# recorded for the name the fix carries. -1 when the binding cannot be
+# pinned to an identifier in this document — an advisory title without
+# an edit would be a button that does nothing.
+fn mut_quickfix_action(uri: String, text: String, mode: String, fix: String, d: Int) -> Int:
+    name := fix.substring(MUT_FIX_PREFIX.len(), fix.len())
+    binding := binding_by_name(name)
+    if binding.1 < 0:
+        return 0 - 1
+    if file_for_node(binding.1) != uri_to_path(uri):
+        return 0 - 1
+    # a binding node sits at its initializer's last token; the name is
+    # found by scanning the declaring line, as rename does
+    decl := get_node(binding.1)
+    col := word_col_in_line(text_line(text, decl.line - 1), name)
+    if col == 0:
+        return 0 - 1
+    range := json.make_object()
+    json.object_set(range, "start", position_json(text, decl.line, col, mode))
+    json.object_set(range, "end", position_json(text, decl.line, col, mode))
+    edit := json.make_object()
+    json.object_set(edit, "range", range)
+    json.object_set(edit, "newText", json.make_string("mut "))
+    edits := json.make_array()
+    json.array_push(edits, edit)
+    changes := json.make_object()
+    json.object_set(changes, uri, edits)
+    workspace_edit := json.make_object()
+    json.object_set(workspace_edit, "changes", changes)
+    diags := json.make_array()
+    json.array_push(diags, d)
+    action := json.make_object()
+    json.object_set(action, "title", json.make_string(fix))
+    json.object_set(action, "kind", json.make_string("quickfix"))
+    json.object_set(action, "diagnostics", diags)
+    json.object_set(action, "edit", workspace_edit)
+    return action
+
+## quickfix actions for the diagnostics a codeAction request carries,
+## as a json array handle. only mechanically applicable fixes become
+## actions — today that is E216's "declare with 'mut'". every other
+## fix the compiler attaches is advice in prose, which stays in the
+## diagnostic message instead of becoming an action with no edit.
+pub fn code_actions(uri: String, params: Int) -> Int:
+    arr := json.make_array()
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    mode := get_position_encoding()
+    context := json.object_get(params, "context")
+    if context < 0:
+        return arr
+    diags := json.object_get(context, "diagnostics")
+    if diags < 0 or json.type_of(diags) != "array":
+        return arr
+    mut stored: List[Diagnostic] := []
+    if last_diags_by_path.contains_key(path):
+        stored = last_diags_by_path[path]
+    mut i := 0
+    while i < json.array_len(diags):
+        d := json.array_get(diags, i)
+        fix := fix_for_client_diagnostic(d, stored, text, mode)
+        if fix.starts_with(MUT_FIX_PREFIX):
+            action := mut_quickfix_action(uri, text, mode, fix, d)
+            if action >= 0:
+                json.array_push(arr, action)
+        i = i + 1
     return arr
 
 # ---------------------------------------------------------------

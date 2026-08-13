@@ -1,0 +1,38 @@
+# a fresh optional written straight into a call argument — `take(mk(i))` —
+# is a transferred shell nothing else names. the caller used to strand its
+# 64-byte box on every call, because the owned-argument release keeps the
+# tuple kind excluded (it cannot tell a wrapper from a tuple literal). the
+# emitter now proves through the callee's body that the caller stays sole
+# owner and releases the shell — and, for a probing callee, the payload —
+# through the cascade helper right after the call returns.
+import leakprobe as probe
+
+fn mk_int(i: Int) -> Int?:
+    if i % 7 == 0:
+        return none
+    return i
+
+fn take_int(v: Int?) -> Int:
+    return v.unwrap_or(0)
+
+fn mk_str(i: Int) -> String?:
+    if i % 7 == 0:
+        return none
+    return "value-{i}-payload"
+
+fn peek_str(v: String?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+fn main():
+    n := probe.rounds()
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        acc = acc + take_int(mk_int(i))
+        acc = acc + peek_str(mk_str(i))
+        i = i + 1
+    print("{probe.peak_kb()}")
+    if acc < 0:
+        print("impossible")

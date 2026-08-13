@@ -1,0 +1,46 @@
+# a fresh optional in argument position is released after the call when the
+# callee provably borrows it. these cases pin the behavior on both branches:
+# the payload must still be intact for the callee (no over-release), the
+# probing callee qualifies, and the extracting callee keeps ownership of the
+# payload it hands out.
+
+fn mk(i: Int) -> String?:
+    if i == 0:
+        return none
+    return "payload-{i}"
+
+fn probe_only(v: String?) -> String:
+    if v == none:
+        return "none"
+    return "some"
+
+fn extract(v: String?) -> String:
+    return v.unwrap_or("fallback")
+
+fn mk_int(i: Int) -> Int?:
+    if i == 0:
+        return none
+    return i * 10
+
+fn take_int(v: Int?) -> Int:
+    return v.unwrap_or(0 - 1)
+
+fn main():
+    print(probe_only(mk(0)))
+    print(probe_only(mk(3)))
+    print(extract(mk(0)))
+    print(extract(mk(5)))
+    print("{take_int(mk_int(0))}")
+    print("{take_int(mk_int(4))}")
+    # the same shapes in a loop: an over-release shows up as a recycled
+    # handle carrying someone else's data, so repetition is the point
+    mut hits := 0
+    mut i := 0
+    while i < 1000:
+        if probe_only(mk(i)) == "some":
+            hits = hits + 1
+        if extract(mk(i)).starts_with("payload-"):
+            hits = hits + 1
+        hits = hits + take_int(mk_int(i))
+        i = i + 1
+    print("hits={hits}")

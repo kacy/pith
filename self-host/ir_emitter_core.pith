@@ -1580,6 +1580,14 @@ fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
     return emit_name == "map_get_default" or emit_name == "map_get_default_ikey"
 
 fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int]):
+    # a named argument may land in any declared position, so a positional
+    # index is only handed to the fresh-optional walk when no named
+    # arguments could have shifted it
+    mut has_named := false
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "arg" and cn.value.len() > 0:
+            has_named = true
     mut reg_i := 0
     for child, i in node.children:
         if i < start_idx:
@@ -1587,13 +1595,17 @@ fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int])
         if reg_i >= arg_regs.len():
             return
         mut expr_idx := child
+        mut arg_name := ""
         cn := get_node(child)
         if cn.kind == "arg":
             if cn.children.len() == 0:
                 continue
+            arg_name = cn.value
             expr_idx = cn.children[0]
         if ir_arg_release_is_skipped(expr_idx) == false:
             ir_release_owned_string_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
+            if arg_name.len() > 0 or not has_named:
+                ir_release_fresh_optional_arg(node, reg_i, arg_name, expr_idx, arg_regs[reg_i])
         reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
@@ -2741,6 +2753,46 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
     if arg_kind == "struct" or arg_kind == "closure":
         return true
     return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
+
+# a fresh optional written straight into a call argument — `take(mk(i))` —
+# is a transferred shell nothing else names, and it used to strand its
+# 64-byte box on every call. the general release above must keep "tuple"
+# excluded because the kind alone cannot tell a wrapper from a tuple
+# literal, but when the argument expression is itself a call the register
+# is a wrapper the caller alone owns, and the same body walk that
+# qualifies a named tuple local's call argument can prove the callee
+# leaves the caller sole owner. a qualifying argument releases through
+# the cascade helper — live payload first, then the shell — right after
+# the call returns; anything the walk cannot prove keeps the leak, which
+# can never free a live value.
+#
+# extractions inside the callee are the one wrinkle: the optional
+# unwrap_or transfers the borrowed shell's payload count out, so a callee
+# that extracts disqualifies an rc-payload optional — but a payload with
+# no rc kind has no count to move, so extraction is harmless there and
+# the walk runs with its extraction clauses open. results stay excluded
+# entirely for now: they ride a different return abi in places, and the
+# measured leak is the optional shape.
+fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int):
+    en := get_node(expr_idx)
+    if en.kind != "call" and en.kind != "method_call":
+        return
+    # inside generic or specialized bodies the checked types are suppressed
+    # and a wrong answer here frees a register that is not a shell
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return
+    info := get_type_info(tid)
+    if info.kind != "optional":
+        return
+    sig := ir_tuple_cascade_signature(tid)
+    if not ir_tuple_call_arg_is_borrow(node, arg_pos, arg_name, sig == "00"):
+        return
+    if not ir_tuple_cascade_sigs.contains(sig):
+        ir_tuple_cascade_sigs.push(sig)
+    ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", reg)
 
 # true for call and method-call results whose checked or inferred type is
 # string, outside generic bodies where the types cannot be trusted.

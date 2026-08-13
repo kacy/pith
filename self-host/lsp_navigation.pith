@@ -87,8 +87,40 @@ fn decl_site(decl_idx: Int) -> Site:
 # cursor. call-node entries participate like any other key — a call
 # node sits at its last token, so the cursor resolves a call from its
 # closing token onward. -1 when the line holds no use.
-fn use_node_at(path: String, pos: PithPos) -> Int:
+# the identifier the cursor sits on, or "" when it sits on anything
+# else. pos_col is the 1-based byte column within the line.
+fn cursor_word(line_text: String, pos_col: Int) -> String:
+    mut idx := pos_col - 1
+    if idx >= line_text.len():
+        return ""
+    if not is_ident_byte(ord(line_text[idx])):
+        return ""
+    mut start := idx
+    while start > 0 and is_ident_byte(ord(line_text[start - 1])):
+        start = start - 1
+    mut end := idx + 1
+    while end < line_text.len() and is_ident_byte(ord(line_text[end])):
+        end = end + 1
+    return line_text.substring(start, end)
+
+fn use_node_at(path: String, pos: PithPos, word: String) -> Int:
     defs := get_definition_of()
+    # first choice: a same-line entry whose target declaration is named
+    # exactly what the cursor sits on. this is what makes the cursor on
+    # a method name resolve the method — its use-def entry is keyed on
+    # the call node at the closing token, to the right of the cursor,
+    # while the receiver's entry sits to the left and used to win.
+    if word != "":
+        mut named := 0 - 1
+        for use_idx in defs.keys():
+            if named < 0:
+                node := get_node(use_idx)
+                if node.line == pos.line and file_for_node(use_idx) == path:
+                    if bare_symbol_name(get_node(defs[use_idx]).value) == word:
+                        named = use_idx
+        if named >= 0:
+            return named
+    # fallback: the entry starting closest before the cursor on its line
     mut best := 0 - 1
     mut best_col := 0 - 1
     for use_idx in defs.keys():
@@ -112,7 +144,8 @@ pub fn definition_location(uri: String, line0: Int, character: Int) -> Int:
     path := uri_to_path(uri)
     text := document_text(uri)
     pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
-    use_idx := use_node_at(path, pos)
+    word := cursor_word(text_line(text, pos.line - 1), pos.col)
+    use_idx := use_node_at(path, pos, word)
     if use_idx < 0:
         return 0 - 1
     defs := get_definition_of()
@@ -129,8 +162,8 @@ pub fn definition_location(uri: String, line0: Int, character: Int) -> Int:
 # cursor when there is one, otherwise a declaration whose scanned
 # declaration line is the cursor's line (the cursor sits on the
 # declaration itself). -1 when neither matches.
-fn decl_node_at(path: String, pos: PithPos) -> Int:
-    use_idx := use_node_at(path, pos)
+fn decl_node_at(path: String, pos: PithPos, word: String) -> Int:
+    use_idx := use_node_at(path, pos, word)
     defs := get_definition_of()
     if use_idx >= 0:
         return defs[use_idx]
@@ -172,7 +205,8 @@ pub fn references_locations(uri: String, line0: Int, character: Int, include_dec
     path := uri_to_path(uri)
     text := document_text(uri)
     pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
-    decl_idx := decl_node_at(path, pos)
+    word := cursor_word(text_line(text, pos.line - 1), pos.col)
+    decl_idx := decl_node_at(path, pos, word)
     if decl_idx < 0:
         return arr
     defs := get_definition_of()

@@ -17,6 +17,7 @@ from errors import Diagnostic
 from lexer import lex_all
 from formatter import fmt_source
 from lsp_state import PithPos, uri_to_path, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
+from scope import all_binding_names, all_binding_types
 import std.json as json
 import std.lsp.protocol as protocol
 
@@ -179,12 +180,62 @@ pub fn ensure_analyzed(uri: String) -> List[String]:
 ## the hover result for a position as a json handle, or -1 for null.
 ## finds the typed expression node starting closest before the position
 ## on its line and reports the checker's type for it.
+# true for the bytes an identifier is made of
+fn is_ident_byte(b: Int) -> Bool:
+    if b >= 97 and b <= 122:
+        return true
+    if b >= 65 and b <= 90:
+        return true
+    if b >= 48 and b <= 57:
+        return true
+    return b == 95
+
+# the identifier the cursor sits on, or "" when it sits on anything
+# else. pos_col is the 1-based byte column within the line.
+fn word_at(line_text: String, pos_col: Int) -> String:
+    mut idx := pos_col - 1
+    if idx >= line_text.len():
+        return ""
+    if not is_ident_byte(ord(line_text[idx])):
+        return ""
+    mut start := idx
+    while start > 0 and is_ident_byte(ord(line_text[start - 1])):
+        start = start - 1
+    mut end := idx + 1
+    while end < line_text.len() and is_ident_byte(ord(line_text[end])):
+        end = end + 1
+    return line_text.substring(start, end)
+
+# the type of the named binding from the last run, walking the arena
+# backwards so an inner shadowing binding wins over an outer one.
+# -1 when the name is unknown.
+fn binding_type_by_name(name: String) -> Int:
+    if name == "":
+        return 0 - 1
+    names := all_binding_names()
+    types := all_binding_types()
+    mut i := names.len() - 1
+    while i >= 0:
+        if names[i] == name:
+            return types[i]
+        i = i - 1
+    return 0 - 1
+
+fn hover_body(value: String) -> Int:
+    contents := json.make_object()
+    json.object_set(contents, "kind", json.make_string("plaintext"))
+    json.object_set(contents, "value", json.make_string(value))
+    result := json.make_object()
+    json.object_set(result, "contents", contents)
+    return result
+
 pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
     if not analyzed_checked:
         return 0 - 1
     path := uri_to_path(uri)
     text := document_text(uri)
     pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    word := word_at(text_line(text, pos.line - 1), pos.col)
     mut best_idx := 0 - 1
     mut best_col := 0 - 1
     total := node_count()
@@ -201,17 +252,26 @@ pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
                     best_idx = i
                     best_col = node.col
         i = i + 1
-    if best_idx < 0:
-        return 0 - 1
-    name := get_type_name(c_get_expr_type(best_idx))
-    if name == "" or name == "<error>":
-        return 0 - 1
-    contents := json.make_object()
-    json.object_set(contents, "kind", json.make_string("plaintext"))
-    json.object_set(contents, "value", json.make_string(name))
-    result := json.make_object()
-    json.object_set(result, "contents", contents)
-    return result
+    mut name := ""
+    if best_idx >= 0:
+        name = get_type_name(c_get_expr_type(best_idx))
+    # the expression walk misses the commonest hover there is — a name
+    # on its declaration line, whose binding node sits at the line's
+    # last token — and answers "Void" for statement-level punctuation.
+    # fall back to the identifier under the cursor and the binding
+    # tables from the last run.
+    if name == "" or name == "<error>" or name == "Void":
+        fallback_tid := binding_type_by_name(word)
+        if fallback_tid < 0:
+            return 0 - 1
+        name = get_type_name(fallback_tid)
+        if name == "" or name == "<error>":
+            return 0 - 1
+    # "name: Type" when the cursor is on an identifier; a literal or
+    # an operator hovers as its bare type
+    if word != "":
+        return hover_body(word + ": " + name)
+    return hover_body(name)
 
 # ---------------------------------------------------------------
 # document symbols

@@ -74,3 +74,20 @@ see `tooling/editors/vscode/README.md` for details.
 - if nothing attaches, check that the `pith` binary is on the PATH of
   the editor process — gui editors often launch with a shorter PATH
   than your shell.
+
+## syntax highlighting in neovim
+
+the textmate grammar serves vs code and github; neovim uses a classic
+vim syntax file instead, shipped in `tooling/editors/nvim/` (with an
+ftdetect rule, so `.pith` files are recognized without any filetype
+configuration). point your runtimepath at it:
+
+```lua
+vim.opt.runtimepath:append("/path/to/repo/tooling/editors/nvim")
+```
+
+keywords, builtin and pascal-case types, strings with interpolation,
+numbers in every base, and comments highlight; the grammar in
+tooling/highlighting stays the source of truth, so grow both when the
+language grows a keyword. the language server's semantic tokens will
+later layer checker-aware highlighting on top of this base.

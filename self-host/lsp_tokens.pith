@@ -1,0 +1,498 @@
+# lsp_tokens.pith — semantic tokens, signature help, and inlay hints
+#
+# three presentation features over two sources of truth. semantic
+# tokens re-lex the document alone — no checker state — and classify
+# each lexeme from its token kind, so highlighting works even while the
+# text does not parse. signature help and inlay hints read the compiler
+# state the last front-end run left behind, the same way completion
+# does: the binding tables name every function and local the run
+# defined, and the type table renders their types.
+#
+# positions follow the house rules: the lexer speaks 1-based lines and
+# 1-based byte columns, the protocol speaks 0-based lines and utf-16
+# (or utf-8) characters, and every conversion goes through lsp_state's
+# helpers — here applied per line, so a full-document scan stays linear
+# in the text.
+
+from lexer import lex_all
+from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
+from driver import file_for_node, dr_read_source
+from types import get_type_name, get_type_info
+from ast import get_node
+from lsp_state import uri_to_path, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
+from lsp_features import analysis_is_checked, find_decl_position
+import std.json as json
+
+# ---------------------------------------------------------------
+# semantic tokens
+# ---------------------------------------------------------------
+
+# legend indexes; the list below and these constants must stay aligned.
+TOKEN_TYPE_KEYWORD := 0
+TOKEN_TYPE_STRING := 1
+TOKEN_TYPE_NUMBER := 2
+TOKEN_TYPE_COMMENT := 3
+TOKEN_TYPE_FUNCTION := 4
+TOKEN_TYPE_TYPE := 5
+TOKEN_TYPE_VARIABLE := 6
+TOKEN_TYPE_OPERATOR := 7
+
+# lexer kinds that highlight as operators, matched the way the lexer
+# matches its keyword list.
+OPERATOR_KINDS := ",plus,minus,star,slash,percent,eq,eq_eq,bang,bang_eq,less,less_eq,greater,greater_eq,arrow,fat_arrow,colon_eq,plus_eq,minus_eq,star_eq,slash_eq,question,dotdot,dotdoteq,"
+
+## the semantic token legend in index order. the initialize capability
+## advertises exactly this list, so the classifier and the client's
+## theme agree on what each index means.
+pub fn semantic_token_legend() -> List[String]:
+    return ["keyword", "string", "number", "comment", "function", "type", "variable", "operator"]
+
+fn is_ident_byte(b: Int) -> Bool:
+    if b >= 97 and b <= 122:
+        return true
+    if b >= 65 and b <= 90:
+        return true
+    if b >= 48 and b <= 57:
+        return true
+    return b == 95
+
+# the legend index for one lexer token, or -1 for a token that does not
+# highlight: layout, punctuation, and errors. an identifier is a type
+# when it starts uppercase, a function when a "(" follows it directly,
+# and a variable otherwise.
+fn classify_token(kind: String, value: String, line_text: String, col: Int, len: Int) -> Int:
+    if kind.starts_with("kw_"):
+        return TOKEN_TYPE_KEYWORD
+    if kind == "string_lit" or kind == "string_start":
+        return TOKEN_TYPE_STRING
+    if kind == "int_lit" or kind == "float_lit":
+        return TOKEN_TYPE_NUMBER
+    if kind == "comment":
+        return TOKEN_TYPE_COMMENT
+    if kind == "identifier":
+        first := ord(value[0])
+        if first >= 65 and first <= 90:
+            return TOKEN_TYPE_TYPE
+        after := col - 1 + len
+        if after < line_text.len() and ord(line_text[after]) == 40:
+            return TOKEN_TYPE_FUNCTION
+        return TOKEN_TYPE_VARIABLE
+    if OPERATOR_KINDS.contains("," + kind + ","):
+        return TOKEN_TYPE_OPERATOR
+    return 0 - 1
+
+# the document split into lines once, so per-token position conversion
+# works on the token's line instead of rescanning the whole text.
+fn split_lines(text: String) -> List[String]:
+    mut lines: List[String] := []
+    mut start := 0
+    mut i := 0
+    while i < text.len():
+        if ord(text[i]) == 10:
+            lines.push(text.substring(start, i))
+            start = i + 1
+        i = i + 1
+    lines.push(text.substring(start, text.len()))
+    return lines
+
+## the full semantic token scan of a document as a json handle:
+## {"data": [...]} in the lsp delta encoding, five ints per token —
+## [deltaLine, deltaStartChar, length, tokenTypeIndex, modifierBits] —
+## with lengths and characters in the negotiated encoding's units.
+## lexer-based on purpose: highlighting keeps working mid-edit, when
+## the text would not parse. an interpolated string highlights as one
+## string token spanning the whole literal.
+pub fn semantic_tokens_full(uri: String) -> Int:
+    text := document_text(uri)
+    mode := get_position_encoding()
+    lines := split_lines(text)
+
+    # every classifiable lexer token, in source order. synthesized
+    # tokens (indent, newline, queued interpolation pieces) carry a
+    # zero length and drop out here.
+    mut e_lines: List[Int] := []
+    mut e_cols: List[Int] := []
+    mut e_lens: List[Int] := []
+    mut e_types: List[Int] := []
+    mut lexed_lines: Map[Int, Bool] := {}
+    for tok in lex_all(text):
+        line0 := tok.current_line - 1
+        if line0 < 0 or line0 >= lines.len():
+            continue
+        if tok.kind != "eof":
+            lexed_lines.insert(line0, true)
+        if tok.len <= 0 or tok.value.len() == 0:
+            continue
+        type_idx := classify_token(tok.kind, tok.value, lines[line0], tok.current_column, tok.len)
+        if type_idx < 0:
+            continue
+        e_lines.push(tok.current_line)
+        e_cols.push(tok.current_column)
+        e_lens.push(tok.len)
+        e_types.push(type_idx)
+
+    # the lexer treats a line holding only a comment as blank and skips
+    # it wholesale, so those comments are recovered with a direct scan.
+    # a line the lexer produced any token for is left alone — its
+    # trailing comment already came through.
+    mut c_lines: List[Int] := []
+    mut c_cols: List[Int] := []
+    mut c_lens: List[Int] := []
+    mut scan0 := 0
+    while scan0 < lines.len():
+        if not lexed_lines.contains_key(scan0):
+            lt := lines[scan0]
+            mut first := 0
+            while first < lt.len() and (ord(lt[first]) == 32 or ord(lt[first]) == 9):
+                first = first + 1
+            if first < lt.len() and ord(lt[first]) == 35:
+                c_lines.push(scan0 + 1)
+                c_cols.push(first + 1)
+                c_lens.push(lt.len() - first)
+        scan0 = scan0 + 1
+
+    # merge the two position-sorted runs and delta-encode. a recovered
+    # comment line never carries lexer tokens, so plain line order is a
+    # total order across the runs.
+    data := json.make_array()
+    mut prev_line0 := 0
+    mut prev_char := 0
+    mut a := 0
+    mut b := 0
+    while a < e_lines.len() or b < c_lines.len():
+        mut take_comment := a >= e_lines.len()
+        if not take_comment and b < c_lines.len() and c_lines[b] < e_lines[a]:
+            take_comment = true
+        mut line1 := 0
+        mut col1 := 0
+        mut span := 0
+        mut type_idx := 0
+        if take_comment:
+            line1 = c_lines[b]
+            col1 = c_cols[b]
+            span = c_lens[b]
+            type_idx = TOKEN_TYPE_COMMENT
+            b = b + 1
+        else:
+            line1 = e_lines[a]
+            col1 = e_cols[a]
+            span = e_lens[a]
+            type_idx = e_types[a]
+            a = a + 1
+        lt := lines[line1 - 1]
+        start := line_col_to_lsp_pos(lt, 1, col1, mode)
+        finish := line_col_to_lsp_pos(lt, 1, col1 + span, mode)
+        units := finish.character - start.character
+        if units <= 0:
+            continue
+        line0 := line1 - 1
+        mut delta_line := line0 - prev_line0
+        mut delta_char := start.character
+        if delta_line == 0:
+            delta_char = start.character - prev_char
+        json.array_push(data, json.make_int(delta_line))
+        json.array_push(data, json.make_int(delta_char))
+        json.array_push(data, json.make_int(units))
+        json.array_push(data, json.make_int(type_idx))
+        json.array_push(data, json.make_int(0))
+        prev_line0 = line0
+        prev_char = start.character
+    result := json.make_object()
+    json.object_set(result, "data", data)
+    return result
+
+# ---------------------------------------------------------------
+# signature help
+# ---------------------------------------------------------------
+
+# where the innermost unclosed "(" before the cursor sits on the line,
+# and how many top-level commas follow it: offset is a 0-based byte
+# offset, or -1 when the cursor is not inside an argument list.
+struct CallSite:
+    offset: Int
+    commas: Int
+
+# scan the line's bytes up to the cursor, tracking open parens and
+# brackets as frames with a comma count each. string literals are
+# skipped crudely — quotes toggle, a backslash escapes — and a "#"
+# outside a string ends the code portion of the line.
+fn call_site_before(line_text: String, cursor: Int) -> CallSite:
+    mut kinds: List[Int] := []
+    mut offsets: List[Int] := []
+    mut commas: List[Int] := []
+    mut in_string := false
+    mut done := false
+    mut i := 0
+    while i < cursor and not done:
+        c := ord(line_text[i])
+        if in_string:
+            if c == 92 and i + 1 < cursor:
+                i = i + 1
+            elif c == 34:
+                in_string = false
+        elif c == 34:
+            in_string = true
+        elif c == 35:
+            done = true
+        elif c == 40 or c == 91:
+            kinds.push(c)
+            offsets.push(i)
+            commas.push(0)
+        elif c == 41 or c == 93:
+            if kinds.len() > 0:
+                kinds.remove(kinds.len() - 1)
+                offsets.remove(offsets.len() - 1)
+                commas.remove(commas.len() - 1)
+        elif c == 44:
+            if commas.len() > 0:
+                commas[commas.len() - 1] = commas[commas.len() - 1] + 1
+        i = i + 1
+    mut f := kinds.len() - 1
+    while f >= 0:
+        if kinds[f] == 40:
+            return CallSite(offsets[f], commas[f])
+        f = f - 1
+    return CallSite(0 - 1, 0)
+
+# the identifier ending immediately before a byte offset, or "".
+fn ident_before(line_text: String, end: Int) -> String:
+    mut start := end
+    while start > 0 and is_ident_byte(ord(line_text[start - 1])):
+        start = start - 1
+    return line_text.substring(start, end)
+
+# the type and declaration node of the named function binding from the
+# last run, walking backwards so an inner binding shadows an outer one.
+# (-1, -1) when the name is not bound to a function.
+fn function_binding(name: String) -> (Int, Int):
+    if name == "":
+        return (0 - 1, 0 - 1)
+    names := all_binding_names()
+    types := all_binding_types()
+    decls := all_binding_decl_nodes()
+    mut i := names.len() - 1
+    while i >= 0:
+        if names[i] == name and get_type_info(types[i]).kind == "function":
+            return (types[i], decls[i])
+        i = i - 1
+    return (0 - 1, 0 - 1)
+
+# the byte offset of the ")" closing the first "(" in a label, or -1
+# when the label holds no complete argument list.
+fn matched_close(label: String) -> Int:
+    open := label.index_of("(")
+    if open < 0:
+        return 0 - 1
+    mut depth := 0
+    mut i := open
+    while i < label.len():
+        c := ord(label[i])
+        if c == 40 or c == 91:
+            depth = depth + 1
+        elif c == 41 or c == 93:
+            depth = depth - 1
+            if depth == 0 and c == 41:
+                return i
+        i = i + 1
+    return 0 - 1
+
+# the declaration's own source line rendered as a signature label,
+# "name(params) -> Ret": the line is found the same way documentSymbol
+# finds it, cut at the name, and stripped of its trailing colon. ""
+# when the line cannot be found or does not close its argument list
+# (a declaration spanning several lines).
+fn decl_signature_label(decl_idx: Int, name: String) -> String:
+    if decl_idx < 0:
+        return ""
+    decl := get_node(decl_idx)
+    if decl.kind != "fn_decl":
+        return ""
+    file := file_for_node(decl_idx)
+    if file == "":
+        return ""
+    source := dr_read_source(file) catch ""
+    if source == "":
+        return ""
+    at := find_decl_position(source, decl.kind, name)
+    if at.line <= 0:
+        return ""
+    line := text_line(source, at.line - 1)
+    mut label := line.substring(at.col - 1, line.len()).trim()
+    if label.ends_with(":"):
+        label = label.substring(0, label.len() - 1).trim()
+    if matched_close(label) < 0:
+        return ""
+    return label
+
+# a signature label rendered from the function's type, used when the
+# declaration line is unavailable: parameter types only, no names.
+fn type_signature_label(name: String, tid: Int) -> String:
+    info := get_type_info(tid)
+    mut label := name + "("
+    mut i := 0
+    while i < info.param_types.len():
+        if i > 0:
+            label = label + ", "
+        label = label + get_type_name(info.param_types[i])
+        i = i + 1
+    label = label + ")"
+    ret := get_type_name(info.return_type)
+    if ret != "" and ret != "Void":
+        label = label + " -> " + ret
+    return label
+
+# the parameter labels inside a signature label's argument list, split
+# on top-level commas.
+fn signature_parameters(label: String) -> List[String]:
+    mut params: List[String] := []
+    open := label.index_of("(")
+    close := matched_close(label)
+    if open < 0 or close < 0:
+        return params
+    mut depth := 1
+    mut start := open + 1
+    mut i := open + 1
+    while i < close:
+        c := ord(label[i])
+        if c == 40 or c == 91:
+            depth = depth + 1
+        elif c == 41 or c == 93:
+            depth = depth - 1
+        elif c == 44 and depth == 1:
+            piece := label.substring(start, i).trim()
+            if piece != "":
+                params.push(piece)
+            start = i + 1
+        i = i + 1
+    last := label.substring(start, close).trim()
+    if last != "":
+        params.push(last)
+    return params
+
+## the signature help for the call around a position as a json handle,
+## or -1 for null. the innermost unclosed "(" on the cursor's line
+## names the callee; top-level commas before the cursor pick the active
+## parameter. like completion, this reads the last completed analysis
+## on purpose — the cursor usually just gained a "(" and the text would
+## not parse.
+pub fn signature_help(uri: String, line0: Int, character: Int) -> Int:
+    if not analysis_is_checked():
+        return 0 - 1
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    line_text := text_line(text, pos.line - 1)
+    mut cursor := pos.col - 1
+    if cursor > line_text.len():
+        cursor = line_text.len()
+    site := call_site_before(line_text, cursor)
+    if site.offset < 0:
+        return 0 - 1
+    name := ident_before(line_text, site.offset)
+    binding := function_binding(name)
+    if binding.0 < 0:
+        return 0 - 1
+    mut label := decl_signature_label(binding.1, name)
+    if label == "":
+        label = type_signature_label(name, binding.0)
+    params := signature_parameters(label)
+    params_arr := json.make_array()
+    for p in params:
+        param := json.make_object()
+        json.object_set(param, "label", json.make_string(p))
+        json.array_push(params_arr, param)
+    sig := json.make_object()
+    json.object_set(sig, "label", json.make_string(label))
+    json.object_set(sig, "parameters", params_arr)
+    sigs := json.make_array()
+    json.array_push(sigs, sig)
+    mut active := site.commas
+    if params.len() > 0 and active >= params.len():
+        active = params.len() - 1
+    result := json.make_object()
+    json.object_set(result, "signatures", sigs)
+    json.object_set(result, "activeSignature", json.make_int(0))
+    json.object_set(result, "activeParameter", json.make_int(active))
+    return result
+
+# ---------------------------------------------------------------
+# inlay hints
+# ---------------------------------------------------------------
+
+# the byte offset just past the binding name on a line where the name
+# is followed by ":=" (spaces allowed) at an identifier boundary — the
+# spot a type hint belongs. -1 when the line does not bind the name
+# exactly once that way, so an ambiguous line gets no hint rather than
+# a guessed one.
+fn binding_name_end(line_text: String, name: String) -> Int:
+    if name == "":
+        return 0 - 1
+    mut found := 0 - 1
+    mut count := 0
+    mut i := 0
+    while i + name.len() <= line_text.len():
+        if line_text.substring(i, i + name.len()) == name:
+            boundary_before := i == 0 or not is_ident_byte(ord(line_text[i - 1]))
+            mut j := i + name.len()
+            boundary_after := j >= line_text.len() or not is_ident_byte(ord(line_text[j]))
+            if boundary_before and boundary_after:
+                while j < line_text.len() and ord(line_text[j]) == 32:
+                    j = j + 1
+                if j + 1 < line_text.len() and ord(line_text[j]) == 58 and ord(line_text[j + 1]) == 61:
+                    found = i + name.len()
+                    count = count + 1
+        i = i + 1
+    if count != 1:
+        return 0 - 1
+    return found
+
+# hint types that carry no information worth pinning to the line: the
+# empty and error renderings, statements, and the bare "fn" a function
+# type renders as.
+fn hint_type_is_useless(type_name: String) -> Bool:
+    return type_name == "" or type_name == "Void" or type_name == "fn" or type_name == "<error>"
+
+## the inlay hints for a line range as a json array handle: one type
+## hint — label ": Type", kind 1 — right after the name of each
+## `x := expr` binding in the range whose declaration the last run
+## recorded for this file. a binding whose name cannot be matched to
+## exactly one `name :=` on its declaration line is skipped rather than
+## guessed at, which also skips multi-line initializers.
+pub fn inlay_hints(uri: String, start_line0: Int, end_line0: Int) -> Int:
+    arr := json.make_array()
+    if not analysis_is_checked():
+        return arr
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    mode := get_position_encoding()
+    lo := start_line0 + 1
+    hi := end_line0 + 1
+    names := all_binding_names()
+    tids := all_binding_types()
+    decls := all_binding_decl_nodes()
+    mut seen: Map[String, Bool] := {}
+    mut i := 0
+    while i < names.len():
+        decl_idx := decls[i]
+        if decl_idx >= 0 and file_for_node(decl_idx) == path:
+            # a binding's declaration node is its initializer, which
+            # sits on the binding line for the common single-line case
+            node := get_node(decl_idx)
+            type_name := get_type_name(tids[i])
+            if node.line >= lo and node.line <= hi and not hint_type_is_useless(type_name):
+                line_text := text_line(text, node.line - 1)
+                end_off := binding_name_end(line_text, names[i])
+                if end_off >= 0:
+                    at := line_col_to_lsp_pos(line_text, 1, end_off + 1, mode)
+                    key := "{node.line}:{at.character}"
+                    if not seen.contains_key(key):
+                        seen.insert(key, true)
+                        position := json.make_object()
+                        json.object_set(position, "line", json.make_int(node.line - 1))
+                        json.object_set(position, "character", json.make_int(at.character))
+                        hint := json.make_object()
+                        json.object_set(hint, "position", position)
+                        json.object_set(hint, "label", json.make_string(": " + type_name))
+                        json.object_set(hint, "kind", json.make_int(1))
+                        json.array_push(arr, hint)
+        i = i + 1
+    return arr

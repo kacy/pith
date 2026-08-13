@@ -11,6 +11,24 @@ from ast import reset_arena, get_node
 from driver import init_driver, resolve_imports, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of
 from errors import Diagnostic
+import std.time as time
+
+# where the last run's wall time went, in milliseconds per phase. the
+# clock reads cost nothing next to the phases they bracket, so the split
+# is collected unconditionally; the lsp server logs it on request and
+# every other caller ignores it.
+mut timing_lex_ms := 0
+mut timing_parse_ms := 0
+mut timing_imports_ms := 0
+mut timing_check_ms := 0
+mut timing_module_count := 0
+
+## the last pipeline run's phase split, rendered for a log line:
+## reading and lexing the entry file, parsing it, resolving (which
+## lexes, parses, and reads every import), and checking the closure.
+pub fn last_timing_line() -> String:
+    total := timing_lex_ms + timing_parse_ms + timing_imports_ms + timing_check_ms
+    return "total={total}ms lex={timing_lex_ms}ms parse={timing_parse_ms}ms imports={timing_imports_ms}ms check={timing_check_ms}ms modules={timing_module_count}"
 
 ## one front-end run's result. a parse failure carries the parser's
 ## diagnostics with parse_ok false; an unresolvable or unparsable
@@ -27,10 +45,18 @@ pub struct CheckOutcome:
 ## run the whole front end for one entry file. sources are read through
 ## the driver's overlays, so a caller can check unsaved buffers.
 pub fn run_check_pipeline(path: String) -> CheckOutcome!:
+    started := time.mono_millis()
     source := dr_read_source(path)!
     tokens := lex_all(source)
+    lexed := time.mono_millis()
+    timing_lex_ms = lexed - started
     reset_arena()
     root := parse_with_file(tokens, path)
+    parsed := time.mono_millis()
+    timing_parse_ms = parsed - lexed
+    timing_imports_ms = 0
+    timing_check_ms = 0
+    timing_module_count = 1
 
     if parser_has_errors():
         mut no_imports: List[Int] := []
@@ -38,6 +64,9 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
 
     init_driver(path)
     import_roots := resolve_imports(root, path)!
+    resolved := time.mono_millis()
+    timing_imports_ms = resolved - parsed
+    timing_module_count = import_roots.len() + 1
     if driver_has_parse_errors():
         return CheckOutcome(true, false, get_driver_parse_diagnostics(), root, import_roots)
 
@@ -49,6 +78,7 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
     set_checker_module_path("")
     set_checker_file_path(path)
     diags := c_run_module(root)
+    timing_check_ms = time.mono_millis() - resolved
     return CheckOutcome(true, true, diags, root, import_roots)
 
 ## the checker's use-site -> declaration map rendered by position, one

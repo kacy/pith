@@ -16,6 +16,7 @@
 from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
 from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, formatting_edits
 from lsp_navigation import definition_location, references_locations, completion_items
+from lsp_tokens import semantic_token_legend, semantic_tokens_full, signature_help, inlay_hints
 from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
 import std.lsp.transport as transport
 import std.json as json
@@ -87,6 +88,23 @@ fn handle_initialize(m: Message):
     completion := json.make_object()
     json.object_set(completion, "triggerCharacters", triggers)
     json.object_set(caps, "completionProvider", completion)
+    legend_types := json.make_array()
+    for token_type in semantic_token_legend():
+        json.array_push(legend_types, json.make_string(token_type))
+    legend := json.make_object()
+    json.object_set(legend, "tokenTypes", legend_types)
+    json.object_set(legend, "tokenModifiers", json.make_array())
+    semantic := json.make_object()
+    json.object_set(semantic, "legend", legend)
+    json.object_set(semantic, "full", json.make_bool(true))
+    json.object_set(caps, "semanticTokensProvider", semantic)
+    sig_triggers := json.make_array()
+    json.array_push(sig_triggers, json.make_string("("))
+    json.array_push(sig_triggers, json.make_string(","))
+    signature := json.make_object()
+    json.object_set(signature, "triggerCharacters", sig_triggers)
+    json.object_set(caps, "signatureHelpProvider", signature)
+    json.object_set(caps, "inlayHintProvider", json.make_bool(true))
     info := json.make_object()
     json.object_set(info, "name", json.make_string("pith-lsp"))
     json.object_set(info, "version", json.make_string("0.1.0"))
@@ -180,6 +198,43 @@ fn handle_formatting(m: Message):
         return
     write_body(response_body(m.id, m.id_text, m.id_is_text, formatting_edits(uri)))
 
+# semantic tokens are lexer-based: no analysis needed, the overlay
+# text is re-lexed as it stands.
+fn handle_semantic_tokens(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_body(response_body(m.id, m.id_text, m.id_is_text, semantic_tokens_full(uri)))
+
+# signature help reads the last analysis like completion does: the
+# cursor usually just gained a "(" and the text would not parse.
+fn handle_signature_help(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    at := params_position(m.params)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, signature_help(uri, at.line, at.character)))
+
+fn handle_inlay_hint(m: Message):
+    uri := params_uri(m.params)
+    if not document_is_open(uri):
+        write_body(response_body(m.id, m.id_text, m.id_is_text, 0 - 1))
+        return
+    write_bodies(ensure_analyzed(uri))
+    mut start_line := 0
+    mut end_line := 0
+    range := json.object_get(m.params, "range")
+    if range >= 0:
+        start := json.object_get(range, "start")
+        if start >= 0:
+            start_line = json.object_get_int_or(start, "line", 0)
+        end := json.object_get(range, "end")
+        if end >= 0:
+            end_line = json.object_get_int_or(end, "line", 0)
+    write_body(response_body(m.id, m.id_text, m.id_is_text, inlay_hints(uri, start_line, end_line)))
+
 fn handle_request(m: Message):
     if m.method == "initialize":
         handle_initialize(m)
@@ -208,6 +263,15 @@ fn handle_request(m: Message):
         return
     if m.method == "textDocument/completion":
         handle_completion(m)
+        return
+    if m.method == "textDocument/semanticTokens/full":
+        handle_semantic_tokens(m)
+        return
+    if m.method == "textDocument/signatureHelp":
+        handle_signature_help(m)
+        return
+    if m.method == "textDocument/inlayHint":
+        handle_inlay_hint(m)
         return
     write_body(error_body(m.id, m.id_text, m.id_is_text, METHOD_NOT_FOUND, "unknown method: " + m.method))
 

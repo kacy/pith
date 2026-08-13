@@ -36,6 +36,25 @@ what `pith check` reports.
   methods are offered; anywhere else, every binding name from the last
   run plus the language keywords, filtered by the word prefix under
   the cursor. plain `{label, kind}` items, capped at 200.
+- **semantic tokens** — full-document only, lexer-based: the document
+  is re-lexed alone, so highlighting keeps working mid-edit when the
+  text does not parse. the legend is `keyword`, `string`, `number`,
+  `comment`, `function`, `type`, `variable`, `operator`, with no
+  modifiers. identifiers classify by shape: an uppercase first letter
+  is a type, a directly following `(` makes a function, anything else
+  is a variable. an interpolated string highlights as one string
+  token spanning the whole literal.
+- **signature help** — triggered on `(` and `,`. the innermost
+  unclosed `(` on the cursor's line names the callee, top-level
+  commas before the cursor pick the active parameter, and the label
+  is the declaration's own source line (`name(params) -> Ret`), with
+  one parameter entry per top-level comma. free functions and local
+  function bindings resolve; methods do not yet.
+- **inlay hints** — a `: Type` hint after the name of each `x := expr`
+  binding in the requested range, from the last run's binding tables.
+  a binding whose name cannot be matched to exactly one `name :=` on
+  its declaration line is skipped rather than guessed at, which also
+  skips multi-line initializers.
 
 ## how it works
 
@@ -63,6 +82,8 @@ the modules:
 - `self-host/lsp_features.pith` — diagnostics, hover, symbols,
   formatting
 - `self-host/lsp_navigation.pith` — definition, references, completion
+- `self-host/lsp_tokens.pith` — semantic tokens, signature help, and
+  inlay hints
 
 ## running it
 
@@ -137,3 +158,12 @@ files; eyeball every line before freezing a new expectation.
   that run are published too.
 - hover positions are approximate at expression granularity: an ast
   node records the position of the last token that formed it.
+- semantic tokens never consult the checker, so an identifier's class
+  comes from its shape alone; there is no delta or range variant, and
+  no token modifiers.
+- signature help resolves free functions and local function bindings
+  only — method calls return null — and the scan is confined to the
+  cursor's line, so a call whose `(` sits on an earlier line does not
+  resolve. a declaration spanning several lines falls back to a label
+  rendered from the function's type, which names parameter types but
+  not parameters.

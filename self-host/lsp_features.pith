@@ -9,15 +9,15 @@
 # through ensure_analyzed first.
 
 from check_pipeline import run_check_pipeline
-from driver import file_for_node
-from checker import c_get_expr_type
+from driver import file_for_node, dr_read_source
+from checker import c_get_expr_type, get_definition_of
 from types import get_type_name, TID_ERR
 from ast import get_node, node_count
 from errors import Diagnostic
 from lexer import lex_all
 from formatter import fmt_source
 from lsp_state import PithPos, uri_to_path, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
-from scope import all_binding_names, all_binding_types
+from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 import std.json as json
 import std.lsp.protocol as protocol
 
@@ -206,20 +206,72 @@ fn word_at(line_text: String, pos_col: Int) -> String:
         end = end + 1
     return line_text.substring(start, end)
 
-# the type of the named binding from the last run, walking the arena
-# backwards so an inner shadowing binding wins over an outer one.
-# -1 when the name is unknown.
-fn binding_type_by_name(name: String) -> Int:
+# the type and declaration node of the named binding from the last
+# run, walking the arena backwards so an inner shadowing binding wins
+# over an outer one. (-1, -1) when the name is unknown.
+fn binding_by_name(name: String) -> (Int, Int):
     if name == "":
-        return 0 - 1
+        return (0 - 1, 0 - 1)
     names := all_binding_names()
     types := all_binding_types()
+    decls := all_binding_decl_nodes()
     mut i := names.len() - 1
     while i >= 0:
         if names[i] == name:
-            return types[i]
+            return (types[i], decls[i])
         i = i - 1
-    return 0 - 1
+    return (0 - 1, 0 - 1)
+
+# the contiguous run of comment lines directly above the 1-based
+# declaration line, with the leading comment marker stripped — the
+# doc-comment convention the linter and doc coverage gate enforce.
+fn doc_comment_above(source: String, decl_line: Int) -> String:
+    mut collected: List[String] := []
+    mut line0 := decl_line - 2
+    mut scanning := true
+    while scanning and line0 >= 0:
+        trimmed := text_line(source, line0).trim()
+        if trimmed.len() > 0 and ord(trimmed[0]) == 35:
+            mut start := 0
+            while start < trimmed.len() and ord(trimmed[start]) == 35:
+                start = start + 1
+            if start < trimmed.len() and trimmed[start] == " ":
+                start = start + 1
+            collected.push(trimmed.substring(start, trimmed.len()))
+            line0 = line0 - 1
+        else:
+            scanning = false
+    if collected.len() == 0:
+        return ""
+    # collected bottom-up; join back in source order
+    mut out := ""
+    mut i := collected.len() - 1
+    while i >= 0:
+        if out != "":
+            out = out + chr(10)
+        out = out + collected[i]
+        i = i - 1
+    return out
+
+# the doc comment above a declaration node, read from the file that
+# declared it (through the driver's overlays, so unsaved buffers
+# count). only declaration kinds with a doc convention answer.
+fn doc_comment_for(decl_idx: Int, name: String) -> String:
+    if decl_idx < 0 or name == "":
+        return ""
+    decl := get_node(decl_idx)
+    if decl.kind != "fn_decl" and decl.kind != "struct_decl" and decl.kind != "enum_decl" and decl.kind != "interface_decl":
+        return ""
+    file := file_for_node(decl_idx)
+    if file == "":
+        return ""
+    source := dr_read_source(file) catch ""
+    if source == "":
+        return ""
+    decl_pos := find_decl_position(source, decl.kind, name)
+    if decl_pos.line <= 0:
+        return ""
+    return doc_comment_above(source, decl_pos.line)
 
 fn hover_body(value: String) -> Int:
     contents := json.make_object()
@@ -253,25 +305,47 @@ pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
                     best_col = node.col
         i = i + 1
     mut name := ""
+    mut decl_idx := 0 - 1
     if best_idx >= 0:
         name = get_type_name(c_get_expr_type(best_idx))
+        defs := get_definition_of()
+        if defs.contains_key(best_idx):
+            decl_idx = defs[best_idx]
+        if decl_idx < 0 and word != "":
+            # a qualified call's use-def entry is keyed on the call
+            # node, which sits at the closing token — not under the
+            # cursor. accept a same-line entry only when its target
+            # declaration is named exactly what the cursor sits on.
+            for use_idx in defs.keys():
+                if decl_idx < 0:
+                    use_node := get_node(use_idx)
+                    if use_node.line == pos.line and file_for_node(use_idx) == path:
+                        candidate := defs[use_idx]
+                        if get_node(candidate).value == word:
+                            decl_idx = candidate
     # the expression walk misses the commonest hover there is — a name
     # on its declaration line, whose binding node sits at the line's
     # last token — and answers "Void" for statement-level punctuation.
     # fall back to the identifier under the cursor and the binding
     # tables from the last run.
     if name == "" or name == "<error>" or name == "Void":
-        fallback_tid := binding_type_by_name(word)
-        if fallback_tid < 0:
+        fallback := binding_by_name(word)
+        if fallback.0 < 0:
             return 0 - 1
-        name = get_type_name(fallback_tid)
+        name = get_type_name(fallback.0)
         if name == "" or name == "<error>":
             return 0 - 1
+        decl_idx = fallback.1
     # "name: Type" when the cursor is on an identifier; a literal or
-    # an operator hovers as its bare type
+    # an operator hovers as its bare type. a documented declaration
+    # brings its doc comment along.
+    mut value := name
     if word != "":
-        return hover_body(word + ": " + name)
-    return hover_body(name)
+        value = word + ": " + name
+        doc := doc_comment_for(decl_idx, word)
+        if doc != "":
+            value = value + chr(10) + chr(10) + doc
+    return hover_body(value)
 
 # ---------------------------------------------------------------
 # document symbols

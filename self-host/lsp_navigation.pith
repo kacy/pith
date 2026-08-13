@@ -1,4 +1,4 @@
-# lsp_navigation.pith — definition, references, and completion
+# lsp_navigation.pith — definition, references, completion, and rename
 #
 # navigation reads the compiler state the last front-end run left
 # behind: the checker's use-site -> declaration map answers definition
@@ -21,7 +21,7 @@ from driver import file_for_node, dr_read_source
 from types import get_type_name, get_type_info, TID_ERR
 from ast import get_node, node_count
 from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
-from lsp_features import analysis_is_checked, find_decl_position, token_length_at, bare_symbol_name
+from lsp_features import analysis_is_checked, find_decl_position, token_length_at, bare_symbol_name, word_starts_at, word_col_in_line
 import std.json as json
 
 # completion responses stop growing past this many items.
@@ -43,8 +43,8 @@ struct Site:
 fn file_text(path: String) -> String:
     return dr_read_source(path) catch ""
 
-# a Location json object for a site.
-fn location_json(site: Site) -> Int:
+# a Range json object for a site, in the negotiated encoding.
+fn range_json(site: Site) -> Int:
     text := file_text(site.path)
     mode := get_position_encoding()
     start := line_col_to_lsp_pos(text, site.line, site.col, mode)
@@ -58,9 +58,13 @@ fn location_json(site: Site) -> Int:
     range := json.make_object()
     json.object_set(range, "start", start_obj)
     json.object_set(range, "end", end_obj)
+    return range
+
+# a Location json object for a site.
+fn location_json(site: Site) -> Int:
     location := json.make_object()
     json.object_set(location, "uri", json.make_string(path_to_uri(site.path)))
-    json.object_set(location, "range", range)
+    json.object_set(location, "range", range_json(site))
     return location
 
 fn is_named_decl(kind: String) -> Bool:
@@ -230,6 +234,135 @@ pub fn references_locations(uri: String, line0: Int, character: Int, include_dec
         last_key = key
         json.array_push(arr, location_json(s))
     return arr
+
+# ---------------------------------------------------------------
+# rename
+# ---------------------------------------------------------------
+
+# a valid identifier to rename to: first byte alpha or _, the rest
+# alphanumeric or _.
+fn valid_new_name(name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    first := ord(name[0])
+    if first >= 48 and first <= 57:
+        return false
+    if not is_ident_byte(first):
+        return false
+    mut i := 1
+    while i < name.len():
+        if not is_ident_byte(ord(name[i])):
+            return false
+        i = i + 1
+    return true
+
+# every site rename must edit: use sites straight from the definition
+# map plus the declaration's own identifier. a named declaration's
+# identifier comes from the same declaration-line scan documentSymbol
+# uses; a binding node sits at its initializer's last token, so its
+# identifier is found by scanning the declaring line instead. a use
+# whose recorded token is not the identifier itself — a method or
+# module call's use-def entry is keyed on the call node at the call's
+# closing token — cannot be edited, and a rename that would touch the
+# other sites anyway breaks the program silently, so the empty list
+# comes back and the whole rename is refused. the same happens when
+# the declaration's identifier cannot be pinned to a line.
+fn rename_sites(decl_idx: Int, name: String) -> List[Site]:
+    defs := get_definition_of()
+    mut sites: List[Site] := []
+    mut none_found: List[Site] := []
+    for use_idx in defs.keys():
+        if defs[use_idx] != decl_idx:
+            continue
+        node := get_node(use_idx)
+        use_path := file_for_node(use_idx)
+        line_text := text_line(file_text(use_path), node.line - 1)
+        if not word_starts_at(line_text, node.col, name):
+            return none_found
+        sites.push(Site(use_path, node.line, node.col, name.len()))
+    decl := get_node(decl_idx)
+    decl_path := file_for_node(decl_idx)
+    decl_text := file_text(decl_path)
+    if is_named_decl(decl.kind):
+        at := find_decl_position(decl_text, decl.kind, name)
+        if at.line == 0:
+            return none_found
+        sites.push(Site(decl_path, at.line, at.col, name.len()))
+    else:
+        col := word_col_in_line(text_line(decl_text, decl.line - 1), name)
+        if col == 0:
+            return none_found
+        sites.push(Site(decl_path, decl.line, col, name.len()))
+    return sites
+
+## the range of the identifier a rename would edit, as a json handle,
+## or -1 for null when the cursor is not on a renameable symbol: not on
+## an identifier, one that resolves to no known declaration (a builtin,
+## a keyword, a stray word), or one whose rename would be refused
+## because a reference site cannot be edited.
+pub fn prepare_rename_range(uri: String, line0: Int, character: Int) -> Int:
+    if not analysis_is_checked():
+        return 0 - 1
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    line_text := text_line(text, pos.line - 1)
+    word := cursor_word(line_text, pos.col)
+    if word == "":
+        return 0 - 1
+    decl_idx := decl_node_at(path, pos, word)
+    if decl_idx < 0:
+        return 0 - 1
+    if rename_sites(decl_idx, word).len() == 0:
+        return 0 - 1
+    mut start_col := pos.col
+    while start_col > 1 and is_ident_byte(ord(line_text[start_col - 2])):
+        start_col = start_col - 1
+    return range_json(Site(path, pos.line, start_col, word.len()))
+
+## the WorkspaceEdit renaming the symbol at a position to new_name, as
+## a json handle {"changes": {uri: [TextEdit...]}} with edits grouped
+## per file, or -1 for null when the cursor is not on a renameable
+## symbol or new_name is not a valid identifier. every reference edits,
+## the declaration included.
+pub fn rename_workspace_edit(uri: String, line0: Int, character: Int, new_name: String) -> Int:
+    if not analysis_is_checked():
+        return 0 - 1
+    if not valid_new_name(new_name):
+        return 0 - 1
+    path := uri_to_path(uri)
+    text := document_text(uri)
+    pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
+    word := cursor_word(text_line(text, pos.line - 1), pos.col)
+    if word == "":
+        return 0 - 1
+    decl_idx := decl_node_at(path, pos, word)
+    if decl_idx < 0:
+        return 0 - 1
+    sites := rename_sites(decl_idx, word)
+    if sites.len() == 0:
+        return 0 - 1
+    changes := json.make_object()
+    mut current_uri := ""
+    mut edits := 0 - 1
+    mut last_key := ""
+    for s in sort_sites(sites):
+        key := s.path + ":{s.line}:{s.col}"
+        if key == last_key:
+            continue
+        last_key = key
+        site_uri := path_to_uri(s.path)
+        if site_uri != current_uri:
+            edits = json.make_array()
+            json.object_set(changes, site_uri, edits)
+            current_uri = site_uri
+        edit := json.make_object()
+        json.object_set(edit, "range", range_json(s))
+        json.object_set(edit, "newText", json.make_string(new_name))
+        json.array_push(edits, edit)
+    result := json.make_object()
+    json.object_set(result, "changes", changes)
+    return result
 
 # ---------------------------------------------------------------
 # completion

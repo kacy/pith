@@ -1714,6 +1714,9 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     name := extract_binding_name(node.value)
     is_mut := binding_is_mutable(node.value)
+    if node.value.contains(" weak"):
+        check_weak_binding(node_idx, scope_id, name)
+        return
     # children: [type_expr?, value_expr]
     # if 2 children -> first is type annotation, second is value
     # if 1 child -> no annotation, child is value
@@ -1756,6 +1759,29 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
             if val_node.children.len() == 0:
                 if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
                     open_empty_literal_bindings.insert(lookup_binding_index(scope_id, name), node.children[0])
+
+# `weak name := expr` holds its struct target without keeping it alive.
+# the binding's type is the optional of the target's type — every read
+# yields the target, or none once it has been reclaimed — mirroring a
+# weak struct field (E249). the target must be a plain struct value,
+# and the binding stays immutable: a weak slot is not a variable to
+# swap, it is an edge that either still reaches its target or does not.
+fn check_weak_binding(node_idx: Int, scope_id: Int, name: String):
+    node := get_node(node_idx)
+    if node.value.contains(" mut"):
+        report_error_at(node_idx, "E261", "a weak binding cannot be 'mut'")
+    if node.children.len() == 2:
+        report_error_at(node.children[0], "E261", "a weak binding takes its type from its value; remove the annotation")
+    val_idx := node.children[node.children.len() - 1]
+    val_type := c_check_expr(val_idx, scope_id)
+    if is_error_type(val_type):
+        define_binding_at(scope_id, name, val_type, false, node_idx)
+        return
+    if get_type_info(val_type).kind != "struct":
+        report_error_at(val_idx, "E261", "a weak binding must hold a struct value, got " + get_type_name(val_type))
+        define_binding_at(scope_id, name, TID_ERR, false, node_idx)
+        return
+    define_binding_at(scope_id, name, add_type_info(ti_optional(val_type)), false, node_idx)
 
 # ---------------------------------------------------------------
 # assignment statement

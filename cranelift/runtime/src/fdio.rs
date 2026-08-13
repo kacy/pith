@@ -649,11 +649,19 @@ mod tests {
     fn a_genuinely_closed_fd_is_ebadf_not_enotsock() {
         // a number nothing is open on: the socket calls report it the same way
         // `read`/`write` do, so only a *recycled* fd trips the new check.
+        //
+        // the probed number must stay closed across the assertions, and cargo
+        // runs tests on parallel threads whose own sockets and pipes recycle
+        // low fd numbers immediately. parking the probe on a high slot keeps
+        // it out of lowest-available allocation's reach.
         let (a, b) = socket_pair();
+        let high: RawFd = 941;
+        assert_eq!(unsafe { libc::dup2(a, high) }, high);
         close(a);
         close(b);
-        assert_eq!(socket_read_errno(a), libc::EBADF);
-        assert_eq!(socket_write_errno(a), libc::EBADF);
+        close(high);
+        assert_eq!(socket_read_errno(high), libc::EBADF);
+        assert_eq!(socket_write_errno(high), libc::EBADF);
     }
 
     // -----------------------------------------------------------------------

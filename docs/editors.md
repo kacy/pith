@@ -4,47 +4,49 @@
 [lsp.md](lsp.md) for what it supports). any editor with a generic lsp
 client can use it; here is the exact wiring for neovim and vs code.
 
-## neovim (0.11+)
+## neovim
 
-put this in your `init.lua`. it teaches neovim the `pith` filetype,
-registers the server, and enables it:
+put this in your `init.lua`. it teaches neovim the `pith` filetype and
+starts the server; it works on both current neovim (0.11+, via
+`vim.lsp.config`) and 0.10 (via a `vim.lsp.start` autocommand) —
+`vim.lsp.config` does not exist before 0.11, so an unguarded call to it
+errors on older installs:
 
 ```lua
-vim.filetype.add({
-  extension = { pith = "pith" },
-})
+vim.filetype.add({ extension = { pith = "pith" } })
 
-vim.lsp.config("pith", {
-  cmd = { "pith", "lsp" },
-  filetypes = { "pith" },
-  root_markers = { "pith.toml", ".git" },
-})
-vim.lsp.enable("pith")
+local pith_cmd = { "pith", "lsp" }
+
+if vim.lsp.config then
+  vim.lsp.config("pith", {
+    cmd = pith_cmd,
+    filetypes = { "pith" },
+    root_markers = { "pith.toml", ".git" },
+  })
+  vim.lsp.enable("pith")
+else
+  vim.api.nvim_create_autocmd("FileType", {
+    pattern = "pith",
+    callback = function(args)
+      vim.lsp.start({
+        name = "pith",
+        cmd = pith_cmd,
+        root_dir = vim.fs.root(args.buf, { "pith.toml", ".git" }),
+      })
+    end,
+  })
+end
 ```
 
 open any `.pith` file inside a project (a directory with a `pith.toml`
 or `.git`) and diagnostics, hover (`K`), document symbols, and
 formatting (`vim.lsp.buf.format()`) work out of the box.
 
-if `pith` is not on your PATH, put the absolute path to the binary in
-`cmd` instead.
-
-on neovim 0.10 and earlier, `vim.lsp.config`/`vim.lsp.enable` do not
-exist; use `vim.lsp.start` from an autocommand instead:
-
-```lua
-vim.filetype.add({ extension = { pith = "pith" } })
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "pith",
-  callback = function(args)
-    vim.lsp.start({
-      name = "pith",
-      cmd = { "pith", "lsp" },
-      root_dir = vim.fs.root(args.buf, { "pith.toml", ".git" }),
-    })
-  end,
-})
-```
+if `pith` is not on your PATH, put an absolute path in `pith_cmd`.
+pointing it straight at the frontend binary — for example
+`{ "/path/to/repo/self-host/pith_main", "lsp" }` — also sidesteps the
+`pith` wrapper's working-directory-relative frontend lookup, which
+matters when the editor is launched outside the repo.
 
 ## vs code
 

@@ -7,7 +7,7 @@ if exists("b:current_syntax")
 endif
 
 " declarations and modifiers
-syn keyword pithDeclaration fn struct enum interface impl type import from as pub mut ref weak
+syn keyword pithDeclaration fn struct enum interface impl type import from as pub mut ref weak let threadlocal
 " control flow and concurrency
 syn keyword pithControl if elif else for in while match return fail break continue spawn await select defer errdefer catch timeout default test
 " word operators

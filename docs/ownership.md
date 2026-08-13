@@ -353,6 +353,16 @@ gaps, all bounded leaks rather than dangling pointers:
   paths still hand on — releasing one would be a double free rather
   than a leak. `f((a, b))` therefore strands one box per call; `t := (a,
   b)` then `f(t)` does not, because scope cleanup releases the local.
+  a fresh OPTIONAL in that position is narrower and is now reclaimed:
+  when the argument expression is itself a call — `take(mk(i))` — the
+  register is a wrapper the caller alone owns, and the same callee-body
+  walk that qualifies a named tuple local's call argument proves the
+  callee leaves the caller sole owner; a qualifying argument releases
+  its live payload and shell through the cascade helper right after the
+  call returns. a callee that extracts an rc-payload optional, or one
+  the walk cannot read (imported, builtin, method, closure), keeps the
+  argument on the leak side as before. results in argument position and
+  real tuple literals still strand their box.
 - **a collection literal the checker cannot type builds an untagged
   container.** `[]` and `{}` have no type of their own and take one from
   context. an annotated bind, a `return`, a struct constructor, an

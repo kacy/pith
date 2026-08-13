@@ -147,6 +147,41 @@ make lsp-check-only   # binaries already built
 `LSP_CHECK_UPDATE=1 ./tooling/lsp_check.sh` regenerates the expected
 files; eyeball every line before freezing a new expectation.
 
+## analysis performance
+
+`PITH_LSP_TIMING=1` logs one line per analysis on stderr with the wall
+time split by phase: lexing the entry file, parsing it, resolving
+imports (which reads, lexes, and parses every module in the closure),
+and checking the closure.
+
+measured on this repository (three runs per file, variance under five
+percent, quiet 2-core host):
+
+| entry file                      | total   | lex+parse | imports | check   | modules |
+|---------------------------------|---------|-----------|---------|---------|---------|
+| small fixture                   |   47 ms |      0 ms |   23 ms |   24 ms |       4 |
+| std/term/ui.pith                |  234 ms |     18 ms |   96 ms |  120 ms |      19 |
+| self-host/checker.pith          |  772 ms |     88 ms |   87 ms |  597 ms |      17 |
+| std/net/http.pith               | 2268 ms |     60 ms |  312 ms | 1896 ms |      36 |
+| self-host/ir_emitter_core.pith  | 3438 ms |    118 ms |  279 ms | 3042 ms |      50 |
+
+what the split says about incrementality:
+
+- the checker is 77-88% of every closure large enough to hurt, so
+  checking is the only phase worth making incremental. a lex cache
+  keyed by content hash — the candidate this instrumentation was built
+  to judge — could save at most the imports phase, under a tenth of
+  the worst total, and is rejected on those numbers.
+- queries never wait on any of this: hover, definition, references,
+  and the rest answer from the last completed analysis, so the split
+  above is diagnostic latency only.
+- the cheap next step the numbers do justify is a syntax-only fast
+  lane: lexing and parsing one edited file costs tens of milliseconds
+  even for the largest files, so parse errors could publish almost
+  immediately with full diagnostics following. checker-level
+  incrementality (per-module result caching) is the real lever and a
+  design of its own.
+
 ## current limitations
 
 - rename covers what the definition map covers: local bindings,

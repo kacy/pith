@@ -9,7 +9,7 @@
 # describe only the most recent run_check_pipeline call — so every
 # feature goes through ensure_analyzed first.
 
-from check_pipeline import run_check_pipeline
+from check_pipeline import run_check_pipeline, last_timing_line
 from driver import file_for_node, dr_read_source
 from checker import c_get_expr_type, get_definition_of
 from types import get_type_name, TID_ERR
@@ -17,6 +17,7 @@ from ast import get_node, node_count
 from errors import Diagnostic
 from lexer import lex_all
 from formatter import fmt_source
+import std.log as log
 from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 import std.json as json
@@ -143,6 +144,10 @@ pub fn run_analysis(uri: String) -> List[String]:
     mut bodies: List[String] := []
     outcome := run_check_pipeline(path) catch:
         return bodies
+    # PITH_LSP_TIMING=1 logs where each analysis spent its time, on
+    # stderr where the protocol channel never sees it
+    if env("PITH_LSP_TIMING") == "1":
+        log.info("analysis " + path + " " + last_timing_line())
     clear_dirty_if(uri)
     analyzed_uri = uri
     analyzed_root = outcome.root

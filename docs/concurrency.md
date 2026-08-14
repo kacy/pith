@@ -402,11 +402,14 @@ where a workload's handoffs actually go.
 it also keeps memory flat under fan-out. when a task finishes, the green
 backend reclaims its slot and releases the closure it was spawned with, so a
 server that spawns one task per request holds only the tasks running at once,
-not one record for every request it has ever served. a fan-out of 500k short
-tasks that used to climb to ~226 mb now holds around 3 mb, flat no matter how
-many run in total — see the green fan-out row in `docs/performance.md`. (the
-os-thread backend still keeps a record per task it has run; teaching it the
-same reclamation is the next step.)
+not one record for every request it has ever served. this holds even for a
+fire-and-forget `spawn f()` whose handle you never keep: a discarded spawn is
+detached at the spawn site, so its slot is reclaimed when the body finishes
+rather than pinned until the process exits. a fan-out of 500k short tasks that
+used to climb to ~226 mb now holds around 3 mb, flat no matter how many run in
+total — see the green fan-out row in `docs/performance.md`. (an awaited task on
+the os-thread backend still keeps its record until you read the result;
+teaching that path the same reclamation is the next step.)
 
 ### which backend to use
 

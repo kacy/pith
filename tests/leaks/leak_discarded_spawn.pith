@@ -1,0 +1,19 @@
+# a fire-and-forget `spawn f()` whose handle is discarded at statement
+# position — the shape every std accept loop uses (`spawn handle_conn(fd)`).
+# the task slab reclaims a slot only on await or detach, so before the
+# emitter learned to detach a discarded spawn, each one stranded its slot
+# and the resident set grew with the TOTAL spawned, not the live count:
+# ~72 mb over 200k here. with the detach the peak tracks the steady-state
+# concurrent count instead, so it is the same at 200k and 800k rounds.
+import leakprobe as probe
+
+fn work():
+    return
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        spawn work()
+        i = i + 1
+    print("{probe.peak_kb()}")

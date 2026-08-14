@@ -1,0 +1,26 @@
+# read_until_bytes_including_bounded fails a peer that floods without ever
+# sending the separator, instead of buffering to exhaustion. this is the
+# primitive under the chunked-transfer chunk-size line read, where a
+# newline-less flood was an unauthenticated remote memory-exhaustion kill.
+import std.io as io
+import std.bytes as bytes
+
+fn main() -> Int!:
+    nl := bytes.from_string_utf8(chr(10))
+
+    # a well-formed line reads through the bounded path unchanged
+    ok := io.bytes_reader(bytes.from_string_utf8("hi" + chr(10) + "rest")).buffered_chunked(2)
+    print(ok.read_until_bytes_including_bounded(nl, 64)!.to_string_utf8()!.replace(chr(10), "\\n"))
+
+    # a line longer than the cap, with no separator in sight, fails cleanly
+    flood := io.bytes_reader(bytes.from_string_utf8("0123456789abcdef")).buffered_chunked(4)
+    res := flood.read_until_bytes_including_bounded(nl, 8)
+    if res.is_err:
+        print("rejected")
+    else:
+        print("NOT rejected len={res.ok.len()}")
+
+    # a cap of 0 means no limit: the same long line reads fully
+    unl := io.bytes_reader(bytes.from_string_utf8("0123456789abcdef" + chr(10))).buffered_chunked(4)
+    print("{unl.read_until_bytes_including_bounded(nl, 0)!.len()}")
+    return 0

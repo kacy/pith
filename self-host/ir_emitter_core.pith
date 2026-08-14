@@ -1367,11 +1367,21 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
     if ir_is_binding_kind(node.kind):
         parts := ir_collect_bind_parts(node)
         if parts.name.len() > 0:
-            # substitute struct params (C -> the concrete type) so a bind of a
-            # generic element (c := list[i] in a generic impl) is tracked and
-            # retained; otherwise the element frees when the list is mutated and
-            # the returned value dangles. no-op outside a specialized body.
-            kind := ir_rc_kind(ir_substitute_type_name(ir_string_prepass_bind_type(parts, names)))
+            # a `weak` binding is tracked under its own kind: its slot holds a
+            # bare target pointer counted on the header's WEAK count, so the
+            # cleanup must weak_release it — the type-derived kind ("struct")
+            # would strong-release a count the binding never took. the checker
+            # rejects any reuse of a weak name in the same function, so the
+            # kind-conflict poisoning below cannot silently untrack one.
+            mut kind := ""
+            if node.value.contains(" weak"):
+                kind = "weak"
+            else:
+                # substitute struct params (C -> the concrete type) so a bind of a
+                # generic element (c := list[i] in a generic impl) is tracked and
+                # retained; otherwise the element frees when the list is mutated and
+                # the returned value dangles. no-op outside a specialized body.
+                kind = ir_rc_kind(ir_substitute_type_name(ir_string_prepass_bind_type(parts, names)))
             if kind.len() > 0:
                 if names.contains(parts.name):
                     if ir_rc_local_kind(parts.name) != kind and not poisoned.contains(parts.name):
@@ -2306,13 +2316,19 @@ fn ir_method_receiver_type(node: Node) -> String:
                 return ir_substitute_type_name(ir_struct_field_lookup[field_key])
     return ""
 
-# a read of a `weak` field synthesizes a FRESH borrowing optional shell each time
-# (ir_emit_weak_read) — unlike a normal optional field, which reads the stored
-# value in place. that shell has no destructor and holds a borrowed pointer, so
-# releasing it just frees the shell. this predicate lets the optional consumers
-# (`.value()`, `!= none`) free the throwaway shell instead of leaking one per read.
+# a read of a `weak` field or a `weak` local synthesizes a FRESH borrowing
+# optional shell each time (ir_emit_weak_read) — unlike a normal optional,
+# which reads the stored value in place. that shell has no destructor and
+# holds a borrowed pointer, so releasing it just frees the shell. this
+# predicate lets the optional consumers (`.value()`, `!= none`, `?`) free the
+# throwaway shell instead of leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
+    # a weak LOCAL read mints the same throwaway shell as a weak field read
+    # (see ir_emit_ident_load); a loop variable shadowing the name reads its
+    # own slot plainly and must not have a shell freed out from under it.
+    if node.kind == "ident":
+        return ir_loop_var_slot(node.value).len() == 0 and ir_rc_local_kind(node.value) == "weak"
     if node.kind != "field_access":
         return false
     if node.children.len() == 0:
@@ -5459,6 +5475,13 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
     # normal variables and globals still load through storage; threadlocal
     # globals route through the tls runtime inside ir_emit_name_load.
     ir_emit_name_load(r, name)
+    # a weak local's slot holds the bare target pointer, so every read
+    # resolves liveness fresh through pith_struct_weak_load and hands back
+    # the optional the checker typed it as — Some(target) while it is
+    # alive, none once it has been reclaimed. a loop variable shadowing
+    # the name reads its own slot (a strong element) and stays plain.
+    if ir_loop_var_slot(name).len() == 0 and ir_rc_local_kind(name) == "weak":
+        return ir_emit_weak_read(r)
     return r
 
 # True when any argument carries a field name (named construction).
@@ -6323,6 +6346,21 @@ fn ir_emit_bind_stmt(node: Node):
     name := parts.name
     val_idx := parts.val_idx
     type_idx := parts.type_idx
+    # `weak name := expr` stores the bare target pointer and takes a WEAK
+    # reference only, mirroring a weak struct field's store: the binding must
+    # not keep its target alive, or the cycle it exists to break never
+    # reclaims. every read goes back through pith_struct_weak_load (see
+    # ir_emit_ident_load), so the slot never holds an owning optional. the
+    # old slot value covers a loop body re-entering the binding; the
+    # prologue zero-stores the slot, and weak_release(0) is a no-op.
+    if node.value.contains(" weak") and ir_rc_local_kind(name) == "weak" and val_idx >= 0:
+        old_w := ir_reg()
+        ir_emit_local_slot_load(old_w, name)
+        new_w := ir_emit_weak_payload(val_idx)
+        ir_emit_name_store(name, new_w)
+        ir_emit_call1(ir_reg(), "pith_struct_weak_release", "void", old_w)
+        ir_var_regs.insert(name, new_w)
+        return
     # a bind from a call through a closure-typed parameter carries the
     # closure's declared return kind — the one type source that stays
     # reliable in generic bodies, where checked types are suppressed

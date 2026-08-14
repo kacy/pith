@@ -162,11 +162,14 @@ correctness story:
 - memory reclamation is compiler-emitted reference counting (see the readme's
   memory section). closures are reference counted and freed like other heap
   values. the one structural gap that remains: strong reference cycles leak,
-  but a struct graph can break its own cycle with a `weak` field (see
+  but a struct graph can break its own cycle with a `weak` field, and a
+  local can hold a struct weakly with `weak name := expr` (see
   docs/ownership.md) — the only cycle with no weak escape hatch today is a
   closure that captures a binding reaching back to it, since closure captures
-  cannot yet be weak. the leak is bounded by design — the discipline never
-  produces a dangling pointer in exchange. (removing an element from a
+  cannot yet be weak: a lambda referencing an enclosing weak binding is
+  rejected (E261) instead of capturing it strongly behind your back. the
+  leak is bounded by design — the discipline never produces a dangling
+  pointer in exchange. (removing an element from a
   container, returning early on an error path, and indexed reads of
   `List[Struct]` were all listed here once; each was fixed and each is now
   pinned flat by the leak-growth gate, measured at two round counts.)

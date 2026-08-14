@@ -1237,6 +1237,11 @@ fn parse_statement() -> Int:
     if _cur_tok_kind() == "kw_mut":
         return parse_binding()
 
+    # weak binding: `weak name := expr` holds its struct target without
+    # keeping it alive; every read yields an optional
+    if _cur_tok_kind() == "kw_weak":
+        return parse_binding()
+
     # binding: name := expr or name: Type := expr
     if _cur_tok_kind() == "identifier":
         if _peek_ahead_kind(1) == "colon_eq":
@@ -1304,8 +1309,11 @@ fn looks_like_binding() -> Bool:
 
 fn parse_binding() -> Int:
     mut is_mut := false
+    mut is_weak := false
     if match_tok("kw_mut"):
         is_mut = true
+    if match_tok("kw_weak"):
+        is_weak = true
     name_tok := expect("identifier")
 
     mut children: List[Int] := []
@@ -1320,6 +1328,8 @@ fn parse_binding() -> Int:
     mut mod := ""
     if is_mut:
         mod = " mut"
+    if is_weak:
+        mod = mod + " weak"
     return add_node_with_position("binding", name_tok.value + mod, children)
 
 fn parse_expr_stmt_or_assignment() -> Int:

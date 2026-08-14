@@ -1,0 +1,30 @@
+# churn weak local bindings. each round creates a struct, weak-binds it, and
+# reads it back twice — a `== none` probe and a `.value()` extraction. three
+# balances are on trial: the binding's weak reference (an unreleased weak
+# count keeps the 32-byte header alive per round), the binding's absence of a
+# STRONG count (holding one would keep the whole struct per round), and the
+# throwaway optional shell each read mints (an unfreed shell is 64 bytes per
+# read, the exact growth this case showed before the shell release landed).
+import leakprobe as probe
+
+struct Node:
+    pub val: Int
+
+fn round(i: Int) -> Int:
+    n := Node(val: i)
+    weak w := n
+    if w == none:
+        return 0 - 1
+    return w.value().val
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

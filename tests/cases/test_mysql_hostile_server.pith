@@ -1,0 +1,153 @@
+# the mysql client against a hostile server: every crafted reply must come back
+# as an error from the driver, never a crash, a hang, or a silent success.
+#
+# each scenario runs a stub server on its own loopback port. the stub speaks
+# first (mysql servers greet), then answers the client's real handshake with
+# attacker-chosen bytes:
+#   - a zero-length auth reply, which bytes.get used to read as the OK marker
+#   - a result-set column count far past any real result set
+#   - a column count whose 8-byte length encoding wraps negative
+
+import std.mysql as mysql
+import std.bytes as bytes
+import std.bits as bits
+import std.net.tcp as tcp
+from std.collections import copy_list
+
+fn byte1(value: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(value) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# an n-byte little-endian integer.
+fn le(value: Int, width: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < width:
+        out.write_byte(bits.band(bits.shr(value, i * 8), 255)) catch 0
+        i = i + 1
+    result := out.bytes()
+    out.free()
+    return result
+
+# concatenate parts without nesting bytes.concat calls.
+fn cat(parts: List[Bytes]) -> Bytes:
+    out := bytes.buffer()
+    for part in parts:
+        out.write(part) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+fn str(text: String) -> Bytes:
+    return bytes.from_string_utf8(text)
+
+# a string plus its null terminator.
+fn cstr(text: String) -> Bytes:
+    return cat([str(text), byte1(0)])
+
+# frame a payload as one mysql packet: 3-byte little-endian length, then the
+# sequence id.
+fn packet(seq: Int, payload: Bytes) -> Bytes:
+    return cat([le(bytes.len(payload), 3), byte1(seq), payload])
+
+# `count` zero bytes.
+fn zeros(count: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < count:
+        out.write_byte(0) catch 0
+        i = i + 1
+    result := out.bytes()
+    out.free()
+    return result
+
+# a protocol-v10 greeting the client's salt and plugin parsers accept: version
+# byte, server version, thread id, 8 salt bytes, filler, capability/charset/
+# status fields, 10 reserved bytes, 12 more salt bytes plus null, plugin name.
+fn greeting() -> Bytes:
+    return cat([
+        byte1(10),
+        cstr("5.7.0-stub"),
+        le(1, 4),
+        str("12345678"),
+        byte1(0),
+        le(0, 2),
+        byte1(45),
+        le(0, 2),
+        le(0, 2),
+        byte1(21),
+        zeros(10),
+        str("901234567890"),
+        byte1(0),
+        cstr("mysql_native_password"),
+])
+
+# greet the client, then answer each of its messages with the next scripted
+# reply.
+fn serve(listener: Int, replies: List[Bytes]) -> Int!:
+    conn := tcp_accept(listener)!
+    wrote := tcp.write_all_bytes(conn, packet(0, greeting())) catch 0
+    if wrote == 0:
+        tcp_close(conn)
+        return 0
+    for reply in replies:
+        request := tcp_read_bytes(conn, 4096)!
+        if bytes.len(request) == 0:
+            tcp_close(conn)
+            return 0
+        sent := tcp.write_all_bytes(conn, reply) catch 0
+        if sent == 0:
+            tcp_close(conn)
+            return 0
+    tcp_close(conn)
+    return 0
+
+# drive a real connect against the scripted stub and report how it ended.
+fn connect_case(label: String, port: Int, replies: List[Bytes]) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve(listener, copy_list(replies))
+    conn := mysql.connect("127.0.0.1", port, "user", "pw", "db")
+    if conn.is_err:
+        print(label + ": " + conn.err)
+    else:
+        print(label + ": unexpectedly connected")
+        conn.ok.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+# connect through a permissive stub handshake, run one query, and report how
+# the query ended.
+fn query_case(label: String, port: Int, response: Bytes) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    replies := [packet(2, byte1(0)), response]
+    task := spawn serve(listener, copy_list(replies))
+    conn := mysql.connect("127.0.0.1", port, "user", "pw", "db")!
+    rows := mysql.query(conn, "select x")
+    if rows.is_err:
+        print(label + ": " + rows.err)
+    else:
+        print(label + ": unexpectedly parsed")
+    conn.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+fn main() -> Int!:
+    # a zero-length packet has no marker byte; bytes.get reading 0 out of
+    # bounds must not pass as the OK that ends authentication.
+    connect_case("empty auth reply", 17570, [packet(2, bytes.empty())])!
+
+    # a column count far past any real result set would drive that many packet
+    # reads before anything else went wrong.
+    query_case("huge column count", 17571, packet(1, cat([byte1(253), le(100000, 3)])))!
+
+    # an 8-byte length encoding with the top bit set wraps negative; the count
+    # must be rejected, not used as a loop bound.
+    query_case("negative column count", 17572, packet(1, cat([byte1(254), le(bits.shl(1, 63), 8)])))!
+
+    print("alive")
+    return 0

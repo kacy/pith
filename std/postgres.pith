@@ -35,6 +35,12 @@ import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
 
+# backend messages come off an untrusted socket, so the frame length the server
+# advertises is bounded before it drives a read: a hostile or MITM'd peer must
+# not be able to commit the client to buffering gigabytes. postgres rows can be
+# large, but a message beyond this is corruption or an attack, not data.
+MAX_MESSAGE_LEN := 268435456 # 256 MiB
+
 # --- byte helpers ---
 
 # a 4-byte big-endian integer.
@@ -100,13 +106,21 @@ impl Conn:
             return tls.conn_from_handle(self.tls_handle).read_bytes(4096)!
         return tcp_read_bytes(self.fd, 4096)!
 
-    # read exactly `n` bytes, pulling more from the transport as needed.
+    # read exactly `n` bytes, pulling more from the transport as needed. the
+    # unconsumed tail moves into a growable buffer once and chunks append to
+    # it, so a message spanning many reads costs one copy per chunk rather
+    # than recopying everything buffered so far on every chunk.
     fn recv_exact(n: Int) -> Bytes!:
-        while bytes.len(self.buf) - self.pos < n:
-            chunk := self.recv_chunk()!
-            if bytes.len(chunk) == 0:
-                fail "postgres: connection closed"
-            self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
+        if bytes.len(self.buf) - self.pos < n:
+            acc := bytes.buffer()
+            errdefer acc.free()
+            acc.write(bytes.slice(self.buf, self.pos, bytes.len(self.buf))) catch 0
+            while acc.len() < n:
+                chunk := self.recv_chunk()!
+                if bytes.len(chunk) == 0:
+                    fail "postgres: connection closed"
+                acc.write(chunk) catch 0
+            self.buf = acc.take_bytes()
             self.pos = 0
         out := bytes.slice(self.buf, self.pos, self.pos + n)
         self.pos = self.pos + n
@@ -122,6 +136,8 @@ impl Conn:
         # recv_exact for a negative payload. reject a malformed/hostile frame.
         if total < 4:
             fail "postgres: backend message length {total} is too small"
+        if total > MAX_MESSAGE_LEN:
+            fail "postgres: backend message length {total} exceeds the {MAX_MESSAGE_LEN}-byte limit"
         payload := self.recv_exact(total - 4)!
         return Message(mtype: mtype, payload: payload)
 
@@ -241,6 +257,8 @@ impl Conn:
         # SCRAM state carried across the two AuthenticationSASL rounds.
         mut client_nonce := ""
         mut client_first_bare := ""
+        mut server_signature := ""
+        mut scram_verified := false
         while true:
             msg := self.read_message()!
             if msg.mtype == 69:
@@ -248,7 +266,12 @@ impl Conn:
             elif msg.mtype == 82:
                 auth := read_be(msg.payload, 0, 4)
                 if auth == 0:
-                    # AuthenticationOk — keep reading until ReadyForQuery.
+                    # AuthenticationOk — keep reading until ReadyForQuery. once
+                    # SCRAM is under way it counts only after the server proved
+                    # itself in SASLFinal; a MITM that never saw the password
+                    # can send a bare AuthenticationOk.
+                    if client_first_bare != "" and not scram_verified:
+                        fail "postgres: server skipped SCRAM signature verification"
                     continue
                 elif auth == 3:
                     # cleartext password
@@ -267,10 +290,17 @@ impl Conn:
                     # AuthenticationSASLContinue: server-first-message.
                     server_first := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!
                     final := scram_client_final(server_first, client_first_bare, password)!
-                    self.send(112, bytes.from_string_utf8(final))!
+                    server_signature = final.server_signature
+                    self.send(112, bytes.from_string_utf8(final.message))!
                 elif auth == 12:
-                    # AuthenticationSASLFinal — server signature, accepted as-is.
-                    continue
+                    # AuthenticationSASLFinal: the server proves it holds the
+                    # server key by echoing v=ServerSignature. a server that
+                    # cannot produce it never had the credentials this client
+                    # is authenticating against.
+                    server_final := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!
+                    if not scram_server_verified(server_final, server_signature):
+                        fail "postgres: SCRAM server signature verification failed"
+                    scram_verified = true
                 else:
                     fail "postgres: unsupported auth method {auth}"
             elif msg.mtype == 90:
@@ -280,8 +310,15 @@ impl Conn:
                 # ParameterStatus (83), BackendKeyData (75), NoticeResponse (78) — ignore.
                 continue
 
-# build the SCRAM client-final-message from the server-first-message.
-fn scram_client_final(server_first: String, client_first_bare: String, password: String) -> String!:
+# the client-final-message plus the base64 ServerSignature the backend must
+# echo in AuthenticationSASLFinal to prove it holds the server key.
+struct ScramFinal:
+    message: String
+    server_signature: String
+
+# build the SCRAM client-final-message from the server-first-message, together
+# with the server signature the backend has to answer with.
+fn scram_client_final(server_first: String, client_first_bare: String, password: String) -> ScramFinal!:
     mut server_nonce := ""
     mut salt_b64 := ""
     mut iterations := 0
@@ -303,7 +340,20 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
     auth_message := client_first_bare + "," + server_first + "," + client_final_bare
     client_sig := hmac.sha256(stored_key, bytes.from_string_utf8(auth_message))
     proof := xor_bytes(client_key, client_sig)
-    return client_final_bare + ",p=" + encoding.b64_encode(proof)
+    server_key := hmac.sha256(salted, bytes.from_string_utf8("Server Key"))
+    server_sig := hmac.sha256(server_key, bytes.from_string_utf8(auth_message))
+    return ScramFinal(message: client_final_bare + ",p=" + encoding.b64_encode(proof), server_signature: encoding.b64_encode(server_sig))
+
+# whether the server-final-message carries exactly the ServerSignature the
+# handshake computed. an empty expectation means no SASL round happened, so an
+# unsolicited SASLFinal never verifies.
+fn scram_server_verified(server_final: String, expected: String) -> Bool:
+    if expected == "":
+        return false
+    for part in server_final.split(","):
+        if part.starts_with("v="):
+            return part.substring(2, part.len()) == expected
+    return false
 
 # --- queries ---
 
@@ -377,6 +427,11 @@ fn read_response(conn: Conn) -> QueryResult!:
                 if vlen == bits.mask32(0 - 1):
                     values.push(sql.null_value())
                 else:
+                    # any length other than the NULL sentinel must fit inside
+                    # the message; a forged one would swallow the rest of the
+                    # row or push `off` out of range.
+                    if off + vlen > bytes.len(msg.payload):
+                        fail "postgres: DataRow field length {vlen} overruns the message"
                     raw := bytes.to_string_utf8(bytes.slice(msg.payload, off, off + vlen))!
                     # a hostile/buggy server can send a DataRow with more fields
                     # than the RowDescription declared; indexing oids past its end
@@ -635,7 +690,14 @@ test "scram-sha-256 client-final matches the RFC 7677 vector":
     server_first := "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
     client_first_bare := "n=user,r=rOprNGfwEbeRWgbNEkqO"
     final := scram_client_final(server_first, client_first_bare, "pencil")!
-    assert_eq(final, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+    assert_eq(final.message, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+    assert_eq(final.server_signature, "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+
+test "SASLFinal verifies only the exact server signature":
+    assert(scram_server_verified("v=abc", "abc"))
+    assert(not scram_server_verified("v=abd", "abc"))
+    assert(not scram_server_verified("e=other-error", "abc"))
+    assert(not scram_server_verified("v=abc", ""))
 
 test "big-endian int32 round-trips":
     assert_eq(read_be(be32(196608), 0, 4), 196608)
@@ -685,5 +747,12 @@ test "read_message rejects a length below its own header":
     # would ask recv_exact for a negative payload. the frame is pre-buffered,
     # so no real socket is touched.
     framed := bytes.concat(bytes.from_string_utf8("E"), be32(3))
+    conn := Conn(fd: - 1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    assert(conn.read_message().is_err)
+
+test "read_message rejects a length beyond the cap":
+    # a frame length just past MAX_MESSAGE_LEN must be refused before it drives
+    # a read. the frame is pre-buffered, so no real socket is touched.
+    framed := bytes.concat(bytes.from_string_utf8("D"), be32(MAX_MESSAGE_LEN + 1))
     conn := Conn(fd: - 1, buf: framed, pos: 0, secure: false, tls_handle: 0)
     assert(conn.read_message().is_err)

@@ -1,0 +1,20 @@
+# a discarded `spawn` is detached so its slab slot is reclaimed on
+# completion, but detach must NOT cancel the task — the body still runs.
+# each of n discarded spawns sends once; main receives all n, so a
+# dropped task would hang here rather than pass.
+fn worker(ch: Channel[Int]):
+    ch.send(1)
+
+fn main():
+    n := 2000
+    ch := Channel[Int](n)
+    mut i := 0
+    while i < n:
+        spawn worker(ch)
+        i = i + 1
+    mut got := 0
+    mut sum := 0
+    while got < n:
+        sum = sum + ch.recv().unwrap_or(0)
+        got = got + 1
+    print("ran={sum}")

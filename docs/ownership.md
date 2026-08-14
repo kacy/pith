@@ -461,6 +461,34 @@ weak reads to observe that the value is gone and return `none`. the
 rings: with the back edge `weak` peak memory stays flat (about 2 MB),
 and with a strong back edge the same run leaks every ring (about 730 MB).
 
+a local binding can be weak too. `weak name := expr` holds a struct value
+without keeping it alive, and every read yields the same optional a weak
+field read does — `Some(target)` while a strong owner still exists,
+`none` once the target has been reclaimed:
+
+```pith
+mut cache: List[Session] := [Session(id: 1)]
+weak current := cache[0]
+# ... later, possibly after the cache evicted the session ...
+if current == none:
+    print("session gone")
+```
+
+a weak binding takes its type from its value (no annotation), must hold a
+struct, and is immutable — a weak slot is an edge that either still
+reaches its target or does not, not a variable to swap (E261 for each).
+its name must also be unique in its function: the slot is keyed by name
+across the whole function body, so reusing it for any other binding —
+strong, loop variable, or match payload — is rejected rather than left to
+read through the wrong lowering.
+
+two closure interactions are rejected for now rather than half-supported:
+a lambda cannot reference an enclosing weak binding (the closure
+environment has no weak-aware slot yet, so the capture would either hold
+the target strongly or dangle), and a weak binding cannot be declared
+inside a lambda body. both arrive with weak capture support, which is
+what will let a closure over stream state break its own cycle.
+
 closures are reference counted like any other heap value. a closure
 carries its own count and a release tag per captured slot; the last
 release walks the environment, drops the count the closure took on

@@ -1206,6 +1206,7 @@ fn check_function_declaration(node: Node):
         return
     # create function scope with return type
     fn_scope := create_function_scope(current_scope, fn_info.return_type)
+    reset_fn_weak_tracking()
     # define parameters
     mut param_idx := 0
     for child in node.children:
@@ -1214,6 +1215,7 @@ fn check_function_declaration(node: Node):
             pname := extract_binding_name(cn.value)
             if param_idx < fn_info.param_types.len():
                 define_binding_at(fn_scope, pname, fn_info.param_types[param_idx], cn.value.contains("mut"), child)
+            note_fn_binding_name(pname, child)
             param_idx = param_idx + 1
         elif cn.kind == "body":
             check_function_body(child, fn_scope)
@@ -1330,6 +1332,7 @@ fn check_method_body(type_name: String, type_tid: Int, node_idx: Int, node: Node
     param_types := collect_function_param_types(node)
     ret_type := collect_function_return_type(node)
     method_scope := create_function_scope(current_scope, ret_type)
+    reset_fn_weak_tracking()
     # bind self
     define_binding_at(method_scope, "self", type_tid, false, node_idx)
 
@@ -1341,6 +1344,7 @@ fn check_method_body(type_name: String, type_tid: Int, node_idx: Int, node: Node
             pname := extract_binding_name(cn.value)
             if param_idx < param_types.len():
                 define_binding_at(method_scope, pname, param_types[param_idx], cn.value.contains("mut"), child)
+            note_fn_binding_name(pname, child)
             param_idx = param_idx + 1
         elif cn.kind == "body":
             check_function_body(child, method_scope)
@@ -1710,13 +1714,57 @@ fn collection_literal_coerces(value_idx: Int, target_tid: Int, scope_id: Int) ->
 fn collection_literal_matches_target(value_idx: Int, target_tid: Int, scope_id: Int) -> Bool:
     return collection_literal_coerces(value_idx, target_tid, scope_id)
 
+# per-function name bookkeeping for weak bindings. the emitter keys a local's
+# storage slot by NAME across the whole function, so one name carrying both a
+# weak and a non-weak binding (sibling branches, a loop variable, a match
+# payload) would make reads of the weak one lower without the liveness
+# resolution — a wrong value, not a leak. a weak name must therefore be unique
+# in its function, in both directions. reset per function body; lambda bodies
+# do NOT reset (they nest inside the function, and a lambda referencing an
+# enclosing weak binding is rejected until weak capture lands).
+mut fn_bound_names: List[String] := []
+mut fn_weak_names: List[String] := []
+# weak binding arena index -> lambda nesting depth at its definition. a read
+# at a deeper depth is a closure capture, which has no weak-aware environment
+# slot yet; shadowing inside the lambda resolves to a different arena index,
+# so it stays allowed.
+mut weak_def_lambda_depth: Map[Int, Int] := {}
+mut checker_lambda_depth := 0
+
+fn reset_fn_weak_tracking():
+    fn_bound_names = []
+    fn_weak_names = []
+    weak_def_lambda_depth = {}
+    checker_lambda_depth = 0
+
+# record a non-weak binding name (param, loop variable, match payload, plain
+# `:=`), rejecting reuse of a name that is weak elsewhere in the function.
+# the push is unconditional and undeduplicated on purpose: this runs for
+# every binding in every function, so it must stay O(1) — only the rare
+# weak-binding path ever scans the list.
+fn note_fn_binding_name(name: String, node_idx: Int):
+    if fn_weak_names.len() > 0 and fn_weak_names.contains(name):
+        report_error_at(node_idx, "E261", "the name '" + name + "' is bound weak elsewhere in this function; use a different name")
+    fn_bound_names.push(name)
+
 fn check_binding_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     name := extract_binding_name(node.value)
     is_mut := binding_is_mutable(node.value)
     if node.value.contains(" weak"):
+        if fn_bound_names.contains(name):
+            report_error_at(node_idx, "E261", "a weak binding cannot reuse the name '" + name + "', which is already bound in this function")
+        # a lambda body emits as its own function but shares the enclosing
+        # emission's tracking today, so a weak local declared inside one
+        # would lower against the wrong function's slots. weak bindings in
+        # closures arrive together with weak capture support.
+        if checker_lambda_depth > 0:
+            report_error_at(node_idx, "E261", "a weak binding inside a closure is not supported yet")
+        fn_bound_names.push(name)
+        fn_weak_names.push(name)
         check_weak_binding(node_idx, scope_id, name)
         return
+    note_fn_binding_name(name, node_idx)
     # children: [type_expr?, value_expr]
     # if 2 children -> first is type annotation, second is value
     # if 1 child -> no annotation, child is value
@@ -1782,6 +1830,9 @@ fn check_weak_binding(node_idx: Int, scope_id: Int, name: String):
         define_binding_at(scope_id, name, TID_ERR, false, node_idx)
         return
     define_binding_at(scope_id, name, add_type_info(ti_optional(val_type)), false, node_idx)
+    # remember where this weak binding lives so a read from inside a lambda —
+    # a closure capture — can be rejected until weak capture support exists.
+    weak_def_lambda_depth.insert(lookup_binding_index(scope_id, name), checker_lambda_depth)
 
 # ---------------------------------------------------------------
 # assignment statement
@@ -2000,6 +2051,7 @@ fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope
         check_pattern_match(pat_idx, subj_type, branch_scope)
         return
     if pat.kind == "pat_binding":
+        note_fn_binding_name(pat.value, pat_idx)
         info := get_type_info(subj_type)
         if info.kind == "optional":
             define_binding_at(branch_scope, pat.value, info.inner, false, pat_idx)
@@ -2137,12 +2189,14 @@ fn check_for_statement(node: Node, scope_id: Int):
     # bind the loop variable
     if node.children.len() >= 3:
         elem_name := get_node(node.children[2]).value
+        note_fn_binding_name(elem_name, node.children[2])
         define_binding_at(loop_scope, elem_name, elem_type, false, node.children[2])
         # cache the element type on the loop-var node so the ir emitter can
         # read it back (used to type the value extracted from an iterator)
         expression_type_cache.insert(node.children[2], elem_type)
         if node.children.len() >= 4:
             idx_name := get_node(node.children[3]).value
+            note_fn_binding_name(idx_name, node.children[3])
             define_binding_at(loop_scope, idx_name, tid_int, false, node.children[3])
     else:
         binding_names := node.value
@@ -2315,6 +2369,18 @@ fn from_import_source_module(name: String) -> String:
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
+        # a weak binding read from inside a lambda is a closure capture, and
+        # the closure environment has no weak-aware slot yet: the capture
+        # would hold the target strongly (defeating the point) or dangle.
+        # a lambda-local shadow of the name resolves to a different arena
+        # index, so shadowing stays allowed. gated on both counters so code
+        # without weak bindings never pays the extra scope-chain walk —
+        # this runs on every identifier use in every module.
+        if checker_lambda_depth > 0 and weak_def_lambda_depth.len() > 0:
+            weak_idx := lookup_binding_index(scope_id, name)
+            if weak_def_lambda_depth.contains_key(weak_idx) and checker_lambda_depth > weak_def_lambda_depth[weak_idx]:
+                report_error_at(node_idx, "E261", "a closure cannot capture the weak binding '" + name + "' yet; bind it strongly before the lambda")
+                return TID_ERR
         # a name defined by another module resolves only through an
         # import; the shared global scope would otherwise let it leak
         # across modules and die later in emission. builtins and the
@@ -5315,6 +5381,7 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_wildcard":
         return
     if pat.kind == "pat_binding":
+        note_fn_binding_name(pat.value, pat_idx)
         # a binding on an optional subject unwraps, mirroring if let
         info := get_type_info(expected_type)
         if info.kind == "optional":
@@ -5533,7 +5600,9 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
                 params.push(TID_ERR)
         else:
             body_idx = child
-    # check body
+    # check body. the depth counter marks that names resolved in here cross a
+    # closure boundary, which is what the weak-capture rejection keys off.
+    checker_lambda_depth = checker_lambda_depth + 1
     mut ret_type := TID_VOID
     if body_idx >= 0:
         body_node := get_node(body_idx)
@@ -5551,6 +5620,7 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             lambda_inferred_return = saved_infer
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
+    checker_lambda_depth = checker_lambda_depth - 1
     return add_type_info(ti_function(params, ret_type))
 
 # ---------------------------------------------------------------

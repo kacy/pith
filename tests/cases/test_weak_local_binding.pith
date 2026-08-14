@@ -1,0 +1,43 @@
+# a `weak` local holds its struct target without keeping it alive: reads
+# yield the target while some strong owner still does, and none once the
+# target has been reclaimed. the second half is the part worth proving —
+# the binding resolves liveness at every read rather than snapshotting it.
+struct Node:
+    pub val: Int
+
+fn read_state(w: Node?) -> String:
+    return match w:
+        got => "alive:" + got.val.to_string()
+        none => "gone"
+
+fn while_target_lives():
+    n := Node(val: 7)
+    weak w := n
+    print(read_state(w))
+
+fn after_target_drops():
+    mut keeper: List[Node] := [Node(val: 9)]
+    weak w := keeper[0]
+    print(read_state(w))
+    # the list owns the only strong count; clearing it reclaims the node,
+    # and the weak binding must observe that instead of dangling.
+    keeper = []
+    print(read_state(w))
+
+fn rebinding_in_a_loop():
+    mut total := 0
+    mut i := 0
+    while i < 3:
+        n := Node(val: i + 10)
+        weak w := n
+        got := match w:
+            v => v.val
+            none => 0 - 1
+        total = total + got
+        i = i + 1
+    print("total={total}")
+
+fn main():
+    while_target_lives()
+    after_target_drops()
+    rebinding_in_a_loop()

@@ -32,6 +32,12 @@ pub fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
+    elif kind == "weak":
+        # a weak local's slot holds the bare target pointer and counts only
+        # against the header's weak count — never the strong one, or the
+        # binding would keep its target alive and the cycle it exists to
+        # break would never reclaim. 0 (no target) is a no-op in the runtime.
+        ir_emit_call1(ir_reg(), "pith_struct_weak_retain", "void", r)
 
 pub fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
@@ -48,3 +54,5 @@ pub fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
+    elif kind == "weak":
+        ir_emit_call1(ir_reg(), "pith_struct_weak_release", "void", r)

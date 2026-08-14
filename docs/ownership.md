@@ -482,12 +482,34 @@ across the whole function body, so reusing it for any other binding —
 strong, loop variable, or match payload — is rejected rather than left to
 read through the wrong lowering.
 
-two closure interactions are rejected for now rather than half-supported:
-a lambda cannot reference an enclosing weak binding (the closure
-environment has no weak-aware slot yet, so the capture would either hold
-the target strongly or dangle), and a weak binding cannot be declared
-inside a lambda body. both arrive with weak capture support, which is
-what will let a closure over stream state break its own cycle.
+a closure captures a weak binding weakly. the environment slot holds the
+bare target pointer under a weak reference — never a strong count — and
+every read inside the closure resolves liveness fresh, exactly like the
+binding itself. that is what lets a closure over stream state break its
+own cycle: a callback stored on the object it reads from is the classic
+strong ring (object owns closure, closure owns object), and routing the
+back edge through a weak binding tears it down when the object's owner
+drops:
+
+```pith
+mut s := Stream(val: 1, cb: fn(x: Int) => x)
+weak ws := s
+s.cb = fn(x: Int):
+    if ws == none:
+        return 0 - 1              # the stream is gone; report, not crash
+    return ws.value().val + x     # alive: read through the weak edge
+```
+
+`tests/leaks/leak_weak_capture_cycle` pins this flat: the same ring with a
+strong capture grows by every ring ever built, and with the weak capture
+it holds steady no matter how many rounds run.
+
+one closure interaction is still rejected rather than half-supported: a
+weak binding cannot be DECLARED inside a lambda body (E261) — lambda
+bodies share the enclosing emission's local tracking today, so the
+binding would lower against the wrong frame. declare the weak binding
+outside and capture it instead, which is also the shape the cycle break
+needs.
 
 closures are reference counted like any other heap value. a closure
 carries its own count and a release tag per captured slot; the last

@@ -342,6 +342,11 @@ const CLOSURE_TAG_SET: u8 = 4;
 const CLOSURE_TAG_BYTES: u8 = 5;
 const CLOSURE_TAG_STRUCT: u8 = 6;
 const CLOSURE_TAG_CLOSURE: u8 = 7;
+// a captured `weak` binding: the slot holds the bare target pointer and
+// the closure took a WEAK reference, never a strong count — that is what
+// lets a closure refer back to the state that owns it without forming a
+// strong cycle. dropping it releases only the weak count.
+const CLOSURE_TAG_WEAK: u8 = 8;
 
 // closures validate the same way strings and structs do: a magic word
 // at the front of the allocation, read without a lock. `#[repr(C)]`
@@ -383,6 +388,7 @@ unsafe fn release_captured_value(value: i64, tag: u8) {
         CLOSURE_TAG_BYTES => crate::bytes::pith_bytes_release(value),
         CLOSURE_TAG_STRUCT => pith_struct_release(value),
         CLOSURE_TAG_CLOSURE => pith_closure_release(value),
+        CLOSURE_TAG_WEAK => pith_struct_weak_release(value),
         _ => {}
     }
 }

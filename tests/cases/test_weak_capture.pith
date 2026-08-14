@@ -1,0 +1,19 @@
+# a closure can capture a `weak` binding: the environment slot holds the
+# bare target pointer under a weak reference, so the closure refers to the
+# target without keeping it alive. every read inside the closure resolves
+# liveness fresh — the SAME closure sees the value while a strong owner
+# exists and none after that owner drops, which is what makes a callback
+# over shared state safe to hold indefinitely.
+struct Node:
+    pub val: Int
+
+fn main():
+    mut keeper: List[Node] := [Node(val: 5)]
+    weak w := keeper[0]
+    probe := fn(x: Int):
+        if w == none:
+            return 0 - 1
+        return w.value().val + x
+    print("live={probe(10)}")
+    keeper = []
+    print("dead={probe(10)}")

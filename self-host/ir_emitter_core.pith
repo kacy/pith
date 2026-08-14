@@ -6595,6 +6595,17 @@ fn ir_stmt(idx: Int):
 
     if ir_stmt_is_expr(kind):
         r := ir_expr(idx)
+        # a fire-and-forget `spawn f()` whose handle is discarded at statement
+        # position must be detached, or the runtime never reclaims the task's
+        # slab slot once it finishes — the slab reclaims only on await or
+        # detach. an accept loop doing `spawn handle_conn(fd)` per connection
+        # would otherwise grow the slab (and, on the os-thread backend, pin a
+        # JoinHandle) without bound. detaching hands the runtime permission to
+        # reclaim the slot on completion; a bound or awaited handle never
+        # reaches here, so only the discarded case is affected.
+        if kind == "spawn":
+            ir_emit_call1(ir_reg(), "pith_task_detach", "void", r)
+            return
         # a discarded result from a bare `foo()!`-less call owns its box: free
         # its live payload and the shell, or both leak (this is what a bare
         # `buf.write_byte(x)` did before).

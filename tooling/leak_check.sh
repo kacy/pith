@@ -48,6 +48,7 @@ cases=(
   tests/leaks/leak_discarded_spawn
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_local
+  tests/leaks/leak_weak_capture_cycle
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood
 )

@@ -1,0 +1,31 @@
+# the cycle weak capture exists to break: a struct owns a closure through a
+# fn field, and the closure refers back to the struct. captured strongly
+# that ring never reclaims (measured ~230 bytes per round); captured through
+# a `weak` binding the back edge takes no strong count, so dropping the
+# struct's owner tears the whole ring down. this is the closure-over-stream-
+# state shape — a callback registered on the object that owns it.
+import leakprobe as probe
+
+struct Stream:
+    pub val: Int
+    mut cb: fn(Int) -> Int
+
+fn round(i: Int) -> Int:
+    mut s := Stream(val: i, cb: fn(x: Int) => x)
+    weak ws := s
+    s.cb = fn(x: Int):
+        if ws == none:
+            return 0 - 1
+        return ws.value().val + x
+    return s.cb(1)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    print("{probe.peak_kb()}")

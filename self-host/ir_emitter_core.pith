@@ -680,6 +680,26 @@ fn ir_rc_track_local(name: String, kind: String):
         ir_string_locals.push(name)
         ir_rc_local_kinds.push(kind)
 
+# weak locals captured from an enclosing function, live only while a lambda
+# body emits (saved and restored around it, so nesting composes). reads of
+# these wrap in the weak liveness resolution exactly like a weak local's,
+# but the names are NOT tracked in ir_string_locals: the closure environment
+# owns the single weak reference — dropped by its tag-8 slot when the
+# closure frees — so the lambda's per-call exit cleanup must leave the slot
+# alone or the weak count underflows.
+mut ir_weak_capture_names: List[String] := []
+
+# true when reading `name` must resolve liveness through
+# pith_struct_weak_load: a weak local of the emitting function, or a weak
+# binding captured from the enclosing one. a loop variable shadowing the
+# name reads its own slot (a strong element) and stays plain.
+fn ir_name_is_weak_read(name: String) -> Bool:
+    if ir_loop_var_slot(name).len() > 0:
+        return false
+    if ir_rc_local_kind(name) == "weak":
+        return true
+    return ir_weak_capture_names.contains(name)
+
 # true when the expression reads a value some other owner keeps a count
 # for: variables, collection elements, struct fields. anything else that
 # produces a string (concat, substring, to_string, ...) hands us a fresh
@@ -2324,11 +2344,12 @@ fn ir_method_receiver_type(node: Node) -> String:
 # throwaway shell instead of leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
-    # a weak LOCAL read mints the same throwaway shell as a weak field read
+    # a weak LOCAL read — or a read of a weak binding captured into the
+    # emitting lambda — mints the same throwaway shell as a weak field read
     # (see ir_emit_ident_load); a loop variable shadowing the name reads its
     # own slot plainly and must not have a shell freed out from under it.
     if node.kind == "ident":
-        return ir_loop_var_slot(node.value).len() == 0 and ir_rc_local_kind(node.value) == "weak"
+        return ir_name_is_weak_read(node.value)
     if node.kind != "field_access":
         return false
     if node.children.len() == 0:
@@ -2619,6 +2640,8 @@ fn ir_closure_capture_tag(kind: String) -> Int:
         return 6
     if kind == "closure":
         return 7
+    if kind == "weak":
+        return 8
     return 0
 
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
@@ -2626,13 +2649,21 @@ fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
         cap_val := ir_reg()
         # this reads the enclosing scope, so a captured loop variable has to
         # come from the loop's own slot, not the function local it shadows.
+        # for a weak local this hands over the BARE target pointer — the
+        # slot's raw value, not a liveness-resolved optional — which is the
+        # whole point: the closure refers to the target without owning it.
         ir_emit_name_load(cap_val, capture_name)
         slot := ir_reg()
         ir_emit("iconst " + slot.to_string() + " " + i.to_string())
         # the closure environment keeps its own count on captured rc values
         # so the origin scope's cleanup cannot pull them out from under it;
-        # the tag lets the closure drop that count when it is freed.
-        cap_kind := ir_rc_kind(ir_lookup_name_type(capture_name))
+        # the tag lets the closure drop that count when it is freed. a weak
+        # local overrides the type-derived kind: its type reads optional,
+        # but the slot holds a raw pointer counted on the WEAK count, so the
+        # closure takes (and later drops) a weak reference instead.
+        mut cap_kind := ir_rc_kind(ir_lookup_name_type(capture_name))
+        if ir_name_is_weak_read(capture_name):
+            cap_kind = "weak"
         if cap_kind.len() > 0:
             ir_rc_retain_reg(cap_val, cap_kind)
             tag_r := ir_reg()
@@ -5291,6 +5322,15 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_lambda_count = ir_lambda_count + 1
     parts := ir_collect_lambda_parts(idx)
 
+    # decide which captures are weak while the ENCLOSING function's kind
+    # state is still in place — the body emission below clears it. these
+    # names read through the weak liveness resolution inside the lambda,
+    # and the capture setup at the bottom stores them under tag 8.
+    mut lambda_weak_caps: List[String] := []
+    for cap in parts.captures:
+        if ir_name_is_weak_read(cap):
+            lambda_weak_caps.push(cap)
+
     # save current state and emit lambda to deferred buffer
     saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
@@ -5304,12 +5344,14 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_loop_iter_vars := ir_loop_iter_vars
     saved_loop_iter_kinds := ir_loop_iter_kinds
     saved_loop_var_slots := ir_loop_var_slots
+    saved_weak_caps := ir_weak_capture_names
     ir_string_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
+    ir_weak_capture_names = lambda_weak_caps
     ir_reset_lambda_emit_state()
     # a lambda defined inside main is not main: an error return in its body
     # goes to whoever called the lambda, not out of the process.
@@ -5330,6 +5372,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
     ir_loop_var_slots = saved_loop_var_slots
+    # restored before the capture setup below, so a nested lambda's setup
+    # still sees which of the ENCLOSING lambda's names are weak captures
+    ir_weak_capture_names = saved_weak_caps
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -5475,12 +5520,12 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
     # normal variables and globals still load through storage; threadlocal
     # globals route through the tls runtime inside ir_emit_name_load.
     ir_emit_name_load(r, name)
-    # a weak local's slot holds the bare target pointer, so every read
-    # resolves liveness fresh through pith_struct_weak_load and hands back
-    # the optional the checker typed it as — Some(target) while it is
-    # alive, none once it has been reclaimed. a loop variable shadowing
-    # the name reads its own slot (a strong element) and stays plain.
-    if ir_loop_var_slot(name).len() == 0 and ir_rc_local_kind(name) == "weak":
+    # a weak local's slot — or a weak binding captured from the enclosing
+    # function — holds the bare target pointer, so every read resolves
+    # liveness fresh through pith_struct_weak_load and hands back the
+    # optional the checker typed it as: Some(target) while it is alive,
+    # none once it has been reclaimed.
+    if ir_name_is_weak_read(name):
         return ir_emit_weak_read(r)
     return r
 

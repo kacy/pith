@@ -1720,21 +1720,15 @@ fn collection_literal_matches_target(value_idx: Int, target_tid: Int, scope_id: 
 # payload) would make reads of the weak one lower without the liveness
 # resolution — a wrong value, not a leak. a weak name must therefore be unique
 # in its function, in both directions. reset per function body; lambda bodies
-# do NOT reset (they nest inside the function, and a lambda referencing an
-# enclosing weak binding is rejected until weak capture lands).
+# do NOT reset — they nest inside the function, and a lambda referencing an
+# enclosing weak binding captures it weakly through the closure environment.
 mut fn_bound_names: List[String] := []
 mut fn_weak_names: List[String] := []
-# weak binding arena index -> lambda nesting depth at its definition. a read
-# at a deeper depth is a closure capture, which has no weak-aware environment
-# slot yet; shadowing inside the lambda resolves to a different arena index,
-# so it stays allowed.
-mut weak_def_lambda_depth: Map[Int, Int] := {}
 mut checker_lambda_depth := 0
 
 fn reset_fn_weak_tracking():
     fn_bound_names = []
     fn_weak_names = []
-    weak_def_lambda_depth = {}
     checker_lambda_depth = 0
 
 # record a non-weak binding name (param, loop variable, match payload, plain
@@ -1830,9 +1824,6 @@ fn check_weak_binding(node_idx: Int, scope_id: Int, name: String):
         define_binding_at(scope_id, name, TID_ERR, false, node_idx)
         return
     define_binding_at(scope_id, name, add_type_info(ti_optional(val_type)), false, node_idx)
-    # remember where this weak binding lives so a read from inside a lambda —
-    # a closure capture — can be rejected until weak capture support exists.
-    weak_def_lambda_depth.insert(lookup_binding_index(scope_id, name), checker_lambda_depth)
 
 # ---------------------------------------------------------------
 # assignment statement
@@ -2369,18 +2360,6 @@ fn from_import_source_module(name: String) -> String:
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
-        # a weak binding read from inside a lambda is a closure capture, and
-        # the closure environment has no weak-aware slot yet: the capture
-        # would hold the target strongly (defeating the point) or dangle.
-        # a lambda-local shadow of the name resolves to a different arena
-        # index, so shadowing stays allowed. gated on both counters so code
-        # without weak bindings never pays the extra scope-chain walk —
-        # this runs on every identifier use in every module.
-        if checker_lambda_depth > 0 and weak_def_lambda_depth.len() > 0:
-            weak_idx := lookup_binding_index(scope_id, name)
-            if weak_def_lambda_depth.contains_key(weak_idx) and checker_lambda_depth > weak_def_lambda_depth[weak_idx]:
-                report_error_at(node_idx, "E261", "a closure cannot capture the weak binding '" + name + "' yet; bind it strongly before the lambda")
-                return TID_ERR
         # a name defined by another module resolves only through an
         # import; the shared global scope would otherwise let it leak
         # across modules and die later in emission. builtins and the

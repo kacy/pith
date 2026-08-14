@@ -1,3 +1,5 @@
+import std.strings as strings
+
 # replace over inputs shorter than the needle. an empty haystack used to
 # read one byte past the end of the string and abort the process.
 fn main():
@@ -9,3 +11,7 @@ fn main():
     print("[{"".replace("", "X")}]")
     print("[{"aaa".replace("a", "")}]")
     print("[{"banana".replace("na", "NA")}]")
+    # replace_n with an explicit count exercises the bounded path directly,
+    # including a multi-byte tail that must survive the piece-join rebuild.
+    print("[{strings.replace_n("banana", "a", "X", 2)}]")
+    print("[{strings.replace_n("café-café", "-", " | ", 9)}]")

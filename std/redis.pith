@@ -250,10 +250,13 @@ impl Client:
     # server error reply (RESP `-ERR ...`) surfaces as a failed result rather
     # than a value, so callers do not silently read a default past an error.
     pub fn command(args: List[String]) -> Reply!:
-        mut out := "*{args.len()}\r\n"
+        # build the RESP array through a piece list joined once: concatenating
+        # each argument onto a growing string is quadratic in the total command
+        # size, which bites on a pipeline or a bulk value.
+        mut parts: List[String] := ["*{args.len()}\r\n"]
         for a in args:
-            out = out + "${a.len()}\r\n{a}\r\n"
-        tcp.write_all(self.fd, out)!
+            parts.push("${a.len()}\r\n{a}\r\n")
+        tcp.write_all(self.fd, parts.join(""))!
         reply := self.read_reply()!
         if reply_is_error(reply):
             fail "redis: {reply_text(reply)}"

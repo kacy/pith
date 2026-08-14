@@ -120,12 +120,20 @@ impl Conn:
             return tls.conn_from_handle(self.tls_handle).read_bytes(4096)!
         return tcp_read_bytes(self.fd, 4096)!
 
+    # read exactly `n` bytes. the unconsumed tail moves into a growable buffer
+    # once and chunks append to it, so a packet spanning many reads costs one
+    # copy per chunk rather than recopying everything buffered so far each time.
     fn recv_exact(n: Int) -> Bytes!:
-        while bytes.len(self.buf) - self.pos < n:
-            chunk := self.recv_chunk()!
-            if bytes.len(chunk) == 0:
-                fail "mysql: connection closed"
-            self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
+        if bytes.len(self.buf) - self.pos < n:
+            acc := bytes.buffer()
+            errdefer acc.free()
+            acc.write(bytes.slice(self.buf, self.pos, bytes.len(self.buf))) catch 0
+            while acc.len() < n:
+                chunk := self.recv_chunk()!
+                if bytes.len(chunk) == 0:
+                    fail "mysql: connection closed"
+                acc.write(chunk) catch 0
+            self.buf = acc.take_bytes()
             self.pos = 0
         out := bytes.slice(self.buf, self.pos, self.pos + n)
         self.pos = self.pos + n
@@ -168,6 +176,12 @@ impl Conn:
 CAPS_BASE := 557577
 # CLIENT_SSL, added to request a tls upgrade before the handshake response.
 CAP_SSL := 2048
+
+# columns in one result set. the count is a length-encoded integer off an
+# untrusted socket, so an 8-byte encoding can be huge or wrap negative, and an
+# unchecked count drives that many packet reads. a real result set never
+# approaches this.
+MAX_COLUMNS := 4096
 
 # the mysql_native_password scramble:
 #   SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))
@@ -298,6 +312,10 @@ impl Conn:
     fn finish_auth(password: String) -> Bool!:
         while true:
             reply := self.read_packet()!
+            # bytes.get reads 0 past the end, so an empty packet would pass as
+            # the OK marker. an empty auth reply is malformed, not success.
+            if bytes.len(reply) == 0:
+                fail "mysql: empty auth reply"
             marker := bytes.get(reply, 0)
             if marker == 0:
                 return true
@@ -429,6 +447,8 @@ pub fn query(conn: Conn, text: String) -> Rows!:
 
     count_reader := Reader(data: first, pos: 0)
     column_count := count_reader.lenenc()
+    if column_count < 0 or column_count > MAX_COLUMNS:
+        fail "mysql: column count {column_count} is out of range"
 
     # column definitions: keep each column's name and mysql type.
     mut names: List[String] := []
@@ -647,6 +667,8 @@ fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
 
     header := Reader(data: first, pos: 0)
     column_count := header.lenenc()
+    if column_count < 0 or column_count > MAX_COLUMNS:
+        fail "mysql: column count {column_count} is out of range"
     mut names: List[String] := []
     mut types: List[Int] := []
     mut c := 0

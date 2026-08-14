@@ -1,0 +1,187 @@
+# the postgres client against a hostile server: every crafted reply must come
+# back as an error from the driver, never a crash, a hang, or a silent success.
+#
+# each scenario runs a stub server on its own loopback port that answers the
+# client's real handshake with attacker-chosen bytes:
+#   - a frame length past MAX_MESSAGE_LEN, which used to drive an unbounded read
+#   - a SCRAM SASLFinal carrying a forged server signature
+#   - an AuthenticationOk that skips the SCRAM signature round entirely
+#   - a DataRow whose field length runs past the end of the message
+# a final scenario delivers a legitimate response a few kilobytes at a time to
+# show the chunked reassembly still produces the right row.
+
+import std.postgres as postgres
+import std.bytes as bytes
+import std.bits as bits
+import std.net.tcp as tcp
+import std.time as time
+from std.collections import copy_list
+
+fn min_int(a: Int, b: Int) -> Int:
+    if a < b:
+        return a
+    return b
+
+fn byte1(value: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(value) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# a 4-byte big-endian integer.
+fn be32(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 24))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 16))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# a 2-byte big-endian integer.
+fn be16(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# concatenate parts without nesting bytes.concat calls.
+fn cat(parts: List[Bytes]) -> Bytes:
+    out := bytes.buffer()
+    for part in parts:
+        out.write(part) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+fn str(text: String) -> Bytes:
+    return bytes.from_string_utf8(text)
+
+# a string plus its null terminator, the wire's cstring form.
+fn cstr(text: String) -> Bytes:
+    return cat([str(text), byte1(0)])
+
+# a framed backend message: [type:1][length:4][payload].
+fn pg_msg(mtype: Int, payload: Bytes) -> Bytes:
+    return cat([byte1(mtype), be32(bytes.len(payload) + 4), payload])
+
+fn auth_ok() -> Bytes:
+    return pg_msg(82, be32(0))
+
+fn ready() -> Bytes:
+    return pg_msg(90, str("I"))
+
+fn auth_sasl() -> Bytes:
+    return pg_msg(82, cat([be32(10), cstr("SCRAM-SHA-256"), byte1(0)]))
+
+fn sasl_continue() -> Bytes:
+    return pg_msg(82, cat([be32(11), str("r=stubnonce,s=QSXCR+Q6sek8bf92,i=4096")]))
+
+# `count` bytes of 'x'.
+fn xs(count: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < count:
+        out.write_byte(120) catch 0
+        i = i + 1
+    result := out.bytes()
+    out.free()
+    return result
+
+# answer each client message with the next scripted reply, `piece` bytes at a
+# time. the pause between pieces keeps the kernel from coalescing them back
+# into one read; `piece` at or above the reply length means one write.
+fn serve(listener: Int, replies: List[Bytes], piece: Int) -> Int!:
+    conn := tcp_accept(listener)!
+    for reply in replies:
+        request := tcp_read_bytes(conn, 4096)!
+        if bytes.len(request) == 0:
+            tcp_close(conn)
+            return 0
+        mut off := 0
+        while off < bytes.len(reply):
+            stop := min_int(off + piece, bytes.len(reply))
+            wrote := tcp.write_all_bytes(conn, bytes.slice(reply, off, stop)) catch 0
+            if wrote == 0:
+                tcp_close(conn)
+                return 0
+            off = off + wrote
+            if piece < bytes.len(reply):
+                time.delay(1)
+    tcp_close(conn)
+    return 0
+
+# drive a real connect against the scripted stub and report how it ended.
+fn connect_case(label: String, port: Int, replies: List[Bytes]) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve(listener, copy_list(replies), 65536)
+    conn := postgres.connect("127.0.0.1", port, "user", "pencil", "db")
+    if conn.is_err:
+        print(label + ": " + conn.err)
+    else:
+        print(label + ": unexpectedly connected")
+        conn.ok.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+# connect through a permissive stub handshake, run one query, and report how
+# the query ended. `piece` controls how the stub fragments its replies.
+fn query_case(label: String, port: Int, response: Bytes, piece: Int) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    replies := [cat([auth_ok(), ready()]), response]
+    task := spawn serve(listener, copy_list(replies), piece)
+    conn := postgres.connect("127.0.0.1", port, "user", "pw", "db")!
+    rows := postgres.query(conn, "select x")
+    if rows.is_err:
+        print(label + ": " + rows.err)
+    else:
+        mut got := ""
+        for row in rows.ok:
+            got = row.as_text(0)
+        print(label + ": " + got.len().to_string() + " bytes")
+    conn.close()
+    await task
+    tcp_close(listener)
+    return 0
+
+fn main() -> Int!:
+    # a frame length past the cap must be refused before it drives a read that
+    # would buffer (up to) 4 GiB from a server we have not authenticated.
+    connect_case("oversized frame", 17560, [cat([byte1(82), be32(2147483647)])])!
+
+    # a SASLFinal whose v= does not match the signature derived from the
+    # password must end the handshake: only a server that verified the
+    # password can compute the real one.
+    connect_case("forged signature", 17561, [
+        auth_sasl(),
+        sasl_continue(),
+        pg_msg(82, cat([be32(12), str("v=Zm9yZ2Vk")])),
+])!
+
+    # an AuthenticationOk with the SCRAM signature round skipped is what a MITM
+    # that never saw the password would send.
+    connect_case("skipped verification", 17562, [
+        auth_sasl(),
+        sasl_continue(),
+        cat([auth_ok(), ready()]),
+])!
+
+    # a DataRow field length that runs past its message must not swallow the
+    # row or push the cursor out of range.
+    evil_row := pg_msg(68, cat([be16(1), be32(1000), str("xx")]))
+    query_case("datarow overrun", 17563, evil_row, 65536)!
+
+    # a legitimate response fragmented into small pieces still reassembles: one
+    # text column, one 60000-byte value, delivered across many reads.
+    row_desc := pg_msg(84, cat([be16(1), cstr("a"), be32(0), be16(0), be32(25), be16(0), be32(0), be16(0)]))
+    data_row := pg_msg(68, cat([be16(1), be32(60000), xs(60000)]))
+    done := pg_msg(67, cstr("SELECT 1"))
+    query_case("split frames", 17564, cat([row_desc, data_row, done, ready()]), 4001)!
+
+    print("alive")
+    return 0

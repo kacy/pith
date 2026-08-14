@@ -57,6 +57,14 @@ HTTP_FILE_STREAM_CHUNK_SIZE := 4096
 pub MAX_HEADER_BYTES := 65536
 pub MAX_REQUEST_BODY := 10485760
 
+# a chunked-transfer chunk-size line (a hex length plus optional
+# extensions) and a trailer line are both tiny in any real request. this
+# caps the bytes read while scanning for one line's terminating newline,
+# so a peer streaming a newline-less flood on the chunked path cannot grow
+# the buffer until the allocator aborts — the chunk-size *value* is already
+# checked against MAX_REQUEST_BODY, but the line's own length was not.
+CHUNK_LINE_LIMIT := 8192
+
 # the messages the head and body readers fail with when a limit is exceeded. the
 # serve loops match on them to answer with the right status (431 / 413) and then
 # close the connection, so a rejected request never leaves unread body bytes to be
@@ -1129,13 +1137,13 @@ fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
     out := bytes.buffer()
     errdefer out.free()
     while true:
-        line := reader.read_until_bytes_including(nl)!
+        line := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
         if line.is_empty():
             fail "incomplete chunk size"
         chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
         if chunk_size == 0:
             while true:
-                trailer := reader.read_until_bytes_including(nl)!
+                trailer := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
         # check the declared chunk size against the limit BEFORE reading it, so a
@@ -1161,13 +1169,17 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
         out.write(chunk)!
     return out.take_bytes()
 
-fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes) -> Bytes!:
+# `cap` bounds the bytes read before the separator, so a tls peer that
+# never sends it cannot grow `out` without bound; 0 or less means no limit.
+fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
     out := bytes.buffer()
     errdefer out.free()
     mut window := bytes.empty()
     while true:
+        if cap > 0 and out.len() > cap:
+            fail "read_until exceeded {cap} bytes without the separator"
         chunk := conn.read_bytes(1)!
         if chunk.is_empty():
             return out.take_bytes()
@@ -1193,13 +1205,13 @@ fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
     out := bytes.buffer()
     errdefer out.free()
     while true:
-        line := read_until_including_from_tls(conn, nl)!
+        line := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
         if line.is_empty():
             fail "incomplete chunk size"
         chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
         if chunk_size == 0:
             while true:
-                trailer := read_until_including_from_tls(conn, nl)!
+                trailer := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
         # check the declared chunk size against the limit BEFORE reading it, so a
@@ -1353,13 +1365,13 @@ fn stream_chunked_body_from_reader(reader: BufferedBytesReader, writer: Buffered
     nl := bytes.from_string_utf8(chr(10))
     mut total := 0
     while true:
-        line := reader.read_until_bytes_including(nl)!
+        line := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
         if line.is_empty():
             fail "incomplete chunk size"
         chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
         if chunk_size == 0:
             while true:
-                trailer := reader.read_until_bytes_including(nl)!
+                trailer := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     writer.flush()!
                     return total
@@ -1370,13 +1382,13 @@ fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> 
     nl := bytes.from_string_utf8(chr(10))
     mut total := 0
     while true:
-        line := read_until_including_from_tls(conn, nl)!
+        line := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
         if line.is_empty():
             fail "incomplete chunk size"
         chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
         if chunk_size == 0:
             while true:
-                trailer := read_until_including_from_tls(conn, nl)!
+                trailer := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     writer.flush()!
                     return total

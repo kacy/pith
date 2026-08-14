@@ -286,6 +286,13 @@ impl BufferedBytesReader:
     fn read_until_bytes_including(sep: Bytes) -> Bytes!:
         return buffered_bytes_reader_read_until_including_internal(self, sep)
 
+    # like read_until_bytes_including, but fails once the accumulated bytes
+    # pass `cap` before the separator arrives — so a peer that never sends
+    # the separator cannot grow the buffer without bound. a `cap` of 0 or
+    # less means no limit, matching the unbounded form.
+    fn read_until_bytes_including_bounded(sep: Bytes, cap: Int) -> Bytes!:
+        return buffered_bytes_reader_read_until_with_sep_internal(self, sep, true, cap)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
 
@@ -1839,12 +1846,15 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
     return buf.take_bytes()
 
 fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
-    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, false)
+    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, false, 0)
 
 fn buffered_bytes_reader_read_until_including_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
-    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, true)
+    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, true, 0)
 
-fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReader, sep: Bytes, include_sep: Bool) -> Bytes!:
+# `cap` bounds the bytes accumulated before the separator is found: a
+# positive value fails a peer that floods without ever sending it, 0 or
+# less leaves the read unbounded (what the two wrappers above pass).
+fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReader, sep: Bytes, include_sep: Bool, cap: Int) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
     if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
@@ -1852,6 +1862,8 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
 
     buf := bytes.buffer()
     while true:
+        if cap > 0 and buf.len() > cap:
+            fail "read_until exceeded {cap} bytes without the separator"
         mut cached := buffered_bytes_reader_cache_get(reader.handle)
         sep_pos := find_bytes_sep(cached, sep)
         if sep_pos >= 0:

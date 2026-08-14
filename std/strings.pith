@@ -610,24 +610,27 @@ pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
     if count <= 0 or old.len() == 0:
         return s
 
-    mut result := ""
+    # collect the pieces and join once at the end: appending each unmatched
+    # character onto a growing string would recopy the whole accumulator every
+    # step, which is quadratic in the length of the input.
+    mut parts: List[String] := []
     mut pos := 0
     mut replacements := 0
 
     while pos < s.len() and replacements < count:
         if starts_with_at(s, old, pos):
-            result = result + new
+            parts.push(new)
             pos = pos + old.len()
             replacements = replacements + 1
         else:
-            result = result + s[pos]
+            parts.push(s[pos])
             pos = pos + 1
 
     while pos < s.len():
-        result = result + s[pos]
+        parts.push(s[pos])
         pos = pos + 1
 
-    return result
+    return parts.join("")
 
 fn shared_prefix(a: String, b: String) -> String:
     mut i := 0

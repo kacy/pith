@@ -1,0 +1,31 @@
+# constructing a no-payload variant through a module alias used to emit a
+# data field read on the alias chain — `sh.Phase` is a type reference, not
+# a value — and the build died with "field instructions must include an
+# explicit offset". the alias form must lower exactly like the bare form,
+# for both a boxed enum (payload variant elsewhere) and an unboxed one.
+
+import alias_enum_shapes as sh
+from alias_enum_shapes import Phase, Dir
+
+fn main():
+    a := sh.Phase.Alpha
+    match a:
+        Phase.Zed(x) => print("zed {x}")
+        Phase.Alpha => print("alpha")
+
+    # the payload variant arrives as a call and always worked; pin it so the
+    # two construction paths stay in agreement.
+    z := sh.Phase.Zed("hi")
+    match z:
+        Phase.Zed(x) => print("zed {x}")
+        Phase.Alpha => print("alpha")
+
+    d := sh2_pick()
+    match d:
+        Dir.North => print("north")
+        Dir.South => print("south")
+    if d == sh.Dir.South:
+        print("eq works")
+
+fn sh2_pick() -> Dir:
+    return sh.Dir.South

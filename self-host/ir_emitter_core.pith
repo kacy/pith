@@ -6186,6 +6186,23 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
                 r := ir_reg()
                 ir_emit("load " + r.to_string() + " " + ir_import_target_name(module_path, fname))
                 return r
+        # an alias-qualified no-payload variant: `sh.Phase.Alpha` arrives here
+        # with fname Alpha and a field_access receiver whose base is the module
+        # alias. the receiver names a type, not a value, so it must not be
+        # evaluated — emit the same construction the bare Phase.Alpha path
+        # does. payload variants never reach here (they are calls).
+        if recv_node.kind == "field_access" and recv_node.children.len() > 0:
+            base_node := get_node(recv_node.children[0])
+            if base_node.kind == "ident" and ir_module_aliases.contains_key(base_node.value):
+                ename := recv_node.value
+                variant_key := ename + "." + fname
+                if ir_struct_field_index_lookup.contains_key(variant_key):
+                    if ir_struct_field_lookup.contains_key(variant_key) and ir_struct_field_lookup[variant_key] == ename:
+                        if ir_boxed_enums.contains_key(ename):
+                            return ir_emit_variant_alloc(ename, variant_key, 0)
+                        r := ir_reg()
+                        ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
+                        return r
         obj_r := ir_expr(node.children[0])
         # result fields are special: `.ok` and status checks read the tagged value,
         # not a struct field.

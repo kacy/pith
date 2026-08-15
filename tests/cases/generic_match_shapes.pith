@@ -1,0 +1,14 @@
+# helper module for test_generic_match_binding: a payload enum consumed by a
+# generic function that came from another module, so the specialization is
+# emitted in the importing program.
+pub enum Route:
+    Zed(String)
+    Alpha(Int, Int)
+    Beta
+
+pub fn weigh[T](v: T, e: Route) -> Int:
+    bonus := match e:
+        Route.Zed(b0) => b0.len()
+        Route.Alpha(b0, b1) => b0 + b1
+        Route.Beta => 6
+    return bonus

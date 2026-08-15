@@ -1,0 +1,57 @@
+# a generic type may reference itself in a field or payload. instantiation
+# used to resolve field types BEFORE registering the instance name, so
+# Node[Int]'s `next: Node[T]?` re-entered instantiation forever and the
+# checker died by stack overflow. the instance is now registered as an empty
+# shell first and filled in after its fields resolve.
+
+struct Node[T]:
+    value: T
+    next: Node[T]?
+
+# mutual recursion across two generic structs exercises the same floor:
+# Alpha[Int] resolves Beta[Int] mid-flight, which resolves Alpha[Int] again.
+struct Alpha[T]:
+    tag: T
+    twin: Beta[T]?
+
+struct Beta[T]:
+    tag: T
+    twin: Alpha[T]?
+
+# a variant payload naming its own enum goes through the enum twin of the
+# same instantiation path.
+enum Chain[T]:
+    Link(T, Chain[T]?)
+    End
+
+fn make_pair() -> Chain[Int]:
+    tail: Chain[Int] := Chain.Link(2, none)
+    return Chain.Link(1, tail)
+
+fn main():
+    a := Node[Int](value: 1, next: none)
+    b := Node[Int](value: 2, next: a)
+    c := Node[Int](value: 3, next: b)
+    mut sum := 0
+    mut cur: Node[Int]? := c
+    while true:
+        if let n = cur:
+            sum = sum + n.value
+            cur = n.next
+        else:
+            break
+    print("sum {sum}")
+
+    # a second instantiation of the same recursive base must not collide
+    s := Node[String](value: "leaf", next: none)
+    t := Node[String](value: "root", next: s)
+    if let inner = t.next:
+        print("{t.value}->{inner.value}")
+
+    x := Alpha[Int](tag: 10, twin: none)
+    y := Beta[Int](tag: 20, twin: x)
+    if let back = y.twin:
+        print("mutual {back.tag}")
+
+    pair := make_pair()
+    print("chain built")

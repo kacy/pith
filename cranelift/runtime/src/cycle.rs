@@ -1763,6 +1763,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn stop_catches_mutators_at_their_gates() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1814,6 +1815,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn stop_times_out_on_a_mutator_that_never_gates() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1848,6 +1850,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_bracketed_wait_counts_as_stopped_and_the_exit_parks() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1904,6 +1907,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn exited_slots_are_skipped_by_the_rendezvous() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1923,6 +1927,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn with_world_stopped_runs_the_closure_against_a_parked_world() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1981,15 +1986,18 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(false);
 
-        let before = mutators_len_for_tests();
+        // the property is thread-local: this thread's gates and brackets
+        // must not register it. the global slot count is not stable here —
+        // an unrelated test spawning the green workers registers theirs
+        // concurrently, so counting the registry races.
+        assert!(existing_mutator_slot().is_none(), "no slot before");
         mutator_gate();
         {
             let _native = native_bracket();
         }
         adopt_mutator_slot(mutator_slot_for_spawn());
-        assert_eq!(
-            mutators_len_for_tests(),
-            before,
+        assert!(
+            existing_mutator_slot().is_none(),
             "no slot registered with the flag off"
         );
         assert!(
@@ -2066,6 +2074,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_garbage_two_struct_ring_is_collected_exactly_once() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2104,6 +2113,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_ring_with_a_live_external_owner_is_kept_until_the_owner_drops() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2142,6 +2152,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_dtor_less_box_is_a_leaf_the_collector_never_frees() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2171,6 +2182,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_closure_capture_ring_is_collected_through_the_env_slots() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2205,6 +2217,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_collection_drains_the_graveyard() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2230,6 +2243,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_forced_collect_reclaims_a_ring_and_reports_success() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2258,6 +2272,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_forced_collect_reports_failure_when_a_spinner_prevents_the_stop() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -2283,6 +2298,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn a_forced_collect_with_the_flag_off_reports_failure_immediately() {
         let _guard = locked();
         force_enabled_for_tests(false);

@@ -2638,6 +2638,13 @@ fn ir_closure_capture_tag(kind: String) -> Int:
         return 5
     if kind == "struct":
         return 6
+    # a tuple (an optional, result, or tuple literal) is a struct-header
+    # allocation, so the struct tag releases it correctly — through
+    # pith_struct_release and the box's own attached dtor. without this
+    # the capture retains the box (ir_rc_retain_reg handles "tuple") but
+    # tags it 0, so the closure never lets go of it.
+    if kind == "tuple":
+        return 6
     if kind == "closure":
         return 7
     if kind == "weak":

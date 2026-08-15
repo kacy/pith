@@ -1,0 +1,29 @@
+# two match arms may bind the same name to payloads of different shapes.
+# when one arm's payload is refcounted (a struct) and a sibling's is a
+# plain value (an Int), the exit cleanup used to release the name as the
+# rc kind regardless of which arm ran — dereferencing whatever integer
+# the plain arm stored, a segfault after the program's last print. such
+# a name is now dropped from tracking (a bounded leak, never a wild
+# pointer), the same rule := bindings always had.
+
+struct Pack:
+    inner: Int
+
+enum G:
+    Zed(Pack, Pack)
+    Beta(Int, String)
+
+fn main():
+    # the plain-value arm runs last, so the shared name holds an Int at exit
+    e := G.Beta(3360, "s")
+    match e:
+        G.Zed(x0, x1) => print("zed {x0.inner}")
+        G.Beta(x0, x1) => print("beta {x0} {x1}")
+
+    # and the rc arm running last must still print through the binding
+    z := G.Zed(Pack(inner: 7), Pack(inner: 8))
+    match z:
+        G.Zed(x0, x1) => print("zed {x0.inner} {x1.inner}")
+        G.Beta(x0, x1) => print("beta {x0}")
+
+    print("done")

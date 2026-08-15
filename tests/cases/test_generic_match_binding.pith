@@ -1,0 +1,41 @@
+# a generic specialization's body used to skip the string prologue, so a
+# match payload binding — whose store releases the binding's previous
+# value — loaded a name the ir had never declared and the build died with
+# "unknown load source". every other body path (fn, main, test, impl
+# method) ran the prologue; specializations now do too. covers the local
+# and the cross-module (re-emitted) specialization, expression and
+# statement matches, and rc (String) and plain (Int) payloads.
+
+import generic_match_shapes as gm
+from generic_match_shapes import Route
+
+fn local_weigh[T](v: T, e: Route) -> Int:
+    bonus := match e:
+        Route.Zed(b0) => b0.len()
+        Route.Alpha(b0, b1) => b0 + b1
+        Route.Beta => 6
+    return bonus
+
+fn stmt_weigh[T](v: T, e: Route) -> Int:
+    match e:
+        Route.Zed(b0) =>
+            return b0.len()
+        Route.Alpha(b0, b1) =>
+            return b0 * b1
+        Route.Beta =>
+            return 6
+    return 0
+
+fn zed() -> Route:
+    return Route.Zed("hello")
+
+fn alpha() -> Route:
+    return Route.Alpha(3, 4)
+
+fn main():
+    print("local {local_weigh("x", zed())}")
+    print("local2 {local_weigh(7, alpha())}")
+    print("cross {gm.weigh("x", zed())}")
+    print("cross2 {gm.weigh(true, alpha())}")
+    print("stmt {stmt_weigh("x", zed())}")
+    print("stmt2 {stmt_weigh(1, alpha())}")

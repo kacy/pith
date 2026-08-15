@@ -361,6 +361,11 @@ struct PithClosure {
     ref_count: std::sync::atomic::AtomicI64,
     env: [i64; PITH_CLOSURE_ENV_SLOTS],
     env_tags: [u8; PITH_CLOSURE_ENV_SLOTS],
+    // bit 0: this closure sits in the cycle collector's suspect buffer.
+    // appended at the end on purpose — the layout is #[repr(C)] and nothing
+    // outside the runtime reads past env_tags, so the early offsets the
+    // codegen could bake stay where they were.
+    cycle_flags: std::sync::atomic::AtomicU8,
 }
 
 /// Validate a closure handle by its magic word. Returns the typed
@@ -410,6 +415,7 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
         ref_count: std::sync::atomic::AtomicI64::new(1),
         env: [0; PITH_CLOSURE_ENV_SLOTS],
         env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
+        cycle_flags: std::sync::atomic::AtomicU8::new(0),
     }));
     ptr as i64
 }
@@ -439,6 +445,15 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     let Some(closure) = pith_closure_ref(handle) else {
         return;
     };
+    // cycle-gc suspect hook, before our count is given up: while we still
+    // hold it the closure cannot die under the hook, which is what makes
+    // marking it safe against a concurrent final release (see
+    // `maybe_suspect_struct` for the full argument).
+    if crate::cycle::cycle_gc_enabled()
+        && closure.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 1
+    {
+        maybe_suspect_closure(closure, handle);
+    }
     let prev = closure
         .ref_count
         .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -456,10 +471,61 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     for slot in 0..PITH_CLOSURE_ENV_SLOTS {
         release_captured_value(closure.env[slot], closure.env_tags[slot]);
     }
+    let buffered = closure
+        .cycle_flags
+        .load(std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0;
     // scrub the magic so a stale handle fails closure_base before we
     // hand the box back to the allocator.
     (handle as *mut u32).write(0);
+    // a closure that dies while the suspect buffer points at it keeps its
+    // shell: the captures above are already released, so deferring only the
+    // box drop to the graveyard leaks the shell until the collector frees it,
+    // and the scrubbed magic keeps the buffered handle from validating.
+    if buffered && crate::cycle::cycle_gc_enabled() {
+        crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
+        return;
+    }
     drop(Box::from_raw(handle as *mut PithClosure));
+}
+
+/// Mark a closure as a cycle suspect and hand it to the buffer. Outlined and
+/// cold for the same reason the perf recorders are: the release fast path
+/// must stay frameless when the flag is off.
+#[cold]
+#[inline(never)]
+unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
+    if closure
+        .cycle_flags
+        .fetch_or(1, std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0
+    {
+        return; // already buffered
+    }
+    crate::cycle::cycle_suspect(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
+}
+
+/// Drop a closure's buffered mark (overflow, or a collector drain). Magic-
+/// checked, so a closure that already died and was freed is a no-op.
+pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
+    if let Some(closure) = pith_closure_ref(handle) {
+        closure
+            .cycle_flags
+            .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn closure_buffered_for_tests(handle: i64) -> bool {
+    pith_closure_ref(handle).is_some_and(|closure| {
+        closure
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0
+    })
 }
 
 #[no_mangle]
@@ -1786,6 +1852,15 @@ unsafe fn struct_weak(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
 // one thread while a weak reference reads it on another. the release store
 // pairs with the acquire load in `pith_struct_weak_load`, so a reader that
 // observes the value as dead also observes everything the destructor did.
+//
+// the word is a bitfield now, so every reader and writer must be bit-aware:
+// bit 0 is the death flag, bit 1 marks the struct as sitting in the cycle
+// collector's suspect buffer. death is fetch_or, not a plain store, so it
+// cannot erase a concurrent buffering; the alive test is `& STRUCT_DEAD_BIT`,
+// never `!= 0`.
+pub(crate) const STRUCT_DEAD_BIT: u32 = 1;
+pub(crate) const STRUCT_BUFFERED_BIT: u32 = 2;
+
 unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
     &*(base.add(STRUCT_OFF_DEAD) as *const std::sync::atomic::AtomicU32)
 }
@@ -1872,6 +1947,17 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         return;
     };
     let strong = struct_strong(base);
+    // cycle-gc suspect hook, placed before our count is given up rather than
+    // in the prev > 1 arm below. the ordering is load-bearing: while we still
+    // hold a strong count the header cannot be freed, so the buffered bit and
+    // the buffer's weak retain land on live memory. after the fetch_sub a
+    // concurrent owner can finish the whole death path — including the weak
+    // drop that frees the header — under the hook's feet. if other owners
+    // release between this load and our decrement, the struct simply dies
+    // buffered, which the death path below already supports.
+    if crate::cycle::cycle_gc_enabled() && strong.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+        maybe_suspect_struct(ptr, base);
+    }
     let prev = strong.fetch_sub(1, std::sync::atomic::Ordering::Release);
     if prev > 1 {
         return;
@@ -1890,11 +1976,53 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     }
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
     // the value is now dead; a weak read after this returns none. the release
-    // store publishes the destructor's writes to any thread whose weak load
-    // sees the flag. then drop the implicit weak unit, which frees the header
-    // if no weak refs remain.
-    struct_dead(base).store(1, std::sync::atomic::Ordering::Release);
+    // ordering publishes the destructor's writes to any thread whose weak load
+    // sees the flag. fetch_or rather than a store so a concurrently-set
+    // buffered bit survives. then drop the implicit weak unit, which frees the
+    // header if no weak refs remain — for a buffered struct the suspect
+    // buffer's weak count keeps the header alive past this point.
+    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
     struct_weak_drop(base);
+}
+
+/// Mark a struct as a cycle suspect: set the buffered bit, take the weak
+/// count the buffer owns, and hand the pointer to the buffer. Only the
+/// thread that flips the bit pushes, so many racing releases buffer once.
+/// The caller still holds a strong count, so the header is alive throughout.
+#[cold]
+#[inline(never)]
+unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
+    if struct_dead(base).fetch_or(STRUCT_BUFFERED_BIT, std::sync::atomic::Ordering::Relaxed)
+        & STRUCT_BUFFERED_BIT
+        != 0
+    {
+        return; // already buffered
+    }
+    struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::cycle::cycle_suspect(ptr as usize, crate::cycle::CYCLE_KIND_STRUCT);
+}
+
+/// Drop a struct's buffered mark (overflow, or a collector drain). The
+/// caller drops the buffer's weak count separately; magic-checked so a
+/// header that is already gone is a no-op.
+pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
+    if let Some(base) = struct_base(ptr) {
+        struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn struct_dead_word_for_tests(ptr: i64) -> u32 {
+    struct_base(ptr)
+        .map(|base| struct_dead(base).load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
+    struct_base(ptr)
+        .map(|base| struct_weak(base).load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(u32::MAX)
 }
 
 /// One more weak (non-owning) reference to this struct. Does not affect the
@@ -1932,9 +2060,11 @@ pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
     let Some(base) = struct_base(ptr) else {
         return 0;
     };
-    // acquire pairs with the release store in `pith_struct_release`: a load
-    // that sees the target dead also sees its destructor's effects.
-    if struct_dead(base).load(std::sync::atomic::Ordering::Acquire) != 0 {
+    // acquire pairs with the release fetch_or in `pith_struct_release`: a load
+    // that sees the target dead also sees its destructor's effects. test the
+    // death bit specifically — a live struct sitting in the cycle collector's
+    // suspect buffer has bit 1 set and must still read as alive.
+    if struct_dead(base).load(std::sync::atomic::Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
         return 0;
     }
     ptr

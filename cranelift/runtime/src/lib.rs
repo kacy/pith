@@ -43,6 +43,7 @@ pub mod bytes;
 pub mod collections;
 pub mod concurrency;
 pub mod crypto;
+pub mod cycle;
 pub mod dns;
 pub mod encoding;
 pub mod fdio;

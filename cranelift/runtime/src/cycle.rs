@@ -27,8 +27,9 @@
 //! With the flag off — the default — every release path pays one relaxed
 //! atomic load and a predicted branch, the same shape as the perf-stats gate.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// Kind codes for buffer and graveyard entries. These resemble the element
 /// tag codes in `collections::list::element_tag_from_code`, but they are an
@@ -157,6 +158,86 @@ pub(crate) fn graveyard_defer(ptr: usize, kind: u8) {
     CYCLE_GRAVEYARD_DEFERRED.fetch_add(1, Ordering::Relaxed);
 }
 
+// --- destructor -> tracer side table -------------------------------------
+//
+// the emitter pairs every destructor that walks rc children with a tracer
+// twin: the same field walk, but each child is reported to `pith_cc_visit`
+// instead of released. keying the table by destructor address costs nothing
+// per instance — the destructor pointer every rc box already carries doubles
+// as the trace key, and a box with no destructor (or a destructor with no
+// tracer: only string/bytes/weak fields) falls out as a leaf the collector
+// never walks into.
+
+static TRACERS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_tracers() -> std::sync::MutexGuard<'static, HashMap<usize, usize>> {
+    match TRACERS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Record a destructor's tracer twin. Called once per module from the
+/// generated `__cc_register_tracers_m<N>` body before any user code runs, so
+/// lookups during a collection never race a registration in practice; the
+/// mutex makes even that ordering safe rather than assumed.
+#[no_mangle]
+pub extern "C" fn pith_cc_register_tracer(dtor: i64, tracer: i64) {
+    if dtor == 0 || tracer == 0 {
+        return;
+    }
+    lock_tracers().insert(dtor as usize, tracer as usize);
+}
+
+/// The tracer registered for a destructor, if it has one. A `None` means the
+/// object is a leaf: its destructor releases only strings/bytes/weak slots,
+/// none of which can point back into a cycle.
+// consumed by the collection pass, which lands separately.
+#[allow(dead_code)]
+pub(crate) fn tracer_for_dtor(dtor: usize) -> Option<usize> {
+    lock_tracers().get(&dtor).copied()
+}
+
+// the per-child callback tracers invoke. a collector installs itself here
+// (a fn-pointer slot; 0 = nobody listening); with no visitor installed a
+// visit is a no-op, so the generated tracers are inert in normal runs.
+static VISIT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Visits that arrived with no visitor installed (counted only with the
+/// cycle-gc flag on; a diagnostic, not a leak).
+pub static CYCLE_VISITS_UNHOOKED: AtomicU64 = AtomicU64::new(0);
+
+/// Install (or with 0, remove) the process-global visitor `pith_cc_visit`
+/// dispatches to. The hook must have the shape `extern "C" fn(i64, i64)`.
+// consumed by the collection pass, which lands separately.
+#[allow(dead_code)]
+pub(crate) fn install_visit_hook(hook: usize) {
+    VISIT_HOOK.store(hook, Ordering::Release);
+}
+
+/// The callback a tracer invokes once per rc child. `kind` uses the closure
+/// env tag codes (1=string 2=list 3=map 4=set 5=bytes 6=struct 7=closure);
+/// tracers only ever pass rc kinds. A null child (an optional holding none,
+/// an unset field slot) is not a child and returns immediately.
+#[no_mangle]
+pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
+    if child == 0 {
+        return;
+    }
+    let hook = VISIT_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // the release/acquire pair orders the hook store before its first use.
+        // panic-guard: the only writer is install_visit_hook, whose contract pins the fn shape, so the address is always a valid visitor.
+        let visit: extern "C" fn(i64, i64) = unsafe { std::mem::transmute(hook) };
+        visit(child, kind);
+        return;
+    }
+    if cycle_gc_enabled() {
+        CYCLE_VISITS_UNHOOKED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Print the suspect-tracking counters to stderr.
 #[no_mangle]
 pub extern "C" fn pith_cycle_gc_stats() {
@@ -185,6 +266,11 @@ pub(crate) fn force_enabled_for_tests(enabled: bool) {
 #[cfg(test)]
 pub(crate) fn suspects_len_for_tests() -> usize {
     lock_suspects().len()
+}
+
+#[cfg(test)]
+pub(crate) fn tracer_count_for_tests() -> usize {
+    lock_tracers().len()
 }
 
 #[cfg(test)]
@@ -435,6 +521,86 @@ mod tests {
                 pith_struct_release(s);
             }
         }
+    }
+
+    #[test]
+    fn registered_tracer_pairs_are_looked_up_by_dtor_address() {
+        let _guard = locked();
+        // addresses only need to be distinct keys; nothing dereferences them
+        // until a collector walks the table.
+        pith_cc_register_tracer(0x1000, 0x2000);
+        pith_cc_register_tracer(0x3000, 0x4000);
+        assert_eq!(tracer_for_dtor(0x1000), Some(0x2000));
+        assert_eq!(tracer_for_dtor(0x3000), Some(0x4000));
+        assert_eq!(tracer_for_dtor(0x5000), None, "unregistered dtor is a leaf");
+        assert!(tracer_count_for_tests() >= 2);
+
+        // a re-registration (a module reloaded in-process) replaces, never
+        // duplicates
+        let before = tracer_count_for_tests();
+        pith_cc_register_tracer(0x1000, 0x6000);
+        assert_eq!(tracer_for_dtor(0x1000), Some(0x6000));
+        assert_eq!(tracer_count_for_tests(), before);
+
+        // null halves are ignored: no entry, no panic
+        pith_cc_register_tracer(0, 0x7000);
+        pith_cc_register_tracer(0x8000, 0);
+        assert_eq!(tracer_for_dtor(0), None);
+        assert_eq!(tracer_for_dtor(0x8000), None);
+        assert_eq!(tracer_count_for_tests(), before);
+    }
+
+    #[test]
+    fn visit_with_no_hook_is_inert_and_counts_only_when_enabled() {
+        let _guard = locked();
+        force_enabled_for_tests(false);
+        let before = CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed);
+        pith_cc_visit(0x1234, 6);
+        assert_eq!(
+            CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed),
+            before,
+            "flag off: not even the counter moves"
+        );
+
+        force_enabled_for_tests(true);
+        pith_cc_visit(0x1234, 6);
+        pith_cc_visit(0x5678, 2);
+        assert_eq!(CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed), before + 2);
+        pith_cc_visit(0, 6); // a none payload is not a child
+        assert_eq!(CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed), before + 2);
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn visit_dispatches_to_an_installed_hook() {
+        static SEEN_CHILD: AtomicU64 = AtomicU64::new(0);
+        static SEEN_KIND: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn recording_hook(child: i64, kind: i64) {
+            SEEN_CHILD.store(child as u64, Ordering::Relaxed);
+            SEEN_KIND.store(kind as u64, Ordering::Relaxed);
+        }
+
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        install_visit_hook(recording_hook as usize);
+        let unhooked_before = CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed);
+        pith_cc_visit(0xabcd, 7);
+        assert_eq!(SEEN_CHILD.load(Ordering::Relaxed), 0xabcd);
+        assert_eq!(SEEN_KIND.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed),
+            unhooked_before,
+            "a hooked visit is delivered, not counted as unhooked"
+        );
+
+        install_visit_hook(0);
+        pith_cc_visit(0x9999, 3);
+        assert_eq!(SEEN_CHILD.load(Ordering::Relaxed), 0xabcd, "hook removed");
+        assert_eq!(
+            CYCLE_VISITS_UNHOOKED.load(Ordering::Relaxed),
+            unhooked_before + 1
+        );
+        force_enabled_for_tests(false);
     }
 
     #[test]

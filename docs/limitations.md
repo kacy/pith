@@ -101,6 +101,17 @@ something here that now works, the page is stale and a fix to it is welcome.
   concrete `T`. an impl that omits an abstract (non-default) interface
   method is rejected at the impl block (E235). `where` clauses are the
   remaining gap — bounds must be written inline (`[T: Display + Hash]`).
+- **generic enums are constructed and matched through a typed context** — a
+  variant is built where the instantiation is already known (`fn f() ->
+  Chain[Int]: return Chain.Link(1, none)`, or an annotated binding), and
+  matched either there or inside a generic fn over `Chain[T]`. the explicit
+  form `Chain[Int].Link(...)` does not parse as a variant constructor,
+  matching a concrete instance by bare name outside a generic fn does not
+  resolve the enum, and a call like `head_of(pair)` does not infer `T` from
+  a `Chain[Int]` argument. self-referential generic types themselves work —
+  `struct Node[T]: next: Node[T]?`, `Link(T, Chain[T]?)`, and mutually
+  recursive pairs all instantiate (the instance registers before its fields
+  resolve, so the reference finds a floor).
 
 ## standard library
 

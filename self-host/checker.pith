@@ -5833,6 +5833,19 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
     if existing != -1:
         return existing
     generic_params := collect_generic_parameter_names(decl)
+    # register the instance under an empty shell before resolving its fields,
+    # so a self-referential field (next: Node[T]?) finds this tid by name
+    # instead of re-entering this function forever. filled in below.
+    mut shell_names: List[String] := []
+    mut shell_types: List[Int] := []
+    mut shell_bools: List[Bool] := []
+    tid := add_type_info(ti_struct(inst_name, shell_names, shell_types, shell_bools, shell_bools))
+    register_type_name(inst_name, tid)
+    # remember the type-args + base name on the instance tid so dispatch can
+    # substitute the struct's type parameters in method signatures
+    struct_instance_type_args.insert(tid, encode_tid_list(type_args))
+    struct_instance_base_name.insert(tid, base_name)
+    struct_instance_tids.push(tid)
     mut field_names: List[String] := []
     mut field_types: List[Int] := []
     mut field_pub: List[Bool] := []
@@ -5853,13 +5866,7 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
                     struct_field_default_nodes.insert(inst_name + "." + fname, cn.children[1])
             else:
                 field_types.push(TID_ERR)
-    tid := add_type_info(ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
-    register_type_name(inst_name, tid)
-    # remember the type-args + base name on the instance tid so dispatch can
-    # substitute the struct's type parameters in method signatures
-    struct_instance_type_args.insert(tid, encode_tid_list(type_args))
-    struct_instance_base_name.insert(tid, base_name)
-    struct_instance_tids.push(tid)
+    set_type_info(tid, ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
     return tid
 
 fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
@@ -5870,6 +5877,13 @@ fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
     if existing != -1:
         return existing
     generic_params := collect_generic_parameter_names(decl)
+    # same shell-first registration as the struct path: a variant payload can
+    # name its own enum (Cons(T, Chain[T]?)), and resolving it before the
+    # name exists recurses without a floor.
+    mut shell_variants: List[String] := []
+    mut shell_variant_types: List[List[Int]] := []
+    tid := add_type_info(ti_enum(inst_name, shell_variants, shell_variant_types))
+    register_type_name(inst_name, tid)
     mut variant_names: List[String] := []
     mut variant_types: List[List[Int]] := []
     for child in decl.children:
@@ -5880,8 +5894,7 @@ fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
             for vc in cn.children:
                 vtypes.push(resolve_type_with_substitution_map(vc, generic_params, type_args))
             variant_types.push(vtypes)
-    tid := add_type_info(ti_enum(inst_name, variant_names, variant_types))
-    register_type_name(inst_name, tid)
+    set_type_info(tid, ti_enum(inst_name, variant_names, variant_types))
     return tid
 
 # ---------------------------------------------------------------

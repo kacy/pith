@@ -62,6 +62,8 @@ pub struct MapImpl {
     /// value counts. A map holds exactly one count per stored heap value, the
     /// same contract a tagged list has for its elements.
     val_tag: ListTypeTag,
+    /// Bit 0: this map sits in the cycle collector's suspect buffer.
+    cycle_flags: std::sync::atomic::AtomicU8,
 }
 
 /// Key type enumeration
@@ -87,6 +89,7 @@ impl MapImpl {
             key_type,
             val_size,
             val_tag,
+            cycle_flags: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -439,6 +442,14 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     let Some(impl_ref) = map_mut(map) else {
         return;
     };
+    // cycle-gc suspect hook, before our count is given up: while we still
+    // hold it the map cannot die under the hook (see `maybe_suspect_struct`
+    // in runtime_core for why the ordering matters).
+    if crate::cycle::cycle_gc_enabled()
+        && impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed) > 1
+    {
+        maybe_suspect_map(impl_ref, map.ptr as usize);
+    }
     let prev = impl_ref
         .rc
         .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -457,7 +468,47 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     // that outlives the map fails the fast validity check.
     (*(map.ptr as *mut MapImpl)).magic = 0;
     handle_registry::unregister(map.ptr as *const (), HandleKind::Map);
+    // a map that dies while the suspect buffer points at it keeps its shell:
+    // the values are already released and the handle no longer validates
+    // anywhere, so deferring the box drop to the graveyard leaks only the
+    // impl struct until the collector frees it.
+    if crate::cycle::cycle_gc_enabled()
+        && impl_ref
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0
+    {
+        crate::cycle::graveyard_defer(map.ptr as usize, crate::cycle::CYCLE_KIND_MAP);
+        return;
+    }
     let _ = Box::from_raw(map.ptr as *mut MapImpl);
+}
+
+/// Mark a map as a cycle suspect and hand it to the buffer. Cold and
+/// outlined so the release fast path stays frameless with the flag off.
+#[cold]
+#[inline(never)]
+unsafe fn maybe_suspect_map(impl_ref: &MapImpl, ptr: usize) {
+    if impl_ref
+        .cycle_flags
+        .fetch_or(1, std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0
+    {
+        return; // already buffered
+    }
+    crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_MAP);
+}
+
+/// Drop a map's buffered mark (overflow, or a collector drain). Magic-
+/// checked, so a map that already died and was freed is a no-op.
+pub(crate) unsafe fn cycle_clear_map_buffered(handle: i64) {
+    if let Some(impl_ref) = map_ref_from_handle(handle) {
+        impl_ref
+            .cycle_flags
+            .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Remove an int-keyed entry and hand its value — count included — to the
@@ -1535,6 +1586,53 @@ mod tests {
             assert_eq!(pith_map_len_handle(handle), 0);
             assert_eq!(pith_map_is_empty_handle(handle), 1);
             pith_map_release(map);
+        }
+    }
+
+    // this test lives here rather than in cycle.rs because building a map and
+    // reading its handle needs the private PithMap internals. it serializes
+    // on the cycle test lock like every test that turns the flag on.
+    #[test]
+    fn buffered_map_dies_into_the_graveyard() {
+        let _guard = match crate::cycle::CYCLE_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        crate::cycle::force_enabled_for_tests(true);
+        crate::cycle::reset_for_tests();
+        unsafe {
+            // a struct value observed through a weak reference proves the
+            // map's death still cascades into its values.
+            let value = crate::runtime_core::pith_struct_alloc(1);
+            crate::runtime_core::pith_struct_weak_retain(value);
+
+            let map = pith_map_new_tagged(0, 8, 4); // int keys, struct values
+            let handle = map.ptr as i64;
+            pith_map_insert_ikey(handle, 1, value); // map retains
+            crate::runtime_core::pith_struct_release(value); // map holds the only count
+            assert_eq!(crate::runtime_core::pith_struct_weak_load(value), value);
+
+            pith_map_retain_handle(handle);
+            pith_map_release(map); // 2 -> 1: buffered
+            assert_eq!(crate::cycle::suspect_count_for_tests(handle as usize), 1);
+            pith_map_release(map); // 1 -> 0: dies buffered
+
+            assert_eq!(crate::cycle::graveyard_count_for_tests(handle as usize), 1);
+            assert_eq!(
+                crate::runtime_core::pith_struct_weak_load(value),
+                0,
+                "value was released"
+            );
+            assert_eq!(
+                pith_map_len(map),
+                0,
+                "magic scrubbed: handle no longer validates"
+            );
+            pith_map_retain_handle(handle); // must be a no-op, not a revival
+
+            crate::runtime_core::pith_struct_weak_release(value);
+            crate::cycle::force_enabled_for_tests(false);
+            crate::cycle::reset_for_tests();
         }
     }
 }

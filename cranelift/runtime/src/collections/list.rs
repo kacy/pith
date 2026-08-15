@@ -38,6 +38,10 @@ pub struct ListImpl {
     pub values8_ptr: *const i64,
     /// Cached length for 8-byte storage.
     pub values8_len: usize,
+    /// Bit 0: this list sits in the cycle collector's suspect buffer.
+    /// Appended at the end so the `offset_of!` constants the codegen imports
+    /// keep describing the same layout.
+    pub(crate) cycle_flags: std::sync::atomic::AtomicU8,
 }
 
 /// Magic number to identify ListImpl pointers
@@ -79,6 +83,7 @@ impl ListImpl {
             values8_len: 0,
             elem_size,
             type_tag,
+            cycle_flags: std::sync::atomic::AtomicU8::new(0),
         };
         list.sync_value_view();
         list
@@ -1199,6 +1204,14 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
+    // cycle-gc suspect hook, before our count is given up: while we still
+    // hold it the list cannot die under the hook (see `maybe_suspect_struct`
+    // in runtime_core for why the ordering matters).
+    if crate::cycle::cycle_gc_enabled()
+        && impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed) > 1
+    {
+        maybe_suspect_list(impl_ref, list.ptr as usize);
+    }
     let prev = impl_ref
         .rc
         .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -1220,7 +1233,47 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     (*(list.ptr as *mut ListImpl)).magic = 0;
     handle_registry::unregister(list.ptr as *const (), HandleKind::List);
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
+    // a list that dies while the suspect buffer points at it keeps its shell:
+    // the elements are already released and the handle no longer validates
+    // anywhere, so deferring the box drop to the graveyard leaks only the
+    // impl struct until the collector frees it.
+    if crate::cycle::cycle_gc_enabled()
+        && impl_ref
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0
+    {
+        crate::cycle::graveyard_defer(list.ptr as usize, crate::cycle::CYCLE_KIND_LIST);
+        return;
+    }
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
+}
+
+/// Mark a list as a cycle suspect and hand it to the buffer. Cold and
+/// outlined so the release fast path stays frameless with the flag off.
+#[cold]
+#[inline(never)]
+unsafe fn maybe_suspect_list(impl_ref: &ListImpl, ptr: usize) {
+    if impl_ref
+        .cycle_flags
+        .fetch_or(1, std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0
+    {
+        return; // already buffered
+    }
+    crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_LIST);
+}
+
+/// Drop a list's buffered mark (overflow, or a collector drain). Magic-
+/// checked, so a list that already died and was freed is a no-op.
+pub(crate) unsafe fn cycle_clear_list_buffered(handle: i64) {
+    if let Some(impl_ref) = list_ref_from_handle(handle) {
+        impl_ref
+            .cycle_flags
+            .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Retain a list handle: one more owner of this shared handle.

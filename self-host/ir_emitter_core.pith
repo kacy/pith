@@ -1490,6 +1490,14 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
                             poisoned.push(sub.value)
                     else:
                         ir_rc_track_local(sub.value, payload_kind)
+                elif not poisoned.contains(sub.value):
+                    # a sibling arm binds this name with an rc payload while
+                    # this arm binds it as a plain value (Zed(Pack, _) versus
+                    # Beta(Int, _) sharing x0). releasing the rc kind at exit
+                    # would dereference whatever integer the last-run arm
+                    # stored — same rule as the := path above: drop the name,
+                    # a bounded leak, never a wild pointer.
+                    poisoned.push(sub.value)
     for child in node.children:
         ir_collect_string_bind_names(child, names, poisoned)
 

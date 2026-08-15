@@ -352,6 +352,9 @@ pub fn run_case(
 ) -> CaseOutcome {
     let _ = fs::remove_dir_all(case_dir);
     fs::create_dir_all(case_dir).expect("create case dir");
+    // a relative out dir would otherwise break the exe spawn below: the
+    // program path is resolved after the child's chdir into the case dir
+    let case_dir = &fs::canonicalize(case_dir).expect("canonicalize case dir");
     for (name, content) in files {
         fs::write(case_dir.join(name), content).expect("write case file");
     }

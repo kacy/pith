@@ -80,6 +80,11 @@ fn collect_declared_ir_names_from_lines(lines: List[String], prefix: String, ini
             function_set.insert(name, true)
             if name.starts_with("__init_globals"):
                 init_funcs.push(prefix + maybe_prefixed_init_name(name, init_prefix))
+            elif name.starts_with("__cc_register_tracers"):
+                # the module's cycle-tracer registration runs at startup like
+                # its globals init. already module-suffixed, so only the
+                # symbol prefix applies.
+                init_funcs.push(prefix + name)
     return DeclaredIrNames(global_set, function_set, init_funcs)
 
 fn prefixed_init_name(module_index: Int) -> String:

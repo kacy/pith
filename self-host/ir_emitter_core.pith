@@ -51,7 +51,7 @@ from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_ma
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
-from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
+from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
@@ -130,6 +130,7 @@ mut ir_tuple_borrow_walk_active: List[String] := []
 
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
+mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
 
@@ -289,6 +290,7 @@ fn ir_reset_global_state():
 fn ir_reset_type_state():
     ir_local_struct_names = []
     ir_dtor_memo = {}
+    ir_tracer_memo = {}
     ir_tuple_dtor_sigs = []
     ir_tuple_cascade_sigs = []
     ir_struct_names.clear()
@@ -653,6 +655,57 @@ fn ir_rc_field_kind(ftype: String) -> String:
         if ir_struct_needs_dtor(ftype.substring(7, ftype.len())):
             return "struct"
     return ""
+
+# kinds a cycle tracer reports: children that can themselves hold
+# references. a string or bytes value is a leaf — it never points back —
+# and a weak field holds no strong count, so none of those are visited.
+fn ir_trace_kind_enabled(kind: String) -> Bool:
+    return kind == "struct" or kind == "list" or kind == "map" or kind == "set" or kind == "closure" or kind == "tuple"
+
+# true when any variant of a boxed enum carries a traceable payload, so
+# the enum's destructor gets a tracer twin. mirrors ir_enum_needs_dtor.
+fn ir_enum_needs_tracer(ename: String) -> Bool:
+    if not ir_enum_variant_lists.contains_key(ename):
+        return false
+    for variant in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + variant
+        if ir_enum_payload_kinds.contains_key(vkey):
+            for pk in ir_enum_payload_kinds[vkey].split(","):
+                if ir_trace_kind_enabled(ir_rc_field_kind(pk)):
+                    return true
+    return false
+
+# true when at least one field is a traceable child, so the struct's
+# destructor gets a tracer twin. a struct that needs a dtor but holds only
+# string/bytes/weak fields gets none: it is a leaf to the collector.
+# mirrors ir_struct_needs_dtor, with its own memo.
+fn ir_struct_needs_tracer(raw_name: String) -> Bool:
+    sname := ir_struct_base_name(raw_name)
+    if ir_tracer_memo.contains_key(sname):
+        return ir_tracer_memo[sname] == 1
+    # mark first so self-referential fields don't recurse forever; a
+    # direct traceable field still sets the final answer below
+    ir_tracer_memo.insert(sname, 2)
+    # a boxed enum's releasable slots are tagged payloads, not declared
+    # fields, so answer from the variants.
+    if ir_boxed_enums.contains_key(sname):
+        enum_needs := ir_enum_needs_tracer(sname)
+        if enum_needs:
+            ir_tracer_memo.insert(sname, 1)
+        return enum_needs
+    count := ir_struct_field_count(sname)
+    mut i := 0
+    mut needs := false
+    while i < count:
+        fname := ir_struct_field_name_at(sname, i)
+        ftype := ir_struct_field_type_name(sname, fname)
+        if not ir_struct_field_is_weak(sname, fname):
+            if ir_trace_kind_enabled(ir_rc_field_kind(ftype)):
+                needs = true
+        i = i + 1
+    if needs:
+        ir_tracer_memo.insert(sname, 1)
+    return needs
 
 # a map target whose value type is string picks the heap-value
 # constructor for empty literals, so runtime inserts retain
@@ -3753,6 +3806,63 @@ fn ir_emit_generic_instance_dtors():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
+# the generic parameter names and substituted argument names for a recorded
+# generic instance destructor, packed as (params, arg_names) lookups shared
+# by the instance tracer emitter and its needs test.
+fn ir_generic_instance_arg_names(sym: String) -> List[String]:
+    mut arg_names: List[String] := []
+    args_str := ir_generic_dtor_args[sym]
+    if args_str.len() > 0:
+        arg_names = args_str.split(chr(1))
+    return arg_names
+
+# true when a generic instance destructor has a traceable field once the
+# instance's type arguments are substituted in — the per-instance answer to
+# ir_struct_needs_tracer. weak fields are skipped like everywhere else.
+fn ir_generic_instance_needs_tracer(sym: String) -> Bool:
+    base := ir_generic_dtor_base[sym]
+    arg_names := ir_generic_instance_arg_names(sym)
+    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+    count := ir_struct_field_count(base)
+    mut i := 0
+    while i < count:
+        fname := ir_struct_field_name_at(base, i)
+        base_ftype := ir_struct_field_type_name(base, fname)
+        fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
+        if not ir_struct_field_is_weak(base, fname) and ir_trace_kind_enabled(fkind):
+            return true
+        i = i + 1
+    return false
+
+# tracer twin of a generic instance destructor: the same substituted field
+# walk, visiting traceable children instead of releasing them.
+fn ir_emit_generic_instance_tracers():
+    for sym in ir_generic_dtor_base.keys():
+        if not ir_generic_instance_needs_tracer(sym):
+            continue
+        base := ir_generic_dtor_base[sym]
+        arg_names := ir_generic_instance_arg_names(sym)
+        params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+        ir_emit_func_header("__cc_trace_" + sym, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count := ir_struct_field_count(base)
+        mut i := 0
+        while i < count:
+            fname := ir_struct_field_name_at(base, i)
+            base_ftype := ir_struct_field_type_name(base, fname)
+            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
+            if not ir_struct_field_is_weak(base, fname) and ir_trace_kind_enabled(fkind):
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                ir_rc_visit_reg(fr, fkind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
     if not ir_is_generic_function_name(callee.name):
         return callee
@@ -4226,6 +4336,20 @@ fn ir_tuple_sig_has_rc(sig: String) -> Bool:
     mut i := 0
     while i < sig.len():
         if sig[i] != "0":
+            return true
+        i = i + 1
+    return false
+
+# module-suffixed like the destructor it twins.
+fn ir_tuple_tracer_name(sig: String) -> String:
+    return "__tuple_trace_" + sig + "_m" + ir_module_count.to_string()
+
+# a tuple destructor gets a tracer twin only when some element is a
+# traceable child; string/bytes-only signatures are leaves.
+fn ir_tuple_sig_has_trace(sig: String) -> Bool:
+    mut i := 0
+    while i < sig.len():
+        if ir_trace_kind_enabled(ir_tuple_dtor_code_kind(sig[i])):
             return true
         i = i + 1
     return false
@@ -7888,6 +8012,9 @@ fn ir_emit_test_main(root_idx: Int):
         return
     ir_prepare_func_emission("int")
     ir_emit_func_header("main", 0, "int")
+    # test builds replace user main, so the tracer registration call the
+    # normal main prelude carries is emitted here instead.
+    ir_emit_call0(ir_reg(), ir_cc_register_fn_name(), "int")
 
     for test_idx, i in tests:
         name_r := ir_reg()
@@ -7948,6 +8075,12 @@ fn ir_func(idx: Int):
     ir_emitting_main_body = name == "main"
     ir_emit_func_header(name, param_count, ret_type)
     ir_emit_fn_params(idx)
+    if ir_emitting_main_body:
+        # register this module's tracer pairs before any user code, the
+        # way the driver injects the imported modules' init calls. an
+        # imported module's main is stripped by the driver, so only the
+        # root module's call survives into the combined program.
+        ir_emit_call0(ir_reg(), ir_cc_register_fn_name(), "int")
     ir_emit_string_prologue(body_idx)
     ir_finish_func_emission(body_idx)
     ir_emitting_main_body = false
@@ -8320,6 +8453,118 @@ fn ir_emit_enum_dtors():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
+# --- cycle tracer twins ----------------------------------------------------
+#
+# every destructor that walks traceable children gets a tracer twin: the
+# same field walk, but each child is reported to pith_cc_visit instead of
+# released. __cc_register_tracers_m<N> pairs each destructor with its twin
+# in the runtime's side table, so a future collector can enumerate a dead
+# candidate's edges through the destructor pointer the box already carries
+# — no per-instance cost, and destructors without a twin (only string,
+# bytes or weak slots) correctly read as leaves. inert until a collector
+# installs a visitor: an unhooked pith_cc_visit returns immediately.
+
+# tracer twin of __opt_dtor_<kind>, for the payload kinds that are
+# traceable children — bytes payloads are leaves and get no twin.
+fn ir_emit_optional_tracers():
+    kinds := ["struct", "list", "map", "set", "closure"]
+    for k in kinds:
+        ir_emit_func_header("__opt_trace_" + k, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        vr := ir_reg()
+        ir_emit("field " + vr.to_string() + " " + pr.to_string() + " 8 unknown value")
+        ir_rc_visit_reg(vr, k)
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# tracer twin of __dtor_<sname>: visit each traceable field. weak fields
+# are skipped entirely — they hold no strong count, so they are not edges
+# of the ownership graph the collector trial-deletes.
+fn ir_emit_struct_tracers():
+    for sname in ir_struct_names.keys():
+        if sname.index_of("[") >= 0:
+            continue
+        # boxed enums get their tag-aware twin from ir_emit_enum_tracers.
+        if ir_boxed_enums.contains_key(sname):
+            continue
+        if not ir_struct_needs_dtor(sname):
+            continue
+        if not ir_struct_needs_tracer(sname):
+            continue
+        ir_emit_func_header("__cc_trace_" + sname, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count := ir_struct_field_count(sname)
+        mut i := 0
+        while i < count:
+            fname := ir_struct_field_name_at(sname, i)
+            ftype := ir_struct_field_type_name(sname, fname)
+            fkind := ir_rc_field_kind(ftype)
+            if not ir_struct_field_is_weak(sname, fname) and ir_trace_kind_enabled(fkind):
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                ir_rc_visit_reg(fr, fkind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# tracer twin of a boxed enum's __dtor_<ename>: the same tag dispatch,
+# visiting the matching variant's traceable payload slots.
+fn ir_emit_enum_tracers():
+    for ename in ir_boxed_enums.keys():
+        if not ir_enum_needs_tracer(ename):
+            continue
+        if not ir_enum_variant_lists.contains_key(ename):
+            continue
+        ir_emit_func_header("__cc_trace_" + ename, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        tag_r := ir_reg()
+        ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
+        variants := ir_enum_variant_lists[ename].split(",")
+        mut vi := 0
+        while vi < variants.len():
+            vkey := ename + "." + variants[vi]
+            if ir_enum_payload_kinds.contains_key(vkey):
+                kinds := ir_enum_payload_kinds[vkey].split(",")
+                mut has_trace := false
+                mut c := 0
+                while c < kinds.len():
+                    if ir_trace_kind_enabled(ir_rc_field_kind(kinds[c])):
+                        has_trace = true
+                    c = c + 1
+                if has_trace:
+                    vtag := ir_reg()
+                    ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
+                    is_v := ir_reg()
+                    ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
+                    hit_l := ir_label()
+                    skip_l := ir_label()
+                    ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
+                    ir_emit_label(hit_l)
+                    mut s := 0
+                    while s < kinds.len():
+                        rk := ir_rc_field_kind(kinds[s])
+                        if ir_trace_kind_enabled(rk):
+                            slot_r := ir_reg()
+                            ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((s + 1) * 8).to_string() + " unknown __p" + s.to_string())
+                            ir_rc_visit_reg(slot_r, rk)
+                        s = s + 1
+                    ir_emit_label(skip_l)
+            vi = vi + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 # one equality helper per boxed enum: same pointer or same tag with
 # equal payloads. string payloads compare by content and nested boxed
 # enums recurse; struct payloads keep pointer identity.
@@ -8340,6 +8585,30 @@ fn ir_emit_tuple_dtors():
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())
                 ir_rc_release_reg(fr, kind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# tracer twin of a tuple destructor: visit the traceable elements. keyed
+# and ordered like ir_emit_tuple_dtors — the signatures exist only after
+# the bodies emitted their tuple literals.
+fn ir_emit_tuple_tracers():
+    for sig in ir_tuple_dtor_sigs:
+        if not ir_tuple_sig_has_trace(sig):
+            continue
+        ir_emit_func_header(ir_tuple_tracer_name(sig), 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        mut i := 0
+        while i < sig.len():
+            kind := ir_tuple_dtor_code_kind(sig[i])
+            if ir_trace_kind_enabled(kind):
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())
+                ir_rc_visit_reg(fr, kind)
             i = i + 1
         zr := ir_reg()
         ir_emit("iconst " + zr.to_string() + " 0")
@@ -8535,6 +8804,7 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
 fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_local_struct_names = []
     ir_dtor_memo = {}
+    ir_tracer_memo = {}
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -8591,6 +8861,62 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
 
     ir_register_alias_structs(root_idx)
 
+# the module's tracer registration function: __cc_register_tracers_m<N>,
+# module-suffixed like ir_tuple_dtor_name so every module carries its own
+# copy for its own destructor copies. main's prelude calls the root
+# module's; the driver injects the imported modules' calls next to the
+# init-globals calls. always emitted — possibly empty — so that prelude
+# call never dangles.
+fn ir_cc_register_fn_name() -> String:
+    return "__cc_register_tracers_m" + ir_module_count.to_string()
+
+# one funcref pair + registration call: the runtime side table maps the
+# destructor's address to its tracer twin's.
+fn ir_emit_cc_register_pair(dtor_name: String, trace_name: String):
+    dr := ir_reg()
+    ir_emit("funcref " + dr.to_string() + " " + dtor_name)
+    tr := ir_reg()
+    ir_emit("funcref " + tr.to_string() + " " + trace_name)
+    ir_emit_call2(ir_reg(), "pith_cc_register_tracer", "void", dr, tr)
+
+# emitted after every destructor family, since the tuple and generic
+# instance key sets are only complete once all bodies are. the pair loops
+# repeat the emitters' own gates so exactly the destructors with a twin
+# are registered.
+fn ir_emit_cc_register_tracers():
+    ir_emit_func_header(ir_cc_register_fn_name(), 0, "int")
+    opt_kinds := ["struct", "list", "map", "set", "closure"]
+    for k in opt_kinds:
+        ir_emit_cc_register_pair("__opt_dtor_" + k, "__opt_trace_" + k)
+    for sname in ir_struct_names.keys():
+        if sname.index_of("[") >= 0:
+            continue
+        if ir_boxed_enums.contains_key(sname):
+            continue
+        if not ir_struct_needs_dtor(sname):
+            continue
+        if not ir_struct_needs_tracer(sname):
+            continue
+        ir_emit_cc_register_pair("__dtor_" + sname, "__cc_trace_" + sname)
+    for ename in ir_boxed_enums.keys():
+        if not ir_enum_needs_tracer(ename):
+            continue
+        if not ir_enum_variant_lists.contains_key(ename):
+            continue
+        ir_emit_cc_register_pair("__dtor_" + ename, "__cc_trace_" + ename)
+    for sig in ir_tuple_dtor_sigs:
+        if not ir_tuple_sig_has_trace(sig):
+            continue
+        ir_emit_cc_register_pair(ir_tuple_dtor_name(sig), ir_tuple_tracer_name(sig))
+    for sym in ir_generic_dtor_base.keys():
+        if not ir_generic_instance_needs_tracer(sym):
+            continue
+        ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
+    zr := ir_reg()
+    ir_emit("iconst " + zr.to_string() + " 0")
+    ir_emit("ret " + zr.to_string())
+    ir_emit("endfunc")
+
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_base = {}
     ir_generic_dtor_args = {}
@@ -8600,6 +8926,9 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_optional_dtors()
     ir_emit_struct_dtors()
     ir_emit_enum_dtors()
+    ir_emit_optional_tracers()
+    ir_emit_struct_tracers()
+    ir_emit_enum_tracers()
     ir_emit_enum_eq_fns()
     # pre-register all impl method specializations across the module so that
     # an earlier impl's specialized body can dispatch to a later impl's
@@ -8610,15 +8939,20 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # tuple destructors last: their shapes are only known once every
     # tuple literal in the module body has been emitted.
     ir_emit_tuple_dtors()
+    ir_emit_tuple_tracers()
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend
     # constructor call: emitted after the specializations, since those bodies
     # are where such constructions (and their attaches) are recorded.
     ir_emit_generic_instance_dtors()
+    ir_emit_generic_instance_tracers()
     ir_append_lambda_bodies()
     # tuple cascade helpers last of all: every body (top level, specializations,
     # generic instance dtors and lambdas) has registered its signatures by now.
     ir_emit_tuple_cascade_helpers()
+    # tracer registration after every destructor family above, so its pair
+    # list covers the tuple and generic-instance twins too.
+    ir_emit_cc_register_tracers()
 
 # Walk every impl_decl in the current root and register specialization name
 # entries into ir_impl_method_specializations without emitting bodies yet.

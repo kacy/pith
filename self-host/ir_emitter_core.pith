@@ -7758,6 +7758,26 @@ fn ir_emit_generic_specialization(key: String):
     elif concrete_types.len() == 1 and ir_is_json_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
         ir_emit_json_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_emit_value_for_target, ir_emit_default_return)
     else:
+        # a match payload binding's store releases the binding's previous
+        # value, which loads a name the specialization's ir never declared —
+        # ordinary bodies zero-store those names in the prologue. a re-emitted
+        # generic body cannot run the full prologue: its exit cleanup would
+        # release locals whose cross-module escape the emitter cannot see
+        # from the caller's module (a result struct carrying a list, say),
+        # and a recycled handle is worse than a leak. publish every rc bind
+        # as untracked instead — the match emitter then skips the
+        # release-of-previous and the binding's retain leaks at exit,
+        # bounded and in the safe direction.
+        mut spec_poisoned: List[String] := []
+        ir_collect_string_bind_names(body_idx, ir_string_locals, spec_poisoned)
+        for bn in ir_string_locals:
+            if not ir_untracked_rc_binds.contains(bn):
+                ir_untracked_rc_binds.push(bn)
+        for pn in spec_poisoned:
+            if not ir_untracked_rc_binds.contains(pn):
+                ir_untracked_rc_binds.push(pn)
+        ir_string_locals = []
+        ir_rc_local_kinds = []
         ir_finish_func_emission(body_idx)
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types

@@ -254,6 +254,53 @@ pub fn mismatch_context(actual: &str, expected: &[ExpLine], idx: usize) -> Strin
     out
 }
 
+/// coarse classification of a fault address parsed from valgrind output
+pub fn classify_addr(addr: u64) -> &'static str {
+    if addr < 0x1000 {
+        "null-ish"
+    } else if addr < 0x100000 {
+        "small-int-as-pointer"
+    } else {
+        "other"
+    }
+}
+
+pub fn parse_fault_addr(s: &str) -> Option<u64> {
+    // valgrind spells the address either as "Address 0xN is not stack'd..."
+    // under an Invalid read/write, or "Access not within mapped region at
+    // address 0xN" when the segfault escapes its checks
+    for line in s.lines() {
+        for pat in ["at address 0x", "Address 0x"] {
+            if let Some(p) = line.find(pat) {
+                let hex: String = line[p + pat.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                if !hex.is_empty() {
+                    if let Ok(v) = u64::from_str_radix(&hex, 16) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// rerun a crashed binary under valgrind and classify the fault site.
+/// tolerates valgrind being absent or the crash not reproducing: None then.
+pub fn fault_site_class(exe: &str, cwd: &Path, envs: &[(String, String)]) -> Option<&'static str> {
+    let vg = run_with_timeout(
+        "valgrind",
+        &["--error-exitcode=9", "--quiet", exe],
+        cwd,
+        envs,
+        Duration::from_secs(60),
+    )
+    .ok()?;
+    parse_fault_addr(&vg.stderr).map(classify_addr)
+}
+
 pub struct Toolchain {
     pub pith: PathBuf,
     pub self_host: PathBuf,
@@ -412,7 +459,12 @@ pub fn run_case(
             if run.timed_out {
                 hang = Some("run timeout (possible hang/deadlock)".into());
             } else if let Some(sig) = run.signal {
-                let signature = format!("binary died: {}", signal_name(sig));
+                // dedup by fault site: a valgrind rerun tells the null-ish
+                // dereference apart from the small-int-as-pointer one
+                let signature = match fault_site_class(&exe_s, case_dir, &tc.envs) {
+                    Some(cls) => format!("binary died: {} [{}]", signal_name(sig), cls),
+                    None => format!("binary died: {}", signal_name(sig)),
+                };
                 findings.push(Finding {
                     seed,
                     class: "run-crash".into(),
@@ -535,4 +587,20 @@ mod tests {
         assert_eq!((mm.idx, mm.expected.as_str()), (2, "<end>"));
     }
 
+    #[test]
+    fn fault_addr_parses_both_valgrind_forms() {
+        let a = "==1== Invalid read of size 8\n==1==  Address 0x10 is not stack'd, malloc'd or (recently) free'd\n";
+        assert_eq!(parse_fault_addr(a), Some(0x10));
+        let b = "==1==  Access not within mapped region at address 0x4F22A8\n";
+        assert_eq!(parse_fault_addr(b), Some(0x4F22A8));
+        assert_eq!(parse_fault_addr("nothing here"), None);
+    }
+
+    #[test]
+    fn addr_classes() {
+        assert_eq!(classify_addr(0x0), "null-ish");
+        assert_eq!(classify_addr(0x8), "null-ish");
+        assert_eq!(classify_addr(0x4f22), "small-int-as-pointer");
+        assert_eq!(classify_addr(0x7f0012345678), "other");
+    }
 }

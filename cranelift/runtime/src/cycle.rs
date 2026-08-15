@@ -28,6 +28,7 @@
 //! With the flag off — the default — every release path pays one relaxed
 //! atomic load and a predicted branch, the same shape as the perf-stats gate.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
@@ -136,16 +137,28 @@ unsafe fn discard_suspect(ptr: usize, kind: u8) {
 #[cold]
 #[inline(never)]
 pub(crate) unsafe fn cycle_suspect(ptr: usize, kind: u8) {
-    {
+    let admitted_len = {
         let mut suspects = lock_suspects();
         if suspects.len() < CYCLE_SUSPECT_CAP {
             suspects.push((ptr, kind));
             CYCLE_SUSPECTS_BUFFERED.fetch_add(1, Ordering::Relaxed);
-            return;
+            Some(suspects.len())
+        } else {
+            None
         }
+    };
+    // outside the buffer lock: the collector wake path takes its own lock,
+    // and holding both here would order them against the collector's
+    // wait-for-work, which reads the buffer length under the control lock.
+    let Some(len) = admitted_len else {
+        CYCLE_SUSPECTS_OVERFLOWED.fetch_add(1, Ordering::Relaxed);
+        discard_suspect(ptr, kind);
+        return;
+    };
+    ensure_collector_thread();
+    if len >= collect_threshold() {
+        GC_CTRL_CV.notify_all();
     }
-    CYCLE_SUSPECTS_OVERFLOWED.fetch_add(1, Ordering::Relaxed);
-    discard_suspect(ptr, kind);
 }
 
 /// Park a dead closure/list/map shell for the collector to free. Called from
@@ -195,8 +208,6 @@ pub extern "C" fn pith_cc_register_tracer(dtor: i64, tracer: i64) {
 /// The tracer registered for a destructor, if it has one. A `None` means the
 /// object is a leaf: its destructor releases only strings/bytes/weak slots,
 /// none of which can point back into a cycle.
-// consumed by the collection pass, which lands separately.
-#[allow(dead_code)]
 pub(crate) fn tracer_for_dtor(dtor: usize) -> Option<usize> {
     lock_tracers().get(&dtor).copied()
 }
@@ -212,8 +223,6 @@ pub static CYCLE_VISITS_UNHOOKED: AtomicU64 = AtomicU64::new(0);
 
 /// Install (or with 0, remove) the process-global visitor `pith_cc_visit`
 /// dispatches to. The hook must have the shape `extern "C" fn(i64, i64)`.
-// consumed by the collection pass, which lands separately.
-#[allow(dead_code)]
 pub(crate) fn install_visit_hook(hook: usize) {
     VISIT_HOOK.store(hook, Ordering::Release);
 }
@@ -447,6 +456,12 @@ pub(crate) fn mutator_gate() {
 
 #[inline(never)]
 fn mutator_gate_slow() {
+    // the thread running the collection pass must never park on its own stop
+    // request: a compiled destructor it calls during teardown could carry a
+    // safe-point, and parking there would deadlock the stopped world.
+    if ON_COLLECTOR.with(Cell::get) {
+        return;
+    }
     let Some(slot) = mutator_slot() else {
         return;
     };
@@ -485,6 +500,9 @@ impl Drop for NativeBracket {
 
 #[inline(never)]
 fn enter_native() {
+    if ON_COLLECTOR.with(Cell::get) {
+        return;
+    }
     if let Some(slot) = mutator_slot() {
         slot.state.store(MUTATOR_NATIVE, Ordering::SeqCst);
     }
@@ -492,6 +510,9 @@ fn enter_native() {
 
 #[inline(never)]
 fn exit_native() {
+    if ON_COLLECTOR.with(Cell::get) {
+        return;
+    }
     let Some(slot) = mutator_slot() else {
         return;
     };
@@ -524,9 +545,27 @@ fn world_is_stopped() -> bool {
         .all(|slot| slot.state.load(Ordering::SeqCst) != MUTATOR_RUNNING)
 }
 
+// the green preemption flag's value before a stop raised it, restored on
+// release. stops serialize (one collector, and `with_world_stopped` holds
+// STOPPER), so a single saved value is enough; the saved bit keeps a resume
+// that follows no stop from writing a stale value back.
+static PREEMPT_PRIOR: AtomicU8 = AtomicU8::new(0);
+static PREEMPT_SAVED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a stop-the-world request is pending. The green monitor keeps the
+/// preemption flag raised while this holds, so its 10ms refresh cannot erase
+/// the stop accelerator between a request and the rendezvous.
+pub(crate) fn stop_requested() -> bool {
+    GC_STOP.load(Ordering::SeqCst)
+}
+
 /// clear the stop request, wake everyone parked on it, and (when the caller
 /// is itself a registered mutator) become a running mutator again.
 fn release_the_world(own: Option<&MutatorSlot>) {
+    if PREEMPT_SAVED.swap(false, Ordering::SeqCst) {
+        crate::concurrency::green::PITH_PREEMPT_REQUESTED
+            .store(PREEMPT_PRIOR.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
     let guard = lock_gate();
     GC_STOP.store(false, Ordering::SeqCst);
     GC_GATE_CV.notify_all();
@@ -547,8 +586,6 @@ fn release_the_world(own: Option<&MutatorSlot>) {
 /// `native` for the duration so the rendezvous does not wait on the thread
 /// doing the waiting; resume puts it back. The collection pass runs from a
 /// dedicated thread, which never registers and needs neither.
-// consumed by the collection pass, which lands separately.
-#[allow(dead_code)]
 pub(crate) fn pith_cycle_stop_the_world() -> bool {
     if !cycle_gc_enabled() {
         return false;
@@ -558,6 +595,17 @@ pub(crate) fn pith_cycle_stop_the_world() -> bool {
         slot.state.store(MUTATOR_NATIVE, Ordering::SeqCst);
     }
     GC_STOP.store(true, Ordering::SeqCst);
+    // preempt accelerator: while the stop request is pending, raise the
+    // green preemption flag so compiled loop back-edges call into
+    // `pith_green_maybe_yield`, whose first gate is the collector's. that
+    // drives a compute-bound task (or the main thread in a tight loop) to a
+    // park it would otherwise only reach at its next runtime call. the prior
+    // value is restored on release; the monitor also keeps the flag up while
+    // the request stands (see `stop_requested`).
+    let prior =
+        crate::concurrency::green::PITH_PREEMPT_REQUESTED.swap(1, Ordering::SeqCst);
+    PREEMPT_PRIOR.store(prior, Ordering::SeqCst);
+    PREEMPT_SAVED.store(true, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_millis(stop_timeout_ms());
     loop {
         if world_is_stopped() {
@@ -576,8 +624,6 @@ pub(crate) fn pith_cycle_stop_the_world() -> bool {
 /// Withdraw the stop request and wake every mutator parked on it. Only
 /// meaningful after a `true` from `pith_cycle_stop_the_world`, on the same
 /// thread; calling it with the world already running is a harmless no-op.
-// consumed by the collection pass, which lands separately.
-#[allow(dead_code)]
 pub(crate) fn pith_cycle_resume_the_world() {
     if !cycle_gc_enabled() {
         return;
@@ -590,8 +636,6 @@ pub(crate) fn pith_cycle_resume_the_world() {
 /// flag is off. Concurrent callers serialize on an internal lock; the resume
 /// runs even if `f` panics, so a bug in a collection pass cannot leave every
 /// mutator parked forever.
-// consumed by the collection pass, which lands separately.
-#[allow(dead_code)]
 pub(crate) fn with_world_stopped<F: FnOnce() -> R, R>(f: F) -> Option<R> {
     if !cycle_gc_enabled() {
         return None;
@@ -613,16 +657,637 @@ pub(crate) fn with_world_stopped<F: FnOnce() -> R, R>(f: F) -> Option<R> {
     Some(f())
 }
 
-/// Print the suspect-tracking counters to stderr.
+// --- the collection pass ----------------------------------------------------
+//
+// trial deletion (Bacon-Rajan), synchronous, inside the stopped world. the
+// suspects are the only places a garbage cycle can root, so the pass drains
+// them, walks the ownership graph they reach, subtracts the edges internal to
+// that graph from each member's real count (MarkGray), restores the counts of
+// everything still owned from outside (Scan/ScanBlack), and frees what is
+// left (the white set) — the members of cycles no live reference reaches.
+//
+// child kinds use the closure env tag codes, the one numbering the runtime,
+// the tracers, and `pith_cc_visit` already share: 2=list 3=map 4=set 6=struct
+// (and tuple boxes) 7=closure. strings and bytes never appear in the graph —
+// they hold no edges, so they cannot sit in a cycle, and the destruction of
+// their owner releases them the ordinary way. sets appear as nodes (they have
+// a count of their own, so a set owned only by garbage is garbage) but are
+// never enumerated into: ints and copied byte strings are all they hold.
+
+const CHILD_KIND_LIST: u8 = 2;
+const CHILD_KIND_MAP: u8 = 3;
+const CHILD_KIND_SET: u8 = 4;
+const CHILD_KIND_STRUCT: u8 = 6;
+const CHILD_KIND_CLOSURE: u8 = 7;
+
+/// Collections that ran to completion (world stopped, whites freed).
+pub static CYCLE_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Live suspects examined as candidate roots across all collections.
+pub static CYCLE_ROOTS_EXAMINED: AtomicU64 = AtomicU64::new(0);
+/// Cycle members reclaimed by trial deletion.
+pub static CYCLE_WHITES_FREED: AtomicU64 = AtomicU64::new(0);
+/// Graveyard shells reclaimed by the collector.
+pub static CYCLE_GRAVEYARD_FREED: AtomicU64 = AtomicU64::new(0);
+
+// how many buffered suspects trigger a collection. resolved once from
+// PITH_CYCLE_GC_THRESHOLD; 0 in the cell means not yet resolved.
+static COLLECT_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+const COLLECT_THRESHOLD_DEFAULT: usize = 4096;
+
+fn collect_threshold() -> usize {
+    let cached = COLLECT_THRESHOLD.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let threshold = std::env::var("PITH_CYCLE_GC_THRESHOLD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(COLLECT_THRESHOLD_DEFAULT);
+    COLLECT_THRESHOLD.store(threshold, Ordering::Relaxed);
+    threshold
+}
+
+thread_local! {
+    // set on the thread running a collection pass (the dedicated collector
+    // thread for its whole life, a test caller for the span of one collect).
+    // the mutator gates and native brackets check it so teardown code the
+    // collector calls can never park the collector on its own stop request.
+    static ON_COLLECTOR: Cell<bool> = const { Cell::new(false) };
+
+    // the children one tracer call reports. `pith_cc_visit` has no context
+    // argument, so the installed hook needs a side slot to deliver through;
+    // a per-thread buffer the caller drains right after the tracer returns
+    // is the simplest shape that cannot dangle — no borrowed closure state
+    // survives past the call that set it up. tracer calls never nest (the
+    // pass walks one object at a time and drains before descending).
+    static TRACED_CHILDREN: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The hook installed for the span of a collection: buffer each reported
+/// child for the tracer caller to drain. Installing it process-wide is safe
+/// because the world is stopped — only the collector runs tracers.
+extern "C" fn collector_visit(child: i64, kind: i64) {
+    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().push((child, kind)));
+}
+
+/// The object's real, current strong count — the trial counts seed from
+/// this. `None` when the pointer does not validate as the claimed kind (a
+/// corpse, or a miscarried edge), in which case it never joins the graph.
+unsafe fn real_strong_count(ptr: usize, kind: u8) -> Option<i64> {
+    match kind {
+        CHILD_KIND_STRUCT => {
+            crate::runtime_core::cycle_struct_strong_count(ptr as i64).map(i64::from)
+        }
+        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_strong_count(ptr as i64),
+        CHILD_KIND_LIST => {
+            crate::collections::list::cycle_list_strong_count(ptr as i64).map(i64::from)
+        }
+        CHILD_KIND_MAP => {
+            crate::collections::map::cycle_map_strong_count(ptr as i64).map(i64::from)
+        }
+        CHILD_KIND_SET => {
+            crate::collections::set::cycle_set_strong_count(ptr as i64).map(i64::from)
+        }
+        _ => None,
+    }
+}
+
+/// Every rc edge out of the object, as (child pointer, child kind). One
+/// function for every kind:
+///
+/// - a struct-family box reaches its children through the tracer keyed by
+///   its destructor pointer; no destructor, or no tracer for it (only
+///   string/bytes/weak fields), means a leaf.
+/// - a closure walks its tagged env slots; weak captures (tag 8) hold no
+///   strong count and are skipped with the string/bytes leaves.
+/// - lists and maps enumerate the values they own counts on.
+/// - sets are nodes with no out-edges.
+unsafe fn children_of(ptr: usize, kind: u8) -> Vec<(usize, u8)> {
+    let mut children: Vec<(usize, u8)> = Vec::new();
+    let mut push = |child: i64, child_kind: u8| {
+        if child != 0
+            && matches!(
+                child_kind,
+                CHILD_KIND_LIST
+                    | CHILD_KIND_MAP
+                    | CHILD_KIND_SET
+                    | CHILD_KIND_STRUCT
+                    | CHILD_KIND_CLOSURE
+            )
+        {
+            children.push((child as usize, child_kind));
+        }
+    };
+    match kind {
+        CHILD_KIND_STRUCT => {
+            let dtor = crate::runtime_core::cycle_struct_dtor_slot(ptr as i64);
+            if dtor == 0 {
+                return children;
+            }
+            let Some(tracer) = tracer_for_dtor(dtor as usize) else {
+                return children;
+            };
+            // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
+            let trace: extern "C" fn(i64) = std::mem::transmute(tracer);
+            trace(ptr as i64);
+            let reported = TRACED_CHILDREN.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+            for (child, child_kind) in reported {
+                push(child, child_kind as u8);
+            }
+        }
+        CHILD_KIND_CLOSURE => {
+            crate::runtime_core::cycle_closure_children(ptr as i64, &mut |child, tag| {
+                push(child, tag);
+            });
+        }
+        CHILD_KIND_LIST => {
+            crate::collections::list::cycle_list_children(ptr as i64, &mut |child, code| {
+                push(child, code);
+            });
+        }
+        CHILD_KIND_MAP => {
+            crate::collections::map::cycle_map_children(ptr as i64, &mut |child, code| {
+                push(child, code);
+            });
+        }
+        _ => {}
+    }
+    children
+}
+
+/// mark-gray colors. every node starts `Fresh` when seeded; MarkGray turns
+/// the candidate graph gray while subtracting internal edges, Scan restores
+/// (black) what outside references still hold, and what stays with no
+/// external count comes out white — the garbage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Color {
+    Fresh,
+    Gray,
+    Black,
+    White,
+}
+
+/// one graph node, keyed by pointer in the pass-local map. the children are
+/// enumerated once at seeding (the world is stopped, so the edges cannot
+/// change) and reused by every later phase.
+struct Node {
+    kind: u8,
+    count: i64,
+    color: Color,
+    children: Vec<(usize, u8)>,
+}
+
+/// Seed a node with its real count and its edges. `false` when the pointer
+/// does not validate, which keeps a miscarried edge out of the graph — its
+/// trial count is then simply never decremented, the leak direction.
+unsafe fn seed_node(nodes: &mut HashMap<usize, Node>, ptr: usize, kind: u8) -> bool {
+    if nodes.contains_key(&ptr) {
+        return true;
+    }
+    let Some(count) = real_strong_count(ptr, kind) else {
+        return false;
+    };
+    let children = children_of(ptr, kind);
+    nodes.insert(
+        ptr,
+        Node {
+            kind,
+            count,
+            color: Color::Fresh,
+            children,
+        },
+    );
+    true
+}
+
+/// MarkGray: walk from a root, graying each node once and subtracting one
+/// from the trial count of every edge target. after every root is walked,
+/// each node's trial count is its real count minus the edges internal to
+/// the candidate graph.
+unsafe fn mark_gray(nodes: &mut HashMap<usize, Node>, root: usize) {
+    let mut stack = vec![root];
+    while let Some(ptr) = stack.pop() {
+        let children = match nodes.get_mut(&ptr) {
+            Some(node) if node.color != Color::Gray => {
+                node.color = Color::Gray;
+                node.children.clone()
+            }
+            _ => continue,
+        };
+        for (child, child_kind) in children {
+            if !seed_node(nodes, child, child_kind) {
+                continue;
+            }
+            // seeded just above, so the lookup can only hit.
+            let Some(child_node) = nodes.get_mut(&child) else {
+                continue;
+            };
+            child_node.count -= 1;
+            if child_node.color != Color::Gray {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Scan: a gray node with a positive trial count is owned from outside the
+/// candidate graph — re-blacken it and everything it reaches, restoring the
+/// counts MarkGray subtracted. a gray node at zero or below goes white and
+/// its children are scanned in turn.
+unsafe fn scan(nodes: &mut HashMap<usize, Node>, root: usize) {
+    let mut stack = vec![root];
+    while let Some(ptr) = stack.pop() {
+        let Some(node) = nodes.get_mut(&ptr) else {
+            continue;
+        };
+        if node.color != Color::Gray {
+            continue;
+        }
+        if node.count > 0 {
+            scan_black(nodes, ptr);
+            continue;
+        }
+        node.color = Color::White;
+        let children = node.children.clone();
+        for (child, _) in children {
+            stack.push(child);
+        }
+    }
+}
+
+/// ScanBlack: blacken everything reachable from a node with external owners,
+/// re-incrementing each edge target's trial count exactly once per edge.
+unsafe fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
+    let mut stack = vec![root];
+    while let Some(ptr) = stack.pop() {
+        let children = match nodes.get_mut(&ptr) {
+            Some(node) if node.color != Color::Black => {
+                node.color = Color::Black;
+                node.children.clone()
+            }
+            _ => continue,
+        };
+        for (child, _) in children {
+            if let Some(child_node) = nodes.get_mut(&child) {
+                child_node.count += 1;
+                if child_node.color != Color::Black {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+// a teardown guard far above any real count: added to every white's real
+// counter before destruction, so a release arriving from another dying
+// object decrements a huge number instead of ever reaching a death path
+// the collector is about to run by hand.
+const WHITE_GUARD: i64 = 1 << 30;
+
+unsafe fn guard_white(ptr: usize, kind: u8) {
+    match kind {
+        CHILD_KIND_STRUCT => {
+            crate::runtime_core::cycle_struct_guard_strong(ptr as i64, WHITE_GUARD as u32)
+        }
+        CHILD_KIND_CLOSURE => {
+            crate::runtime_core::cycle_closure_guard_strong(ptr as i64, WHITE_GUARD)
+        }
+        CHILD_KIND_LIST => {
+            crate::collections::list::cycle_list_guard_strong(ptr as i64, WHITE_GUARD as u32)
+        }
+        CHILD_KIND_MAP => {
+            crate::collections::map::cycle_map_guard_strong(ptr as i64, WHITE_GUARD as u32)
+        }
+        CHILD_KIND_SET => {
+            crate::collections::set::cycle_set_guard_strong(ptr as i64, WHITE_GUARD as u32)
+        }
+        _ => {}
+    }
+}
+
+/// A white's normal destruction body: release everything it owns. edges to
+/// other whites decrement guarded counts harmlessly; edges out of the
+/// garbage release for real, which can cascade ordinary frees and can push
+/// fresh suspects — both fine, because no buffer lock is held here.
+unsafe fn destroy_white(ptr: usize, kind: u8) {
+    match kind {
+        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_run_dtor(ptr as i64),
+        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_release_env(ptr as i64),
+        CHILD_KIND_LIST => crate::collections::list::cycle_list_release_elements(ptr as i64),
+        CHILD_KIND_MAP => crate::collections::map::cycle_map_release_values(ptr as i64),
+        CHILD_KIND_SET => crate::collections::set::cycle_set_release_elements(ptr as i64),
+        _ => {}
+    }
+}
+
+/// A white's terminal free, everything its kind's death path does after the
+/// destruction body it already ran.
+unsafe fn free_white_shell(ptr: usize, kind: u8) {
+    match kind {
+        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_free_dead(ptr as i64),
+        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_free_dead(ptr as i64),
+        CHILD_KIND_LIST => crate::collections::list::cycle_list_free_dead(ptr as i64),
+        CHILD_KIND_MAP => crate::collections::map::cycle_map_free_dead(ptr as i64),
+        CHILD_KIND_SET => crate::collections::set::cycle_set_free_dead(ptr as i64),
+        _ => {}
+    }
+}
+
+/// restores the flag (and removes the visit hook) even when a collection
+/// panics, so the process is left inert rather than half-instrumented.
+struct CollectGuard {
+    was_on: bool,
+}
+
+impl CollectGuard {
+    fn enter() -> Self {
+        let was_on = ON_COLLECTOR.with(|cell| cell.replace(true));
+        install_visit_hook(collector_visit as extern "C" fn(i64, i64) as usize);
+        CollectGuard { was_on }
+    }
+}
+
+impl Drop for CollectGuard {
+    fn drop(&mut self) {
+        install_visit_hook(0);
+        let was_on = self.was_on;
+        ON_COLLECTOR.with(|cell| cell.set(was_on));
+    }
+}
+
+/// One trial-deletion collection. Must run with the world stopped: it reads
+/// and rewrites reference counts assuming no mutator moves them.
+///
+/// # Safety
+/// The caller holds the world stopped (`with_world_stopped`), and every
+/// pointer in the suspect buffer and graveyard satisfies the invariants the
+/// buffer maintains (see the module doc).
+pub(crate) unsafe fn collect() {
+    let _guard = CollectGuard::enter();
+
+    // 1. drain and validate the roots. the buffer is swapped empty first, so
+    // suspects pushed by teardown below land in a fresh buffer for the next
+    // round. the graveyard is snapshotted at the same moment: shells parked
+    // during teardown pair with entries in that fresh buffer and must
+    // survive until the pass that drains those entries.
+    let drained = std::mem::take(&mut *lock_suspects());
+    let parked = std::mem::take(&mut *lock_graveyard());
+
+    let mut roots: Vec<(usize, u8)> = Vec::new();
+    // live struct roots keep the buffer's weak count until the very end of
+    // the pass: the world is stopped, so nothing re-suspends them mid-pass,
+    // and the held count is what guarantees the header outlives every phase.
+    let mut root_struct_weaks: Vec<i64> = Vec::new();
+    for (ptr, kind) in drained {
+        match kind {
+            CYCLE_KIND_STRUCT => match crate::runtime_core::cycle_struct_alive(ptr as i64) {
+                Some(true) => {
+                    crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
+                    root_struct_weaks.push(ptr as i64);
+                    roots.push((ptr, CHILD_KIND_STRUCT));
+                }
+                Some(false) => {
+                    // the value died while buffered: nothing to collect, the
+                    // buffer's weak count is all that held the header.
+                    crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
+                    crate::runtime_core::pith_struct_weak_release(ptr as i64);
+                }
+                None => {}
+            },
+            CYCLE_KIND_CLOSURE => {
+                if crate::runtime_core::cycle_closure_strong_count(ptr as i64).is_some() {
+                    crate::runtime_core::cycle_clear_closure_buffered(ptr as i64);
+                    roots.push((ptr, CHILD_KIND_CLOSURE));
+                }
+                // scrubbed magic: the object died into the graveyard, whose
+                // snapshot below frees the shell.
+            }
+            CYCLE_KIND_LIST => {
+                if crate::collections::list::cycle_list_strong_count(ptr as i64).is_some() {
+                    crate::collections::list::cycle_clear_list_buffered(ptr as i64);
+                    roots.push((ptr, CHILD_KIND_LIST));
+                }
+            }
+            CYCLE_KIND_MAP => {
+                if crate::collections::map::cycle_map_strong_count(ptr as i64).is_some() {
+                    crate::collections::map::cycle_clear_map_buffered(ptr as i64);
+                    roots.push((ptr, CHILD_KIND_MAP));
+                }
+            }
+            _ => {}
+        }
+    }
+    CYCLE_ROOTS_EXAMINED.fetch_add(roots.len() as u64, Ordering::Relaxed);
+
+    // 2-3. trial deletion over the graph the roots reach.
+    let mut nodes: HashMap<usize, Node> = HashMap::new();
+    for &(ptr, kind) in &roots {
+        if seed_node(&mut nodes, ptr, kind) {
+            mark_gray(&mut nodes, ptr);
+        }
+    }
+    for &(ptr, _) in &roots {
+        scan(&mut nodes, ptr);
+    }
+    let whites: Vec<(usize, u8)> = nodes
+        .iter()
+        .filter(|(_, node)| node.color == Color::White)
+        .map(|(&ptr, node)| (ptr, node.kind))
+        .collect();
+
+    // 4. free the whites: guard every real count first so teardown can never
+    // recursively free a member, then run every destruction body, then free
+    // every shell. three full passes, in that order — a destruction body may
+    // touch any other white, so no white's shell may go before the last
+    // body has run.
+    for &(ptr, kind) in &whites {
+        guard_white(ptr, kind);
+    }
+    for &(ptr, kind) in &whites {
+        destroy_white(ptr, kind);
+    }
+    for &(ptr, kind) in &whites {
+        free_white_shell(ptr, kind);
+    }
+    CYCLE_WHITES_FREED.fetch_add(whites.len() as u64, Ordering::Relaxed);
+
+    // 5. the graveyard snapshot: shells fully destructed before this pass,
+    // whose buffer entries were discarded in the drain above.
+    CYCLE_GRAVEYARD_FREED.fetch_add(parked.len() as u64, Ordering::Relaxed);
+    for (ptr, kind) in parked {
+        match kind {
+            CYCLE_KIND_CLOSURE => crate::runtime_core::cycle_drop_closure_shell(ptr),
+            CYCLE_KIND_LIST => crate::collections::list::cycle_drop_list_shell(ptr),
+            CYCLE_KIND_MAP => crate::collections::map::cycle_drop_map_shell(ptr),
+            _ => {}
+        }
+    }
+
+    // 6. drop the buffer's weak count on every drained live struct root. a
+    // root that stayed black is simply un-buffered again; one that went
+    // white had its shell freed above, and this lets outstanding weak
+    // references (or nothing) decide when the header goes.
+    for ptr in root_struct_weaks {
+        crate::runtime_core::pith_struct_weak_release(ptr);
+    }
+
+    CYCLE_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+// --- the collector thread ---------------------------------------------------
+//
+// a dedicated std thread, spawned lazily on the first suspect (or the first
+// forced collection) while the flag is on. it never registers as a mutator,
+// so the rendezvous never waits on it. it loops: wait until the suspect
+// buffer crosses the threshold or a forced collection is requested, stop the
+// world, collect, and on a failed stop back off (10ms doubling to 500ms)
+// before retrying.
+
+struct GcControl {
+    /// forced collections requested; each `pith_cycle_gc_collect_now` call
+    /// takes the next sequence number and waits for it to complete.
+    force_pending: u64,
+    /// forced requests answered (successfully or not).
+    force_done: u64,
+    /// whether the attempt that completed `force_done` stopped the world.
+    last_force_ok: bool,
+}
+
+static GC_CTRL: Mutex<GcControl> = Mutex::new(GcControl {
+    force_pending: 0,
+    force_done: 0,
+    last_force_ok: false,
+});
+static GC_CTRL_CV: Condvar = Condvar::new();
+static COLLECTOR_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn lock_ctrl() -> MutexGuard<'static, GcControl> {
+    match GC_CTRL.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+const COLLECT_BACKOFF_START: Duration = Duration::from_millis(10);
+const COLLECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+
+fn ensure_collector_thread() {
+    if COLLECTOR_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if COLLECTOR_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("pith-cycle-gc".into())
+        .spawn(collector_main);
+    if spawned.is_err() {
+        // no thread means no collections — cycles leak, the acceptable
+        // direction — and a later suspect may try again.
+        COLLECTOR_STARTED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn collector_main() {
+    // for its whole life: teardown code must never park this thread on its
+    // own stop request, and it must never register as a mutator.
+    ON_COLLECTOR.with(|cell| cell.set(true));
+    let mut backoff = COLLECT_BACKOFF_START;
+    loop {
+        let force_goal = wait_for_work();
+        let stopped = with_world_stopped(|| unsafe { collect() }).is_some();
+        finish_forced(force_goal, stopped);
+        if stopped {
+            backoff = COLLECT_BACKOFF_START;
+        } else {
+            // some mutator would not stop (or the flag went off). back off,
+            // but on the control condvar so a forced request cuts the wait
+            // short.
+            let ctrl = lock_ctrl();
+            if ctrl.force_pending == ctrl.force_done {
+                let _ = GC_CTRL_CV.wait_timeout(ctrl, backoff);
+            }
+            backoff = (backoff * 2).min(COLLECT_BACKOFF_MAX);
+        }
+    }
+}
+
+/// Block until there is a reason to collect. Returns the forced-request
+/// sequence this attempt will answer for (unchanged `force_done` when the
+/// trigger was the threshold alone).
+fn wait_for_work() -> u64 {
+    let mut ctrl = lock_ctrl();
+    loop {
+        if ctrl.force_pending > ctrl.force_done {
+            return ctrl.force_pending;
+        }
+        if lock_suspects().len() >= collect_threshold() {
+            return ctrl.force_pending;
+        }
+        // the timeout is the threshold poll: pushes only notify on the
+        // crossing itself, and a buffer that idles above the threshold
+        // afterwards still deserves a pass.
+        ctrl = GC_CTRL_CV
+            .wait_timeout(ctrl, Duration::from_millis(50))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
+/// Answer every forced request the finished attempt covered. Requests that
+/// arrived mid-attempt have a later sequence and get their own attempt.
+fn finish_forced(goal: u64, stopped: bool) {
+    let mut ctrl = lock_ctrl();
+    if goal > ctrl.force_done {
+        ctrl.force_done = goal;
+        ctrl.last_force_ok = stopped;
+        GC_CTRL_CV.notify_all();
+    }
+}
+
+/// Force a collection and wait for the attempt: 1 when it ran, 0 when the
+/// stop timed out or the collector is disabled. Callable from pith by its
+/// literal name; the wait is a native bracket, so a mutator blocking here
+/// counts as stopped for the very collection it asked for.
+#[no_mangle]
+pub extern "C" fn pith_cycle_gc_collect_now() -> i64 {
+    if !cycle_gc_enabled() {
+        return 0;
+    }
+    ensure_collector_thread();
+    let mut ctrl = lock_ctrl();
+    ctrl.force_pending += 1;
+    let my_seq = ctrl.force_pending;
+    GC_CTRL_CV.notify_all();
+    let _native = native_bracket();
+    while ctrl.force_done < my_seq {
+        ctrl = GC_CTRL_CV
+            .wait(ctrl)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    let ok = ctrl.last_force_ok;
+    // release the control lock before the bracket exits: the exit may park
+    // this thread for a later stop, and the collector needs the lock to
+    // answer forced requests — parking while holding it would wedge both.
+    drop(ctrl);
+    i64::from(ok)
+}
+
+/// Print the cycle-gc counters to stderr.
 #[no_mangle]
 pub extern "C" fn pith_cycle_gc_stats() {
     eprintln!(
-        "pith cycle gc: buffered={} overflowed={} graveyard_deferred={} pending_suspects={} pending_graveyard={}",
+        "pith cycle gc: buffered={} overflowed={} graveyard_deferred={} pending_suspects={} pending_graveyard={} collections={} roots_examined={} whites_freed={} graveyard_freed={}",
         CYCLE_SUSPECTS_BUFFERED.load(Ordering::Relaxed),
         CYCLE_SUSPECTS_OVERFLOWED.load(Ordering::Relaxed),
         CYCLE_GRAVEYARD_DEFERRED.load(Ordering::Relaxed),
         lock_suspects().len(),
         lock_graveyard().len(),
+        CYCLE_COLLECTIONS.load(Ordering::Relaxed),
+        CYCLE_ROOTS_EXAMINED.load(Ordering::Relaxed),
+        CYCLE_WHITES_FREED.load(Ordering::Relaxed),
+        CYCLE_GRAVEYARD_FREED.load(Ordering::Relaxed),
     );
 }
 
@@ -674,8 +1339,8 @@ pub(crate) fn graveyard_count_for_tests(ptr: usize) -> usize {
 /// Drain both buffers so the next test starts clean. Buffer entries are
 /// discarded properly (bit cleared, struct weak count dropped — which frees
 /// the header of a struct that died while buffered). Graveyard shells are
-/// deliberately leaked: the collector that frees them does not exist yet,
-/// and a bounded leak inside the test process is harmless.
+/// deliberately leaked rather than dropped here: freeing them belongs to a
+/// collection pass, and a bounded leak inside the test process is harmless.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     let entries = std::mem::take(&mut *lock_suspects());
@@ -694,7 +1359,7 @@ mod tests {
     use crate::runtime_core::{
         closure_buffered_for_tests, pith_closure_get_fn, pith_closure_new, pith_closure_release,
         pith_closure_retain, pith_closure_set_env_rc, pith_struct_alloc, pith_struct_release,
-        pith_struct_retain, pith_struct_weak_load, pith_struct_weak_release,
+        pith_struct_retain, pith_struct_set_dtor, pith_struct_weak_load, pith_struct_weak_release,
         pith_struct_weak_retain, struct_dead_word_for_tests, struct_weak_count_for_tests,
     };
 
@@ -1294,5 +1959,290 @@ mod tests {
         assert!(!GC_STOP.load(Ordering::SeqCst), "no request left behind");
         assert_eq!(with_world_stopped(|| 1), None);
         pith_cycle_resume_the_world(); // a no-op, not a panic
+    }
+
+    // --- collection pass tests ---------------------------------------------
+    //
+    // rings are built from raw runtime calls with a hand-written destructor
+    // and tracer pair, the same shapes the emitter generates: the dtor
+    // releases the one field, the tracer reports it to pith_cc_visit.
+
+    /// dtor for a one-field box whose field holds another struct.
+    unsafe extern "C" fn ring_dtor(ptr: i64) {
+        let field = *(ptr as *const i64);
+        if field != 0 {
+            pith_struct_release(field);
+        }
+    }
+
+    /// tracer twin of `ring_dtor`: report the field instead of releasing it.
+    extern "C" fn ring_tracer(ptr: i64) {
+        let field = unsafe { *(ptr as *const i64) };
+        pith_cc_visit(field, 6);
+    }
+
+    /// dtor for a one-field box whose field holds a closure.
+    unsafe extern "C" fn holder_dtor(ptr: i64) {
+        let closure = *(ptr as *const i64);
+        if closure != 0 {
+            pith_closure_release(closure);
+        }
+    }
+
+    extern "C" fn holder_tracer(ptr: i64) {
+        let closure = unsafe { *(ptr as *const i64) };
+        pith_cc_visit(closure, 7);
+    }
+
+    /// run a collection against a provably stopped world, retrying because
+    /// unrelated test threads may hold running mutator slots for a while.
+    fn collect_eventually() -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if with_world_stopped(|| unsafe { collect() }).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// a garbage two-struct ring: a owns b through its field, b owns a back,
+    /// and no external count remains once the builder's is dropped.
+    unsafe fn build_garbage_ring() -> (i64, i64) {
+        pith_cc_register_tracer(ring_dtor as usize as i64, ring_tracer as usize as i64);
+        let a = pith_struct_alloc(1);
+        let b = pith_struct_alloc(1);
+        pith_struct_set_dtor(a, ring_dtor as usize as i64);
+        pith_struct_set_dtor(b, ring_dtor as usize as i64);
+        *(a as *mut i64) = b; // our count on b transfers into a's field
+        pith_struct_retain(a);
+        *(b as *mut i64) = a; // b's edge holds its own count on a
+        pith_struct_weak_retain(a);
+        pith_struct_weak_retain(b);
+        (a, b)
+    }
+
+    #[test]
+    fn a_garbage_two_struct_ring_is_collected_exactly_once() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            let (a, b) = build_garbage_ring();
+            pith_struct_release(a); // the last external count: garbage now
+            assert_eq!(suspect_count_for_tests(a as usize), 1);
+            assert_eq!(pith_struct_weak_load(a), a, "the ring still holds it");
+
+            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+            assert!(collect_eventually(), "the stop must eventually land");
+            assert_eq!(pith_struct_weak_load(a), 0, "ring member a reclaimed");
+            assert_eq!(pith_struct_weak_load(b), 0, "ring member b reclaimed");
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                2,
+                "exactly the two ring members were freed"
+            );
+
+            // a second pass drains the teardown's fresh suspects and finds
+            // nothing more to free: collected exactly once.
+            assert!(collect_eventually());
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                2,
+                "nothing was freed twice"
+            );
+
+            pith_struct_weak_release(a);
+            pith_struct_weak_release(b);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_ring_with_a_live_external_owner_is_kept_until_the_owner_drops() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            let (a, b) = build_garbage_ring();
+            pith_struct_retain(a); // the "stack" reference keeping it alive
+            pith_struct_release(a); // buffers a, but a real owner remains
+
+            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+            assert!(collect_eventually());
+            assert_eq!(pith_struct_weak_load(a), a, "externally owned: kept");
+            assert_eq!(pith_struct_weak_load(b), b, "reached only from a: kept");
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                0,
+                "a reachable ring frees nothing"
+            );
+
+            // the owner lets go: the same ring is garbage on the next pass.
+            pith_struct_release(a);
+            assert!(collect_eventually());
+            assert_eq!(pith_struct_weak_load(a), 0);
+            assert_eq!(pith_struct_weak_load(b), 0);
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                2
+            );
+
+            pith_struct_weak_release(a);
+            pith_struct_weak_release(b);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_dtor_less_box_is_a_leaf_the_collector_never_frees() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            // no destructor, so no tracer: the collector sees a leaf with a
+            // real external count and must leave it alone.
+            let s = pith_struct_alloc(2);
+            pith_struct_weak_retain(s);
+            pith_struct_retain(s);
+            pith_struct_release(s); // buffered, still owned by us
+
+            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+            assert!(collect_eventually());
+            assert_eq!(pith_struct_weak_load(s), s, "leaf with an owner: kept");
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                0
+            );
+
+            pith_struct_weak_release(s);
+            pith_struct_release(s);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_closure_capture_ring_is_collected_through_the_env_slots() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            pith_cc_register_tracer(holder_dtor as usize as i64, holder_tracer as usize as i64);
+            let s = pith_struct_alloc(1);
+            pith_struct_set_dtor(s, holder_dtor as usize as i64);
+            let c = pith_closure_new(0x1000);
+            pith_struct_retain(s);
+            pith_closure_set_env_rc(c, 0, s, 6); // closure captures the struct
+            *(s as *mut i64) = c; // the struct's field owns the closure back
+            pith_struct_weak_retain(s);
+
+            pith_struct_release(s); // the last external count: garbage now
+            assert_eq!(suspect_count_for_tests(s as usize), 1);
+
+            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+            assert!(collect_eventually());
+            assert_eq!(pith_struct_weak_load(s), 0, "struct half reclaimed");
+            assert_eq!(pith_closure_get_fn(c), 0, "closure half no longer validates");
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                2
+            );
+
+            pith_struct_weak_release(s);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_collection_drains_the_graveyard() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            let list = crate::collections::list::pith_list_new(8, 0);
+            pith_list_retain_handle(list.ptr as i64);
+            pith_list_release(list); // 2 -> 1: buffered
+            pith_list_release(list); // 1 -> 0: dies into the graveyard
+            assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
+
+            assert!(collect_eventually());
+            assert_eq!(
+                graveyard_count_for_tests(list.ptr as usize),
+                0,
+                "the parked shell was freed"
+            );
+
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_forced_collect_reclaims_a_ring_and_reports_success() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+        reset_for_tests();
+        unsafe {
+            let (a, b) = build_garbage_ring();
+            pith_struct_release(a);
+
+            // retried because unrelated test threads may hold running
+            // mutator slots for a while, exactly like collect_eventually.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut forced_ok = false;
+            while !forced_ok && Instant::now() < deadline {
+                forced_ok = pith_cycle_gc_collect_now() == 1;
+            }
+            assert!(forced_ok, "the forced collection must eventually run");
+            assert_eq!(pith_struct_weak_load(a), 0);
+            assert_eq!(pith_struct_weak_load(b), 0);
+
+            pith_struct_weak_release(a);
+            pith_struct_weak_release(b);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_forced_collect_reports_failure_when_a_spinner_prevents_the_stop() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(30);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let spinner_done = Arc::clone(&done);
+        let (_slot, handle) = spawn_registered(move || {
+            while !spinner_done.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+        });
+
+        assert_eq!(
+            pith_cycle_gc_collect_now(),
+            0,
+            "a mutator that never gates times the forced stop out"
+        );
+
+        done.store(true, Ordering::Relaxed);
+        handle.join().expect("spinning thread panicked");
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn a_forced_collect_with_the_flag_off_reports_failure_immediately() {
+        let _guard = locked();
+        force_enabled_for_tests(false);
+        assert_eq!(pith_cycle_gc_collect_now(), 0);
     }
 }

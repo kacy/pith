@@ -209,6 +209,21 @@ pub fn recv_ctx[T](ch: Channel[T], ctx: Context) -> RecvResult[T]!WaitError:
         if ctx.is_cancelled():
             fail context_wait_error(ctx)
 
+## ask the experimental cycle collector for a collection right now and wait
+## for the attempt to finish. returns true when a collection ran, false when
+## the collector is disabled or some thread kept the world from stopping in
+## time. the collector only exists when the process was started with
+## PITH_CYCLE_GC=1; without it this returns false immediately and reference
+## cycles keep their documented behavior — they leak (see docs/ownership.md).
+pub fn gc_collect() -> Bool:
+    return pith_cycle_gc_collect_now() != 0
+
+## print the cycle collector's counters to stderr: suspects buffered, cycles
+## reclaimed, collections run. useful when deciding whether a long-running
+## process is accumulating unmarked reference cycles.
+pub fn gc_stats():
+    pith_cycle_gc_stats()
+
 # build a blocking error for cancellation.
 pub fn blocking_cancelled() -> BlockingError:
     return BlockingError(1, "cancelled")

@@ -313,16 +313,34 @@ reference counting frees a value the moment its last count drops, with
 no gc pause. that covers the common case completely. the deliberate
 gaps, all bounded leaks rather than dangling pointers:
 
-- **reference cycles are not collected.** there is no cycle collector,
-  so a graph that closes a loop of strong references keeps its own count
-  above zero and leaks. a struct can name its own type in a field and an
+- **unmarked reference cycles leak by default.** a graph that closes a
+  loop of strong references keeps its own count above zero, so arc alone
+  never reclaims it. a struct can name its own type in a field and an
   optional field owns its target, so a linked structure — a parent that
   owns a child which points back at the parent — closes a strong cycle.
-  the fix is the `weak` keyword (below): mark the back edge `weak` and
-  the ring reclaims. the other way to build a cycle is a closure that
-  captures a binding which transitively holds the closure — for example
-  a list that contains a closure capturing that same list; there is no
-  weak capture yet, so that shape still leaks.
+  the first-class fix is the `weak` keyword (below): mark the back edge
+  `weak` — a field, a local binding, or a binding a closure captures —
+  and the ring reclaims deterministically.
+
+  for cycles nobody marked there is an experimental trial-deletion
+  collector, off by default and enabled by running the process with
+  `PITH_CYCLE_GC=1`. with the flag on, a release that leaves a count
+  above zero records the object as a *suspect* — the only place a
+  garbage cycle can root — and a background thread periodically stops
+  the world, subtracts the edges internal to the suspect graph from each
+  member's count, and frees the members no outside reference still
+  holds (Bacon-Rajan trial deletion). a collection runs when enough
+  suspects accumulate (`PITH_CYCLE_GC_THRESHOLD`, default 4096), or on
+  demand from `std.concurrent.gc_collect()`, which waits for the attempt
+  and reports whether it ran; `std.concurrent.gc_stats()` prints the
+  collector's counters. some shapes stay uncollectable even with the
+  flag on and degrade to the leak they always were: a cycle through a
+  channel's buffer (a channel holds raw handles, not counted edges), a
+  cycle through a task handle, and a cycle through a container that
+  never learned its element kind — none of those edges are visible to
+  the collector's tracers. with the flag off — the default — the only
+  cost is one predicted branch per release, and cycles behave exactly
+  as this section always described: they leak, bounded, never dangling.
 - **a value sent down a channel outlives its local.** a channel holds a
   raw handle between the send and the receive and is not a counted
   container, so the sender adds a count nothing drops. it is the last

@@ -1276,6 +1276,101 @@ pub(crate) unsafe fn cycle_clear_list_buffered(handle: i64) {
     }
 }
 
+// --- collector-facing accessors ---------------------------------------------
+//
+// the collection pass runs with the world stopped; these keep the field
+// layout private to this file and magic-check every handle so a bad edge
+// degrades to None or a no-op.
+
+/// The `pith_cc_visit` child code for an element kind, or `None` when the
+/// elements are not graph nodes: primitives carry no counts, and strings and
+/// bytes are leaves the free-time cascade releases (they cannot sit in a
+/// cycle). The codes are the closure env tag codes, the one child-kind
+/// numbering the collector speaks.
+pub(crate) fn cycle_child_code(tag: ListTypeTag) -> Option<u8> {
+    match tag {
+        ListTypeTag::List => Some(2),
+        ListTypeTag::Map => Some(3),
+        ListTypeTag::Set => Some(4),
+        ListTypeTag::Struct => Some(6),
+        ListTypeTag::Closure => Some(7),
+        _ => None,
+    }
+}
+
+/// The list's current reference count, or `None` when the handle no longer
+/// validates (the list died into the graveyard).
+pub(crate) unsafe fn cycle_list_strong_count(handle: i64) -> Option<u32> {
+    list_ref_from_handle(handle)
+        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Add `delta` to the reference count — the collector's teardown guard.
+pub(crate) unsafe fn cycle_list_guard_strong(handle: i64, delta: u32) {
+    if let Some(impl_ref) = list_ref_from_handle(handle) {
+        impl_ref
+            .rc
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Report every element the list owns a count on, as (value, child code).
+pub(crate) unsafe fn cycle_list_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    let Some(impl_ref) = list_ref_from_handle(handle) else {
+        return;
+    };
+    let Some(code) = cycle_child_code(impl_ref.type_tag) else {
+        return;
+    };
+    for i in 0..impl_ref.len() {
+        if let Some(raw) = impl_ref.get_value(i) {
+            if raw != 0 {
+                f(raw, code);
+            }
+        }
+    }
+}
+
+/// The destruction body of a garbage list: drop the count it holds on every
+/// element, then empty the storage so the shell free below can never release
+/// them a second time.
+pub(crate) unsafe fn cycle_list_release_elements(handle: i64) {
+    let Some(impl_ref) = list_mut_from_handle(handle) else {
+        return;
+    };
+    release_all_elements(impl_ref);
+    impl_ref.clear();
+}
+
+/// Free a garbage list's shell: the tail of `pith_list_release` minus the
+/// element cascade, which `cycle_list_release_elements` already ran. A shell
+/// re-buffered during teardown parks in the graveyard so the fresh suspect
+/// entry never dangles.
+pub(crate) unsafe fn cycle_list_free_dead(handle: i64) {
+    let Some(impl_ref) = list_ref_from_handle(handle) else {
+        return;
+    };
+    let buffered = impl_ref
+        .cycle_flags
+        .load(std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0;
+    (*(handle as *mut ListImpl)).magic = 0;
+    handle_registry::unregister(handle as *const (), HandleKind::List);
+    crate::perf_count(&crate::PERF_LIST_FREES, 1);
+    if buffered && crate::cycle::cycle_gc_enabled() {
+        crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_LIST);
+        return;
+    }
+    drop(Box::from_raw(handle as *mut ListImpl));
+}
+
+/// Drop a list shell the graveyard parked: elements already released, magic
+/// already scrubbed, registry entry already gone — only the box remains.
+pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
+    drop(Box::from_raw(ptr as *mut ListImpl));
+}
+
 /// Retain a list handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {

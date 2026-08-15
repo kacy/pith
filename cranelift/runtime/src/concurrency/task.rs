@@ -381,6 +381,11 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
         None => return 0,
     };
     if let Some(join_handle) = join_handle {
+        // a native window for the cycle collector: the join blocks until the
+        // task thread exits and reads no heap handle while it does. without
+        // this, a main thread parked in await forever would keep every
+        // collection from ever stopping the world.
+        let _native = crate::cycle::native_bracket();
         let _ = join_handle.join();
     }
     let result = {
@@ -388,7 +393,13 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
         let mut state = lock_shared(lock);
         while !state.done {
             state.waiters += 1;
-            state = wait_shared(cvar, state);
+            // same shape as the channel wait: the condvar wait is a native
+            // window, and the exit runs while holding the re-acquired task
+            // lock — safe, because the collection pass never takes one.
+            state = {
+                let _native = crate::cycle::native_bracket();
+                wait_shared(cvar, state)
+            };
             state.waiters -= 1;
         }
         state.result

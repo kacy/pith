@@ -1320,7 +1320,14 @@ fn monitor_loop() {
 
         // set when something is overrunning, clear otherwise. clearing each quiet
         // pass keeps a stale request from waking tasks after the offender yields.
-        PITH_PREEMPT_REQUESTED.store(u8::from(any_overrun), AtomicOrdering::Relaxed);
+        // a pending cycle-gc stop keeps the flag up regardless: the stop path
+        // raised it as an accelerator (every safe-point routes through the
+        // collector gate), and a quiet monitor pass must not lower it while
+        // the rendezvous is still waiting on some mutator.
+        PITH_PREEMPT_REQUESTED.store(
+            u8::from(any_overrun || crate::cycle::stop_requested()),
+            AtomicOrdering::Relaxed,
+        );
     }
 }
 
@@ -2110,7 +2117,15 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
             // atomic step from the completer's point of view.
             None => {
                 j.condvar_waiters += 1;
-                j = cvar.wait(j).unwrap_or_else(|p| p.into_inner());
+                // the wait is a native window for the cycle collector: an
+                // os-thread awaiter reads no heap handle until the condvar
+                // hands the join lock back. same shape as the channel wait;
+                // the collection pass never takes a join lock, so the exit
+                // parking while the lock is held cannot wedge it.
+                j = {
+                    let _native = crate::cycle::native_bracket();
+                    cvar.wait(j).unwrap_or_else(|p| p.into_inner())
+                };
                 j.condvar_waiters -= 1;
             }
             // green awaiter: register under the join lock, release it, and suspend

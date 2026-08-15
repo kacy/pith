@@ -517,6 +517,92 @@ pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
     }
 }
 
+// --- collector-facing closure accessors -------------------------------------
+//
+// the collection pass runs with every mutator stopped, so these read and
+// rewrite the count with plain relaxed operations; each one magic-checks the
+// handle so an edge into something that was never (or is no longer) a closure
+// degrades to a None or a no-op instead of a wild read.
+
+/// The closure's current reference count, or `None` when the handle no longer
+/// validates (the closure died and its magic was scrubbed).
+pub(crate) unsafe fn cycle_closure_strong_count(handle: i64) -> Option<i64> {
+    pith_closure_ref(handle).map(|closure| {
+        closure
+            .ref_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// Add `delta` to the closure's reference count. The collector's teardown
+/// guard: a huge bias keeps releases from other dying objects from ever
+/// reaching this closure's death path while the collector owns it.
+pub(crate) unsafe fn cycle_closure_guard_strong(handle: i64, delta: i64) {
+    if let Some(closure) = pith_closure_ref(handle) {
+        closure
+            .ref_count
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Report every captured value that carries a count, as (value, env tag).
+/// Weak captures (tag 8) are reported too — the caller filters; they hold no
+/// strong count and are not edges of the ownership graph.
+pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    let Some(closure) = pith_closure_ref(handle) else {
+        return;
+    };
+    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
+        let value = closure.env[slot];
+        let tag = closure.env_tags[slot];
+        if value != 0 && tag != 0 {
+            f(value, tag);
+        }
+    }
+}
+
+/// The destruction body of a garbage closure: drop the counts it took on its
+/// captures, exactly as the last release would, then blank the slots so the
+/// shell free below can never release them a second time.
+pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
+    let Some(closure) = pith_closure_mut(handle) else {
+        return;
+    };
+    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
+        release_captured_value(closure.env[slot], closure.env_tags[slot]);
+        closure.env[slot] = 0;
+        closure.env_tags[slot] = 0;
+    }
+}
+
+/// Free a garbage closure's shell: the tail of `pith_closure_release` minus
+/// the environment release, which `cycle_closure_release_env` already ran.
+/// A shell whose buffered bit was set during teardown (a release hook fired
+/// on the collector thread) parks in the graveyard so the fresh suspect
+/// entry never dangles; the next collection frees it.
+pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
+    let Some(closure) = pith_closure_ref(handle) else {
+        return;
+    };
+    let buffered = closure
+        .cycle_flags
+        .load(std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0;
+    (handle as *mut u32).write(0);
+    if buffered && crate::cycle::cycle_gc_enabled() {
+        crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
+        return;
+    }
+    drop(Box::from_raw(handle as *mut PithClosure));
+}
+
+/// Drop a closure shell the graveyard parked. The magic is already scrubbed
+/// and the captures already released, so only the box itself remains.
+pub(crate) unsafe fn cycle_drop_closure_shell(ptr: usize) {
+    drop(Box::from_raw(ptr as *mut PithClosure));
+}
+
 #[cfg(test)]
 pub(crate) unsafe fn closure_buffered_for_tests(handle: i64) -> bool {
     pith_closure_ref(handle).is_some_and(|closure| {
@@ -2009,6 +2095,75 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
         struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+// --- collector-facing struct accessors --------------------------------------
+//
+// like the closure accessors above: the collection pass holds the world
+// stopped, so these use relaxed reads, and every one magic-checks so a bad
+// pointer degrades to None or a no-op.
+
+/// `Some(true)` for a live struct, `Some(false)` for one whose value died
+/// but whose header is still held (a weak count — the suspect buffer's, for
+/// a drained entry), `None` when the pointer is not a struct header at all.
+pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
+    let base = struct_base(ptr)?;
+    Some(struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
+}
+
+/// The struct's current strong count, or `None` for a dead value or a
+/// non-struct pointer — the collector must never seed a graph node from a
+/// corpse.
+pub(crate) unsafe fn cycle_struct_strong_count(ptr: i64) -> Option<u32> {
+    let base = struct_base(ptr)?;
+    if struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+        return None;
+    }
+    Some(struct_strong(base).load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The compiled destructor in the header's dtor slot, or 0 for none (a
+/// dtor-less box is a leaf to the collector: no rc children to walk).
+pub(crate) unsafe fn cycle_struct_dtor_slot(ptr: i64) -> u64 {
+    match struct_base(ptr) {
+        Some(base) => (base.add(STRUCT_OFF_DTOR) as *const u64).read(),
+        None => 0,
+    }
+}
+
+/// Add `delta` to the strong count — the collector's teardown guard.
+pub(crate) unsafe fn cycle_struct_guard_strong(ptr: i64, delta: u32) {
+    if let Some(base) = struct_base(ptr) {
+        struct_strong(base).fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Run a garbage struct's destructor: the same body the last strong release
+/// would have run, releasing every field the struct owns.
+pub(crate) unsafe fn cycle_struct_run_dtor(ptr: i64) {
+    let Some(base) = struct_base(ptr) else {
+        return;
+    };
+    let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
+    if dtor != 0 {
+        // panic-guard: calling a compiler-emitted struct destructor from its header slot.
+        let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
+        f(ptr);
+    }
+}
+
+/// Free a garbage struct's shell: the tail of `pith_struct_release` minus
+/// the destructor, which `cycle_struct_run_dtor` already ran. Marks the
+/// value dead (weak reads answer none from here on) and drops the implicit
+/// weak unit, so outstanding weak references keep holding the header exactly
+/// as they would after a normal death.
+pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
+    let Some(base) = struct_base(ptr) else {
+        return;
+    };
+    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
+    struct_weak_drop(base);
 }
 
 #[cfg(test)]

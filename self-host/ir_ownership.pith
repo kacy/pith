@@ -5,8 +5,8 @@
 # a value of a given rc kind. the owned-locals tracking state and the exit
 # cleanup stay in ir_emitter_core.
 
-from ir_builder import ir_reg
-from ir_call_emit import ir_emit_call1
+from ir_builder import ir_reg, ir_emit
+from ir_call_emit import ir_emit_call1, ir_emit_call2
 
 pub fn ir_string_retain_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
@@ -38,6 +38,39 @@ pub fn ir_rc_retain_reg(r: Int, kind: String):
         # binding would keep its target alive and the cycle it exists to
         # break would never reclaim. 0 (no target) is a no-op in the runtime.
         ir_emit_call1(ir_reg(), "pith_struct_weak_retain", "void", r)
+
+# the runtime kind code pith_cc_visit expects for an rc child, mirroring
+# the closure env tag table (CLOSURE_TAG_* in runtime_core.rs). a tuple is
+# a struct-header allocation, so it reports as a struct and the collector
+# reaches its elements through the box's own destructor-keyed tracer. 0
+# means the kind is not a visitable child.
+pub fn ir_cc_visit_code(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if kind == "set":
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "struct" or kind == "tuple":
+        return 6
+    if kind == "closure":
+        return 7
+    return 0
+
+# report an rc child to the cycle collector's visit callback without
+# touching its count. the generated tracer bodies are built from this the
+# way destructor bodies are built from ir_rc_release_reg.
+pub fn ir_rc_visit_reg(r: Int, kind: String):
+    code := ir_cc_visit_code(kind)
+    if code == 0:
+        return
+    code_r := ir_reg()
+    ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
+    ir_emit_call2(ir_reg(), "pith_cc_visit", "void", r, code_r)
 
 pub fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":

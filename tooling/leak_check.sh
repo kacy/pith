@@ -24,6 +24,9 @@ high_rounds="${PITH_LEAK_ROUNDS_HIGH:-800000}"
 # the noise and well below the smallest real signal.
 limit_kb="${PITH_LEAK_GROWTH_LIMIT_KB:-2048}"
 
+# a case is a path, optionally followed by KEY=VALUE pairs the measure runs
+# receive in their environment (e.g. the cycle-collector case, which only
+# collects with its flag on).
 pith="./target/release/pith"
 cases=(
   tests/leaks/leak_container_eviction
@@ -52,6 +55,7 @@ cases=(
   tests/leaks/leak_closure_captured_optional
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood
+  "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
 )
 
 echo "--- leak growth (${low_rounds} vs ${high_rounds} rounds, limit ${limit_kb}kb) ---"
@@ -67,16 +71,20 @@ is_peak() {
 
 # one measurement: peak at the high round count minus peak at the low one.
 # prints the growth in kilobytes, or nothing at all if the case did not run.
+# arguments past the executable are KEY=VALUE pairs for its environment.
 measure() {
   local exe="$1" low high
-  low="$(PITH_LEAK_ROUNDS="$low_rounds" "$exe" 2>/dev/null)" || return 1
-  high="$(PITH_LEAK_ROUNDS="$high_rounds" "$exe" 2>/dev/null)" || return 1
+  shift
+  low="$(env "$@" PITH_LEAK_ROUNDS="$low_rounds" "$exe" 2>/dev/null)" || return 1
+  high="$(env "$@" PITH_LEAK_ROUNDS="$high_rounds" "$exe" 2>/dev/null)" || return 1
   is_peak "$low" && is_peak "$high" || return 1
   echo $((high - low))
 }
 
 failed=0
-for base in "${cases[@]}"; do
+for entry in "${cases[@]}"; do
+  # split "path KEY=VALUE..." into the case path and its extra environment
+  read -r base extra_env <<<"$entry"
   if ! "$pith" build "$base.pith" > /dev/null 2>&1; then
     echo "FAIL $base (build)"
     failed=1
@@ -88,7 +96,8 @@ for base in "${cases[@]}"; do
   # gate red — the retry only costs anything when something is already wrong.
   growth=""
   for _ in 1 2; do
-    if ! growth="$(measure "./$base")"; then
+    # $extra_env is deliberately unquoted: zero or more KEY=VALUE words.
+    if ! growth="$(measure "./$base" $extra_env)"; then
       growth=""
       break
     fi

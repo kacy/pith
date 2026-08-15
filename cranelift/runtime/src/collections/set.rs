@@ -292,6 +292,64 @@ pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
     });
 }
 
+// --- collector-facing accessors ---------------------------------------------
+//
+// a set stores only ints and byte strings, so it holds no edges into the
+// ownership graph and the collector never walks into one. it still has a
+// reference count of its own, though, so a set every one of whose owners is
+// garbage is garbage too — these let the collection pass count it and, when
+// it turns out white, tear it down. every entry point magic-checks so a bad
+// edge degrades to None or a no-op.
+
+/// The set's current reference count, or `None` for an invalid handle.
+pub(crate) unsafe fn cycle_set_strong_count(handle: i64) -> Option<u32> {
+    set_ref_from_handle(handle)
+        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Add `delta` to the reference count — the collector's teardown guard.
+pub(crate) unsafe fn cycle_set_guard_strong(handle: i64, delta: u32) {
+    if let Some(impl_ref) = set_ref_from_handle(handle) {
+        impl_ref
+            .rc
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The destruction body of a garbage set: the element release loop from
+/// `pith_set_release`, then an empty so the shell free cannot repeat it.
+pub(crate) unsafe fn cycle_set_release_elements(handle: i64) {
+    let Some(impl_ref) = set_mut_from_handle(handle) else {
+        return;
+    };
+    if impl_ref.elem_is_heap {
+        for elem in impl_ref.iter() {
+            if let SetElement::String(bytes) = elem {
+                let s = PithString {
+                    ptr: bytes.as_ptr(),
+                    len: bytes.len() as i64,
+                    is_heap: true,
+                };
+                pith_string_release(s);
+            }
+        }
+    }
+    impl_ref.clear();
+}
+
+/// Free a garbage set's shell: the tail of `pith_set_release` minus the
+/// element loop, which `cycle_set_release_elements` already ran. Sets carry
+/// no buffered bit and never enter the suspect buffer, so a plain drop is
+/// always safe here.
+pub(crate) unsafe fn cycle_set_free_dead(handle: i64) {
+    if set_ref_from_handle(handle).is_none() {
+        return;
+    }
+    (*(handle as *mut SetImpl)).magic = 0;
+    handle_registry::unregister(handle as *const (), HandleKind::Set);
+    drop(Box::from_raw(handle as *mut SetImpl));
+}
+
 /// Convert set to list (for int elements)
 ///
 /// # Safety

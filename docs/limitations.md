@@ -167,10 +167,12 @@ correctness story:
   local holds a struct weakly with `weak name := expr`, and a closure that
   captures a weak binding holds its target weakly too, so a callback stored
   on the object it reads from reclaims with the object (see
-  docs/ownership.md). an unmarked strong cycle still leaks, bounded by
-  design — the discipline never produces a dangling pointer in exchange.
-  the deliberate answer for cycles nobody marked is the planned trial-
-  deletion collector. (removing an element from a
+  docs/ownership.md). an unmarked strong cycle still leaks by default,
+  bounded by design — the discipline never produces a dangling pointer in
+  exchange. for cycles nobody marked there is now an experimental
+  trial-deletion collector behind `PITH_CYCLE_GC=1` (off by default; see
+  docs/ownership.md for what it reclaims and what stays uncollectable),
+  with `std.concurrent.gc_collect()` to force a pass. (removing an element from a
   container, returning early on an error path, and indexed reads of
   `List[Struct]` were all listed here once; each was fixed and each is now
   pinned flat by the leak-growth gate, measured at two round counts.)

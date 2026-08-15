@@ -1,0 +1,34 @@
+# an UNMARKED two-node strong ring, built and dropped every round: next owns
+# forward and back, and neither edge is `weak`, so ARC alone can never
+# reclaim one (~352 bytes per round). the gate runs this case with
+# PITH_CYCLE_GC=1 (see the per-case env in leak_check.sh), where the
+# trial-deletion collector reclaims the rings and the peak stays flat. the
+# forced collection every few thousand rounds keeps each pass small and the
+# peak deterministic; the suspect threshold alone would also trigger passes,
+# but on its own schedule. the same binary without the flag grows by a ring
+# per round — which is how the collector's effect was falsified.
+import leakprobe as probe
+import std.concurrent as concurrent
+
+struct Node:
+    value: Int
+    mut next: Node?
+
+fn build_ring(seed: Int) -> Int:
+    a := Node(value: seed, next: none)
+    b := Node(value: seed + 1, next: none)
+    a.next = b
+    b.next = a
+    return a.value + b.value
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + build_ring(i)
+        i = i + 1
+        if i % 4096 == 0:
+            concurrent.gc_collect()
+    kb := probe.peak_kb()
+    print("{kb}")

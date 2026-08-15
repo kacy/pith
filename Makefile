@@ -63,6 +63,13 @@ build:
 check-no-panics:
 	bash tooling/check_no_panics.sh
 
+# the world-stopping cycle-gc tests run one at a time in their own process:
+# a stop request parks every gated thread in the binary, and the collector
+# thread a forced collect spawns lives for the rest of the process, so these
+# tests cannot share a parallel test binary with unrelated suites.
+test-cycle-gc:
+	cargo test --manifest-path cranelift/Cargo.toml -p pith-runtime --locked -- --ignored --test-threads=1 cycle:: collections::map::tests::buffered_map
+
 safety-check: build check-no-panics
 	cargo test --manifest-path cranelift/Cargo.toml --workspace --locked
 	./target/release/pith run tests/cases/test_channel_runtime.pith

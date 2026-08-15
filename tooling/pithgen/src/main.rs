@@ -23,6 +23,7 @@
 mod eval;
 mod gen;
 mod oracle;
+mod reduce;
 mod rng;
 
 use std::collections::BTreeMap;
@@ -43,6 +44,7 @@ fn main() {
     match args[1].as_str() {
         "gen" => cmd_gen(&args[2..]),
         "run" => cmd_run(&args[2..]),
+        "reduce" => reduce::cmd_reduce(&args[2..]),
         other => {
             eprintln!("unknown subcommand: {}", other);
             std::process::exit(2);

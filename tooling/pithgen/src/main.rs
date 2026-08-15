@@ -252,6 +252,9 @@ fn cmd_run(args: &[String]) {
     let out_dir = PathBuf::from(flag_value(args, "--out").expect("--out DIR required"));
     let valgrind = args.iter().any(|a| a == "--valgrind");
     let keep_all = args.iter().any(|a| a == "--keep-all");
+    // gate mode: any finding is a failure. the ci smoke runs a fixed seed
+    // range that is known clean, so a nonzero exit means a regression.
+    let fail_on_findings = args.iter().any(|a| a == "--fail-on-findings");
 
     // locate the self-hosted compiler and ir driver next to the pith binary
     let mut repo_root = pith.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -543,6 +546,9 @@ fn cmd_run(args: &[String]) {
         );
     }
     println!("elapsed: {:.0}s", started.elapsed().as_secs_f32());
+    if fail_on_findings && !findings.is_empty() {
+        std::process::exit(1);
+    }
 }
 
 fn tail(s: &str, n: usize) -> String {

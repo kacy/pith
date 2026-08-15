@@ -1,0 +1,32 @@
+# churn optionals widened at a return statement and held by a closure. the
+# box a return widening builds owns its payload, so it must carry the
+# payload destructor — without one, any consumer whose last count drop is a
+# plain struct release (a closure env slot here) frees the box but leaks
+# the payload, about 48 bytes per round.
+import leakprobe as probe
+
+struct Node:
+    pub val: Int
+
+fn mk(i: Int) -> Node?:
+    return Node(val: i)
+
+fn round(i: Int) -> Int:
+    o := mk(i)
+    f := fn():
+        if o == none:
+            return 0
+        return 1
+    return f()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

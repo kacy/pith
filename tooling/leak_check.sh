@@ -50,6 +50,7 @@ cases=(
   tests/leaks/leak_weak_local
   tests/leaks/leak_weak_capture_cycle
   tests/leaks/leak_closure_captured_optional
+  tests/leaks/leak_return_widened_optional
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood
 )

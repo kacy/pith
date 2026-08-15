@@ -6340,7 +6340,23 @@ fn ir_emit_return_stmt(node: Node):
             if expr_node.kind == "none_lit":
                 r = ir_emit_optional_none_value()
             elif already_optional == false:
-                r = ir_emit_optional_some_value(r)
+                # a freshly built payload (a constructor or call result, never
+                # an ident) arrives owned, so the box widened here must OWN
+                # it: attach the payload destructor exactly like a target-typed
+                # store does, or a box freed by a plain struct release (a
+                # closure env slot, a container store) leaks its payload.
+                # idents stay on the borrowing constructor: a local's tracked
+                # kind does not prove it holds a count (an indexed read binds
+                # a borrow), and a destructor on a borrowed payload would free
+                # a count the box never took. strings stay borrowed too
+                # (copy-on-derive keeps them safe).
+                mut payload_kind := ""
+                if expr_node.kind != "ident" and ir_string_expr_is_borrowed(node.children[0]) == false:
+                    payload_kind = ir_rc_kind(ir_substitute_type_name(ir_infer_type(node.children[0])))
+                if payload_kind == "struct" or payload_kind == "list" or payload_kind == "map" or payload_kind == "set" or payload_kind == "bytes" or payload_kind == "closure":
+                    r = ir_emit_optional_owned_some(r, payload_kind)
+                else:
+                    r = ir_emit_optional_some_value(r)
         elif ir_current_func_return_kind == "tuple":
             if result_kind != "tuple":
                 r = ir_emit_ok_result_tuple(r)

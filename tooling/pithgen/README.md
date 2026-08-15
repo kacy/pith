@@ -19,8 +19,20 @@ lists/maps/sets, closures, spawn/await/channels, module aliases across
 weighted toward the intersections that have historically broken:
 generics × optionals × cross-module × enum payloads.
 
+alongside every expression the generator keeps a small semantic tree
+(`eval.rs`) and an environment of the values its locals hold, so each
+emitted print also appends the line it must produce to the program's
+expected output. this is bookkeeping over the generator's own choices,
+not a pith interpreter: fn bodies are recorded as they are written and
+replayed at call sites, match arms are resolved against the known
+subject, channel pumps send a counted number of messages. constructs
+whose printed value cannot be pinned (spawn interleavings, say) are
+simply not printed. `gen --seed N` shows the prediction after the
+files; `--out` writes it as expected.txt.
+
 same seed, same program: the prng is splitmix64-seeded xoshiro256**,
-and generation never consults time or environment.
+and generation never consults time or environment. the expected
+output is part of the same determinism contract.
 
 ## oracles
 
@@ -33,11 +45,48 @@ and generation never consults time or environment.
   "pith runtime error" exit 1 is a controlled failure, not a finding.
 - **run-silent / run-hang** — the binary exits without its final
   marker, or outlives the timeout.
+- **wrong-output** — the differential oracle. the generator picks every
+  literal, every arithmetic operand, every enum variant, so while it
+  builds the tree it also computes the exact line each print must
+  produce. after a clean run the actual stdout is compared line by
+  line against that prediction; any divergence is a silent wrong
+  answer — the class of bug no crash oracle can see. a line whose
+  value genuinely cannot be pinned at generation time can be marked
+  as a wildcard the comparator skips; the summary counts them (the
+  current generator emits none).
 - **valgrind** (opt-in) — memcheck on the built binary.
 
 findings dedup by a normalized signature (paths, numbers, and
 generated identifiers stripped), so a 500-seed batch reports root
-causes, not instances.
+causes, not instances. a run-crash goes one step further: the crashed
+binary is rerun under valgrind, the faulting address is parsed out,
+and a coarse fault-site class (null-ish below 0x1000, small-int-as-
+pointer below 0x100000, other) is folded into the signature, so two
+different bad-pointer bugs that both end in SIGSEGV no longer share
+one bucket. valgrind being absent just falls back to the plain
+signature.
+
+the wrong-output signature keeps the first mismatching line index and
+the expected-vs-actual pair with digit runs collapsed; finding.txt
+carries the surrounding context, plus expected.txt and stdout.txt for
+a straight diff.
+
+## reducing a finding
+
+```
+tooling/pithgen/target/release/pithgen reduce \
+    --seed 393 --pith ./target/release/pith --out /tmp/reduced [--class run-crash]
+```
+
+regenerates the seed, confirms the finding reproduces, then
+delta-debugs at statement granularity: drop one top-level item or one
+main-body statement at a time, keep the removal when the same finding
+persists, iterate to a fixed point. multi-module programs first get
+one attempt at inlining the helper modules into main (aliases
+stripped at token boundaries). crash and build findings match on
+class plus signature; a wrong-output finding is tracked by its raw
+mismatch pair, since line indexes shift as statements fall away. the
+minimal program and a report land in the out dir.
 
 ## running it
 

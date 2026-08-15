@@ -1,0 +1,33 @@
+# churn closures that capture an owned optional. the capture retains the
+# optional's heap box, so the closure's env slot must carry a tag that
+# releases the box when the closure is freed — an untagged capture leaked
+# the box and its payload per round (about 109 bytes).
+#
+# the optional is bound with an annotation so the box is built at the
+# binding, where the payload destructor is attached. a box widened at a
+# return statement carries no destructor yet, so the call-produced variant
+# of this case still grows until that construction site attaches one.
+import leakprobe as probe
+
+struct Node:
+    pub val: Int
+
+fn round(i: Int) -> Int:
+    o: Node? := Node(val: i)
+    f := fn():
+        if o == none:
+            return 0
+        return 1
+    return f()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

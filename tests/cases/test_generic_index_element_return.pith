@@ -1,0 +1,39 @@
+# a generic specialization indexing a List[T] parameter used to lose the
+# element's type — the checked types are suppressed in a re-emitted body,
+# so xs[0] answered unknown, the return path skipped the retain a borrowed
+# element needs, and the caller received a value the dying argument list
+# still owned. the weak probe is the sharp assertion: without the retain
+# the target's count hits zero the moment the temporary list dies, and the
+# weak reads back none while the strong reference is still in hand.
+
+enum Pulse:
+    Alpha(String, String)
+    Beta
+
+struct Spool:
+    extra: Int
+    count: Pulse
+
+fn blend[T](xs: List[T], fb: T) -> T:
+    if xs.len() > 0:
+        return xs[0]
+    return fb
+
+fn main():
+    r := blend[Spool]([Spool(31, Pulse.Alpha("a", "b"))], Spool(2, Pulse.Beta))
+    weak wk := r
+    match wk:
+        alive => print("live {alive.extra}")
+        none => print("gone")
+    match r.count:
+        Pulse.Alpha(a, b) => print("alpha {a} {b}")
+        Pulse.Beta => print("beta")
+
+    # the fallback path still transfers correctly
+    e := blend[Spool]([], Spool(7, Pulse.Beta))
+    print("fb {e.extra}")
+
+    # strings keep their element identity through the same path
+    s := blend[String](["hello"], "other")
+    print("s {s}")
+    print("done")

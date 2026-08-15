@@ -413,6 +413,10 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("process_output_stdout", [tid_int], tid_string)
     fix_builtin_binding("process_output_stderr", [tid_int], tid_string)
     fix_builtin_binding("process_output_close", [tid_int], tid_void)
+    # the experimental cycle collector's runtime entry points, callable by
+    # their literal runtime names; std.concurrent wraps them for programs.
+    fix_builtin_binding("pith_cycle_gc_collect_now", [], tid_int)
+    fix_builtin_binding("pith_cycle_gc_stats", [], tid_void)
 
 fn create_function_type(params: List[Int], ret: Int) -> Int:
     return add_type_info(ti_function(params, ret))

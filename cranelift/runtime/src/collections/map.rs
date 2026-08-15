@@ -511,6 +511,87 @@ pub(crate) unsafe fn cycle_clear_map_buffered(handle: i64) {
     }
 }
 
+// --- collector-facing accessors ---------------------------------------------
+//
+// mirrors the list accessors: the collection pass holds the world stopped,
+// and every entry point magic-checks so a bad edge degrades to None or a
+// no-op rather than a wild read.
+
+/// The map's current reference count, or `None` when the handle no longer
+/// validates (the map died into the graveyard).
+pub(crate) unsafe fn cycle_map_strong_count(handle: i64) -> Option<u32> {
+    map_ref_from_handle(handle)
+        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Add `delta` to the reference count — the collector's teardown guard.
+pub(crate) unsafe fn cycle_map_guard_strong(handle: i64, delta: u32) {
+    if let Some(impl_ref) = map_ref_from_handle(handle) {
+        impl_ref
+            .rc
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Report every value the map owns a count on, as (value, child code).
+/// Keys are copies (ints, byte strings), never counted handles, so only the
+/// value side has edges; the scalar fast path stores raw ints and owns none.
+pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    let Some(impl_ref) = map_ref_from_handle(handle) else {
+        return;
+    };
+    let Some(code) = crate::collections::list::cycle_child_code(impl_ref.val_tag) else {
+        return;
+    };
+    for val in impl_ref.data.values() {
+        if val.len() >= 8 {
+            let raw = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
+            if raw != 0 {
+                f(raw, code);
+            }
+        }
+    }
+}
+
+/// The destruction body of a garbage map: drop the count it holds on every
+/// value, then empty the storage so the shell free below can never release
+/// them a second time.
+pub(crate) unsafe fn cycle_map_release_values(handle: i64) {
+    let Some(impl_ref) = map_mut_from_handle(handle) else {
+        return;
+    };
+    impl_ref.release_all_values();
+    impl_ref.clear();
+}
+
+/// Free a garbage map's shell: the tail of `pith_map_release` minus the value
+/// cascade, which `cycle_map_release_values` already ran. A shell re-buffered
+/// during teardown parks in the graveyard so the fresh suspect entry never
+/// dangles.
+pub(crate) unsafe fn cycle_map_free_dead(handle: i64) {
+    let Some(impl_ref) = map_ref_from_handle(handle) else {
+        return;
+    };
+    let buffered = impl_ref
+        .cycle_flags
+        .load(std::sync::atomic::Ordering::Relaxed)
+        & 1
+        != 0;
+    (*(handle as *mut MapImpl)).magic = 0;
+    handle_registry::unregister(handle as *const (), HandleKind::Map);
+    if buffered && crate::cycle::cycle_gc_enabled() {
+        crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_MAP);
+        return;
+    }
+    drop(Box::from_raw(handle as *mut MapImpl));
+}
+
+/// Drop a map shell the graveyard parked: values already released, magic
+/// already scrubbed, registry entry already gone — only the box remains.
+pub(crate) unsafe fn cycle_drop_map_shell(ptr: usize) {
+    drop(Box::from_raw(ptr as *mut MapImpl));
+}
+
 /// Remove an int-keyed entry and hand its value — count included — to the
 /// caller. The map neither retains nor releases: ownership transfers, so
 /// this is the reclaim-safe way to drop registry entries under the
@@ -1593,6 +1674,7 @@ mod tests {
     // reading its handle needs the private PithMap internals. it serializes
     // on the cycle test lock like every test that turns the flag on.
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_map_dies_into_the_graveyard() {
         let _guard = match crate::cycle::CYCLE_TEST_LOCK.lock() {
             Ok(guard) => guard,

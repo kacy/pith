@@ -31,17 +31,21 @@ mut binding_module_tags: List[String] := []
 mut binding_decl_nodes: List[Int] := []
 mut defining_module := ""
 
+# name-indexed view of the arena: "scope:name" -> arena indices in
+# definition order. every lookup used to scan the WHOLE arena backwards at
+# every level of the scope chain, which made checking quadratic in the
+# binding count of a large module closure — the single hottest cost in the
+# checker. the index narrows each probe to the handful of bindings that one
+# scope actually holds under that name, so a lookup costs the chain depth
+# times a tiny list instead of the chain depth times every binding so far.
+mut binding_index: Map[String, List[Int]] := {}
+
+fn binding_key(scope_id: Int, name: String) -> String:
+    return scope_id.to_string() + ":" + name
+
 ## set the module path tagged onto bindings defined from here on.
 pub fn set_defining_module(module_path: String):
     defining_module = module_path
-
-fn binding_names_equal(a: String, b: String) -> Bool:
-    if a.len() != b.len():
-        return false
-    for ch, i in a:
-        if ord(ch) != ord(b[i]):
-            return false
-    return true
 
 # reset the arena (for reuse between files)
 pub fn reset_scope_arena():
@@ -52,6 +56,7 @@ pub fn reset_scope_arena():
     binding_mutable_flags = []
     binding_module_tags = []
     binding_decl_nodes = []
+    binding_index = {}
     defining_module = ""
 
 # create a new scope, return its index
@@ -77,6 +82,14 @@ pub fn define_binding_at(scope_id: Int, name: String, type_id: Int, is_mut: Bool
     binding_mutable_flags.push(is_mut)
     binding_module_tags.push(defining_module)
     binding_decl_nodes.push(decl_node)
+    key := binding_key(scope_id, name)
+    idx := binding_names.len() - 1
+    if binding_index.contains_key(key):
+        mut entries := binding_index[key]
+        entries.push(idx)
+        binding_index.insert(key, entries)
+    else:
+        binding_index.insert(key, [idx])
 
 ## every binding name the last run defined, builtins included, in
 ## definition order. tooling reads this for completion; names repeat
@@ -106,14 +119,15 @@ pub fn all_binding_types() -> List[Int]:
 ## be registered by several modules (a builtin re-exported by std),
 ## and local visibility means any one of them suffices.
 pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) -> Bool:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                tag := binding_module_tags[i]
-                if tag == "" or tag == module_path:
-                    return true
-        i = i - 1
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        mut i := entries.len() - 1
+        while i >= 0:
+            tag := binding_module_tags[entries[i]]
+            if tag == "" or tag == module_path:
+                return true
+            i = i - 1
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return binding_visible_from(entry.parent, name, module_path)
@@ -123,14 +137,15 @@ pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) ->
 ## the root scope is always id 0 (first created after reset); builtin
 ## registrations carry an empty tag and count as declared everywhere.
 pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == 0:
-            if binding_names_equal(binding_names[i], name):
-                tag := binding_module_tags[i]
-                if tag == "" or tag == module_path:
-                    return true
-        i = i - 1
+    key := binding_key(0, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        mut i := entries.len() - 1
+        while i >= 0:
+            tag := binding_module_tags[entries[i]]
+            if tag == "" or tag == module_path:
+                return true
+            i = i - 1
     return false
 
 ## the type of a binding the module owns, or -1. bindings tagged with a
@@ -139,14 +154,15 @@ pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
 ## would otherwise reach a function some unrelated module declared.
 ## builtins carry an empty tag and belong to every module.
 pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String) -> Int:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                tag := binding_module_tags[i]
-                if tag == "" or tag == module_path:
-                    return binding_types[i]
-        i = i - 1
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        mut i := entries.len() - 1
+        while i >= 0:
+            tag := binding_module_tags[entries[i]]
+            if tag == "" or tag == module_path:
+                return binding_types[entries[i]]
+            i = i - 1
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_owned_by(entry.parent, name, module_path)
@@ -158,12 +174,10 @@ pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String)
 ## the binding starts out untyped and takes its real type from the
 ## first value stored into it.
 pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                return i
-        i = i - 1
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        return entries[entries.len() - 1]
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_index(entry.parent, name)
@@ -177,26 +191,22 @@ pub fn set_binding_type_at(index: Int, type_id: Int):
 ## the declaration node of the binding a lookup from this scope would
 ## find, or -1 for a builtin or an unknown name.
 pub fn lookup_binding_decl_node(scope_id: Int, name: String) -> Int:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                return binding_decl_nodes[i]
-        i = i - 1
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        return binding_decl_nodes[entries[entries.len() - 1]]
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_decl_node(entry.parent, name)
     return - 1
 
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
-    # search bindings in reverse order (latest first) for this scope
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                return binding_types[i]
-        i = i - 1
-    # walk parent chain
+    # the latest binding of the name in this scope wins (shadowing), so
+    # only the last index under the key matters; miss falls to the parent
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        return binding_types[entries[entries.len() - 1]]
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding(entry.parent, name)
@@ -204,12 +214,10 @@ pub fn lookup_binding(scope_id: Int, name: String) -> Int:
 
 # check if a binding is mutable, walking the parent chain
 pub fn is_binding_mutable(scope_id: Int, name: String) -> Bool:
-    mut i := binding_scope_ids.len() - 1
-    while i >= 0:
-        if binding_scope_ids[i] == scope_id:
-            if binding_names_equal(binding_names[i], name):
-                return binding_mutable_flags[i]
-        i = i - 1
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        return binding_mutable_flags[entries[entries.len() - 1]]
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return is_binding_mutable(entry.parent, name)

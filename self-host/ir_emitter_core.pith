@@ -2170,6 +2170,39 @@ fn ir_index_expr_type(idx: Int, node: Node) -> String:
         return "string"
     if coll_type == "map" or coll_type == "map_int":
         return ir_lookup_map_value_type_for_expr(node.children[0])
+    # inside a generic specialization the checked types are suppressed, so
+    # indexing a List[T] parameter answers nothing here and the element loses
+    # its rc identity — the return path then skips the retain a borrowed
+    # element needs, and the caller inherits a value the dying list still
+    # owns. resolve the parameter's declared type under the active
+    # substitution instead.
+    coll_node := get_node(node.children[0])
+    if coll_node.kind == "ident":
+        elem := ir_spec_param_list_element_type(coll_node.value)
+        if elem.len() > 0:
+            return elem
+    return ""
+
+# the element type of an indexed list parameter inside a generic
+# specialization, resolved from the active declaration's type node under the
+# T -> concrete substitution. "" when no specialization is active, the name
+# is not a parameter of the active declaration, or its type is not a list.
+fn ir_spec_param_list_element_type(name: String) -> String:
+    if ir_active_generic_params.len() == 0 or ir_active_generic_decl_idx < 0:
+        return ""
+    decl := get_node(ir_active_generic_decl_idx)
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "param" and cn.value == name:
+            for tc in cn.children:
+                tn := get_node(tc)
+                if tn.kind == "type" or tn.kind == "generic_type":
+                    tid := ir_declared_type_node_tid(tc)
+                    if tid >= 0:
+                        info := get_type_info(tid)
+                        if info.kind == "list":
+                            return ir_type_from_tid(info.inner)
+                    return ""
     return ""
 
 fn ir_call_expr_type(idx: Int, node: Node) -> String:

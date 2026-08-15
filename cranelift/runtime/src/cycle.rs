@@ -1399,6 +1399,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn struct_decremented_to_nonzero_is_buffered_exactly_once() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1428,6 +1429,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_struct_survives_the_death_of_its_value() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1450,6 +1452,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn weak_load_ignores_the_buffered_bit() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1471,6 +1474,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_list_dies_into_the_graveyard() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1507,6 +1511,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_closure_dies_into_the_graveyard() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1537,6 +1542,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn overflow_degrades_to_a_leak_never_a_dangle() {
         let _guard = locked();
         force_enabled_for_tests(true);
@@ -1604,6 +1610,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn visit_with_no_hook_is_inert_and_counts_only_when_enabled() {
         let _guard = locked();
         force_enabled_for_tests(false);
@@ -1625,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn visit_dispatches_to_an_installed_hook() {
         static SEEN_CHILD: AtomicU64 = AtomicU64::new(0);
         static SEEN_KIND: AtomicU64 = AtomicU64::new(0);
@@ -1657,6 +1665,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn concurrent_releases_buffer_a_shared_struct_once() {
         let _guard = locked();
         force_enabled_for_tests(true);

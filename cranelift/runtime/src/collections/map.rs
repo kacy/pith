@@ -1674,6 +1674,7 @@ mod tests {
     // reading its handle needs the private PithMap internals. it serializes
     // on the cycle test lock like every test that turns the flag on.
     #[test]
+    #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_map_dies_into_the_graveyard() {
         let _guard = match crate::cycle::CYCLE_TEST_LOCK.lock() {
             Ok(guard) => guard,

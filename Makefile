@@ -68,7 +68,7 @@ check-no-panics:
 # thread a forced collect spawns lives for the rest of the process, so these
 # tests cannot share a parallel test binary with unrelated suites.
 test-cycle-gc:
-	cargo test --manifest-path cranelift/Cargo.toml -p pith-runtime --locked -- --ignored --test-threads=1 cycle::
+	cargo test --manifest-path cranelift/Cargo.toml -p pith-runtime --locked -- --ignored --test-threads=1 cycle:: collections::map::tests::buffered_map
 
 safety-check: build check-no-panics
 	cargo test --manifest-path cranelift/Cargo.toml --workspace --locked

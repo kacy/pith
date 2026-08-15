@@ -227,8 +227,8 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
     }
     let hook = VISIT_HOOK.load(Ordering::Acquire);
     if hook != 0 {
-        // safety: the only writer is install_visit_hook, whose contract pins
-        // the shape; the release/acquire pair orders the store before use.
+        // the release/acquire pair orders the hook store before its first use.
+        // panic-guard: the only writer is install_visit_hook, whose contract pins the fn shape, so the address is always a valid visitor.
         let visit: extern "C" fn(i64, i64) = unsafe { std::mem::transmute(hook) };
         visit(child, kind);
         return;

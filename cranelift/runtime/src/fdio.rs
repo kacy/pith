@@ -88,6 +88,11 @@ fn poll_wait_any_fd(fd: i64, events: i16, timeout_ms: i64) -> i64 {
     } else {
         timeout_ms as i32
     };
+    // the wait loop is a native window for the cycle collector: from here to
+    // every return the thread reads only this stack frame and errno, never a
+    // heap handle, so a stop-the-world counts it as stopped. the bracket
+    // drops on return, where its exit side re-checks the stop request.
+    let _native = crate::cycle::native_bracket();
     loop {
         // SAFETY: polling one `pollfd` we own for the length of the call.
         let status = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
@@ -485,9 +490,15 @@ fn write_channel(fd: i64, data: &[u8], channel: Channel) -> i64 {
 /// it. `None` covers every error alike, as that did.
 pub(crate) fn socket_read_blocking(fd: i64, size: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; size];
-    // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is owned by
-    // pith for the duration of this call.
-    let n = unsafe { Channel::Socket.read(fd as i32, buf.as_mut_ptr(), size) };
+    // the syscall can sit in the kernel up to SO_RCVTIMEO — forever, with no
+    // timeout set — touching only this owned buffer, so it is a native window
+    // for the cycle collector. the bracket is kept to the syscall itself.
+    let n = {
+        let _native = crate::cycle::native_bracket();
+        // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is
+        // owned by pith for the duration of this call.
+        unsafe { Channel::Socket.read(fd as i32, buf.as_mut_ptr(), size) }
+    };
     if n >= 0 {
         buf.truncate(n as usize);
         return Some(buf);
@@ -499,9 +510,15 @@ pub(crate) fn socket_read_blocking(fd: i64, size: usize) -> Option<Vec<u8>> {
 /// one write to a socket that blocks in the kernel, the counterpart of
 /// `socket_read_blocking`. returns the bytes accepted, or `0` for any error.
 pub(crate) fn socket_write_blocking(fd: i64, data: &[u8]) -> i64 {
-    // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is owned
-    // by pith for the duration of this call.
-    let n = unsafe { Channel::Socket.write(fd as i32, data.as_ptr(), data.len()) };
+    // a full send buffer can hold this in the kernel indefinitely; like the
+    // blocking read it touches only the borrowed buffer, so it is a native
+    // window for the cycle collector, kept to the syscall itself.
+    let n = {
+        let _native = crate::cycle::native_bracket();
+        // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is
+        // owned by pith for the duration of this call.
+        unsafe { Channel::Socket.write(fd as i32, data.as_ptr(), data.len()) }
+    };
     if n >= 0 {
         return n as i64;
     }

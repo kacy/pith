@@ -422,9 +422,16 @@ fn block_on_channel<'a>(
                     &inner.receivers
                 }
             };
-            let mut state = cvar
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // the wait is a native window for the cycle collector: the thread
+            // reads no heap handle until the condvar hands the lock back. the
+            // bracket's exit runs while holding the re-acquired channel lock —
+            // safe, because a stop that parks us there stops only mutators,
+            // and the collection pass itself never takes a channel lock.
+            let mut state = {
+                let _native = crate::cycle::native_bracket();
+                cvar.wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
             match role {
                 Role::Sender => state.os_senders_waiting -= 1,
                 Role::Receiver => state.os_receivers_waiting -= 1,

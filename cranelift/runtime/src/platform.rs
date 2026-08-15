@@ -40,6 +40,10 @@ pub extern "C" fn pith_sleep(ms: i64) {
         crate::netpoll::sleep_task(ms, task);
         return;
     }
+    // the blocking arm sits in the kernel for the whole duration touching no
+    // heap handle, so it is a native window for the cycle collector; the
+    // bracket's exit re-checks the stop request before pith code resumes.
+    let _native = crate::cycle::native_bracket();
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 

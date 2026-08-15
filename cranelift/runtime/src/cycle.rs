@@ -6,9 +6,10 @@
 //! whose count was decremented but stayed above zero, the only way a garbage
 //! cycle can form — trial-decrements the counts internal to the candidate
 //! graph, and frees the members whose counts reach zero with the internal
-//! edges discounted. This module is the suspect-tracking half only: the
-//! buffer, the per-object buffered bit, and the graveyard. The collection
-//! pass lands separately.
+//! edges discounted. This module holds the suspect tracking — the buffer, the
+//! per-object buffered bit, and the graveyard — and the stop-the-world
+//! rendezvous the collection pass will run inside (see the mutator registry
+//! below). The collection pass itself lands separately.
 //!
 //! Invariants the buffer maintains, in force only when `PITH_CYCLE_GC` is on:
 //!
@@ -28,8 +29,9 @@
 //! atomic load and a predicted branch, the same shape as the perf-stats gate.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Kind codes for buffer and graveyard entries. These resemble the element
 /// tag codes in `collections::list::element_tag_from_code`, but they are an
@@ -238,6 +240,379 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
     }
 }
 
+// --- stop-the-world rendezvous --------------------------------------------
+//
+// the collection pass must read and rewrite reference counts with no mutator
+// moving them underneath it. nothing compiled emits a safe-point it could
+// rely on, so the halt is assembled from the places a mutator already stands
+// still:
+//
+//  - a *gate*: a point where the thread holds no pith frame (a green worker
+//    between tasks) or is frozen at a compiled preemption safe-point. seeing
+//    the stop request there, the thread parks on the gc condvar until the
+//    request clears.
+//  - a *native bracket*: a blocking runtime wait (poll, a condvar, a sleep)
+//    during which the thread provably reads no heap handle. the thread is
+//    counted as stopped for as long as it is inside; the exit side re-checks
+//    the request and parks before any heap access resumes.
+//
+// mutators are the threads that can touch a reference count: green workers,
+// os-thread-backend task threads, and the process main thread. the netpoll
+// reactor, the sysmon monitor, and the blocking-pool threads never do (the
+// pool's contract is owned plain data only), so they are never registered and
+// the rendezvous never waits on them.
+//
+// a stop request that some mutator does not answer within the timeout is
+// abandoned: the request clears, everyone parked resumes, and the caller gets
+// `false` to retry later. the failure direction is a delayed collection,
+// never a mutator observed as stopped while it runs.
+
+/// the mutator is executing code that may touch reference counts.
+const MUTATOR_RUNNING: u8 = 0;
+/// the mutator is inside a native bracket: blocked (or about to block) in a
+/// wait that reads no heap handle until the bracket exits.
+const MUTATOR_NATIVE: u8 = 1;
+/// the mutator saw the stop request at a gate or a bracket exit and is
+/// waiting it out on the gc condvar.
+const MUTATOR_PARKED_FOR_GC: u8 = 2;
+/// the mutator's thread has exited. slots are never removed from the
+/// registry, only marked, so the rendezvous skips these.
+const MUTATOR_EXITED: u8 = 3;
+
+/// One registered mutator thread's state word. Created once per thread and
+/// kept in the registry for the life of the process; the owning thread holds
+/// it through a thread-local and flips it with plain seq-cst stores.
+///
+/// seq-cst is what makes the rendezvous scan trustworthy: a mutator that
+/// loaded `GC_STOP` as clear and re-entered `running` did so before the
+/// stopper's store in the total order, so the stopper's later scan cannot
+/// still read the slot's older `native` — it never observes "stopped" for a
+/// thread that is running.
+pub(crate) struct MutatorSlot {
+    state: AtomicU8,
+}
+
+#[cfg(test)]
+impl MutatorSlot {
+    pub(crate) fn state_for_tests(&self) -> u8 {
+        self.state.load(Ordering::SeqCst)
+    }
+}
+
+// every mutator slot ever created, in registration order. slots are pushed
+// under the mutex and never removed (an exited thread's slot is marked, not
+// popped), so the stopper's scan holds the lock only long enough to read the
+// state words.
+static MUTATORS: Mutex<Vec<Arc<MutatorSlot>>> = Mutex::new(Vec::new());
+
+/// the stop request. set by the stopper, polled by mutators at gates and
+/// bracket exits, cleared (under `GC_GATE`) by resume or an abandoned stop.
+static GC_STOP: AtomicBool = AtomicBool::new(false);
+
+// the condvar a stopped mutator parks on until the request clears. the mutex
+// guards only the wait handshake: resume clears GC_STOP and notifies while
+// holding it, and a parker re-checks GC_STOP under it, so the clear can never
+// slip between a parker's check and its wait.
+static GC_GATE: Mutex<()> = Mutex::new(());
+static GC_GATE_CV: Condvar = Condvar::new();
+
+// stoppers must not interleave: two concurrent stop/resume pairs would clear
+// each other's request mid-collection. `with_world_stopped` serializes on
+// this; the raw pair's contract is a single caller (the collector thread).
+static STOPPER: Mutex<()> = Mutex::new(());
+
+/// how long a stop request waits before giving up, in milliseconds. resolved
+/// once from `PITH_CYCLE_GC_STOP_MS`; 0 in the cell means not yet resolved
+/// (0 is not a valid timeout — it would abandon every stop unconditionally).
+static STOP_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+const STOP_TIMEOUT_DEFAULT_MS: u64 = 25;
+
+fn stop_timeout_ms() -> u64 {
+    let cached = STOP_TIMEOUT_MS.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let ms = std::env::var("PITH_CYCLE_GC_STOP_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(STOP_TIMEOUT_DEFAULT_MS);
+    STOP_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+    ms
+}
+
+fn lock_mutators() -> MutexGuard<'static, Vec<Arc<MutatorSlot>>> {
+    match MUTATORS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_gate() -> MutexGuard<'static, ()> {
+    match GC_GATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// the calling thread's handle on its own slot. dropping it — which the
+/// thread-local machinery does as the thread exits — marks the slot exited,
+/// so a finished os-thread task (or any other thread that ever bracketed) is
+/// skipped by every later rendezvous rather than waited on forever.
+struct SlotOwner(Arc<MutatorSlot>);
+
+impl Drop for SlotOwner {
+    fn drop(&mut self) {
+        self.0.state.store(MUTATOR_EXITED, Ordering::SeqCst);
+    }
+}
+
+thread_local! {
+    static MY_MUTATOR: std::cell::RefCell<Option<SlotOwner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn register_new_slot() -> Arc<MutatorSlot> {
+    let slot = Arc::new(MutatorSlot {
+        state: AtomicU8::new(MUTATOR_RUNNING),
+    });
+    lock_mutators().push(Arc::clone(&slot));
+    slot
+}
+
+/// this thread's slot, created and registered on first use — how the main
+/// thread (and any other thread that reaches a gate or bracket) becomes a
+/// registered mutator without an explicit spawn seam. `None` only while
+/// thread-local storage is tearing down, where the thread is exiting and a
+/// bracket can no longer matter.
+fn mutator_slot() -> Option<Arc<MutatorSlot>> {
+    MY_MUTATOR
+        .try_with(|cell| {
+            let mut owner = cell.borrow_mut();
+            if let Some(existing) = owner.as_ref() {
+                return Arc::clone(&existing.0);
+            }
+            let slot = register_new_slot();
+            *owner = Some(SlotOwner(Arc::clone(&slot)));
+            slot
+        })
+        .ok()
+}
+
+/// this thread's slot if it already has one; never creates. the stop path
+/// uses this so a dedicated collector thread does not become a registered
+/// mutator merely by asking for the world.
+fn existing_mutator_slot() -> Option<Arc<MutatorSlot>> {
+    MY_MUTATOR
+        .try_with(|cell| cell.borrow().as_ref().map(|owner| Arc::clone(&owner.0)))
+        .ok()
+        .flatten()
+}
+
+/// Create and register a mutator slot on behalf of a thread about to be
+/// spawned. The parent registers it *before* the thread exists: were the
+/// thread to register itself at entry, the rendezvous could scan — and
+/// declare the world stopped — in the window between the spawn returning and
+/// the child's first instruction, while the child mutates unobserved. `None`
+/// with the flag off, so spawn paths stay one relaxed load.
+pub(crate) fn mutator_slot_for_spawn() -> Option<Arc<MutatorSlot>> {
+    if !cycle_gc_enabled() {
+        return None;
+    }
+    Some(register_new_slot())
+}
+
+/// Install a slot created by `mutator_slot_for_spawn` as the calling thread's
+/// own. The first thing a spawned mutator body does; the thread-local owner
+/// then marks the slot exited when the thread returns.
+pub(crate) fn adopt_mutator_slot(slot: Option<Arc<MutatorSlot>>) {
+    let Some(slot) = slot else {
+        return;
+    };
+    let _ = MY_MUTATOR.try_with(|cell| {
+        *cell.borrow_mut() = Some(SlotOwner(slot));
+    });
+}
+
+/// A stop-the-world check for a mutator at a point where parking it is safe:
+/// no runtime lock held, and either no pith frame at all (a worker between
+/// tasks) or a frame frozen at a compiled safe-point. With the flag off this
+/// is one relaxed load and a fall-through branch.
+#[inline(always)]
+pub(crate) fn mutator_gate() {
+    if cycle_gc_enabled() {
+        mutator_gate_slow();
+    }
+}
+
+#[inline(never)]
+fn mutator_gate_slow() {
+    let Some(slot) = mutator_slot() else {
+        return;
+    };
+    if GC_STOP.load(Ordering::SeqCst) {
+        park_for_gc(&slot);
+    }
+}
+
+/// An RAII native bracket around one blocking wait. Enter marks the slot
+/// `native` — counted as stopped by the rendezvous — and the drop re-checks
+/// the stop request before the thread returns to code that may touch the
+/// heap, parking it if a stop landed while it was blocked. Between the two,
+/// the code inside the bracket must read no heap handle; keep it to the
+/// syscall or condvar wait itself. With the flag off, one relaxed load each
+/// way. Deliberately `!Send`: the exit must run on the entering thread.
+pub(crate) struct NativeBracket {
+    _same_thread: std::marker::PhantomData<*const ()>,
+}
+
+pub(crate) fn native_bracket() -> NativeBracket {
+    if cycle_gc_enabled() {
+        enter_native();
+    }
+    NativeBracket {
+        _same_thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for NativeBracket {
+    fn drop(&mut self) {
+        if cycle_gc_enabled() {
+            exit_native();
+        }
+    }
+}
+
+#[inline(never)]
+fn enter_native() {
+    if let Some(slot) = mutator_slot() {
+        slot.state.store(MUTATOR_NATIVE, Ordering::SeqCst);
+    }
+}
+
+#[inline(never)]
+fn exit_native() {
+    let Some(slot) = mutator_slot() else {
+        return;
+    };
+    if GC_STOP.load(Ordering::SeqCst) {
+        park_for_gc(&slot);
+    } else {
+        slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
+    }
+}
+
+/// wait out a stop request on the gc condvar, then come back as `running`.
+/// spurious wakes just re-check `GC_STOP` under the gate lock and wait again.
+fn park_for_gc(slot: &MutatorSlot) {
+    slot.state.store(MUTATOR_PARKED_FOR_GC, Ordering::SeqCst);
+    let mut guard = lock_gate();
+    while GC_STOP.load(Ordering::SeqCst) {
+        guard = GC_GATE_CV
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    drop(guard);
+    slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
+}
+
+/// is every registered mutator provably not running? `native`, `parked`, and
+/// `exited` all count as stopped; only `running` keeps the stopper waiting.
+fn world_is_stopped() -> bool {
+    lock_mutators()
+        .iter()
+        .all(|slot| slot.state.load(Ordering::SeqCst) != MUTATOR_RUNNING)
+}
+
+/// clear the stop request, wake everyone parked on it, and (when the caller
+/// is itself a registered mutator) become a running mutator again.
+fn release_the_world(own: Option<&MutatorSlot>) {
+    let guard = lock_gate();
+    GC_STOP.store(false, Ordering::SeqCst);
+    GC_GATE_CV.notify_all();
+    drop(guard);
+    if let Some(slot) = own {
+        slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
+    }
+}
+
+/// Bring every registered mutator to a provable halt: set the stop request
+/// and wait until each non-exited slot reads `native` or `parked_for_gc`.
+/// Returns `false` — with the request already withdrawn and the world resumed
+/// — when some mutator did not stop within the timeout, or immediately when
+/// the flag is off; the caller simply retries later. On `true` the world
+/// stays stopped until `pith_cycle_resume_the_world`.
+///
+/// A caller that is itself a registered mutator (main, in tests) is marked
+/// `native` for the duration so the rendezvous does not wait on the thread
+/// doing the waiting; resume puts it back. The collection pass runs from a
+/// dedicated thread, which never registers and needs neither.
+// consumed by the collection pass, which lands separately.
+#[allow(dead_code)]
+pub(crate) fn pith_cycle_stop_the_world() -> bool {
+    if !cycle_gc_enabled() {
+        return false;
+    }
+    let own = existing_mutator_slot();
+    if let Some(slot) = &own {
+        slot.state.store(MUTATOR_NATIVE, Ordering::SeqCst);
+    }
+    GC_STOP.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_millis(stop_timeout_ms());
+    loop {
+        if world_is_stopped() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            release_the_world(own.as_deref());
+            return false;
+        }
+        // the laggard is finishing a task or crossing to its next gate; give
+        // it the core rather than hammering the registry lock.
+        std::thread::sleep(Duration::from_micros(50));
+    }
+}
+
+/// Withdraw the stop request and wake every mutator parked on it. Only
+/// meaningful after a `true` from `pith_cycle_stop_the_world`, on the same
+/// thread; calling it with the world already running is a harmless no-op.
+// consumed by the collection pass, which lands separately.
+#[allow(dead_code)]
+pub(crate) fn pith_cycle_resume_the_world() {
+    if !cycle_gc_enabled() {
+        return;
+    }
+    release_the_world(existing_mutator_slot().as_deref());
+}
+
+/// Stop the world, run `f` on the calling thread, resume, and return `f`'s
+/// value — or `None` (with the world running) when the stop timed out or the
+/// flag is off. Concurrent callers serialize on an internal lock; the resume
+/// runs even if `f` panics, so a bug in a collection pass cannot leave every
+/// mutator parked forever.
+// consumed by the collection pass, which lands separately.
+#[allow(dead_code)]
+pub(crate) fn with_world_stopped<F: FnOnce() -> R, R>(f: F) -> Option<R> {
+    if !cycle_gc_enabled() {
+        return None;
+    }
+    let _one_stopper = match STOPPER.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !pith_cycle_stop_the_world() {
+        return None;
+    }
+    struct ResumeOnDrop;
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            pith_cycle_resume_the_world();
+        }
+    }
+    let _resume = ResumeOnDrop;
+    Some(f())
+}
+
 /// Print the suspect-tracking counters to stderr.
 #[no_mangle]
 pub extern "C" fn pith_cycle_gc_stats() {
@@ -266,6 +641,19 @@ pub(crate) fn force_enabled_for_tests(enabled: bool) {
 #[cfg(test)]
 pub(crate) fn suspects_len_for_tests() -> usize {
     lock_suspects().len()
+}
+
+// the timeout cell is process-global like the enable state; stop-the-world
+// tests pin it explicitly (under CYCLE_TEST_LOCK) rather than inherit
+// whatever an earlier test resolved.
+#[cfg(test)]
+pub(crate) fn set_stop_timeout_for_tests(ms: u64) {
+    STOP_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn mutators_len_for_tests() -> usize {
+    lock_mutators().len()
 }
 
 #[cfg(test)]
@@ -639,5 +1027,272 @@ mod tests {
             reset_for_tests();
             pith_struct_release(s);
         }
+    }
+
+    // --- stop-the-world tests ----------------------------------------------
+    //
+    // these force the flag on under CYCLE_TEST_LOCK, like the buffer tests.
+    // the mutator registry is process-global, and while the flag is on *any*
+    // test thread in this binary that crosses a bracket registers a slot that
+    // reads `running` until its thread exits — so tests that expect a stop to
+    // SUCCEED retry the attempt for a while instead of asserting the first
+    // one, which is exactly how the collector treats a `false` anyway.
+
+    /// spawn a thread the way the runtime spawns mutators: slot registered
+    /// here first, adopted by the thread. returns the slot for state asserts.
+    fn spawn_registered<F: FnOnce() + Send + 'static>(
+        body: F,
+    ) -> (Arc<MutatorSlot>, std::thread::JoinHandle<()>) {
+        let slot = mutator_slot_for_spawn().expect("the flag is on in these tests");
+        let adopted = Some(Arc::clone(&slot));
+        let handle = std::thread::spawn(move || {
+            adopt_mutator_slot(adopted);
+            body();
+        });
+        (slot, handle)
+    }
+
+    /// retry the stop until it lands, with a ceiling so a genuine hang fails
+    /// the test instead of the suite.
+    fn stop_eventually() -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if pith_cycle_stop_the_world() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn await_state(slot: &MutatorSlot, expected: u8) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.state_for_tests() != expected {
+            assert!(
+                Instant::now() < deadline,
+                "slot never reached state {expected}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// resumes the world when dropped, so an assert that fails while the
+    /// world is stopped unwinds into a resume instead of wedging every other
+    /// parked test thread in the process.
+    struct WorldResumer;
+    impl Drop for WorldResumer {
+        fn drop(&mut self) {
+            pith_cycle_resume_the_world();
+        }
+    }
+
+    #[test]
+    fn stop_catches_mutators_at_their_gates() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let done = Arc::clone(&done);
+                spawn_registered(move || {
+                    // the shape of a worker between tasks: gate, work, gate.
+                    while !done.load(Ordering::Relaxed) {
+                        mutator_gate();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        assert!(stop_eventually(), "gate-looping mutators must stop");
+        {
+            let _resume = WorldResumer;
+            for (slot, _) in &workers {
+                assert_eq!(
+                    slot.state_for_tests(),
+                    MUTATOR_PARKED_FOR_GC,
+                    "a stopped gate-looper is parked, not merely slow"
+                );
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        for (slot, handle) in workers {
+            handle.join().expect("gate-looping thread panicked");
+            assert_eq!(
+                slot.state_for_tests(),
+                MUTATOR_EXITED,
+                "a joined thread's slot reads exited"
+            );
+        }
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn stop_times_out_on_a_mutator_that_never_gates() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(30);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let spinner_done = Arc::clone(&done);
+        let (slot, handle) = spawn_registered(move || {
+            // pith code with no compiled safe-points: checks nothing, ever.
+            while !spinner_done.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+        });
+
+        assert!(
+            !pith_cycle_stop_the_world(),
+            "a spinner that never gates must time the stop out"
+        );
+        assert!(
+            !GC_STOP.load(Ordering::SeqCst),
+            "an abandoned stop withdraws the request"
+        );
+        assert_eq!(
+            slot.state_for_tests(),
+            MUTATOR_RUNNING,
+            "the spinner never noticed"
+        );
+
+        done.store(true, Ordering::Relaxed);
+        handle.join().expect("spinning thread panicked");
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn a_bracketed_wait_counts_as_stopped_and_the_exit_parks() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        let thread_finished = Arc::clone(&finished);
+        let (slot, handle) = spawn_registered(move || {
+            {
+                // the shape of every runtime bracket: enter, one blocking
+                // wait that reads no heap handle, exit.
+                let _native = native_bracket();
+                let (lock, cv) = &*thread_release;
+                let mut go = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*go {
+                    go = cv.wait(go).unwrap_or_else(|p| p.into_inner());
+                }
+            }
+            // only reachable once the bracket exit let us back in.
+            thread_finished.store(true, Ordering::Relaxed);
+        });
+
+        await_state(&slot, MUTATOR_NATIVE);
+        assert!(stop_eventually(), "a bracketed waiter counts as stopped");
+        {
+            let _resume = WorldResumer;
+            // wake the waiter while the world is stopped: it leaves its wait,
+            // and the bracket's exit must park it before any code after the
+            // bracket runs.
+            {
+                let (lock, cv) = &*release;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+            await_state(&slot, MUTATOR_PARKED_FOR_GC);
+            assert!(
+                !finished.load(Ordering::Relaxed),
+                "the exit parked before code past the bracket ran"
+            );
+        }
+        handle.join().expect("bracketed thread panicked");
+        assert!(finished.load(Ordering::Relaxed), "resume let it finish");
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn exited_slots_are_skipped_by_the_rendezvous() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+
+        let (slot, handle) = spawn_registered(|| {});
+        handle.join().expect("exiting thread panicked");
+        assert_eq!(slot.state_for_tests(), MUTATOR_EXITED);
+
+        assert!(
+            stop_eventually(),
+            "a dead thread's slot must not hold the world up"
+        );
+        pith_cycle_resume_the_world();
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn with_world_stopped_runs_the_closure_against_a_parked_world() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(200);
+
+        // give the calling thread a slot of its own: the stop must mark it
+        // native for the duration rather than wait on it (the main-thread
+        // test-caller case the seam documents).
+        mutator_gate();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let gate_done = Arc::clone(&done);
+        let (slot, handle) = spawn_registered(move || {
+            while !gate_done.load(Ordering::Relaxed) {
+                mutator_gate();
+                std::thread::yield_now();
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = None;
+        while observed.is_none() && Instant::now() < deadline {
+            observed = with_world_stopped(|| slot.state_for_tests());
+        }
+        assert_eq!(
+            observed,
+            Some(MUTATOR_PARKED_FOR_GC),
+            "the closure ran while the other mutator was parked"
+        );
+        assert_eq!(
+            existing_mutator_slot()
+                .expect("this thread registered above")
+                .state_for_tests(),
+            MUTATOR_RUNNING,
+            "the caller is a running mutator again after the resume"
+        );
+
+        done.store(true, Ordering::Relaxed);
+        handle.join().expect("gate-looping thread panicked");
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    fn flag_off_gates_and_brackets_are_inert() {
+        let _guard = locked();
+        force_enabled_for_tests(false);
+
+        let before = mutators_len_for_tests();
+        mutator_gate();
+        {
+            let _native = native_bracket();
+        }
+        adopt_mutator_slot(mutator_slot_for_spawn());
+        assert_eq!(
+            mutators_len_for_tests(),
+            before,
+            "no slot registered with the flag off"
+        );
+        assert!(
+            !pith_cycle_stop_the_world(),
+            "no stop-the-world with the flag off"
+        );
+        assert!(!GC_STOP.load(Ordering::SeqCst), "no request left behind");
+        assert_eq!(with_world_stopped(|| 1), None);
+        pith_cycle_resume_the_world(); // a no-op, not a panic
     }
 }

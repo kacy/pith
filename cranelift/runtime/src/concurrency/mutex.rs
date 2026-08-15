@@ -100,6 +100,12 @@ fn lock_os(m: &PithMutex) {
         if spins < 64 {
             std::hint::spin_loop();
         } else {
+            // this lock blocks by spinning, not on a condvar, so the yield arm
+            // doubles as the cycle collector's stop gate: a contended waiter
+            // touches no reference count while it waits, holds no lock, and
+            // its own frames are frozen for the length of the park. one
+            // relaxed load when the collector flag is off.
+            crate::cycle::mutator_gate();
             std::thread::yield_now();
         }
     }

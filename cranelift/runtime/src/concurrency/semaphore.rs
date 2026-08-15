@@ -60,6 +60,12 @@ fn wait_state<'a>(
     cvar: &Condvar,
     state: MutexGuard<'a, SemaphoreState>,
 ) -> MutexGuard<'a, SemaphoreState> {
+    // the wait is a native window for the cycle collector: no heap handle is
+    // read until the condvar hands the lock back. the bracket's exit runs
+    // holding the re-acquired semaphore lock, which is safe — a stop that
+    // parks us there stops only mutators, and the collection pass itself
+    // never takes a semaphore lock.
+    let _native = crate::cycle::native_bracket();
     cvar.wait(state)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

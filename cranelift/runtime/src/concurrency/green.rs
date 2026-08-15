@@ -213,6 +213,14 @@ fn task_overrun(running_since: u64, now: u64) -> bool {
 /// same contract as any other runtime FFI reached from JIT code.
 #[no_mangle]
 pub extern "C" fn pith_green_maybe_yield() {
+    // gate 0: a stop-the-world request from the cycle collector. checked before
+    // the task gates so *any* thread frozen at a compiled safe-point parks for
+    // the collector, green task or not — the frame it holds is off-CPU for the
+    // whole park, never mutated. an accelerator for the worker-loop gate (which
+    // alone is sufficient between tasks), not a replacement for it. one relaxed
+    // load when the collector flag is off.
+    crate::cycle::mutator_gate();
+
     // gate 1: are we inside a green task at all?
     let Some(id) = current_task() else {
         return;
@@ -1252,9 +1260,14 @@ fn ensure_workers_started() {
     WORKERS_STARTED.call_once(|| {
         let n = scheduler().workers.len();
         for i in 0..n {
+            // the worker's cycle-collector slot is created and registered here,
+            // on the spawning thread, so a stop-the-world rendezvous can never
+            // scan the gap between the thread starting and the thread
+            // registering itself: the slot exists before the thread does.
+            let cycle_slot = crate::cycle::mutator_slot_for_spawn();
             if let Err(err) = std::thread::Builder::new()
                 .name(format!("pith-green-{i}"))
-                .spawn(move || worker_loop(i))
+                .spawn(move || worker_loop(i, cycle_slot))
             {
                 runtime_fatal!("could not start green worker {i} of {n}: {err}")
             }
@@ -1658,12 +1671,28 @@ fn has_any_work(index: usize) -> bool {
 }
 
 /// the worker thread body: take work, run it, park when there is none.
-fn worker_loop(index: usize) {
+fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>) {
     CURRENT_WORKER.with(|c| c.set(Some(index)));
+    // a worker moves reference counts, so it is a mutator the cycle collector
+    // must be able to stop. the slot was registered by the spawning thread
+    // (see `ensure_workers_started`); adopting it makes it this thread's own.
+    crate::cycle::adopt_mutator_slot(cycle_slot);
     loop {
         match find_work(index) {
-            Some(id) => run_task(id),
-            None => park(index),
+            Some(id) => {
+                // between tasks is the worker's stop point: the previous
+                // coroutine is off-CPU and the next has not started, so a
+                // worker parked here holds no pith frame at all.
+                crate::cycle::mutator_gate();
+                run_task(id)
+            }
+            None => {
+                // the idle path passes this gate once per park timeout (the
+                // 1ms condvar wait in `park`), so an idle worker answers a
+                // stop request within that bound.
+                crate::cycle::mutator_gate();
+                park(index)
+            }
         }
     }
 }

@@ -293,7 +293,15 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     let task_handle = make_handle(index, generation);
     handle_registry::register_id(task_handle, HandleKind::Task);
 
+    // the task thread moves reference counts, so it is a mutator the cycle
+    // collector must be able to stop. its slot is created and registered here,
+    // on the spawning thread, so a stop-the-world rendezvous can never scan
+    // the gap between the thread starting and registering itself; the
+    // thread-local owner installed by `adopt_mutator_slot` marks the slot
+    // exited as the thread returns.
+    let cycle_slot = crate::cycle::mutator_slot_for_spawn();
     let join_handle = std::thread::spawn(move || {
+        crate::cycle::adopt_mutator_slot(cycle_slot);
         let func_ptr = crate::pith_closure_get_fn(closure_handle);
         let result = if func_ptr == 0 {
             0

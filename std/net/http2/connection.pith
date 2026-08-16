@@ -60,6 +60,14 @@ pub DEFAULT_INITIAL_WINDOW := 65535
 MAX_HEADER_BLOCK_BYTES := 81920
 MAX_CONTINUATION_FRAMES := 64
 
+# how many consumed body bytes the sequential read loop lets accumulate before
+# granting the peer fresh flow-control credit mid-response. must sit well below
+# DEFAULT_INITIAL_WINDOW: the peer can keep sending while at most this much
+# credit (plus one frame) is outstanding, so it never stalls waiting for a
+# grant. a quarter of the window keeps three quarters always in the peer's
+# hands while letting a small response settle in a single write at the end.
+REPLENISH_THRESHOLD := 16384
+
 # the hex of the 24-byte client connection preface,
 # "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (RFC 9113 §3.4). encoded as hex so the
 # carriage returns and line feeds are unambiguous in source.
@@ -192,8 +200,7 @@ impl Connection:
     # send the preface and the opening SETTINGS. the response read loop acks the
     # peer's SETTINGS when it arrives, so no separate wait is needed here.
     fn handshake() -> Bool!:
-        self.send(client_preface())!
-        self.send_frame(initial_settings_frame()!)!
+        self.send(bytes.concat(client_preface(), frames.frame_bytes(initial_settings_frame()!)!))!
         return true
 
     # read a complete header block, following CONTINUATION frames until the
@@ -221,22 +228,33 @@ impl Connection:
             done = cont.end_headers
         return out.bytes()
 
-    # grant flow-control credit for `amount` consumed body bytes: always at the
-    # connection level, and at the stream level while the stream stays open.
-    fn replenish(stream_id: Int, amount: Int, end_stream: Bool) -> Bool!:
-        if amount <= 0:
-            return true
-        self.send_frame(frames.window_update_frame(0, amount)!)!
-        if not end_stream:
-            self.send_frame(frames.window_update_frame(stream_id, amount)!)!
+    # send everything owed to the peer — queued acks plus WINDOW_UPDATE grants
+    # for `owed` consumed body bytes — as one write, so it all rides one tls
+    # record and one syscall. the grant is always connection-level; the
+    # stream-level grant is skipped once the stream is ending, since the peer
+    # has nothing left to send on it. with nothing owed, nothing is written.
+    fn settle(acks: Bytes, owed: Int, stream_id: Int, ending: Bool) -> Bool!:
+        mut wire := acks
+        if owed > 0:
+            wire = bytes.concat(wire, frames.frame_bytes(frames.window_update_frame(0, owed)!)!)
+            if not ending:
+                wire = bytes.concat(wire, frames.frame_bytes(frames.window_update_frame(stream_id, owed)!)!)
+        if wire.len() > 0:
+            self.send(wire)!
         return true
 
-    # read frames until `stream_id` ends, assembling the response. servicing
-    # connection housekeeping along the way: ack SETTINGS, answer PING, honor
-    # GOAWAY and RST_STREAM, and replenish flow-control credit as body arrives.
+    # read frames until `stream_id` ends, assembling the response. connection
+    # housekeeping — SETTINGS acks, PING answers, flow-control grants for
+    # consumed body bytes — is owed to the peer promptly but not instantly, so
+    # instead of a write per frame it is queued and settled in one write: when
+    # consumed-but-ungranted credit crosses REPLENISH_THRESHOLD (the peer must
+    # never stall against an exhausted window), and when the response
+    # completes. GOAWAY and RST_STREAM still fail the call directly.
     fn read_response(stream_id: Int) -> Response!:
         body := bytes.buffer()
         defer body.free()
+        mut acks := bytes.empty()
+        mut owed := 0
         mut status := 0
         mut headers: List[hpack.HeaderField] := []
         mut trailers: List[hpack.HeaderField] := []
@@ -259,23 +277,29 @@ impl Connection:
                     else:
                         trailers = decoded
                     if hf.end_stream:
+                        self.settle(acks, owed, stream_id, true)!
                         return Response(status, headers, trailers, body.bytes())
             elif t == frames.FRAME_DATA:
                 df := frames.parse_data(frame)!
                 if df.stream_id == stream_id:
                     body.write(df.data)!
                     # flow control counts the whole frame payload, padding included.
-                    self.replenish(stream_id, frame.header.length, df.end_stream)!
+                    owed = owed + frame.header.length
                     if df.end_stream:
+                        self.settle(acks, owed, stream_id, true)!
                         return Response(status, headers, trailers, body.bytes())
+                    if owed >= REPLENISH_THRESHOLD:
+                        self.settle(acks, owed, stream_id, false)!
+                        acks = bytes.empty()
+                        owed = 0
             elif t == frames.FRAME_SETTINGS:
                 sf := frames.parse_settings(frame)!
                 if not sf.ack:
-                    self.send_frame(frames.settings_ack_frame())!
+                    acks = bytes.concat(acks, frames.frame_bytes(frames.settings_ack_frame())!)
             elif t == frames.FRAME_PING:
                 pf := frames.parse_ping(frame)!
                 if not pf.ack:
-                    self.send_frame(frames.ping_ack_frame(pf.opaque)!)!
+                    acks = bytes.concat(acks, frames.frame_bytes(frames.ping_ack_frame(pf.opaque)!)!)
             elif t == frames.FRAME_GOAWAY:
                 ga := frames.parse_goaway(frame)!
                 if ga.last_stream_id < stream_id:
@@ -1465,9 +1489,12 @@ impl Client:
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
         block := self.conn.encoder.encode(fields)
-        self.conn.send_frame(frames.headers_frame(stream_id, block, not has_body, true))!
+        mut wire := frames.frame_bytes(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
-            self.conn.send_frame(frames.data_frame(stream_id, body, true))!
+            # HEADERS and DATA ride one write — one tls record, one syscall —
+            # instead of a record each.
+            wire = bytes.concat(wire, frames.frame_bytes(frames.data_frame(stream_id, body, true))!)
+        self.conn.send(wire)!
         return self.conn.read_response(stream_id)!
 
     # send a request with the given header fields and body, and read its full
@@ -1701,20 +1728,37 @@ test "the read loop acks server SETTINGS before the response":
     settings := frames.parse_settings(ack)!
     assert(settings.ack)
 
-test "the read loop replenishes flow control as body arrives":
+test "the read loop grants flow control once when the response completes":
     block := header_block([hpack.header_field(":status", "200")])
     stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello"), false), frames.data_frame(1, bytes.empty(), true)])!
     conn := connection_from_frames(stream)
     response := conn.read_response(1)!
     assert_eq(response.body.to_string_utf8()!, "hello")
     updates := sent_window_updates(conn)!
-    # the 5-byte DATA frame yields a connection and a stream WINDOW_UPDATE; the
-    # empty end-of-stream DATA yields none.
-    assert_eq(updates.len(), 2)
+    # a small body settles at end of response: one connection-level grant for
+    # every consumed byte, and no stream-level grant for a finished stream.
+    assert_eq(updates.len(), 1)
     assert_eq(updates[0].stream_id, 0)
     assert_eq(updates[0].increment, 5)
+
+test "the read loop grants credit mid-response once owed bytes cross the threshold":
+    block := header_block([hpack.header_field(":status", "200")])
+    chunk := bytes.array_filled(REPLENISH_THRESHOLD, 97)!.bytes()
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, chunk, false), frames.data_frame(1, bytes.from_string_utf8("tail"), true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.body.len(), REPLENISH_THRESHOLD + 4)
+    updates := sent_window_updates(conn)!
+    # the threshold-sized DATA frame triggers an immediate grant at both levels
+    # (the stream is still open, so the peer needs stream credit to keep
+    # sending); the 4-byte tail settles connection-only at end of stream.
+    assert_eq(updates.len(), 3)
+    assert_eq(updates[0].stream_id, 0)
+    assert_eq(updates[0].increment, REPLENISH_THRESHOLD)
     assert_eq(updates[1].stream_id, 1)
-    assert_eq(updates[1].increment, 5)
+    assert_eq(updates[1].increment, REPLENISH_THRESHOLD)
+    assert_eq(updates[2].stream_id, 0)
+    assert_eq(updates[2].increment, 4)
 
 test "the read loop follows CONTINUATION frames to finish a header block":
     full := header_block([hpack.header_field(":status", "200"), hpack.header_field("x-note", "split-across-frames")])

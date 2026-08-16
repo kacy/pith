@@ -4550,7 +4550,7 @@ fn ir_result_reg_enabled() -> Bool:
 # value never needs reference counting. the error payload is whatever `fail`
 # produced — always a single register, released by the consumer exactly as
 # the box world's err slot is.
-fn ir_maybe_register_result_reg(name: String, node: Node):
+fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
     if not ir_result_reg_enabled():
         return
     if name == "main":
@@ -4574,8 +4574,7 @@ fn ir_maybe_register_result_reg(name: String, node: Node):
     # registered name.
     if name.starts_with("std_json_") or name.starts_with("std_config_") or name.starts_with("std_toml_") or name.starts_with("std_yaml_"):
         return
-    mp := ir_current_module_path
-    if mp.contains("json") or mp.contains("config") or mp.contains("toml") or mp.contains("yaml"):
+    if home_module.contains("json") or home_module.contains("config") or home_module.contains("toml") or home_module.contains("yaml"):
         return
     # a declaration containing a lambda or a spawn is excluded: their bodies
     # are emitted as separate single-return functions while the enclosing
@@ -8485,9 +8484,9 @@ fn ir_record_function_return(node: Node):
     # recognized as a declared callable (e.g. usable as a fn-value).
     if not has_returns:
         ir_func_returns.insert(node.value, "void")
-    ir_maybe_register_result_reg(node.value, node)
+    ir_maybe_register_result_reg(node.value, node, ir_current_module_path)
 
-fn ir_record_function_return_as(name: String, node: Node):
+fn ir_record_function_return_as(name: String, node: Node, home_module: String):
     mut has_returns := false
     for returns_idx in node.children:
         returns_node := get_node(returns_idx)
@@ -8496,7 +8495,7 @@ fn ir_record_function_return_as(name: String, node: Node):
             has_returns = true
     if not has_returns:
         ir_func_returns.insert(name, "void")
-    ir_maybe_register_result_reg(name, node)
+    ir_maybe_register_result_reg(name, node, home_module)
 
 fn ir_record_returns_clause(name: String, returns_node: Node):
     for type_idx in returns_node.children:
@@ -9125,7 +9124,7 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
         for item_idx in ir_root_items(root):
             node := get_node(item_idx)
             if ir_is_fn_decl_kind(node.kind):
-                ir_record_function_return_as(ir_import_target_name(module_path, node.value), node)
+                ir_record_function_return_as(ir_import_target_name(module_path, node.value), node, module_path)
         ir_collect_generic_function_decls_from_root(root, module_path)
 
     for item_idx in ir_root_items(root_idx):

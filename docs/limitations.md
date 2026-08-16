@@ -45,9 +45,11 @@ something here that now works, the page is stale and a fix to it is welcome.
     is simply not wired up on the generic call path, and turning it on wants
     its own verification pass. a method on a *generic struct* is unaffected
     and does widen.
-  - an enum variant payload — an `Int?` payload binds as `Int` when
-    destructured, so an optional payload is not usable yet in either
-    direction.
+  - an enum variant payload — `Probe.Alpha(3)` against an `Int?` payload
+    still needs the value bound to an `Int?` local first. destructuring is
+    fine: a match binding on an optional payload has the payload's declared
+    type, so `Probe.Alpha(b0) => b0.unwrap_or(0)` reads it like any other
+    optional local.
 - **`==` does not widen** — `o == 5` where `o` is an `Int?` reports; compare
   against `none` or unwrap first.
 - **a collection literal does not widen into an optional element that is

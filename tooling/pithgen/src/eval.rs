@@ -64,6 +64,7 @@ pub enum ArmSem {
     B0Len,               // payload[0]: String or List -> .len()
     B0FieldInt(usize),   // payload[0]: struct, read Int field by index
     B0FieldStrLen(usize),
+    B0OptIntOr(i64),     // payload[0]: Int? -> .unwrap_or(k)
 }
 
 /// how a cross-blend computes its base term from the struct param

@@ -1,0 +1,53 @@
+# a match binding on an optional enum payload holds the payload exactly as
+# declared: Alpha(Int?) binds an Int?, not an Int. the checker used to
+# apply the optional-subject unwrap rule here — typing the binding as the
+# inner value while the runtime bound the boxed optional — so
+# interpolating it printed a heap address and arithmetic on it computed
+# garbage. the binding now behaves like any other optional local:
+# unwrap_or works, bare use where the inner is required is a type error
+# (see tests/invalid/optional_payload_binding_bare_use.pith).
+
+enum Probe:
+    Alpha(Int?)
+    Gamma
+
+enum Tag:
+    Named(String?, Int)
+    Plain
+
+fn bonus_of(e: Probe) -> Int:
+    bonus := match e:
+        Probe.Alpha(b0) => b0.unwrap_or(0)
+        Probe.Gamma => 5
+    return bonus
+
+fn main():
+    ov: Int? := 7
+    some_e: Probe := Probe.Alpha(ov)
+    match some_e:
+        Probe.Alpha(x0) => print("some {x0.unwrap_or(0 - 1)}")
+        Probe.Gamma => print("gamma")
+    print("fn some {bonus_of(some_e)}")
+
+    n: Int? := none
+    none_e: Probe := Probe.Alpha(n)
+    match none_e:
+        Probe.Alpha(x0) => print("none {x0.unwrap_or(0 - 1)}")
+        Probe.Gamma => print("gamma")
+    print("fn none {bonus_of(none_e)}")
+
+    print("fn gamma {bonus_of(Probe.Gamma)}")
+
+    # a string optional payload beside a plain payload in the same variant
+    s: String? := "label"
+    t: Tag := Tag.Named(s, 42)
+    match t:
+        Tag.Named(name, rank) => print("named {name.unwrap_or("?")} {rank}")
+        Tag.Plain => print("plain")
+
+    sn: String? := none
+    tn: Tag := Tag.Named(sn, 9)
+    match tn:
+        Tag.Named(name, rank) => print("named {name.unwrap_or("?")} {rank}")
+        Tag.Plain => print("plain")
+    print("done")

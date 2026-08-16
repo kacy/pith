@@ -5446,7 +5446,20 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
                 mut fidx := 0
                 for sub_pat in pat.children:
                     if fidx < variant_fields.len():
-                        check_pattern_match(sub_pat, variant_fields[fidx], scope_id)
+                        sub := get_node(sub_pat)
+                        if sub.kind == "pat_binding":
+                            # a payload binding holds the slot exactly as
+                            # declared: the runtime binds the raw payload, so
+                            # an optional payload stays optional here. the
+                            # unwrap rule in check_pattern_match is for a
+                            # binding arm on an optional SUBJECT, where the
+                            # match itself unwraps — applying it to a payload
+                            # typed the box as its inner and interpolating
+                            # the binding printed a heap address.
+                            note_fn_binding_name(sub.value, sub_pat)
+                            define_binding_at(scope_id, sub.value, variant_fields[fidx], false, sub_pat)
+                        else:
+                            check_pattern_match(sub_pat, variant_fields[fidx], scope_id)
                     fidx = fidx + 1
         vidx = vidx + 1
     if found == false:

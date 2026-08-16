@@ -189,6 +189,20 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
         callee_end := next_space(line, callee_start)
         return rewrite_call_callee(line, declared, prefix, init_prefix, callee_start, callee_end)
 
+    if op == "rcall":
+        # two result registers precede the callee: rcall flag val fname ...
+        flag_start := first_end + 1
+        flag_end := next_space(line, flag_start)
+        if flag_end >= line.len():
+            return line
+        val_start := flag_end + 1
+        val_end := next_space(line, val_start)
+        if val_end >= line.len():
+            return line
+        callee_start := val_end + 1
+        callee_end := next_space(line, callee_start)
+        return rewrite_call_callee(line, declared, prefix, init_prefix, callee_start, callee_end)
+
     if op == "callv":
         callee_start := first_end + 1
         callee_end := next_space(line, callee_start)
@@ -256,7 +270,7 @@ fn is_explicit_ir_retkind(kind: String) -> Bool:
         return true
     if kind.starts_with("opaque:"):
         return true
-    return kind == "unknown" or kind == "void" or kind == "int" or kind == "result_int" or kind == "float" or kind == "bool" or kind == "result_bool" or kind == "string" or kind == "bytes" or kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int" or kind == "tuple" or kind == "channel" or kind == "task"
+    return kind == "unknown" or kind == "void" or kind == "int" or kind == "result_int" or kind == "float" or kind == "bool" or kind == "result_bool" or kind == "string" or kind == "bytes" or kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int" or kind == "tuple" or kind == "channel" or kind == "task" or kind == "result_reg" or kind == "result_reg_f"
 
 fn ir_contract_error(line_no: Int, message: String):
     print("ir contract error on line " + line_no.to_string() + ": " + message)

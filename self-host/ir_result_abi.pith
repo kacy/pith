@@ -7,6 +7,31 @@ from types import get_type_info
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
     return result_kind.len() > 0 and result_kind != "tuple"
 
+# whether the function currently being emitted returns the two-register
+# result pair (the register ABI). the emitter core sets this at function
+# start; the low-level helpers below consult it so their early error
+# returns match a two-value signature.
+mut result_abi_pair_return := false
+
+pub fn ir_set_pair_return(active: Bool):
+    result_abi_pair_return = active
+
+# return `result_r` — a fresh result box KNOWN to hold an error — from the
+# current function. under the register ABI the error payload leaves in the
+# value register with its count and the destructor-less shell is freed;
+# otherwise the box itself is the return value, exactly as before.
+pub fn ir_emit_ret_known_err_box(result_r: Int):
+    if not result_abi_pair_return:
+        ir_emit("ret " + result_r.to_string())
+        return
+    err_r := ir_reg()
+    ir_emit("field " + err_r.to_string() + " " + result_r.to_string() + " 16 unknown err")
+    rel_r := ir_reg()
+    ir_emit("call " + rel_r.to_string() + " pith_struct_release void 1 " + result_r.to_string())
+    zf_r := ir_reg()
+    ir_emit("iconst " + zf_r.to_string() + " 0")
+    ir_emit("ret2 " + zf_r.to_string() + " " + err_r.to_string())
+
 pub fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
     if ir_uses_result_abi(result_kind):
         one := ir_reg()

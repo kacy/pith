@@ -1,0 +1,17 @@
+# a match binding on an optional enum payload has the payload's declared
+# type — Int? here, not Int. using it bare where an Int is required must
+# be a type error: before this rule the checker typed the binding as the
+# inner value while the runtime bound the boxed optional, and arithmetic
+# on it computed garbage from a heap address.
+
+enum Probe:
+    Alpha(Int?)
+    Gamma
+
+fn main():
+    ov: Int? := 7
+    e: Probe := Probe.Alpha(ov)
+    total := match e:
+        Probe.Alpha(b0) => b0 + 1
+        Probe.Gamma => 5
+    print("{total}")

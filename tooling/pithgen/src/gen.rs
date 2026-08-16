@@ -357,6 +357,10 @@ impl Gen {
                             Val::St(_, fs) => fs[*fx].len_of(),
                             other => panic!("pithgen eval: cross-blend payload {:?}", other),
                         },
+                        ArmSem::B0OptIntOr(k) => match &payload[0] {
+                            Val::NoneV => *k,
+                            v => v.as_int(),
+                        },
                     },
                     other => panic!("pithgen eval: cross-blend enum arg {:?}", other),
                 };
@@ -1123,9 +1127,8 @@ impl Gen {
         let sd = self.structs[si].clone();
         let ed = self.enums[ei].clone();
         // an int expression per variant, using payload bindings where possible.
-        // an optional payload binding is checker-typed as its inner type but
-        // holds the box at runtime, so using it as an Int yields the pointer
-        // (see the wrong-output oracle notes); those arms take a constant.
+        // a payload binding has the payload's declared type, so an optional
+        // payload arrives as the optional and reads through unwrap_or.
         let mut arms = String::new();
         let mut arm_sems = Vec::new();
         for (vname, payload) in &ed.variants {
@@ -1139,6 +1142,10 @@ impl Gen {
                     Ty::Int => ("b0".to_string(), ArmSem::B0Int),
                     Ty::Str => ("b0.len()".to_string(), ArmSem::B0Len),
                     Ty::List(_) => ("b0.len()".to_string(), ArmSem::B0Len),
+                    Ty::Opt(inner) if **inner == Ty::Int => {
+                        let k = self.rng.range(1, 9);
+                        (format!("b0.unwrap_or({})", k), ArmSem::B0OptIntOr(k))
+                    }
                     Ty::Struct(fsi, _) => {
                         let fsd = &self.structs[*fsi];
                         match fsd
@@ -2087,21 +2094,17 @@ impl Gen {
                 ));
             } else {
                 let binds: Vec<String> = (0..payload.len()).map(|k| format!("x{}", k)).collect();
-                // a match binding on an optional payload element is checker-typed
-                // as the inner type but holds the box at runtime; interpolating it
-                // prints a heap address, so those arms print a fixed line instead
-                let frag = if matches!(&payload[0], Ty::Opt(_)) {
-                    format!("print(\"{} held\")", vname)
-                } else {
-                    match self.printable(&binds[0], &payload[0]) {
-                        Some(Print::Interp(fr)) if !fr.contains('"') => {
-                            format!("print(\"{} {{{}}}\")", vname, fr)
-                        }
-                        Some(Print::Concat(ce)) if !ce.contains('"') => {
-                            format!("print(\"{} \" + {})", vname, ce)
-                        }
-                        _ => format!("print(\"{} bound\")", vname),
+                // a payload binding has the payload's declared type, so an
+                // optional payload routes through printable's unwrap_or forms
+                // like any other optional value
+                let frag = match self.printable(&binds[0], &payload[0]) {
+                    Some(Print::Interp(fr)) if !fr.contains('"') => {
+                        format!("print(\"{} {{{}}}\")", vname, fr)
                     }
+                    Some(Print::Concat(ce)) => {
+                        format!("print(\"{} \" + {})", vname, ce)
+                    }
+                    _ => format!("print(\"{} bound\")", vname),
                 };
                 out.push_str(&format!(
                     "{}{}.{}({}) => {}\n",
@@ -2124,8 +2127,6 @@ impl Gen {
             let (vname, payload) = &ed.variants[vi];
             let text = if payload.is_empty() {
                 format!("{} hit", vname)
-            } else if matches!(&payload[0], Ty::Opt(_)) {
-                format!("{} held", vname)
             } else {
                 match self.print_value_text(&payload[0], &pvals[0]) {
                     Some(t) => format!("{} {}", vname, t),

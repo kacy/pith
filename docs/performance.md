@@ -250,6 +250,23 @@ its m:n scheduler, which is most of why it does ~2x the calls at lower cpu;
 closing that gap on one connection would need the same, and the cheaper lever is
 more connections.
 
+the 2026-08-16 pass took the syscalls out of the inline path. a traced
+sequential call made five socket writes — HEADERS and DATA as a tls record
+each, then a PING ack (grpc-go probes bandwidth with a ping alongside each
+response) and two WINDOW_UPDATEs, each its own record and syscall — where
+grpc-go makes ~1.8. now the request rides one write, HEADERS and DATA in a
+single record, and the read loop queues what it owes the peer — acks and
+flow-control grants — settling it in one write when the response completes,
+or as soon as ungranted credit crosses 16 KiB (a quarter of the advertised
+window) so a large response never stalls against an exhausted one. a
+finished stream also no longer receives a stream-level grant it can never
+spend. strace counts the result exactly: 2.0 writes per call, down from
+5.0. interleaved a/b on the quiet box, 16 B sequential: ~3.2k to ~4.1k
+calls/sec (+24%), median 281 to 228 µs — ahead of grpc-go's ~4.0k on the
+same box for the first time. 8-concurrent is unchanged, as expected: the
+threaded pipeline already batches through the coalescing writer, and its
+remaining gap is per-call cpu in the handoff chain, a separate lever.
+
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker

@@ -114,3 +114,64 @@ pub fn ir_struct_field_type_name(struct_name: String, field_name: String) -> Str
 ## the ast node of a field's default expression, or -1.
 pub fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
     return ir_struct_field_default_node_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_default_nodes)
+
+# ---------------------------------------------------------------------------
+# destructor need: whether a struct (or boxed enum) holds any rc field, so
+# every construction site — literals in the core emitter and the decode
+# lowering's result builders alike — answers from one predicate and one memo.
+
+mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
+
+pub fn ir_reset_dtor_memo():
+    ir_dtor_memo = {}
+
+# true when any variant of a boxed enum carries an rc payload, so the enum
+# needs a tag-aware destructor to release it.
+pub fn ir_enum_needs_dtor(ename: String) -> Bool:
+    if not ir_enum_variant_lists.contains_key(ename):
+        return false
+    for variant in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + variant
+        if ir_enum_payload_kinds.contains_key(vkey):
+            for pk in ir_enum_payload_kinds[vkey].split(","):
+                if ir_rc_field_kind(pk).len() > 0:
+                    return true
+    return false
+
+pub fn ir_struct_needs_dtor(raw_name: String) -> Bool:
+    sname := ir_struct_base_name(raw_name)
+    if ir_dtor_memo.contains_key(sname):
+        return ir_dtor_memo[sname] == 1
+    # mark first so self-referential fields don't recurse forever; a
+    # direct rc field still sets the final answer below
+    ir_dtor_memo.insert(sname, 2)
+    # a boxed enum is a struct-shaped allocation but its releasable slots are
+    # tagged payloads, not declared fields, so answer from the variants.
+    if ir_boxed_enums.contains_key(sname):
+        enum_needs := ir_enum_needs_dtor(sname)
+        if enum_needs:
+            ir_dtor_memo.insert(sname, 1)
+        return enum_needs
+    count := ir_struct_field_count(sname)
+    mut i := 0
+    mut needs := false
+    while i < count:
+        fname := ir_struct_field_name_at(sname, i)
+        ftype := ir_struct_field_type_name(sname, fname)
+        if ir_rc_field_kind(ftype).len() > 0:
+            needs = true
+        i = i + 1
+    if needs:
+        ir_dtor_memo.insert(sname, 1)
+    return needs
+
+# rc kind of a struct FIELD by its recorded type: like ir_rc_kind plus
+# nested structs (a field holding a dtor-bearing struct is releasable)
+pub fn ir_rc_field_kind(ftype: String) -> String:
+    base := ir_rc_kind(ftype)
+    if base.len() > 0:
+        return base
+    if ftype.starts_with("struct:"):
+        if ir_struct_needs_dtor(ftype.substring(7, ftype.len())):
+            return "struct"
+    return ""

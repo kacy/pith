@@ -1,0 +1,25 @@
+# typed json.decode of a struct document from freshly minted bytes — the
+# shape a server runs per request body. the decode lowering used to leak
+# its input bytes and one result-tuple shell per require step, and the
+# struct it built carried no destructor, so overwriting the decoded value
+# stranded its string fields.
+import leakprobe as probe
+import std.json as json
+import std.bytes as bytes
+
+pub struct Flat:
+    pub name: String
+    pub val: Int
+
+fn main():
+    mut acc := 0
+    mut i := 0
+    n := probe.rounds()
+    while i < n:
+        text := "{{\"name\": \"n{i}\", \"val\": {i}}}"
+        o := json.decode[Flat](bytes.from_string_utf8(text)) catch Flat("x", 0)
+        acc = acc + o.val
+        i = i + 1
+    if acc < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

@@ -652,9 +652,12 @@ cycle `weak` breaks it and the whole graph reclaims:
 | peak rss | 708 mb | **2 mb** |
 
 this is the escape hatch for the one thing reference counting can't do
-on its own. pith has no cycle collector by design (no gc pauses); a
-`weak` field is a non-owning reference that reads back as `none` once
-its target is freed. see docs/ownership.md.
+on its own. the default build has no gc pauses; a `weak` field is a
+non-owning reference that reads back as `none` once its target is
+freed. an experimental trial-deletion collector exists behind
+`PITH_CYCLE_GC=1`, measured and deliberately left off by default —
+see docs/ownership.md for the numbers and the recipe that works
+(the flag plus explicit `gc_collect()` calls).
 
 the weak-edge row was not always flat. a rerun on 2026-08-11 caught it
 climbing linearly — ~120 mb at a million rings — where this table had

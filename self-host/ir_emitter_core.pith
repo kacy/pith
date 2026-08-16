@@ -4564,6 +4564,19 @@ fn ir_maybe_register_result_reg(name: String, node: Node):
     ok_kind := ir_func_result_ok_kinds[name]
     if ok_kind != "int" and ok_kind != "bool":
         return
+    # the typed-decode emitters call json/config/toml/yaml helpers by raw
+    # name (ir_resolve_json_call_name and friends), bypassing the rcall
+    # hooks — a plain `call` into a pair-returning function reads the flag
+    # as the value. keep those modules on the box ABI until the raw decode
+    # call sites learn the pair. each module compiles in its own emitter
+    # pass with UNPREFIXED names (the driver adds std_json_ when combining),
+    # so the module identity comes from the current module path, not the
+    # registered name.
+    if name.starts_with("std_json_") or name.starts_with("std_config_") or name.starts_with("std_toml_") or name.starts_with("std_yaml_"):
+        return
+    mp := ir_current_module_path
+    if mp.contains("json") or mp.contains("config") or mp.contains("toml") or mp.contains("yaml"):
+        return
     # a declaration containing a lambda or a spawn is excluded: their bodies
     # are emitted as separate single-return functions while the enclosing
     # function's return kind is still in effect, so a `fail` or `!` inside
@@ -4814,6 +4827,10 @@ fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) ->
         call_name = handler_node.value
     if call_name.len() > 0:
         out_r := ir_reg()
+        if ir_result_reg_funcs.contains_key(call_name):
+            # a pair-returning handler: bind the pair and fold it into the
+            # box this consumer expects.
+            return ir_emit_result_reg_call(out_r, call_name, 1, " " + arg_r.to_string())
         legacy_kind := ir_builtin_result_retkind(call_name)
         mut call_type := ret_type
         if legacy_kind.len() > 0:
@@ -5341,7 +5358,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     while ci + 1 < call_regs.len():
         arg_regs.push(call_regs[ci + 1])
         ci = ci + 1
-    r := ir_reg()
+    mut r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(emit_name, impl_dispatch), idx)
     mut ret_type := ir_call_retkind_for_name(idx, uses_result_abi, emit_name)
     if ir_is_void_method(emit_name):
@@ -5403,7 +5420,13 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if store_tag_r >= 0:
         call_arg_text = call_arg_text + " " + store_tag_r.to_string()
         call_arg_count = call_arg_count + 1
-    ir_emit_call_text(r, call_name, ret_type, call_arg_count, call_arg_text)
+    if ir_result_reg_funcs.contains_key(call_name):
+        # a module-alias call resolved to a pair-returning free function
+        # (real methods are never registered); fold the pair into the box
+        # this path's consumers expect.
+        r = ir_emit_result_reg_call(r, call_name, call_arg_count, call_arg_text)
+    else:
+        ir_emit_call_text(r, call_name, ret_type, call_arg_count, call_arg_text)
     # a builtin that may hand an argument straight back out takes no count on
     # either branch, so the caller takes one here — before the release below,
     # which on the hand-back branch drops the very register this just counted.

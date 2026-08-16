@@ -25,6 +25,11 @@ pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SOCK_READS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SOCK_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SOCK_WRITES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_SOCK_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_REACTOR_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
@@ -233,6 +238,14 @@ pub fn dump_perf_stats() {
         "  signals: waits={} deliveries={}",
         PERF_SIGNAL_WAITS.load(Ordering::Relaxed),
         PERF_SIGNAL_DELIVERIES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  sockets: reads={} read_bytes={} writes={} write_bytes={} reactor_waits={}",
+        PERF_SOCK_READS.load(Ordering::Relaxed),
+        PERF_SOCK_READ_BYTES.load(Ordering::Relaxed),
+        PERF_SOCK_WRITES.load(Ordering::Relaxed),
+        PERF_SOCK_WRITE_BYTES.load(Ordering::Relaxed),
+        PERF_REACTOR_WAITS.load(Ordering::Relaxed)
     );
     eprintln!(
         "  lists: new={} free={} live={}",

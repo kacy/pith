@@ -4,7 +4,6 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::handle_registry::{self, HandleKind};
-use crate::string::{pith_string_release, PithString};
 use hashbrown::HashSet;
 use std::hash::{Hash, Hasher};
 
@@ -48,8 +47,6 @@ pub struct SetImpl {
     data: HashSet<SetElement>,
     /// Type tag for elements (0=int, 1=string)
     elem_type: ElemType,
-    /// Whether elements are heap types (need retain/release)
-    elem_is_heap: bool,
 }
 
 /// Element type enumeration
@@ -60,13 +57,12 @@ pub enum ElemType {
 }
 
 impl SetImpl {
-    fn new(elem_type: ElemType, _elem_size: usize, elem_is_heap: bool) -> Self {
+    fn new(elem_type: ElemType, _elem_size: usize) -> Self {
         SetImpl {
             magic: SET_MAGIC,
             rc: std::sync::atomic::AtomicU32::new(1),
             data: HashSet::new(),
             elem_type,
-            elem_is_heap,
         }
     }
 
@@ -140,19 +136,17 @@ unsafe fn set_mut_from_handle<'a>(handle: i64) -> Option<&'a mut SetImpl> {
 /// # Arguments
 /// * `elem_type` - 0 for int elements, 1 for string elements
 /// * `elem_size` - Size of each element in bytes
-/// * `elem_is_heap` - Whether elements are heap types (need retain/release)
+///
+/// Elements are stored as owned copies (ints, or the set's own byte
+/// buffers), so there is nothing element-wise to retain or release.
 #[no_mangle]
-pub unsafe extern "C" fn pith_set_new(
-    elem_type: i32,
-    elem_size: i64,
-    elem_is_heap: bool,
-) -> PithSet {
+pub unsafe extern "C" fn pith_set_new(elem_type: i32, elem_size: i64) -> PithSet {
     let etype = match elem_type {
         1 => ElemType::String,
         _ => ElemType::Int,
     };
 
-    let set_impl = SetImpl::new(etype, elem_size as usize, elem_is_heap);
+    let set_impl = SetImpl::new(etype, elem_size as usize);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
     handle_registry::register(ptr as *const (), HandleKind::Set);
@@ -217,21 +211,6 @@ pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
         return;
     };
 
-    // Release all elements if they're heap types
-    if impl_ref.elem_is_heap {
-        for elem in impl_ref.iter() {
-            if let SetElement::String(bytes) = elem {
-                // Reconstruct the string from bytes to release it
-                let s = PithString {
-                    ptr: bytes.as_ptr(),
-                    len: bytes.len() as i64,
-                    is_heap: true,
-                };
-                pith_string_release(s);
-            }
-        }
-    }
-
     impl_ref.clear();
 }
 
@@ -252,20 +231,6 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
         return;
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-
-    // Release all elements if they're heap types
-    if impl_ref.elem_is_heap {
-        for elem in impl_ref.iter() {
-            if let SetElement::String(bytes) = elem {
-                let s = PithString {
-                    ptr: bytes.as_ptr(),
-                    len: bytes.len() as i64,
-                    is_heap: true,
-                };
-                pith_string_release(s);
-            }
-        }
-    }
 
     // Free the set implementation. Scrub the magic first so any handle
     // that outlives the set fails the fast validity check.
@@ -316,24 +281,12 @@ pub(crate) unsafe fn cycle_set_guard_strong(handle: i64, delta: u32) {
     }
 }
 
-/// The destruction body of a garbage set: the element release loop from
-/// `pith_set_release`, then an empty so the shell free cannot repeat it.
+/// The destruction body of a garbage set: drop the owned elements by
+/// clearing, leaving an empty set so the shell free cannot repeat it.
 pub(crate) unsafe fn cycle_set_release_elements(handle: i64) {
     let Some(impl_ref) = set_mut_from_handle(handle) else {
         return;
     };
-    if impl_ref.elem_is_heap {
-        for elem in impl_ref.iter() {
-            if let SetElement::String(bytes) = elem {
-                let s = PithString {
-                    ptr: bytes.as_ptr(),
-                    len: bytes.len() as i64,
-                    is_heap: true,
-                };
-                pith_string_release(s);
-            }
-        }
-    }
     impl_ref.clear();
 }
 
@@ -483,7 +436,7 @@ pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
         1 => ElemType::String,
         _ => ElemType::Int,
     };
-    let set_impl = SetImpl::new(etype, 8, false);
+    let set_impl = SetImpl::new(etype, 8);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed);
     handle_registry::register(ptr as *const (), HandleKind::Set);
@@ -654,7 +607,7 @@ mod tests {
     #[test]
     fn released_set_handles_are_rejected() {
         unsafe {
-            let set = pith_set_new(0, 8, false);
+            let set = pith_set_new(0, 8);
             let handle = set.ptr as i64;
             assert_eq!(pith_set_len(set), 0);
             pith_set_release(set);

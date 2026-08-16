@@ -62,30 +62,35 @@ zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledge
 ```
 
 Latest measured results on this machine, 200000 events, median of 5
-interleaved trials (2026-08-08; the 2026-07-29 pith total was 618):
+interleaved trials (2026-08-16; the 2026-08-08 pith total was 570, the
+2026-07-29 total 618):
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 299 | 195 | 57 | 0 | 570 |
-| go | 120 | 336 | 14 | 0 | 477 |
-| rust | 28 | 60 | 24 | 0 | 113 |
-| zig | 21 | 105 | 9 | 0 | 137 |
+| pith | 120 | 175 | 53 | 0 | 351 |
+| go | 122 | 333 | 14 | 0 | 466 |
+| rust | 28 | 58 | 23 | 0 | 111 |
+| zig | 20 | 102 | 9 | 0 | 132 |
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
 
-Read this honestly. Rust and Zig are fastest; Pith and Go are close, with
-Pith about 1.2x Go on the total. The interesting part is `parse`: a flat
-struct of required scalars decodes in a single pass, straight into the
-struct — Pith's runtime fills it in place, no intermediate map and no
-per-field allocation. That makes Pith's `parse` the second-fastest of
-the four here, ahead of Go's reflection-based decode. It was not always
-so: the first cut of this benchmark had Pith at 1084ms on parse and
-1472ms total; the single-pass decoder took parse to ~179ms and the total
-to ~551ms.
+Read this honestly. Rust and Zig are fastest; Pith now leads Go on the
+total, and the two changes that got it there are both instructive. The
+2026-08-16 `gen` drop (299 → 120, now even with Go) came from writing
+the stream into one ByteBuffer instead of concatenating fresh strings
+per line — the same builder shape the Go version always used with
+`strings.Builder`, so the comparison is idiom for idiom. The `parse`
+improvement (195 → 175) came for free from fixing the decode lowering's
+per-call leaks: a flat struct of required scalars decodes in a single
+pass, straight into the struct, and it no longer strands its input
+buffer, so the allocator stays out of fresh pages. That single-pass
+decode is what keeps Pith's `parse` the second-fastest of the four,
+ahead of Go's reflection-based decode. It was not always so: the first
+cut of this benchmark had Pith at 1084ms on parse and 1472ms total.
 
-What's left of the gap is now the `gen` phase — building the event stream
-is string-assembly, still Pith's slower area — and the map/set rollup.
+What's left of the gap to Rust and Zig is spread across all three busy
+phases rather than concentrated in one.
 And the whole pipeline — JSON, collections, HMAC-SHA256 — is standard
 library with no dependencies to add, and compiles in a fraction of the
 time the others take to build.

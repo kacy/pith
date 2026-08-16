@@ -2,6 +2,22 @@
 
 from ir_builder import ir_emit, ir_reg
 from ir_metadata import ir_runtime_call_name
+from ir_struct_registry import ir_struct_base_name, ir_struct_needs_dtor
+
+# a struct built here is handed to the caller as an owned value, so it
+# needs its type's destructor exactly like a literal-built one — without
+# it, releasing the decoded struct freed the shell and stranded every rc
+# field. guarded by the same predicate the core emitter uses, because a
+# destructor only exists for types that need one.
+fn ir_emit_attach_result_dtor(struct_r: Int, struct_kind: String):
+    if not struct_kind.starts_with("struct:"):
+        return
+    raw_name := struct_kind.substring(7, struct_kind.len())
+    if raw_name == "tuple" or not ir_struct_needs_dtor(raw_name):
+        return
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __dtor_" + ir_struct_base_name(raw_name))
+    ir_emit("call " + ir_reg().to_string() + " pith_struct_set_dtor void 2 " + struct_r.to_string() + " " + fr.to_string())
 
 fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
     ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
@@ -33,6 +49,7 @@ pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, t
     ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_result_dtor(struct_r, struct_kind)
     ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
 
 pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
@@ -42,6 +59,7 @@ pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
     ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_result_dtor(struct_r, struct_kind)
     result_r := ir_emit_ok_result_tuple_raw(struct_r)
     ir_emit("ret " + result_r.to_string())
     ir_emit("endfunc")

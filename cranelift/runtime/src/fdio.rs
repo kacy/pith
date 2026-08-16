@@ -128,6 +128,7 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }
+    crate::perf_stats!(PERF_REACTOR_WAITS += 1);
     wait_ready_unguarded(fd, read, timeout_ms)
 }
 
@@ -405,6 +406,9 @@ fn read_channel(fd: i64, size: usize, channel: Channel) -> Option<Vec<u8>> {
         // by pith for the duration of this call.
         let n = unsafe { channel.read(fd as i32, buf.as_mut_ptr(), size) };
         if n >= 0 {
+            if matches!(channel, Channel::Socket) {
+                crate::perf_stats!(PERF_SOCK_READS += 1, PERF_SOCK_READ_BYTES += n as usize);
+            }
             buf.truncate(n as usize);
             return Some(buf);
         }
@@ -460,6 +464,9 @@ fn write_channel(fd: i64, data: &[u8], channel: Channel) -> i64 {
         // owned by pith for the duration of this call.
         let n = unsafe { channel.write(fd as i32, data.as_ptr(), data.len()) };
         if n > 0 {
+            if matches!(channel, Channel::Socket) {
+                crate::perf_stats!(PERF_SOCK_WRITES += 1, PERF_SOCK_WRITE_BYTES += n as usize);
+            }
             return n as i64;
         }
         if n == 0 {

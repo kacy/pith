@@ -282,6 +282,27 @@ conc=1) because its steady-state fields are all table hits — but any
 header that changes per response (date, set-cookie) is a huffman literal
 every time from real servers, and first requests always are.
 
+the deepest cut is an experiment, shipped off by default: a two-register
+result ABI behind PITH_RESULT_REG=1. every `-> T!` function today returns
+a heap-allocated three-slot box, and the perf counters put that at ~500
+struct allocations per grpc call across the byte codecs. under the flag,
+a non-generic, lambda-free function whose ok value is an Int or Bool
+returns (is_ok, payload) in two registers instead — a `!` call site
+consumes the pair with no allocation at all, and every other context
+folds the pair into an ordinary box on the spot, so the ownership rules
+never change. with the flag off, not one instruction moves (the full
+regression suite is byte-for-byte the box world); with it on, the whole
+tree passes regressions, the golden examples, and the leak gate. measured
+on the shape it targets — std.binary's chained fallible reads, a u32+u64
+read per round — struct allocations fall 14 to 2 per round and wall time
+drops ~2.3x (54-66 to 23-29 ms per 200k rounds). the ceilings are honest
+too: hpack decode only falls 59 to 53 structs per block and the grpc echo
+gains ~2% sequential, because most codec results are String!, Bytes!, or
+struct-shaped — single-register handles the current Int/Bool gate
+excludes. extending the gate to those (with ok-path retain classification)
+is where the remaining shells fall, and is what a default-on decision
+waits on.
+
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker

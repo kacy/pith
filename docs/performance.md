@@ -295,13 +295,25 @@ regression suite is byte-for-byte the box world); with it on, the whole
 tree passes regressions, the golden examples, and the leak gate. measured
 on the shape it targets — std.binary's chained fallible reads, a u32+u64
 read per round — struct allocations fall 14 to 2 per round and wall time
-drops ~2.3x (54-66 to 23-29 ms per 200k rounds). the ceilings are honest
-too: hpack decode only falls 59 to 53 structs per block and the grpc echo
-gains ~2% sequential, because most codec results are String!, Bytes!, or
-struct-shaped — single-register handles the current Int/Bool gate
-excludes. extending the gate to those (with ok-path retain classification)
-is where the remaining shells fall, and is what a default-on decision
-waits on.
+drops ~2.3x (54-66 to 23-29 ms per 200k rounds).
+
+the second phase widened the gate from Int/Bool to every ok payload that
+fits one register: String, Bytes, the list/map/set family, and struct
+handles, whose reference count transfers through the register exactly as
+it transferred through the box's ok slot. `catch` grew the same pair fast
+path `!` already had, so a `f(x) catch fallback` loop allocates nothing on
+either arm. Float still needs the f64 pair variant, impl methods still
+box (method registration never records ok kinds), and the json/config/
+toml/yaml modules stay excluded wholesale because their typed-decode
+emitters call helpers by raw name. component a/b at 100k rounds: a
+String!-returning catch loop falls 200,010 to 2 struct allocations, the
+binary-read catch shape 400,000 to 0, http/2 frame serialization 33 to 19
+per frame, hpack decode 59 to 48 per block. end to end, sequential grpc
+echo gains ~3% (median 222 to 213 µs) and conc=8 is unchanged — that
+path's cost is the futex handoff chain, not allocation. the residual
+shells sit behind the three exclusions above; narrowing those (methods
+first — hpack encode and protobuf writes are all impl methods and moved
+not at all) is what a default-on decision waits on.
 
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built

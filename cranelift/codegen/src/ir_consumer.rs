@@ -1072,7 +1072,7 @@ pub fn compile_from_ir(
                     for _ in 0..nparam {
                         sig.params.push(AbiParam::new(types::I64));
                     }
-                    sig.returns.push(AbiParam::new(types::I64));
+                    push_return_types(&mut sig.returns, parts.get(3).copied().unwrap_or(""));
                     let linkage = if name == "main" {
                         Linkage::Export
                     } else {
@@ -1147,6 +1147,7 @@ pub fn compile_from_ir(
 
         let func_name = parts[1].to_string();
         let _nparam: usize = parts[2].parse().unwrap_or(0);
+        let func_retkind = parts.get(3).copied().unwrap_or("").to_string();
         i += 1;
 
         // Collect function body lines until endfunc
@@ -1176,6 +1177,7 @@ pub fn compile_from_ir(
                 codegen,
                 func_id,
                 &func_name,
+                &func_retkind,
                 &param_names,
                 &body_lines,
                 runtime_funcs,
@@ -1192,6 +1194,32 @@ pub fn compile_from_ir(
     }
 
     Ok(declared_funcs)
+}
+
+/// A `-> T!` function whose ok value fits one register returns two values
+/// instead of a heap-allocated result box: `(is_ok: i64, payload)`. The payload
+/// carries the ok value when is_ok=1, else the error-message string pointer.
+/// `result_reg` uses an i64 payload (ints, handles, pointers); `result_reg_f`
+/// uses an f64 payload for float ok values. Any other retkind is the normal
+/// single-i64 return. Callers and the callee agree via this retkind string.
+fn result_abi_payload_type(retkind: &str) -> Option<types::Type> {
+    match retkind {
+        "result_reg" => Some(types::I64),
+        "result_reg_f" => Some(types::F64),
+        _ => None,
+    }
+}
+
+/// Push the return AbiParams for a function's retkind: two values for the
+/// register result ABI, one i64 otherwise.
+fn push_return_types(returns: &mut Vec<AbiParam>, retkind: &str) {
+    match result_abi_payload_type(retkind) {
+        Some(payload) => {
+            returns.push(AbiParam::new(types::I64));
+            returns.push(AbiParam::new(payload));
+        }
+        None => returns.push(AbiParam::new(types::I64)),
+    }
 }
 
 fn normalize_runtime_result(
@@ -1214,6 +1242,7 @@ fn compile_ir_function(
     codegen: &mut CodeGen,
     func_id: FuncId,
     func_name: &str,
+    func_retkind: &str,
     param_names: &[String],
     body_lines: &[&str],
     runtime_funcs: &HashMap<String, FuncId>,
@@ -1232,7 +1261,7 @@ fn compile_ir_function(
     for _ in param_names {
         ctx.func.signature.params.push(AbiParam::new(types::I64));
     }
-    ctx.func.signature.returns.push(AbiParam::new(types::I64));
+    push_return_types(&mut ctx.func.signature.returns, func_retkind);
 
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
@@ -1789,6 +1818,100 @@ fn compile_ir_function(
                 string_regs.insert(reg);
                 bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
+            }
+
+            // Register result ABI call: `rcall flag_reg val_reg fname payload_kind nargs args...`
+            // The callee returns two values (is_ok, payload); bind both into the
+            // named registers. Only user functions declared with the result ABI
+            // are called this way, so this is always a direct declared-func call.
+            "rcall" if parts.len() >= 6 => {
+                let flag_reg = parse_reg(parts[1], line, func_name)?;
+                let val_reg = parse_reg(parts[2], line, func_name)?;
+                let fname = parts[3];
+                let payload_kind = parts[4];
+                let nargs: usize = parts[5].parse().map_err(|_| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: malformed rcall instruction in {}: {}",
+                        func_name, line
+                    ))
+                })?;
+                let mut args: Vec<Value> = Vec::new();
+                for j in 0..nargs {
+                    args.push(get_reg(&regs, parts[6 + j])?);
+                }
+                let fid = declared_funcs.get(fname).copied().ok_or_else(|| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: rcall to unknown function {} in {}",
+                        fname, func_name
+                    ))
+                })?;
+                let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
+                    codegen.module.declare_func_in_func(fid, builder.func)
+                });
+                // Bitcast any f64 params to match the callee signature.
+                let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
+                let param_types: Vec<types::Type> = builder.func.dfg.signatures[sig_ref]
+                    .params
+                    .iter()
+                    .map(|p| p.value_type)
+                    .collect();
+                for (i, arg) in args.iter_mut().enumerate() {
+                    if i < param_types.len() && param_types[i] == types::F64 {
+                        *arg = builder.ins().bitcast(
+                            types::F64,
+                            cranelift::codegen::ir::MemFlags::new(),
+                            *arg,
+                        );
+                    }
+                }
+                let call = builder.ins().call(fref, &args);
+                let results = builder.func.dfg.inst_results(call);
+                let flag_v = results[0];
+                let payload_v = results[1];
+                // Normalize the flag (iadd 0 works around a Cranelift register
+                // state issue also handled on the normal call path).
+                let zero = builder.ins().iconst(types::I64, 0);
+                let flag_norm = builder.ins().iadd(flag_v, zero);
+                regs.insert(flag_reg, flag_norm);
+                // The payload is an f64 when the ok value is a float; hold it as
+                // an i64 bit pattern like the rest of the register file.
+                if payload_kind == "float" {
+                    let cast = builder.ins().bitcast(
+                        types::I64,
+                        cranelift::codegen::ir::MemFlags::new(),
+                        payload_v,
+                    );
+                    regs.insert(val_reg, cast);
+                    float_regs.insert(val_reg);
+                } else {
+                    let zero2 = builder.ins().iconst(types::I64, 0);
+                    let payload_norm = builder.ins().iadd(payload_v, zero2);
+                    regs.insert(val_reg, payload_norm);
+                    float_regs.remove(&val_reg);
+                }
+                // Tag the payload register so downstream field/RC handling knows
+                // whether the ok value is a string, bytes, or struct handle.
+                struct_regs.remove(&flag_reg);
+                string_regs.remove(&flag_reg);
+                bytes_regs.remove(&flag_reg);
+                float_regs.remove(&flag_reg);
+                if payload_kind == "string" {
+                    string_regs.insert(val_reg);
+                } else {
+                    string_regs.remove(&val_reg);
+                }
+                if payload_kind == "bytes" {
+                    bytes_regs.insert(val_reg);
+                } else {
+                    bytes_regs.remove(&val_reg);
+                }
+                if let Some(struct_name) = explicit_struct_name_from_retkind(payload_kind) {
+                    struct_regs.insert(val_reg, struct_name.to_string());
+                } else {
+                    struct_regs.remove(&val_reg);
+                }
+                reg_source_vars.remove(&flag_reg);
+                reg_source_vars.remove(&val_reg);
             }
 
             "call" if parts.len() >= 4 => {
@@ -2536,6 +2659,25 @@ fn compile_ir_function(
                 terminated = true;
             }
 
+            // Register result ABI return: `ret2 flag payload`. The function's
+            // signature has two returns (is_ok, payload); the payload is the ok
+            // value on success or the error-message pointer on failure.
+            "ret2" if parts.len() >= 3 => {
+                let flag = get_reg(&regs, parts[1])?;
+                let mut payload = get_reg(&regs, parts[2])?;
+                if func_retkind == "result_reg_f" {
+                    // the payload reg is held as an i64 bit pattern; the second
+                    // return is declared f64, so reinterpret before returning.
+                    payload = builder.ins().bitcast(
+                        types::F64,
+                        cranelift::codegen::ir::MemFlags::new(),
+                        payload,
+                    );
+                }
+                builder.ins().return_(&[flag, payload]);
+                terminated = true;
+            }
+
             "brif" if parts.len() >= 4 => {
                 let cond = get_reg(&regs, parts[1])?;
                 let then_label = parts[2];
@@ -2612,10 +2754,23 @@ fn compile_ir_function(
         }
     }
 
-    // Default return if not terminated
+    // Default return if not terminated. Match the function's return arity so a
+    // result-abi function that falls through still type-checks (is_ok=0 = error).
     if !terminated {
         let zero = builder.ins().iconst(types::I64, 0);
-        builder.ins().return_(&[zero]);
+        match result_abi_payload_type(func_retkind) {
+            Some(types::F64) => {
+                let fzero = builder.ins().f64const(0.0);
+                builder.ins().return_(&[zero, fzero]);
+            }
+            Some(_) => {
+                let zero2 = builder.ins().iconst(types::I64, 0);
+                builder.ins().return_(&[zero, zero2]);
+            }
+            None => {
+                builder.ins().return_(&[zero]);
+            }
+        }
     }
 
     builder.seal_all_blocks();
@@ -2849,6 +3004,62 @@ mod tests {
         let result = compile_from_ir(&mut codegen, ir, &runtime_funcs);
         assert!(result.is_err(), "expected malformed IR to fail");
         result.err().expect("compile error").to_string()
+    }
+
+    fn compile_ok_for_ir(ir: &str) {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs = HashMap::new();
+        let result = compile_from_ir(&mut codegen, ir, &runtime_funcs);
+        assert!(result.is_ok(), "expected IR to compile, got {:?}", result.err());
+    }
+
+    #[test]
+    fn push_return_types_uses_two_returns_for_result_abi() {
+        let mut r = Vec::new();
+        push_return_types(&mut r, "int");
+        assert_eq!(r.len(), 1);
+
+        let mut r = Vec::new();
+        push_return_types(&mut r, "result_reg");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].value_type, types::I64);
+        assert_eq!(r[1].value_type, types::I64);
+
+        let mut r = Vec::new();
+        push_return_types(&mut r, "result_reg_f");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1].value_type, types::F64);
+    }
+
+    #[test]
+    fn result_abi_ret2_and_rcall_compile() {
+        // A result-abi function returns (is_ok, payload) via ret2; a caller
+        // binds both with rcall. Arity mismatches would trip the verifier, so
+        // a clean compile validates the two-return plumbing end to end.
+        let ir = "func const_ok 0 result_reg\n\
+                  iconst 1 1\n\
+                  iconst 2 42\n\
+                  ret2 1 2\n\
+                  endfunc\n\
+                  func main 0 int\n\
+                  rcall 3 4 const_ok int 0\n\
+                  ret 4\n\
+                  endfunc\n";
+        compile_ok_for_ir(ir);
+    }
+
+    #[test]
+    fn result_abi_float_payload_compiles() {
+        let ir = "func const_okf 0 result_reg_f\n\
+                  iconst 1 1\n\
+                  fconst 2 2.5\n\
+                  ret2 1 2\n\
+                  endfunc\n\
+                  func main 0 int\n\
+                  rcall 3 4 const_okf float 0\n\
+                  ret 3\n\
+                  endfunc\n";
+        compile_ok_for_ir(ir);
     }
 
     #[test]

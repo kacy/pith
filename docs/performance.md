@@ -267,6 +267,21 @@ same box for the first time. 8-concurrent is unchanged, as expected: the
 threaded pipeline already batches through the coalescing writer, and its
 remaining gap is per-call cpu in the handoff chain, a separate lever.
 
+a follow-up pass indexed the hpack tables. the encoder used to scan all 61
+static entries per header field before consulting its dynamic table — the
+new perf-stats counters showed it as ~460 list reads per grpc call — and
+the huffman decoder built a string key ("length:code") per input BIT and
+hashed it into a string-keyed map. now the static table answers from
+prebuilt maps (the small dynamic table is scanned first; the two sets are
+provably disjoint, so the order is observably identical) and the huffman
+map is keyed by a packed integer on the map's int fast path. component
+a/b, 100k iterations each: encoding a six-field grpc header list 255 to
+108 ms (2.4x), decoding a block with one huffman literal 1.9 s to 250 ms
+(7.6x). the grpc echo moves little (~+4% at conc=8, within noise at
+conc=1) because its steady-state fields are all table hits — but any
+header that changes per response (date, set-cookie) is a huffman literal
+every time from real servers, and first requests always are.
+
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker

@@ -282,19 +282,22 @@ fn huff_table() -> List[HuffEntry]:
         HuffEntry(0x3fffffff, 30),
 ]
 
-# reverse lookup for decoding, keyed by "length:code".
+# reverse lookup for decoding, keyed by the packed (length, code) integer.
+# the decoder consults this once per input BIT, so the key must cost nothing:
+# an int key stays on the map's integer fast path, where the string key this
+# replaces allocated two number strings and a concat per bit.
 #
 # it is derived from the fixed table above, so it is built when the module loads
 # rather than on the first header block that needs it. module initializers run on
 # the main thread before main's body, so by the time any connection task exists
 # the map is already whole and read-only, and concurrent decoders never observe
 # it half-built. building it costs well under a millisecond, paid once.
-decode_map: Map[String, Int] := build_decode_map()
+decode_map: Map[Int, Int] := build_decode_map()
 
-# invert the code table into the "length:code" -> symbol map that `decode` walks.
-fn build_decode_map() -> Map[String, Int]:
+# invert the code table into the (length, code) -> symbol map that `decode` walks.
+fn build_decode_map() -> Map[Int, Int]:
     table := huff_table()
-    mut built: Map[String, Int] := {}
+    mut built: Map[Int, Int] := {}
     mut i := 0
     while i < table.len():
         entry := table[i]
@@ -306,9 +309,11 @@ fn build_decode_map() -> Map[String, Int]:
 fn low_mask(n: Int) -> Int:
     return bits.shl(1, n) - 1
 
-# the decode-map key that uniquely identifies a codeword.
-fn decode_key(length: Int, code: Int) -> String:
-    return length.to_string() + ":" + code.to_string()
+# the decode-map key that uniquely identifies a codeword: the length in the
+# bits above the code. a code of `length` bits is below 2^length <= 2^30, so
+# the two can never overlap and every (length, code) pair packs uniquely.
+fn decode_key(length: Int, code: Int) -> Int:
+    return bits.bor(bits.shl(length, 30), code)
 
 # huffman-encode bytes. the result is padded to a byte boundary with the
 # most-significant bits of the EOS symbol, per RFC 7541 §5.2.

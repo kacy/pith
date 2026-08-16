@@ -5,7 +5,25 @@
 // bare `none` in typed positions, and enum variants reached through a module
 // alias — the places compiler bugs have historically lived.
 
+use crate::eval::{lookup, ArmSem, BaseSem, Body, CmpOp, Env, PickSem, Stmt, Val, E};
 use crate::rng::Rng;
+
+/// an emitted expression: the code text plus its semantic tree
+pub struct Ex {
+    pub code: String,
+    pub e: E,
+}
+
+fn ex(code: String, e: E) -> Ex {
+    Ex { code, e }
+}
+
+/// one line of predicted stdout. a wildcard line matches anything.
+#[derive(Clone)]
+pub struct ExpLine {
+    pub text: String,
+    pub wildcard: bool,
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Ty {
@@ -62,6 +80,7 @@ pub struct FnDef {
     pub params: Vec<(String, Ty)>,
     pub ret: Option<Ty>,
     pub special: Special,
+    pub body: Body,
 }
 
 pub struct IfaceDef {
@@ -73,6 +92,8 @@ pub struct ImplDef {
     pub iface: usize,
     pub struct_idx: usize,
     pub item: Ty,
+    pub first: E,
+    pub pick: Option<PickSem>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,6 +149,8 @@ pub struct Gen {
     counter: u32,
     emitted_fns: usize, // bodies rendered so far; general calls only reach these
     pluck_fn: Option<(usize, bool)>,
+    env: Env,               // main-scope values, parallel to main's Scope
+    expected: Vec<ExpLine>, // predicted stdout, in program order
 }
 
 const STRUCT_POOL: &[&str] = &["Pack", "Crate", "Badge", "Relay", "Prism", "Vault", "Ledger", "Spool"];
@@ -139,6 +162,7 @@ const VARIANT_POOL: &[&str] = &["Alpha", "Beta", "Gamma", "Delta", "Omega", "Zed
 
 pub struct Program {
     pub files: Vec<(String, String)>, // filename, content
+    pub expected: Vec<ExpLine>,       // predicted stdout for a clean run
 }
 
 pub fn generate(seed: u64) -> Program {
@@ -166,6 +190,237 @@ impl Gen {
             counter: 0,
             emitted_fns: 0,
             pluck_fn: None,
+            env: Vec::new(),
+            expected: Vec::new(),
+        }
+    }
+
+    fn expect(&mut self, text: String) {
+        self.expected.push(ExpLine { text, wildcard: false });
+    }
+
+    #[allow(dead_code)]
+    fn expect_wild(&mut self) {
+        self.expected.push(ExpLine { text: String::new(), wildcard: true });
+    }
+
+    // ---------- evaluation ----------
+
+    /// resolve a dotted path against an environment: longest env key first,
+    /// then remaining segments as struct field reads
+    fn resolve(&self, path: &str, env: &Env) -> Val {
+        if let Some(v) = lookup(env, path) {
+            return v.clone();
+        }
+        if let Some((prefix, seg)) = path.rsplit_once('.') {
+            let base = self.resolve(prefix, env);
+            return self.field_val(&base, seg);
+        }
+        panic!("pithgen eval: unresolved path '{}'", path);
+    }
+
+    fn field_val(&self, v: &Val, field: &str) -> Val {
+        match v {
+            Val::St(si, fields) => {
+                let pos = self.structs[*si]
+                    .fields
+                    .iter()
+                    .position(|f| f.name == field)
+                    .unwrap_or_else(|| panic!("pithgen eval: no field '{}' on {}", field, self.structs[*si].name));
+                fields[pos].clone()
+            }
+            other => panic!("pithgen eval: field '{}' read on {:?}", field, other),
+        }
+    }
+
+    fn eval(&self, e: &E, env: &Env) -> Val {
+        match e {
+            E::Lit(v) => v.clone(),
+            E::Path(p) => self.resolve(p, env),
+            E::Add(a, b) => Val::I(self.eval(a, env).as_int().wrapping_add(self.eval(b, env).as_int())),
+            E::Mul(a, b) => Val::I(self.eval(a, env).as_int().wrapping_mul(self.eval(b, env).as_int())),
+            E::Concat(a, b) => {
+                let mut s = self.eval(a, env).as_str().to_string();
+                s.push_str(self.eval(b, env).as_str());
+                Val::S(s)
+            }
+            E::ToStr(a) => Val::S(self.eval(a, env).as_int().to_string()),
+            E::Len(a) => Val::I(self.eval(a, env).len_of()),
+            E::Cmp(op, a, b) => {
+                let x = self.eval(a, env).as_int();
+                let y = self.eval(b, env).as_int();
+                Val::B(match op {
+                    CmpOp::Lt => x < y,
+                    CmpOp::Gt => x > y,
+                    CmpOp::Eq => x == y,
+                    CmpOp::Ne => x != y,
+                })
+            }
+            E::IsNone(a, negated) => {
+                let none = self.eval(a, env) == Val::NoneV;
+                Val::B(if *negated { !none } else { none })
+            }
+            E::ListL(items) => Val::L(items.iter().map(|it| self.eval(it, env)).collect()),
+            E::MapL(pairs) => {
+                // literal insert semantics: unique keys, later value wins
+                let mut out: Vec<(Val, Val)> = Vec::new();
+                for (k, v) in pairs {
+                    let kv = self.eval(k, env);
+                    let vv = self.eval(v, env);
+                    if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == kv) {
+                        slot.1 = vv;
+                    } else {
+                        out.push((kv, vv));
+                    }
+                }
+                Val::M(out)
+            }
+            E::StructL(si, fields) => Val::St(*si, fields.iter().map(|f| self.eval(f, env)).collect()),
+            E::EnumL(ei, vi, payload) => {
+                Val::En(*ei, *vi, payload.iter().map(|p| self.eval(p, env)).collect())
+            }
+            E::Call(fi, args) => {
+                let argv: Vec<Val> = args.iter().map(|a| self.eval(a, env)).collect();
+                self.eval_call(*fi, argv)
+            }
+        }
+    }
+
+    fn eval_in_main(&self, e: &E) -> Val {
+        self.eval(e, &self.env)
+    }
+
+    fn eval_call(&self, fi: usize, args: Vec<Val>) -> Val {
+        let f = &self.fns[fi];
+        match &f.body {
+            Body::Stmts(stmts) => {
+                let mut env: Env = f
+                    .params
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .zip(args.into_iter())
+                    .collect();
+                for st in stmts {
+                    match st {
+                        Stmt::Let(name, e) => {
+                            let v = self.eval(e, &env);
+                            env.push((name.clone(), v));
+                        }
+                        Stmt::IfRet(cond, ret) => {
+                            if self.eval(cond, &env).as_bool() {
+                                return self.eval(ret, &env);
+                            }
+                        }
+                        Stmt::Ret(e) => return self.eval(e, &env),
+                    }
+                }
+                panic!("pithgen eval: fn body without return");
+            }
+            Body::Identity => args.into_iter().next().unwrap(),
+            Body::FirstOr => {
+                let mut it = args.into_iter();
+                let xs = it.next().unwrap();
+                let fb = it.next().unwrap();
+                match xs {
+                    Val::L(items) if !items.is_empty() => items[0].clone(),
+                    _ => fb,
+                }
+            }
+            Body::OptProbe => {
+                let tag = args[0].as_str().to_string();
+                if args[1] == Val::NoneV {
+                    Val::S(tag + "-none")
+                } else {
+                    Val::S(tag + "-some")
+                }
+            }
+            Body::WrapStruct(si, tail) => {
+                let mut fields = vec![args.into_iter().next().unwrap()];
+                fields.extend(tail.iter().cloned());
+                Val::St(*si, fields)
+            }
+            Body::UnwrapOr7 => match &args[1] {
+                Val::NoneV => Val::I(7),
+                other => Val::I(other.as_int()),
+            },
+            Body::CrossBlend(arms, base) => {
+                let bonus = match &args[2] {
+                    Val::En(_, vi, payload) => match &arms[*vi] {
+                        ArmSem::Const(n) => *n,
+                        ArmSem::B0Int => payload[0].as_int(),
+                        ArmSem::B0Len => payload[0].len_of(),
+                        ArmSem::B0FieldInt(fx) => match &payload[0] {
+                            Val::St(_, fs) => fs[*fx].as_int(),
+                            other => panic!("pithgen eval: cross-blend payload {:?}", other),
+                        },
+                        ArmSem::B0FieldStrLen(fx) => match &payload[0] {
+                            Val::St(_, fs) => fs[*fx].len_of(),
+                            other => panic!("pithgen eval: cross-blend payload {:?}", other),
+                        },
+                    },
+                    other => panic!("pithgen eval: cross-blend enum arg {:?}", other),
+                };
+                let base_v = match (base, &args[1]) {
+                    (BaseSem::FieldInt(fx), Val::St(_, fs)) => fs[*fx].as_int(),
+                    (BaseSem::FieldStrLen(fx), Val::St(_, fs)) => fs[*fx].len_of(),
+                    (BaseSem::One, _) => 1,
+                    (b, v) => panic!("pithgen eval: cross-blend base {:?} on {:?}", b, v),
+                };
+                Val::I(base_v.wrapping_add(bonus))
+            }
+            Body::Pluck(optional) => {
+                let recv = &args[0];
+                let si = match recv {
+                    Val::St(si, _) => *si,
+                    other => panic!("pithgen eval: pluck receiver {:?}", other),
+                };
+                let ii = self
+                    .impls
+                    .iter()
+                    .position(|im| im.iface == 0 && im.struct_idx == si)
+                    .expect("pithgen eval: pluck receiver has no impl");
+                if *optional {
+                    self.eval_impl_pick(ii, recv)
+                } else {
+                    self.eval_impl_first(ii, recv)
+                }
+            }
+            Body::Opaque => panic!("pithgen eval: call into opaque body '{}'", f.name),
+        }
+    }
+
+    fn impl_env(&self, si: usize, recv: &Val) -> Env {
+        let fields = match recv {
+            Val::St(_, fs) => fs,
+            other => panic!("pithgen eval: impl receiver {:?}", other),
+        };
+        self.structs[si]
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.weak)
+            .map(|(i, f)| (format!("self.{}", f.name), fields[i].clone()))
+            .collect()
+    }
+
+    fn eval_impl_first(&self, ii: usize, recv: &Val) -> Val {
+        let im = &self.impls[ii];
+        let env = self.impl_env(im.struct_idx, recv);
+        self.eval(&im.first, &env)
+    }
+
+    fn eval_impl_pick(&self, ii: usize, recv: &Val) -> Val {
+        let im = &self.impls[ii];
+        let pick = im.pick.as_ref().expect("pithgen eval: pick without opt method");
+        let env = self.impl_env(im.struct_idx, recv);
+        let guard = match recv {
+            Val::St(_, fs) => fs[pick.field_idx].as_int(),
+            other => panic!("pithgen eval: pick receiver {:?}", other),
+        };
+        if guard > pick.lim {
+            self.eval(&pick.some, &env)
+        } else {
+            Val::NoneV
         }
     }
 
@@ -594,13 +849,13 @@ impl Gen {
             } else {
                 Ty::Str
             };
-            let int_field = self.structs[si]
+            let (int_field_idx, int_field) = self.structs[si]
                 .fields
                 .iter()
-                .find(|f| f.ty == Ty::Int)
-                .unwrap()
-                .name
-                .clone();
+                .enumerate()
+                .find(|(_, f)| f.ty == Ty::Int)
+                .map(|(i, f)| (i, f.name.clone()))
+                .unwrap();
             let mut sc = Scope::new(0);
             for f in &self.structs[si].fields {
                 if !f.weak {
@@ -613,19 +868,27 @@ impl Gen {
                 name,
                 self.structs[si].name,
                 self.ty_name(&item),
-                first_expr
+                first_expr.code
             );
+            let mut pick_sem = None;
             if opt_method {
                 let some_expr = self.expr(&item, 1, &sc);
                 let lim = self.rng.range(0, 5);
                 text.push_str(&format!(
                     "    fn pick() -> Item?:\n        if self.{} > {}:\n            return {}\n        return none\n",
-                    int_field, lim, some_expr
+                    int_field, lim, some_expr.code
                 ));
+                pick_sem = Some(PickSem { field_idx: int_field_idx, lim, some: some_expr.e });
             }
             text.push('\n');
             self.decl_text[0].push_str(&text);
-            self.impls.push(ImplDef { iface: iface_idx, struct_idx: si, item });
+            self.impls.push(ImplDef {
+                iface: iface_idx,
+                struct_idx: si,
+                item,
+                first: first_expr.e,
+                pick: pick_sem,
+            });
         }
     }
 
@@ -648,7 +911,7 @@ impl Gen {
         for (p, t) in &params {
             sc.vars.push((p.clone(), t.clone(), false));
         }
-        let body = self.fn_body(&mut sc, &ret);
+        let (body, stmts) = self.fn_body(&mut sc, &ret);
         let sig_params: Vec<String> = params
             .iter()
             .map(|(p, t)| format!("{}: {}", p, self.ty_name(t)))
@@ -670,51 +933,61 @@ impl Gen {
             params,
             ret: Some(ret),
             special: Special::Plain,
+            body: Body::Stmts(stmts),
         });
         self.emitted_fns = self.fns.len();
     }
 
-    fn fn_body(&mut self, sc: &mut Scope, ret: &Ty) -> String {
+    fn fn_body(&mut self, sc: &mut Scope, ret: &Ty) -> (String, Vec<Stmt>) {
         let mut out = String::new();
+        let mut stmts = Vec::new();
         let n_lets = self.rng.below(3);
         for _ in 0..n_lets {
             let ty = self.random_ty(sc.module, 1);
             let code = self.expr(&ty, 1, sc);
             let vname = format!("t{}", self.counter);
             self.counter += 1;
-            let annotate = code == "[]"
-                || code == "{}"
-                || code == "none"
+            let annotate = code.code == "[]"
+                || code.code == "{}"
+                || code.code == "none"
                 || matches!(ty, Ty::Opt(_));
             if annotate {
-                out.push_str(&format!("    {}: {} := {}\n", vname, self.ty_name(&ty), code));
+                out.push_str(&format!("    {}: {} := {}\n", vname, self.ty_name(&ty), code.code));
             } else {
-                out.push_str(&format!("    {} := {}\n", vname, code));
+                out.push_str(&format!("    {} := {}\n", vname, code.code));
             }
+            stmts.push(Stmt::Let(vname.clone(), code.e));
             sc.vars.push((vname, ty, false));
         }
         if self.rng.chance(35) {
             let cond = self.expr(&Ty::Bool, 1, sc);
             let early = self.expr(ret, 1, sc);
-            out.push_str(&format!("    if {}:\n        return {}\n", cond, early));
+            out.push_str(&format!("    if {}:\n        return {}\n", cond.code, early.code));
+            stmts.push(Stmt::IfRet(cond.e, early.e));
         }
         let fin = self.expr(ret, 2, sc);
-        out.push_str(&format!("    return {}\n", fin));
-        out
+        out.push_str(&format!("    return {}\n", fin.code));
+        stmts.push(Stmt::Ret(fin.e));
+        (out, stmts)
     }
 
     fn gen_generic_fn(&mut self, m: usize) {
         let name = self.fresh(FN_POOL);
         let kind = self.rng.weighted(&[25, 25, 25, 25]);
         let vis = if m == 0 { "" } else { "pub " };
-        let (text, params, ret): (String, Vec<(String, Ty)>, Ty) = match kind {
+        let (text, params, ret, body): (String, Vec<(String, Ty)>, Ty, Body) = match kind {
             0 => {
                 // identity with a detour through a local
                 let text = format!(
                     "{}fn {}[T](v: T) -> T:\n    held := v\n    return held\n\n",
                     vis, name
                 );
-                (text, vec![("v".into(), Ty::Param("T".into()))], Ty::Param("T".into()))
+                (
+                    text,
+                    vec![("v".into(), Ty::Param("T".into()))],
+                    Ty::Param("T".into()),
+                    Body::Identity,
+                )
             }
             1 => {
                 // first-or-fallback over a list of T
@@ -729,6 +1002,7 @@ impl Gen {
                         ("fb".into(), Ty::Param("T".into())),
                     ],
                     Ty::Param("T".into()),
+                    Body::FirstOr,
                 )
             }
             2 => {
@@ -744,6 +1018,7 @@ impl Gen {
                         ("v".into(), Ty::Opt(Box::new(Ty::Param("T".into())))),
                     ],
                     Ty::Str,
+                    Body::OptProbe,
                 )
             }
             _ => {
@@ -758,12 +1033,25 @@ impl Gen {
                 if let Some(&si) = gs.first() {
                     let sd = self.structs[si].clone();
                     let mut args = vec!["v".to_string()];
+                    let mut tail = Vec::new();
                     for f in sd.fields.iter().skip(1) {
                         match &f.ty {
-                            Ty::Opt(_) => args.push("none".into()),
-                            Ty::Str => args.push("\"w\"".into()),
-                            Ty::Int => args.push("1".into()),
-                            _ => args.push("none".into()),
+                            Ty::Opt(_) => {
+                                args.push("none".into());
+                                tail.push(Val::NoneV);
+                            }
+                            Ty::Str => {
+                                args.push("\"w\"".into());
+                                tail.push(Val::S("w".into()));
+                            }
+                            Ty::Int => {
+                                args.push("1".into());
+                                tail.push(Val::I(1));
+                            }
+                            _ => {
+                                args.push("none".into());
+                                tail.push(Val::NoneV);
+                            }
                         }
                     }
                     let text = format!(
@@ -778,6 +1066,7 @@ impl Gen {
                         text,
                         vec![("v".into(), Ty::Param("T".into()))],
                         Ty::Struct(si, vec![Ty::Param("T".into())]),
+                        Body::WrapStruct(si, tail),
                     )
                 } else {
                     let text = format!(
@@ -788,6 +1077,7 @@ impl Gen {
                         text,
                         vec![("a".into(), Ty::Param("T".into())), ("b".into(), Ty::Opt(Box::new(Ty::Int)))],
                         Ty::Int,
+                        Body::UnwrapOr7,
                     )
                 }
             }
@@ -800,6 +1090,7 @@ impl Gen {
             params,
             ret: Some(ret),
             special: Special::Generic,
+            body,
         });
         self.emitted_fns = self.fns.len();
     }
@@ -831,28 +1122,41 @@ impl Gen {
         let name = self.fresh(FN_POOL);
         let sd = self.structs[si].clone();
         let ed = self.enums[ei].clone();
-        // an int expression per variant, using payload bindings where possible
+        // an int expression per variant, using payload bindings where possible.
+        // an optional payload binding is checker-typed as its inner type but
+        // holds the box at runtime, so using it as an Int yields the pointer
+        // (see the wrong-output oracle notes); those arms take a constant.
         let mut arms = String::new();
+        let mut arm_sems = Vec::new();
         for (vname, payload) in &ed.variants {
             if payload.is_empty() {
-                arms.push_str(&format!("        {}.{} => {}\n", ed.name, vname, self.rng.range(1, 9)));
+                let n = self.rng.range(1, 9);
+                arm_sems.push(ArmSem::Const(n));
+                arms.push_str(&format!("        {}.{} => {}\n", ed.name, vname, n));
             } else {
                 let binds: Vec<String> = (0..payload.len()).map(|k| format!("b{}", k)).collect();
-                let use_expr = match &payload[0] {
-                    Ty::Int => "b0".to_string(),
-                    Ty::Str => "b0.len()".to_string(),
-                    Ty::List(_) => "b0.len()".to_string(),
-                    Ty::Opt(inner) if **inner == Ty::Int => "b0".to_string(),
+                let (use_expr, sem) = match &payload[0] {
+                    Ty::Int => ("b0".to_string(), ArmSem::B0Int),
+                    Ty::Str => ("b0.len()".to_string(), ArmSem::B0Len),
+                    Ty::List(_) => ("b0.len()".to_string(), ArmSem::B0Len),
                     Ty::Struct(fsi, _) => {
                         let fsd = &self.structs[*fsi];
-                        match fsd.fields.iter().find(|f| f.ty == Ty::Int || f.ty == Ty::Str) {
-                            Some(f) if f.ty == Ty::Int => format!("b0.{}", f.name),
-                            Some(f) => format!("b0.{}.len()", f.name),
-                            None => "3".to_string(),
+                        match fsd
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .find(|(_, f)| f.ty == Ty::Int || f.ty == Ty::Str)
+                        {
+                            Some((fx, f)) if f.ty == Ty::Int => {
+                                (format!("b0.{}", f.name), ArmSem::B0FieldInt(fx))
+                            }
+                            Some((fx, f)) => (format!("b0.{}.len()", f.name), ArmSem::B0FieldStrLen(fx)),
+                            None => ("3".to_string(), ArmSem::Const(3)),
                         }
                     }
-                    _ => "3".to_string(),
+                    _ => ("4".to_string(), ArmSem::Const(4)),
                 };
+                arm_sems.push(sem);
                 arms.push_str(&format!(
                     "        {}.{}({}) => {}\n",
                     ed.name,
@@ -865,15 +1169,21 @@ impl Gen {
         let sfield = sd
             .fields
             .iter()
-            .find(|f| f.ty == Ty::Int)
-            .map(|f| f.name.clone());
-        let base = match sfield {
-            Some(f) => format!("p.{}", f),
+            .enumerate()
+            .find(|(_, f)| f.ty == Ty::Int)
+            .map(|(i, f)| (i, f.name.clone()));
+        let (base, base_sem) = match sfield {
+            Some((fx, f)) => (format!("p.{}", f), BaseSem::FieldInt(fx)),
             None => {
-                let f = sd.fields.iter().find(|f| f.ty == Ty::Str);
+                let f = sd
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.ty == Ty::Str)
+                    .map(|(i, f)| (i, f.name.clone()));
                 match f {
-                    Some(f) => format!("p.{}.len()", f.name),
-                    None => "1".to_string(),
+                    Some((fx, f)) => (format!("p.{}.len()", f), BaseSem::FieldStrLen(fx)),
+                    None => ("1".to_string(), BaseSem::One),
                 }
             }
         };
@@ -893,6 +1203,7 @@ impl Gen {
             ],
             ret: Some(Ty::Int),
             special: Special::CrossBlend,
+            body: Body::CrossBlend(arm_sems, base_sem),
         });
         self.emitted_fns = self.fns.len();
     }
@@ -911,6 +1222,7 @@ impl Gen {
             params: vec![("n".into(), Ty::Int)],
             ret: Some(Ty::Int),
             special: Special::Fallible,
+            body: Body::Opaque,
         });
         self.emitted_fns = self.fns.len();
     }
@@ -932,6 +1244,7 @@ impl Gen {
             ],
             ret: Some(Ty::Int),
             special: Special::Apply,
+            body: Body::Opaque,
         });
         self.emitted_fns = self.fns.len();
     }
@@ -973,7 +1286,7 @@ impl Gen {
             "fn {}(ch: Channel[{}], n: Int):\n    mut i := 0\n    while i < n:\n        ch.send({})\n        i = i + 1\n\n",
             name,
             self.ty_name(&payload),
-            send_expr
+            send_expr.code
         );
         self.decl_text[0].push_str(&text);
         self.fns.push(FnDef {
@@ -986,6 +1299,7 @@ impl Gen {
             ],
             ret: None,
             special: Special::Worker,
+            body: Body::Opaque,
         });
         self.emitted_fns = self.fns.len();
         if self.feats.spawn_generic {
@@ -1007,6 +1321,7 @@ impl Gen {
                 ],
                 ret: None,
                 special: Special::Worker,
+                body: Body::Opaque,
             });
             self.emitted_fns = self.fns.len();
         }
@@ -1038,6 +1353,7 @@ impl Gen {
             params: vec![("c".into(), Ty::Param("T".into()))],
             ret: None,
             special: Special::Generic,
+            body: Body::Pluck(optional),
         });
         // remember which pluck fn exists via impls; store optional flag in ifaces
         let last = self.fns.len() - 1;
@@ -1092,27 +1408,31 @@ impl Gen {
             .collect()
     }
 
-    fn expr(&mut self, ty: &Ty, depth: u32, sc: &Scope) -> String {
+    fn expr(&mut self, ty: &Ty, depth: u32, sc: &Scope) -> Ex {
         let vars = self.vars_of(sc, ty);
         let fields = if depth > 0 { self.fields_of(sc, ty) } else { vec![] };
         let calls = if depth > 0 { self.callable_fns(ty, sc) } else { vec![] };
         // shared productions: var / field / call, else a per-type form
         if !vars.is_empty() && self.rng.chance(40) {
-            return vars[self.rng.below(vars.len())].clone();
+            let v = vars[self.rng.below(vars.len())].clone();
+            return ex(v.clone(), E::Path(v));
         }
         if !fields.is_empty() && self.rng.chance(25) {
-            return fields[self.rng.below(fields.len())].clone();
+            let p = fields[self.rng.below(fields.len())].clone();
+            return ex(p.clone(), E::Path(p));
         }
         if !calls.is_empty() && self.rng.chance(25) {
             let fi = calls[self.rng.below(calls.len())];
             let f = self.fns[fi].clone();
             let cname = self.fn_call_name(fi, sc.module);
-            let args: Vec<String> = f
-                .params
-                .iter()
-                .map(|(_, pt)| self.expr(pt, depth.saturating_sub(1), sc))
-                .collect();
-            return format!("{}({})", cname, args.join(", "));
+            let mut acode = Vec::new();
+            let mut aes = Vec::new();
+            for (_, pt) in f.params.iter() {
+                let a = self.expr(pt, depth.saturating_sub(1), sc);
+                acode.push(a.code);
+                aes.push(a.e);
+            }
+            return ex(format!("{}({})", cname, acode.join(", ")), E::Call(fi, aes));
         }
         match ty {
             Ty::Int => {
@@ -1120,48 +1440,71 @@ impl Gen {
                     let a = self.expr(&Ty::Int, depth - 1, sc);
                     let b = self.expr(&Ty::Int, depth - 1, sc);
                     let op = if self.rng.chance(70) { "+" } else { "*" };
-                    format!("({} {} {})", a, op, b)
+                    let e = if op == "+" {
+                        E::Add(Box::new(a.e), Box::new(b.e))
+                    } else {
+                        E::Mul(Box::new(a.e), Box::new(b.e))
+                    };
+                    ex(format!("({} {} {})", a.code, op, b.code), e)
                 } else if depth > 0 && self.rng.chance(20) {
                     // a length read off something in scope
                     let mut lens = Vec::new();
                     for (n, t, _) in &sc.vars {
                         match t {
-                            Ty::List(_) | Ty::Map(_, _) | Ty::Str => lens.push(format!("{}.len()", n)),
+                            Ty::List(_) | Ty::Map(_, _) | Ty::Str => lens.push(n.clone()),
                             _ => {}
                         }
                     }
                     if lens.is_empty() {
-                        format!("{}", self.rng.range(0, 99))
+                        let n = self.rng.range(0, 99);
+                        ex(format!("{}", n), E::Lit(Val::I(n)))
                     } else {
-                        lens[self.rng.below(lens.len())].clone()
+                        let v = lens[self.rng.below(lens.len())].clone();
+                        ex(format!("{}.len()", v), E::Len(Box::new(E::Path(v))))
                     }
                 } else {
-                    format!("{}", self.rng.range(0, 99))
+                    let n = self.rng.range(0, 99);
+                    ex(format!("{}", n), E::Lit(Val::I(n)))
                 }
             }
             Ty::Str => {
                 if depth > 0 && self.rng.chance(25) {
                     let a = self.expr(&Ty::Str, depth - 1, sc);
                     let b = self.expr(&Ty::Str, depth - 1, sc);
-                    format!("({} + {})", a, b)
+                    ex(
+                        format!("({} + {})", a.code, b.code),
+                        E::Concat(Box::new(a.e), Box::new(b.e)),
+                    )
                 } else if depth > 0 && self.rng.chance(20) {
                     let n = self.expr(&Ty::Int, depth - 1, sc);
-                    format!("{}.to_string()", n)
+                    ex(format!("{}.to_string()", n.code), E::ToStr(Box::new(n.e)))
                 } else {
                     let n = self.counter;
                     self.counter += 1;
-                    format!("\"s{}\"", n)
+                    ex(format!("\"s{}\"", n), E::Lit(Val::S(format!("s{}", n))))
                 }
             }
             Ty::Bool => {
                 let w = self.rng.weighted(&[25, 30, 20, 25]);
                 match w {
-                    0 => (if self.rng.chance(50) { "true" } else { "false" }).into(),
+                    0 => {
+                        let b = self.rng.chance(50);
+                        ex((if b { "true" } else { "false" }).into(), E::Lit(Val::B(b)))
+                    }
                     1 => {
                         let a = self.expr(&Ty::Int, depth.saturating_sub(1), sc);
                         let b = self.expr(&Ty::Int, depth.saturating_sub(1), sc);
                         let op = *self.rng.pick(&["<", ">", "==", "!="]);
-                        format!("({} {} {})", a, op, b)
+                        let cop = match op {
+                            "<" => CmpOp::Lt,
+                            ">" => CmpOp::Gt,
+                            "==" => CmpOp::Eq,
+                            _ => CmpOp::Ne,
+                        };
+                        ex(
+                            format!("({} {} {})", a.code, op, b.code),
+                            E::Cmp(cop, Box::new(a.e), Box::new(b.e)),
+                        )
                     }
                     2 => {
                         // optional-vs-none probe on anything optional in scope
@@ -1172,25 +1515,37 @@ impl Gen {
                             .map(|(n, _, _)| n.clone())
                             .collect();
                         if opts.is_empty() {
-                            "true".into()
+                            ex("true".into(), E::Lit(Val::B(true)))
                         } else {
                             let v = opts[self.rng.below(opts.len())].clone();
-                            let op = if self.rng.chance(50) { "==" } else { "!=" };
-                            format!("({} {} none)", v, op)
+                            let eq = self.rng.chance(50);
+                            let op = if eq { "==" } else { "!=" };
+                            ex(
+                                format!("({} {} none)", v, op),
+                                E::IsNone(Box::new(E::Path(v)), !eq),
+                            )
                         }
                     }
                     _ => {
                         let a = self.expr(&Ty::Str, depth.saturating_sub(1), sc);
-                        format!("({}.len() > {})", a, self.rng.range(0, 3))
+                        let k = self.rng.range(0, 3);
+                        ex(
+                            format!("({}.len() > {})", a.code, k),
+                            E::Cmp(
+                                CmpOp::Gt,
+                                Box::new(E::Len(Box::new(a.e))),
+                                Box::new(E::Lit(Val::I(k))),
+                            ),
+                        )
                     }
                 }
             }
             Ty::Opt(inner) => {
                 if depth == 0 {
-                    return "none".into();
+                    return ex("none".into(), E::Lit(Val::NoneV));
                 }
                 if self.rng.chance(22) {
-                    "none".into()
+                    ex("none".into(), E::Lit(Val::NoneV))
                 } else {
                     // implicit T -> T? coercion in a typed position
                     self.expr(inner, depth - 1, sc)
@@ -1198,26 +1553,33 @@ impl Gen {
             }
             Ty::List(inner) => {
                 if depth == 0 || self.rng.chance(15) {
-                    "[]".into()
+                    ex("[]".into(), E::ListL(vec![]))
                 } else {
                     let n = 1 + self.rng.below(3);
-                    let elems: Vec<String> =
-                        (0..n).map(|_| self.expr(inner, depth - 1, sc)).collect();
-                    format!("[{}]", elems.join(", "))
+                    let mut codes = Vec::new();
+                    let mut es = Vec::new();
+                    for _ in 0..n {
+                        let it = self.expr(inner, depth - 1, sc);
+                        codes.push(it.code);
+                        es.push(it.e);
+                    }
+                    ex(format!("[{}]", codes.join(", ")), E::ListL(es))
                 }
             }
             Ty::Map(k, v) => {
                 if depth == 0 || self.rng.chance(30) {
-                    "{}".into()
+                    ex("{}".into(), E::MapL(vec![]))
                 } else {
                     let n = 1 + self.rng.below(2);
                     let mut pairs = Vec::new();
+                    let mut pes = Vec::new();
                     for _ in 0..n {
                         let kk = self.expr(k, 0, sc);
                         let vv = self.expr(v, depth - 1, sc);
-                        pairs.push(format!("{}: {}", kk, vv));
+                        pairs.push(format!("{}: {}", kk.code, vv.code));
+                        pes.push((kk.e, vv.e));
                     }
-                    format!("{{{}}}", pairs.join(", "))
+                    ex(format!("{{{}}}", pairs.join(", ")), E::MapL(pes))
                 }
             }
             Ty::Struct(i, targs) => {
@@ -1229,13 +1591,17 @@ impl Gen {
                     .zip(targs.iter().cloned())
                     .collect();
                 let mut args = Vec::new();
+                let mut aes = Vec::new();
                 for f in &sd.fields {
                     if f.weak {
-                        args.push("none".into());
+                        args.push("none".to_string());
+                        aes.push(E::Lit(Val::NoneV));
                         continue;
                     }
                     let fty = self.subst(&f.ty, &map);
-                    args.push(self.expr(&fty, depth.saturating_sub(1), sc));
+                    let a = self.expr(&fty, depth.saturating_sub(1), sc);
+                    args.push(a.code);
+                    aes.push(a.e);
                 }
                 let head = if targs.is_empty() {
                     sd.name.clone()
@@ -1245,7 +1611,7 @@ impl Gen {
                 } else {
                     sd.name.clone()
                 };
-                if targs.is_empty() && self.rng.chance(25) {
+                let code = if targs.is_empty() && self.rng.chance(25) {
                     let named: Vec<String> = sd
                         .fields
                         .iter()
@@ -1255,46 +1621,57 @@ impl Gen {
                     format!("{}({})", head, named.join(", "))
                 } else {
                     format!("{}({})", head, args.join(", "))
-                }
+                };
+                ex(code, E::StructL(*i, aes))
             }
             Ty::Enum(i) => {
                 let ed = self.enums[*i].clone();
                 let vi = self.rng.below(ed.variants.len());
                 let (vname, payload) = &ed.variants[vi];
                 if payload.is_empty() {
-                    format!("{}.{}", ed.name, vname)
+                    ex(format!("{}.{}", ed.name, vname), E::EnumL(*i, vi, vec![]))
                 } else {
                     // an optional payload element does not accept a bare inner
                     // value at construction, so those slots use a real optional
                     // (a `none`, or an in-scope optional var of that type)
-                    let args: Vec<String> = payload
-                        .iter()
-                        .map(|t| {
-                            if matches!(t, Ty::Opt(_)) {
-                                let vs = self.vars_of(sc, t);
-                                if !vs.is_empty() && self.rng.chance(50) {
-                                    vs[self.rng.below(vs.len())].clone()
-                                } else {
-                                    "none".into()
-                                }
+                    let mut args = Vec::new();
+                    let mut aes = Vec::new();
+                    for t in payload.iter() {
+                        if matches!(t, Ty::Opt(_)) {
+                            let vs = self.vars_of(sc, t);
+                            if !vs.is_empty() && self.rng.chance(50) {
+                                let v = vs[self.rng.below(vs.len())].clone();
+                                args.push(v.clone());
+                                aes.push(E::Path(v));
                             } else {
-                                self.expr(t, depth.saturating_sub(1), sc)
+                                args.push("none".to_string());
+                                aes.push(E::Lit(Val::NoneV));
                             }
-                        })
-                        .collect();
-                    format!("{}.{}({})", ed.name, vname, args.join(", "))
+                        } else {
+                            let a = self.expr(t, depth.saturating_sub(1), sc);
+                            args.push(a.code);
+                            aes.push(a.e);
+                        }
+                    }
+                    ex(
+                        format!("{}.{}({})", ed.name, vname, args.join(", ")),
+                        E::EnumL(*i, vi, aes),
+                    )
                 }
             }
             Ty::Param(_) => {
                 // only reachable through in-scope values of that parameter type
                 if let Some(v) = vars.first() {
-                    v.clone()
+                    ex(v.clone(), E::Path(v.clone()))
                 } else {
                     // should not happen; a harmless fallback
-                    "0".into()
+                    ex("0".into(), E::Lit(Val::I(0)))
                 }
             }
-            Ty::Chan(inner) => format!("Channel[{}]({})", self.ty_name(inner), self.rng.range(1, 4)),
+            Ty::Chan(inner) => ex(
+                format!("Channel[{}]({})", self.ty_name(inner), self.rng.range(1, 4)),
+                E::Lit(Val::Opaque),
+            ),
             Ty::FnT(ps, r) => {
                 let pnames: Vec<String> = (0..ps.len()).map(|k| format!("q{}", k)).collect();
                 let sig: Vec<String> = pnames
@@ -1313,7 +1690,10 @@ impl Gen {
                     }
                 }
                 let body = self.expr(r, depth.saturating_sub(1), &inner_sc);
-                format!("fn({}) => {}", sig.join(", "), body)
+                ex(
+                    format!("fn({}) => {}", sig.join(", "), body.code),
+                    E::Lit(Val::Opaque),
+                )
             }
         }
     }
@@ -1353,7 +1733,53 @@ impl Gen {
         }
     }
 
-    fn emit_print(&mut self, out: &mut String, ind: usize, code: &str, ty: &Ty) {
+    /// the rendered value part of a print for `ty`, or None when the type is
+    /// not printable and the emitter falls back to a fixed "ok" line. this
+    /// mirrors `printable` branch for branch — the two must stay in lockstep.
+    fn print_value_text(&self, ty: &Ty, val: &Val) -> Option<String> {
+        match ty {
+            Ty::Int | Ty::Str | Ty::Bool => Some(val.show()),
+            Ty::List(_) | Ty::Map(_, _) => Some(val.len_of().to_string()),
+            Ty::Opt(inner) => match **inner {
+                Ty::Int => Some(match val {
+                    Val::NoneV => "0".to_string(),
+                    other => other.show(),
+                }),
+                Ty::Str => Some(match val {
+                    Val::NoneV => "?".to_string(),
+                    other => other.show(),
+                }),
+                _ => None,
+            },
+            Ty::Struct(i, targs) => {
+                let sd = &self.structs[*i];
+                let map: Vec<(String, Ty)> = sd
+                    .generics
+                    .iter()
+                    .cloned()
+                    .zip(targs.iter().cloned())
+                    .collect();
+                for (fx, f) in sd.fields.iter().enumerate() {
+                    if f.weak {
+                        continue;
+                    }
+                    let fty = self.subst(&f.ty, &map);
+                    if fty == Ty::Int || fty == Ty::Str {
+                        return match val {
+                            Val::St(_, fields) => Some(fields[fx].show()),
+                            other => panic!("pithgen eval: struct print on {:?}", other),
+                        };
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// emit a labeled print of `code` and record the line it must produce.
+    /// `live` is false when the print sits in a branch that will not run.
+    fn emit_print(&mut self, out: &mut String, ind: usize, code: &str, ty: &Ty, val: &Val, live: bool) {
         let label = format!("p{}", self.counter);
         self.counter += 1;
         let pad = "    ".repeat(ind);
@@ -1371,6 +1797,13 @@ impl Gen {
             None => {
                 out.push_str(&format!("{}print(\"{} ok\")\n", pad, label));
             }
+        }
+        if live {
+            let text = match self.print_value_text(ty, val) {
+                Some(v) => format!("{}: {}", label, v),
+                None => format!("{} ok", label),
+            };
+            self.expect(text);
         }
     }
 
@@ -1456,9 +1889,10 @@ impl Gen {
         for _ in 0..n {
             let ty = self.random_ty(0, 2);
             let code = self.expr(&ty, 2, &sc);
-            let name = self.let_var(&mut filler, &mut sc, &ty, &code, "v");
+            let val = self.eval_in_main(&code.e);
+            let name = self.let_var(&mut filler, &mut sc, &ty, &code.code, val.clone(), "v");
             if self.rng.chance(70) {
-                self.emit_print(&mut filler, 1, &name, &ty);
+                self.emit_print(&mut filler, 1, &name, &ty, &val, true);
             }
         }
         blocks.push(filler);
@@ -1468,10 +1902,19 @@ impl Gen {
             out.push_str(&b);
         }
         out.push_str("    print(\"done\")\n");
+        self.expect("done".to_string());
         out
     }
 
-    fn let_var(&mut self, out: &mut String, sc: &mut Scope, ty: &Ty, code: &str, prefix: &str) -> String {
+    fn let_var(
+        &mut self,
+        out: &mut String,
+        sc: &mut Scope,
+        ty: &Ty,
+        code: &str,
+        val: Val,
+        prefix: &str,
+    ) -> String {
         let name = format!("{}{}", prefix, self.counter);
         self.counter += 1;
         // an optional local assigned a bare inner value would infer the inner
@@ -1487,6 +1930,7 @@ impl Gen {
             out.push_str(&format!("    {} := {}\n", name, code));
         }
         sc.vars.push((name.clone(), ty.clone(), false));
+        self.env.push((name.clone(), val));
         name
     }
 
@@ -1506,8 +1950,9 @@ impl Gen {
             let si = cands[self.rng.below(cands.len())];
             let ty = Ty::Struct(si, vec![]);
             let code = self.expr(&ty, 2, sc);
-            let name = self.let_var(out, sc, &ty, &code, "s");
-            self.emit_print(out, 1, &name, &ty);
+            let val = self.eval_in_main(&code.e);
+            let name = self.let_var(out, sc, &ty, &code.code, val.clone(), "s");
+            self.emit_print(out, 1, &name, &ty, &val, true);
         }
     }
 
@@ -1528,8 +1973,9 @@ impl Gen {
             let targ = self.concrete_ty(true);
             let ty = Ty::Struct(si, vec![targ.clone()]);
             let code = self.expr(&ty, 2, sc);
-            let name = self.let_var(out, sc, &ty, &code, "g");
-            self.emit_print(out, 1, &name, &ty);
+            let val = self.eval_in_main(&code.e);
+            let name = self.let_var(out, sc, &ty, &code.code, val.clone(), "g");
+            self.emit_print(out, 1, &name, &ty, &val, true);
             let sd = self.structs[si].clone();
             let map = vec![("T".to_string(), targ.clone())];
             // read the interesting fields back
@@ -1539,17 +1985,21 @@ impl Gen {
                     Ty::Opt(inner) if **inner == Ty::Param("T".into()) => {
                         // the M? field, probed through unwrap_or / == none / match
                         let path = format!("{}.peer", name);
+                        let peer_val = self.field_val(&val, "peer");
                         let w = self.rng.weighted(&[35, 30, 35]);
                         match w {
                             0 => {
-                                let pv = self.let_var(out, sc, &fty, &path, "m");
-                                self.emit_print(out, 1, &pv, &fty);
+                                let pv = self.let_var(out, sc, &fty, &path, peer_val.clone(), "m");
+                                self.emit_print(out, 1, &pv, &fty, &peer_val, true);
                             }
                             1 => {
                                 out.push_str(&format!(
                                     "    if {} == none:\n        print(\"peer none\")\n",
                                     path
                                 ));
+                                if peer_val == Val::NoneV {
+                                    self.expect("peer none".to_string());
+                                }
                             }
                             _ => {
                                 let inner_print = match self.printable("pv", &targ) {
@@ -1562,6 +2012,14 @@ impl Gen {
                                     "    match {}:\n        pv => {}\n        none => print(\"peer empty\")\n",
                                     path, inner_print
                                 ));
+                                if peer_val == Val::NoneV {
+                                    self.expect("peer empty".to_string());
+                                } else {
+                                    match self.print_value_text(&targ, &peer_val) {
+                                        Some(t) => self.expect(format!("peer {}", t)),
+                                        None => self.expect("peer set".to_string()),
+                                    }
+                                }
                             }
                         }
                     }
@@ -1574,6 +2032,13 @@ impl Gen {
                                     "    match {}:\n        nx => print(\"next {{nx.tag}}\")\n        none => print(\"next end\")\n",
                                     path
                                 ));
+                                let next_val = self.field_val(&val, "next");
+                                if next_val == Val::NoneV {
+                                    self.expect("next end".to_string());
+                                } else {
+                                    let tag = self.field_val(&next_val, "tag");
+                                    self.expect(format!("next {}", tag.show()));
+                                }
                             }
                         }
                     }
@@ -1592,11 +2057,24 @@ impl Gen {
         let ei = cands[self.rng.below(cands.len())];
         let ty = Ty::Enum(ei);
         let code = self.expr(&ty, 2, sc);
-        let name = self.let_var(out, sc, &ty, &code, "e");
-        self.emit_match_enum(out, sc, &name, ei, 1);
+        let val = self.eval_in_main(&code.e);
+        let name = self.let_var(out, sc, &ty, &code.code, val.clone(), "e");
+        self.emit_match_enum(out, sc, &name, ei, 1, &val, true);
     }
 
-    fn emit_match_enum(&mut self, out: &mut String, _sc: &Scope, subject: &str, ei: usize, ind: usize) {
+    /// emit an exhaustive match over `subject` and record the arm line the
+    /// known value takes. `live` is false when the match sits in a dead branch
+    /// (the value is then allowed to be a placeholder).
+    fn emit_match_enum(
+        &mut self,
+        out: &mut String,
+        _sc: &Scope,
+        subject: &str,
+        ei: usize,
+        ind: usize,
+        val: &Val,
+        live: bool,
+    ) {
         let ed = self.enums[ei].clone();
         let pad = "    ".repeat(ind);
         out.push_str(&format!("{}match {}:\n", pad, subject));
@@ -1609,19 +2087,21 @@ impl Gen {
                 ));
             } else {
                 let binds: Vec<String> = (0..payload.len()).map(|k| format!("x{}", k)).collect();
-                // a match binding on an optional payload element is typed as the
-                // inner type, so it is printed as that inner type, not as an
-                // optional (no unwrap_or on the binding)
-                let bind_ty = match &payload[0] {
-                    Ty::Opt(inner) => (**inner).clone(),
-                    other => other.clone(),
-                };
-                let frag = match self.printable(&binds[0], &bind_ty) {
-                    Some(Print::Interp(fr)) if !fr.contains('"') => format!("print(\"{} {{{}}}\")", vname, fr),
-                    Some(Print::Concat(ce)) if !ce.contains('"') => {
-                        format!("print(\"{} \" + {})", vname, ce)
+                // a match binding on an optional payload element is checker-typed
+                // as the inner type but holds the box at runtime; interpolating it
+                // prints a heap address, so those arms print a fixed line instead
+                let frag = if matches!(&payload[0], Ty::Opt(_)) {
+                    format!("print(\"{} held\")", vname)
+                } else {
+                    match self.printable(&binds[0], &payload[0]) {
+                        Some(Print::Interp(fr)) if !fr.contains('"') => {
+                            format!("print(\"{} {{{}}}\")", vname, fr)
+                        }
+                        Some(Print::Concat(ce)) if !ce.contains('"') => {
+                            format!("print(\"{} \" + {})", vname, ce)
+                        }
+                        _ => format!("print(\"{} bound\")", vname),
                     }
-                    _ => format!("print(\"{} bound\")", vname),
                 };
                 out.push_str(&format!(
                     "{}{}.{}({}) => {}\n",
@@ -1633,6 +2113,27 @@ impl Gen {
                 ));
             }
         }
+        if live {
+            let (vi, pvals) = match val {
+                Val::En(e2, vi, pvals) => {
+                    assert_eq!(*e2, ei, "pithgen eval: enum value/type mismatch");
+                    (*vi, pvals)
+                }
+                other => panic!("pithgen eval: match subject {:?}", other),
+            };
+            let (vname, payload) = &ed.variants[vi];
+            let text = if payload.is_empty() {
+                format!("{} hit", vname)
+            } else if matches!(&payload[0], Ty::Opt(_)) {
+                format!("{} held", vname)
+            } else {
+                match self.print_value_text(&payload[0], &pvals[0]) {
+                    Some(t) => format!("{} {}", vname, t),
+                    None => format!("{} bound", vname),
+                }
+            };
+            self.expect(text);
+        }
     }
 
     fn block_interfaces(&mut self, out: &mut String, sc: &mut Scope) {
@@ -1641,35 +2142,45 @@ impl Gen {
             let (si, item) = (self.impls[ii].struct_idx, self.impls[ii].item.clone());
             let ty = Ty::Struct(si, vec![]);
             let code = self.expr(&ty, 2, sc);
-            let obj = self.let_var(out, sc, &ty, &code, "o");
+            let objv = self.eval_in_main(&code.e);
+            let obj = self.let_var(out, sc, &ty, &code.code, objv.clone(), "o");
             let fcall = format!("{}.first()", obj);
-            let fv = self.let_var(out, sc, &item, &fcall, "f");
+            let fval = self.eval_impl_first(ii, &objv);
+            let fv = self.let_var(out, sc, &item, &fcall, fval.clone(), "f");
             if let Ty::Enum(ei) = item {
-                self.emit_match_enum(out, sc, &fv, ei, 1);
+                self.emit_match_enum(out, sc, &fv, ei, 1, &fval, true);
             } else {
-                self.emit_print(out, 1, &fv, &item);
+                self.emit_print(out, 1, &fv, &item, &fval, true);
             }
             if self.ifaces[self.impls[ii].iface].opt_method {
                 // the optional-of-associated-type extraction path
                 let pcall = format!("{}.pick()", obj);
                 let opt_ty = Ty::Opt(Box::new(item.clone()));
-                let ov = self.let_var(out, sc, &opt_ty, &pcall, "u");
+                let pickv = self.eval_impl_pick(ii, &objv);
+                let ov = self.let_var(out, sc, &opt_ty, &pcall, pickv.clone(), "u");
                 if let Ty::Enum(ei) = item {
                     let got = format!("got{}", self.counter);
                     self.counter += 1;
                     out.push_str(&format!("    if let {} = {}:\n", got, ov));
-                    self.emit_match_enum(out, sc, &got, ei, 2);
+                    self.emit_match_enum(out, sc, &got, ei, 2, &pickv, pickv != Val::NoneV);
                     out.push_str(&format!(
                         "    if {} == none:\n        print(\"pick none\")\n",
                         ov
                     ));
+                    if pickv == Val::NoneV {
+                        self.expect("pick none".to_string());
+                    }
                 } else {
                     match self.printable(&ov, &opt_ty) {
                         Some(Print::Interp(fr)) if !fr.contains('"') => {
                             out.push_str(&format!("    print(\"picked: {{{}}}\")\n", fr));
+                            let t = self.print_value_text(&opt_ty, &pickv).unwrap();
+                            self.expect(format!("picked: {}", t));
                         }
                         Some(Print::Concat(ce)) => {
                             out.push_str(&format!("    print(\"picked: \" + {})\n", ce));
+                            let t = self.print_value_text(&opt_ty, &pickv).unwrap();
+                            self.expect(format!("picked: {}", t));
                         }
                         _ => {}
                     }
@@ -1685,18 +2196,23 @@ impl Gen {
                     } else {
                         item.clone()
                     };
-                    let rv = self.let_var(out, sc, &rty, &call, "k");
+                    let rval = if optional {
+                        self.eval_impl_pick(ii, &objv)
+                    } else {
+                        self.eval_impl_first(ii, &objv)
+                    };
+                    let rv = self.let_var(out, sc, &rty, &call, rval.clone(), "k");
                     if let Ty::Enum(ei) = item {
                         if optional {
                             let plucked = format!("got{}", self.counter);
                             self.counter += 1;
                             out.push_str(&format!("    if let {} = {}:\n", plucked, rv));
-                            self.emit_match_enum(out, sc, &plucked, ei, 2);
+                            self.emit_match_enum(out, sc, &plucked, ei, 2, &rval, rval != Val::NoneV);
                         } else {
-                            self.emit_match_enum(out, sc, &rv, ei, 1);
+                            self.emit_match_enum(out, sc, &rv, ei, 1, &rval, true);
                         }
                     } else {
-                        self.emit_print(out, 1, &rv, &rty);
+                        self.emit_print(out, 1, &rv, &rty, &rval, true);
                     }
                 }
             }
@@ -1731,17 +2247,22 @@ impl Gen {
                 // forces explicit type arguments.
                 let mut explicit = self.rng.chance(45);
                 let mut args: Vec<String> = Vec::new();
+                let mut argvals: Vec<Val> = Vec::new();
                 for (_, pt) in f.params.iter() {
                     let concrete = self.subst(pt, &map);
                     if matches!(concrete, Ty::Opt(_)) {
                         let code = self.expr(&concrete, 2, sc);
-                        let ov = self.let_var(out, sc, &concrete, &code, "oa");
+                        let v = self.eval_in_main(&code.e);
+                        let ov = self.let_var(out, sc, &concrete, &code.code, v.clone(), "oa");
                         args.push(ov);
+                        argvals.push(v);
                         if param_under_opt(pt) {
                             explicit = true;
                         }
                     } else {
-                        args.push(self.expr(&concrete, 2, sc));
+                        let a = self.expr(&concrete, 2, sc);
+                        argvals.push(self.eval_in_main(&a.e));
+                        args.push(a.code);
                     }
                 }
                 let call = if explicit {
@@ -1750,11 +2271,12 @@ impl Gen {
                     format!("{}({})", cname, args.join(", "))
                 };
                 let rty = self.subst(f.ret.as_ref().unwrap(), &map);
-                let rv = self.let_var(out, sc, &rty, &call, "r");
+                let rval = self.eval_call(fi, argvals);
+                let rv = self.let_var(out, sc, &rty, &call, rval.clone(), "r");
                 if let Ty::Enum(ei) = rty {
-                    self.emit_match_enum(out, sc, &rv, ei, 1);
+                    self.emit_match_enum(out, sc, &rv, ei, 1, &rval, true);
                 } else {
-                    self.emit_print(out, 1, &rv, &rty);
+                    self.emit_print(out, 1, &rv, &rty, &rval, true);
                 }
             }
         }
@@ -1765,27 +2287,35 @@ impl Gen {
         let inner = if self.rng.chance(55) { Ty::Int } else { Ty::Str };
         let oty = Ty::Opt(Box::new(inner.clone()));
         let some_code = self.expr(&inner, 1, sc);
-        let a = self.let_var(out, sc, &oty, &some_code, "op");
+        let some_val = self.eval_in_main(&some_code.e);
+        let a = self.let_var(out, sc, &oty, &some_code.code, some_val, "op");
         let b_name = format!("op{}", self.counter);
         self.counter += 1;
         out.push_str(&format!("    {}: {} := none\n", b_name, self.ty_name(&oty)));
         sc.vars.push((b_name.clone(), oty.clone(), false));
+        self.env.push((b_name.clone(), Val::NoneV));
         for v in [a.clone(), b_name.clone()] {
+            let vv = self.resolve(&v, &self.env);
             match self.rng.weighted(&[30, 30, 20, 20]) {
                 0 => {
                     out.push_str(&format!(
                         "    if {} != none:\n        print(\"{} set\")\n    if {} == none:\n        print(\"{} unset\")\n",
                         v, v, v, v
                     ));
+                    if vv != Val::NoneV {
+                        self.expect(format!("{} set", v));
+                    } else {
+                        self.expect(format!("{} unset", v));
+                    }
                 }
                 1 => {
-                    self.emit_print(out, 1, &v, &oty);
+                    self.emit_print(out, 1, &v, &oty, &vv, true);
                 }
                 2 => {
                     out.push_str(&format!("    if let got{} = {}:\n", self.counter, v));
                     let gname = format!("got{}", self.counter);
                     self.counter += 1;
-                    self.emit_print(out, 2, &gname, &inner);
+                    self.emit_print(out, 2, &gname, &inner, &vv, vv != Val::NoneV);
                 }
                 _ => {
                     let frag = match self.printable("w", &inner) {
@@ -1796,6 +2326,14 @@ impl Gen {
                         "    match {}:\n        w => {}\n        none => print(\"none arm\")\n",
                         v, frag
                     ));
+                    if vv == Val::NoneV {
+                        self.expect("none arm".to_string());
+                    } else {
+                        match self.print_value_text(&inner, &vv) {
+                            Some(t) => self.expect(format!("some {}", t)),
+                            None => self.expect("some".to_string()),
+                        }
+                    }
                 }
             }
         }
@@ -1816,16 +2354,22 @@ impl Gen {
             self.ty_name(&elem)
         ));
         let n_push = 2 + self.rng.below(2);
+        let mut elem_vals = Vec::new();
         for _ in 0..n_push {
             let e = self.expr(&elem, 1, sc);
-            out.push_str(&format!("    {}.push({})\n", lname, e));
+            elem_vals.push(self.eval_in_main(&e.e));
+            out.push_str(&format!("    {}.push({})\n", lname, e.code));
         }
         out.push_str(&format!("    print(\"len: {{{}.len()}}\")\n", lname));
-        let idx_code = format!("{}[{}]", lname, self.rng.below(2));
-        let iv = self.let_var(out, sc, &elem, &idx_code, "el");
-        self.emit_print(out, 1, &iv, &elem);
+        self.expect(format!("len: {}", n_push));
+        let idx = self.rng.below(2);
+        let idx_code = format!("{}[{}]", lname, idx);
+        let iv_val = elem_vals[idx].clone();
+        let iv = self.let_var(out, sc, &elem, &idx_code, iv_val.clone(), "el");
+        self.emit_print(out, 1, &iv, &elem, &iv_val, true);
         sc.vars
             .push((lname.clone(), Ty::List(Box::new(elem.clone())), true));
+        self.env.push((lname.clone(), Val::L(elem_vals)));
 
         // an empty literal straight into an argument position
         let list_fns: Vec<usize> = (0..self.emitted_fns)
@@ -1841,20 +2385,29 @@ impl Gen {
         if let Some(&fi) = list_fns.first() {
             let f = self.fns[fi].clone();
             let cname = self.fn_call_name(fi, 0);
-            let args: Vec<String> = f
-                .params
-                .iter()
-                .map(|(_, t)| {
-                    if matches!(t, Ty::List(_)) {
-                        "[]".to_string()
-                    } else {
-                        self.expr(t, 1, sc)
-                    }
-                })
-                .collect();
+            let mut args: Vec<String> = Vec::new();
+            let mut argvals: Vec<Val> = Vec::new();
+            for (_, t) in f.params.iter() {
+                if matches!(t, Ty::List(_)) {
+                    args.push("[]".to_string());
+                    argvals.push(Val::L(vec![]));
+                } else {
+                    let a = self.expr(t, 1, sc);
+                    argvals.push(self.eval_in_main(&a.e));
+                    args.push(a.code);
+                }
+            }
             let rty = f.ret.clone().unwrap();
-            let rv = self.let_var(out, sc, &rty, &format!("{}({})", cname, args.join(", ")), "z");
-            self.emit_print(out, 1, &rv, &rty);
+            let rval = self.eval_call(fi, argvals);
+            let rv = self.let_var(
+                out,
+                sc,
+                &rty,
+                &format!("{}({})", cname, args.join(", ")),
+                rval.clone(),
+                "z",
+            );
+            self.emit_print(out, 1, &rv, &rty, &rval, true);
         }
 
         // a map with inserts and get_default
@@ -1868,16 +2421,18 @@ impl Gen {
                 self.ty_name(&vt)
             ));
             let val = self.expr(&vt, 1, sc);
-            out.push_str(&format!("    {}.insert(\"k1\", {})\n", mname, val));
+            let vval = self.eval_in_main(&val.e);
+            out.push_str(&format!("    {}.insert(\"k1\", {})\n", mname, val.code));
             let dflt = self.expr(&vt, 0, sc);
             let gv = self.let_var(
                 out,
                 sc,
                 &vt,
-                &format!("{}.get_default(\"k1\", {})", mname, dflt),
+                &format!("{}.get_default(\"k1\", {})", mname, dflt.code),
+                vval.clone(),
                 "mv",
             );
-            self.emit_print(out, 1, &gv, &vt);
+            self.emit_print(out, 1, &gv, &vt, &vval, true);
         }
 
         // a nested list, read through len
@@ -1886,20 +2441,23 @@ impl Gen {
             self.counter += 1;
             let inner1 = self.expr(&Ty::List(Box::new(Ty::Int)), 1, sc);
             let inner2 = self.expr(&Ty::List(Box::new(Ty::Int)), 1, sc);
-            out.push_str(&format!("    {} := [{}, {}]\n", nl, inner1, inner2));
+            let l1 = self.eval_in_main(&inner1.e);
+            out.push_str(&format!("    {} := [{}, {}]\n", nl, inner1.code, inner2.code));
             out.push_str(&format!(
                 "    print(\"nested: {{{}.len()}} {{{}[0].len()}}\")\n",
                 nl, nl
             ));
+            self.expect(format!("nested: 2 {}", l1.len_of()));
         }
     }
 
     fn block_closures(&mut self, out: &mut String, sc: &mut Scope) {
         let capn = self.rng.range(1, 20);
-        let cap = self.let_var(out, sc, &Ty::Int, &format!("{}", capn), "c");
+        let cap = self.let_var(out, sc, &Ty::Int, &format!("{}", capn), Val::I(capn), "c");
         let fname = format!("fx{}", self.counter);
         self.counter += 1;
-        if self.rng.chance(60) {
+        let block_form = !self.rng.chance(60);
+        if !block_form {
             out.push_str(&format!("    {} := fn(x: Int) => x + {}\n", fname, cap));
         } else {
             // block lambda: no return annotation on purpose (not allowed)
@@ -1908,9 +2466,25 @@ impl Gen {
                 fname, cap
             ));
         }
+        let lam = |x: i64| -> i64 {
+            let acc = x + capn;
+            if block_form && acc > 50 {
+                acc + 1
+            } else {
+                acc
+            }
+        };
         let dvn = self.rng.range(0, 9);
-        let dv = self.let_var(out, sc, &Ty::Int, &format!("{}({})", fname, dvn), "d");
-        self.emit_print(out, 1, &dv, &Ty::Int);
+        let dval = lam(dvn);
+        let dv = self.let_var(
+            out,
+            sc,
+            &Ty::Int,
+            &format!("{}({})", fname, dvn),
+            Val::I(dval),
+            "d",
+        );
+        self.emit_print(out, 1, &dv, &Ty::Int, &Val::I(dval), true);
         // hand a lambda to the apply fn when it exists
         let apply: Vec<usize> = (0..self.fns.len())
             .filter(|&i| self.fns[i].special == Special::Apply)
@@ -1918,24 +2492,28 @@ impl Gen {
         if let Some(&fi) = apply.first() {
             let cname = self.fns[fi].name.clone();
             let avn = self.rng.range(0, 9);
+            let aval = lam(avn);
             let av = self.let_var(
                 out,
                 sc,
                 &Ty::Int,
                 &format!("{}({}, {})", cname, fname, avn),
+                Val::I(aval),
                 "d",
             );
-            self.emit_print(out, 1, &av, &Ty::Int);
+            self.emit_print(out, 1, &av, &Ty::Int, &Val::I(aval), true);
             if self.rng.chance(50) {
                 let bvn = self.rng.range(0, 5);
+                let bval = bvn * 2 + capn;
                 let bv = self.let_var(
                     out,
                     sc,
                     &Ty::Int,
                     &format!("{}(fn(y: Int) => y * 2 + {}, {})", cname, cap, bvn),
+                    Val::I(bval),
                     "d",
                 );
-                self.emit_print(out, 1, &bv, &Ty::Int);
+                self.emit_print(out, 1, &bv, &Ty::Int, &Val::I(bval), true);
             }
         }
     }
@@ -1980,14 +2558,16 @@ impl Gen {
                 out.push_str(&format!("        {} = {} + 1\n", i, i));
                 out.push_str(&format!("    await {}\n", task));
                 out.push_str(&format!("    print(\"seen: {{{}}}\")\n", seen));
+                self.expect(format!("seen: {}", n_msgs));
                 // a last look at the payload through match, for enum payloads
                 if let Ty::Enum(_) = payload {
                     let one = format!("lp{}", self.counter);
                     self.counter += 1;
                     let e = self.expr(&payload, 1, sc);
-                    out.push_str(&format!("    {} := {}\n", one, e));
+                    let eval = self.eval_in_main(&e.e);
+                    out.push_str(&format!("    {} := {}\n", one, e.code));
                     if let Ty::Enum(ei) = payload {
-                        self.emit_match_enum(out, sc, &one, ei, 1);
+                        self.emit_match_enum(out, sc, &one, ei, 1, &eval, true);
                     }
                 }
             } else {
@@ -2007,9 +2587,9 @@ impl Gen {
                 self.counter += 1;
                 let explicit = self.rng.chance(50);
                 let call = if explicit {
-                    format!("{}[{}]({}, {}, {})", f.name, self.ty_name(&payload), ch, val, n_msgs)
+                    format!("{}[{}]({}, {}, {})", f.name, self.ty_name(&payload), ch, val.code, n_msgs)
                 } else {
-                    format!("{}({}, {}, {})", f.name, ch, val, n_msgs)
+                    format!("{}({}, {}, {})", f.name, ch, val.code, n_msgs)
                 };
                 out.push_str(&format!("    {} := spawn {}\n", task, call));
                 let i = format!("i{}", self.counter);
@@ -2028,6 +2608,7 @@ impl Gen {
                 out.push_str(&format!("        {} = {} + 1\n", i, i));
                 out.push_str(&format!("    await {}\n", task));
                 out.push_str(&format!("    print(\"gseen: {{{}}}\")\n", seen));
+                self.expect(format!("gseen: {}", n_msgs));
             }
         }
         // spawn of a call that takes a capturing closure
@@ -2038,20 +2619,19 @@ impl Gen {
             if let Some(&fi) = apply.first() {
                 let cname = self.fns[fi].name.clone();
                 let basen = self.rng.range(1, 30);
-                let base = self.let_var(out, sc, &Ty::Int, &format!("{}", basen), "b");
+                let base = self.let_var(out, sc, &Ty::Int, &format!("{}", basen), Val::I(basen), "b");
                 let task = format!("ct{}", self.counter);
                 self.counter += 1;
+                let argn = self.rng.range(0, 9);
                 out.push_str(&format!(
                     "    {} := spawn {}(fn(y: Int) => y + {}, {})\n",
-                    task,
-                    cname,
-                    base,
-                    self.rng.range(0, 9)
+                    task, cname, base, argn
                 ));
                 let got = format!("cw{}", self.counter);
                 self.counter += 1;
                 out.push_str(&format!("    {} := await {}\n", got, task));
                 out.push_str(&format!("    print(\"closure task: {{{}}}\")\n", got));
+                self.expect(format!("closure task: {}", basen + argn));
             }
         }
     }
@@ -2067,10 +2647,24 @@ impl Gen {
         if let Some(&fi) = helper_fns.first() {
             let f = self.fns[fi].clone();
             let cname = self.fn_call_name(fi, 0);
-            let args: Vec<String> = f.params.iter().map(|(_, t)| self.expr(t, 1, sc)).collect();
+            let mut args: Vec<String> = Vec::new();
+            let mut argvals: Vec<Val> = Vec::new();
+            for (_, t) in f.params.iter() {
+                let a = self.expr(t, 1, sc);
+                argvals.push(self.eval_in_main(&a.e));
+                args.push(a.code);
+            }
             let rty = f.ret.clone().unwrap();
-            let rv = self.let_var(out, sc, &rty, &format!("{}({})", cname, args.join(", ")), "av");
-            self.emit_print(out, 1, &rv, &rty);
+            let rval = self.eval_call(fi, argvals);
+            let rv = self.let_var(
+                out,
+                sc,
+                &rty,
+                &format!("{}({})", cname, args.join(", ")),
+                rval.clone(),
+                "av",
+            );
+            self.emit_print(out, 1, &rv, &rty, &rval, true);
         }
         // reference enum variants through the alias — payload form, and the
         // no-payload form when the dial is on
@@ -2081,26 +2675,34 @@ impl Gen {
             let ed = self.enums[ei].clone();
             let alias = module_alias(ed.module, 0);
             if self.feats.alias_nopayload {
-                if let Some((vname, _)) = ed.variants.iter().find(|(_, p)| p.is_empty()) {
+                if let Some(vi) = ed.variants.iter().position(|(_, p)| p.is_empty()) {
+                    let vname = &ed.variants[vi].0;
                     let name = format!("an{}", self.counter);
                     self.counter += 1;
                     out.push_str(&format!(
                         "    {} := {}.{}.{}\n",
                         name, alias, ed.name, vname
                     ));
+                    let val = Val::En(ei, vi, vec![]);
                     sc.vars.push((name.clone(), Ty::Enum(ei), false));
-                    self.emit_match_enum(out, sc, &name, ei, 1);
+                    self.env.push((name.clone(), val.clone()));
+                    self.emit_match_enum(out, sc, &name, ei, 1, &val, true);
                 }
             }
             if self.rng.chance(60) {
-                if let Some((vname, payload)) = ed.variants.iter().find(|(_, p)| !p.is_empty()) {
+                if let Some(vi) = ed.variants.iter().position(|(_, p)| !p.is_empty()) {
+                    let (vname, payload) = ed.variants[vi].clone();
                     let mut args: Vec<String> = Vec::new();
+                    let mut argvals: Vec<Val> = Vec::new();
                     for t in payload.iter() {
                         if matches!(t, Ty::Opt(_)) {
                             args.push("none".into());
+                            argvals.push(Val::NoneV);
                         } else {
                             let tt = t.clone();
-                            args.push(self.expr(&tt, 1, sc));
+                            let a = self.expr(&tt, 1, sc);
+                            argvals.push(self.eval_in_main(&a.e));
+                            args.push(a.code);
                         }
                     }
                     let name = format!("ap{}", self.counter);
@@ -2113,8 +2715,10 @@ impl Gen {
                         vname,
                         args.join(", ")
                     ));
+                    let val = Val::En(ei, vi, argvals);
                     sc.vars.push((name.clone(), Ty::Enum(ei), false));
-                    self.emit_match_enum(out, sc, &name, ei, 1);
+                    self.env.push((name.clone(), val.clone()));
+                    self.emit_match_enum(out, sc, &name, ei, 1, &val, true);
                 }
             }
         }
@@ -2134,7 +2738,8 @@ impl Gen {
         let si = cands[self.rng.below(cands.len())];
         let ty = Ty::Struct(si, vec![]);
         let code = self.expr(&ty, 1, sc);
-        let strong = self.let_var(out, sc, &ty, &code, "st");
+        let sval = self.eval_in_main(&code.e);
+        let strong = self.let_var(out, sc, &ty, &code.code, sval.clone(), "st");
         let w = format!("wk{}", self.counter);
         self.counter += 1;
         out.push_str(&format!("    weak {} := {}\n", w, strong));
@@ -2146,6 +2751,11 @@ impl Gen {
             "    match {}:\n        alive => {}\n        none => print(\"gone\")\n",
             w, frag
         ));
+        // the strong ref is still in scope, so the weak ref is always alive
+        match self.print_value_text(&ty, &sval) {
+            Some(t) => self.expect(format!("live {}", t)),
+            None => self.expect("live".to_string()),
+        }
     }
 
     fn block_results(&mut self, out: &mut String, sc: &mut Scope) {
@@ -2155,23 +2765,27 @@ impl Gen {
         if let Some(&fi) = risky.first() {
             let cname = self.fns[fi].name.clone();
             let okn = self.rng.range(0, 20);
+            // the fallible body doubles a non-negative input, and a negative
+            // one lands in the catch arm
             let ok = self.let_var(
                 out,
                 sc,
                 &Ty::Int,
                 &format!("{}({}) catch (0 - 1)", cname, okn),
+                Val::I(okn * 2),
                 "rr",
             );
-            self.emit_print(out, 1, &ok, &Ty::Int);
+            self.emit_print(out, 1, &ok, &Ty::Int, &Val::I(okn * 2), true);
             let badn = self.rng.range(1, 5);
             let bad = self.let_var(
                 out,
                 sc,
                 &Ty::Int,
                 &format!("{}((0 - {})) catch (0 - 9)", cname, badn),
+                Val::I(-9),
                 "rr",
             );
-            self.emit_print(out, 1, &bad, &Ty::Int);
+            self.emit_print(out, 1, &bad, &Ty::Int, &Val::I(-9), true);
         }
     }
 
@@ -2233,7 +2847,10 @@ impl Gen {
         main.push_str(&self.decl_text[0]);
         main.push_str(&main_body);
         files.push(("main.pith".into(), main));
-        Program { files }
+        Program {
+            files,
+            expected: self.expected.clone(),
+        }
     }
 }
 

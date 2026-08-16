@@ -58,7 +58,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
-from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
+from ir_result_abi import ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
@@ -142,6 +142,29 @@ mut ir_threadlocal_slots: Map[String, Int] := {}
 mut ir_threadlocal_kinds: Map[String, String] := {}
 mut ir_next_tls_slot := 0
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
+
+# --- the two-register result ABI (PITH_RESULT_REG=1) ---
+# functions in this registry return (is_ok, payload) in two registers via
+# ret2, and their call sites bind the pair with rcall, instead of passing a
+# heap-allocated three-slot result box. everything OUTSIDE these paths still
+# sees the declared retkind "tuple": a call site that is not consuming the
+# pair directly materializes a box from it on the spot, so the box world and
+# its ARC rules are untouched — with the flag off, not one instruction moves.
+# eligibility (ir_maybe_register_result_reg) is deliberately narrow for the
+# measured prototype: non-generic free functions whose ok payload is an Int
+# or Bool. the error payload is always a single register (a handle or zero).
+mut ir_result_reg_funcs: Map[String, Bool] := {}
+mut ir_result_reg_flag := 0 - 1
+# the pair handshake: a consumer that can use (flag, payload) directly (the
+# `!` emitter) stores its operand node index here before emitting it; the
+# call emitter delivers the pair through the three registers below only when
+# the call it is lowering IS that node — an argument's nested call never
+# matches, so it materializes a box like any other context.
+mut ir_rcall_defer_idx := 0 - 1
+mut ir_rcall_current_idx := 0 - 1
+mut ir_rcall_pair_ready := false
+mut ir_rcall_flag_reg := 0
+mut ir_rcall_val_reg := 0
 mut ir_lambda_count := 0
 mut ir_for_count := 0
 mut ir_break_stack: List[String] := []
@@ -302,6 +325,10 @@ fn ir_reset_type_state():
     ir_import_renames = {}
     ir_func_returns.clear()
     ir_func_result_ok_kinds = {}
+    ir_result_reg_funcs = {}
+    ir_rcall_defer_idx = 0 - 1
+    ir_rcall_current_idx = 0 - 1
+    ir_rcall_pair_ready = false
     ir_named_fn_value_wrappers = {}
     ir_module_aliases = {}
     ir_import_declared_functions = {}
@@ -2441,7 +2468,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + si)
         ir_emit_main_error_report(err_r, true)
-        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+        ir_emit_ret_err_value(err_r)
     ir_emit_label(merge_l)
     return decoded_r
 
@@ -3952,10 +3979,15 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     if callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
         return ir_emit_test_assert_eq(node, arg_regs, false)
 
-    r := ir_reg()
+    mut r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)
     ret_type := ir_call_retkind_for_name(idx, uses_result_abi, callee.name)
-    ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    if ir_result_reg_funcs.contains_key(callee.name):
+        ir_rcall_current_idx = idx
+        r = ir_emit_result_reg_call(r, callee.name, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        ir_rcall_current_idx = 0 - 1
+    else:
+        ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
     # a generic struct built here (backend constructor call) gets no destructor
     # from the backend; attach a per-instance one so its rc fields release
     ir_attach_generic_construction_dtor(node, ret_type, r, arg_regs)
@@ -4497,6 +4529,100 @@ fn ir_emit_ok_result_tuple(ok_r: Int) -> Int:
 fn ir_emit_err_result_tuple(err_r: Int) -> Int:
     zero := ir_zero_reg()
     return ir_emit_result_tuple(zero, zero, err_r)
+
+# whether the two-register result ABI is on for this process. read once: the
+# emitter must make the same decision for a function's header and for every
+# one of its call sites, across every module of the program.
+fn ir_result_reg_enabled() -> Bool:
+    if ir_result_reg_flag < 0:
+        value := env_opt("PITH_RESULT_REG").unwrap_or("")
+        if value == "1":
+            ir_result_reg_flag = 1
+        else:
+            ir_result_reg_flag = 0
+    return ir_result_reg_flag == 1
+
+# register `name` for the two-register result ABI when it qualifies. the gate
+# is per-FUNCTION and must be decided before any call site emits, which is why
+# it runs during return-clause registration. narrow on purpose: no generics
+# (specializations re-emit bodies under substitution), no `main` (the entry
+# glue expects one return), and only Int/Bool ok payloads so the extracted
+# value never needs reference counting. the error payload is whatever `fail`
+# produced — always a single register, released by the consumer exactly as
+# the box world's err slot is.
+fn ir_maybe_register_result_reg(name: String, node: Node):
+    if not ir_result_reg_enabled():
+        return
+    if name == "main":
+        return
+    if ir_has_generic_params(node):
+        return
+    if not ir_func_returns.contains_key(name) or ir_func_returns[name] != "tuple":
+        return
+    if not ir_func_result_ok_kinds.contains_key(name):
+        return
+    ok_kind := ir_func_result_ok_kinds[name]
+    if ok_kind != "int" and ok_kind != "bool":
+        return
+    # a declaration containing a lambda or a spawn is excluded: their bodies
+    # are emitted as separate single-return functions while the enclosing
+    # function's return kind is still in effect, so a `fail` or `!` inside
+    # one would try to return the pair from a function that has no pair.
+    for child_idx in node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return
+    ir_result_reg_funcs.insert(name, true)
+
+fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return true
+    for child_idx in node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return true
+    return false
+
+# lower a call to a pair-returning function. always emits rcall; then either
+# hands the raw pair to the consumer that asked for it (the try emitter, via
+# the defer handshake) or folds the pair into an ordinary result box so every
+# other context — bindings, field reads, argument position, forwarding —
+# behaves exactly as the box world always has.
+fn ir_emit_result_reg_call(r: Int, fname: String, arg_count: Int, arg_text: String) -> Int:
+    flag_r := ir_reg()
+    val_r := ir_reg()
+    mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " int " + arg_count.to_string()
+    if arg_text.len() > 0:
+        line = line + arg_text
+    ir_emit(line)
+    if ir_rcall_current_idx >= 0 and ir_rcall_current_idx == ir_rcall_defer_idx:
+        ir_rcall_pair_ready = true
+        ir_rcall_flag_reg = flag_r
+        ir_rcall_val_reg = val_r
+        return r
+    return ir_emit_result_reg_box(flag_r, val_r)
+
+# fold an rcall's (flag, payload) pair into a three-slot result box: the
+# payload register holds the ok value on the ok path and the error on the err
+# path, so each arm stores it in its own slot. ownership transfers into the
+# box with no extra count, the same as a callee-built box.
+fn ir_emit_result_reg_box(flag_r: Int, val_r: Int) -> Int:
+    temp_name := ir_new_temp_name("rreg_box")
+    ir_var_types.insert(temp_name, "tuple")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ok_tuple := ir_emit_ok_result_tuple(val_r)
+    ir_emit("store " + temp_name + " " + ok_tuple.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    err_tuple := ir_emit_err_result_tuple(val_r)
+    ir_emit("store " + temp_name + " " + err_tuple.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
 
 fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
     temp_name := ir_new_temp_name("legacy_result")
@@ -5137,10 +5263,15 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
             ir_record_generic_spec_arg_tids(call_name, mct, ir_generic_arg_tids(node))
             call_name = ir_queue_generic_specialization(call_name, mct, generic_ret_type)
         arg_regs := ir_collect_call_arg_regs(node, 1)
-        r := ir_reg()
+        mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
-        ir_emit_call_text(r, call_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        if ir_result_reg_funcs.contains_key(call_name):
+            ir_rcall_current_idx = idx
+            r = ir_emit_result_reg_call(r, call_name, arg_regs.len(), ir_join_arg_regs(arg_regs))
+            ir_rcall_current_idx = 0 - 1
+        else:
+            ir_emit_call_text(r, call_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
         # module-qualified calls take the same transfer convention as
         # plain static calls: owned string temps die with the call
         ir_release_owned_string_args(node, 1, arg_regs)
@@ -5621,8 +5752,13 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
         ir_emit("iconst " + zero_r.to_string() + " 0")
         ir_emit("ret " + zero_r.to_string())
     else:
-        call_r := ir_reg()
-        ir_emit_call_text(call_r, target_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        mut call_r := ir_reg()
+        if ir_result_reg_funcs.contains_key(target_name):
+            # a pair-returning target reached through a fn value: the wrapper
+            # itself keeps the box convention, so fold the pair into a box.
+            call_r = ir_emit_result_reg_call(call_r, target_name, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        else:
+            ir_emit_call_text(call_r, target_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
         ir_emit("ret " + call_r.to_string())
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
@@ -5805,7 +5941,17 @@ fn ir_emit_spawn_expr(node: Node) -> Int:
 fn ir_emit_try_expr(node: Node) -> Int:
     if node.children.len() > 0:
         result_kind := ir_expr_result_kind(node.children[0])
+        # ask the call emitter for the raw (flag, payload) pair when the
+        # operand is a direct call to a pair-returning function; any other
+        # operand ignores the request and the box path below runs unchanged.
+        saved_defer := ir_rcall_defer_idx
+        ir_rcall_defer_idx = node.children[0]
+        ir_rcall_pair_ready = false
         val_r := ir_expr(node.children[0])
+        ir_rcall_defer_idx = saved_defer
+        if ir_rcall_pair_ready:
+            ir_rcall_pair_ready = false
+            return ir_emit_try_pair(node.children[0], ir_rcall_flag_reg, ir_rcall_val_reg)
         if result_kind == "tuple":
             operand_class := ir_extraction_operand_class(node.children[0])
             operand_tid := c_get_expr_type(node.children[0])
@@ -5841,11 +5987,30 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
                 if err_kind.len() > 0:
                     ir_rc_retain_reg(err_r, err_kind)
-                fresh_err_r := ir_emit_err_result_tuple(err_r)
+                if ir_current_func_return_kind == "result_reg":
+                    # the pair return carries the freshly-counted error in the
+                    # payload register; the borrowed shell stays with its owner.
+                    ir_defer_emit_to_function_frame(true)
+                    ir_emit_string_cleanup("")
+                    zero_flag2_r := ir_reg()
+                    ir_emit("iconst " + zero_flag2_r.to_string() + " 0")
+                    ir_emit("ret2 " + zero_flag2_r.to_string() + " " + err_r.to_string())
+                else:
+                    fresh_err_r := ir_emit_err_result_tuple(err_r)
+                    ir_defer_emit_to_function_frame(true)
+                    ir_emit_string_cleanup("")
+                    ir_emit_main_error_report(err_r, err_kind == "string")
+                    ir_emit("ret " + fresh_err_r.to_string())
+            elif ir_current_func_return_kind == "result_reg":
+                # the enclosing function returns the pair: take the error out
+                # of the owned box, free the shell, and propagate via ret2.
+                prop_err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
+                ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
                 ir_defer_emit_to_function_frame(true)
                 ir_emit_string_cleanup("")
-                ir_emit_main_error_report(err_r, err_kind == "string")
-                ir_emit("ret " + fresh_err_r.to_string())
+                zero_flag_r := ir_reg()
+                ir_emit("iconst " + zero_flag_r.to_string() + " 0")
+                ir_emit("ret2 " + zero_flag_r.to_string() + " " + prop_err_r.to_string())
             else:
                 # propagating the error out early skips the normal return,
                 # so release the function's owned locals here too; the error
@@ -5879,6 +6044,16 @@ fn ir_emit_try_expr(node: Node) -> Int:
         ir_emit_label(err_l)
         if ir_emit_tests and ir_emitting_test_func:
             ir_test_assert_fail_return()
+        elif ir_current_func_return_kind == "result_reg":
+            # a legacy sentinel failure carries no error value; propagate the
+            # pair with a zero error, matching the zero the box world returns.
+            ir_defer_emit_to_function_frame(true)
+            ir_emit_string_cleanup("")
+            zf := ir_reg()
+            ir_emit("iconst " + zf.to_string() + " 0")
+            zv := ir_reg()
+            ir_emit("iconst " + zv.to_string() + " 0")
+            ir_emit("ret2 " + zf.to_string() + " " + zv.to_string())
         else:
             ir_defer_emit_to_function_frame(true)
             ir_emit_string_cleanup("")
@@ -5890,6 +6065,36 @@ fn ir_emit_try_expr(node: Node) -> Int:
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
+
+# consume a two-register (flag, payload) result directly at a `!` site: no
+# box exists on either path. the ok arm's payload is an Int or Bool, so
+# nothing is counted; the err arm owns whatever error the callee handed over
+# and propagates or reports it exactly as the box path would.
+fn ir_emit_try_pair(operand_idx: Int, flag_r: Int, val_r: Int) -> Int:
+    operand_tid := c_get_expr_type(operand_idx)
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    if ir_emit_tests and ir_emitting_test_func:
+        ir_test_assert_fail_return()
+    elif ir_current_func_return_kind == "result_reg":
+        ir_defer_emit_to_function_frame(true)
+        ir_emit_string_cleanup("")
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        ir_emit("ret2 " + zero_r.to_string() + " " + val_r.to_string())
+    else:
+        fresh_err_r := ir_emit_err_result_tuple(val_r)
+        ir_defer_emit_to_function_frame(true)
+        ir_emit_string_cleanup("")
+        ir_emit_main_error_report(val_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
+        ir_emit("ret " + fresh_err_r.to_string())
+    ir_emit_label(merge_l)
+    return val_r
 
 # on main's error-return paths, print the error and exit 1 before the ret:
 # the entry glue forces main's return value to 0, so without this the error
@@ -5921,11 +6126,26 @@ fn ir_emit_fail_expr(node: Node) -> Int:
                 exclude = expr_node.value
             elif ir_string_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
-        tuple_r := ir_emit_err_result_tuple(err_r)
+        if ir_current_func_return_kind == "result_reg":
+            ir_defer_emit_to_function_frame(true)
+            ir_emit_string_cleanup(exclude)
+            zero_r := ir_reg()
+            ir_emit("iconst " + zero_r.to_string() + " 0")
+            ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
+        else:
+            tuple_r := ir_emit_err_result_tuple(err_r)
+            ir_defer_emit_to_function_frame(true)
+            ir_emit_string_cleanup(exclude)
+            ir_emit_main_error_report(err_r, ir_infer_type(node.children[0]) == "string")
+            ir_emit("ret " + tuple_r.to_string())
+    elif ir_current_func_return_kind == "result_reg":
         ir_defer_emit_to_function_frame(true)
-        ir_emit_string_cleanup(exclude)
-        ir_emit_main_error_report(err_r, ir_infer_type(node.children[0]) == "string")
-        ir_emit("ret " + tuple_r.to_string())
+        ir_emit_string_cleanup("")
+        z1 := ir_reg()
+        ir_emit("iconst " + z1.to_string() + " 0")
+        z2 := ir_reg()
+        ir_emit("iconst " + z2.to_string() + " 0")
+        ir_emit("ret2 " + z1.to_string() + " " + z2.to_string())
     else:
         ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup("")
@@ -6035,7 +6255,7 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + msg)
         ir_emit_main_error_report(err_r, true)
-        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+        ir_emit_ret_err_value(err_r)
     ir_emit_label(merge_l)
     return unwrapped_r
 
@@ -6474,6 +6694,22 @@ fn ir_emit_return_stmt(node: Node):
         elif ir_current_func_return_kind == "tuple":
             if result_kind != "tuple":
                 r = ir_emit_ok_result_tuple(r)
+        elif ir_current_func_return_kind == "result_reg":
+            if result_kind == "tuple":
+                # forwarding a whole result (`return other_fallible()`): the
+                # expression produced a box, so unpack it into the pair. the
+                # take-ok convention applies — the payload leaves with its
+                # count and the destructor-less shell is freed.
+                ir_emit_return_box_as_pair(r, exclude)
+                ir_last_was_ret = true
+                return
+            ir_defer_emit_to_function_frame(false)
+            ir_emit_string_cleanup(exclude)
+            one_r := ir_reg()
+            ir_emit("iconst " + one_r.to_string() + " 1")
+            ir_emit("ret2 " + one_r.to_string() + " " + r.to_string())
+            ir_last_was_ret = true
+            return
         ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + r.to_string())
@@ -6481,9 +6717,51 @@ fn ir_emit_return_stmt(node: Node):
         ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup("")
         r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 0")
-        ir_emit("ret " + r.to_string())
+        if ir_current_func_return_kind == "result_reg":
+            ir_emit("iconst " + r.to_string() + " 1")
+            zero_r := ir_reg()
+            ir_emit("iconst " + zero_r.to_string() + " 0")
+            ir_emit("ret2 " + r.to_string() + " " + zero_r.to_string())
+        else:
+            ir_emit("iconst " + r.to_string() + " 0")
+            ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
+
+# propagate `err_r` out of the current function as its error return: the
+# two-register pair when the function uses the register ABI, a fresh error
+# box otherwise. cleanup must already have run at the call site.
+fn ir_emit_ret_err_value(err_r: Int):
+    if ir_current_func_return_kind == "result_reg":
+        zf := ir_reg()
+        ir_emit("iconst " + zf.to_string() + " 0")
+        ir_emit("ret2 " + zf.to_string() + " " + err_r.to_string())
+    else:
+        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+
+# unpack a result box into the two-register return: branch on its flag and
+# ret2 each slot's payload from its own arm. run defers and cleanup before
+# the branch so both arms leave through already-settled state.
+fn ir_emit_return_box_as_pair(box_r: Int, exclude: String):
+    ir_defer_emit_to_function_frame(false)
+    ir_emit_string_cleanup(exclude)
+    flag_r := ir_emit_result_flag_field(box_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + box_r.to_string() + " 8 unknown ok")
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", box_r)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    ir_emit("ret2 " + one_r.to_string() + " " + ok_r.to_string())
+    ir_emit_label(err_l)
+    err_r := ir_reg()
+    ir_emit("field " + err_r.to_string() + " " + box_r.to_string() + " 16 unknown err")
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", box_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
 
 # the tagged constructor for an empty `List[T]` bind whose element type only
 # the annotation knows, or "" when the normal target path already handles it.
@@ -7961,7 +8239,14 @@ fn ir_emit_default_return() -> Int:
     ir_emit_string_cleanup("")
     dr := ir_reg()
     ir_emit("iconst " + dr.to_string() + " 0")
-    ir_emit("ret " + dr.to_string())
+    if ir_current_func_return_kind == "result_reg":
+        # a pair-returning function's trailing (unreachable) default return
+        # must still match the two-value signature.
+        dr2 := ir_reg()
+        ir_emit("iconst " + dr2.to_string() + " 0")
+        ir_emit("ret2 " + dr.to_string() + " " + dr2.to_string())
+    else:
+        ir_emit("ret " + dr.to_string())
     ir_emit("endfunc")
     return 0
 
@@ -7988,6 +8273,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_loop_var_slots = {}
     ir_seed_global_types()
     ir_current_func_return_kind = ret_type
+    ir_set_pair_return(ret_type == "result_reg")
     ir_current_func_optional_inner_kind = ""
 
 # A value-returning function whose body ends in a bare match has no explicit
@@ -8093,7 +8379,9 @@ fn ir_func(idx: Int):
     name := ir_base_decl_name(full_name)
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx)
-    ret_type := ir_lookup_func_return(full_name, name)
+    mut ret_type := ir_lookup_func_return(full_name, name)
+    if ir_result_reg_funcs.contains_key(name):
+        ret_type = "result_reg"
     ir_prepare_func_emission(ret_type)
     ir_current_arc_func = name
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
@@ -8174,6 +8462,7 @@ fn ir_record_function_return(node: Node):
     # recognized as a declared callable (e.g. usable as a fn-value).
     if not has_returns:
         ir_func_returns.insert(node.value, "void")
+    ir_maybe_register_result_reg(node.value, node)
 
 fn ir_record_function_return_as(name: String, node: Node):
     mut has_returns := false
@@ -8184,6 +8473,7 @@ fn ir_record_function_return_as(name: String, node: Node):
             has_returns = true
     if not has_returns:
         ir_func_returns.insert(name, "void")
+    ir_maybe_register_result_reg(name, node)
 
 fn ir_record_returns_clause(name: String, returns_node: Node):
     for type_idx in returns_node.children:

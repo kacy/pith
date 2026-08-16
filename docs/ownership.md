@@ -341,6 +341,28 @@ gaps, all bounded leaks rather than dangling pointers:
   the collector's tracers. with the flag off — the default — the only
   cost is one predicted branch per release, and cycles behave exactly
   as this section always described: they leak, bounded, never dangling.
+
+  the flag stays off by default on measured grounds (2026-08-16, five
+  interleaved trials per bench, flag off vs on with the same binaries).
+  the automatic threshold mode cannot keep up with churn-heavy cycle
+  creation: a tight loop building and dropping a two-node strong ring
+  filled the 65,536-suspect buffer almost immediately, and 378,340
+  suspects from a 200,000-round run overflowed — an overflowed suspect
+  is discarded, and if it rooted a garbage ring that ring is
+  permanently uncollectable. only 3 collections ran, about a third of
+  the rings were freed, and peak rss came out *higher* than with the
+  flag off (117 mb vs 103 mb at 400k rings) because the suspect buffer
+  sits on top of the leak. the time cost is real too: the cycle-churn
+  bench runs about 2x slower flag-on (120 → 250 ms median) and the
+  std-pipeline bench about 20% slower (550 → 670 ms, disjoint ranges);
+  the catalog, event-ledger and channel-fanout benches read neutral.
+  what does work is the flag plus an explicit
+  `std.concurrent.gc_collect()` at points the program chooses — the
+  leak gate's ring case runs flat that way, collecting every 4096
+  rounds, where the same binary grows by a ring per round on the
+  threshold alone. so: prefer `weak` edges; if you need the collector,
+  run with `PITH_CYCLE_GC=1` and call `gc_collect()` at natural
+  quiesce points rather than relying on the threshold.
 - **a value sent down a channel outlives its local.** a channel holds a
   raw handle between the send and the receive and is not a counted
   container, so the sender adds a count nothing drops. it is the last

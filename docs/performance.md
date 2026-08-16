@@ -31,7 +31,7 @@ the language:
 | catalog workload, 200k requests | **~118 ms** | ~408 ms | ~70 ms | — |
 | grpc unary echo, conc=8, 16 B | 7476 calls/s | 14731 | 12005 | — |
 | http server under wrk, 30 s | 4648 req/s, rss flat (+0 kb) | 15444 req/s (+5.9 mb) | — | — |
-| event_ledger, 200k events | 570 ms (1.19x go) | 477 ms | 113 ms | 137 ms |
+| event_ledger, 200k events | **351 ms (0.75x go)** | 466 ms | 111 ms | 132 ms |
 | std_pipeline, 50k records | 480 ms (1.50x go) | 319 ms | 145 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
@@ -39,6 +39,15 @@ to ~27 ms at flat memory — the argument-ownership fixes took a per-call
 allocation out of the spawn path. **event_ledger fell 618 to 570 ms** and
 **std_pipeline 576 to 480 ms**, closing the gap to go from 1.28x to 1.19x and
 from 1.63x to 1.50x. channel fan-out and the catalog workload are unchanged.
+
+and on 2026-08-16 **event_ledger fell again, 570 to 351 ms — past go's
+466** (all four digests matching, medians of 5 interleaved trials). two
+changes, one each in the compiler and the bench: fixing the typed-decode
+lowering's per-call leaks took `parse` from 195 to 175 ms and peak rss
+from ~95 to ~67 mb, and rewriting the bench's `gen` phase to build its
+stream in one ByteBuffer — the shape the go version always used with
+`strings.Builder`, idiom for idiom — took `gen` from 299 to 120 ms, even
+with go's 122. see bench/README.md for the full phase table.
 
 the http row is the one not to read as a regression. both servers dropped by
 about the same 45% against july, because `wrk` itself competes for the two

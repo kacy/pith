@@ -10,6 +10,7 @@
 # work over the in-memory events — is, and the breakdown shows both
 # honestly.
 
+import std.bytes as bytes
 import std.json as json
 import std.crypto.hmac as hmac
 from std.algo import sort_strings
@@ -45,22 +46,24 @@ fn region_name(k: Int) -> String:
         return "east"
     return "west"
 
-# build the ndjson event stream: one flat json object per line. pith
-# treats `{` in a string literal as interpolation, so the braces and
-# quotes are assembled from chr() the way the json module's own tests do.
-fn event_line(i: Int, user: Int, action: String, amount: Int, region: String) -> String:
+# build the ndjson event stream: one flat json object per line, written
+# into a single ByteBuffer the way the go version writes its
+# strings.Builder — per-piece appends into one growing buffer instead of
+# concatenating fresh strings. pith treats `{` in a string literal as
+# interpolation, so the braces and quotes are assembled from chr() the
+# way the json module's own tests do.
+fn generate_events(count: Int) -> String!:
     dq := chr(34)
     lb := chr(123)
     rb := chr(125)
-    mut line := lb + dq + "id" + dq + ":" + i.to_string()
-    line = line + "," + dq + "user" + dq + ":" + user.to_string()
-    line = line + "," + dq + "action" + dq + ":" + dq + action + dq
-    line = line + "," + dq + "amount" + dq + ":" + amount.to_string()
-    line = line + "," + dq + "region" + dq + ":" + dq + region + dq + rb
-    return line
-
-fn generate_events(count: Int) -> String:
-    mut lines: List[String] := []
+    user_key := "," + dq + "user" + dq + ":"
+    action_key := "," + dq + "action" + dq + ":" + dq
+    amount_key := dq + "," + dq + "amount" + dq + ":"
+    region_key := "," + dq + "region" + dq + ":" + dq
+    id_open := lb + dq + "id" + dq + ":"
+    line_close := dq + rb
+    out := bytes.buffer()
+    defer out.free()
     mut state := 20260711
     mut i := 0
     while i < count:
@@ -74,9 +77,21 @@ fn generate_events(count: Int) -> String:
         amount := (state / 256) % 500
         state = lcg_next(state)
         region := region_name((state / 256) % 4)
-        lines.push(event_line(i, user, action, amount, region))
+        if i > 0:
+            out.write_byte(10)!
+        out.write_string_utf8(id_open)!
+        out.write_string_utf8(i.to_string())!
+        out.write_string_utf8(user_key)!
+        out.write_string_utf8(user.to_string())!
+        out.write_string_utf8(action_key)!
+        out.write_string_utf8(action)!
+        out.write_string_utf8(amount_key)!
+        out.write_string_utf8(amount.to_string())!
+        out.write_string_utf8(region_key)!
+        out.write_string_utf8(region)!
+        out.write_string_utf8(line_close)!
         i = i + 1
-    return lines.join("\n")
+    return bytes.to_string_utf8(out.take_bytes())!
 
 struct Event:
     pub user: Int
@@ -171,13 +186,13 @@ fn digest_score(digest: String) -> Int:
 fn print_metric(name: String, value: Int):
     print(name + "=" + value.to_string())
 
-fn main() -> Int:
+fn main() -> Int!:
     events := events_from_args()
 
     start_total := time()
 
     mut start := time()
-    stream := generate_events(events)
+    stream := generate_events(events)!
     gen_ms := time() - start
 
     start = time()

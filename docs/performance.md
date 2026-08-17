@@ -324,10 +324,13 @@ waiting `!`, `catch`, or pair return, and `return f()` forwards an
 rcall'd pair the same way. component a/b at 100k rounds, box world to
 flag-on: hpack encode 7 to 1 struct per block, hpack decode 59 to 25,
 frame serialization 33 to 16, protobuf writes 10 to 5. sequential grpc
-echo holds at ~+4% (median 226 to 217 µs); conc=8 stays put. still
-boxed: Float results, the json/config/toml/yaml modules, interface-impl
-and generic-impl methods, and unwrap_or/block-catch sites — the
-remaining slices of a default-on decision.
+echo holds at ~+4% (median 226 to 217 µs); conc=8 stays put. unwrap_or
+and `catch:` blocks then joined the same handshake `!` and inline catch
+use, so every result-consuming form now runs box-free on a direct
+pair-returning call — a 200k-round unwrap_or/block-catch loop fell from
+400,032 struct allocations to zero. still boxed: Float results, the
+json/config/toml/yaml modules, and interface-impl and generic-impl
+methods — the remaining slices of a default-on decision.
 
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built

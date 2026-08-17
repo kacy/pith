@@ -18,13 +18,37 @@ from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_sta
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_ownership import ir_rc_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
-from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg
+from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
 from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
+
+# result-returning decode helper calls, routed through the register-ABI
+# registry: a registered pair-returning helper is rcall'd and its pair
+# folded back into the result box every decode consumer here expects;
+# anything else keeps the plain call. the decode emitters reach helpers
+# by resolved name outside the normal call paths, which is what kept the
+# json family off the register ABI until these wrappers.
+fn ir_emit_decode_result_call1(result_reg: Int, fname: String, arg0: Int):
+    if ir_result_reg_funcs.contains_key(fname):
+        ir_emit_registered_rcall_boxed_into(result_reg, fname, 1, " " + arg0.to_string())
+        return
+    ir_emit_call1(result_reg, fname, "tuple", arg0)
+
+fn ir_emit_decode_result_call2(result_reg: Int, fname: String, arg0: Int, arg1: Int):
+    if ir_result_reg_funcs.contains_key(fname):
+        ir_emit_registered_rcall_boxed_into(result_reg, fname, 2, " " + arg0.to_string() + " " + arg1.to_string())
+        return
+    ir_emit_call2(result_reg, fname, "tuple", arg0, arg1)
+
+fn ir_emit_decode_result_call3(result_reg: Int, fname: String, arg0: Int, arg1: Int, arg2: Int):
+    if ir_result_reg_funcs.contains_key(fname):
+        ir_emit_registered_rcall_boxed_into(result_reg, fname, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
+        return
+    ir_emit_call3(result_reg, fname, "tuple", arg0, arg1, arg2)
 
 # the concrete struct tid a decode call targets, or -1 when there is none.
 #
@@ -192,14 +216,14 @@ pub fn ir_handle_generic_name(base_name: String, module_path: String) -> String:
 ## decode a nested struct field through its helper.
 pub fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, require_name: String, decode_name: String, temp_prefix: String) -> Int:
     child_result_r := ir_reg()
-    ir_emit_call2(child_result_r, require_name, "tuple", parent_handle_r, key_r)
+    ir_emit_decode_result_call2(child_result_r, require_name, parent_handle_r, key_r)
     done_l := ir_label()
     temp_name := ir_new_temp_name(temp_prefix)
     ir_var_types.insert(temp_name, "tuple")
     ir_emit_result_store_error_branch(child_result_r, temp_name, done_l)
     child_handle_r := ir_take_result_ok(child_result_r, lookup_type_id("Int"))
     decode_result_r := ir_reg()
-    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
+    ir_emit_decode_result_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), child_handle_r)
     ir_emit("store " + temp_name + " " + decode_result_r.to_string())
     ir_emit_label(done_l)
     result_r := ir_reg()
@@ -215,14 +239,14 @@ pub fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_
 pub fn ir_emit_config_nested_decode_prefix(cfg_r: Int, prefix_r: Int, target_tid: Int, index_idx: Int) -> Int:
     decode_name := ir_generic_preferred_name(ir_resolve_config_call_name(index_idx, "decode_prefix"), "decode_prefix")
     result_r := ir_reg()
-    ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
+    ir_emit_decode_result_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), cfg_r, prefix_r)
     return result_r
 
 ## emit the config nested decode prefix specialized sequence.
 pub fn ir_emit_config_nested_decode_prefix_specialized(cfg_r: Int, prefix_r: Int, target_tid: Int) -> Int:
     decode_name := ir_config_generic_name("decode_prefix")
     result_r := ir_reg()
-    ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
+    ir_emit_decode_result_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), cfg_r, prefix_r)
     return result_r
 
 ## emit the handle-pool nested decode path sequence.
@@ -348,7 +372,7 @@ pub fn ir_emit_config_spec_optional_scalar_field(cfg_r: Int, full_key_r: Int, de
     ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
     ir_decode_field_present(branch)
     field_result_r := ir_reg()
-    ir_emit_call2(field_result_r, helper_name, "tuple", cfg_r, full_key_r)
+    ir_emit_decode_result_call2(field_result_r, helper_name, cfg_r, full_key_r)
     ir_emit_result_return_error_branch(field_result_r)
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
@@ -360,7 +384,7 @@ pub fn ir_emit_config_spec_scalar_field(cfg_r: Int, full_key_r: Int, field_tid: 
         return ir_decode_missing_helper_value(emit_default_ret)
     if default_idx < 0:
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", cfg_r, full_key_r)
+        ir_emit_decode_result_call2(field_result_r, helper_name, cfg_r, full_key_r)
         ir_emit_result_return_error_branch(field_result_r)
         return IrDecodeFieldValue(true, ir_take_json_ok(field_result_r, field_tid))
 
@@ -370,7 +394,7 @@ pub fn ir_emit_config_spec_scalar_field(cfg_r: Int, full_key_r: Int, field_tid: 
     ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
     ir_decode_field_present(branch)
     field_result_r := ir_reg()
-    ir_emit_call2(field_result_r, helper_name, "tuple", cfg_r, full_key_r)
+    ir_emit_decode_result_call2(field_result_r, helper_name, cfg_r, full_key_r)
     ir_emit_result_return_error_branch(field_result_r)
     ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
@@ -473,7 +497,7 @@ pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: 
             ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), cfg_r, full_key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -488,13 +512,13 @@ pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: 
             ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), cfg_r, full_key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
+        ir_emit_decode_result_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), cfg_r, full_key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
@@ -540,7 +564,7 @@ pub fn ir_emit_handle_spec_optional_scalar_field(handle_r: Int, key_r: Int, modu
     ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
     ir_decode_field_present(branch)
     field_result_r := ir_reg()
-    ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+    ir_emit_decode_result_call2(field_result_r, helper_name, handle_r, key_r)
     ir_emit_result_return_error_branch(field_result_r)
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
@@ -552,7 +576,7 @@ pub fn ir_emit_handle_spec_scalar_field(handle_r: Int, key_r: Int, module_path: 
         return ir_decode_missing_helper_value(emit_default_ret)
     if default_idx < 0:
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, helper_name, handle_r, key_r)
         ir_emit_result_return_error_branch(field_result_r)
         return IrDecodeFieldValue(true, ir_take_json_ok(field_result_r, field_tid))
 
@@ -562,7 +586,7 @@ pub fn ir_emit_handle_spec_scalar_field(handle_r: Int, key_r: Int, module_path: 
     ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
     ir_decode_field_present(branch)
     field_result_r := ir_reg()
-    ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+    ir_emit_decode_result_call2(field_result_r, helper_name, handle_r, key_r)
     ir_emit_result_return_error_branch(field_result_r)
     ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
@@ -631,13 +655,13 @@ pub fn ir_emit_handle_decode_text_specialization_body(struct_name: String, modul
     # strings out), so the nodes are dead by the time we restore.
     mark := ir_emit_handle_pool_mark(ir_resolve_generic_module_call_name(module_path, "pool_mark_node_id"), ir_resolve_generic_module_call_name(module_path, "pool_mark_table_len"), ir_resolve_generic_module_call_name(module_path, "pool_mark_array_len"))
     parse_result_r := ir_reg()
-    ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), "tuple", input_r)
+    ir_emit_decode_result_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), input_r)
     ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     root_r := ir_take_result_ok_typed(parse_result_r, "Int")
     decode_base := ir_resolve_generic_module_call_name(module_path, "decode")
     decode_name := ir_queue_generic_specialization(decode_base, concrete_types, ret_type)
     decode_result_r := ir_reg()
-    ir_emit_call1(decode_result_r, decode_name, "tuple", root_r)
+    ir_emit_decode_result_call1(decode_result_r, decode_name, root_r)
     ir_emit("store " + temp_name + " " + decode_result_r.to_string())
     ir_emit_label(done_l)
     ir_emit_handle_pool_restore(mark, ir_resolve_generic_module_call_name(module_path, "pool_restore"))
@@ -656,7 +680,7 @@ pub fn ir_emit_handle_decode_text_path_specialization_body(struct_name: String, 
     # owns the parse, so bracket it and reclaim at the single exit.
     mark := ir_emit_handle_pool_mark(ir_resolve_generic_module_call_name(module_path, "pool_mark_node_id"), ir_resolve_generic_module_call_name(module_path, "pool_mark_table_len"), ir_resolve_generic_module_call_name(module_path, "pool_mark_array_len"))
     parse_result_r := ir_reg()
-    ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), "tuple", input_r)
+    ir_emit_decode_result_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), input_r)
     ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     root_r := ir_take_result_ok_typed(parse_result_r, "Int")
     path_r := ir_reg()
@@ -664,7 +688,7 @@ pub fn ir_emit_handle_decode_text_path_specialization_body(struct_name: String, 
     decode_path_base := ir_resolve_generic_module_call_name(module_path, "decode_path")
     decode_path_name := ir_queue_generic_specialization(decode_path_base, concrete_types, ret_type)
     path_result_r := ir_reg()
-    ir_emit_call2(path_result_r, decode_path_name, "tuple", root_r, path_r)
+    ir_emit_decode_result_call2(path_result_r, decode_path_name, root_r, path_r)
     ir_emit("store " + temp_name + " " + path_result_r.to_string())
     ir_emit_label(done_l)
     ir_emit_handle_pool_restore(mark, ir_resolve_generic_module_call_name(module_path, "pool_restore"))
@@ -722,7 +746,7 @@ pub fn ir_emit_config_loader_decode_call(idx: Int, node: Node, loader_name: Stri
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
     load_result_r := ir_reg()
-    ir_emit_call1(load_result_r, ir_resolve_config_call_name(node.children[0], loader_name), "tuple", input_r)
+    ir_emit_decode_result_call1(load_result_r, ir_resolve_config_call_name(node.children[0], loader_name), input_r)
     ir_emit_result_store_error_branch(load_result_r, temp_name, done_l)
     cfg_r := ir_take_result_ok(load_result_r, lookup_type_id("Config"))
     ir_emit_config_decode_value(target_info, cfg_r, prefix_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
@@ -788,7 +812,7 @@ pub fn ir_emit_handle_decode_value(target_info: TypeInfo, handle_r: Int, index_i
             ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -803,13 +827,13 @@ pub fn ir_emit_handle_decode_value(target_info: TypeInfo, handle_r: Int, index_i
             ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), handle_r, key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
@@ -836,7 +860,7 @@ pub fn ir_emit_handle_decode_call(idx: Int, node: Node, text_input: Bool, emit_e
     if text_input:
         mark = ir_emit_handle_pool_mark(ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
-        ir_emit_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_required"), "tuple", handle_r)
+        ir_emit_decode_result_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_required"), handle_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r = ir_take_result_ok(parse_result_r, lookup_type_id("Int"))
 
@@ -870,7 +894,7 @@ pub fn ir_emit_handle_decode_path_call(idx: Int, node: Node, text_input: Bool, e
     if text_input:
         mark = ir_emit_handle_pool_mark(ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
-        ir_emit_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_required"), "tuple", handle_r)
+        ir_emit_decode_result_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_required"), handle_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r = ir_take_result_ok(parse_result_r, lookup_type_id("Int"))
 
@@ -910,7 +934,7 @@ pub fn ir_emit_handle_decode_file_call(idx: Int, node: Node, path_input: Bool, e
         # reads and parses the file itself, so it owns the pool nodes.
         mark := ir_emit_handle_pool_mark(ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
-        ir_emit_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
+        ir_emit_decode_result_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_file_required"), file_path_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r := ir_take_result_ok(parse_result_r, lookup_type_id("Int"))
         ir_emit_handle_decode_value(target_info, handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
@@ -934,7 +958,7 @@ pub fn ir_emit_handle_decode_file_call(idx: Int, node: Node, path_input: Bool, e
     # owns the file parse, so bracket the pool and reclaim at done_l.
     mark := ir_emit_handle_pool_mark(ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_handle_decode_call_name(node.children[0], "pool_mark_array_len"))
     parse_result_r := ir_reg()
-    ir_emit_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
+    ir_emit_decode_result_call1(parse_result_r, ir_resolve_handle_decode_call_name(node.children[0], "parse_file_required"), file_path_r)
     ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     handle_r := ir_take_result_ok(parse_result_r, lookup_type_id("Int"))
 
@@ -1070,7 +1094,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
     done_l := ir_label()
 
     scan_r := ir_reg()
-    ir_emit_call1(scan_r, "std_json_decode_scalars_bytes", "tuple", input_r)
+    ir_emit_decode_result_call1(scan_r, "std_json_decode_scalars_bytes", input_r)
     ir_emit_result_store_error_branch(scan_r, temp_name, done_l)
     fields_r := ir_take_result_ok(scan_r, -1)
 
@@ -1094,7 +1118,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
             ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, helper_name, "tuple", fields_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -1114,7 +1138,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
             ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, helper_name, "tuple", fields_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -1122,7 +1146,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
         key_r := ir_reg()
         ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", fields_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
@@ -1184,7 +1208,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
             ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -1199,13 +1223,13 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
             ir_decode_field_store_and_merge(branch, emit_expr(default_idx))
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), handle_r, key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
@@ -1251,11 +1275,11 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
             handle_r = parsed_r
         else:
             parse_result_r := ir_reg()
-            ir_emit_call1(parse_result_r, ir_resolve_json_call_name(node.children[0], "parse_bytes_required"), "tuple", input_r)
+            ir_emit_decode_result_call1(parse_result_r, ir_resolve_json_call_name(node.children[0], "parse_bytes_required"), input_r)
             ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
             handle_r = ir_take_result_ok(parse_result_r, lookup_type_id("Int"))
         checked_r := ir_reg()
-        ir_emit_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", handle_r)
+        ir_emit_decode_result_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), handle_r)
         ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
         object_r := ir_take_result_ok(checked_r, lookup_type_id("Int"))
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
@@ -1298,7 +1322,7 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         key_r := ir_reg()
         ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", input_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, helper_name, input_r, key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
@@ -1374,7 +1398,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
             ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
@@ -1389,14 +1413,14 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
             ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid), emit_value)
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+            ir_emit_decode_result_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+        ir_emit_decode_result_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), handle_r, key_r)
         ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
         i = i + 1
@@ -1441,11 +1465,11 @@ pub fn ir_emit_json_decode_specialization_body(struct_name: String, module_path:
         handle_r = parsed_r
     else:
         parse_result_r := ir_reg()
-        ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_bytes_required"), "tuple", input_r)
+        ir_emit_decode_result_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_bytes_required"), input_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r = ir_take_result_ok(parse_result_r, 0)
     checked_r := ir_reg()
-    ir_emit_call1(checked_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), "tuple", handle_r)
+    ir_emit_decode_result_call1(checked_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), handle_r)
     ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
     object_r := ir_take_result_ok(checked_r, 0)
     ir_emit_json_decode_object_value_specialized(struct_name, object_r, module_path, temp_name, done_l, emit_value)
@@ -1463,7 +1487,7 @@ pub fn ir_emit_json_decode_path_specialization_body(struct_name: String, module_
     handle_r := ir_reg()
     ir_emit("load " + handle_r.to_string() + " handle")
     root_result_r := ir_reg()
-    ir_emit_call1(root_result_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), "tuple", handle_r)
+    ir_emit_decode_result_call1(root_result_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), handle_r)
     temp_name := ir_new_temp_name("json_decode_path")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
@@ -1502,7 +1526,7 @@ pub fn ir_emit_json_decode_object_call(idx: Int, node: Node, emit_expr: fn(Int) 
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
     checked_r := ir_reg()
-    ir_emit_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", handle_r)
+    ir_emit_decode_result_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), handle_r)
     ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
     object_r := ir_take_result_ok(checked_r, lookup_type_id("Int"))
     ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
@@ -1539,7 +1563,7 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
         handle_r = parsed_r
 
     root_result_r := ir_reg()
-    ir_emit_call1(root_result_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", handle_r)
+    ir_emit_decode_result_call1(root_result_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), handle_r)
     ir_emit_result_store_error_branch(root_result_r, temp_name, done_l)
 
     current_name := ir_new_temp_name("json_current")
@@ -1582,7 +1606,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
         parsed_r := ir_reg()
         ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
         checked_r := ir_reg()
-        ir_emit_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", parsed_r)
+        ir_emit_decode_result_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), parsed_r)
         ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
         object_r := ir_take_result_ok(checked_r, lookup_type_id("Int"))
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
@@ -1608,7 +1632,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     parsed_r := ir_reg()
     ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
     root_result_r := ir_reg()
-    ir_emit_call1(root_result_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", parsed_r)
+    ir_emit_decode_result_call1(root_result_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), parsed_r)
     ir_emit_result_store_error_branch(root_result_r, temp_name, done_l)
 
     current_name := ir_new_temp_name("json_file_current")

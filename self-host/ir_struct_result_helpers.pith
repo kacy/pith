@@ -42,6 +42,11 @@ pub fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
     ir_emit("iconst " + one.to_string() + " 1")
     return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg_raw())
 
+## build an error result box around `err_r`, mirroring the ok variant.
+pub fn ir_emit_err_result_tuple_raw(err_r: Int) -> Int:
+    zero := ir_zero_reg_raw()
+    return ir_emit_result_tuple_raw(zero, zero, err_r)
+
 pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, temp_name: String):
     struct_r := ir_reg()
     field_count_r := ir_reg()

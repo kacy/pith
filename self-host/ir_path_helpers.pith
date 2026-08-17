@@ -2,7 +2,7 @@
 
 from ir_builder import ir_emit, ir_reg, ir_label, ir_str
 from ir_metadata import ir_runtime_call_name
-from ir_result_abi import ir_emit_result_flag_field, ir_emit_result_value_field, ir_emit_ret_known_err_box
+from ir_result_abi import ir_emit_result_flag_field, ir_emit_result_value_field, ir_emit_ret_known_err_box, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 
 fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
     mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
@@ -71,7 +71,12 @@ pub fn ir_emit_dotted_path_lookup(handle_r: Int, dotted_path_r: Int, require_nam
     current_r := ir_reg()
     ir_emit("load " + current_r.to_string() + " " + current_name)
     child_result_r := ir_reg()
-    ir_emit_call2_raw(child_result_r, require_name, "tuple", current_r, part_r)
+    # the require helper may be on the register ABI; fold its pair back
+    # into the box this walker branches on either way
+    if ir_result_reg_funcs.contains_key(require_name):
+        ir_emit_registered_rcall_boxed_into(child_result_r, require_name, 2, " " + current_r.to_string() + " " + part_r.to_string())
+    else:
+        ir_emit_call2_raw(child_result_r, require_name, "tuple", current_r, part_r)
     child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
     child_ok_l := ir_label()
     child_err_l := ir_label()
@@ -132,7 +137,10 @@ pub fn ir_emit_dotted_path_lookup_or_return(handle_r: Int, dotted_path_r: Int, r
     current_r := ir_reg()
     ir_emit("load " + current_r.to_string() + " " + current_name)
     table_result_r := ir_reg()
-    ir_emit_call2_raw(table_result_r, require_name, "tuple", current_r, part_r)
+    if ir_result_reg_funcs.contains_key(require_name):
+        ir_emit_registered_rcall_boxed_into(table_result_r, require_name, 2, " " + current_r.to_string() + " " + part_r.to_string())
+    else:
+        ir_emit_call2_raw(table_result_r, require_name, "tuple", current_r, part_r)
     table_ok_r := ir_emit_result_flag_field(table_result_r, "is_ok")
     table_ok_l := ir_label()
     table_err_l := ir_label()

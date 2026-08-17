@@ -1,11 +1,48 @@
 # ir_result_abi.pith - low-level Result IR helpers
 
-from ir_builder import ir_emit, ir_reg, ir_str
+from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
+from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw
 from ir_type_helpers import ir_type_from_tid, ir_resolve_type_hint_with_state
 from types import get_type_info
 
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
     return result_kind.len() > 0 and result_kind != "tuple"
+
+# the register-ABI registry, shared here so the decode emitters can consult
+# it too: which functions return the two-register pair, and each result
+# function's ok payload kind (the rcall line carries it to the consumer).
+# the emitter core owns registration; everything else only reads.
+pub mut ir_result_reg_funcs: Map[String, Bool] := {}
+pub mut ir_func_result_ok_kinds: Map[String, String] := {}
+
+# call a registered pair-returning function and fold its (flag, payload)
+# into the three-slot result box every boxed consumer expects, defining
+# the caller's `result_reg` with the box. ownership transfers into the
+# box with no extra count, the same as a callee-built box; mirrors the
+# emitter core's fold for ordinary call sites.
+pub fn ir_emit_registered_rcall_boxed_into(result_reg: Int, fname: String, arg_count: Int, arg_text: String):
+    flag_r := ir_reg()
+    val_r := ir_reg()
+    mut payload_kind := "int"
+    if ir_func_result_ok_kinds.contains_key(fname):
+        payload_kind = ir_func_result_ok_kinds[fname]
+    mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " " + payload_kind + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        line = line + arg_text
+    ir_emit(line)
+    temp_name := ir_new_temp_name("rreg_box")
+    ir_var_types.insert(temp_name, "tuple")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(val_r).to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + ir_emit_err_result_tuple_raw(val_r).to_string())
+    ir_emit("label " + merge_l)
+    ir_emit("load " + result_reg.to_string() + " " + temp_name)
 
 # whether the function currently being emitted returns the two-register
 # result pair (the register ABI). the emitter core sets this at function

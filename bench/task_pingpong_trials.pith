@@ -1,0 +1,88 @@
+# task_pingpong_trials — how OFTEN a communicating pair lands split.
+#
+# task_pingpong measures what one handoff costs. This measures the other half:
+# a green task pins to the worker that first runs it, so a pair either colocates
+# (a userspace switch per message) or lands split (a park and a futex wake per
+# message, ~10x). Which one you get is decided once, by a race at spawn. The
+# quantity of interest is therefore a RATE — what fraction of pairs land split —
+# and each trial here is one fresh placement decision.
+#
+#   pith build bench/task_pingpong_trials.pith
+#   ./bench/task_pingpong_trials 200 20000     # trials, rounds per trial
+#
+# It prints "<index> <ms>" per trial. At 20k rounds the two modes are far apart
+# (~4 ms colocated, ~35 ms split), so anything over ~15 ms is a split.
+#
+# ★ Run the trials INSIDE one process, which is the whole point of this file.
+# Measuring the same thing by launching a process per trial gives a completely
+# different answer, because the rate turns out to depend on how fast the
+# launches come:
+#
+#     back-to-back in a shell loop     50-57%
+#     same, with a 0.3s gap            15-25%
+#     many trials in one process       16-22%
+#
+# Same binary, same machine. A tight `for i in $(seq N); do ./bench; done` loop
+# measures its own cadence as much as the scheduler — the previous process is
+# still tearing down while the next one's workers start. That is not a
+# cold-start effect: with two trials per process, the first (cold pool) and the
+# second (warm) both match the in-process rate. It cost a merged-then-reverted
+# scheduler change to work out, because the batch-to-batch spread of the
+# unspaced loop was wider than the effect being measured.
+
+fn ponger(req: Channel[Int], rsp: Channel[Int]) -> Int:
+    mut seen := 0
+    while true:
+        if let value = req.recv():
+            if value < 0:
+                break
+            rsp.send(value + 1)
+            seen = seen + 1
+        else:
+            break
+    return seen
+
+fn pinger(req: Channel[Int], rsp: Channel[Int], rounds: Int) -> Int:
+    mut i := 0
+    mut sum := 0
+    while i < rounds:
+        req.send(i)
+        if let back = rsp.recv():
+            sum = sum + back
+        i = i + 1
+    req.send(0 - 1)
+    return sum
+
+# one placement decision: fresh channels, fresh pair, timed round trip.
+fn trial(rounds: Int) -> Int:
+    req := Channel[Int](1)
+    rsp := Channel[Int](1)
+    start := time()
+    pong := spawn ponger(req, rsp)
+    ping := spawn pinger(req, rsp, rounds)
+    sum := await ping
+    seen := await pong
+    elapsed := time() - start
+    if seen != rounds:
+        print("MISMATCH seen={seen} rounds={rounds}")
+    return elapsed
+
+fn main() -> Int!:
+    argv := args()
+    mut trials := 100
+    mut rounds := 20000
+    if argv.len() > 1:
+        p := parse_int(argv[1])
+        if p.is_ok and p.ok > 0:
+            trials = p.ok
+    if argv.len() > 2:
+        p2 := parse_int(argv[2])
+        if p2.is_ok and p2.ok > 0:
+            rounds = p2.ok
+
+    mut i := 0
+    while i < trials:
+        ms := trial(rounds)
+        print("{i} {ms}")
+        i = i + 1
+    return 0

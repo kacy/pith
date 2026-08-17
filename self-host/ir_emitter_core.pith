@@ -4823,8 +4823,44 @@ fn ir_extraction_operand_class(idx: Int) -> String:
         return "borrowed"
     return "opaque"
 
+# consume a pair at an unwrap_or site with no box on either path. the ok
+# payload arrives owned, exactly as the owned-shell box path hands it out;
+# the err arm evaluates the fallback under the same retain rule the box
+# path applies, then drops the error by its kind — the same order the box
+# path uses.
+fn ir_emit_unwrap_or_pair(idx: Int, node: Node, flag_r: Int, val_r: Int) -> Int:
+    recv_tid := c_get_expr_type(node.children[0])
+    temp_name := ir_new_temp_name("unwrap_or")
+    arg_idx := ir_method_call_arg_expr(node, 0)
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + val_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(fallback_l)
+    fallback_r := ir_expr(arg_idx)
+    if not ir_string_expr_is_borrowed(idx) and ir_string_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
+    err_kind := ir_rc_kind(ir_result_field_kind(recv_tid, "err"))
+    if err_kind.len() > 0:
+        ir_rc_release_reg(val_r, err_kind)
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
+    saved_defer := ir_rcall_defer_idx
+    ir_rcall_defer_idx = node.children[0]
+    ir_rcall_pair_ready = false
     recv_r := ir_expr(node.children[0])
+    ir_rcall_defer_idx = saved_defer
+    if ir_rcall_pair_ready:
+        ir_rcall_pair_ready = false
+        return ir_emit_unwrap_or_pair(idx, node, ir_rcall_flag_reg, ir_rcall_val_reg)
     recv_tid := c_get_expr_type(node.children[0])
     operand_class := ir_extraction_operand_class(node.children[0])
     cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
@@ -6657,8 +6693,39 @@ fn ir_emit_catch_expr(node: Node) -> Int:
 # the user's block, which the checker guarantees leaves (return, fail,
 # continue or break). the trailing jmp is dead code on every real path — it
 # only keeps the ir well formed.
+# consume a pair at a `catch:` block with no box on either path: the ok
+# payload arrives owned, and the err arm drops the error by its kind
+# before the user's block runs, matching the box path's disposal.
+fn ir_emit_catch_block_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
+    result_tid := c_get_expr_type(node.children[0])
+    temp_name := ir_new_temp_name("catch_block")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + val_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
+    if err_kind.len() > 0:
+        ir_rc_release_reg(val_r, err_kind)
+    ir_block(node.children[1])
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_catch_block(node: Node) -> Int:
+    saved_defer := ir_rcall_defer_idx
+    ir_rcall_defer_idx = node.children[0]
+    ir_rcall_pair_ready = false
     result_r := ir_expr(node.children[0])
+    ir_rcall_defer_idx = saved_defer
+    if ir_rcall_pair_ready:
+        ir_rcall_pair_ready = false
+        return ir_emit_catch_block_pair(node, ir_rcall_flag_reg, ir_rcall_val_reg)
     result_tid := c_get_expr_type(node.children[0])
     operand_class := ir_extraction_operand_class(node.children[0])
     cond_r := ir_emit_result_flag_field(result_r, "is_ok")

@@ -1,0 +1,78 @@
+# task_pingpong — what one task-to-task handoff costs.
+#
+# two spawned tasks pass a token back and forth over a pair of capacity-1
+# channels. neither side can run while the other is working, so there is no
+# parallelism here to find: the whole number is the cost of handing a message
+# to another task and waiting for the answer. that is the shape a network
+# client has, where a caller hands a request to a writer and blocks on the
+# reply.
+#
+# both halves must be spawned. driving one side from main would measure a
+# thread boundary instead — main is not a green worker, so every exchange
+# would cross threads no matter where the other task sits.
+#
+# under the green backend the number depends on where the two tasks landed.
+# a task pins to the worker that first runs it, so a pair that starts on one
+# worker exchanges through a userspace switch, and a pair that starts split
+# pays a park and a futex wake per message. run it a few times: the split
+# arrangement shows up as an occasional run that is far slower than the rest.
+#
+#   pith build bench/task_pingpong.pith
+#   ./bench/task_pingpong 200000
+#   PITH_GREEN_WORKERS=1 ./bench/task_pingpong 200000   # always colocated
+
+ROUNDS_DEFAULT := 200000
+
+fn rounds_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return ROUNDS_DEFAULT
+
+# echoes value+1 until it is told to stop with a negative token.
+fn ponger(req: Channel[Int], rsp: Channel[Int]) -> Int:
+    mut seen := 0
+    while true:
+        if let value = req.recv():
+            if value < 0:
+                break
+            rsp.send(value + 1)
+            seen = seen + 1
+        else:
+            break
+    return seen
+
+fn pinger(req: Channel[Int], rsp: Channel[Int], rounds: Int) -> Int:
+    mut i := 0
+    mut sum := 0
+    while i < rounds:
+        req.send(i)
+        if let back = rsp.recv():
+            sum = sum + back
+        i = i + 1
+    req.send(0 - 1)
+    return sum
+
+fn main() -> Int!:
+    rounds := rounds_from_args()
+    req := Channel[Int](1)
+    rsp := Channel[Int](1)
+
+    start := time()
+    pong := spawn ponger(req, rsp)
+    ping := spawn pinger(req, rsp, rounds)
+    sum := await ping
+    seen := await pong
+    elapsed_ms := time() - start
+
+    # the sum is fixed by the round count, so it doubles as a check that every
+    # exchange actually completed rather than a race quietly dropping one.
+    expected := (rounds * (rounds + 1)) / 2
+    if sum != expected or seen != rounds:
+        print("MISMATCH sum={sum} expected={expected} seen={seen}")
+        return 1
+
+    print("rounds={rounds} elapsed_ms={elapsed_ms}")
+    return 0

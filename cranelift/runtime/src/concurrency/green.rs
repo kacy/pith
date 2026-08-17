@@ -104,7 +104,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // opt-in scheduler-locality profiling, gated behind `PITH_GREEN_STATS=1`. it
@@ -1650,6 +1650,39 @@ fn park(index: usize, timeout: Duration) -> bool {
     wait.timed_out()
 }
 
+/// how long a worker keeps looking for work before it parks. this is the cost
+/// of a *split* pipeline: when the two halves of a request/response pair pin to
+/// different workers, each message hands off across threads, and without this
+/// the receiving worker parks and must be futex-woken every single time. a
+/// two-task ping-pong that lands split measured ~19us per round against ~0.2us
+/// colocated — a 90x cliff that a bounded spin closes, because the partner's
+/// reply is on its way already.
+///
+/// it is only paid when the worker found work recently (`idle_timeout` still at
+/// its floor). an idle pool spins once on the way down and then backs off, so
+/// this does not undo the idle-syscall work: a worker that is genuinely out of
+/// work parks as before.
+const PARK_SPIN: Duration = Duration::from_micros(10);
+
+/// look for work for up to `PARK_SPIN` before parking. probes are spaced by a
+/// short pause burst rather than run back-to-back: `has_any_work` takes the
+/// queue locks, and hammering them would slow down the very peer this worker is
+/// waiting on.
+fn spin_for_work(index: usize) -> bool {
+    let deadline = Instant::now() + PARK_SPIN;
+    loop {
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+        if has_any_work(index) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
 /// is there any work *this* worker could actually take? used only to avoid
 /// parking on a false-empty; the authoritative pop is still `find_work`, and it
 /// must consider exactly the same sources: this worker's own pinned queue, its
@@ -1727,6 +1760,12 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 // when it wants the world stopped, which cuts a long park
                 // short — the bound below is the fallback, not the mechanism.
                 crate::cycle::mutator_gate();
+                // a worker still at the floor timeout was running a moment ago,
+                // so a handoff aimed at it is plausibly already in flight —
+                // worth a bounded look before paying a park/futex round trip.
+                if idle_timeout == PARK_TIMEOUT_MIN && spin_for_work(index) {
+                    continue;
+                }
                 if park(index, idle_timeout) {
                     idle_timeout = (idle_timeout * 2).min(PARK_TIMEOUT_MAX);
                 } else {

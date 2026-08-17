@@ -66,25 +66,30 @@ pub fn get_runtime_lib_path() -> String {
         }
     }
 
+    // the archive that sits beside THIS pith binary is the one cargo built
+    // alongside it, so it is the only candidate guaranteed to match the
+    // compiler in use. it has to win: a repo checked out with more than one
+    // cargo workspace can hold an older `target/release/libpith_runtime.a`
+    // relative to the working directory, and picking by path order linked
+    // that stale archive instead — silently, since the link succeeds and the
+    // binary merely behaves like an older runtime. that cost real debugging
+    // time (runtime changes appeared to have no effect at all) and could
+    // ship a binary built from code nobody has.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("libpith_runtime.a");
+            if beside.exists() {
+                return beside.to_string_lossy().to_string();
+            }
+        }
+    }
+
     for candidate in &[
         "target/release/libpith_runtime.a",
         "../target/release/libpith_runtime.a",
     ] {
         if std::path::Path::new(candidate).exists() {
             return candidate.to_string();
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-        {
-            let candidate = root.join("target/release/libpith_runtime.a");
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
         }
     }
 
@@ -107,10 +112,22 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
         return Ok(());
     };
 
-    let runtime_src = workspace_root.join("cranelift/runtime/src");
-    if !runtime_src.exists() {
+    // `workspace_root` is the cargo workspace holding this binary (the exe is
+    // at <workspace>/target/release/pith), so the runtime sources sit at
+    // <workspace>/runtime/src. joining "cranelift/runtime/src" looked right
+    // but resolved one level too deep, so the directory never existed and
+    // this guard returned early on every build — leaving the staleness check
+    // that is supposed to protect against linking old runtime code doing
+    // nothing at all. the second candidate keeps a repo-root layout working.
+    let runtime_src = [
+        workspace_root.join("runtime/src"),
+        workspace_root.join("cranelift/runtime/src"),
+    ]
+    .into_iter()
+    .find(|p| p.exists());
+    let Some(runtime_src) = runtime_src else {
         return Ok(());
-    }
+    };
 
     // Check if runtime lib is older than any source file
     let lib_mtime = std::fs::metadata(runtime_lib)

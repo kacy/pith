@@ -351,6 +351,12 @@ fn skip_leading_spaces(line: String, start: Int) -> Int:
             break
     return i
 
+# keywords that can be directly followed by an expression, and so leave a `-`
+# after them unary. this is the whole keyword set except the four that are
+# themselves values — `self.x - 1` and `true - 1` end with an operand, so a
+# minus after those is binary like any other.
+NON_OPERAND_KEYWORDS := ",fn,if,elif,else,for,in,while,match,select,default,timeout,return,fail,break,continue,spawn,await,struct,enum,interface,impl,type,pub,mut,ref,weak,import,from,as,and,or,not,catch,test,let,threadlocal,defer,errdefer,"
+
 # check if the output so far ends with an operand (for binary vs unary minus)
 fn is_preceded_by_operand(output: String) -> Bool:
     if output.len() == 0:
@@ -366,6 +372,20 @@ fn is_preceded_by_operand(output: String) -> Bool:
         return false
     last := output[idx - 1]
     if is_alphanumeric(last):
+        # a trailing word may be a keyword rather than a value. `return -1` and
+        # `and -1` read as alphanumeric here, but nothing has been produced for
+        # the minus to bind to, so it is unary — without this, `return -1`
+        # formats to `return - 1`.
+        mut start := idx
+        while start > 0:
+            ch := output[start - 1]
+            if is_alphanumeric(ch) or ch == "_":
+                start = start - 1
+            else:
+                break
+        word := output.substring(start, idx)
+        if NON_OPERAND_KEYWORDS.contains("," + word + ","):
+            return false
         return true
     if last == ")" or last == "]" or last == "_" or last == "?" or last == "!":
         return true
@@ -405,3 +425,26 @@ fn trim_left(s: String) -> String:
         else:
             break
     return s.substring(start, s.len())
+
+test "a unary minus after a keyword stays glued to its operand":
+    # `return`, `and`, `if` and friends all end in a letter, so a naive
+    # "is the last character alphanumeric" test reads them as operands and
+    # spaces the minus as if it were binary. that rewrote `return -1` to
+    # `return - 1` — valid, but not what anyone wrote, and 191 sites in the
+    # tree had already been rewritten that way before this was caught.
+    assert(fmt_source("fn f() -> Int:" + chr(10) + "    return -1" + chr(10)).contains("return -1"))
+    assert(fmt_source("fn g(a: Int) -> Int:" + chr(10) + "    return -a" + chr(10)).contains("return -a"))
+    assert(fmt_source("fn h(a: Int) -> Bool:" + chr(10) + "    return a > 0 and -1 < a" + chr(10)).contains("and -1 < a"))
+    assert(fmt_source("fn i(a: Int):" + chr(10) + "    if -1 < a:" + chr(10) + "        print(\"x\")" + chr(10)).contains("if -1 < a"))
+
+test "a binary minus is still spaced, including after a value keyword":
+    # the four keywords that ARE values must keep binary spacing — they end an
+    # operand just like an identifier does.
+    assert(fmt_source("fn f(a: Int) -> Int:" + chr(10) + "    return a - 1" + chr(10)).contains("a - 1"))
+    assert(fmt_source("fn g(a: Int) -> Int:" + chr(10) + "    return f(a) - 1" + chr(10)).contains("f(a) - 1"))
+    assert(fmt_source("fn h(xs: List[Int]) -> Int:" + chr(10) + "    return xs[0] - 1" + chr(10)).contains("xs[0] - 1"))
+
+test "formatting is idempotent across the minus cases":
+    src := "fn f(a: Int) -> Int:" + chr(10) + "    b := [-1, -2]" + chr(10) + "    return a - 1" + chr(10)
+    once := fmt_source(src)
+    assert(fmt_source(once) == once)

@@ -339,6 +339,27 @@ time: total 355 to ~320 ms (−10%) with an identical digest. still
 boxed: Float results and interface-impl and generic-impl methods — the
 last slices of a default-on decision.
 
+the threaded path then took the write fusion the inline path got above. at
+concurrency a unary request reached the writer task as two messages — the
+HEADERS under the encoder mutex, then the DATA behind it — where one would do.
+a single-frame body now rides the HEADERS write, and the send credit it needs
+is reserved through the mutex the header block already holds, which also saves
+a mutex round trip per call. that reservation is all-or-nothing on purpose: a
+caller that took a partial grant would have to hand the remainder back on every
+error path, and one missed undo silently shrinks the connection window for the
+life of the connection, so a connection with no window left simply falls back to
+the ordinary flow-controlled send. bodies past one frame are untouched — they
+still stream on their own task while the caller drains the response. the effect
+is countable: `PITH_GREEN_STATS=1` over 3300 calls at conc=8 puts channel wakes
+at 8174 before and 6625 after, about half a wake per call rather than a whole
+one, because the coalescing writer was already absorbing part of the second
+handoff. interleaved a/b, 14 alternating rounds of 20000 16 B calls at conc=8:
+~8930 to ~9210 calls/sec (+3%) at 116 to 111 µs of client cpu per call (−4%),
+the branch ahead in 10 of the 14 pairs. the run-to-run spread on this box is
+wider than the gain (8.1k-9.9k either way), so the counted handoff is the solid
+half of that result and the wall clock is the weak half. conc=1 is unchanged, as
+it takes the inline path.
+
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker

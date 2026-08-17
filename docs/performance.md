@@ -310,10 +310,24 @@ String!-returning catch loop falls 200,010 to 2 struct allocations, the
 binary-read catch shape 400,000 to 0, http/2 frame serialization 33 to 19
 per frame, hpack decode 59 to 48 per block. end to end, sequential grpc
 echo gains ~3% (median 222 to 213 µs) and conc=8 is unchanged — that
-path's cost is the futex handoff chain, not allocation. the residual
-shells sit behind the three exclusions above; narrowing those (methods
-first — hpack encode and protobuf writes are all impl methods and moved
-not at all) is what a default-on decision waits on.
+path's cost is the futex handoff chain, not allocation.
+
+the third phase brought methods and the legacy bridge in. a method on a
+plain (non-interface, non-generic) impl now registers like a free
+function — safe because pith interfaces dispatch statically, so no
+indirect call can reach a pair signature — and the wrappers around
+single-register legacy builtins stopped costing a box: a `return
+byte_buffer_write_byte(...)` used to build a result box just so the pair
+return could unpack it, and a caller in a non-pair context built a second
+one. the wrap now hands its (flag, payload) registers straight to a
+waiting `!`, `catch`, or pair return, and `return f()` forwards an
+rcall'd pair the same way. component a/b at 100k rounds, box world to
+flag-on: hpack encode 7 to 1 struct per block, hpack decode 59 to 25,
+frame serialization 33 to 16, protobuf writes 10 to 5. sequential grpc
+echo holds at ~+4% (median 226 to 217 µs); conc=8 stays put. still
+boxed: Float results, the json/config/toml/yaml modules, interface-impl
+and generic-impl methods, and unwrap_or/block-catch sites — the
+remaining slices of a default-on decision.
 
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built

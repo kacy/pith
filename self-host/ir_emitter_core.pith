@@ -3999,6 +3999,8 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     if not ir_is_generic_struct_construction_call(node):
         ir_release_owned_string_args(node, 1, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+        if ret_type != "float" and idx == ir_rcall_defer_idx:
+            return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
 
@@ -4585,6 +4587,56 @@ fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
             return
     ir_result_reg_funcs.insert(name, true)
 
+# the ok payload kind of a method that returns a result, resolved through
+# the impl's associated-type bindings the same way its header type is.
+fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
+    node := get_node(method_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
+                if rn.kind == "result_type" and rn.children.len() > 0:
+                    return ir_retkind(ir_resolve_assoc_type(impl_type, ir_resolve_type_node(rn.children[0])))
+    return ""
+
+# register a plain-impl method for the register ABI when its result shape
+# fits. interface impls (`impl Iface for T`) are excluded wholesale: their
+# defaults are shared fn_decl nodes emitted once per conforming type, and
+# their methods back generic bounds whose bodies re-emit under specialized
+# names. a generic impl target is excluded the same way a generic function
+# is — its methods re-emit per specialization while this registry keys the
+# base name. beyond that the gate matches the free-function one exactly,
+# including the json-family home-module exclusion and the lambda/spawn
+# body exclusion (see ir_maybe_register_result_reg for both rationales).
+fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, method_idx: Int, method_node: Node, module_path: String):
+    if not ir_result_reg_enabled():
+        return
+    if ir_impl_interface_base(impl_node).len() > 0:
+        return
+    if impl_type.contains("["):
+        return
+    if ir_has_generic_params(method_node):
+        return
+    if ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx)) != "tuple":
+        return
+    ok_kind := ir_method_result_ok_kind(impl_type, method_idx)
+    if not ir_result_reg_ok_kind_fits(ok_kind):
+        return
+    mut home := module_path
+    if home.len() == 0:
+        home = ir_current_module_path
+    if home.contains("json") or home.contains("config") or home.contains("toml") or home.contains("yaml"):
+        return
+    for child_idx in method_node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return
+    mut full_name := impl_type + "_" + method_node.value
+    if module_path.len() > 0:
+        full_name = ir_import_impl_method_name(module_path, impl_type, method_node.value)
+    ir_result_reg_funcs.insert(full_name, true)
+    ir_func_result_ok_kinds.insert(full_name, ok_kind)
+
 fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind == "lambda" or node.kind == "spawn":
@@ -4650,6 +4702,46 @@ fn ir_emit_result_reg_box(flag_r: Int, val_r: Int) -> Int:
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
+
+# hand a legacy single-register result straight to the pair handshake:
+# decode the sentinel into (flag, payload) registers with no box on either
+# arm. the err payload is the same static message string the box path
+# stores, so the consumer's release path sees nothing new. float stays on
+# the box path — its payload cannot travel an int-typed temp.
+fn ir_emit_wrapped_legacy_pair(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
+    flag_temp := ir_new_temp_name("lp_flag")
+    val_temp := ir_new_temp_name("lp_val")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    cond_r := ir_reg()
+    ir_emit("neq " + cond_r.to_string() + " " + raw_r.to_string() + " " + zero_r.to_string())
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    mut ok_r := raw_r
+    if legacy_kind == "result_int" or legacy_kind == "result_bool":
+        ok_r = ir_decode_result_value(raw_r, legacy_kind)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    ir_emit("store " + flag_temp + " " + one_r.to_string())
+    ir_emit("store " + val_temp + " " + ok_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    zf_r := ir_reg()
+    ir_emit("iconst " + zf_r.to_string() + " 0")
+    ir_emit("store " + flag_temp + " " + zf_r.to_string())
+    ir_emit("store " + val_temp + " " + ir_emit_result_error_message(callee_name).to_string())
+    ir_emit_label(merge_l)
+    flag_r := ir_reg()
+    ir_emit("load " + flag_r.to_string() + " " + flag_temp)
+    val_r := ir_reg()
+    ir_emit("load " + val_r.to_string() + " " + val_temp)
+    ir_rcall_pair_ready = true
+    ir_rcall_flag_reg = flag_r
+    ir_rcall_val_reg = val_r
+    return raw_r
 
 fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
     temp_name := ir_new_temp_name("legacy_result")
@@ -5307,6 +5399,8 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # plain static calls: owned string temps die with the call
         ir_release_owned_string_args(node, 1, arg_regs)
         if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+            if ret_type != "float" and idx == ir_rcall_defer_idx:
+                return ir_emit_wrapped_legacy_pair(r, ret_type, call_name)
             return ir_emit_wrapped_legacy_result(r, ret_type, call_name)
         return r
     return 0 - 1
@@ -5435,10 +5529,13 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         call_arg_text = call_arg_text + " " + store_tag_r.to_string()
         call_arg_count = call_arg_count + 1
     if ir_result_reg_funcs.contains_key(call_name):
-        # a module-alias call resolved to a pair-returning free function
-        # (real methods are never registered); fold the pair into the box
-        # this path's consumers expect.
+        # a pair-returning callee: a registered plain-impl method, or a
+        # module-alias call that resolved to a pair-returning free function.
+        # the handshake lets a `!` or `catch` wrapping this call consume the
+        # raw pair; any other context folds it into the usual box.
+        ir_rcall_current_idx = idx
         r = ir_emit_result_reg_call(r, call_name, call_arg_count, call_arg_text)
+        ir_rcall_current_idx = 0 - 1
     else:
         ir_emit_call_text(r, call_name, ret_type, call_arg_count, call_arg_text)
     # a builtin that may hand an argument straight back out takes no count on
@@ -5463,6 +5560,8 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             if not ir_is_void_method(emit_name):
                 ir_rc_release_reg(obj_r, recv_kind)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+        if ret_type != "float" and idx == ir_rcall_defer_idx:
+            return ir_emit_wrapped_legacy_pair(r, ret_type, emit_name)
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):
         return obj_r
@@ -6692,6 +6791,23 @@ fn ir_emit_return_stmt(node: Node):
         mut r := 0
         if node_kind(node.children[0]) == "none_lit":
             r = ir_emit_zero_value()
+        elif ir_current_func_return_kind == "result_reg":
+            # forwarding handshake: a direct pair-returning call (an rcall or
+            # a legacy-builtin wrap) hands its (flag, payload) registers
+            # straight to this return, so no box is built only to be unpacked
+            # again below.
+            saved_defer := ir_rcall_defer_idx
+            ir_rcall_defer_idx = node.children[0]
+            ir_rcall_pair_ready = false
+            r = ir_expr(node.children[0])
+            ir_rcall_defer_idx = saved_defer
+            if ir_rcall_pair_ready:
+                ir_rcall_pair_ready = false
+                ir_defer_emit_to_function_frame(false)
+                ir_emit_string_cleanup("")
+                ir_emit("ret2 " + ir_rcall_flag_reg.to_string() + " " + ir_rcall_val_reg.to_string())
+                ir_last_was_ret = true
+                return
         else:
             r = ir_expr(node.children[0])
         # hand the returned string's count to the caller: a returned local
@@ -8260,6 +8376,7 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
         method_node := get_node(method_idx)
         if ir_is_fn_decl_kind(method_node.kind):
             ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
+            ir_maybe_register_result_reg_method(node, impl_type, method_idx, method_node, module_path)
     # inherited interface defaults get a signature under this concrete type too
     for default_idx in ir_inherited_default_indices(node):
         ir_record_impl_method_signature(impl_type, default_idx, get_node(default_idx), module_path)
@@ -8486,13 +8603,19 @@ fn ir_impl_func(idx: Int, impl_type: String):
     # resolve an associated-type return (`-> Item`) to the impl's bound type so
     # the function's return kind is right — critical for heap types and arc
     ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(idx))
-    ir_prepare_func_emission(ret_type)
+    # a registered method emits the pair signature, but the recorded return
+    # below stays "tuple" — the same split ir_func keeps for free functions,
+    # so everything outside the rcall paths still sees the box world.
+    mut emit_ret := ret_type
+    if ir_result_reg_funcs.contains_key(full_name):
+        emit_ret = "result_reg"
+    ir_prepare_func_emission(emit_ret)
     # an `-> Item?` return: resolve the inner kind too so the optional's
     # payload is reclaimed correctly for heap-typed bindings
     ir_current_func_optional_inner_kind = ir_resolve_assoc_type(impl_type, ir_extract_optional_inner_type(idx))
     ir_current_impl_type = impl_type
     ir_current_arc_func = full_name
-    ir_emit_func_header(full_name, param_count, ret_type)
+    ir_emit_func_header(full_name, param_count, emit_ret)
     ir_emit_named_param("self", impl_type)
     ir_emit_fn_params(idx)
     ir_emit_string_prologue(body_idx)

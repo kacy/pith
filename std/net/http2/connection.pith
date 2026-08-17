@@ -1390,6 +1390,12 @@ impl Client:
     # postcondition is the same either way, which is why nothing has to be
     # signalled back to the caller.
     fn open_stream_with_body(fields: List[hpack.HeaderField], end_stream: Bool, unary: Bool, body: Bytes) -> Stream!:
+        # half-closing on the HEADERS and then sending the body would put DATA on
+        # a stream this endpoint has already closed, which the peer must reject
+        # (RFC 9113 §5.1). no caller does it today; refusing here keeps it that
+        # way rather than letting a future one emit an invalid stream silently.
+        if end_stream and body.len() > 0:
+            fail "http2: cannot half-close a stream that still has a body to send"
         self.mu.lock()
         while true:
             if self.closed.load() != 0:

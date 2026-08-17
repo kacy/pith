@@ -1269,6 +1269,15 @@ impl Client:
     # so a non-positive result just means "wait".
     fn reserve_send(stream_id: Int, want: Int) -> Int:
         self.mu.lock()
+        grant := self.reserve_send_locked(stream_id, want)
+        self.mu.unlock()
+        return grant
+
+    # the body of reserve_send, with `mu` already held by the caller. a caller
+    # that is already inside the mutex for another reason (open_stream_with_fields
+    # fusing a body into the HEADERS write) reserves through this and saves the
+    # lock round trip.
+    fn reserve_send_locked(stream_id: Int, want: Int) -> Int:
         mut win := 0
         if self.send_windows.contains_key(stream_id):
             win = self.send_windows[stream_id]
@@ -1282,10 +1291,28 @@ impl Client:
         if grant > 0:
             self.send_windows.insert(stream_id, win - grant)
             self.conn_send_window = self.conn_send_window - grant
-        self.mu.unlock()
         if grant < 0:
             return 0
         return grant
+
+    # reserve `want` bytes of send credit for `stream_id` all at once, or nothing
+    # at all: true means both windows were debited by the full `want`, false means
+    # neither moved. `mu` must be held. this is deliberately not a partial
+    # reservation — a caller that took a short grant and handed the remainder back
+    # would have to undo a debit on every error path, and one missed undo silently
+    # shrinks the connection window for the life of the connection. failing here
+    # instead costs only the ordinary flow-controlled send.
+    fn reserve_send_all_locked(stream_id: Int, want: Int) -> Bool:
+        if want <= 0 or want > self.peer_max_frame_size:
+            return false
+        if not self.send_windows.contains_key(stream_id):
+            return false
+        win := self.send_windows[stream_id]
+        if win < want or self.conn_send_window < want:
+            return false
+        self.send_windows.insert(stream_id, win - want)
+        self.conn_send_window = self.conn_send_window - want
+        return true
 
     # block until this stream's credit is poked (a WINDOW_UPDATE grew a window),
     # returning false if the connection closed instead (the channel was closed).
@@ -1348,6 +1375,21 @@ impl Client:
     # reader coalesces its response into one event (see handle_frame); a streaming
     # caller passes false so its events flow one frame at a time.
     fn open_stream_with_fields(fields: List[hpack.HeaderField], end_stream: Bool, unary: Bool) -> Stream!:
+        return self.open_stream_with_body(fields, end_stream, unary, bytes.empty())!
+
+    # open_stream_with_fields, plus the stream's whole request body in the same
+    # call. a non-empty `body` half-closes the stream on its final DATA frame, so
+    # `end_stream` must be false; on return the body has been sent, either fused
+    # into the HEADERS write or streamed the ordinary way. fusing is what makes
+    # this worth having: HEADERS and DATA reach the writer task as one message, so
+    # a unary request costs one channel handoff instead of two, and the flow
+    # control it needs is reserved through the mutex the header block already
+    # holds. the fallback is not an error path — a busy connection can simply be
+    # out of send window — so it just falls through to send_stream_data, which
+    # waits for credit exactly as a streaming caller's Stream.send does. the
+    # postcondition is the same either way, which is why nothing has to be
+    # signalled back to the caller.
+    fn open_stream_with_body(fields: List[hpack.HeaderField], end_stream: Bool, unary: Bool, body: Bytes) -> Stream!:
         self.mu.lock()
         while true:
             if self.closed.load() != 0:
@@ -1381,11 +1423,26 @@ impl Client:
             self.mu.unlock()
             self.forget(stream_id)
             fail built.err
-        accepted := self.outbound.send(built.ok)
+        mut wire := built.ok
+        mut fused := false
+        if body.len() > 0:
+            # serialize before reserving, so a frame that cannot be built never
+            # leaves a debit behind to undo.
+            framed := frames.frame_bytes(frames.data_frame(stream_id, body, true))
+            if not framed.is_err:
+                if self.reserve_send_all_locked(stream_id, body.len()):
+                    wire = bytes.concat(wire, framed.ok)
+                    fused = true
+        accepted := self.outbound.send(wire)
         self.mu.unlock()
         if not accepted:
             self.forget(stream_id)
             fail "http2: connection closed"
+        if body.len() > 0 and not fused:
+            # the connection window was empty at open time (the stream's own
+            # window is fresh, so it is never the shortfall here); send the body
+            # under flow control, waiting for a WINDOW_UPDATE if it must.
+            send_stream_data(self, stream_id, body, true)
         return Stream(self, stream_id, inbox)
 
     # open a stream for a streaming rpc: fills the four pseudo-headers from the
@@ -1523,18 +1580,19 @@ impl Client:
     # flow-controlled DATA on its own task while the response is read.
     fn threaded_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
-        stream := self.open_stream_with_fields(fields, not has_body, true)!
-        stream_id := stream.id
         if has_body and body.len() <= self.peer_max_frame_size:
-            # the body is a single frame within the initial window, so sending it
-            # never waits on flow control and the small write drains immediately
-            # — no need to send on a task. this is the common grpc unary case.
-            send_stream_data(self, stream_id, body, true)
+            # the body is a single frame within the initial window, so it rides
+            # the HEADERS write as one message to the writer task — one handoff,
+            # not two. this is the common grpc unary case.
+            stream := self.open_stream_with_body(fields, false, true, body)!
+            stream_id := stream.id
             attempt := assemble_response(stream.inbox)
             self.forget(stream_id)
             if attempt.is_err:
                 fail attempt.err
             return attempt.ok
+        stream := self.open_stream_with_fields(fields, not has_body, true)!
+        stream_id := stream.id
         if has_body:
             # a larger body may span frames and block on flow-control credit, so
             # send it on a task while this call keeps draining the response inbox.
@@ -1588,9 +1646,9 @@ impl Client:
     # table — which also wakes a body sender still blocked on flow control.
     fn threaded_request_until(fields: List[hpack.HeaderField], body: Bytes, deadline_ms: Int) -> Response!:
         has_body := body.len() > 0
-        stream := self.open_stream_with_fields(fields, not has_body, true)!
-        stream_id := stream.id
         if has_body and body.len() > self.peer_max_frame_size:
+            stream := self.open_stream_with_fields(fields, false, true)!
+            stream_id := stream.id
             # a large body may block on flow-control credit, so send it on a
             # task while this call drains the response inbox (see
             # threaded_request). bind self to a local: a spawn thunk cannot
@@ -1607,10 +1665,10 @@ impl Client:
             await sender
             self.forget(stream_id)
             return attempt.ok
-        if has_body:
-            # a single-frame body drains immediately — the common grpc unary
-            # case — so it is sent right here, no task needed.
-            send_stream_data(self, stream_id, body, true)
+        # a single-frame body rides the HEADERS write (see threaded_request), and
+        # an empty one half-closes on the HEADERS frame — one call covers both.
+        stream := self.open_stream_with_body(fields, not has_body, true, body)!
+        stream_id := stream.id
         attempt := assemble_response_until(stream.inbox, deadline_ms)
         if attempt.is_err:
             stream.close()
@@ -2047,6 +2105,20 @@ fn next_data_frame(ch: Channel[Bytes]) -> frames.DataFrame!:
     frame := frames.read_frame(binary.reader(opt?), frames.MAX_ALLOWED_FRAME_SIZE)!
     return frames.parse_data(frame)!
 
+# one POST pseudo-header, enough to make a header block a byte or two long so a
+# small frame cap in a test still fits it in one HEADERS frame.
+fn post_fields() -> List[hpack.HeaderField]:
+    return [hpack.header_field(":method", "POST")]
+
+# open a stream with a body on a task, yielding the stream id (-1 on failure).
+# the fallback path blocks waiting for credit, so a test that wants to observe it
+# has to drive the open from somewhere other than the task granting the credit.
+fn open_with_body_task(client: Client, body: Bytes) -> Int:
+    opened := client.open_stream_with_body(post_fields(), false, true, body)
+    if opened.is_err:
+        return -1
+    return opened.ok.id
+
 test "reserve_send is bounded by the stream and connection windows":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 10, 6, 100)
@@ -2062,6 +2134,96 @@ test "reserve_send caps a chunk at the peer's max frame size":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 1000, 1000, 16)
     assert_eq(client.reserve_send(1, 1000), 16)
+
+test "reserve_send_all_locked debits the whole request or nothing at all":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    arm_send_stream(client, 1, 10, 6, 100)
+    client.mu.lock()
+    # eight bytes wanted against a six-byte connection window: refused, and both
+    # windows are left exactly as they were — no partial grant to hand back.
+    assert(not client.reserve_send_all_locked(1, 8))
+    assert_eq(client.send_windows[1], 10)
+    assert_eq(client.conn_send_window, 6)
+    # what both windows can cover is taken in full.
+    assert(client.reserve_send_all_locked(1, 6))
+    assert_eq(client.send_windows[1], 4)
+    assert_eq(client.conn_send_window, 0)
+    client.mu.unlock()
+
+test "reserve_send_all_locked refuses more than one frame's worth":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    arm_send_stream(client, 1, 1000, 1000, 16)
+    client.mu.lock()
+    assert(not client.reserve_send_all_locked(1, 17))
+    assert_eq(client.conn_send_window, 1000)
+    assert(client.reserve_send_all_locked(1, 16))
+    client.mu.unlock()
+    assert_eq(client.conn_send_window, 984)
+    assert_eq(client.send_windows[1], 984)
+
+test "a single-frame body rides the HEADERS write as one message":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    body := bytes.from_string_utf8("hello-body")
+    opened := client.open_stream_with_body(post_fields(), false, true, body)
+    assert(not opened.is_err)
+    stream := opened.ok
+    msg := client.outbound.recv()
+    assert(msg != none)
+    reader := binary.reader(msg?)
+    head := frames.parse_headers(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    # the half-close moved off the HEADERS and onto the DATA frame behind it.
+    assert(not head.end_stream)
+    data := frames.parse_data(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert_eq(data.data.to_string_utf8()!, "hello-body")
+    assert(data.end_stream)
+    # both frames came out of that one message: the writer sees a single handoff.
+    assert_eq(binary.remaining(reader), 0)
+    # and the fused body was paid for out of both send windows.
+    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW - 10)
+    assert_eq(client.send_windows[stream.id], DEFAULT_INITIAL_WINDOW - 10)
+
+test "a body exactly at the peer's frame cap still rides the HEADERS write":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    client.peer_max_frame_size = 8
+    body := bytes.from_string_utf8("12345678")
+    opened := client.open_stream_with_body(post_fields(), false, true, body)
+    assert(not opened.is_err)
+    reader := binary.reader(client.outbound.recv()?)
+    head := frames.parse_headers(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert(not head.end_stream)
+    data := frames.parse_data(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert_eq(data.data.len(), 8)
+    assert(data.end_stream)
+    assert_eq(binary.remaining(reader), 0)
+
+test "an empty body still half-closes on the HEADERS frame":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    opened := client.open_stream_with_body(post_fields(), true, true, bytes.empty())
+    assert(not opened.is_err)
+    reader := binary.reader(client.outbound.recv()?)
+    head := frames.parse_headers(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert(head.end_stream)
+    assert_eq(binary.remaining(reader), 0)
+    # nothing was reserved, because nothing was sent.
+    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
+
+test "a body waits for credit when the connection window is exhausted":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    # the stream window is always fresh at open time, so an empty connection
+    # window is the only way the fused reservation is refused.
+    client.conn_send_window = 0
+    opener := spawn open_with_body_task(client, bytes.from_string_utf8("late"))
+    # the HEADERS go out on their own; reading them proves the body did not ride
+    # along, and that the opener is now waiting on a WINDOW_UPDATE.
+    reader := binary.reader(client.outbound.recv()?)
+    head := frames.parse_headers(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert(not head.end_stream)
+    assert_eq(binary.remaining(reader), 0)
+    grant_send_credit(client, 0, 100)
+    late := next_data_frame(client.outbound)!
+    assert_eq(late.data.to_string_utf8()!, "late")
+    assert(late.end_stream)
+    assert_eq(await opener, 1)
 
 test "grant_send_credit grows the stream and connection windows":
     client := offline_client(connection_from_frames(bytes.empty()))

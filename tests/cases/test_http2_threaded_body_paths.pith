@@ -1,0 +1,82 @@
+# drives the http/2 client's three threaded request shapes against the native
+# h2c server: a body larger than one frame (chunked under flow control on its own
+# task), a body sitting exactly on the peer's frame cap, and a small one. the
+# oversized body promotes the connection to the pipeline, so the two that follow
+# take the threaded path rather than the inline codec — which is where a body
+# rides the HEADERS write as a single message to the writer. the server echoes
+# each body's length and checksum, so a body that arrives short, doubled or out
+# of order shows up in the output.
+
+import std.net.http2.connection as http2
+import std.net.http2.server as h2server
+import std.net.http2.hpack as hpack
+import std.net.http2.frames as frames
+import std.net.http as http
+import std.bytes as bytes
+import std.time as time
+
+PORT := 17411
+
+# a cheap running checksum over a body, computed the same way on both ends.
+fn digest(body: Bytes) -> String:
+    mut sum := 0
+    mut i := 0
+    while i < body.len():
+        sum = (sum + ((i + 1) * body[i])) % 65521
+        i = i + 1
+    return "{body.len()}:{sum}"
+
+fn handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, digest(req.body))
+
+fn serve_once(listener: Int):
+    fd := tcp_accept(listener) catch 0
+    if fd != 0:
+        h2server.serve_h2c_connection(fd, handler)
+
+# a body of `n` bytes with varied content, so a checksum notices a reordering.
+fn body_of(n: Int) -> Bytes:
+    buf := bytes.buffer()
+    defer buf.free()
+    mut i := 0
+    while i < n:
+        buf.write_byte(65 + (i % 26)) catch 0
+        i = i + 1
+    return buf.bytes()
+
+# post a body of `n` bytes and report whether the server saw exactly it.
+fn post(client: http2.Client, label: String, n: Int) -> String:
+    no_extra: List[hpack.HeaderField] := []
+    body := body_of(n)
+    want := digest(body)
+    resp := client.request("POST", "localhost", "/echo", no_extra, body)
+    if resp.is_err:
+        return "{label}: ERR {resp.err}"
+    got := resp.ok.body.to_string_utf8() catch "?"
+    if got != want:
+        return "{label}: MISMATCH want {want} got {got}"
+    return "{label}: {resp.ok.status} ok"
+
+fn main():
+    listener := tcp_listen("127.0.0.1", PORT) catch 0
+    task := spawn serve_once(listener)
+    time.delay(200)
+    opened := http2.open_h2c("127.0.0.1", PORT)
+    if opened.is_err:
+        print("dial failed")
+        tcp_close(listener)
+        return
+    client := opened.ok
+    # over the frame cap and over the initial window too, so this one spans DATA
+    # frames and has to wait for a WINDOW_UPDATE partway through. it also
+    # promotes the connection, so the calls after it are threaded.
+    print(post(client, "multi-frame", 100000))
+    # exactly the cap: the largest body that still fuses into the HEADERS write.
+    print(post(client, "at-cap", frames.DEFAULT_MAX_FRAME_SIZE))
+    # the common unary shape.
+    print(post(client, "small", 64))
+    # no body at all: END_STREAM rides the HEADERS frame.
+    print(post(client, "empty", 0))
+    client.close()
+    await task
+    tcp_close(listener)

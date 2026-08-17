@@ -945,20 +945,6 @@ struct Scheduler {
     sync: SyncArena,
     workers: Vec<Worker>,
     injector: Mutex<VecDeque<TaskId>>,
-    /// the indices of the workers currently asleep in `park`'s condvar wait,
-    /// most-recently-parked LAST. fresh work needs to rouse *a* worker rather
-    /// than all of them, and the newest sleeper is the warmest choice, so this
-    /// is the missing piece: the per-worker condvar can nudge a named worker but
-    /// cannot answer "who parked most recently".
-    ///
-    /// a worker adds itself while holding its own `park_lock` (before park's
-    /// final work re-check) and removes itself, under that same lock, on every
-    /// way out of the wait. so an entry means "this worker is inside, or is
-    /// about to enter, the wait, and has not left it" — never a worker that has
-    /// already woken. a waker only ever *reads* the top; it must drop this lock
-    /// before touching a `park_lock`, because the parking side takes them in the
-    /// other order.
-    parked_lifo: Mutex<Vec<usize>>,
 }
 
 /// the scheduler is built lazily on the first green spawn so a process that
@@ -1253,7 +1239,6 @@ fn scheduler() -> &'static Scheduler {
             sync: SyncArena::new(),
             workers,
             injector: Mutex::new(VecDeque::new()),
-            parked_lifo: Mutex::new(Vec::with_capacity(n)),
         }
     })
 }
@@ -1376,21 +1361,13 @@ fn enqueue_fresh(id: TaskId) {
             .unwrap_or_else(|p| p.into_inner())
             .push_back(id),
     }
-    // one task needs one worker, so nudge one worker — the most recently parked.
-    // waking the whole pool for a single stealable task is what decided task
-    // placement for a *communicating* pair: two tasks spawned back to back from
-    // main both land in the injector, every worker is roused at once, and they
-    // race, so the pair lands split about as often as together. split costs a
-    // park plus a futex wake on every message for the life of the pair.
-    //
-    // fan-out is preserved by chaining instead of bursting (see `find_work`):
-    // whoever takes this task wakes the next worker if more fresh work is still
-    // queued behind it, so n queued tasks still reach n workers. the difference
-    // is that each hop starts only once the previous taker is already running,
-    // which lets a worker that has nothing left to do collect the second half of
-    // a pair before an idle peer can finish waking up.
+    // a fresh task is stealable by any worker, so nudge the whole pool: whoever
+    // is idle picks it up (or steals it), which is what keeps an independent
+    // fan-out spread across cores. fresh spawns are comparatively rare (task
+    // startup, not the per-message hot path), so the pool-wide nudge here is not
+    // the herd the pinned path had to shed.
     note_notify();
-    wake_one_parked();
+    wake_pool();
 }
 
 /// re-enqueue a *woken started* task onto its owner worker's pinned queue and
@@ -1471,70 +1448,10 @@ fn wake_worker(index: usize) {
     worker.park_cv.notify_one();
 }
 
-/// nudge the most-recently-parked worker, if any worker is parked at all. this
-/// is the wake for fresh, stealable work: any worker is a valid taker, so one is
-/// enough, and the newest sleeper is the likeliest to still be cache-warm.
-///
-/// the stack lock is released before `wake_worker` takes a `park_lock`: a parking
-/// worker holds its `park_lock` and then takes this one, so a waker that held
-/// both in the opposite order would deadlock against it.
-///
-/// reading the top without removing it is deliberate. two spawns in quick
-/// succession then target the *same* worker, and the second notify is a harmless
-/// no-op instead of rousing a second worker to race for work the first has not
-/// even collected yet; the chained wake in `find_work` is what spreads a genuine
-/// backlog. it is also why this cannot lose a wakeup: an entry is removed only
-/// by its own worker, under the `park_lock`, after it leaves the wait — so a
-/// worker seen here is either still in the wait and gets the notify, or has
-/// already left it and re-runs `find_work` after our enqueue. and if the stack
-/// reads empty, every worker either is running (and will call `find_work` again)
-/// or has yet to publish itself here, which it does *before* park's final
-/// `has_any_work` check — a check that counts every queue fresh work can be in.
-fn wake_one_parked() {
-    // scoped so the stack lock is dropped before the park lock is taken.
-    let target = {
-        let stack = scheduler()
-            .parked_lifo
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        stack.last().copied()
-    };
-    if let Some(index) = target {
-        wake_worker(index);
-    }
-}
-
-/// publish this worker as parked. called from `park` with the worker's own
-/// `park_lock` held, before the final work re-check, so a waker either sees the
-/// entry and notifies or has already published work the re-check will find.
-fn parked_push(index: usize) {
-    let mut stack = scheduler()
-        .parked_lifo
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    // a worker is in `park` at most once at a time, so it can never double-push.
-    debug_assert!(!stack.contains(&index));
-    stack.push(index);
-}
-
-/// retract this worker's parked entry. every exit from `park` runs it — the
-/// early "work appeared" return, a notify, and a timeout alike — so no waker can
-/// aim at a worker that is already up. the vector is worker-count sized, so the
-/// linear scan is a handful of comparisons.
-fn parked_remove(index: usize) {
-    let mut stack = scheduler()
-        .parked_lifo
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if let Some(at) = stack.iter().position(|&i| i == index) {
-        stack.remove(at);
-    }
-}
-
-/// nudge every worker. the collector uses it to bring the whole pool to its stop
-/// gate, which is the one caller that genuinely needs all of them: scheduling
-/// wakes name a single worker (`wake_worker` for pinned work, `wake_one_parked`
-/// for fresh).
+/// nudge every worker. used for fresh, stealable work (injector or a worker's
+/// local queue), where any worker is a valid taker, so an idle peer wakes to run
+/// or steal it. this keeps independent fan-out spread across cores; it is not on
+/// the per-message hot path, so it is not a herd.
 pub(crate) fn wake_pool() {
     let n = scheduler().workers.len();
     for i in 0..n {
@@ -1618,31 +1535,23 @@ fn find_work(index: usize) -> Option<TaskId> {
 
     // own local queue (stealable): pop into a local so the queue lock is released
     // before the debug invariant check locks the slab.
-    let (from_local, more_local) = {
-        let mut q = sched.workers[index]
-            .local
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let taken = q.pop_front();
-        (taken, !q.is_empty())
-    };
+    let from_local = sched.workers[index]
+        .local
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front();
     if let Some(id) = from_local {
         debug_assert_stealable(id);
-        chain_wake(more_local);
         return Some(id);
     }
 
-    let (from_injector, more_injected) = {
-        let mut q = sched
-            .injector
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let taken = q.pop_front();
-        (taken, !q.is_empty())
-    };
+    let from_injector = sched
+        .injector
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front();
     if let Some(id) = from_injector {
         debug_assert_stealable(id);
-        chain_wake(more_injected);
         return Some(id);
     }
 
@@ -1657,17 +1566,13 @@ fn find_work(index: usize) -> Option<TaskId> {
         if victim == index {
             continue;
         }
-        let (stolen, more_stealable) = {
-            let mut q = sched.workers[victim]
-                .local
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let taken = q.pop_front();
-            (taken, !q.is_empty())
-        };
+        let stolen = sched.workers[victim]
+            .local
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop_front();
         if let Some(id) = stolen {
             debug_assert_stealable(id);
-            chain_wake(more_stealable);
             return Some(id);
         }
     }
@@ -1685,23 +1590,6 @@ fn find_work(index: usize) -> Option<TaskId> {
         return Some(id);
     }
     None
-}
-
-/// hand the backlog on. a fresh enqueue wakes exactly one worker, so a worker
-/// that takes a stealable task and leaves more behind owes the next worker a
-/// nudge, or the tail of a fan-out would wait for a park timeout to expire. one
-/// hop per task taken is enough: n queued tasks produce n-1 chained wakes and
-/// still reach n workers, just in sequence rather than in one burst.
-///
-/// `more` is read from the queue we just popped, while its lock was held, so it
-/// costs nothing beyond an `is_empty` — but it is passed in as a bool on purpose:
-/// this must be called after that lock is dropped. a parking worker holds its
-/// `park_lock` and then takes the queue locks (`has_any_work`), so waking with a
-/// queue lock still held would close a cycle.
-fn chain_wake(more: bool) {
-    if more {
-        wake_one_parked();
-    }
 }
 
 /// cheap per-thread rotating start index for steal victim selection. no strong
@@ -1737,14 +1625,8 @@ fn park(index: usize, timeout: Duration) -> bool {
     // and we never sleep. flipping this order would let both sides miss each
     // other and cost a full park timeout per task.
     worker.parked.store(true, AtomicOrdering::SeqCst);
-    // same handshake, one step wider: publish this worker as a wake *target*
-    // before the re-check too, so a fresh enqueue that reads the stack after our
-    // push finds us, and one that reads it before ours lands has already put its
-    // task where the re-check below looks.
-    parked_push(index);
     // one last check under the lock: if work appeared, don't sleep.
     if has_any_work(index) {
-        parked_remove(index);
         worker.parked.store(false, AtomicOrdering::SeqCst);
         return false;
     }
@@ -1760,10 +1642,6 @@ fn park(index: usize, timeout: Duration) -> bool {
         .park_cv
         .wait_timeout(guard, timeout)
         .unwrap_or_else(|p| p.into_inner());
-    // retract before releasing `park_lock`, which a waker must hold to notify:
-    // that ordering is what makes an entry mean "still in the wait" rather than
-    // "was parked at some point".
-    parked_remove(index);
     worker.parked.store(false, AtomicOrdering::SeqCst);
     drop(guard);
     if stats_on() {

@@ -326,14 +326,21 @@ very differently: colocated, each handoff is the userspace switch above; split
 across workers, each one is a park and a futex wake. a two-task ping-pong
 measured ~0.2us per round colocated and ~19us split.
 
-workers therefore look for work for a short while before parking, so a handoff
-already in flight is caught without a kernel round trip. that spin is only paid
-by a worker that ran something recently: once a worker has idled long enough to
-back its park timeout off it parks directly, and an idle pool stays quiet. the
-spin narrows the split case rather than removing it — a pipeline that lands
-split is still the slower arrangement, and `PITH_GREEN_WORKERS=1` is worth
-trying for a workload that is one request/response chain rather than genuine
-fan-out.
+two things narrow that. workers look for work for a short while before parking,
+so a handoff already in flight is caught without a kernel round trip; that spin
+is only paid by a worker that ran something recently, so once a worker has idled
+long enough to back its park timeout off it parks directly and an idle pool stays
+quiet. and a newly spawned task wakes one worker rather than the whole pool — the
+most recently parked one — with each taker waking the next only if more fresh
+work is still queued behind it. that is still work-conserving, so a real fan-out
+still reaches every core, but tasks spawned back to back are no longer handed to
+a burst of workers racing for them, which is how a communicating pair used to end
+up split. measured on `bench/task_pingpong` at two workers, the pair landed split
+in 24 of 200 runs before and 7 of 200 after.
+
+neither removes the split case: a pipeline that lands split is still the slower
+arrangement, and `PITH_GREEN_WORKERS=1` is worth trying for a workload that is
+one request/response chain rather than genuine fan-out.
 
 a read deadline survives that translation. `tcp.set_timeout` stores the deadline
 on the socket itself, and the reactor wait is bounded by it: a read that reaches
@@ -466,11 +473,14 @@ socket holds its worker until it finishes, unless the binary was built with
 safe-points (`PITH_GREEN_PREEMPT=1`, below). code that coordinates already yields
 on its own and never needs it.
 
-and placement is luck. a task pins to the first worker that runs it, so whether
-two tasks that talk to each other end up sharing one is chance. on the channel
-fan-out benchmark that is the difference between ~46ms and ~130-170ms for the
-same program. `PITH_GREEN_WORKERS=1` takes the choice away and is often the
-fastest setting for a single pipeline.
+and placement is still partly luck. a task pins to the first worker that runs it,
+so whether two tasks that talk to each other end up sharing one is decided by
+which worker gets to them first. spawning wakes one worker rather than the pool,
+which tilts that outcome towards colocation — a two-task ping-pong at two workers
+landed split in 7 of 200 runs, down from 24 — but it does not settle it, and a
+split pair pays a park and a futex wake per message for as long as it lives.
+`PITH_GREEN_WORKERS=1` takes the choice away and is often the fastest setting for
+a single pipeline.
 
 there is one more reason the os-thread backend stays, which matters to this
 repo rather than to your program: it is the reference green gets checked
@@ -502,4 +512,6 @@ the rest of the rough edges:
   spreads across connections or cores. on the channel fan-out benchmark this is
   the difference between ~46ms pinned and ~130-170ms when the pipeline splits
   across two workers — placement is the biggest remaining cost on coordinated
-  shapes, and today it falls where first-resume luck puts it
+  shapes. a spawn wakes one worker rather than the pool, which makes a split much
+  rarer than it was, but first-resume still decides it and nothing moves a task
+  afterwards

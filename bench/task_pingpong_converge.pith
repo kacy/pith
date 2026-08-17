@@ -1,0 +1,84 @@
+# task_pingpong_converge — does a pair's handoff cost change over its lifetime?
+#
+# The other two ping-pong benchmarks answer "what does a handoff cost" and "how
+# often does a pair land split". This one answers the question that actually
+# gates task migration, and it does so with a DURATION rather than a rate —
+# which matters, because the rate wanders and a duration does not.
+#
+# A green task pins to the worker that first runs it. So today a pair that
+# starts split stays split for its whole life, and the prediction is that every
+# window of a run costs the same. Measured baseline, 8 windows x 20k rounds:
+#
+#     colocated   4  4  4  4  4  4  4  3   ms
+#     split      59 60 37 69 44 62 35 38   ms
+#     split      42 40 40 37 37 42 36 48   ms
+#
+# Flat either way, ~10x apart, no overlap. That is the "before".
+#
+# If the runtime could re-home a parked task to the worker that keeps waking it,
+# a split pair would converge: the first window or two expensive, the rest at
+# the colocated cost. So the acceptance test for migration is a single run whose
+# cost DROPS partway through — no threshold on frequency, no batching, no
+# statistics. One run answers it.
+#
+#   pith build bench/task_pingpong_converge.pith
+#   ./bench/task_pingpong_converge 8 20000      # windows, rounds per window
+#   PITH_GREEN_WORKERS=1 ./bench/task_pingpong_converge   # always colocated
+#
+# Run it a few times to catch a split pair — they are a minority (~11% of pairs
+# on a 2-core box; see task_pingpong_trials for why that number is awkward to
+# pin down).
+
+fn ponger(req: Channel[Int], rsp: Channel[Int]) -> Int:
+    mut seen := 0
+    while true:
+        if let value = req.recv():
+            if value < 0:
+                break
+            rsp.send(value + 1)
+            seen = seen + 1
+        else:
+            break
+    return seen
+
+# runs `windows` batches of `per` round trips over ONE pair of channels, timing
+# each window separately, so the cost is sampled repeatedly across one pair's
+# lifetime rather than once per pair.
+fn pinger(req: Channel[Int], rsp: Channel[Int], windows: Int, per: Int) -> Int:
+    mut w := 0
+    while w < windows:
+        start := time()
+        mut i := 0
+        while i < per:
+            req.send(i)
+            if let back = rsp.recv():
+                i = i + 1
+            else:
+                break
+        elapsed := time() - start
+        print("window {w} {elapsed}ms")
+        w = w + 1
+    req.send(0 - 1)
+    return windows
+
+fn main() -> Int!:
+    argv := args()
+    mut windows := 10
+    mut per := 20000
+    if argv.len() > 1:
+        p := parse_int(argv[1])
+        if p.is_ok and p.ok > 0:
+            windows = p.ok
+    if argv.len() > 2:
+        p2 := parse_int(argv[2])
+        if p2.is_ok and p2.ok > 0:
+            per = p2.ok
+
+    req := Channel[Int](1)
+    rsp := Channel[Int](1)
+    pong := spawn ponger(req, rsp)
+    ping := spawn pinger(req, rsp, windows, per)
+    done := await ping
+    seen := await pong
+    print("done windows={done} seen={seen}")
+    return 0

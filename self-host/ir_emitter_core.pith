@@ -4562,7 +4562,7 @@ fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
     if not ir_func_result_ok_kinds.contains_key(name):
         return
     ok_kind := ir_func_result_ok_kinds[name]
-    if ok_kind != "int" and ok_kind != "bool":
+    if not ir_result_reg_ok_kind_fits(ok_kind):
         return
     # the typed-decode emitters call json/config/toml/yaml helpers by raw
     # name (ir_resolve_json_call_name and friends), bypassing the rcall
@@ -4599,10 +4599,25 @@ fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
 # the defer handshake) or folds the pair into an ordinary result box so every
 # other context — bindings, field reads, argument position, forwarding —
 # behaves exactly as the box world always has.
+# the ok payload kinds the register ABI carries. every entry is one i64
+# register: ints and bools by value, the reference-counted kinds as handles
+# whose count transfers through the register exactly as it transferred
+# through the box's ok slot. Float needs the f64 pair (result_reg_f) and
+# multi-word shapes (tuple, optional) have no single register — excluded.
+fn ir_result_reg_ok_kind_fits(ok_kind: String) -> Bool:
+    if ok_kind == "int" or ok_kind == "bool" or ok_kind == "string" or ok_kind == "bytes":
+        return true
+    if ok_kind == "list" or ok_kind == "list_string" or ok_kind == "map" or ok_kind == "map_int" or ok_kind == "set" or ok_kind == "set_int":
+        return true
+    return ok_kind.starts_with("struct:")
+
 fn ir_emit_result_reg_call(r: Int, fname: String, arg_count: Int, arg_text: String) -> Int:
     flag_r := ir_reg()
     val_r := ir_reg()
-    mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " int " + arg_count.to_string()
+    mut payload_kind := "int"
+    if ir_func_result_ok_kinds.contains_key(fname):
+        payload_kind = ir_func_result_ok_kinds[fname]
+    mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " " + payload_kind + " " + arg_count.to_string()
     if arg_text.len() > 0:
         line = line + arg_text
     ir_emit(line)
@@ -6486,7 +6501,16 @@ fn ir_emit_discard_result(result_r: Int, result_tid: Int):
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
 
 fn ir_emit_catch_expr(node: Node) -> Int:
+    # the pair fast path: a direct call to a pair-returning function delivers
+    # (flag, payload) through the defer handshake and no box exists at all.
+    saved_defer := ir_rcall_defer_idx
+    ir_rcall_defer_idx = node.children[0]
+    ir_rcall_pair_ready = false
     result_r := ir_expr(node.children[0])
+    ir_rcall_defer_idx = saved_defer
+    if ir_rcall_pair_ready:
+        ir_rcall_pair_ready = false
+        return ir_emit_catch_pair(node, ir_rcall_flag_reg, ir_rcall_val_reg)
     result_tid := c_get_expr_type(node.children[0])
     operand_class := ir_extraction_operand_class(node.children[0])
     cond_r := ir_emit_result_flag_field(result_r, "is_ok")
@@ -6759,6 +6783,34 @@ fn ir_emit_ret_err_value(err_r: Int):
         ir_emit("ret2 " + zf.to_string() + " " + err_r.to_string())
     else:
         ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+
+# consume a two-register (flag, payload) result at a `catch` site with no
+# box on either path. the ok payload arrives owned (the callee transferred
+# its count through the register), exactly what a catch value's consumer
+# expects; the err arm owns the error, drops it, and evaluates the fallback
+# in its place — the same ownership contract as the box path's arms.
+fn ir_emit_catch_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
+    result_tid := c_get_expr_type(node.children[0])
+    temp_name := ir_new_temp_name("catch")
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + val_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(fallback_l)
+    err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
+    if err_kind.len() > 0:
+        ir_rc_release_reg(val_r, err_kind)
+    fallback_r := ir_expr(node.children[1])
+    if ir_string_expr_is_borrowed(node.children[1]):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_infer_type(node.children[1])))
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
 
 # unpack a result box into the two-register return: branch on its flag and
 # ret2 each slot's payload from its own arm. run defers and cleanup before

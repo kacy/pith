@@ -58,7 +58,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
-from ir_result_abi import ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
+from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
@@ -133,7 +133,6 @@ mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
 
-mut ir_func_result_ok_kinds: Map[String, String] := {}
 # `threadlocal` module globals: name -> a process-unique slot id, and name ->
 # the global's ir retkind (for the init thunk header + access typing). Reads and
 # writes of these names route through pith_tls_get_or_init / pith_tls_set instead
@@ -153,7 +152,6 @@ mut ir_named_fn_value_wrappers: Map[String, String] := {}
 # eligibility (ir_maybe_register_result_reg) is deliberately narrow for the
 # measured prototype: non-generic free functions whose ok payload is an Int
 # or Bool. the error payload is always a single register (a handle or zero).
-mut ir_result_reg_funcs: Map[String, Bool] := {}
 mut ir_result_reg_flag := 0 - 1
 # the pair handshake: a consumer that can use (flag, payload) directly (the
 # `!` emitter) stores its operand node index here before emitting it; the
@@ -324,8 +322,8 @@ fn ir_reset_type_state():
     ir_impl_method_owner.clear()
     ir_import_renames = {}
     ir_func_returns.clear()
-    ir_func_result_ok_kinds = {}
-    ir_result_reg_funcs = {}
+    ir_func_result_ok_kinds.clear()
+    ir_result_reg_funcs.clear()
     ir_rcall_defer_idx = 0 - 1
     ir_rcall_current_idx = 0 - 1
     ir_rcall_pair_ready = false
@@ -4566,18 +4564,6 @@ fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
     ok_kind := ir_func_result_ok_kinds[name]
     if not ir_result_reg_ok_kind_fits(ok_kind):
         return
-    # the typed-decode emitters call json/config/toml/yaml helpers by raw
-    # name (ir_resolve_json_call_name and friends), bypassing the rcall
-    # hooks — a plain `call` into a pair-returning function reads the flag
-    # as the value. keep those modules on the box ABI until the raw decode
-    # call sites learn the pair. each module compiles in its own emitter
-    # pass with UNPREFIXED names (the driver adds std_json_ when combining),
-    # so the module identity comes from the current module path, not the
-    # registered name.
-    if name.starts_with("std_json_") or name.starts_with("std_config_") or name.starts_with("std_toml_") or name.starts_with("std_yaml_"):
-        return
-    if home_module.contains("json") or home_module.contains("config") or home_module.contains("toml") or home_module.contains("yaml"):
-        return
     # a declaration containing a lambda or a spawn is excluded: their bodies
     # are emitted as separate single-return functions while the enclosing
     # function's return kind is still in effect, so a `fail` or `!` inside
@@ -4607,8 +4593,8 @@ fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
 # names. a generic impl target is excluded the same way a generic function
 # is — its methods re-emit per specialization while this registry keys the
 # base name. beyond that the gate matches the free-function one exactly,
-# including the json-family home-module exclusion and the lambda/spawn
-# body exclusion (see ir_maybe_register_result_reg for both rationales).
+# including the lambda/spawn body exclusion (see ir_maybe_register_result_reg
+# for the rationale).
 fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     if not ir_result_reg_enabled():
         return
@@ -4622,11 +4608,6 @@ fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, metho
         return
     ok_kind := ir_method_result_ok_kind(impl_type, method_idx)
     if not ir_result_reg_ok_kind_fits(ok_kind):
-        return
-    mut home := module_path
-    if home.len() == 0:
-        home = ir_current_module_path
-    if home.contains("json") or home.contains("config") or home.contains("toml") or home.contains("yaml"):
         return
     for child_idx in method_node.children:
         if ir_node_contains_lambda_or_spawn(child_idx):

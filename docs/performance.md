@@ -328,9 +328,16 @@ echo holds at ~+4% (median 226 to 217 µs); conc=8 stays put. unwrap_or
 and `catch:` blocks then joined the same handshake `!` and inline catch
 use, so every result-consuming form now runs box-free on a direct
 pair-returning call — a 200k-round unwrap_or/block-catch loop fell from
-400,032 struct allocations to zero. still boxed: Float results, the
-json/config/toml/yaml modules, and interface-impl and generic-impl
-methods — the remaining slices of a default-on decision.
+400,032 struct allocations to zero. the json/config/toml/yaml family
+then joined too: those modules were excluded wholesale because their
+typed-decode emitters call helpers by resolved name outside the normal
+call paths, and a plain call into a pair-returning function reads the
+flag as the value — the decode call sites now consult the registry and
+fold a registered helper's pair back into the box the decode machinery
+expects. that put the flag on the event ledger benchmark for the first
+time: total 355 to ~320 ms (−10%) with an identical digest. still
+boxed: Float results and interface-impl and generic-impl methods — the
+last slices of a default-on decision.
 
 the green backend (see `docs/concurrency.md`) is that same in-userspace
 scheduler, and this benchmark is the case it was built

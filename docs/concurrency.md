@@ -318,6 +318,23 @@ heap instead of blocking the worker, so a task sleeping out a backoff — or a
 `select` idling between probes — costs nothing but its own time. that reactor
 is also why the default is linux-only; see "which backend to use".
 
+where a task runs is decided once. a task pins to the worker that first runs it
+and stays there — a suspended coroutine may hold live pith stack, so moving it
+between threads is not safe. that makes the placement a pair of communicating
+tasks happens to get a lasting property of the program, and the two cases cost
+very differently: colocated, each handoff is the userspace switch above; split
+across workers, each one is a park and a futex wake. a two-task ping-pong
+measured ~0.2us per round colocated and ~19us split.
+
+workers therefore look for work for a short while before parking, so a handoff
+already in flight is caught without a kernel round trip. that spin is only paid
+by a worker that ran something recently: once a worker has idled long enough to
+back its park timeout off it parks directly, and an idle pool stays quiet. the
+spin narrows the split case rather than removing it — a pipeline that lands
+split is still the slower arrangement, and `PITH_GREEN_WORKERS=1` is worth
+trying for a workload that is one request/response chain rather than genuine
+fan-out.
+
 a read deadline survives that translation. `tcp.set_timeout` stores the deadline
 on the socket itself, and the reactor wait is bounded by it: a read that reaches
 the deadline with nothing to show for it fails, which is exactly what happens on

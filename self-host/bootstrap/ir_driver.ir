@@ -13508,388 +13508,389 @@ func errors_render_diagnostics 2 string
 param diags
 param source
 iconst 2 0
-store output 2
-load 3 output
-strref 4 m7s0
-call 5 pith_cstring_release void 1 3
-store output 4
-load 6 diags
-call 7 pith_auto_len int 1 6
-iconst 8 0
-store __for_idx_22 8
-store __for_len_22 7
-store __for_iter_22 6
+store source_lines 2
+iconst 3 0
+store rendered 3
+load 4 source_lines
+load 5 source
+call 6 std_strings_lines_keep_empty list_string 1 5
+call 7 pith_list_release_handle void 1 4
+store source_lines 6
+load 8 rendered
+call 9 pith_list_new_cstr list 0
+call 10 pith_list_release_handle void 1 8
+store rendered 9
+load 11 diags
+call 12 pith_auto_len int 1 11
+iconst 13 0
+store __for_idx_22 13
+store __for_len_22 12
+store __for_iter_22 11
 label L0
-load 9 __for_idx_22
-load 10 __for_len_22
-lt 11 9 10
-brif 11 L1 L3
+load 14 __for_idx_22
+load 15 __for_len_22
+lt 16 14 15
+brif 16 L1 L3
 label L1
-load 12 __for_iter_22
-load 13 __for_idx_22
-call 14 pith_list_get_value unknown 2 12 13
-store __loopvar_22_d 14
-load 15 output
-load 16 output
-load 17 __loopvar_22_d
-load 18 source
-call 19 errors_render_single_diagnostic string 2 17 18
-concat 20 16 19
-call 21 pith_cstring_release void 1 19
-call 22 pith_cstring_release void 1 15
-store output 20
+load 17 __for_iter_22
+load 18 __for_idx_22
+call 19 pith_list_get_value unknown 2 17 18
+store __loopvar_22_d 19
+load 20 rendered
+load 21 __loopvar_22_d
+load 22 source_lines
+call 23 errors_render_single_diagnostic string 2 21 22
+call 24 pith_list_push_value_owned void 2 20 23
 label L2
-load 23 __for_idx_22
-iconst 24 1
-add 25 23 24
-store __for_idx_22 25
+load 25 __for_idx_22
+iconst 26 1
+add 27 25 26
+store __for_idx_22 27
 jmp L0
 label L3
-load 26 output
-ret 26
-load 27 output
-call 28 pith_cstring_release void 1 27
-iconst 29 0
-ret 29
+load 28 rendered
+strref 29 m7s0
+call 30 list_join string 2 28 29
+call 31 pith_cstring_release void 1 29
+load 32 source_lines
+call 33 pith_list_release_handle void 1 32
+load 34 rendered
+call 35 pith_list_release_handle void 1 34
+ret 30
+load 36 source_lines
+call 37 pith_list_release_handle void 1 36
+load 38 rendered
+call 39 pith_list_release_handle void 1 38
+iconst 40 0
+ret 40
 endfunc
 func errors_render_single_diagnostic 2 string
 param d
-param source
+param source_lines
 iconst 2 0
 store output 2
 iconst 3 0
 store location 3
 iconst 4 0
-store lines 4
+store source_line 4
 iconst 5 0
-store source_line 5
-iconst 6 0
-store line_num 6
-load 7 output
-strref 8 m7s0
-call 9 pith_cstring_release void 1 7
-store output 8
-load 10 location
-strref 11 m7s0
-call 12 pith_cstring_release void 1 10
-store location 11
-load 13 d
-field 14 13 24 string file
-strref 15 m7s0
-call 17 pith_cstring_eq bool 2 14 15
-iconst 18 1
-sub 16 18 17
-call 19 pith_cstring_release void 1 15
-brif 16 L5 L6
+store line_num 5
+load 6 output
+strref 7 m7s0
+call 8 pith_cstring_release void 1 6
+store output 7
+load 9 location
+strref 10 m7s0
+call 11 pith_cstring_release void 1 9
+store location 10
+load 12 d
+field 13 12 24 string file
+strref 14 m7s0
+call 16 pith_cstring_eq bool 2 13 14
+iconst 17 1
+sub 15 17 16
+call 18 pith_cstring_release void 1 14
+brif 15 L5 L6
 label L5
-load 20 location
-load 21 d
-field 22 21 24 string file
-call 23 pith_cstring_retain void 1 22
-call 24 pith_cstring_release void 1 20
-store location 22
-load 25 d
-field 26 25 32 int line
-iconst 27 0
-gt 28 26 27
-brif 28 L8 L9
+load 19 location
+load 20 d
+field 21 20 24 string file
+call 22 pith_cstring_retain void 1 21
+call 23 pith_cstring_release void 1 19
+store location 21
+load 24 d
+field 25 24 32 int line
+iconst 26 0
+gt 27 25 26
+brif 27 L8 L9
 label L8
+load 28 location
 load 29 location
-load 30 location
-strref 31 m7s104
-concat 32 30 31
-call 33 pith_cstring_release void 1 31
-load 34 d
-field 35 34 32 int line
-call 36 int_to_string string 1 35
-concat 37 32 36
-call 38 pith_cstring_release void 1 32
-call 39 pith_cstring_release void 1 36
-call 40 pith_cstring_release void 1 29
-store location 37
-load 41 d
-field 42 41 40 int col
-iconst 43 0
-gt 44 42 43
-brif 44 L11 L12
+strref 30 m7s104
+concat 31 29 30
+call 32 pith_cstring_release void 1 30
+load 33 d
+field 34 33 32 int line
+call 35 int_to_string string 1 34
+concat 36 31 35
+call 37 pith_cstring_release void 1 31
+call 38 pith_cstring_release void 1 35
+call 39 pith_cstring_release void 1 28
+store location 36
+load 40 d
+field 41 40 40 int col
+iconst 42 0
+gt 43 41 42
+brif 43 L11 L12
 label L11
+load 44 location
 load 45 location
-load 46 location
-strref 47 m7s104
-concat 48 46 47
-call 49 pith_cstring_release void 1 47
-load 50 d
-field 51 50 40 int col
-call 52 int_to_string string 1 51
-concat 53 48 52
-call 54 pith_cstring_release void 1 48
-call 55 pith_cstring_release void 1 52
-call 56 pith_cstring_release void 1 45
-store location 53
+strref 46 m7s104
+concat 47 45 46
+call 48 pith_cstring_release void 1 46
+load 49 d
+field 50 49 40 int col
+call 51 int_to_string string 1 50
+concat 52 47 51
+call 53 pith_cstring_release void 1 47
+call 54 pith_cstring_release void 1 51
+call 55 pith_cstring_release void 1 44
+store location 52
 jmp L10
 label L12
 label L10
 jmp L7
 label L9
 label L7
+load 56 location
 load 57 location
-load 58 location
-strref 59 m7s118
-concat 60 58 59
-call 61 pith_cstring_release void 1 59
-call 62 pith_cstring_release void 1 57
-store location 60
+strref 58 m7s118
+concat 59 57 58
+call 60 pith_cstring_release void 1 58
+call 61 pith_cstring_release void 1 56
+store location 59
 jmp L4
 label L6
 label L4
-load 63 d
-field 64 63 8 string code
-strref 65 m7s0
-call 67 pith_cstring_eq bool 2 64 65
-iconst 68 1
-sub 66 68 67
-call 69 pith_cstring_release void 1 65
-brif 66 L14 L15
+load 62 d
+field 63 62 8 string code
+strref 64 m7s0
+call 66 pith_cstring_eq bool 2 63 64
+iconst 67 1
+sub 65 67 66
+call 68 pith_cstring_release void 1 64
+brif 65 L14 L15
 label L14
+load 69 output
 load 70 output
-load 71 output
-load 72 location
-concat 73 71 72
-load 74 d
-field 75 74 0 string severity
-concat 76 73 75
-call 77 pith_cstring_release void 1 73
-strref 78 m7s113
-concat 79 76 78
-call 80 pith_cstring_release void 1 76
-call 81 pith_cstring_release void 1 78
-load 82 d
-field 83 82 8 string code
-concat 84 79 83
-call 85 pith_cstring_release void 1 79
-strref 86 m7s119
-concat 87 84 86
-call 88 pith_cstring_release void 1 84
-call 89 pith_cstring_release void 1 86
-load 90 d
-field 91 90 16 string message
-concat 92 87 91
-call 93 pith_cstring_release void 1 87
-iconst 94 10
-call 95 chr string 1 94
-concat 96 92 95
-call 97 pith_cstring_release void 1 92
-call 98 pith_cstring_release void 1 95
-call 99 pith_cstring_release void 1 70
-store output 96
+load 71 location
+concat 72 70 71
+load 73 d
+field 74 73 0 string severity
+concat 75 72 74
+call 76 pith_cstring_release void 1 72
+strref 77 m7s113
+concat 78 75 77
+call 79 pith_cstring_release void 1 75
+call 80 pith_cstring_release void 1 77
+load 81 d
+field 82 81 8 string code
+concat 83 78 82
+call 84 pith_cstring_release void 1 78
+strref 85 m7s119
+concat 86 83 85
+call 87 pith_cstring_release void 1 83
+call 88 pith_cstring_release void 1 85
+load 89 d
+field 90 89 16 string message
+concat 91 86 90
+call 92 pith_cstring_release void 1 86
+iconst 93 10
+call 94 chr string 1 93
+concat 95 91 94
+call 96 pith_cstring_release void 1 91
+call 97 pith_cstring_release void 1 94
+call 98 pith_cstring_release void 1 69
+store output 95
 jmp L13
 label L15
+load 99 output
 load 100 output
-load 101 output
-load 102 location
-concat 103 101 102
-load 104 d
-field 105 104 0 string severity
-concat 106 103 105
-call 107 pith_cstring_release void 1 103
-strref 108 m7s118
-concat 109 106 108
-call 110 pith_cstring_release void 1 106
-call 111 pith_cstring_release void 1 108
-load 112 d
-field 113 112 16 string message
-concat 114 109 113
-call 115 pith_cstring_release void 1 109
-iconst 116 10
-call 117 chr string 1 116
-concat 118 114 117
-call 119 pith_cstring_release void 1 114
-call 120 pith_cstring_release void 1 117
-call 121 pith_cstring_release void 1 100
-store output 118
+load 101 location
+concat 102 100 101
+load 103 d
+field 104 103 0 string severity
+concat 105 102 104
+call 106 pith_cstring_release void 1 102
+strref 107 m7s118
+concat 108 105 107
+call 109 pith_cstring_release void 1 105
+call 110 pith_cstring_release void 1 107
+load 111 d
+field 112 111 16 string message
+concat 113 108 112
+call 114 pith_cstring_release void 1 108
+iconst 115 10
+call 116 chr string 1 115
+concat 117 113 116
+call 118 pith_cstring_release void 1 113
+call 119 pith_cstring_release void 1 116
+call 120 pith_cstring_release void 1 99
+store output 117
 label L13
-load 122 d
-field 123 122 32 int line
-iconst 124 0
-gt 125 123 124
-brif 125 L17 L18
+load 121 d
+field 122 121 32 int line
+iconst 123 0
+gt 124 122 123
+brif 124 L17 L18
 label L17
-load 126 lines
-load 127 source
-call 128 std_strings_lines_keep_empty list_string 1 127
-call 129 pith_list_release_handle void 1 126
-store lines 128
-load 130 d
-field 131 130 32 int line
-iconst 132 1
-sub 133 131 132
-store line_idx 133
-iconst 134 0
-store __and_134_22 134
-load 135 line_idx
-iconst 136 0
-gte 137 135 136
-store __and_134_22 137
-brif 137 L22 L23
+load 125 d
+field 126 125 32 int line
+iconst 127 1
+sub 128 126 127
+store line_idx 128
+iconst 129 0
+store __and_129_22 129
+load 130 line_idx
+iconst 131 0
+gte 132 130 131
+store __and_129_22 132
+brif 132 L22 L23
 label L22
-load 138 line_idx
-load 139 lines
-call 140 pith_list_len int 1 139
-lt 141 138 140
-store __and_134_22 141
+load 133 line_idx
+load 134 source_lines
+call 135 pith_list_len int 1 134
+lt 136 133 135
+store __and_129_22 136
 label L23
-load 142 __and_134_22
-brif 142 L20 L21
+load 137 __and_129_22
+brif 137 L20 L21
 label L20
-load 143 source_line
-load 144 lines
-load 145 line_idx
-call 146 pith_list_get_value_strict string 2 144 145
-call 147 pith_cstring_retain void 1 146
-call 148 pith_cstring_release void 1 143
-store source_line 146
-load 149 line_num
-load 150 d
-field 151 150 32 int line
-call 152 int_to_string string 1 151
-call 153 pith_cstring_release void 1 149
-store line_num 152
-load 154 output
-load 155 output
-strref 156 m7s117
-concat 157 155 156
-call 158 pith_cstring_release void 1 156
-load 159 line_num
-concat 160 157 159
-call 161 pith_cstring_release void 1 157
-strref 162 m7s116
-concat 163 160 162
-call 164 pith_cstring_release void 1 160
-call 165 pith_cstring_release void 1 162
-load 166 source_line
-concat 167 163 166
-call 168 pith_cstring_release void 1 163
-iconst 169 10
-call 170 chr string 1 169
-concat 171 167 170
-call 172 pith_cstring_release void 1 167
-call 173 pith_cstring_release void 1 170
-call 174 pith_cstring_release void 1 154
-store output 171
-load 175 line_num
-call 176 string_len int 1 175
-iconst 177 4
-add 178 176 177
-store margin_width 178
-iconst 179 0
-store j 179
+load 138 source_line
+load 139 source_lines
+load 140 line_idx
+call 141 pith_list_get_value_strict string 2 139 140
+call 142 pith_cstring_retain void 1 141
+call 143 pith_cstring_release void 1 138
+store source_line 141
+load 144 line_num
+load 145 d
+field 146 145 32 int line
+call 147 int_to_string string 1 146
+call 148 pith_cstring_release void 1 144
+store line_num 147
+load 149 output
+load 150 output
+strref 151 m7s117
+concat 152 150 151
+call 153 pith_cstring_release void 1 151
+load 154 line_num
+concat 155 152 154
+call 156 pith_cstring_release void 1 152
+strref 157 m7s116
+concat 158 155 157
+call 159 pith_cstring_release void 1 155
+call 160 pith_cstring_release void 1 157
+load 161 source_line
+concat 162 158 161
+call 163 pith_cstring_release void 1 158
+iconst 164 10
+call 165 chr string 1 164
+concat 166 162 165
+call 167 pith_cstring_release void 1 162
+call 168 pith_cstring_release void 1 165
+call 169 pith_cstring_release void 1 149
+store output 166
+load 170 line_num
+call 171 string_len int 1 170
+iconst 172 4
+add 173 171 172
+store margin_width 173
+iconst 174 0
+store j 174
 label L24
-load 180 j
-load 181 margin_width
-load 182 d
-field 183 182 40 int col
-add 184 181 183
-lt 185 180 184
-brif 185 L25 L26
+load 175 j
+load 176 margin_width
+load 177 d
+field 178 177 40 int col
+add 179 176 178
+lt 180 175 179
+brif 180 L25 L26
 label L25
-load 186 output
-load 187 output
-strref 188 m7s2
-concat 189 187 188
-call 190 pith_cstring_release void 1 188
-call 191 pith_cstring_release void 1 186
-store output 189
-load 192 j
-iconst 193 1
-add 194 192 193
-store j 194
+load 181 output
+load 182 output
+strref 183 m7s2
+concat 184 182 183
+call 185 pith_cstring_release void 1 183
+call 186 pith_cstring_release void 1 181
+store output 184
+load 187 j
+iconst 188 1
+add 189 187 188
+store j 189
 jmp L24
 label L26
-load 195 output
-load 196 output
-strref 197 m7s115
-concat 198 196 197
-call 199 pith_cstring_release void 1 197
-iconst 200 10
-call 201 chr string 1 200
-concat 202 198 201
-call 203 pith_cstring_release void 1 198
-call 204 pith_cstring_release void 1 201
-call 205 pith_cstring_release void 1 195
-store output 202
+load 190 output
+load 191 output
+strref 192 m7s115
+concat 193 191 192
+call 194 pith_cstring_release void 1 192
+iconst 195 10
+call 196 chr string 1 195
+concat 197 193 196
+call 198 pith_cstring_release void 1 193
+call 199 pith_cstring_release void 1 196
+call 200 pith_cstring_release void 1 190
+store output 197
 jmp L19
 label L21
 label L19
 jmp L16
 label L18
 label L16
-load 206 d
-field 207 206 48 string fix
-strref 208 m7s0
-call 210 pith_cstring_eq bool 2 207 208
-iconst 211 1
-sub 209 211 210
-call 212 pith_cstring_release void 1 208
-brif 209 L28 L29
+load 201 d
+field 202 201 48 string fix
+strref 203 m7s0
+call 205 pith_cstring_eq bool 2 202 203
+iconst 206 1
+sub 204 206 205
+call 207 pith_cstring_release void 1 203
+brif 204 L28 L29
 label L28
-load 213 output
-load 214 output
-strref 215 m7s114
-concat 216 214 215
-call 217 pith_cstring_release void 1 215
-load 218 d
-field 219 218 48 string fix
-concat 220 216 219
-call 221 pith_cstring_release void 1 216
-iconst 222 10
-call 223 chr string 1 222
-concat 224 220 223
-call 225 pith_cstring_release void 1 220
-call 226 pith_cstring_release void 1 223
-call 227 pith_cstring_release void 1 213
-store output 224
+load 208 output
+load 209 output
+strref 210 m7s114
+concat 211 209 210
+call 212 pith_cstring_release void 1 210
+load 213 d
+field 214 213 48 string fix
+concat 215 211 214
+call 216 pith_cstring_release void 1 211
+iconst 217 10
+call 218 chr string 1 217
+concat 219 215 218
+call 220 pith_cstring_release void 1 215
+call 221 pith_cstring_release void 1 218
+call 222 pith_cstring_release void 1 208
+store output 219
 jmp L27
 label L29
 label L27
-load 228 output
-load 229 output
-iconst 230 10
-call 231 chr string 1 230
-concat 232 229 231
-call 233 pith_cstring_release void 1 231
-call 234 pith_cstring_release void 1 228
-store output 232
-load 235 output
-load 236 location
-call 237 pith_cstring_release void 1 236
-load 238 lines
-call 239 pith_list_release_handle void 1 238
-load 240 source_line
-call 241 pith_cstring_release void 1 240
-load 242 line_num
-call 243 pith_cstring_release void 1 242
-ret 235
-load 244 output
-call 245 pith_cstring_release void 1 244
-load 246 location
-call 247 pith_cstring_release void 1 246
-load 248 lines
-call 249 pith_list_release_handle void 1 248
-load 250 source_line
-call 251 pith_cstring_release void 1 250
-load 252 line_num
-call 253 pith_cstring_release void 1 252
-iconst 254 0
-ret 254
+load 223 output
+load 224 output
+iconst 225 10
+call 226 chr string 1 225
+concat 227 224 226
+call 228 pith_cstring_release void 1 226
+call 229 pith_cstring_release void 1 223
+store output 227
+load 230 output
+load 231 location
+call 232 pith_cstring_release void 1 231
+load 233 source_line
+call 234 pith_cstring_release void 1 233
+load 235 line_num
+call 236 pith_cstring_release void 1 235
+ret 230
+load 237 output
+call 238 pith_cstring_release void 1 237
+load 239 location
+call 240 pith_cstring_release void 1 239
+load 241 source_line
+call 242 pith_cstring_release void 1 241
+load 243 line_num
+call 244 pith_cstring_release void 1 243
+iconst 245 0
+ret 245
 endfunc
 func errors_render_diagnostics_json 1 string
 param diags
 iconst 1 0
-store output 1
-load 2 output
-strref 3 m7s113
-call 4 pith_cstring_release void 1 2
-store output 3
+store objects 1
+load 2 objects
+call 3 pith_list_new_cstr list 0
+call 4 pith_list_release_handle void 1 2
+store objects 3
 load 5 diags
 call 6 pith_auto_len int 1 5
 iconst 7 0
@@ -13906,56 +13907,41 @@ load 11 __for_iter_23
 load 12 __for_idx_23
 call 13 pith_list_get_value unknown 2 11 12
 store __loopvar_23_d 13
-load 14 __for_idx_23
-store __loopvar_23_i 14
-load 15 __loopvar_23_i
-iconst 16 0
-gt 17 15 16
-brif 17 L35 L36
-label L35
-load 18 output
-load 19 output
-strref 20 m7s38
-concat 21 19 20
-call 22 pith_cstring_release void 1 20
-call 23 pith_cstring_release void 1 18
-store output 21
-jmp L34
-label L36
-label L34
-load 24 output
-load 25 output
-load 26 __loopvar_23_d
-call 27 errors_render_diagnostic_json string 1 26
-concat 28 25 27
-call 29 pith_cstring_release void 1 27
-call 30 pith_cstring_release void 1 24
-store output 28
+load 14 objects
+load 15 __loopvar_23_d
+call 16 errors_render_diagnostic_json string 1 15
+call 17 pith_list_push_value_owned void 2 14 16
 label L32
-load 31 __for_idx_23
-iconst 32 1
-add 33 31 32
-store __for_idx_23 33
+load 18 __for_idx_23
+iconst 19 1
+add 20 18 19
+store __for_idx_23 20
 jmp L30
 label L33
-load 34 output
-load 35 output
-strref 36 m7s112
-concat 37 35 36
-call 38 pith_cstring_release void 1 36
-iconst 39 10
-call 40 chr string 1 39
-concat 41 37 40
-call 42 pith_cstring_release void 1 37
-call 43 pith_cstring_release void 1 40
-call 44 pith_cstring_release void 1 34
-store output 41
-load 45 output
-ret 45
-load 46 output
-call 47 pith_cstring_release void 1 46
-iconst 48 0
-ret 48
+strref 21 m7s113
+load 22 objects
+strref 23 m7s38
+call 24 list_join string 2 22 23
+call 25 pith_cstring_release void 1 23
+concat 26 21 24
+call 27 pith_cstring_release void 1 21
+call 28 pith_cstring_release void 1 24
+strref 29 m7s112
+concat 30 26 29
+call 31 pith_cstring_release void 1 26
+call 32 pith_cstring_release void 1 29
+iconst 33 10
+call 34 chr string 1 33
+concat 35 30 34
+call 36 pith_cstring_release void 1 30
+call 37 pith_cstring_release void 1 34
+load 38 objects
+call 39 pith_list_release_handle void 1 38
+ret 35
+load 40 objects
+call 41 pith_list_release_handle void 1 40
+iconst 42 0
+ret 42
 endfunc
 func errors_render_diagnostic_json 1 string
 param d
@@ -13997,8 +13983,8 @@ call 31 pith_cstring_eq bool 2 28 29
 iconst 32 1
 sub 30 32 31
 call 33 pith_cstring_release void 1 29
-brif 30 L38 L39
-label L38
+brif 30 L35 L36
+label L35
 load 34 output
 load 35 output
 load 36 quote
@@ -14014,8 +14000,8 @@ concat 45 41 44
 call 46 pith_cstring_release void 1 41
 call 47 pith_cstring_release void 1 34
 store output 45
-jmp L37
-label L39
+jmp L34
+label L36
 load 48 output
 load 49 output
 strref 50 m7s103
@@ -14023,7 +14009,7 @@ concat 51 49 50
 call 52 pith_cstring_release void 1 50
 call 53 pith_cstring_release void 1 48
 store output 51
-label L37
+label L34
 load 54 output
 load 55 output
 strref 56 m7s38
@@ -14085,8 +14071,8 @@ call 110 pith_cstring_eq bool 2 107 108
 iconst 111 1
 sub 109 111 110
 call 112 pith_cstring_release void 1 108
-brif 109 L41 L42
-label L41
+brif 109 L38 L39
+label L38
 load 113 output
 load 114 output
 load 115 quote
@@ -14102,8 +14088,8 @@ concat 124 120 123
 call 125 pith_cstring_release void 1 120
 call 126 pith_cstring_release void 1 113
 store output 124
-jmp L40
-label L42
+jmp L37
+label L39
 load 127 output
 load 128 output
 strref 129 m7s103
@@ -14111,7 +14097,7 @@ concat 130 128 129
 call 131 pith_cstring_release void 1 129
 call 132 pith_cstring_release void 1 127
 store output 130
-label L40
+label L37
 load 133 output
 load 134 output
 strref 135 m7s38
@@ -14227,8 +14213,8 @@ call 241 pith_cstring_eq bool 2 238 239
 iconst 242 1
 sub 240 242 241
 call 243 pith_cstring_release void 1 239
-brif 240 L44 L45
-label L44
+brif 240 L41 L42
+label L41
 load 244 output
 load 245 output
 load 246 quote
@@ -14244,8 +14230,8 @@ concat 255 251 254
 call 256 pith_cstring_release void 1 251
 call 257 pith_cstring_release void 1 244
 store output 255
-jmp L43
-label L45
+jmp L40
+label L42
 load 258 output
 load 259 output
 strref 260 m7s103
@@ -14253,7 +14239,7 @@ concat 261 259 260
 call 262 pith_cstring_release void 1 260
 call 263 pith_cstring_release void 1 258
 store output 261
-label L43
+label L40
 load 264 output
 load 265 output
 iconst 266 125
@@ -14301,12 +14287,12 @@ iconst 17 0
 store __for_idx_24 17
 store __for_len_24 16
 store __for_iter_24 15
-label L46
+label L43
 load 18 __for_idx_24
 load 19 __for_len_24
 lt 20 18 19
-brif 20 L47 L49
-label L47
+brif 20 L44 L46
+label L44
 load 21 __for_iter_24
 load 22 __for_idx_24
 call 23 pith_cstring_char_at string 2 21 22
@@ -14314,8 +14300,8 @@ store __loopvar_24_ch 23
 load 24 __loopvar_24_ch
 load 25 quote
 call 26 pith_cstring_eq bool 2 24 25
-brif 26 L51 L52
-label L51
+brif 26 L48 L49
+label L48
 load 27 output
 load 28 output
 load 29 backslash
@@ -14325,13 +14311,13 @@ concat 32 30 31
 call 33 pith_cstring_release void 1 30
 call 34 pith_cstring_release void 1 27
 store output 32
-jmp L50
-label L52
+jmp L47
+label L49
 load 35 __loopvar_24_ch
 load 36 backslash
 call 37 pith_cstring_eq bool 2 35 36
-brif 37 L53 L54
-label L53
+brif 37 L50 L51
+label L50
 load 38 output
 load 39 output
 load 40 backslash
@@ -14341,15 +14327,15 @@ concat 43 41 42
 call 44 pith_cstring_release void 1 41
 call 45 pith_cstring_release void 1 38
 store output 43
-jmp L50
-label L54
+jmp L47
+label L51
 load 46 __loopvar_24_ch
 iconst 47 10
 call 48 chr string 1 47
 call 49 pith_cstring_eq bool 2 46 48
 call 50 pith_cstring_release void 1 48
-brif 49 L55 L56
-label L55
+brif 49 L52 L53
+label L52
 load 51 output
 load 52 output
 load 53 backslash
@@ -14360,15 +14346,15 @@ call 57 pith_cstring_release void 1 54
 call 58 pith_cstring_release void 1 55
 call 59 pith_cstring_release void 1 51
 store output 56
-jmp L50
-label L56
+jmp L47
+label L53
 load 60 __loopvar_24_ch
 iconst 61 9
 call 62 chr string 1 61
 call 63 pith_cstring_eq bool 2 60 62
 call 64 pith_cstring_release void 1 62
-brif 63 L57 L58
-label L57
+brif 63 L54 L55
+label L54
 load 65 output
 load 66 output
 load 67 backslash
@@ -14379,22 +14365,22 @@ call 71 pith_cstring_release void 1 68
 call 72 pith_cstring_release void 1 69
 call 73 pith_cstring_release void 1 65
 store output 70
-jmp L50
-label L58
+jmp L47
+label L55
 load 74 output
 load 75 output
 load 76 __loopvar_24_ch
 concat 77 75 76
 call 78 pith_cstring_release void 1 74
 store output 77
-label L50
-label L48
+label L47
+label L45
 load 79 __for_idx_24
 iconst 80 1
 add 81 79 80
 store __for_idx_24 81
-jmp L46
-label L49
+jmp L43
+label L46
 load 82 output
 load 83 quote
 call 84 pith_cstring_release void 1 83
@@ -14420,12 +14406,12 @@ iconst 4 0
 store __for_idx_25 4
 store __for_len_25 3
 store __for_iter_25 2
-label L59
+label L56
 load 5 __for_idx_25
 load 6 __for_len_25
 lt 7 5 6
-brif 7 L60 L62
-label L60
+brif 7 L57 L59
+label L57
 load 8 __for_iter_25
 load 9 __for_idx_25
 call 10 pith_list_get_value unknown 2 8 9
@@ -14435,22 +14421,22 @@ field 12 11 0 string severity
 strref 13 m7s100
 call 14 pith_cstring_eq bool 2 12 13
 call 15 pith_cstring_release void 1 13
-brif 14 L64 L65
-label L64
+brif 14 L61 L62
+label L61
 load 16 count
 iconst 17 1
 add 18 16 17
 store count 18
-jmp L63
-label L65
-label L63
-label L61
+jmp L60
+label L62
+label L60
+label L58
 load 19 __for_idx_25
 iconst 20 1
 add 21 19 20
 store __for_idx_25 21
-jmp L59
-label L62
+jmp L56
+label L59
 load 22 count
 ret 22
 iconst 23 0

@@ -16,13 +16,26 @@ pub struct Diagnostic:
 
 # render all diagnostics as human-readable text with source context.
 pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
-    mut output := ""
+    # split the file once for the whole batch and join the rendered
+    # diagnostics once at the end. doing either per diagnostic made
+    # rendering cost the square of the count, and a file that fails to
+    # check tends to fail in a lot of places at once: 4000 diagnostics
+    # took over half a minute to print.
+    #
+    # split() would drop empty segments, so every blank line in the file
+    # would shift the snippet up by one: a diagnostic reported at line 8
+    # of a file with three blank lines above it printed line 11 instead,
+    # and anything past the last non-empty segment printed no snippet at
+    # all. the line number in the header was right the whole time — only
+    # the source line under it was wrong, which is worse than no snippet.
+    source_lines := lines_keep_empty(source)
+    mut rendered: List[String] := []
     for d in diags:
-        output = output + render_single_diagnostic(d, source)
-    return output
+        rendered.push(render_single_diagnostic(d, source_lines))
+    return rendered.join("")
 
 # render a single diagnostic with source context and underline.
-fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
+fn render_single_diagnostic(d: Diagnostic, source_lines: List[String]) -> String:
     mut output := ""
 
     # header: file + severity + message (with error code)
@@ -42,16 +55,9 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
 
     # source line + underline (only if we have line info)
     if d.line > 0:
-        # split() drops empty segments, so every blank line in the file used to
-        # shift the snippet up by one: a diagnostic reported at line 8 of a file
-        # with three blank lines above it printed line 11 instead, and anything
-        # past the last non-empty segment printed no snippet at all. the line
-        # number in the header was right the whole time — only the source line
-        # under it was wrong, which is worse than no snippet.
-        lines := lines_keep_empty(source)
         line_idx := d.line - 1
-        if line_idx >= 0 and line_idx < lines.len():
-            source_line := lines[line_idx]
+        if line_idx >= 0 and line_idx < source_lines.len():
+            source_line := source_lines[line_idx]
             line_num := d.line.to_string()
             output = output + "  " + line_num + " | " + source_line + chr(10)
 
@@ -72,13 +78,14 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
 
 # render diagnostics as JSON (same format as check_main.pith).
 pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:
-    mut output := "["
-    for d, i in diags:
-        if i > 0:
-            output = output + ","
-        output = output + render_diagnostic_json(d)
-    output = output + "]" + chr(10)
-    return output
+    # one object per slot, joined once — appending each object to the
+    # array text rebuilt the whole array every time, which is the same
+    # quadratic shape the human renderer above had, and nothing caps
+    # how many diagnostics a broken file produces.
+    mut objects: List[String] := []
+    for d in diags:
+        objects.push(render_diagnostic_json(d))
+    return "[" + objects.join(",") + "]" + chr(10)
 
 # render a single diagnostic as a JSON object.
 fn render_diagnostic_json(d: Diagnostic) -> String:

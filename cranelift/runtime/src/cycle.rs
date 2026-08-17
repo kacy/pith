@@ -606,6 +606,13 @@ pub(crate) fn pith_cycle_stop_the_world() -> bool {
         crate::concurrency::green::PITH_PREEMPT_REQUESTED.swap(1, Ordering::SeqCst);
     PREEMPT_PRIOR.store(prior, Ordering::SeqCst);
     PREEMPT_SAVED.store(true, Ordering::SeqCst);
+    // the preempt flag only reaches a RUNNING task, at its next back-edge. an
+    // idle worker is asleep in `park` and reaches its mutator gate when that
+    // wait ends, so wake the pool too: a parked worker answers the request
+    // immediately instead of after its park timeout. that timeout backs off
+    // while a worker stays idle, so without this the stop deadline (25 ms by
+    // default) could expire on a pool that was ready to stop instantly.
+    crate::concurrency::green::wake_pool();
     let deadline = Instant::now() + Duration::from_millis(stop_timeout_ms());
     loop {
         if world_is_stopped() {

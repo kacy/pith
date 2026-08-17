@@ -186,6 +186,17 @@ const QUANTUM_EPOCHS: u64 = 1;
 /// how often the monitor thread wakes to bump the epoch and scan the workers.
 const MONITOR_INTERVAL: Duration = Duration::from_millis(10);
 
+/// the park timeout a worker starts from, and the ceiling it backs off to
+/// while it keeps finding no work. the minimum is the latency bound that
+/// matters: it only covers the sliver where an enqueue's notify races our
+/// decision to sleep, and any enqueue that loses that race still wakes us
+/// through `wake_worker`. the maximum only bounds how long a worker can
+/// sleep through a wake that never arrives — nothing depends on it for
+/// correctness, since both the enqueue path and the collector's stop
+/// request notify the pool explicitly.
+const PARK_TIMEOUT_MIN: Duration = Duration::from_millis(1);
+const PARK_TIMEOUT_MAX: Duration = Duration::from_millis(32);
+
 /// has the task the given worker is running exceeded its quantum as of `now`?
 /// factored out so both the monitor and `pith_green_maybe_yield` share one
 /// definition of "overrun", and so the epoch arithmetic is unit-testable.
@@ -1441,7 +1452,7 @@ fn wake_worker(index: usize) {
 /// local queue), where any worker is a valid taker, so an idle peer wakes to run
 /// or steal it. this keeps independent fan-out spread across cores; it is not on
 /// the per-message hot path, so it is not a herd.
-fn wake_pool() {
+pub(crate) fn wake_pool() {
     let n = scheduler().workers.len();
     for i in 0..n {
         wake_worker(i);
@@ -1596,9 +1607,16 @@ fn steal_start(n: usize) -> usize {
 
 /// park an idle worker until work likely exists. we re-check for work while
 /// holding `park_lock` to shrink the window where an enqueue+notify slips
-/// between our empty `find_work` and this wait; a short timeout closes the
+/// between our empty `find_work` and this wait; the timeout closes the
 /// window entirely, so a missed wakeup costs latency, never a hang.
-fn park(index: usize) {
+///
+/// the timeout is the caller's: `worker_loop` starts at 1ms and doubles it
+/// on each consecutive timed-out park (capped), so a busy pool keeps the
+/// tight bound while an idle one stops ticking the clock ~1000 times a
+/// second per worker. before the backoff, an idle two-worker process made
+/// ~2,000 failing futex calls per second doing nothing. returns whether
+/// the wait timed out (true) or was cut short by a notify (false).
+fn park(index: usize, timeout: Duration) -> bool {
     let worker = &scheduler().workers[index];
     let guard = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
     // publish the flag BEFORE the final work re-check. an enqueuer publishes
@@ -1610,7 +1628,7 @@ fn park(index: usize) {
     // one last check under the lock: if work appeared, don't sleep.
     if has_any_work(index) {
         worker.parked.store(false, AtomicOrdering::SeqCst);
-        return;
+        return false;
     }
     // profiling: mark ourselves parked so a concurrent wake can be attributed as
     // a real futex wake vs one absorbed by a busy pool.
@@ -1620,15 +1638,16 @@ fn park(index: usize) {
     if stats_on() {
         C_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    let (guard, _) = worker
+    let (guard, wait) = worker
         .park_cv
-        .wait_timeout(guard, Duration::from_millis(1))
+        .wait_timeout(guard, timeout)
         .unwrap_or_else(|p| p.into_inner());
     worker.parked.store(false, AtomicOrdering::SeqCst);
     drop(guard);
     if stats_on() {
         PARKED_WORKERS.fetch_sub(1, AtomicOrdering::Relaxed);
     }
+    wait.timed_out()
 }
 
 /// is there any work *this* worker could actually take? used only to avoid
@@ -1684,9 +1703,17 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
     // must be able to stop. the slot was registered by the spawning thread
     // (see `ensure_workers_started`); adopting it makes it this thread's own.
     crate::cycle::adopt_mutator_slot(cycle_slot);
+    // the park timeout backs off while this worker keeps finding nothing:
+    // the tight bound only earns its keep when a wake is imminent, and an
+    // idle pool paying it forever is pure syscall noise (measured: ~1,000
+    // failing futex waits per second per worker, and the runtime's own
+    // futex traffic scaled linearly with worker count on an idle pool).
+    // any work at all resets it, so a busy pool never sees the long tail.
+    let mut idle_timeout = PARK_TIMEOUT_MIN;
     loop {
         match find_work(index) {
             Some(id) => {
+                idle_timeout = PARK_TIMEOUT_MIN;
                 // between tasks is the worker's stop point: the previous
                 // coroutine is off-CPU and the next has not started, so a
                 // worker parked here holds no pith frame at all.
@@ -1694,11 +1721,17 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 run_task(id)
             }
             None => {
-                // the idle path passes this gate once per park timeout (the
-                // 1ms condvar wait in `park`), so an idle worker answers a
-                // stop request within that bound.
+                // the idle path passes this gate once per park timeout, so an
+                // idle worker answers a stop request within that bound. the
+                // collector raises the preemption flag and notifies the pool
+                // when it wants the world stopped, which cuts a long park
+                // short — the bound below is the fallback, not the mechanism.
                 crate::cycle::mutator_gate();
-                park(index)
+                if park(index, idle_timeout) {
+                    idle_timeout = (idle_timeout * 2).min(PARK_TIMEOUT_MAX);
+                } else {
+                    idle_timeout = PARK_TIMEOUT_MIN;
+                }
             }
         }
     }

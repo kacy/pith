@@ -17,7 +17,12 @@
 # format pith source code, returning a new string with canonical formatting.
 pub fn fmt_source(source: String) -> String:
     lines := split_lines_preserve_empty(source)
-    mut output := ""
+    # each formatted line lands in its own slot and the file is joined
+    # once at the end. appending to a growing string instead rebuilt the
+    # whole file on every line, so formatting cost grew with the square
+    # of the source size — on the 9600-line emitter that was most of the
+    # run, and ci formats every self-hosted file on every push.
+    mut formatted_lines: List[String] := []
     mut consecutive_blank := 0
 
     for raw_line in lines:
@@ -28,7 +33,7 @@ pub fn fmt_source(source: String) -> String:
         if line.len() == 0:
             consecutive_blank = consecutive_blank + 1
             if consecutive_blank <= 1:
-                output = output + chr(10)
+                formatted_lines.push("")
             continue
         consecutive_blank = 0
 
@@ -38,14 +43,15 @@ pub fn fmt_source(source: String) -> String:
             if trimmed[0] == "#":
                 # preserve indentation, normalize comment spacing
                 indent_len := line.len() - trimmed.len()
-                output = output + line.substring(0, indent_len)
-                output = output + format_comment(trimmed)
-                output = output + chr(10)
+                formatted_lines.push(line.substring(0, indent_len) + format_comment(trimmed))
                 continue
 
         # for code lines, normalize spacing
-        output = output + format_code_line(line)
-        output = output + chr(10)
+        formatted_lines.push(format_code_line(line))
+
+    # every slot above stood for a line the old loop terminated with a
+    # newline, so the joined file needs one more to match.
+    mut output := formatted_lines.join(chr(10)) + chr(10)
 
     # ensure exactly one trailing newline
     while output.len() > 1:

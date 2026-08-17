@@ -6,6 +6,16 @@
 #
 # run from the repo root so the pith client can resolve std/ and ir_driver:
 #   bash bench/grpc/run.sh
+#
+# ★ each row runs the three clients in a FIXED order, which is fine for
+# watching one client move against its own history but not for ranking the
+# three against each other — this suite carried an ordering bias worth ~2x
+# until #678. before publishing a comparison, repeat each row with the client
+# order rotated and report the spread across repetitions, not one run.
+#
+# ★★ the server shares this 2-core machine with the client, so the conc=8
+# rows oversubscribe the box by construction. treat them as a symptom
+# detector; the sequential rows are the clean measurement.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)

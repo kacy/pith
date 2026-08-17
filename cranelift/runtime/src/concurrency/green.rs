@@ -265,7 +265,7 @@ pub extern "C" fn pith_green_maybe_yield() {
         return;
     };
     block.word.fetch_or(S_PREEMPT_PENDING, AtomicOrdering::AcqRel);
-    park_current();
+    park_current(id);
 }
 
 /// index into the task slab.
@@ -975,12 +975,6 @@ thread_local! {
     /// both kinds of waiter.
     static CURRENT_TASK: Cell<Option<TaskId>> = const { Cell::new(None) };
 
-    /// raw pointer to the `Yielder` of the task currently running on this worker,
-    /// or null between tasks. `run_task` installs the task's stored pointer before
-    /// each resume; the coroutine body publishes it here on its first run (see
-    /// `green_spawn`). `park_current` reads it to suspend the running task from
-    /// deep inside pith code.
-    static CURRENT_YIELDER: Cell<*const TaskYielder> = const { Cell::new(ptr::null()) };
 }
 
 /// the slab id of the green task running on this worker thread, or `None` when
@@ -991,21 +985,66 @@ pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
 }
 
-/// suspend the currently running green task back to its worker. must be called
-/// only from inside a running green task (guarded by a `current_task()` check),
-/// and only *after* releasing any channel lock — `suspend` returns control to
-/// the worker, which may run other pith code that touches the same channel.
+/// suspend the green task `id` back to its worker. must be called only from
+/// inside that task (every caller has just gone through a `current_task()`
+/// check, and passes the id it got from it), and only *after* releasing any
+/// channel lock — `suspend` returns control to the worker, which may run other
+/// pith code that touches the same channel.
 ///
 /// returns when the task is resumed by a later `wake`.
-pub(crate) fn park_current() {
-    let yielder = CURRENT_YIELDER.with(|c| c.get());
-    debug_assert!(!yielder.is_null(), "park_current with no running coroutine");
-    // SAFETY: `yielder` points at the `Yielder` owned by the coroutine that is
-    // currently executing on this thread. `run_task` installs it before every
-    // resume and it stays valid for the whole time this coroutine is on-CPU,
-    // which is exactly the window in which pith code can reach this call. the
-    // suspend is a stack switch back to the worker; the pointer is not retained.
+///
+/// the id is a parameter rather than a thread-local read for a reason worth
+/// keeping. five call sites park inside a `loop`, and a thread-local read
+/// inside a loop is exactly the shape a compiler may hoist above it: the
+/// second iteration would then suspend through whatever the *first* iteration
+/// loaded. that is harmless only while a task always resumes on the thread it
+/// parked on. the slab id, by contrast, is a plain index that means the same
+/// thing on every thread, and the yielder is read out of the task's own sync
+/// block — so this path holds no thread-derived value at all. see the note on
+/// `debug_assert_stealable` for why that matters.
+pub(crate) fn park_current(id: TaskId) {
+    // SAFETY: the caller is running inside task `id`, which means this worker
+    // holds the Running claim on its block (see the claim protocol on
+    // `SyncBlock`), so reading the cell is exclusive. the pointer was published
+    // by the coroutine body on its first resume and names the `Yielder` living
+    // on that coroutine's own stack, which is the stack we are executing on.
+    let yielder = match sync_block(id) {
+        Some(block) => unsafe { *block.yielder.get() },
+        None => ptr::null(),
+    };
+    // unreachable: a task cannot reach a block site before its body has run and
+    // published the yielder. panic rather than dereference null — `run_task`
+    // catches it, marks the task done and keeps the worker alive, where a null
+    // deref would take the process with it.
+    assert!(
+        !yielder.is_null(),
+        "park_current on a task with no running coroutine (id {id})"
+    );
+    // SAFETY: as above — the `Yielder` is valid for as long as this coroutine is
+    // on-CPU, which is exactly the window in which pith code can reach this
+    // call. the suspend is a stack switch back to the worker; nothing retains
+    // the pointer across it.
     unsafe { &*yielder }.suspend(());
+}
+
+/// record the running coroutine's `Yielder` in its own sync block, so
+/// `park_current` can find it later. called once, at the top of a task body on
+/// its first resume — before the task can possibly reach a block site.
+///
+/// this is a task-entry read of `CURRENT_TASK`, which is the one place the
+/// `CURRENT_*` cells may be consulted: `run_task` has just installed them and
+/// no suspension has happened yet.
+fn publish_yielder(yielder: *const TaskYielder) {
+    let Some(id) = current_task() else {
+        return;
+    };
+    if let Some(block) = sync_block(id) {
+        // SAFETY: this worker holds the Running claim on the block for the whole
+        // resume (see the claim protocol on `SyncBlock`), so the write is
+        // exclusive. the yield arm of `run_task` releases it to the next
+        // claimant through the transition CAS.
+        unsafe { *block.yielder.get() = yielder }
+    }
 }
 
 /// wake a parked green task: move it back onto its owner worker's queue so it
@@ -1131,10 +1170,13 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
     }
 }
 
-/// take (and clear) the value a waker handed to the current task, if any. the
-/// first thing a resumed channel block site checks.
-pub(crate) fn take_handoff() -> Option<i64> {
-    let id = current_task()?;
+/// take (and clear) the value a waker handed to task `id`, if any. the first
+/// thing a resumed channel block site checks.
+///
+/// the id is a parameter for the same reason `park_current` takes one: the one
+/// caller reads it *before* parking and passes it back in afterwards, so the
+/// resumed path never re-derives its identity from a thread-local.
+pub(crate) fn take_handoff(id: TaskId) -> Option<i64> {
     let block = sync_block(id)?;
     // SAFETY: only the running task itself reads its handoff cell, and a
     // claiming waker only writes it while the task is Parked — disjoint by the
@@ -1487,17 +1529,40 @@ fn note_notify() {
 /// talks to each other stops paying a cross-worker wake per message. the state
 /// machine allows it — a parked task's coroutine is back in its block, in no
 /// queue, and the waker that wins the Parked -> Ready CAS could name a new owner
-/// in that same CAS. it was tried and it is fast. it is also **unsound**, and not
-/// because of the stack: the compiler caches the ELF thread-local base in a
-/// coroutine's frame across a suspension, so a coroutine resumed on a different
-/// thread reads the *previous* thread's `CURRENT_TASK`, `CURRENT_WORKER`,
-/// `CURRENT_TLS`, and `CURRENT_YIELDER`. that was observed directly: one physical
-/// thread reporting two different values of `CURRENT_WORKER`, which is written
-/// once at worker startup and never changes. the visible damage was
-/// `take_handoff` returning `None` for a migrated receiver and silently dropping
-/// channel messages. no source-level barrier fixes it — every thread-local read
-/// in every frame that can span a park is exposed. migration needs those reads
-/// eliminated or provably tamed first; it is not a scheduler change.
+/// in that same CAS. it was tried and it is fast. it was also **unsound**, for a
+/// reason that is worth stating precisely, because the earlier note here got it
+/// wrong twice over.
+///
+/// the hazard is not the pith compiler. pith emits no thread-local access at
+/// all: a `threadlocal` global lowers to a CALL (`pith_tls_get_or_init` /
+/// `pith_tls_set`), so there is nothing for it to cache. and `CURRENT_TLS` is
+/// per-TASK, not per-thread, so pith-level thread-locals are migration-correct
+/// by construction.
+///
+/// the hazard is *this file's own Rust frames*. rustc may hoist the address of a
+/// `thread_local!` and reuse it after a suspension, at which point a coroutine
+/// resumed on a different thread reads the previous thread's cell. that was
+/// observed: one physical thread reporting two different values of
+/// `CURRENT_WORKER`, which is written once at worker startup and never changes,
+/// and `take_handoff` returning `None` for a migrated receiver — silently
+/// dropping channel messages.
+///
+/// so the fix is not a barrier, it is removing the reads. the invariant now is:
+///
+///   **the `CURRENT_*` cells may be read only at task entry — from `run_task`
+///   or the top of a coroutine body — and never re-read after a park.**
+///
+/// `park_current` and `take_handoff` take a `TaskId` rather than looking one up,
+/// every block site reads its id once before parking and threads it through by
+/// value, and a slab index means the same thing on every thread. `CURRENT_TLS`
+/// is read only by the FFI, synchronously, inside one pith call. what remains is
+/// `CURRENT_WORKER`, whose staleness can misroute a wake but can never fault.
+///
+/// what is still owed before flipping this on, and it is not a scheduler change:
+/// nobody has checked the object code. the hoisting claim above is an empirical
+/// report plus sound reasoning about LLVM's TLS model, not a disassembly. dump
+/// these functions and confirm no `%fs:`-relative address survives across the
+/// `suspend` call before trusting the invariant to hold in release.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
     if let Some(block) = sync_block(id) {
@@ -1899,9 +1964,9 @@ fn run_task(id: TaskId) {
     //
     // SAFETY: exclusive by the Ready -> Running claim; the previous holder's
     // writes are visible through the word's CAS pairing.
-    let (mut coro, tls_ptr, yielder_ptr) = unsafe {
+    let (mut coro, tls_ptr) = unsafe {
         match (*block.coro.get()).take() {
-            Some(c) => (c, *block.tls.get(), *block.yielder.get()),
+            Some(c) => (c, *block.tls.get()),
             // a claimed task with no coroutine should be impossible; skip
             // defensively rather than panic on a corrupt slot.
             None => return,
@@ -1920,11 +1985,12 @@ fn run_task(id: TaskId) {
     // `threadlocal` FFI, synchronously on this same worker thread while this task
     // is the one running, so no other thread and no other task aliases the map.
     // install this task's identity for the duration of the resume: its tls map
-    // (P1b), its slab id (so channel.rs knows which task to park), and its
-    // yielder pointer (so park_current can suspend it). all restored afterward.
+    // (P1b) and its slab id (so channel.rs knows which task to park). both
+    // restored afterward. the yielder is NOT installed here — it lives in the
+    // task's own sync block, published by the body on its first resume, so the
+    // park path never has to consult a thread-local at all.
     let prev_tls = CURRENT_TLS.with(|c| c.replace(tls_ptr));
     let prev_task = CURRENT_TASK.with(|c| c.replace(Some(id)));
-    let prev_yielder = CURRENT_YIELDER.with(|c| c.replace(yielder_ptr));
 
     // publish this task as the worker's running task and stamp the epoch, so the
     // monitor thread can detect a quantum overrun and set the preempt flag. only
@@ -1966,12 +2032,6 @@ fn run_task(id: TaskId) {
             .store(0, AtomicOrdering::Relaxed);
     }
 
-    // on its first resume the body published its yielder pointer here; read it
-    // back so we can re-install it on later resumes (the body's top does not run
-    // again after a suspend).
-    let new_yielder = CURRENT_YIELDER.with(|c| c.get());
-
-    CURRENT_YIELDER.with(|c| c.set(prev_yielder));
     CURRENT_TASK.with(|c| c.set(prev_task));
     CURRENT_TLS.with(|c| c.set(prev_tls));
 
@@ -2000,17 +2060,19 @@ fn run_task(id: TaskId) {
             // the task suspended: either it parked on a blocking op (a channel, a
             // P2b primitive, or an await), or it was preempted at a safe-point.
             //
-            // put the coroutine back (and record where its yielder lives)
-            // BEFORE the word transition below makes the task claimable: once
-            // the word reads Parked a waker may re-enqueue the task, and its
-            // next resume — always on this same worker, by pinning — must find
-            // the coroutine present. the transition CAS releases these writes
-            // to the next claimant (see the claim protocol on `SyncBlock`).
+            // put the coroutine back BEFORE the word transition below makes the
+            // task claimable: once the word reads Parked a waker may re-enqueue
+            // the task, and its next resume — always on this same worker, by
+            // pinning — must find the coroutine present. the transition CAS
+            // releases this write to the next claimant (see the claim protocol
+            // on `SyncBlock`). the yielder cell needs no write here: the body
+            // published it on its first resume and the `Yielder` lives on the
+            // coroutine's own stack, so the pointer is good for the coroutine's
+            // whole life.
             //
             // SAFETY: we still hold the claim from Ready -> Running.
             unsafe {
                 *block.coro.get() = Some(coro);
-                *block.yielder.get() = new_yielder;
             }
             // then decide how to re-enqueue on the scheduling word:
             //   - the preempt flag: overran its quantum -> `deferred` (lowest
@@ -2086,12 +2148,12 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     let coro = TaskCoroutine::with_stack(
         take_stack(),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            // publish this coroutine's yielder so pith code running on its stack
-            // can suspend the task (via park_current). this runs once, on the
-            // first resume; run_task reads it back and re-installs it on later
-            // resumes, since the body's top does not run again after a suspend.
-            // the pointer stays valid for the whole life of the body.
-            CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+            // publish this coroutine's yielder into the task's own sync block so
+            // pith code running on this stack can suspend the task (via
+            // park_current). this runs once, on the first resume — the body's
+            // top does not run again after a suspend — and the pointer stays
+            // valid for the whole life of the body, so once is enough.
+            publish_yielder(yielder as *const TaskYielder);
             // SAFETY: closure_handle was non-zero at spawn and pith owns the
             // closure's lifetime for the duration of the task; get_fn validates
             // the handle and returns 0 for anything bogus. the transmute matches
@@ -2206,7 +2268,7 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
             Some(id) => {
                 j.green_waiters.push(id);
                 drop(j);
-                park_current();
+                park_current(id);
                 j = lock_join(lock);
             }
         }
@@ -2387,7 +2449,7 @@ mod tests {
         let coro = TaskCoroutine::with_stack(
             corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
             move |yielder: &TaskYielder, _input: ()| -> i64 {
-                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                publish_yielder(yielder as *const TaskYielder);
                 PREEMPT_EPOCH.fetch_add(QUANTUM_EPOCHS + 1, AtomicOrdering::Relaxed);
                 pith_green_maybe_yield();
                 99
@@ -2484,7 +2546,7 @@ mod tests {
         let coro = TaskCoroutine::with_stack(
             corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
             move |yielder: &TaskYielder, _input: ()| -> i64 {
-                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                publish_yielder(yielder as *const TaskYielder);
                 panic!("boom from a green task");
             },
         );
@@ -2526,7 +2588,7 @@ mod tests {
         let coro2 = TaskCoroutine::with_stack(
             corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
             move |yielder: &TaskYielder, _input: ()| -> i64 {
-                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                publish_yielder(yielder as *const TaskYielder);
                 7
             },
         );
@@ -2736,8 +2798,8 @@ mod tests {
         let coro = TaskCoroutine::with_stack(
             corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
             move |yielder: &TaskYielder, _input: ()| -> i64 {
-                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
-                park_current();
+                publish_yielder(yielder as *const TaskYielder);
+                park_current(current_task().expect("test body runs inside a task"));
                 21
             },
         );

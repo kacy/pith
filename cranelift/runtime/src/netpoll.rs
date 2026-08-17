@@ -396,7 +396,7 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i6
     // re-enqueues us; even if that wake lands before we finish suspending,
     // green's `wake_pending` flag re-enqueues us from the park path, so it is
     // never lost. thus when `park_current` returns, `outcome` has been set.
-    green::park_current();
+    green::park_current(task);
 
     match outcome.load(AtomicOrdering::Acquire) {
         READY => 1,
@@ -440,7 +440,7 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
     // to sleep: our timer entry is still registered and the sweep will wake us
     // again. once the outcome is terminal the entry is gone and we return.
     while outcome.load(AtomicOrdering::Acquire) == PENDING {
-        green::park_current();
+        green::park_current(task);
     }
 }
 

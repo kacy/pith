@@ -353,7 +353,7 @@ fn resolve_type_name_module_scoped(name: String) -> Int:
     if member == "" and current_checker_module_path.len() > 0:
         # a bare name — prefer the current module's own declaration.
         return lookup_qualified_type_id(current_checker_module_path, name)
-    return - 1
+    return -1
 
 # last resort for an `alias.Type` whose alias is not one of ours. it happens
 # when a type crosses two module boundaries: std.sql returns a
@@ -378,14 +378,14 @@ fn resolve_type_by_module_basename(name: String) -> Int:
     alias := parts.0
     member := parts.1
     if member == "":
-        return - 1
+        return -1
     suffix := "." + alias
     for module_path in checked_module_paths.keys():
         if module_path == alias or module_path.ends_with(suffix):
             found := lookup_qualified_type_id(module_path, member)
             if found >= 0:
                 return found
-    return - 1
+    return -1
 
 fn resolve_named_type(name: String) -> Int:
     # an associated type name resolves to the binding of the impl currently
@@ -1055,7 +1055,7 @@ pub fn get_generic_declaration_index(name: String) -> Int:
     key := resolve_generic_declaration_key(name)
     if key.len() > 0:
         return generic_declaration_map[key]
-    return - 1
+    return -1
 
 fn collect_function_param_types(node: Node) -> List[Int]:
     mut params: List[Int] := []
@@ -3342,7 +3342,7 @@ fn named_arg_type_for_field(arg_indices: List[Int], fname: String, scope_id: Int
             if strings_equal(an.value, fname):
                 if an.children.len() > 0:
                     return c_check_expr(an.children[0], scope_id)
-    return - 1
+    return -1
 
 fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)
@@ -4616,7 +4616,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
         expect_no_arguments(method, args)
         return add_type_info(ti_optional(elem))
     # not a built-in list method
-    return - 1
+    return -1
 
 # ---------------------------------------------------------------
 # map methods
@@ -4672,7 +4672,7 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "values":
         expect_no_arguments(method, args)
         return intern_list_type(val_t)
-    return - 1
+    return -1
 
 # ---------------------------------------------------------------
 # set methods
@@ -4703,7 +4703,7 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "remove":
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
-    return - 1
+    return -1
 
 # ---------------------------------------------------------------
 # method arg validators
@@ -4936,7 +4936,7 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
 fn parse_integer_string(s: String) -> Int:
     # simple integer parser for tuple field indices
     if s.len() == 0:
-        return - 1
+        return -1
     mut result := 0
     mut i := 0
     while i < s.len():
@@ -4962,7 +4962,7 @@ fn parse_integer_string(s: String) -> Int:
         elif ch == "9":
             result = result * 10 + 9
         else:
-            return - 1
+            return -1
         i = i + 1
     return result
 

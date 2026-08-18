@@ -326,17 +326,17 @@ fn scan_object_value_start(input: String, key: String) -> Int:
             break
         scan_pos = scan_pos + 1
     if key_pos < 0:
-        return - 1
+        return -1
     mut pos := key_pos + key.len() + 2
     while pos < input.len() and scan_whitespace(input[pos]):
         pos = pos + 1
     if pos >= input.len() or input[pos] != ":":
-        return - 1
+        return -1
     pos = pos + 1
     while pos < input.len() and scan_whitespace(input[pos]):
         pos = pos + 1
     if pos >= input.len():
-        return - 1
+        return -1
     return pos
 
 fn json_scan_object_string(input: String, key: String) -> String:
@@ -540,25 +540,25 @@ fn json_byte_match_literal(input: Bytes, pos: Int, literal: String) -> Bool:
 
 fn json_byte_skip_scalar_value(input: Bytes, pos: Int) -> Int:
     if pos >= input.len():
-        return - 1
+        return -1
     b := input[pos]
     if b == 34:
         value := json_byte_read_string(input, pos)
         if value.ok:
             return value.next_pos
-        return - 1
+        return -1
     if b == 45 or json_byte_is_digit(b):
         value := json_byte_read_int(input, pos)
         if value.ok:
             return value.next_pos
-        return - 1
+        return -1
     if json_byte_match_literal(input, pos, "true"):
         return pos + 4
     if json_byte_match_literal(input, pos, "false"):
         return pos + 5
     if json_byte_match_literal(input, pos, "null"):
         return pos + 4
-    return - 1
+    return -1
 
 fn json_byte_find_field_value(input: Bytes, key: String) -> JsonByteFieldPos:
     mut pos := json_byte_skip_whitespace(input, 0)

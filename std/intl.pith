@@ -167,13 +167,13 @@ pub fn parse_accept_language(header: String) -> List[String]:
 # clearer here than threading a general parser's error through.
 fn to_number(s: String) -> Int:
     if s == "":
-        return - 1
+        return -1
     mut value := 0
     mut position := 0
     while position < s.len():
         digit := bit_and(ord(s[position]), 255) - 48
         if digit < 0 or digit > 9:
-            return - 1
+            return -1
         value = (value * 10) + digit
         position = position + 1
     return value
@@ -211,7 +211,7 @@ fn rule_set_for_tag(tag: String) -> Int:
     for entry in plural_tables.LOCALE_RULES.split(","):
         if entry.starts_with(needle):
             return to_number(entry.substring(needle.len(), entry.len()))
-    return - 1
+    return -1
 
 # the index of the rule set for a locale, or -1 when CLDR has no rules for it.
 #
@@ -224,7 +224,7 @@ fn rule_set_for(locale: Locale) -> Int:
         found := rule_set_for_tag(tag)
         if found >= 0:
             return found
-    return - 1
+    return -1
 
 # evaluate one relation, such as "i%10=2..4" or "v=0", for an integer.
 #
@@ -392,7 +392,7 @@ fn find_closing(template: String, start: Int) -> Int:
         if template[position] == close_brace():
             return position
         position = position + 1
-    return - 1
+    return -1
 
 # look up a message for a locale and fill its placeholders.
 #

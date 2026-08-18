@@ -334,7 +334,7 @@ fn find_bytes(data: Bytes, start: Int, needle: Bytes) -> Int:
         if bytes_starts_with_at(data, pos, needle):
             return pos
         pos = pos + 1
-    return - 1
+    return -1
 
 fn multipart_header_bounds(data: Bytes, start: Int) -> List[Int]:
     crlf := bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
@@ -638,7 +638,7 @@ fn find_byte(data: Bytes, start: Int, value: Int) -> Int:
         if data[i] == value:
             return i
         i = i + 1
-    return - 1
+    return -1
 fn trim_ascii_start(data: Bytes, start: Int, end: Int) -> Int:
     mut i := start
     while i < end and (data[i] == 32 or data[i] == 9):
@@ -1900,7 +1900,7 @@ fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
         if raw[i] == 10 and raw[i + 1] == 10:
             return i + 2
         i = i + 1
-    return - 1
+    return -1
 
 fn find_request_head_end(raw: Bytes) -> Int:
     return find_request_head_end_from(raw, 0)
@@ -2812,7 +2812,7 @@ impl ClientRequest:
         started := time_mod.mono_nanos()
         result := send_request_following_redirects(traced)
         if result.is_err:
-            finish_http_client_span(span, self.method, - 1, started)
+            finish_http_client_span(span, self.method, -1, started)
         else:
             finish_http_client_span(span, self.method, result.ok.status, started)
         return result!
@@ -2833,7 +2833,7 @@ impl ClientRequest:
         started := time_mod.mono_nanos()
         result := send_tls_request(traced, server_name, config)
         if result.is_err:
-            finish_http_client_span(span, self.method, - 1, started)
+            finish_http_client_span(span, self.method, -1, started)
         else:
             finish_http_client_span(span, self.method, result.ok.status, started)
         return result!

@@ -28,27 +28,57 @@ fn ir_csv_contains(csv: String, name: String) -> Bool:
             return true
     return false
 
+# the builtins the emitter types as returning a float. this table and the
+# six below stand in for the declarations a builtin never has: ir_infer_type
+# falls back to them when the checker supplied no type for the call. a name
+# in none of them types as "", i.e. unknown.
 pub fn ir_is_float_returning_func(fname: String) -> Bool:
     return ir_csv_contains(FLOAT_RETURNING_FUNCS, fname)
 
+# the builtins the emitter types as returning a bool. several are
+# did-it-work calls (os_set_env, fs_remove_tree, the crypto verifiers):
+# they report failure as a plain false and are absent from
+# RESULT_BOOL_FUNCS, so nothing here goes through the result abi.
 pub fn ir_is_bool_returning_func(fname: String) -> Bool:
     return ir_csv_contains(BOOL_RETURNING_FUNCS, fname)
 
+# the builtins the emitter types as returning an int. the fixed-width
+# conversions (Int8 through UInt64, float_to_bits) live here too: the ir
+# has no narrower integer type, so they are ordinary int-returning calls.
 pub fn ir_is_int_returning_func(fname: String) -> Bool:
     return ir_csv_contains(INT_RETURNING_FUNCS, fname)
 
+# the builtins the emitter types as returning a string. a few names are
+# also in RESULT_STRING_FUNCS (read_file, exec_output); those two tables do
+# different jobs — the fallible one decides how the result is carried, this
+# one names the type of the value inside it.
 pub fn ir_is_string_returning_func(fname: String) -> Bool:
     return ir_csv_contains(STRING_RETURNING_FUNCS, fname)
 
+# the builtins the emitter types as returning bytes. most entries are also
+# in RESULT_BYTES_FUNCS, so the call itself yields a result — what this
+# table describes is the payload type, not the shape of the return.
 pub fn ir_is_bytes_returning_func(fname: String) -> Bool:
     return ir_csv_contains(BYTES_RETURNING_FUNCS, fname)
 
+# the builtins whose result the emitter types as the generic "list".
+# keeping these apart from the list-of-string table is how the element kind
+# survives into method lowering: a "list_string" receiver sorts with
+# list_sort_strings_copy, a plain "list" with list_sort_copy.
 pub fn ir_is_list_returning_func(fname: String) -> Bool:
     return ir_csv_contains(LIST_RETURNING_FUNCS, fname)
 
+# the builtins whose result the emitter types as "list_string" rather than
+# plain "list" — the counterpart to ir_is_list_returning_func, which
+# explains why the two are separate tables.
 pub fn ir_is_list_string_returning_func(fname: String) -> Bool:
     return ir_csv_contains(LIST_STRING_RETURNING_FUNCS, fname)
 
+# whether a bare name is one of the builtins the seven tables above type.
+# lambda capture analysis is the caller: an identifier naming a builtin is
+# a call, not a free variable, so it is left out of the closure
+# environment. the fallible tables are not part of this union, so a name
+# like file_open_read answers false here.
 pub fn ir_is_known_returning_func(fname: String) -> Bool:
     return ir_is_float_returning_func(fname) or ir_is_bool_returning_func(fname) or ir_is_int_returning_func(fname) or ir_is_string_returning_func(fname) or ir_is_bytes_returning_func(fname) or ir_is_list_returning_func(fname) or ir_is_list_string_returning_func(fname)
 
@@ -80,15 +110,40 @@ pub fn ir_builtin_result_ok_kind(name: String) -> String:
         return "int"
     return ""
 
+# whether a method call yields a bool. type inference answers "bool" for
+# these on any receiver, and the emitter records the same kind for the call
+# it is lowering. the table carries both spellings of a method — `contains`
+# and `string_contains`, `contains_key` and `map_contains_ikey` — because
+# it is asked once with the source name and once with the lowered emit
+# name, and neither query rewrites the other's form.
 pub fn ir_is_bool_returning_method(meth: String) -> Bool:
     return ir_csv_contains(BOOL_RETURNING_METHODS, meth)
 
+# whether a method leaves no value of its own. asked with the lowered emit
+# name. the emitter forces the call's retkind to "void" and then hands the
+# RECEIVER register back as the expression's value, so `xs.reverse()`
+# evaluates to xs and chains; for the same reason it skips the release of
+# an owned receiver, which trades a leak on a discarded chain for not
+# freeing the value the chain returns.
 pub fn ir_is_void_method(meth: String) -> Bool:
     return ir_csv_contains(VOID_METHODS, meth)
 
+# whether a method returns a string. only type inference asks, and only
+# once the checker has failed to type the call. the table is keyed by
+# method name with no receiver, so an entry means the string version of
+# that name: `reverse` here is String.reverse, not List.reverse, which is
+# a void method.
 pub fn ir_is_string_returning_method(meth: String) -> Bool:
     return ir_csv_contains(STRING_RETURNING_METHODS, meth)
 
+# the runtime symbol a builtin is emitted under, or `name` unchanged when
+# nothing here claims it — which is how a user function passes through. the
+# general call path applies this only after the declared-function table
+# misses, so a program that declares its own `trim` gets its own body; the
+# `_raw` emit helpers apply it unconditionally, because they are already
+# emitting a builtin. the `__`-prefixed keys are the emitter's synthesized
+# calls (collection construction, retain/release, string equality) and
+# cannot be written in source.
 pub fn ir_runtime_call_name(name: String) -> String:
     if name == "print":
         return "pith_print_cstr"
@@ -337,6 +392,13 @@ fn ir_method_set_emit_name(mname: String, obj_type: String) -> String:
         return "set_remove"
     return mname
 
+# the name a method call is emitted under, picked from the source method
+# name and the emitter's receiver-type string ("string", "list_string",
+# "map_int", "channel:T", "opaque:Mutex", and so on). a pair no branch
+# recognizes comes back as `mname` unchanged, leaving the consumer to
+# resolve it — that is the path a user-defined method takes. one result is
+# not a symbol at all: `to_string` on a string receiver returns "identity",
+# which tells the caller to emit no call and reuse the receiver register.
 pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_string := obj_type == "string"
     obj_is_bytes := obj_type == "bytes"

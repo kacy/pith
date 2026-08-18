@@ -2,6 +2,18 @@
 
 from ir_builder import ir_emit, ir_reg
 
+# lower a unary operator into a freshly allocated register and return it.
+# neither case gets a dedicated instruction: `not` becomes `1 - operand`,
+# which is exact only for a 0/1 boolean and relies on the checker having
+# rejected anything else (E217), and `negate` becomes `0 - operand`. a
+# float operand needs no special handling here — the backend promotes a
+# `sub` to `fsub` as soon as either operand register is a known float.
+# an unrecognized op is not an error: the result register is set to the
+# constant 0 and emission carries on.
+#
+# only "not" and "negate" reach this today. the "!" / "-" / "not_op" /
+# "neg" spellings are aliases the parser never produces, and the whole
+# bit_not branch is unreachable — the lexer has no `~` token.
 pub fn ir_emit_unary_op(op: String, operand_r: Int) -> Int:
     r := ir_reg()
     if op == "not" or op == "!" or op == "not_op":
@@ -18,15 +30,54 @@ pub fn ir_emit_unary_op(op: String, operand_r: Int) -> Int:
         ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+# emit one three-address IR line for a binary operator. `op` has to be an
+# IR opcode already, not the AST operator name — run it through
+# ir_binary_simple_ir_op or ir_compound_assignment_ir_op first, or pass a
+# literal opcode like "eq". an opcode the IR consumer does not know is a
+# hard compile failure later, not here. the result register is the
+# caller's to allocate rather than this function's, which is what lets a
+# caller like ir_emit_value_binary pick one register up front and have
+# every branch it might take — enum equality, an optional compare, this
+# plain one — write its answer into that same register.
 pub fn ir_emit_simple_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
     ir_emit(op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
 
+# whether this operator has an `f`-prefixed float form to emit. exactly
+# add, sub, mul and div — the four the IR consumer implements. `mod` is
+# not among them, so a float `%` falls through to the integer opcode.
+# comparisons are absent on purpose rather than by omission: the backend
+# tracks which registers hold floats and picks fcmp for a plain `lt` or
+# `eq` on its own. the caller pairs this with ir_emit_float_binary once
+# it has inferred either operand as "float".
 pub fn ir_is_float_arithmetic(op: String) -> Bool:
     return op == "add" or op == "sub" or op == "mul" or op == "div"
 
+# emit the float form of an arithmetic op by prefixing "f" to the opcode.
+# guard the call with ir_is_float_arithmetic: any other op builds an
+# opcode the IR consumer has never heard of and the compile dies there
+# rather than here. the operand registers are ordinary integer registers
+# carrying f64 bit patterns — the consumer bitcasts in and back out, so
+# nothing upstream has to model a separate float register file.
 pub fn ir_emit_float_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
     ir_emit("f" + op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
 
+# the IR opcode that implements an AST binary operator in a single
+# three-address instruction, or "" when there isn't one. most names pass
+# through unchanged; the bitwise ones are renamed (bit_and -> band,
+# bit_or -> bor, bit_xor -> bxor). "" sends the caller down a fallback
+# that emits a generic `binop <op>` line, which no backend implements —
+# so an operator missing from this table fails the compile at the IR
+# consumer rather than with a diagnostic.
+#
+# `eq` and `neq` are left out on purpose, not by oversight: equality
+# dispatches on operand kind (strings call __str_eq, bytes bytes_eq,
+# enums a per-enum structural helper), so the caller decides those before
+# ever asking here. ordered comparison of strings is the caller's to
+# catch for the same reason — it routes lt/lte/gt/gte on a string operand
+# to the runtime rather than using the opcode this returns. `and` and
+# `or` are in the table but unreachable in practice: ir_emit_binary_expr
+# diverts them to a labeled short-circuit branch first, so the
+# eager, non-short-circuiting opcodes here are never what runs.
 pub fn ir_binary_simple_ir_op(op: String) -> String:
     if op == "add":
         return "add"
@@ -62,6 +113,14 @@ pub fn ir_binary_simple_ir_op(op: String) -> String:
         return "or"
     return ""
 
+# the arithmetic IR opcode behind a compound assignment token, or "" if
+# the token is not one. these four are the only compound-assign tokens
+# the lexer produces, and plain `=` is dealt with before this is reached,
+# so the caller's "" branch is really a guard rather than a live path —
+# it silently emits nothing for anything else. the opcode returned is the
+# integer one; a float compound assignment works because the backend
+# promotes add/sub/mul/div to their float forms once it sees a float
+# operand register, not because anything here inspects types.
 pub fn ir_compound_assignment_ir_op(op: String) -> String:
     if op == "+=":
         return "add"

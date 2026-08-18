@@ -91,6 +91,16 @@ fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, gene
 
     return true
 
+# work out which concrete kinds a call to generic function `name`
+# instantiates it at, by matching each written parameter type against
+# the checked type of the argument in that position, then filling any
+# still-free parameter from the interface bounds on the declaration.
+# `node` is the call node; its first child is the callee, the rest are
+# the arguments. returns one kind per generic parameter in declaration
+# order — the input to the specialization symbol name — using
+# "unknown" for a parameter no argument pinned down. returns [] when
+# `name` is not in generic_decl_indices, which tells the caller to fall
+# back to the type arguments written at the call site.
 pub fn ir_infer_generic_concrete_types_with_state(name: String, node: Node, generic_decl_indices: Map[String, Int]) -> List[String]:
     if not generic_decl_indices.contains_key(name):
         return []

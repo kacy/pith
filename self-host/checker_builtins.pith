@@ -6,6 +6,13 @@ from checker_type_intern import intern_list_type
 
 mut builtin_scope := -1
 
+# seed a scope with everything a program may use without importing it:
+# the free functions the runtime provides, and the sync primitive types
+# (Mutex, WaitGroup, Semaphore, AtomicInt) with their constructors.
+# initialize_checker calls this once on the fresh global scope, so pass
+# the outermost scope — the id is stashed and every binding defined here
+# lands in it. a handful of builtins are deliberately absent because no
+# fixed signature describes them; see the note on assert_eq below.
 pub fn register_builtin_types(scope_id: Int):
     builtin_scope = scope_id
     tid_int := lookup_type_id("Int")

@@ -38,6 +38,13 @@ fn dr_import_position(root_idx: Int, mod_path: String) -> (Int, Int):
                 return (node.line, node.col)
     return (1, 1)
 
+# the dotted module paths this root imports directly, in source order.
+# only the root's own children are scanned, so this is one level of the
+# import graph, not the transitive closure — resolve_imports recurses to
+# get the rest. the `pub` wrapper, a `from x import a, b` name list and
+# an `import x as y` alias are all stripped, leaving just "x".
+# duplicates are not removed; a caller that cares dedups (ir_driver
+# does).
 pub fn find_imports(root_idx: Int) -> List[String]:
     root := get_node(root_idx)
     mut imports: List[String] := []
@@ -341,9 +348,19 @@ fn dr_resolve_module_file(mod_path: String, source_path: String) -> String:
 
     return local_file
 
+# the entry source file of the package rooted at this directory: the
+# `root = "..."` key in its pith.toml, joined onto package_root. a
+# directory with no manifest, or a manifest with no root key, answers
+# <package_root>/lib.pith — the path is always non-empty and is not
+# checked for existence.
 pub fn package_root_file(package_root: String) -> String:
     return dr_root_file_for_package(package_root)
 
+# where dep_name's own package root lives, relative paths already joined
+# onto package_root. returns "" when this package declares no dependency
+# by that name. the dependency table is read on first call for a given
+# package_root and cached until init_driver: pith.lock wins outright when
+# it exists, and pith.toml is consulted only in its absence.
 pub fn package_dependency_root(package_root: String, dep_name: String) -> String:
     dr_load_package_dependencies(package_root)
     key := dr_dependency_key(package_root, dep_name)
@@ -351,6 +368,11 @@ pub fn package_dependency_root(package_root: String, dep_name: String) -> String
         return package_dependency_roots[key]
     return ""
 
+# the names of every dependency this package declares, as they appear on
+# the left of `=` in the table package_dependency_root reads. only
+# entries that resolved to a path are listed, so a dependency with no
+# path is silently absent. the order is the dependency map's iteration
+# order, not manifest order — sort it if you are printing.
 pub fn package_dependency_names(package_root: String) -> List[String]:
     dr_load_package_dependencies(package_root)
     mut names: List[String] := []
@@ -468,17 +490,36 @@ pub fn init_driver(source_path: String):
     record_module_node_range(0, node_count(), source_path)
     mark_visited(source_path)
 
+# whatever went wrong during the import walk: an E247 for a module path
+# that resolves to no file, or the parser's own diagnostics for an
+# imported file that failed to parse. the entry file's parse errors are
+# not in here — the caller parses that itself before calling init_driver.
+# init_driver clears the list, so read it after resolve_imports and
+# before starting the next compile.
 pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:
     return driver_parse_diagnostics
 
+# true when the import walk gave up. resolve_imports returns the roots
+# it had managed to collect so far rather than an error, so check this
+# before running the checker over that list — otherwise you check a
+# truncated build and report follow-on errors instead of the real one.
 pub fn driver_has_parse_errors() -> Bool:
     return driver_parse_diagnostics.len() > 0
 
+# the dotted path ("std.fs") the import walk used to reach this module
+# root, or "" for a root the walk did not produce — including the entry
+# file's own root, which is never recorded. callers push this into
+# set_checker_module_path before checking the module so its declarations
+# get qualified names.
 pub fn get_resolved_module_path(root_idx: Int) -> String:
     if resolved_module_paths.contains_key(root_idx):
         return resolved_module_paths[root_idx]
     return ""
 
+# the file the import walk parsed to produce this module root, or "" for
+# a root it did not produce (the entry file's root included). this is
+# what a diagnostic raised while checking the module should name, so
+# callers set it via set_checker_file_path alongside the module path.
 pub fn get_resolved_module_file(root_idx: Int) -> String:
     if resolved_module_files.contains_key(root_idx):
         return resolved_module_files[root_idx]

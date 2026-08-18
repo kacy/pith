@@ -41,6 +41,17 @@ fn strip_generic_params(name: String) -> String:
 # main entry point
 # ---------------------------------------------------------------
 
+# render a parsed tree to stdout as indented text — the output behind
+# `pith parse`. this is a debugging view of the arena, not source: it
+# names every node by kind and never round-trips back through the lexer,
+# and comments are already gone because the parser skips them. `pith fmt`
+# uses formatter.pith instead, which works from tokens.
+#
+# `root` is normally a "module" node, printed as a "module" header with
+# its children one level in, but any node index works — anything else is
+# rendered as a single top-level declaration at column zero. a node kind
+# the printer has no case for still prints, as "<kind> <value>", so
+# nothing silently disappears from the dump.
 pub fn print_ast(root: Int):
     node := get_node(root)
     if node.kind == "module":

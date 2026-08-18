@@ -273,17 +273,37 @@ mut ir_current_module_path := ""
 mut ir_emit_tests := false
 mut ir_emitting_test_func := false
 
+# the modules the next emit_ir's module imports directly, as parallel
+# lists of ast root index and resolved module path. their strings are
+# interned into the emitted string table and their declarations feed
+# import metadata collection, so a cross-module call has a symbol to
+# lower to. consumed by emit_ir (see ir_finish_module_emit), so it must
+# be set again before each module.
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
     ir_preloaded_import_paths = paths
 
+# every module in the build, for impl-method and interface collection,
+# which must see the whole graph rather than one module's imports.
+# set once per build: emit_ir does not clear it. leaving it empty is
+# allowed — collection then falls back to the direct import roots, and
+# an impl block outside them lowers to a symbol nothing defines.
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
     ir_all_module_roots = roots
     ir_all_module_paths = paths
 
+# the resolved path of the module about to be emitted; "" for the entry
+# file. emit_ir does not clear it, so it holds the previous module's
+# path until the next call — set it for every module, not only the ones
+# that need it.
 pub fn set_current_module_path(path: String):
     ir_current_module_path = path
 
+# turn the next emit_ir into a test build: `test` blocks become
+# functions, their names are interned before the string table is
+# emitted, a generated main runs them and reports, and the module's own
+# main is skipped. off, `test` blocks emit nothing. emit_ir clears it,
+# so only the module actually being tested is emitted with it true.
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
 
@@ -348,6 +368,17 @@ fn ir_reset_control_flow_state():
     ir_break_stack = []
     ir_continue_stack = []
 
+# clear everything that belongs to one module's emission: the output
+# buffer and register/variable maps, the module-global name kinds, the
+# struct / enum / impl / generic registries, and the break and continue
+# label stacks. emit_ir calls this on entry, so lowering a module never
+# sees the previous one's declarations; a caller only needs it to
+# discard a half-finished emit.
+#
+# what it deliberately keeps is the cross-module configuration — the
+# import roots, the full module graph, the current module path, test
+# mode — and ir_module_count, whose per-emit bump is what makes
+# generated symbols unique across the modules of one build.
 pub fn ir_reset():
     ir_reset_local_state()
     ir_reset_global_state()

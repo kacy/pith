@@ -5,14 +5,34 @@ from ir_metadata import ir_runtime_call_name
 from ir_type_helpers import ir_retkind_with_state, ir_resolve_type_hint_with_state
 from ast import get_node
 
+# true when this build declares a function under exactly this name —
+# a free function, an impl method, or an emitted generic specialization.
+# the test is "has a recorded return type", which is what separates a
+# user declaration from a builtin at emission time. lookup is exact:
+# an impl method is recorded twice, once under the `Type.method` key
+# and once under the symbol it emits as, so ask with the same spelling
+# you hold or a declared method reads as undeclared.
 pub fn ir_is_declared_callable_with_state(name: String, func_returns: Map[String, String]) -> Bool:
     return func_returns.contains_key(name)
 
+# the raw return hint recorded for a declared callable, or "" when no
+# function of that name was declared — so "" is also the "not declared"
+# answer, the same question ir_is_declared_callable_with_state asks.
+# the hint is not always a written type name: a result or tuple return
+# is stored as the ABI kind "result_int", "result_bool" or "tuple",
+# which is how call sites detect the pair-returning convention.
 pub fn ir_declared_callable_ir_retkind_with_state(fname: String, func_returns: Map[String, String]) -> String:
     if not func_returns.contains_key(fname):
         return ""
     return func_returns[fname]
 
+# a declared callable's return type as an emission kind, the form the
+# type-inference paths want. the ABI hints are translated back to the
+# value the caller ends up holding — a "result_int" callee reports
+# "int", "result_bool" reports "bool" — while "tuple" stays "tuple";
+# every other hint is resolved through the type aliases and the struct
+# table. returns "" for a name this build never declared, which callers
+# turn into "unknown" rather than propagating.
 pub fn ir_declared_callable_return_type_with_state(fname: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     ret_kind := ir_declared_callable_ir_retkind_with_state(fname, func_returns)
     if ret_kind.len() == 0:
@@ -25,6 +45,15 @@ pub fn ir_declared_callable_return_type_with_state(fname: String, func_returns: 
         return "tuple"
     return ir_resolve_type_hint_with_state(ret_kind, type_aliases, struct_names)
 
+# emit one `call` line, resolving the symbol to name in it. the rule is
+# declaration-wins: a name any function in this build declares is
+# emitted verbatim, and everything else is mapped through the runtime
+# name table — so a user `fn len(...)` captures a bare `len(x)` call.
+# that is right for a free call and wrong for a method, which is why
+# the method paths resolve a primitive receiver's runtime name before
+# calling here. arg_text is the rendered register list (see
+# ir_join_arg_regs) and is appended as-is; arg_count is trusted, not
+# recomputed from it.
 pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]):
     mut emit_name := fname
     if not ir_is_declared_callable_with_state(fname, func_returns):
@@ -40,18 +69,33 @@ pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: St
         call_line = call_line + arg_text
     ir_emit(call_line)
 
+# the argument registers rendered as the tail of a call line. each one
+# is written with a leading space, so the result appends directly onto
+# a line that already ends with the argument count, and an empty list
+# gives "" rather than a stray separator.
 pub fn ir_join_arg_regs(arg_regs: List[Int]) -> String:
     mut call_text := ""
     for arg_reg in arg_regs:
         call_text = call_text + " " + arg_reg.to_string()
     return call_text
 
+# the full argument list for a method call: the receiver register in
+# front of the written arguments, because a method lowers to a plain
+# call whose first parameter is the receiver. builds a new list, so the
+# caller's arg_regs is left alone and can still be used afterwards.
 pub fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
     mut call_args := [obj_r]
     for arg_reg in arg_regs:
         call_args.push(arg_reg)
     return call_args
 
+# the expression node underneath a call argument. the parser wraps
+# every argument in an "arg" node whose value carries the keyword name
+# for `f(x: 1)` and "" otherwise, so a lowering that wants to look at
+# the argument itself — a lambda, a byte operand — has to step through
+# that wrapper first. an index that is not an "arg" node, or an "arg"
+# with no children, comes back unchanged, so this is safe to apply to
+# an index that was already unwrapped.
 pub fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
     arg_node := get_node(arg_idx)
     if arg_node.kind == "arg" and arg_node.children.len() > 0:

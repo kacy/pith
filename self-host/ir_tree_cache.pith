@@ -22,6 +22,13 @@ fn ir_collect_string_nodes(idx: Int) -> List[Int]:
             stack.push(kid)
     return string_nodes
 
+# every string-literal node under root_idx, so the string table can be
+# interned before any function body is emitted. the whole subtree is walked
+# on the first ask and the answer kept for later ones — every module being
+# emitted re-walks the same preloaded import roots, so the repeat is the
+# common case. the walk is stack-based rather than recursive (a deep tree
+# used to blow the stack), which means children are visited last-to-first:
+# the indices come back in traversal order, not source order.
 pub fn ir_cached_string_nodes(root_idx: Int) -> List[Int]:
     for cached_root, i in ir_string_node_cache_roots:
         if cached_root == root_idx:
@@ -31,6 +38,12 @@ pub fn ir_cached_string_nodes(root_idx: Int) -> List[Int]:
     ir_string_node_cache_values.push(ir_encode_int_list(nodes))
     return nodes
 
+# the top-level declarations of a module, with any `pub` wrapper stripped
+# so a public and a private declaration look alike to the caller. this is
+# the standard way to sweep a module — the emitter walks it a dozen times
+# over per compile for structs, impls, functions and so on, which is why
+# the unwrapped list is cached. the cached list is returned as-is, so treat
+# it as read-only.
 pub fn ir_root_items(root_idx: Int) -> List[Int]:
     if ir_root_items_cache.contains_key(root_idx):
         return ir_root_items_cache[root_idx]

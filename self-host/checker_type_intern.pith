@@ -52,6 +52,15 @@ fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> Strin
         return base + "[" + intern_key_name(key_or_elem) + "]"
     return base + "[" + intern_key_name(key_or_elem) + "," + intern_key_name(val) + "]"
 
+# the one type id for `List[elem]`, minted on first request and handed
+# back to everyone after. every written `List[T]` annotation and every
+# list literal resolves through here, so two modules naming the same
+# element type end up on the same id and can be compared with `==`
+# instead of a structural walk. the id is also registered as a global
+# type name built from the element's full spelling, which is why
+# lookup_type_id("List[String]") finds it — but only for primitive
+# elements; a struct or enum element is keyed by its type id
+# ("List[Field#12]") and is not reachable by the name a user writes.
 pub fn intern_list_type(elem: Int) -> Int:
     name := build_collection_type_name("List", elem, -1)
     existing := lookup_type_id(name)
@@ -62,6 +71,12 @@ pub fn intern_list_type(elem: Int) -> Int:
         return tid
     return existing
 
+# the one type id for `Set[elem]`, on the same contract as
+# intern_list_type: created on first use, shared afterwards. reached
+# both from a written `Set[T]` and from a `{a, b}` literal once the
+# checker has agreed on an element type, so a literal assigned to a
+# declared `Set[T]` matches by id and never needs the structural
+# fallback.
 pub fn intern_set_type(elem: Int) -> Int:
     name := build_collection_type_name("Set", elem, -1)
     existing := lookup_type_id(name)
@@ -72,6 +87,12 @@ pub fn intern_set_type(elem: Int) -> Int:
         return tid
     return existing
 
+# the one type id for `Map[key_type, val_type]`. the key covers both
+# halves in order, so Map[String,Int] and Map[Int,String] are separate
+# ids while the same pair written anywhere is one id. this is the only
+# interned kind taking two arguments; pass them in the order they were
+# written, since swapping them silently yields a different live map
+# type rather than an error.
 pub fn intern_map_type(key_type: Int, val_type: Int) -> Int:
     name := build_collection_type_name("Map", key_type, val_type)
     existing := lookup_type_id(name)
@@ -82,6 +103,12 @@ pub fn intern_map_type(key_type: Int, val_type: Int) -> Int:
         return tid
     return existing
 
+# the one type id for `Task[inner]`, the type of a spawned call whose
+# function returns inner. only a written `Task[T]` annotation comes
+# through here: a `spawn f()` expression builds its own task type
+# directly, so it does not get this id, and the two are reconciled by
+# the structural comparison rather than by id equality. do not treat a
+# task id mismatch as a type mismatch.
 pub fn intern_task_type(inner: Int) -> Int:
     name := build_collection_type_name("Task", inner, -1)
     existing := lookup_type_id(name)
@@ -92,6 +119,10 @@ pub fn intern_task_type(inner: Int) -> Int:
         return tid
     return existing
 
+# the one type id for `Channel[inner]`, where inner is the type of the
+# values sent over it. a channel type can only enter the table from a
+# written `Channel[T]`, so unlike tasks every channel id in play is the
+# interned one and two channel types compare equal by id.
 pub fn intern_channel_type(inner: Int) -> Int:
     name := build_collection_type_name("Channel", inner, -1)
     existing := lookup_type_id(name)

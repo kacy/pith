@@ -20,6 +20,12 @@ fn package_value_for_key(line: String, key: String) -> String:
         return value.substring(1, value.len() - 1)
     return value
 
+# the entry source file `pith package check|test|lint|doc` should act on,
+# read from the `root = ` key of ./pith.toml and returned relative to the
+# current directory — so every package subcommand has to be run from the
+# package root. no pith.toml there prints an error and exits 1; a
+# manifest with no root key answers "lib.pith". table headers are not
+# tracked, so the first `root = ` line anywhere in the file wins.
 pub fn package_root_path() -> String!:
     if not file_exists("pith.toml"):
         print("error: pith.toml not found; run this command from a package root")
@@ -315,11 +321,24 @@ fn package_print_api(root: String) -> String!:
     print(doc_format())
     return ""
 
+# `pith package deps`: print the current package's dependencies as
+# "- name -> root directory" lines, or "dependencies: none". the paths
+# come from the same table the compiler resolves imports against, so
+# after `pith package install` they point into .pith/packages rather than
+# at the source trees pith.toml names. exits 1 when the current directory
+# has no pith.toml. the returned "" carries nothing; output is printed.
 pub fn cmd_package_deps() -> String!:
     root := package_current_root()!
     package_print_dependencies(root)
     return ""
 
+# `pith package lock`: rewrite ./pith.lock from ./pith.toml, pinning each
+# dependency to the version read out of that dependency's own manifest.
+# the locked paths stay the ones pith.toml declared — nothing is copied
+# and no cache is consulted, which is the difference from install.
+# overwrites any existing lock without merging. exits 1 when a dependency
+# has no manifest, no version, or a name or version that would not be a
+# safe path segment.
 pub fn cmd_package_lock() -> String!:
     root := package_current_root()!
     deps := package_manifest_dependencies(root)!
@@ -327,6 +346,16 @@ pub fn cmd_package_lock() -> String!:
     print("wrote pith.lock")
     return ""
 
+# `pith package install`: copy every dependency tree into
+# .pith/packages/<name>-<version>, then write a pith.lock pointing at
+# those copies, so later builds read the cache instead of the paths
+# pith.toml names. a dependency already in the cache is left untouched
+# and reported "already installed" unless refresh is true, which deletes
+# the cached tree and copies it again — this is the only way to pick up
+# edits made to a path dependency. .pith, .git, .pith-build, target and
+# zig-out are skipped while copying. exits 1 when a dependency path is
+# missing, its manifest has no name or version, or the cache path is
+# occupied by a file.
 pub fn cmd_package_install(refresh: Bool) -> String!:
     root := package_current_root()!
     deps := package_manifest_dependencies(root)!
@@ -361,6 +390,13 @@ pub fn cmd_package_install(refresh: Bool) -> String!:
     print("wrote pith.lock")
     return ""
 
+# `pith package inspect`: describe a package without opening it. name is
+# "." or "" for the package in the current directory, otherwise the name
+# of one of its declared dependencies — an unknown name prints an error
+# and exits 1. the default report is manifest summary, dependencies, the
+# .pith files found up to four directories deep, then the public api.
+# files_only wins when both flags are set. the api section documents only
+# the package's root file, not every module in it.
 pub fn cmd_package_inspect(name: String, api_only: Bool, files_only: Bool) -> String!:
     root := package_target_root(name)!
     if files_only:
@@ -373,6 +409,11 @@ pub fn cmd_package_inspect(name: String, api_only: Bool, files_only: Bool) -> St
     package_print_files(root)
     return package_print_api(root)
 
+# `pith package context`: the same material as inspect, laid out as
+# markdown sections for pasting into an agent's context, and with a fixed
+# list of the package commands added. name selects the package the same
+# way inspect does — "." for the current one, otherwise a declared
+# dependency, and exit 1 if there is no such dependency.
 pub fn cmd_package_context(name: String) -> String!:
     root := package_target_root(name)!
     print("# pith package context")
@@ -393,6 +434,12 @@ pub fn cmd_package_context(name: String) -> String!:
     print("## public api")
     return package_print_api(root)
 
+# `pith new`: scaffold a package directory named `name` under the current
+# directory, containing pith.toml, AGENTS.md, .gitignore, Makefile,
+# Dockerfile, README.md and a lib.pith holding one function and one test.
+# an existing directory of that name is never overwritten — it prints an
+# error and exits 1. the generated manifest's version is the fixed
+# literal "0.2.3", not the compiler's version.
 pub fn cmd_new(name: String) -> String!:
     nl := chr(10)
     tab := chr(9)

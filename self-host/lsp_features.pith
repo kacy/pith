@@ -302,6 +302,14 @@ fn hover_body(value: String) -> Int:
     json.object_set(result, "contents", contents)
     return result
 
+## the json handle for a textDocument/hover result, or -1 when there is
+## nothing to show — response_body encodes a negative handle as a null
+## result, which is what the protocol wants for "no hover". line0 and
+## character arrive 0-based in the client's negotiated position
+## encoding. the hover text is "word: Type", plus the declaration's doc
+## comment when the cursor resolves to one. requires an analysis that
+## ran the checker to completion, so call ensure_analyzed first; -1 comes
+## straight back otherwise.
 pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
     if not analyzed_checked:
         return 0 - 1

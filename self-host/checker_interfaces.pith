@@ -20,15 +20,35 @@ fn base_type_name(name: String) -> String:
         i = i + 1
     return name
 
+# drop every registered interface name. the registry is module-global
+# and lives for one whole check run, so the checker clears it alongside
+# its other tables when it starts on a new entry file; nothing else
+# should call this mid-run, since an emptied registry turns every
+# interface bound into an unknown-interface error.
 pub fn checker_interfaces_reset():
     interface_declaration_names = []
 
+# record that an interface of this name was declared. registering the
+# same name twice is a no-op, which is what lets a generic interface be
+# entered under both its bare name and its parameterised spelling. the
+# list carries no module tag, so every module's interfaces share one
+# namespace here and the registry can answer only "does some module
+# declare this name", never which one.
 pub fn register_interface_declaration_name(name: String):
     for iface_name in interface_declaration_names:
         if names_equal(iface_name, name):
             return
     interface_declaration_names.push(name)
 
+# whether any module in this run declared an interface by this name.
+# an exact match wins first; failing that, a name carrying type
+# arguments is retried with everything from the `[` onward cut off, so
+# a bound written `Comparable[Int]` is satisfied by a declaration of
+# `Comparable` with no instantiation of its own registered. this is
+# used both to validate a generic bound and, in the import checker, to
+# excuse a `from m import Iface` that no binding or type entry
+# explains — so a false answer here is only ever "no such name
+# anywhere", not "not exported by that module".
 pub fn has_interface_declaration(name: String) -> Bool:
     for iface_name in interface_declaration_names:
         if names_equal(iface_name, name):

@@ -26,6 +26,18 @@ fn ir_emit_path_loop_step(idx_name: String, loop_l: String):
     ir_emit("store " + idx_name + " " + next_idx_r.to_string())
     ir_emit("jmp " + loop_l)
 
+## walk a dotted path such as "server.tls.cert" one segment at a time,
+## calling require_name to descend from the handle in hand into the child
+## that segment names, and return the register holding the handle the path
+## landed on. empty segments are skipped, so a leading, trailing or doubled
+## dot costs nothing and an empty path yields the starting handle unchanged.
+## the failure shape is what a caller has to plan for: the first segment
+## whose require call reports an error stores that whole result box into
+## temp_name and jumps to done_l, so temp_name must already be declared a
+## "tuple" local and the caller must emit done_l itself. ok_tid is the type
+## id used to read the ok payload out of each intermediate result;
+## current_name, parts_name, len_name and idx_name are loop scratch locals
+## and must not be shared with anything else.
 pub fn ir_emit_dotted_path_lookup(handle_r: Int, dotted_path_r: Int, require_name: String, ok_tid: Int, current_name: String, parts_name: String, len_name: String, idx_name: String, temp_name: String, done_l: String) -> Int:
     ir_emit("store " + current_name + " " + handle_r.to_string())
     dot_r := ir_reg()
@@ -94,6 +106,12 @@ pub fn ir_emit_dotted_path_lookup(handle_r: Int, dotted_path_r: Int, require_nam
     ir_emit("load " + final_handle_r.to_string() + " " + current_name)
     return final_handle_r
 
+## the same segment-by-segment walk as ir_emit_dotted_path_lookup, for a
+## generated function body that is free to return: a failing segment returns
+## the error box straight out of the enclosing function rather than routing
+## it to a label the caller supplied. that is why there is no temp_name, no
+## done_l and no ok_tid to pass. returns the register holding the handle the
+## path landed on, and skips empty segments the same way.
 pub fn ir_emit_dotted_path_lookup_or_return(handle_r: Int, dotted_path_r: Int, require_name: String, current_name: String, parts_name: String, len_name: String, idx_name: String) -> Int:
     ir_emit("store " + current_name + " " + handle_r.to_string())
     dot_r := ir_reg()

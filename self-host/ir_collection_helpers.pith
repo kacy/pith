@@ -2,6 +2,11 @@
 
 from ast import get_node, Node
 
+# true when a map literal's first entry is written with an int literal key.
+# a purely syntactic probe: it reads one entry and only recognizes a
+# literal, so `{i: 1}` looks string-keyed here. it survives as the fallback
+# for a literal the checker left untyped — wherever there is a checked type,
+# that decides instead.
 pub fn ir_map_uses_int_keys(node: Node) -> Bool:
     if node.children.len() == 0:
         return false
@@ -11,22 +16,42 @@ pub fn ir_map_uses_int_keys(node: Node) -> Bool:
     key_node := get_node(first_entry.children[0])
     return key_node.kind == "int_lit" or key_node.kind == "int"
 
+# the runtime constructor for a set literal of this type. only two flavors
+# exist, so anything that is not "set_int" builds a string set. the
+# constructor fixes the element type for the set's whole life, which is why
+# it has to be picked from the same literal_type as ir_set_add_name.
 pub fn ir_set_new_name(literal_type: String) -> String:
     if literal_type == "set_int":
         return "__set_new_int"
     return "__set_new"
 
+# the runtime insert matching ir_set_new_name's constructor. the two must
+# be picked from the same literal_type: the runtime reads set_add's element
+# as a cstring pointer, so calling it on an int-keyed set dereferences a raw
+# integer, and set_add_int on a string set silently inserts nothing.
 pub fn ir_set_add_name(literal_type: String) -> String:
     if literal_type == "set_int":
         return "set_add_int"
     return "set_add"
 
+# the recorded value type of the map a bare identifier names, or "" for
+# anything else — a field access, an index or a call expression is not
+# tracked, so a caller has to have another source of the value type. the
+# state map is a parameter rather than a global so this can live outside the
+# emitter core that owns it; ir_lookup_map_value_type_for_expr there is the
+# wrapper that supplies it.
 pub fn ir_lookup_map_value_type_for_expr_with_state(idx: Int, map_value_types: Map[String, String]) -> String:
     node := get_node(idx)
     if node.kind == "ident" and map_value_types.contains_key(node.value):
         return map_value_types[node.value]
     return ""
 
+# the runtime getter behind `obj[i]`, falling back to the list getter for
+# any type not named here. every name it returns is a strict variant, which
+# aborts on a missing key or an out-of-range index instead of handing back a
+# zero. that is deliberate: inside a `T!` function the emitter takes the
+# propagating path before it gets here, so reaching this means aborting is
+# the intended behaviour.
 pub fn ir_index_get_call_name(obj_type: String) -> String:
     if obj_type == "string":
         return "char_at_strict"
@@ -38,6 +63,12 @@ pub fn ir_index_get_call_name(obj_type: String) -> String:
         return "map_get_strict"
     return "__list_get_strict"
 
+# the runtime store behind `obj[i] = v`, falling back to the list store.
+# this is only the plain borrowed form and is rarely what gets emitted
+# unchanged: the caller rewrites the name into a kind-carrying variant when
+# the container has to learn the element's kind, or into an `_owned` variant
+# when the value is a fresh temporary whose count the container should take
+# rather than add to.
 pub fn ir_index_set_call_name(obj_type: String) -> String:
     if obj_type == "map_int":
         return "map_insert_ikey"
@@ -45,6 +76,10 @@ pub fn ir_index_set_call_name(obj_type: String) -> String:
         return "map_insert"
     return "pith_list_set_value"
 
+# the runtime getter a counted `for` loop uses to read one element. the loop
+# head already compares the index against the length, so a string or int
+# element takes the unchecked getter; a char steps through the source string
+# one byte at a time with char_at.
 pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
     if item_kind == "char":
         return "char_at"
@@ -52,6 +87,11 @@ pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
         return "__list_get_unchecked"
     return "__list_get"
 
+# the ir return kind of the element a `for` loop reads, "unknown" for an
+# element type this cannot name — a generic body whose element is `T`, for
+# one. "unknown" carries no rc kind, so the loop variable can still be
+# registered as a local under it without the scope cleanup trying to release
+# something it does not understand.
 pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
     if item_kind == "char" or item_kind == "string":
         return "string"
@@ -59,6 +99,10 @@ pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
         return "int"
     return "unknown"
 
+# what one step of `for x in it` yields for this iterable, "unknown" when
+# the type is not one the counted loop knows how to walk. iterating a string
+# yields "char", which is one byte and not one codepoint: both the getter
+# and the length behind it are byte-oriented.
 pub fn ir_for_iter_item_kind(iter_type: String) -> String:
     if iter_type == "string":
         return "char"
@@ -70,6 +114,12 @@ pub fn ir_for_iter_item_kind(iter_type: String) -> String:
         return "int"
     return "unknown"
 
+# the call that flattens a non-indexable iterable into a list the counted
+# loop can walk, or "" when the iterable is already index-addressable. maps
+# and sets need it, lists and strings do not. what it returns is a freshly
+# allocated list that nothing else holds, so it becomes what the loop
+# releases at the end; an owned original is released as soon as the
+# conversion is done.
 pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
     if iter_type == "map":
         return "map_keys"
@@ -81,6 +131,10 @@ pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
         return "__set_to_list_int"
     return ""
 
+# the ir kind of what ir_for_iter_conversion_call returns, "" exactly when
+# that helper returns no call. answer both from the same iter_type: the loop
+# reads the converted list's release kind off this, so a disagreement means
+# it releases the fresh list as the wrong kind or not at all.
 pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
     if iter_type == "map" or iter_type == "set":
         return "list_string"
@@ -88,11 +142,24 @@ pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
         return "list"
     return ""
 
+# the length call that gives the counted loop its trip count. a string walk
+# ("char") uses string_len, which counts bytes — that is what makes
+# `for c in s` a byte loop rather than a codepoint loop. everything else
+# goes through the generic len.
 pub fn ir_for_len_call_name(item_kind: String) -> String:
     if item_kind == "char":
         return "string_len"
     return "len"
 
+# the constructor for an *empty* collection literal being bound to a known
+# target, or "" when the literal has children or the target is not one of
+# the recognized kinds — the caller then lowers the literal the ordinary
+# way. the target decides, not the syntax: `{}` parses as a map literal but
+# builds a set when that is what the binding asked for, which is the only
+# thing that can tell the two apart when there are no elements to read.
+# target_type may be a composite (map_str_val, map_int_str_val) naming a map
+# that owns a count per stored string value; feed it through
+# ir_normalize_collection_target before using it as a ret kind.
 pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int, target_type: String) -> String:
     if child_count != 0:
         return ""

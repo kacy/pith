@@ -69,6 +69,10 @@ pub struct TypeInfo:
 # constructors — one per kind for clarity
 # ---------------------------------------------------------------
 
+# a leaf type that carries nothing but its name. only
+# initialize_type_table builds these — the 15 builtin primitives plus
+# the "<error>" and "none" sentinels — so a caller outside this file
+# has no reason to.
 pub fn ti_primitive(name: String) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -76,6 +80,13 @@ pub fn ti_primitive(name: String) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("primitive", name, empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, empty_i, empty_s, empty_li)
 
+# a named record. the four field lists are parallel and positional:
+# fields[i] has type field_types[i] and its `pub`/`mut` flags at the
+# same index. all four are copied, so the caller may keep mutating its
+# own lists afterwards. the usual sequence is to add an empty shell
+# first and set_type_info the filled-in struct after resolving the
+# field types, so a field can name the struct's own type. interfaces
+# are also registered this way, as a struct with zero fields.
 pub fn ti_struct(name: String, fields: List[String], field_types: List[Int], field_pub: List[Bool], field_mut: List[Bool]) -> TypeInfo:
     mut empty_i: List[Int] := []
     mut empty_s: List[String] := []
@@ -86,6 +97,10 @@ pub fn ti_struct(name: String, fields: List[String], field_types: List[Int], fie
     copied_field_mut := copy_list(field_mut)
     return TypeInfo("struct", name, copied_fields, copied_field_types, copied_field_pub, copied_field_mut, empty_i, -1, -1, -1, -1, empty_i, empty_s, empty_li)
 
+# a named sum type. variants and variant_types are parallel: variant i
+# carries the payload types listed in variant_types[i], which is empty
+# for a variant declared without a payload. unlike ti_struct, neither
+# list is copied — the TypeInfo holds the caller's lists.
 pub fn ti_enum(name: String, variants: List[String], variant_types: List[List[Int]]) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -93,6 +108,12 @@ pub fn ti_enum(name: String, variants: List[String], variant_types: List[List[In
     mut empty_li: List[List[Int]] := []
     return TypeInfo("enum", name, empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, empty_i, variants, variant_types)
 
+# an anonymous callable signature — an `fn(...)` annotation, a declared
+# function's own type, or a struct's synthesized constructor.
+# param_types is copied. the name stays empty on purpose: get_type_name
+# prints every function type as "fn". nothing interns these, so two
+# identical signatures resolved separately land on different ids and
+# must be compared structurally, never by id.
 pub fn ti_function(param_types: List[Int], return_type: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -101,6 +122,11 @@ pub fn ti_function(param_types: List[Int], return_type: Int) -> TypeInfo:
     copied_params := copy_list(param_types)
     return TypeInfo("function", "", empty_s, empty_i, empty_b, empty_b, copied_params, return_type, -1, -1, -1, empty_i, empty_s, empty_li)
 
+# `T?`, with T in the `inner` field. a bare `none` is not this type —
+# it is TID_NONE, a separate sentinel that is accepted only where an
+# optional is expected. like the other unnamed composites, optionals
+# are not interned: two `Int?` annotations resolve to two ids, so
+# compare them structurally.
 pub fn ti_optional(inner: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -108,6 +134,10 @@ pub fn ti_optional(inner: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("optional", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, inner, -1, -1, empty_i, empty_s, empty_li)
 
+# `T!E`. mind the field placement, because there is no dedicated pair:
+# the ok type is stored in `inner` and the error type in `value_type`.
+# a `T!` annotation with no error type written gets String, filled in
+# by the checker before it calls this. not interned.
 pub fn ti_result(ok_type: Int, err_type: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -115,6 +145,10 @@ pub fn ti_result(ok_type: Int, err_type: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("result", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, ok_type, -1, err_type, empty_i, empty_s, empty_li)
 
+# `(A, B, ...)`. `elements` holds the member types in declaration order
+# and is stored without copying. tuples are the only kind that uses
+# that field — every single-parameter composite uses `inner` instead.
+# not interned.
 pub fn ti_tuple(elements: List[Int]) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -122,6 +156,11 @@ pub fn ti_tuple(elements: List[Int]) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("tuple", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, elements, empty_s, empty_li)
 
+# `List[element]`, with the element type in `inner` (not `elements`,
+# which belongs to tuples). prefer intern_list_type over calling this
+# and add_type_info yourself: interning gives each distinct element
+# type exactly one id, so `List[Int]` written in two modules compares
+# equal by id alone.
 pub fn ti_list(element: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -129,6 +168,9 @@ pub fn ti_list(element: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("list", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, element, -1, -1, empty_i, empty_s, empty_li)
 
+# `Map[key_type, val_type]`, the only kind that fills both `key_type`
+# and `value_type`. prefer intern_map_type, which hands back one shared
+# id per distinct key/value pair.
 pub fn ti_map(key_type: Int, val_type: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -136,6 +178,8 @@ pub fn ti_map(key_type: Int, val_type: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("map", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, key_type, val_type, empty_i, empty_s, empty_li)
 
+# `Set[element]`, with the element type in `inner`. prefer
+# intern_set_type, which reuses one id per distinct element type.
 pub fn ti_set(element: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -143,6 +187,9 @@ pub fn ti_set(element: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("set", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, element, -1, -1, empty_i, empty_s, empty_li)
 
+# `Task[inner]` — what `spawn f()` evaluates to, where inner is f's
+# return type and awaiting the task unwraps back to it. prefer
+# intern_task_type, which reuses one id per distinct inner type.
 pub fn ti_task(inner: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -150,6 +197,9 @@ pub fn ti_task(inner: Int) -> TypeInfo:
     mut empty_li: List[List[Int]] := []
     return TypeInfo("task", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, inner, -1, -1, empty_i, empty_s, empty_li)
 
+# `Channel[inner]`, where inner is the type of the values sent over it.
+# prefer intern_channel_type, which reuses one id per distinct payload
+# type.
 pub fn ti_channel(inner: Int) -> TypeInfo:
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -290,6 +340,12 @@ pub fn get_type_name(tid: Int) -> String:
 # helper predicates
 # ---------------------------------------------------------------
 
+# true for Int, UInt, Float and the eight sized integer types; false
+# for everything else, including Bool, String, Void and every user
+# type. the checker gates the arithmetic and ordering operators on
+# this. it re-resolves each builtin by name through the type table on
+# every call instead of comparing against the TID_* constants, so it
+# only answers correctly once initialize_type_table has run.
 pub fn is_numeric_type(tid: Int) -> Bool:
     tid_int := lookup_type_id("Int")
     tid_uint := lookup_type_id("UInt")
@@ -326,6 +382,10 @@ pub fn is_numeric_type(tid: Int) -> Bool:
         return true
     return false
 
+# is_numeric_type minus Float — Int, UInt and the eight sized integer
+# types. use it where a whole number is required and a Float is not
+# good enough, such as a string, bytes, or list index. same name-based
+# lookup, so the same dependency on initialize_type_table.
 pub fn is_integer_type(tid: Int) -> Bool:
     tid_int := lookup_type_id("Int")
     tid_uint := lookup_type_id("UInt")
@@ -359,6 +419,12 @@ pub fn is_integer_type(tid: Int) -> Bool:
         return true
     return false
 
+# true only for the sentinel the checker returns from an expression it
+# could not type. that sentinel is TID_ERR == 15, an ordinary positive
+# id, so `tid >= 0` is not a valid "did this type check" test — this
+# is. checker guards skip their comparison when either side is the
+# error type, which is what stops one bad expression from producing a
+# cascade of follow-on messages.
 pub fn is_error_type(tid: Int) -> Bool:
     return tid == lookup_type_id("<error>")
 
@@ -371,6 +437,13 @@ pub fn is_none_type(tid: Int) -> Bool:
 # initialization — register all 17 builtin types
 # ---------------------------------------------------------------
 
+# throw away the whole table and re-seed it with the 17 builtins, in
+# the order that puts each one at the index its TID_* constant names —
+# the checker and the IR emitter both hard-code those ids, so the order
+# here is load-bearing. everything else in this file assumes it has
+# run. initialize_checker calls it once per check run; several modules
+# checked in one run deliberately share the table, so do not call it
+# between them or the earlier modules' types disappear.
 pub fn initialize_type_table():
     tt_types = []
     tt_names = {}

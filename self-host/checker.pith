@@ -125,6 +125,11 @@ mut open_empty_literal_bindings: Map[Int, Int] := {}
 # initialization
 # ---------------------------------------------------------------
 
+# clear every piece of checker state and seed a fresh global scope with
+# the builtin types and functions. call this once per check run, before
+# the first c_run_module; checking several modules in one run shares the
+# state deliberately, so re-initializing between them would discard the
+# types the earlier modules registered.
 pub fn initialize_checker(file_path: String):
     initialize_type_table()
     reset_scope_arena()
@@ -158,11 +163,24 @@ pub fn initialize_checker(file_path: String):
     current_scope = create_scope(-1)
     register_builtin_types(current_scope)
 
+# name the module whose AST is about to be checked, so its types,
+# generics and function visibility get registered under a qualified name
+# rather than a bare one. drivers call this before each imported
+# module's c_run_module, then pass "" for the root file being compiled —
+# an empty path means "not inside a module" and turns the qualified
+# lookups off. it also records the path in the set of modules this run
+# has seen, which is what lets the E246 phantom-import check fire (an
+# import naming something the source module never declares) and what
+# lets a type be found by module basename later.
 pub fn set_checker_module_path(module_path: String):
     checked_module_paths.insert(module_path, true)
     current_checker_module_path = module_path
     set_defining_module(module_path)
 
+# set the path stamped on diagnostics raised from here on. a single
+# check run walks several modules, so this has to be updated alongside
+# set_checker_module_path or every error will be reported against
+# whichever file was named last.
 pub fn set_checker_file_path(file_path: String):
     checker_set_file_path(file_path)
 
@@ -551,6 +569,12 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
 # pass 1 — declaration registration
 # ---------------------------------------------------------------
 
+# pass 1: put every top-level name in this module — functions, structs,
+# enums, interfaces, impls, type aliases — into scope before any body is
+# checked, so declarations can refer to each other in any order. globals
+# (`binding` nodes) and test blocks are deliberately left to pass 2.
+# run this before c_check_all; checking a body first would report the
+# names below it as unknown.
 pub fn c_register_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
@@ -992,6 +1016,10 @@ fn register_type_alias_declaration(node: Node):
 # helpers
 # ---------------------------------------------------------------
 
+# the name with any type-argument list cut off, so an instantiated type
+# can be looked up against the generic declaration it came from. a name
+# with no `[` comes back unchanged, which makes this safe to call on any
+# type name without testing first.
 pub fn extract_base_type_name(name: String) -> String:
     # "swap[T]" -> "swap", "Pair[A, B]" -> "Pair"
     mut i := 0
@@ -1008,6 +1036,12 @@ fn declaration_has_generic_params(node: Node) -> Bool:
             return true
     return false
 
+# the type parameter names a declaration introduces, in source order —
+# ["K", "V"] for `struct Pair[K, V]`. the order is what makes this
+# useful: callers zip it against a concrete type-argument list to build
+# the substitution map, so a declaration with no generic params gives an
+# empty list rather than an error. pass the node returned by
+# get_generic_declaration_index.
 pub fn collect_generic_parameter_names(node: Node) -> List[String]:
     mut params: List[String] := []
     for child in node.children:
@@ -1048,9 +1082,19 @@ fn resolve_generic_declaration_key(name: String) -> String:
                     return imported_key
     return ""
 
+# whether `name` names a generic function or struct visible from the
+# module being checked. pass a base name with no type arguments — run it
+# through extract_base_type_name first. the search prefers a declaration
+# in the current module over a bare one of the same name, then falls
+# back to what this module's named and wildcard imports bring in.
 pub fn has_generic_declaration(name: String) -> Bool:
     return resolve_generic_declaration_key(name).len() > 0
 
+# the AST node index of the generic declaration `name` resolves to, or
+# -1 when nothing matches. resolution order is the same as
+# has_generic_declaration. the emitter uses this alongside
+# collect_generic_parameter_names to recover a generic's parameter list
+# at an instantiation site, long after the checker has run.
 pub fn get_generic_declaration_index(name: String) -> Int:
     key := resolve_generic_declaration_key(name)
     if key.len() > 0:
@@ -1159,6 +1203,12 @@ fn binding_is_mutable(value: String) -> Bool:
 # pass 2 — check declarations
 # ---------------------------------------------------------------
 
+# pass 2: type-check the bodies — functions, impl methods, test blocks,
+# and the module's global bindings — with every top-level name already
+# in scope from c_register_all. this is where the bulk of a check run's
+# time goes. a generic function's body is skipped entirely — it has no
+# concrete types until something instantiates it — so a mistake inside
+# one is not reported by this pass.
 pub fn c_check_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
@@ -2203,6 +2253,16 @@ fn check_for_statement(node: Node, scope_id: Int):
 # expression checking
 # ---------------------------------------------------------------
 
+# type an expression and return its type id, recording the answer in
+# expression_type_cache so the emitter can read it back by node index
+# through c_get_expr_type. this is the single entry point for expression
+# typing — every kind of expression funnels through here, which is why
+# it also stamps the node as current, so a diagnostic raised anywhere
+# below gets that node's line and column. an expression that fails to
+# check yields the `<error>` type rather than a raised error, so test
+# the result with is_error_type instead of assuming success. the cache
+# is written, never consulted, on this path: calling twice on one node
+# re-checks it and can re-report.
 pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
     prev := checker_set_current_node(node_idx)
     result := check_expression_implementation(node_idx, scope_id)
@@ -3693,6 +3753,12 @@ fn encode_tid_list(tids: List[Int]) -> String:
         parts.push(tid.to_string())
     return parts.join(",")
 
+# the inverse of encode_tid_list: split a csv of type ids back into a
+# list. this is how a caller reads struct_instance_type_args and
+# impl_interface_args, which hold their tid lists as strings because
+# pith Maps cannot carry List values reliably. an empty string decodes
+# to an empty list, so an entry recorded for a type with no arguments
+# round-trips cleanly.
 pub fn decode_tid_list(s: String) -> List[Int]:
     mut tids: List[Int] := []
     if s.len() == 0:
@@ -6029,6 +6095,13 @@ fn types_compatible(actual: Int, expected: Int) -> Bool:
 # public API — run checker and return diagnostics as JSON
 # ---------------------------------------------------------------
 
+# check one parsed file end to end: initialize, register declarations,
+# then check bodies, and hand back everything that was reported. this is
+# the single-file path — it re-initializes on entry, so it cannot be
+# used to check a program spread across modules, and imported names go
+# unresolved because pass 1 skips import nodes. for a multi-module run
+# call initialize_checker once and drive c_run_module per module.
+# an empty list means the file checked clean.
 pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     initialize_checker(file_path)
     process_import_aliases(root_idx)
@@ -6046,5 +6119,11 @@ pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     module_aliases = saved_aliases
     return checker_get_diagnostics()
 
+# render diagnostics as the machine-readable JSON array editors and
+# tests consume: one object per diagnostic, in the order they were
+# reported, with a trailing newline. nothing is filtered — warnings come
+# through alongside errors, told apart by each object's "severity"
+# field. this only re-exports errors.render_diagnostics_json so a caller
+# that already imports the checker needs no second import.
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
     return render_diagnostics_json(diags)

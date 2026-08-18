@@ -6,11 +6,23 @@ from ir_result_abi import ir_zero_reg
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info
 
+# load the is_some flag out of an optional's two-slot shell (offset 0):
+# 0 for none, 1 for Some. reading it is a pure probe — it never touches
+# the payload and takes no count — which is why `== none` counts as a
+# non-owning use of an optional local.
 pub fn ir_optional_flag_field(obj_r: Int) -> Int:
     r := ir_reg()
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 0 bool is_some")
     return r
 
+# load the payload out of an optional's shell (offset 8), typed from
+# `opt_tid`'s inner type so the ir slot gets the right kind. the read
+# borrows: the optional still holds whatever count it had, so anything
+# keeping the payload past the optional's life must retain it. check
+# the flag first — the slot of a none holds 0 and this reads it anyway.
+# when `opt_tid` is not an optional type, or its inner type is unknown,
+# it emits no field load and hands back a register holding 0 rather
+# than reporting anything.
 pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
     info := get_type_info(opt_tid)
     if info.kind != "optional" or info.inner < 0:
@@ -19,6 +31,11 @@ pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
     return r
 
+# emit `optional == none` (op "eq") or `!= none` (anything else) into
+# `result_reg`. it compares the flag alone and never reads the payload,
+# so it is safe on an optional of any inner type and needs no type id.
+# call sites pass whichever side of the comparison is not the `none`
+# literal.
 pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: Int):
     flag_r := ir_optional_flag_field(optional_r)
     zero_r := ir_reg()
@@ -84,6 +101,11 @@ fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
     ir_emit("sstore " + tuple_r.to_string() + " 1 " + value_r.to_string())
     return tuple_r
 
+# build a fresh `none`: a two-slot shell with the flag and the value
+# slot both zero. this is what a `none` literal lowers to wherever an
+# optional is expected. the shell is a struct-header allocation the
+# caller owns outright, and it carries no destructor, since there is no
+# payload for one to release.
 pub fn ir_emit_optional_none_value() -> Int:
     flag_r := ir_reg()
     value_r := ir_reg()
@@ -91,6 +113,13 @@ pub fn ir_emit_optional_none_value() -> Int:
     ir_emit("iconst " + value_r.to_string() + " 0")
     return ir_emit_optional_tuple(flag_r, value_r)
 
+# wrap `value_r` in a `Some` shell. the shell BORROWS its payload: no
+# destructor is attached, so releasing the optional frees the two slots
+# and drops nothing else. that is right for a primitive or a string,
+# and wrong for anything reference counted — use
+# ir_emit_optional_owned_some for a struct, list, map, set, bytes or
+# closure payload, or the target dies while the optional still points
+# at it. the shell itself is owned by the caller.
 pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
     flag_r := ir_reg()
     ir_emit("iconst " + flag_r.to_string() + " 1")

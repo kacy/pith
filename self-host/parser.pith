@@ -144,9 +144,20 @@ fn report_lexer_error_tokens():
             prev_was_err = false
         i = i + 1
 
+# everything the most recent parse complained about, in the order it was
+# found: lexer error tokens first (reported up front as E243), then the
+# syntax errors hit while walking the stream. the list is cleared at the
+# start of every parse, so read it before parsing the next file. each
+# entry carries the file path handed to parse_with_file — parse() leaves
+# that empty.
 pub fn parser_diagnostics() -> List[Diagnostic]:
     return parser_diag_list
 
+# whether the most recent parse recorded anything. the parser never
+# stops at the first problem — it recovers and keeps going, and still
+# hands back a module root with "error" leaves standing in for the parts
+# it could not read — so this is the check that decides whether the tree
+# is worth passing on to the checker.
 pub fn parser_has_errors() -> Bool:
     return parser_diag_list.len() > 0
 
@@ -364,6 +375,15 @@ fn parse_tuple_type() -> Int:
 # expressions — precedence tower
 # ---------------------------------------------------------------
 
+# parse one expression at the current token and return its arena node
+# index; the token position is left just past it. this is the top of the
+# precedence tower, so it accepts anything down to a literal.
+#
+# nesting is capped at 256 levels: past that it reports E242 and returns
+# an "error" leaf rather than recursing, which keeps a pathological input
+# like a thousand open parens from taking the process down. that means a
+# returned index is not proof the expression parsed — check
+# parser_has_errors().
 pub fn parse_expression() -> Int:
     if recursion_depth >= max_depth:
         parser_report_error_here("E242", "expression nesting too deep", "")
@@ -1500,9 +1520,26 @@ fn parse_fail_stmt() -> Int:
 # declarations
 # ---------------------------------------------------------------
 
+# parse a token stream with no source file attached. the diagnostics it
+# produces carry an empty file path, so anything that renders them with a
+# `file:line:col` header will render it headless — prefer
+# parse_with_file() whenever the path is known.
 pub fn parse(token_list: List[Token]) -> Int:
     return parse_with_file(token_list, "")
 
+# parse a whole module and return the arena index of its "module" node,
+# whose children are the imports followed by the top-level declarations.
+# `file_path` is only ever used to label diagnostics.
+#
+# this resets the parser (token table, position, diagnostics) but not the
+# node arena: nodes are appended to whatever is already there, which is
+# what lets the driver parse a module and all of its imports into one
+# arena and tell them apart by node range. call reset_arena() yourself
+# when you want a fresh one.
+#
+# it always returns a root, even for input that is badly broken. errors
+# are recovered from, not raised: check parser_has_errors() before
+# trusting the tree.
 pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     load_tokens(token_list)
     current_token_position = 0

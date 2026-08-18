@@ -25,6 +25,13 @@ fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
         return ""
     return recv.value
 
+# true when `recv.member[T]` names one of std.json's decode entry
+# points, whatever the importing module aliased std.json to. an
+# unaliased receiver spelled `json` or `json_mod` counts too, so a
+# module that only imported the name still lowers. anything that is not
+# an index over a field access with a plain identifier receiver is
+# false, so a decode reached through a call or a subscript is not
+# recognized and falls through to an ordinary call.
 pub fn ir_is_json_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
     recv_name := ir_decode_field_receiver(index_idx, member_name)
     if recv_name.len() == 0:
@@ -34,6 +41,11 @@ pub fn ir_is_json_decode_callee_with_aliases(index_idx: Int, member_name: String
             return true
     return recv_name == "json" or recv_name == "json_mod"
 
+# the std.config twin of ir_is_json_decode_callee_with_aliases: true
+# when `recv.member[T]` is a config decode under any alias, or under the
+# unaliased names `config` and `config_mod`. only the receiver is
+# checked here, so the caller still decides which config member it is
+# looking at.
 pub fn ir_is_config_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
     recv_name := ir_decode_field_receiver(index_idx, member_name)
     if recv_name.len() == 0:
@@ -52,6 +64,11 @@ pub fn ir_is_config_decode_callee_with_aliases(index_idx: Int, member_name: Stri
 pub fn ir_is_handle_pool_module(module_path: String) -> Bool:
     return module_path == "std.toml" or module_path == "std.yaml"
 
+# true when `recv.member[T]` is a decode on either handle-pool module,
+# under any alias or under the unaliased names `toml`, `toml_mod`,
+# `yaml` and `yaml_mod`. std.toml and std.yaml share one lowering, so
+# this answers for both at once; the emitted helper names are qualified
+# later from the receiver's own module path, not from here.
 pub fn ir_is_handle_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
     recv_name := ir_decode_field_receiver(index_idx, member_name)
     if recv_name.len() == 0:
@@ -61,6 +78,11 @@ pub fn ir_is_handle_decode_callee_with_aliases(index_idx: Int, member_name: Stri
             return true
     return recv_name == "toml" or recv_name == "toml_mod" or recv_name == "yaml" or recv_name == "yaml_mod"
 
+# the config file-decode form, which unlike the other three callee
+# tests also accepts a bare receiverless call: `decode_file[T](path)`
+# written after `from config import decode_file` is an index over a
+# plain identifier, and matches when that identifier is member_name
+# itself. with a receiver it behaves like the config test above.
 pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
     index_node := get_node(index_idx)
     if index_node.kind != "index" or index_node.children.len() < 2:
@@ -80,6 +102,13 @@ pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name:
             return true
     return recv.value == "config" or recv.value == "config_mod"
 
+# the fully-qualified std.config require-helper for a scalar field, or
+# "" when the field is not String, Int or Bool. this is the form the
+# specialization bodies need: they are emitted with no receiver
+# expression to resolve a bare member name against, so the symbol has to
+# arrive already qualified. type_name may be the annotation as written
+# (an alias, an `opaque:` kind) or an already-resolved kind — both land
+# on the same helper.
 pub fn ir_config_require_full_name_for_type_name_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
     if resolved == "string":
@@ -90,6 +119,11 @@ pub fn ir_config_require_full_name_for_type_name_with_state(type_name: String, t
         return "std_config_require_bool"
     return ""
 
+# the handle-pool twin of the config version: the qualified
+# require_string / require_int / require_bool for a scalar field, "" for
+# anything else. module_path decides which pool module's symbol comes
+# back, so std.toml and std.yaml stay distinct even though they share
+# the lowering; an empty module_path yields the bare member name.
 pub fn ir_handle_require_full_name_for_type_name_with_state(type_name: String, module_path: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
     if resolved == "string":
@@ -100,6 +134,16 @@ pub fn ir_handle_require_full_name_for_type_name_with_state(type_name: String, m
         return ir_resolve_generic_module_call_name(module_path, "require_bool")
     return ""
 
+# true when the generic body about to be specialized is std.config's
+# `decode[T]` (or `decode_prefix[T]` when prefixed is set). the written
+# source of both is only a `fail ... requires compiler support` stub, so
+# a true answer is what makes the emitter substitute a real lowering for
+# the concrete T; a false answer emits the stub and the program fails at
+# run time rather than at compile time. the module_path arm accepts ""
+# (std.config compiling itself) or the literal "std/config", but the
+# paths recorded for generic declarations are dotted, so only the empty
+# case matches in practice — an imported std.config is caught by the
+# already-prefixed `std_config_decode` name instead.
 pub fn ir_is_config_decode_specialization(base_name: String, prefixed: Bool, module_path: String, decl_idx: Int) -> Bool:
     local_std_config := module_path == "" or module_path == "std/config"
     first_param := ir_param_name_at(decl_idx, 0)
@@ -121,12 +165,23 @@ fn in_handle_pool_module(module_path: String) -> Bool:
 fn is_handle_pool_specialization_name(base_name: String, suffix: String) -> Bool:
     return base_name == "std_toml_" + suffix or base_name == "std_yaml_" + suffix
 
+# true when the body being specialized is `decode[T](handle)` from
+# std.toml or std.yaml — the root form, taking an already-parsed table
+# handle. its written source is a stub that fails with "requires
+# compiler support", so a false answer here does not stop the build; it
+# ships a binary that fails on the first decode. the parameter-name test
+# is what keeps `decode` in some unrelated module from being claimed.
 pub fn ir_is_handle_decode_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     first_param := ir_param_name_at(decl_idx, 0)
     if is_handle_pool_specialization_name(base_name, "decode"):
         return true
     return base_name == "decode" and in_handle_pool_module(module_path) and first_param == "handle"
 
+# true for `decode_path[T](handle, dotted_path)` on either handle-pool
+# module. unlike the root decode, this one does have a working written
+# body (walk require_table down the path, then decode the sub-table);
+# the emitter replaces it anyway, inlining both the walk and the field
+# loads instead of routing the tail through a second specialization.
 pub fn ir_is_handle_decode_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     first_param := ir_param_name_at(decl_idx, 0)
     second_param := ir_param_name_at(decl_idx, 1)
@@ -134,6 +189,11 @@ pub fn ir_is_handle_decode_path_specialization(base_name: String, module_path: S
         return true
     return base_name == "decode_path" and in_handle_pool_module(module_path) and first_param == "handle" and second_param == "dotted_path"
 
+# true for `decode_text_path[T](input, dotted_path)`, the form that
+# parses the document itself before walking the path. the emitted body
+# owns that parse, so it is the lowering that has to bracket the node
+# pool; the two path forms are told apart by the first parameter name
+# alone (`input` here, `handle` for the already-parsed twin).
 pub fn ir_is_handle_decode_text_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     first_param := ir_param_name_at(decl_idx, 0)
     second_param := ir_param_name_at(decl_idx, 1)
@@ -141,12 +201,23 @@ pub fn ir_is_handle_decode_text_path_specialization(base_name: String, module_pa
         return true
     return base_name == "decode_text_path" and in_handle_pool_module(module_path) and first_param == "input" and second_param == "dotted_path"
 
+# true for `decode_text[T](input)`, the form handed raw document text.
+# the body it selects owns the parse it performs, so that lowering marks
+# the node pool up front and restores it at the single exit. only the
+# two text forms do that; the handle forms are handed a pool their
+# caller parsed and still owns.
 pub fn ir_is_handle_decode_text_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     first_param := ir_param_name_at(decl_idx, 0)
     if is_handle_pool_specialization_name(base_name, "decode_text"):
         return true
     return base_name == "decode_text" and in_handle_pool_module(module_path) and first_param == "input"
 
+# true for std.json's `decode_object[T](handle)`, which decodes an
+# already-parsed object node rather than text or bytes. this is the one
+# the rest of the json family funnels into: every nested struct field a
+# decode meets is lowered as a call to the decode_object specialization
+# for that field's type, so a miss here breaks nesting everywhere, not
+# just at a written `json.decode_object` call.
 pub fn ir_is_json_decode_object_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     local_std_json := module_path == "" or module_path == "std.json"
     first_param := ir_param_name_at(decl_idx, 0)
@@ -154,6 +225,12 @@ pub fn ir_is_json_decode_object_specialization(base_name: String, module_path: S
         return true
     return base_name == "decode_object" and local_std_json and first_param == "handle"
 
+# the two root std.json entry points share this test: text_input false
+# asks about `decode[T](input: Bytes)`, true about
+# `decode_text[T](input: String)`. both are `fail ... requires compiler
+# support` stubs in source, and both take a parameter spelled `input`,
+# so the emitter calls this twice — once per flag — rather than trying
+# to tell them apart from the declaration alone.
 pub fn ir_is_json_decode_specialization(base_name: String, module_path: String, decl_idx: Int, text_input: Bool) -> Bool:
     local_std_json := module_path == "" or module_path == "std.json"
     first_param := ir_param_name_at(decl_idx, 0)
@@ -165,6 +242,10 @@ pub fn ir_is_json_decode_specialization(base_name: String, module_path: String, 
         return true
     return base_name == "decode" and local_std_json and first_param == "input"
 
+# true for `decode_path[T](handle, dotted_path)`, which selects a nested
+# object by dotted key before decoding it. the handle is the caller's,
+# so the lowering this picks walks the path and reads fields without
+# touching the node pool marks; only the text-taking forms own a parse.
 pub fn ir_is_json_decode_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
     local_std_json := module_path == "" or module_path == "std.json"
     first_param := ir_param_name_at(decl_idx, 0)
@@ -184,6 +265,16 @@ fn ir_module_alias_member_name_with_state(alias: String, member: String, module_
         return ir_import_target_name(module_path, member)
     return member
 
+# the symbol to emit for `member_name` when a decode lowering needs a
+# sibling helper — `parse`, `object_has`, `pool_mark_node_id` — from
+# whichever module the written call went through. index_idx is the
+# `mod.decode[T]` index node the lowering came from; the receiver on it
+# is the alias to resolve against, so the same lowering serves an
+# `import std.json as j` and a plain `import std.json` unchanged.
+# returns member_name untouched when the receiver is not a known module
+# alias, when that module declares no such name, or when the node is not
+# an index over a field access with an identifier receiver, so an
+# unresolved helper is emitted under its bare written name.
 pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     index_node := get_node(index_idx)
     if index_node.kind == "index" and index_node.children.len() > 0:
@@ -196,6 +287,12 @@ pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: Strin
                     return alias_name
     return member_name
 
+# the per-key byte scanner for a scalar field, or "" for anything else.
+# used by the small flat-struct lowering, which calls one of these per
+# field straight against the input bytes instead of first building a
+# scalar object. this returns exactly what
+# ir_json_scan_required_helper_name returns — the two tables are
+# duplicates of each other.
 pub fn ir_json_field_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -207,6 +304,13 @@ pub fn ir_json_field_helper_name(field_tid: Int) -> String:
             return "std_json_scan_required_bool_bytes"
     return ""
 
+# the scalar accessor for a field read out of a parsed object node, as a
+# bare member name — the caller has to run it through
+# ir_resolve_json_call_name before emitting, because unlike the
+# std_json_* tables below these are not already qualified. "" when the
+# field is not String, Int or Bool; the caller then skips the field, and
+# only the checker's rejection of unsupported field types keeps that
+# skip from shifting the struct slots after it.
 pub fn ir_json_object_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -218,6 +322,12 @@ pub fn ir_json_object_helper_name(field_tid: Int) -> String:
             return "object_require_bool"
     return ""
 
+# the scalar accessor for a field read out of a JsonScalarObject — the
+# three-map summary std_json_decode_scalars_bytes returns — rather than
+# out of a node handle. already fully qualified, so the caller emits it
+# as-is. this is the general lowering's table: it is what a struct with
+# more than three fields, or with an optional or defaulted field, reads
+# its scalars through. "" for a non-scalar field.
 pub fn ir_json_require_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -255,12 +365,22 @@ pub fn ir_json_type_name_char(name: String) -> String:
         return "b"
     return ""
 
+# the packed-spec type code for a field's tid, "" for a non-scalar. the
+# spec itself is built from the declaration's written type names, so
+# this is the tid-side twin used where only the tid is in hand — the
+# single-pass lowering asks it whether any field is a string, which is
+# what decides that the filled struct needs a destructor attached.
 pub fn ir_json_field_type_char(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
         return ir_json_type_name_char(info.name)
     return ""
 
+# the presence test that goes with ir_json_require_helper_name: does the
+# scalar object carry this key at this type. a field that is optional or
+# carries a default needs both names, so the caller drops the field
+# unless this and the require helper both come back non-empty. "" for a
+# non-scalar field.
 pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -272,6 +392,12 @@ pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
             return "std_json_scalar_has_bool"
     return ""
 
+# the std.config require-helper for a scalar field, as a bare member
+# name the caller resolves against the written call's receiver. note the
+# String case is spelled `require`, not `require_string` as the
+# handle-pool table has it. "" for a non-scalar field. the qualified
+# form, for specialization bodies that have no receiver to resolve
+# against, is ir_config_require_full_name_for_type_name_with_state.
 pub fn ir_config_require_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -297,12 +423,21 @@ pub fn ir_handle_require_helper_name(field_tid: Int) -> String:
             return "require_bool"
     return ""
 
+# field_tid back when the field is itself a struct, -1 otherwise. every
+# decode lowering asks this first, because a struct field is not read
+# with a scalar helper at all — it recurses into the decode_object
+# specialization for that type. an out-of-range tid answers -1 too,
+# since get_type_info hands back a kind of "<error>" for one.
 pub fn ir_struct_decode_field_tid(field_tid: Int) -> Int:
     info := get_type_info(field_tid)
     if info.kind == "struct":
         return field_tid
     return 0 - 1
 
+# the numeric scalar code for a field tid — 0 String, 1 Int, 2 Bool,
+# -1 for anything else. the integer counterpart of
+# ir_json_field_type_char; nothing in the tree calls it today, so treat
+# the encoding as unpinned by any test.
 pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -314,24 +449,47 @@ pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
             return 2
     return 0 - 1
 
+# the tid inside an optional field, or -1 when the field is not
+# optional. this is the unwrap step every decode field loop starts with:
+# the helper tables key off the inner type, while the optional-ness is
+# what decides whether a missing key is an error or a `none` store. the
+# -1 answer doubles as the "not optional" test, so callers write
+# `>= 0` rather than carrying a separate flag.
 pub fn ir_optional_inner_tid(field_tid: Int) -> Int:
     info := get_type_info(field_tid)
     if info.kind == "optional":
         return info.inner
     return 0 - 1
 
+# true when any field of the decode target is optional. one of the three
+# shape questions that pick a json decode strategy: an optional field
+# rules out both fast paths, because a missing key has to become a
+# `none` store rather than an error, which needs a per-field presence
+# test the single-pass scanner does not emit.
 pub fn ir_struct_has_optional_fields(target_info: TypeInfo) -> Bool:
     for field_tid in target_info.field_types:
         if ir_optional_inner_tid(field_tid) >= 0:
             return true
     return false
 
+# true when any field of the decode target declares a default value. the
+# defaults live in a registry keyed "Struct.field", not on the TypeInfo,
+# which is why this one has to be handed the map. a defaulted field
+# needs the same presence-test-then-branch shape an optional one does,
+# so it steers the decode away from the fast paths too.
 pub fn ir_struct_has_default_fields_with_state(target_info: TypeInfo, struct_field_default_nodes: Map[String, Int]) -> Bool:
     for field_name in target_info.fields:
         if struct_field_default_nodes.contains_key(target_info.name + "." + field_name):
             return true
     return false
 
+# true when any field is a struct, or an optional wrapping one. the
+# third shape question, and the one with the strongest consequence: a
+# nested field means the decode must parse into the node pool and
+# recurse, so the lowering brackets the parse with a pool mark and
+# restore instead of scanning the bytes flat. only one level is
+# inspected — a nested struct's own fields are the recursive call's
+# problem.
 pub fn ir_struct_has_nested_decode_fields(target_info: TypeInfo) -> Bool:
     for field_tid in target_info.field_types:
         if ir_struct_decode_field_tid(field_tid) >= 0:

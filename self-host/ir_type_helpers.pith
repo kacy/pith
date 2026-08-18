@@ -10,6 +10,16 @@ from checker import c_get_expr_type
 from types import get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
 
+# turn a type name as it was written into an emission kind, taking the
+# alias and struct tables explicitly so it works before global emitter
+# state is populated (ir_resolve_type_hint is the wrapper that reads
+# the globals). one alias hop is applied, not a transitive chain, and
+# an "opaque:" tag is stripped first. a name that is neither builtin
+# nor a known struct comes back unchanged, so this never returns "" —
+# an unrecognised annotation is passed through, not reported.
+# matching on the containers is by substring of the written text, so
+# for a nested annotation the innermost match can win: prefer the
+# node-based resolvers when you have the type node.
 pub fn ir_resolve_type_hint_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     mut resolved := type_name
     if type_aliases.contains_key(resolved):
@@ -49,6 +59,13 @@ pub fn ir_resolve_type_hint_with_state(type_name: String, type_aliases: Map[Stri
         return base
     return resolved
 
+# the kind string to write into emitted IR for a declared return or
+# field type. this is ir_resolve_type_hint_with_state plus the tagging
+# the IR text wants: a struct becomes "struct:Name", the four sync
+# primitives become "opaque:Name", and everything builtin stays as its
+# bare kind. an empty type_name — a function declared with no return
+# type — gives "unknown", never "". takes the tables explicitly;
+# ir_retkind is the wrapper over global emitter state.
 pub fn ir_retkind_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     if type_name.len() == 0:
         return "unknown"
@@ -81,6 +98,12 @@ pub fn ir_retkind_with_state(type_name: String, type_aliases: Map[String, String
         return "struct:" + resolved
     return resolved
 
+# the kind of a `generic_type` annotation node, distinguishing the
+# variants emission treats differently: List[String] from any other
+# list, and an integer-keyed map or set from a boxed one. only the
+# first type argument is inspected. returns "" for any other generic
+# head — Channel, Task, a user generic — so callers fall back to
+# resolving the head name as a plain type hint.
 pub fn ir_resolve_generic_type_node(tn: Node) -> String:
     if tn.value == "List":
         if tn.children.len() > 0:
@@ -102,9 +125,21 @@ pub fn ir_resolve_generic_type_node(tn: Node) -> String:
         return "set"
     return ""
 
+# every `T!` lowers to the same tuple representation whatever its ok
+# type is, so this always answers "tuple" and inner_type is ignored.
+# it exists so the call sites that resolve a result annotation read as
+# one shape, and so a representation that did vary by ok kind would
+# have a single place to change.
 pub fn ir_resolve_result_type_kind(inner_type: String) -> String:
     return "tuple"
 
+# the bridge from the checker's type ids to emission kinds, and the
+# authoritative one: unlike the name-based resolvers it sees through
+# aliases and generic substitution because the checker already did.
+# optionals and results both collapse to "tuple"; a function type is
+# "closure"; a struct is its bare name. returns "" for a negative tid
+# — the checker's "untyped" answer — and for a type it has no kind
+# for, so a caller that needs a kind must have a fallback ready.
 pub fn ir_type_from_tid(tid: Int) -> String:
     if tid < 0:
         return ""
@@ -162,6 +197,11 @@ pub fn ir_type_from_tid(tid: Int) -> String:
         return "closure"
     return ""
 
+# the kind of the elements of the list expression at expr_idx. this is
+# what picks the right list constructor and decides whether elements
+# are rc-tracked, so a wrong answer here leaks or over-releases.
+# returns "unknown" — not "" — when the checker did not type the
+# expression or typed it as something other than a list.
 pub fn ir_list_element_kind(expr_idx: Int) -> String:
     tid := c_get_expr_type(expr_idx)
     if tid >= 0:
@@ -172,6 +212,12 @@ pub fn ir_list_element_kind(expr_idx: Int) -> String:
                 return kind
     return "unknown"
 
+# the return kind of the function *value* at expr_idx — a lambda, a
+# closure variable, an element of a list of functions. use it for a
+# callee that is an expression rather than a name, where there is no
+# declaration to look the return type up in. returns "unknown" when
+# the checker did not type the expression as a function value; call
+# sites substitute their own default ("int" for an indirect call).
 pub fn ir_function_return_kind(expr_idx: Int) -> String:
     tid := c_get_expr_type(expr_idx)
     if tid >= 0:
@@ -182,9 +228,17 @@ pub fn ir_function_return_kind(expr_idx: Int) -> String:
                 return kind
     return "unknown"
 
+# the emission kind the checker assigned to the expression at idx, or
+# "" when it left it untyped. this is the first thing the emitter's
+# type inference asks; the syntactic guesses below it only run when
+# this comes back empty.
 pub fn ir_checked_type(idx: Int) -> String:
     return ir_type_from_tid(c_get_expr_type(idx))
 
+# "tuple" when the checker typed the expression at idx as a `T!`, and
+# "" otherwise. the "" is the useful half: it is how a call site asks
+# "is this actually a result?" before deciding to unpack it, so an
+# untyped expression is treated as not-a-result rather than guessed at.
 pub fn ir_checked_result_kind(idx: Int) -> String:
     tid := c_get_expr_type(idx)
     if tid < 0:
@@ -194,6 +248,14 @@ pub fn ir_checked_result_kind(idx: Int) -> String:
         return ""
     return "tuple"
 
+# the kind an index expression `coll[k]` yields, derived from the
+# collection's own type rather than from the type recorded on the
+# index node — the collection is typed even where the result of the
+# indexing is not, so this answers in more cases. one optional or
+# result wrapper on the collection is unwrapped first, so `maybe[k]`
+# still finds the map underneath. falls back to the node's checked
+# type when idx is not an index node or the collection is untyped, so
+# a "" answer still means "no idea", as everywhere else here.
 pub fn ir_checked_index_type(idx: Int) -> String:
     node := get_node(idx)
     if node.kind != "index" or node.children.len() == 0:
@@ -212,6 +274,13 @@ pub fn ir_checked_index_type(idx: Int) -> String:
         return ir_type_from_tid(coll_info.inner)
     return ir_checked_type(idx)
 
+# the kind of a bare identifier, from the emitter's own bookkeeping
+# rather than the checker: the current function's tracked locals
+# first, then the per-kind lists of module globals. a local shadows a
+# global of the same name, matching normal scoping. returns "" for a
+# name that is tracked nowhere — a function name, a struct name, or an
+# identifier the emitter never recorded a kind for. every table is
+# passed in; ir_lookup_name_type is the wrapper over emitter globals.
 pub fn ir_lookup_name_type_with_state(name: String, var_types: Map[String, String], global_int_names: List[String], global_string_names: List[String], global_list_string_names: List[String], global_list_names: List[String], global_map_int_names: List[String], global_map_names: List[String], global_set_int_names: List[String], global_set_names: List[String], global_bool_names: List[String]) -> String:
     if var_types.contains_key(name):
         return var_types[name]
@@ -235,6 +304,12 @@ pub fn ir_lookup_name_type_with_state(name: String, var_types: Map[String, Strin
         return "bool"
     return ""
 
+# the scalar kind a builtin or runtime function returns, from the
+# static tables in ir_metadata. these functions have no pith
+# declaration to read a return type off, so the tables are the only
+# source. returns "" for anything not listed, including every
+# user-declared function — the caller then falls through to the
+# declared-callable lookup.
 pub fn ir_known_scalar_return_type(fname: String) -> String:
     if ir_is_float_returning_func(fname):
         return "float"
@@ -248,6 +323,11 @@ pub fn ir_known_scalar_return_type(fname: String) -> String:
         return "bytes"
     return ""
 
+# the list kind a builtin or runtime function returns, separated from
+# the scalar table because emission distinguishes a list of strings
+# from any other list. returns "" for anything not listed, so callers
+# ask this after ir_known_scalar_return_type and before falling back
+# to a user declaration.
 pub fn ir_known_collection_return_type(fname: String) -> String:
     if ir_is_list_returning_func(fname):
         return "list"
@@ -255,6 +335,12 @@ pub fn ir_known_collection_return_type(fname: String) -> String:
         return "list_string"
     return ""
 
+# the return kind of a builtin method identified by its name alone,
+# with no receiver type needed because these names mean the same thing
+# on every receiver. despite the name it also covers the methods that
+# yield a list of strings — keys, values, split, chars — since those
+# are decided by the method name too. returns "" when the name is not
+# one of them, which is the signal to consult the receiver's type.
 pub fn ir_known_string_method_return_type(meth: String) -> String:
     if ir_is_string_returning_method(meth) or meth == "to_string_utf8":
         return "string"
@@ -262,6 +348,13 @@ pub fn ir_known_string_method_return_type(meth: String) -> String:
         return "list_string"
     return ""
 
+# the return kind of the builtin methods whose answer depends on what
+# they are called on: channel and task operations, and the list
+# methods that keep or lose the element kind (`slice` and `sort` of a
+# list_string stay list_string). obj_type is an emission kind and may
+# carry an element suffix, so both "list" and "list:Foo" are accepted.
+# returns "" when the pair is not one of these, leaving the caller to
+# keep looking.
 pub fn ir_known_collection_method_return_type(obj_type: String, meth: String) -> String:
     if obj_type == "channel" or obj_type.starts_with("channel:"):
         if meth == "recv":
@@ -283,6 +376,13 @@ pub fn ir_known_collection_method_return_type(obj_type: String, meth: String) ->
             return "list"
     return ""
 
+# the kind of a literal, from its node kind. `kind` is passed
+# separately from `node` because callers sometimes assert the shape
+# themselves — a set literal is emitted through this with kind "set"
+# regardless of how the node was tagged. a collection literal's
+# element kind is taken from its *first* element only, so a list whose
+# head is a string is list_string; an empty one falls back to the
+# untyped container kind. returns "" when the node is not a literal.
 pub fn ir_literal_expr_type(node: Node, kind: String) -> String:
     if kind == "int_lit" or kind == "int" or kind == "integer":
         return "int"
@@ -310,6 +410,11 @@ pub fn ir_literal_expr_type(node: Node, kind: String) -> String:
         return "tuple"
     return ""
 
+# the kind of a unary expression: "bool" for a logical not, "int" for
+# everything else. it does not look at the operand, so a negated float
+# is answered "int" — this is a last-resort guess that only runs after
+# the checker has already declined to type the expression, and it
+# never returns "" the way the other helpers here do.
 pub fn ir_unary_expr_type(node: Node) -> String:
     if node.value == "not" or node.value == "!" or node.value == "not_op":
         return "bool"

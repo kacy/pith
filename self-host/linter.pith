@@ -64,8 +64,13 @@ fn lint_top_level(node_idx: Int, source: String):
     elif inner.kind == "impl_decl":
         lint_impl_decl(inner, source)
     elif inner.kind == "binding":
+        # a binding at module level is a CONSTANT, and SCREAMING_SNAKE_CASE is
+        # how this tree spells one — std, self-host, tools and bench all do.
+        # flagging those as non-snake_case was the rule misreading a constant
+        # as a variable, and it is why std/ could never be brought under lint.
         name := l_extract_binding_name(inner.value)
-        check_snake_case(name, "variable", inner.line, inner.col)
+        if not is_screaming_snake_case(name):
+            check_snake_case(name, "constant", inner.line, inner.col)
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
 
@@ -126,6 +131,26 @@ fn check_snake_case(name: String, kind: String, line: Int, col: Int):
         return
     if not is_snake_case(name):
         report_linter_warning("E300", kind + " '" + name + "' should be snake_case", line, col)
+
+# SCREAMING_SNAKE_CASE — the spelling this tree uses for a module constant.
+# deliberately strict: it must be uppercase, digits and underscores only, so a
+# mixed-case name like `Color_UNKNOWN` still fails and gets reported. accepting
+# "has an uppercase letter somewhere" would have made the rule vacuous.
+fn is_screaming_snake_case(name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    c := ord(name[0])
+    if not is_uppercase_char(c):
+        return false
+    mut has_upper := false
+    for ch, i in name:
+        code := ord(ch)
+        if is_uppercase_char(code):
+            has_upper = true
+            continue
+        if not is_digit_char(code) and ch != "_":
+            return false
+    return has_upper
 
 fn is_snake_case(name: String) -> Bool:
     if name.len() == 0:
@@ -232,6 +257,13 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
 fn l_extract_binding_name(value: String) -> String:
     if value.starts_with("mut "):
         return value.substring(4, value.len())
+    # a `mut` binding stores its marker AFTER the name, so the leading strip
+    # above never fired for one and the name came out as "app_name mut" —
+    # which then failed the snake_case test on the space, reporting a casing
+    # problem that was really a parsing one. every `mut` module binding in the
+    # tree was flagged this way.
+    if value.ends_with(" mut"):
+        return value.substring(0, value.len() - 4)
     return value
 
 fn is_lowercase_char(c: Int) -> Bool:

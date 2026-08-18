@@ -158,7 +158,12 @@ jobs:
         run: |
           # std/ nests to std/net/http2, deeper than a `std/**/*.pith` glob
           # reaches without globstar, so the file list comes from find.
-          for f in $(find std -name '*.pith' | sort); do
+          #
+          # self-host/ joined this gate once its pub items were documented.
+          # note the gate and lint's E304 cover DIFFERENT things and neither
+          # subsumes the other: this walks top-level items including structs,
+          # E304 also walks impl methods. a file can pass here and still warn.
+          for f in $(find self-host std -name '*.pith' | sort); do
             ./self-host/pith_main doc --check "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL $f missing doc comments"

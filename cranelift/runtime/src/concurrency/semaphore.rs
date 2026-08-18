@@ -95,7 +95,7 @@ fn block_on_acquire<'a>(
         Some(id) => {
             state.green_waiters.push_back(id);
             drop(state);
-            green::park_current();
+            green::park_current(id);
             lock_state(lock)
         }
     }

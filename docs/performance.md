@@ -67,6 +67,34 @@ go's version, because a flat struct decodes in one pass with no reflection. the
 compute rows keep their long-standing shape: modestly behind go, well behind
 rust and zig, with string building the remaining gap.
 
+### why the default worker count stays at the core count
+
+every channel-shaped benchmark here runs faster pinned to one worker, which
+looks like an argument for making one the default. it is not, and the control
+is what settles it — eight spawned tasks doing independent arithmetic, no
+channels, nothing shared:
+
+| 2026-08-17, medians of 3 | 1 worker | 2 workers |
+|---|---:|---:|
+| chan_fanout, 1m msgs | **46-54 ms** | 64-96 ms |
+| green_fanout, 300k spawn+await | **~172 ms** | ~232 ms |
+| cpu_parallel, 8 independent tasks | 190 ms | **~107 ms** |
+
+so one worker wins the coordination rows by ~1.3-1.8x and loses the parallel
+row by **1.77x** — near-linear scaling on two cores, identical checksum.
+
+that asymmetry is the whole answer. the channel wins are not one worker being
+better; they are the placement cliff being *avoided*, because a pair that
+cannot land on two workers cannot land split. defaulting to one would hard-code
+that workaround into every program, and would charge every genuinely parallel
+workload 1.77x to do it — trading the point of an M:N runtime for a bug
+mitigation. **the default stays `available_parallelism`.** the channel numbers
+are a reason to fix placement (see the migration note in `green.rs`), not a
+reason to change the default.
+
+`PITH_GREEN_WORKERS=1` remains the right answer for a process that is known to
+be handoff-bound and not compute-bound, which is why the flag exists.
+
 ### a note on how these are measured
 
 the cross-language harnesses interleave: one round runs every language once,

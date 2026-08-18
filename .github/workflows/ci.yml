@@ -110,19 +110,26 @@ jobs:
       - name: verify bootstrap fixed point
         run: make bootstrap-verify
 
-      - name: lint examples
+      - name: lint
         run: |
-          for f in $(find examples -name '*.pith' | sort); do
-            ./self-host/pith_main lint "$f"
-            if [ $? -ne 0 ]; then
-              echo "FAIL lint $f"
-              exit 1
-            fi
-          done
-
-      - name: lint self-host
-        run: |
-          for f in self-host/*.pith; do
+          # std/ is in here because its public api IS the documentation —
+          # docsite generates from it, so a naming slip there ships to
+          # readers rather than staying an internal wart.
+          #
+          # lint now fails on a WARNING, not only on a hard error. a file
+          # that declares itself generated in its leading comment block is
+          # skipped, since generated code mirrors the naming of whatever
+          # produced it and is not ours to rename.
+          #
+          # tools/docsite/sample is golden-test INPUT rather than source:
+          # docsite renders that tree and the output is diffed, so the
+          # fixture deliberately contains an undocumented public function
+          # to pin how an undocumented item renders. documenting it would
+          # delete the case it exists to cover. a marker comment is no
+          # good either — the file's leading `##` block IS the module doc
+          # the golden captures.
+          for f in $(find examples self-host std tools -name '*.pith' \
+                          -not -path 'tools/docsite/sample/*' | sort); do
             ./self-host/pith_main lint "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL lint $f"

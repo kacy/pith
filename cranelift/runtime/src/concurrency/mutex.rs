@@ -128,7 +128,7 @@ fn lock_green(m: &PithMutex, id: usize) {
         }
         waiters.push(id);
         drop(waiters);
-        green::park_current();
+        green::park_current(id);
         // resumed by an unlock; loop and retry the acquire.
     }
 }

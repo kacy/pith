@@ -448,7 +448,7 @@ fn block_on_channel<'a>(
                 Role::Sender => state.green_senders.push(id),
             }
             drop(state);
-            green::park_current();
+            green::park_current(id);
             lock_state(&inner.state)
         }
     }
@@ -650,9 +650,10 @@ unsafe fn buffered_recv(inner: &ChannelInner, ring: &Ring) -> i64 {
         inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
         // a green task may have been handed its value by the waker (see
         // wake_parked): the send dequeued on our behalf, so take it and skip the
-        // re-try entirely.
-        if green_task.is_some() {
-            if let Some(value) = green::take_handoff() {
+        // re-try entirely. pass the id read before the park rather than asking
+        // which task we are again — see the note on `green::park_current`.
+        if let Some(id) = green_task {
+            if let Some(value) = green::take_handoff(id) {
                 return optional_tuple(true, value);
             }
         }

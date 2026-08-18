@@ -85,7 +85,7 @@ fn block_on_wait<'a>(
         Some(id) => {
             state.green_waiters.push(id);
             drop(state);
-            green::park_current();
+            green::park_current(id);
             lock_state(lock)
         }
     }

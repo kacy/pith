@@ -97,7 +97,7 @@ where
         if let Some(value) = slot.take() {
             return value;
         }
-        green::park_current();
+        green::park_current(task);
     }
 }
 

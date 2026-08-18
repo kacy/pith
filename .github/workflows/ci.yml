@@ -154,8 +154,9 @@ jobs:
 
       - name: check doc coverage
         run: |
-          for f in std/*.pith std/**/*.pith; do
-            [ -f "$f" ] || continue
+          # std/ nests to std/net/http2, deeper than a `std/**/*.pith` glob
+          # reaches without globstar, so the file list comes from find.
+          for f in $(find std -name '*.pith' | sort); do
             ./self-host/pith_main doc --check "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL $f missing doc comments"

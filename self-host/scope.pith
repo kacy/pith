@@ -8,6 +8,16 @@
 # scope entry — a single lexical scope (no nested collections)
 # ---------------------------------------------------------------
 
+# one lexical scope. note what is NOT here: the bindings. those live in
+# flat parallel lists tagged by scope id, so a scope is just this small
+# record and lookups filter the binding lists rather than walking a
+# per-scope container.
+#
+# `parent` is the enclosing scope's id, which is how a name not found
+# here is chased outward. `return_type` is the enclosing function's
+# declared return type, so a `return` can be checked without carrying
+# the function down the walk, and `in_loop` is what lets `break` and
+# `continue` be rejected outside one.
 pub struct ScopeEntry:
     pub parent: Int
     pub return_type: Int

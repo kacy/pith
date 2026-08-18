@@ -86,7 +86,7 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
 
     # E304: public function missing doc comment
     if is_pub:
-        check_doc_comment(name, node_idx, source)
+        check_doc_comment(name, node_idx, source, false)
 
     # check body for nesting depth
     for child in node.children:
@@ -115,7 +115,7 @@ fn lint_impl_decl(node: Node, source: String):
             check_snake_case(name, "method", actual.line, actual.col)
             # E304: public method missing doc comment
             if is_pub:
-                check_doc_comment(name, actual_idx, source)
+                check_doc_comment(name, actual_idx, source, true)
             # check body nesting depth
             for child in actual.children:
                 cn := get_node(child)
@@ -199,28 +199,38 @@ fn is_pascal_case(name: String) -> Bool:
 # E304: public function missing doc comment
 # ---------------------------------------------------------------
 
-fn check_doc_comment(name: String, node_idx: Int, source: String):
+# is_method says which declaration we are looking for, and it is load
+# bearing rather than cosmetic. a top-level function and an impl method
+# routinely share a name — std/fs.pith has both `pub fn read(path)` and
+# `FileStream.read(max_bytes)` — and searching the whole file for the
+# name found BOTH, kept the last, and judged the top-level function by
+# the line above the METHOD. every such pair reported the documented
+# function as undocumented. indentation separates them: a top-level
+# declaration starts at column 0, a method never does.
+fn check_doc_comment(name: String, node_idx: Int, source: String, is_method: Bool):
     # the doc comment lives on the line above the declaration, so the
-    # declaration is found by text search — a node's position points at
-    # the declaration, not at the blank or comment line before it. the
-    # blank-preserving split keeps indices equal to real line numbers;
-    # plain split drops empty lines and shifts everything above a gap.
+    # declaration is found by text search — the node's own position is the
+    # LAST token that formed it, which for a function is somewhere in its
+    # body, not the signature. the blank-preserving split keeps indices
+    # equal to real line numbers; plain split drops empty lines and shifts
+    # everything above a gap.
     lines := lines_keep_empty(source)
-    # search for the function declaration by looking for "fn name("
     search := "fn " + name + "("
     mut found_line := 0 - 1
     for line, i in lines:
         if not line.contains(search):
             continue
+        if found_line >= 0:
+            continue
         # a bare `contains` also matches a call site and any comment or
-        # string that happens to name the function, and the loop keeps the
-        # LAST hit — so a prose mention below the declaration became "the
-        # declaration", and the rule then read the line above THAT and
-        # reported a documented function as undocumented. only a line that
-        # opens with the declaration itself counts.
+        # string that happens to name the function, so require the line to
+        # OPEN with this exact declaration.
         trimmed := line.trim()
-        if trimmed.starts_with("fn ") or trimmed.starts_with("pub fn "):
-            found_line = i
+        if not trimmed.starts_with(search) and not trimmed.starts_with("pub " + search):
+            continue
+        if is_line_indented(line, trimmed) != is_method:
+            continue
+        found_line = i
     if found_line <= 0:
         # can't find or first line — skip
         return
@@ -261,6 +271,11 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
 # ---------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------
+
+# a line is indented when trimming it removed something. comparing
+# lengths is enough here and avoids caring which whitespace was used.
+fn is_line_indented(line: String, trimmed: String) -> Bool:
+    return line.len() > trimmed.len()
 
 # extract the plain binding name from a value like "mut x" or "x"
 fn l_extract_binding_name(value: String) -> String:

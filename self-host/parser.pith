@@ -999,9 +999,11 @@ fn parse_string_interpolation() -> Int:
         # interpolation expression
         if check("interpolation_expr"):
             _tv := _cur_tok_value()
+            interp_line := tok_line(current_token_position)
+            interp_col := tok_col(current_token_position)
             advance_token()
             split := split_format_spec(_tv)
-            interp_expr := parse_interp_expr(split.0)
+            interp_expr := parse_interp_expr(split.0, interp_line, interp_col)
             if split.1.len() > 0:
                 parts.push(add_node_with_position("interp_spec", split.1, [interp_expr]))
             else:
@@ -1092,7 +1094,18 @@ fn is_format_spec(spec: String) -> Bool:
         return false
     return digits > 0 or frac_digits > 0
 
-fn parse_interp_expr(text: String) -> Int:
+# parse the expression inside a `{}` interpolation.
+#
+# the expression is sub-lexed as its own fragment, so its tokens come back
+# numbered from line 1 — and every node built from them inherited that,
+# which is why a type error inside an interpolated string used to be
+# reported at line 1 of the file rather than where the string was written.
+#
+# base_line/base_col are the position of the enclosing interpolation token.
+# stamping them onto the fragment's tokens before loading is what puts the
+# nodes back on the right line, since the parser takes a node's position
+# from the token it is looking at.
+fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
     # save parser state
     saved_kinds := snapshot_token_kinds()
     saved_values := snapshot_token_values()
@@ -1104,7 +1117,16 @@ fn parse_interp_expr(text: String) -> Int:
     saved_depth := recursion_depth
 
     # sub-lex and sub-parse the interpolation expression
-    sub_tokens := lex_all(text)
+    raw_tokens := lex_all(text)
+    # the column stays the enclosing token's rather than base_col plus the
+    # offset within the fragment: the fragment's own columns are relative to
+    # the expression text, and the interpolation token's column is not yet
+    # the position of the opening brace, so adding them would point at a
+    # confident wrong column. the caret lands on the string that contains
+    # the error, which is honest about what is known.
+    mut sub_tokens: List[Token] := []
+    for tok in raw_tokens:
+        sub_tokens.push(Token(tok.kind, tok.value, base_line, base_col, tok.offset, tok.len))
     load_tokens(sub_tokens)
     current_token_position = 0
     recursion_depth = 0

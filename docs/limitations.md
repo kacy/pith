@@ -146,9 +146,11 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## tooling
 
-- **editor support is early** — `pith lsp` covers diagnostics, hover, document
-  symbols, and formatting; no go-to-definition or completion yet. see
-  [docs/lsp.md](lsp.md) for what works.
+- **no incremental analysis** — `pith lsp` re-checks the whole import closure
+  on every change, so diagnostics on a large file trail the last keystroke by
+  the closure's check time. queries answer instantly from the last snapshot
+  throughout. see [docs/lsp.md](lsp.md) for the feature list and the measured
+  numbers.
 - **no package registry** — dependencies are local path entries in `pith.toml`;
   there is no fetch, lock, or hosted index yet.
 - **no debugger** — runtime stack traces are thin and there is no stepping.
@@ -157,11 +159,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   it), but a node's position is the position of the last token that formed it,
   so an error about a whole expression points at its closing token rather than
   its first.
-- **an error inside a string interpolation reports at line 1** — the expression
-  in `"{f(x)}"` is parsed as its own fragment and carries no position from the
-  enclosing file, so a type error in it lands on line 1 rather than on the line
-  the string is written. pull the expression out to a binding to see where it
-  really is.
+- **an error inside a string interpolation points at the string, not at the
+  expression** — the expression in `"{f(x)}"` is parsed as its own fragment, so
+  its tokens are stamped with the enclosing interpolation's position. the line
+  is right; the column is the string's rather than the expression's, because
+  the fragment's own columns are relative to the expression text.
 
 ## backend
 

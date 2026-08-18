@@ -107,6 +107,11 @@ pub fn all_binding_names() -> List[String]:
 pub fn all_binding_decl_nodes() -> List[Int]:
     return binding_decl_nodes
 
+## the type id recorded for each binding, positionally parallel to
+## all_binding_names and all_binding_decl_nodes. tooling walks the
+## three together and backwards, so a repeated name resolves to the
+## innermost binding that shadows it. this returns a fresh copy, not
+## the arena's own list.
 pub fn all_binding_types() -> List[Int]:
     mut tids: List[Int] := []
     for tid in binding_types:
@@ -200,6 +205,10 @@ pub fn lookup_binding_decl_node(scope_id: Int, name: String) -> Int:
         return lookup_binding_decl_node(entry.parent, name)
     return -1
 
+## the type id bound to the name, searched in this scope and then up
+## the parent chain, or -1 when no scope in the chain binds it. -1
+## means the name is unknown, not that it is untyped: a binding the
+## checker could not resolve is recorded as TID_ERR, which is 15.
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # the latest binding of the name in this scope wins (shadowing), so
     # only the last index under the key matters; miss falls to the parent

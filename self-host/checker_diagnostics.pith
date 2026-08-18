@@ -10,11 +10,20 @@ mut checker_file_path := ""
 # doesn't thread a node through
 mut checker_current_node := 0 - 1
 
+## stamp `idx` as the node that plain report_error calls take their line
+## and column from, and hand back the previous stamp so a nested check
+## can put it back with checker_restore_current_node. a caller that
+## drops the return value leaves its stamp in place after it finishes,
+## which is what statement checking relies on.
 pub fn checker_set_current_node(idx: Int) -> Int:
     prev := checker_current_node
     checker_current_node = idx
     return prev
 
+## put back a stamp saved by checker_set_current_node, so checking a
+## sub-expression doesn't leave its node as the position for errors the
+## enclosing expression reports afterwards. -1 means "no node", and
+## reporting with that stamp gives line 0, column 0.
 pub fn checker_restore_current_node(prev: Int):
     checker_current_node = prev
 
@@ -30,13 +39,26 @@ fn checker_node_position(node_idx: Int) -> (Int, Int):
     node := get_node(node_idx)
     return (node.line, node.col)
 
+## throw away everything reported so far and start attributing
+## diagnostics to `file_path`. initialize_checker calls this once at the
+## start of a check run and nothing resets again, so the diagnostics of
+## a multi-module run all pile into one list.
 pub fn checker_reset_diagnostics(file_path: String):
     checker_diagnostics = []
     checker_file_path = file_path
 
+## change the file stamped on diagnostics from here on, keeping the ones
+## already reported. a check run walks several modules through one
+## shared diagnostic list, so a driver has to update this as it enters
+## each module or every error will name whichever file was named last.
 pub fn checker_set_file_path(file_path: String):
     checker_file_path = file_path
 
+## everything reported since the last checker_reset_diagnostics, in the
+## order it was reported. nothing is filtered or deduplicated, and
+## warnings share the list with errors — the `severity` field is the
+## only thing telling them apart. nothing resets between modules, so
+## each c_run_module result also carries the earlier modules' entries.
 pub fn checker_get_diagnostics() -> List[Diagnostic]:
     return checker_diagnostics
 
@@ -52,25 +74,56 @@ pub fn checker_reported_at_current() -> Bool:
             return true
     return false
 
+## report an error against a specific AST node, for a site that holds
+## the offending node but is not the node currently being checked — an
+## argument, or a child of the expression under check. a negative
+## node_idx reports at line 0, and the text renderer then prints the
+## file and message with no line number and no source snippet.
 pub fn report_error_at(node_idx: Int, code: String, message: String):
     pos := checker_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
 
+## report an error at whatever node checking is currently inside. this
+## is the common form: the statement and expression walkers stamp the
+## node on entry with checker_set_current_node, so a reporting site
+## buried in a helper gets a position without threading a node index
+## through. with no node stamped yet the error lands at line 0 and
+## prints without a location.
 pub fn report_error(code: String, message: String):
     pos := checker_node_position(checker_current_node)
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
 
+## report_error_at plus a suggested repair. the fix travels in its own
+## field, not in the message: the text renderer prints it on a separate
+## `fix:` line and the JSON carries it as "fix", so phrase it as a
+## standalone instruction ("declare with 'mut': mut x") rather than a
+## clause continuing the message. an empty fix prints no `fix:` line and
+## comes out as JSON null.
 pub fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
     pos := checker_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
 
+## report_error plus a suggested repair, positioned at the node
+## currently being checked. the fix follows the same rules as in
+## report_error_with_fix_at: a standalone instruction, rendered on its
+## own line, and skipped when empty.
 pub fn report_error_with_fix(code: String, message: String, fix: String):
     pos := checker_node_position(checker_current_node)
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
 
+## record a warning at a node's position, into the same list the errors
+## go into — severity "warning" is all that distinguishes it, and
+## checker_reported_at_current only ever looks at errors, so a warning
+## here never suppresses a later error at the same line. no checker pass
+## calls this today; the E3xx warnings a user sees come from the
+## linter's own diagnostic list, not this one.
 pub fn report_warning_at(node_idx: Int, code: String, message: String):
     pos := checker_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, pos.0, pos.1, ""))
 
+## record a warning with no source position at all. unlike report_error
+## it ignores the current-node stamp entirely and always writes line 0,
+## column 0, so it renders with the file and message but no line and no
+## snippet. like report_warning_at, no checker pass calls it today.
 pub fn report_warning(code: String, message: String):
     checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, 0, 0, ""))

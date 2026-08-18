@@ -3,6 +3,15 @@
 from ir_builder import ir_emit, ir_label
 from ir_result_abi import ir_emit_result_flag_field, ir_emit_ret_known_err_box
 
+## guard one fallible step of a generated body: test `result_r`, and on
+## the error arm store the box whole into `temp_name` and jump to
+## `done_l`. emission continues on the ok path, so the next thing the
+## caller emits runs only when the step succeeded.
+## the caller owns the protocol around it — register `temp_name` as a
+## "tuple" var before the first step, emit `label done_l` after the last
+## one, and load the temp there to get whichever box was reached. the
+## error box's ownership moves into the temp; on the ok path `result_r`
+## is still the caller's to take the payload from and release.
 pub fn ir_emit_result_store_error_branch(result_r: Int, temp_name: String, done_l: String):
     ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
     ok_l := ir_label()
@@ -13,6 +22,11 @@ pub fn ir_emit_result_store_error_branch(result_r: Int, temp_name: String, done_
     ir_emit("jmp " + done_l)
     ir_emit("label " + ok_l)
 
+## the same guard for a body that is free to return: the error arm
+## returns `result_r` straight out, in whichever shape the enclosing
+## function's signature wants — the box itself, or the error payload in
+## the pair's value register with the shell freed. emission continues on
+## the ok path, where `result_r` is still the caller's to unpack.
 pub fn ir_emit_result_return_error_branch(result_r: Int):
     ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
     ok_l := ir_label()

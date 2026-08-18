@@ -8,15 +8,34 @@
 from ir_builder import ir_reg, ir_emit
 from ir_call_emit import ir_emit_call1, ir_emit_call2
 
+# take one count on the string in `r`. safe on any string register: the
+# runtime makes retain a no-op for literals and null, so emitted code
+# never has to know where the string came from.
 pub fn ir_string_retain_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
 
+# drop one count on the string in `r`, freeing it at the last one. the
+# mirror of ir_string_retain_reg and just as safe on a literal or null.
 pub fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
 
+# whether `kind` names something reference counted at all. ir_rc_kind
+# returns "" for a value that carries no count (an int, a bool, a
+# result shell), so the empty string is the "nothing to release"
+# answer. scope cleanup uses this to skip locals that own no count.
+# it only asks whether the kind is non-empty — a kind ir_rc_release_reg
+# does not recognise still passes here and then emits nothing.
 pub fn ir_rc_release_enabled(kind: String) -> Bool:
     return kind.len() > 0
 
+# take one count on `r`, dispatching to the runtime retain that matches
+# the rc kind ("string", "list", "map", "set", "bytes", "struct",
+# "tuple", "closure", "weak"). this is what a borrow becomes an owned
+# count through: binding, assigning or storing a value read out of a
+# variable, a collection or a struct field goes through here first.
+# an unrecognised kind — including the "" ir_rc_kind returns for a
+# non-counted value — emits nothing at all, so a wrong kind string is a
+# silent missing retain rather than an error.
 pub fn ir_rc_retain_reg(r: Int, kind: String):
     if kind == "string":
         ir_string_retain_reg(r)
@@ -72,6 +91,13 @@ pub fn ir_rc_visit_reg(r: Int, kind: String):
     ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
     ir_emit_call2(ir_reg(), "pith_cc_visit", "void", r, code_r)
 
+# drop one count on `r` for the given rc kind, freeing the value at the
+# last one. the exact mirror of ir_rc_retain_reg, kind for kind, and the
+# two must stay that way — every emitted retain is matched by a release
+# with the same kind string. scope cleanup, rebinds, owned-argument
+# releases and generated destructor bodies all end up here. an
+# unrecognised kind emits nothing, which shows up as a leak, not a
+# crash.
 pub fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
         ir_string_release_reg(r)

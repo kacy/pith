@@ -10,12 +10,29 @@ pub struct ResolvedCallee:
 fn ir_import_key(module_path: String, name: String) -> String:
     return module_path + "." + name
 
+# true when the module at `module_path` declares a function called
+# `name`. the map is keyed "module.name" and is filled while collecting
+# a preloaded module root, so it only answers for modules this emit
+# actually loaded — one that was never loaded reads as declaring
+# nothing. callers use it to decide whether a written name has to be
+# rewritten to that module's qualified IR symbol.
 pub fn ir_import_declares_function_with_state(module_path: String, name: String, import_declared_functions: Map[String, Bool]) -> Bool:
     return import_declared_functions.contains_key(ir_import_key(module_path, name))
 
+# true when the module at `module_path` declares a global called `name`.
+# globals get their own map because a module member can be either a
+# function or a global and both are qualified the same way, so a name
+# resolver has to ask both questions before falling back.
 pub fn ir_import_declares_global_with_state(module_path: String, name: String, import_declared_globals: Map[String, Bool]) -> Bool:
     return import_declared_globals.contains_key(ir_import_key(module_path, name))
 
+# the IR symbol for `alias.member`, resolved through the module the
+# alias names. returns "" when `alias` is not a known module alias, and
+# that empty string is the signal callers test to tell a module member
+# apart from a field access on an ordinary value. when the alias is
+# known but the module declares neither a function nor a global called
+# `member`, the bare `member` comes back unqualified rather than "" —
+# so an unresolved member is emitted under its written name.
 pub fn ir_module_alias_member_name_with_state(alias: String, member: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     if not module_aliases.contains_key(alias):
         return ""
@@ -26,11 +43,23 @@ pub fn ir_module_alias_member_name_with_state(alias: String, member: String, mod
         return ir_import_target_name(module_path, member)
     return member
 
+# a method name with any leading "." stripped, so every reader of a
+# method_call node's value agrees on one spelling. the parser builds
+# that value from an identifier token, so no node in the current tree
+# carries the dot and the name comes back unchanged; the strip is here
+# for readers that reach a method_call from elsewhere.
 pub fn ir_plain_method_name(name: String) -> String:
     if name.starts_with("."):
         return name.substring(1, name.len())
     return name
 
+# the symbol a bare callee name resolves to, plus whether it came from
+# another module. two rules, tried in this order: an explicit
+# from-import rename wins first, then — only while a generic body
+# declared in another module is being specialized — a name that module
+# declares is qualified against it. a name neither rule claims comes
+# back untouched with imported=false, which is what callers read as
+# "declared right here" before they go looking for its body.
 pub fn ir_ident_callee_with_state(name: String, import_renames: Map[String, String], active_generic_module_path: String, import_declared_functions: Map[String, Bool]) -> ResolvedCallee:
     if import_renames.contains_key(name):
         return ResolvedCallee(import_renames[name], true)
@@ -38,6 +67,11 @@ pub fn ir_ident_callee_with_state(name: String, import_renames: Map[String, Stri
         return ResolvedCallee(ir_import_target_name(active_generic_module_path, name), true)
     return ResolvedCallee(name, false)
 
+# the qualified symbol for a `mod.fn` callee node. idx is the callee
+# expression, which has to be a field access whose receiver is a plain
+# identifier naming a module alias; anything else — a field access on a
+# value, a chained path, a non-alias identifier — returns "". callers
+# treat "" as "not a module member" and leave the expression alone.
 pub fn ir_resolve_module_alias_call_name_with_state(idx: Int, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     node := get_node(idx)
     if node.kind != "field_access" or node.children.len() == 0:
@@ -47,6 +81,12 @@ pub fn ir_resolve_module_alias_call_name_with_state(idx: Int, module_aliases: Ma
         return ""
     return ir_module_alias_member_name_with_state(recv.value, node.value, module_aliases, import_declared_functions, import_declared_globals)
 
+# the same alias resolution as ir_resolve_module_alias_call_name_with_state,
+# but for the method_call spelling: `mod.fn(x)` parses as a call ON the
+# alias rather than a field access, so the alias sits on the receiver
+# and the member is the node's own value. returns "" for a method_call
+# on anything that is not a bare identifier naming a module alias, which
+# is every ordinary method call on a value.
 pub fn ir_resolve_module_alias_method_call_name_with_state(idx: Int, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     node := get_node(idx)
     if node.kind != "method_call" or node.children.len() == 0:
@@ -56,6 +96,14 @@ pub fn ir_resolve_module_alias_method_call_name_with_state(idx: Int, module_alia
         return ""
     return ir_module_alias_member_name_with_state(recv.value, ir_plain_method_name(node.value), module_aliases, import_declared_functions, import_declared_globals)
 
+# the function a call node's callee names, for the three spellings that
+# are statically resolvable: a bare ident, a `f[T]` instantiation, and
+# `mod.f` (including `mod.f[T]`). `Channel[T]` short-circuits to the
+# bare name "Channel" because it lowers to a builtin, not to a declared
+# function. anything else — a call through a value, a field access on a
+# non-alias receiver — comes back with an empty name, which is what
+# callers read as "no statically known callee" before falling back to
+# an indirect or unknown-callee path.
 pub fn ir_resolve_static_callee_with_state(idx: Int, import_renames: Map[String, String], active_generic_module_path: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> ResolvedCallee:
     node := get_node(idx)
     if node.kind == "ident":

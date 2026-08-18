@@ -37,6 +37,13 @@ fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     ir_emit("sstore " + result_r.to_string() + " 2 " + err_r.to_string())
     return result_r
 
+## wrap `ok_r` in a success result box: three slots, is_ok set, the
+## payload in the ok slot and a zero error slot. no retain is emitted —
+## the payload's count moves into the box — and the shell gets no
+## destructor, so releasing it later frees the three slots alone: the
+## payload has to be taken out first or its count is stranded.
+## "raw" means it is built on the registry-free call helper, so modules
+## below the emitter core can build a box without importing its tables.
 pub fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
     one := ir_reg()
     ir_emit("iconst " + one.to_string() + " 1")
@@ -47,6 +54,14 @@ pub fn ir_emit_err_result_tuple_raw(err_r: Int) -> Int:
     zero := ir_zero_reg_raw()
     return ir_emit_result_tuple_raw(zero, zero, err_r)
 
+## the success tail of a generated decode that returns through a temp:
+## allocate the struct, fill it from `field_regs` — list position is the
+## field slot, so they must be in declaration order — give it its
+## destructor when the type needs one, and store the ok box into
+## `temp_name`. the counts in `field_regs` transfer into the struct.
+## `temp_name` is the same temp every fallible step of the decode stores
+## its error box into, so the caller emits the shared done label right
+## after this and loads the temp to get whichever box was reached.
 pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, temp_name: String):
     struct_r := ir_reg()
     field_count_r := ir_reg()
@@ -57,6 +72,11 @@ pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, t
     ir_emit_attach_result_dtor(struct_r, struct_kind)
     ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
 
+## the same packing as ir_emit_struct_result_store, for a generated body
+## that returns directly instead of routing through a temp: the ok box
+## becomes the return value. it emits the `endfunc` itself, so this is
+## the last thing that may be emitted for that function — anything the
+## caller adds afterwards lands outside the body.
 pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
     struct_r := ir_reg()
     field_count_r := ir_reg()

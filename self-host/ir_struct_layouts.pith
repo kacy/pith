@@ -5,6 +5,12 @@ from ir_ast_helpers import ir_unwrap_pub_node
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid
 from types import get_type_info, lookup_type_id
 
+# the name a struct annotation's layout is registered under. every
+# instantiation of a generic shares one layout, so `Box[Int]` folds back
+# to `Box` — but only when `Box` is itself registered, so a name that
+# merely happens to contain a bracket is never truncated into a wrong
+# layout. an unregistered name comes back unchanged, which the callers
+# then see as an ordinary lookup miss.
 pub fn ir_struct_layout_name_with_state(struct_name: String, struct_names: Map[String, Int]) -> String:
     if struct_names.contains_key(struct_name):
         return struct_name
@@ -14,12 +20,24 @@ pub fn ir_struct_layout_name_with_state(struct_name: String, struct_names: Map[S
             return base_name
     return struct_name
 
+# how many slots the struct's layout has, or 0 when the name is not
+# registered — 0 and "no such struct" are not distinguishable here.
+# together with ir_struct_field_name_at_with_state this is the standard
+# walk over a struct's fields in declaration order, used by destructor
+# emission, decode lowering and generic specialization. boxed enums are
+# registered in the same table, where the count is the variant count.
 pub fn ir_struct_field_count_with_state(struct_name: String, struct_names: Map[String, Int]) -> Int:
     layout_name := ir_struct_layout_name_with_state(struct_name, struct_names)
     if struct_names.contains_key(layout_name):
         return struct_names[layout_name]
     return 0
 
+# the name of the slot at field_index in declaration order, or "" when
+# the index is out of range or the struct is unknown. the checker's
+# registered type info answers first; a struct that never got a type id
+# falls through to a linear scan of the whole "Struct.field" -> index
+# table, so the fallback path costs one pass over every field of every
+# struct in the program and should not sit inside a hot loop.
 pub fn ir_struct_field_name_at_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_field_index_lookup: Map[String, String]) -> String:
     struct_tid := lookup_type_id(struct_name)
     if struct_tid >= 0:
@@ -33,6 +51,14 @@ pub fn ir_struct_field_name_at_with_state(struct_name: String, field_index: Int,
             return key.substring(prefix.len(), key.len())
     return ""
 
+# the emission kind recorded for a field, or "" when the struct or the
+# field is unknown. despite the name this is the resolved kind the IR
+# writes rather than the source spelling: `String` reads back as
+# "string", an optional or tuple field as "tuple", a closure field as
+# "closure", and a struct-typed field as the bare struct name. for a
+# boxed enum the entry under "Enum.Variant" is the enum's own name,
+# which is the marker the emitter uses to tell a variant constructor
+# apart from a real field.
 pub fn ir_struct_field_type_name_with_state(struct_name: String, field_name: String, struct_names: Map[String, Int], struct_field_lookup: Map[String, String]) -> String:
     key := ir_struct_layout_name_with_state(struct_name, struct_names) + "." + field_name
     if struct_field_lookup.contains_key(key):
@@ -59,6 +85,15 @@ fn ir_struct_resolve_type_node(type_idx: Int, type_aliases: Map[String, String],
         return "tuple"
     return ""
 
+# the emission kind of the field at field_index, read back out of the
+# struct's declaration ast instead of the layout tables. this resolves
+# aliases and the optional/result/fn/tuple type forms the same way field
+# registration did, so it can answer for a struct whose kind never made
+# it into struct_field_lookup. returns "" when the struct has no
+# recorded declaration node, when field_index runs past the last field,
+# or when the field carries no type node at all. only `field` members
+# advance the index — methods and anything else in the body are skipped,
+# and a `pub` field is unwrapped first.
 pub fn ir_struct_field_kind_from_decl_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_decl_nodes: Map[String, Int], type_aliases: Map[String, String]) -> String:
     layout_name := ir_struct_layout_name_with_state(struct_name, struct_names)
     if not struct_decl_nodes.contains_key(layout_name):
@@ -76,6 +111,14 @@ pub fn ir_struct_field_kind_from_decl_with_state(struct_name: String, field_inde
         current_index = current_index + 1
     return ""
 
+# the type id behind an emission kind. the six primitive kinds map to
+# their fixed ids and a kind naming a registered struct resolves through
+# the type registry; everything else — list, map, set, tuple, closure,
+# channel, task, "unknown", and the sized integer kinds like "Int32"
+# that never collapse to "int" — comes back as -1, which callers read as
+# "no better answer, keep the tid you had". the primitive ids are spelt
+# as literals here and have to stay in step with the TID_* constants in
+# types.pith.
 pub fn ir_field_kind_tid_with_state(kind: String, struct_names: Map[String, Int]) -> Int:
     if kind == "int":
         return 0
@@ -93,6 +136,16 @@ pub fn ir_field_kind_tid_with_state(kind: String, struct_names: Map[String, Int]
         return lookup_type_id(kind)
     return -1
 
+# the type id to use for a struct field, second-guessing the tid the
+# checker already handed over. fallback_tid is that guess (pass -1 when
+# there is none). the declaration ast is consulted first and the layout
+# tables second; when the kind they agree on disagrees with what
+# fallback_tid decodes to, the layout wins. fallback_tid survives
+# untouched when neither source knows the field and when the field's
+# kind has no id of its own — a list, map or tuple field always keeps
+# the checker's tid. decode lowering leans on this because a struct
+# reached through a generic can arrive with a stale or -1 field tid, and
+# the tid is what picks the per-field converter.
 pub fn ir_struct_field_tid_at_with_state(struct_name: String, field_index: Int, fallback_tid: Int, struct_names: Map[String, Int], struct_decl_nodes: Map[String, Int], struct_field_index_lookup: Map[String, String], struct_field_lookup: Map[String, String], type_aliases: Map[String, String]) -> Int:
     mut field_kind := ir_struct_field_kind_from_decl_with_state(struct_name, field_index, struct_names, struct_decl_nodes, type_aliases)
     if field_kind.len() == 0:
@@ -109,6 +162,11 @@ pub fn ir_struct_field_tid_at_with_state(struct_name: String, field_index: Int, 
         return field_tid
     return fallback_tid
 
+# the ast node of the field's default-value expression, or -1 when the
+# field declares no default (or the struct is unknown). decode lowering
+# is the main caller: -1 means the key is required and its absence is an
+# error, anything else is the expression to emit when the key is missing
+# from the input.
 pub fn ir_struct_field_default_node_with_state(struct_name: String, field_name: String, struct_names: Map[String, Int], struct_field_default_nodes: Map[String, Int]) -> Int:
     key := ir_struct_layout_name_with_state(struct_name, struct_names) + "." + field_name
     if struct_field_default_nodes.contains_key(key):

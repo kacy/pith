@@ -122,6 +122,13 @@ pub fn ir_struct_field_default_node(struct_name: String, field_name: String) -> 
 
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 
+# drop every cached ir_struct_needs_dtor answer. the memo is keyed by
+# bare struct name and derived from the registry's field tables, so it
+# has to be cleared whenever those tables are — the emitter does it in
+# the same breath as clearing the struct registry between modules.
+# leaving it would answer a new module's same-named struct from the
+# old one's fields, and a wrong "no dtor" is a struct whose rc fields
+# are never released.
 pub fn ir_reset_dtor_memo():
     ir_dtor_memo = {}
 
@@ -138,6 +145,19 @@ pub fn ir_enum_needs_dtor(ename: String) -> Bool:
                     return true
     return false
 
+# whether a struct holds anything reference counted, so every
+# construction site knows to attach the generated destructor. `raw_name`
+# may be qualified or `struct:`-prefixed; it is reduced to the bare
+# name, which is also the memo key. a boxed enum answers from its
+# variant payloads instead of declared fields, since that is where its
+# releasable slots live.
+#
+# false is the answer for a struct the registry does not know, so a
+# caller that asks before the type is registered gets no destructor
+# and the fields it holds are never released — call it after the
+# metadata pass, and reset the memo when the registry changes.
+# a struct that reaches itself only through its own fields answers
+# false on the recursive visit, which is what stops the walk looping.
 pub fn ir_struct_needs_dtor(raw_name: String) -> Bool:
     sname := ir_struct_base_name(raw_name)
     if ir_dtor_memo.contains_key(sname):

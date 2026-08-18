@@ -204,9 +204,14 @@ fn format_code_line(line: String) -> String:
                 i = i + 1
                 i = skip_leading_spaces(line, i)
                 continue
-            # unary — no space after
+            # unary — binds tight to its operand, so no space after. skipping
+            # the spaces is what NORMALISES an already-damaged site: `- 1`
+            # written by an older formatter comes back as `-1` rather than
+            # being preserved. the binary arm above is unreachable from here,
+            # so a real subtraction (`a - 1`, `x[i - 1]`) keeps its spacing.
             output = output + "-"
             i = i + 1
+            i = skip_leading_spaces(line, i)
             continue
 
         # = (assignment, not ==)
@@ -434,8 +439,9 @@ test "a unary minus after a keyword stays glued to its operand":
     # `return`, `and`, `if` and friends all end in a letter, so a naive
     # "is the last character alphanumeric" test reads them as operands and
     # spaces the minus as if it were binary. that rewrote `return -1` to
-    # `return - 1` — valid, but not what anyone wrote, and 191 sites in the
-    # tree had already been rewritten that way before this was caught.
+    # `return - 1` — valid, but not what anyone wrote, and 91 sites in the
+    # tree had already been rewritten that way before this was caught. they
+    # are normalised now; the test below covers the repair direction.
     assert(fmt_source("fn f() -> Int:" + chr(10) + "    return -1" + chr(10)).contains("return -1"))
     assert(fmt_source("fn g(a: Int) -> Int:" + chr(10) + "    return -a" + chr(10)).contains("return -a"))
     assert(fmt_source("fn h(a: Int) -> Bool:" + chr(10) + "    return a > 0 and -1 < a" + chr(10)).contains("and -1 < a"))
@@ -452,6 +458,29 @@ test "formatting is idempotent across the minus cases":
     src := "fn f(a: Int) -> Int:" + chr(10) + "    b := [-1, -2]" + chr(10) + "    return a - 1" + chr(10)
     once := fmt_source(src)
     assert(fmt_source(once) == once)
+
+test "a unary minus already spaced apart is pulled back to its operand":
+    # #784 stopped the formatter CREATING `return - 1`; it did not teach it to
+    # repair the ~93 sites already written that way. both directions are here
+    # because the discriminator has to get both right from one rule: skipping
+    # the spaces after a unary minus normalises the damage, and the binary arm
+    # is unreachable from that branch so a real subtraction is untouched.
+    fix := "fn f(a: Int, xs: List[Int]) -> Int:" + chr(10) + "    b := - 1" + chr(10) + "    c := [-1, - 2]" + chr(10) + "    if a == - 1:" + chr(10) + "        return - 1" + chr(10) + "    return b + c[0]" + chr(10)
+    out := fmt_source(fix)
+    assert(out.contains("b := -1"))
+    assert(out.contains("[-1, -2]"))
+    assert(out.contains("if a == -1:"))
+    assert(out.contains("return -1"))
+    assert(not out.contains("- 1"))
+
+    # the other direction: a binary minus must keep its spacing in every shape
+    # where the left side is an operand — identifier, index, call, paren.
+    keep := "fn g(a: Int, n: Int, xs: List[Int]) -> Int:" + chr(10) + "    return a - 1 + xs[n - 1] + g(n - 1, 0, xs) + (0 - 1)" + chr(10)
+    kept := fmt_source(keep)
+    assert(kept.contains("a - 1"))
+    assert(kept.contains("xs[n - 1]"))
+    assert(kept.contains("g(n - 1, 0, xs)"))
+    assert(kept.contains("(0 - 1)"))
 
 test "a line ending in an operator keeps no trailing space":
     # the spacing pass puts a space after an operator before it knows whether

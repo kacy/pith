@@ -45,7 +45,7 @@ pub ATTR_FLOAT := 3
 # which field is live). mirrors OTLP AnyValue's string/bool/int/double.
 pub struct Attr:
     pub key: String
-    pub kind: Int      # ATTR_STRING | ATTR_INT | ATTR_BOOL | ATTR_FLOAT
+    pub kind: Int # ATTR_STRING | ATTR_INT | ATTR_BOOL | ATTR_FLOAT
     pub s: String
     pub i: Int
     pub b: Bool
@@ -199,7 +199,7 @@ fn no_op_span() -> Span:
 pub SAMPLER_ALWAYS_ON := 0
 pub SAMPLER_ALWAYS_OFF := 1
 pub SAMPLER_TRACEIDRATIO := 2
-pub SAMPLER_PARENT_ALWAYS_ON := 3      # OTel default
+pub SAMPLER_PARENT_ALWAYS_ON := 3 # OTel default
 pub SAMPLER_PARENT_ALWAYS_OFF := 4
 pub SAMPLER_PARENT_TRACEIDRATIO := 5
 
@@ -244,7 +244,7 @@ pub fn set_sampler_from_name(name: String, ratio: Float):
 # random. taking the low 62 gives an even split for both pith-generated ids and
 # fully-random inbound trace ids, and it is purely a function of the id, so every
 # service that sees the trace reaches the same decision.
-SAMPLE_MASK := 4611686018427387903      # 2^62 - 1
+SAMPLE_MASK := 4611686018427387903 # 2^62 - 1
 # 2^62 as a float, the scale we compare ratio against. it lives inside
 # ratio_sampled as a local because a module-level float constant is miscompiled
 # to zero; keeping it local sidesteps that.
@@ -274,7 +274,7 @@ fn ratio_sampled(trace_id: String, ratio: Float) -> Bool:
     decoded := encoding.from_hex(trace_id) catch bytes.empty()
     if decoded.len() < 16:
         return false
-    sample_scale := 4611686018427387904.0   # 2^62
+    sample_scale := 4611686018427387904.0 # 2^62
     value := bits.band(trace_id_sample_value(decoded), SAMPLE_MASK)
     threshold := (ratio * sample_scale).to_int()
     return value < threshold
@@ -544,8 +544,8 @@ test "spans nest through the per-thread current span":
     assert_eq(root.parent_id, "")
 
     child := start("child")
-    assert_eq(child.trace_id, root.trace_id)      # same trace
-    assert_eq(child.parent_id, root.span_id)      # parented under root
+    assert_eq(child.trace_id, root.trace_id) # same trace
+    assert_eq(child.parent_id, root.span_id) # parented under root
     assert(child.span_id != root.span_id)
 
     child.end()
@@ -839,7 +839,7 @@ test "always_off spans propagate context but record nothing":
     set_active(true)
     set_sink(true)
     clear_context()
-    drain_finished_spans()          # clear anything left by an earlier test
+    drain_finished_spans() # clear anything left by an earlier test
     set_sampler(SAMPLER_ALWAYS_OFF, 1.0)
 
     span := start("root")

@@ -561,17 +561,17 @@ pub fn snapshot_text() -> String:
 # (prometheus le semantics); an OTLP exporter differences them into per-bucket
 # counts and adds the implicit +Inf overflow bucket.
 pub struct MetricSample:
-    pub name: String        # bare metric name
-    pub kind: String        # "counter" | "gauge" | "histogram"
-    pub labels: List[String]  # [k1,v1,k2,v2,...]
-    pub value: Float        # counter/gauge value, or histogram observation count
-    pub sum: Float          # histogram sum of observations (0 for counter/gauge)
-    pub description: String  # help text, or ""
-    pub unit: String         # unit, or ""
-    pub bucket_bounds: List[Float]   # histogram upper bounds (empty otherwise)
+    pub name: String # bare metric name
+    pub kind: String # "counter" | "gauge" | "histogram"
+    pub labels: List[String] # [k1,v1,k2,v2,...]
+    pub value: Float # counter/gauge value, or histogram observation count
+    pub sum: Float # histogram sum of observations (0 for counter/gauge)
+    pub description: String # help text, or ""
+    pub unit: String # unit, or ""
+    pub bucket_bounds: List[Float] # histogram upper bounds (empty otherwise)
     pub bucket_cumulative: List[Int] # cumulative count <= each bound
-    pub min: Float           # histogram min observation (0 otherwise)
-    pub max: Float           # histogram max observation (0 otherwise)
+    pub min: Float # histogram min observation (0 otherwise)
+    pub max: Float # histogram max observation (0 otherwise)
 
 # the cumulative bucket counts for a histogram series, aligned with `bounds`.
 # caller holds the lock.
@@ -813,10 +813,10 @@ test "snapshot carries cumulative histogram buckets, min, and max":
             # default bounds 1,5,10,25,50,100,250,500,1000,5000
             assert_eq(s.bucket_bounds.len(), 10)
             assert_eq(s.bucket_cumulative.len(), 10)
-            assert_eq(s.bucket_cumulative[0], 0)   # <=1
-            assert_eq(s.bucket_cumulative[1], 1)   # <=5 (3)
-            assert_eq(s.bucket_cumulative[4], 2)   # <=50 (3, 30)
-            assert_eq(s.bucket_cumulative[9], 3)   # <=5000 (all)
+            assert_eq(s.bucket_cumulative[0], 0) # <=1
+            assert_eq(s.bucket_cumulative[1], 1) # <=5 (3)
+            assert_eq(s.bucket_cumulative[4], 2) # <=50 (3, 30)
+            assert_eq(s.bucket_cumulative[9], 3) # <=5000 (all)
             assert_eq(s.value, 3.0)
             assert_eq(s.min, 3.0)
             assert_eq(s.max, 3000.0)

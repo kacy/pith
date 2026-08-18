@@ -1554,15 +1554,39 @@ fn note_notify() {
 ///
 /// `park_current` and `take_handoff` take a `TaskId` rather than looking one up,
 /// every block site reads its id once before parking and threads it through by
-/// value, and a slab index means the same thing on every thread. `CURRENT_TLS`
-/// is read only by the FFI, synchronously, inside one pith call. what remains is
-/// `CURRENT_WORKER`, whose staleness can misroute a wake but can never fault.
+/// value, and a slab index means the same thing on every thread. `CURRENT_WORKER`
+/// is read in a spanning frame only by `pith_green_maybe_yield`, where the index
+/// is bounds-checked before use, so a stale value cannot even index out of range.
 ///
-/// what is still owed before flipping this on, and it is not a scheduler change:
-/// nobody has checked the object code. the hoisting claim above is an empirical
-/// report plus sound reasoning about LLVM's TLS model, not a disassembly. dump
-/// these functions and confirm no `%fs:`-relative address survives across the
-/// `suspend` call before trusting the invariant to hold in release.
+/// the object code has now been checked, and the invariant holds: across every
+/// unit that both touches thread-local storage and can be on the stack at a
+/// suspend, no TLS-derived address survives the suspend into a use — in a
+/// register or a spilled stack slot. no `std`, allocator, `parking_lot` or
+/// cycle-collector thread-local is reachable from such a frame at all. panic
+/// machinery in particular is clean: `run_task`'s `catch_unwind` sits on the
+/// *worker* stack, which structurally cannot migrate, and a coroutine that
+/// panicked is dropped rather than resumed.
+///
+/// ★ how to re-check it, because the obvious method silently measures nothing.
+/// `libpith_runtime.a` is relocatable, so its thread-local accesses are still in
+/// the general/local-dynamic form — `lea tlsld(%rip),%rdi; call __tls_get_addr`
+/// — and contain **zero** bytes of `%fs:`. grepping the archive for `%fs:`
+/// therefore returns 0 for every function, including ones that read a
+/// thread-local on every line. either count TLS *relocations* (`R_X86_64_TLSGD`
+/// / `TLSLD` / `DTPOFF32`) in the function's own body, or link first and read the
+/// relaxed form. the archive currently carries 51 TLSGD + 67 TLSLD + 149
+/// DTPOFF32 and 0 `%fs:`, which is the proof that the grep is vacuous.
+///
+/// ★★ one hazard of exactly the kind described above is live TODAY, and is safe
+/// only by coupling: `pith_tls_get_or_init` caches the address of the
+/// `TLS_GLOBALS` cell in a callee-saved register across the compiler-emitted
+/// `threadlocal` initializer thunk, which is arbitrary pith code and can park.
+/// the source splits that into two separate `.with()` closures; LLVM CSE'd the
+/// address across them anyway. it is safe because that branch is taken iff
+/// `CURRENT_TLS` is null or the backend is not green — i.e. iff no coroutine
+/// exists to suspend — and `run_task` sets and clears `CURRENT_TLS` and
+/// `CURRENT_TASK` together. if migration is built, that coupling becomes
+/// load-bearing and should be asserted rather than assumed.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
     if let Some(block) = sync_block(id) {

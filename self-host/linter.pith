@@ -159,8 +159,17 @@ fn lint_impl_decl(node: Node, source: String):
 fn check_snake_case(name: String, kind: String, line: Int, col: Int):
     if name == "" or name == "_":
         return
-    if not is_snake_case(name):
-        report_linter_warning("E300", kind + " '" + name + "' should be snake_case", line, col)
+    if is_snake_case(name):
+        return
+    # a constant that has to be computed is still a constant, and it is
+    # spelled like one: std.math exposes PI(), E() and TAU() as calls
+    # because a float constant cannot be evaluated at module level. the
+    # uppercase name is the point — `math.PI()` is what a caller expects
+    # to write, and every language spells these in caps. this matches the
+    # SCREAMING_SNAKE_CASE the tree already uses for module constants.
+    if is_screaming_snake_case(name):
+        return
+    report_linter_warning("E300", kind + " '" + name + "' should be snake_case", line, col)
 
 # SCREAMING_SNAKE_CASE — the spelling this tree uses for a module constant.
 # deliberately strict: it must be uppercase, digits and underscores only, so a
@@ -214,16 +223,17 @@ fn is_pascal_case(name: String) -> Bool:
     c := ord(name[0])
     if not is_uppercase_char(c):
         return false
-    # no underscores
-    mut has_lower := false
+    # letters and digits only, so no underscores
     for ch in name:
-        code := ord(ch)
-        if not is_alphanumeric_char(code):
+        if not is_alphanumeric_char(ord(ch)):
             return false
-        if is_lowercase_char(code):
-            has_lower = true
-    # must have at least one lowercase letter (HELLO is not PascalCase)
-    return name.len() == 1 or has_lower
+    # an all-caps name is an acronym, and renaming it is the wrong repair:
+    # `URL` is how the type is spelled everywhere it is documented, and
+    # `Url` would be a public API break made to satisfy a naming rule.
+    # what this rule is really for is catching a type written `my_thing`
+    # or `myThing`, and neither reaches here — both start lowercase and
+    # were rejected above.
+    return true
 
 # ---------------------------------------------------------------
 # E304: public function missing doc comment

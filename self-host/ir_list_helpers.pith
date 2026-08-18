@@ -26,6 +26,11 @@ fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
     ir_emit("store " + idx_name + " " + next_i_r.to_string())
     ir_emit("jmp " + loop_l)
 
+## true for the object types backed by the runtime list: the bare "list",
+## "list_string", and the tagged "list:<elem>" forms. this is the gate on
+## the self-hosted list methods (is_empty, index_of, contains, map, filter,
+## reduce); a receiver type that fails it falls through to the generic
+## method path instead.
 pub fn ir_is_list_runtime_type(obj_type: String) -> Bool:
     return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
 
@@ -101,6 +106,12 @@ pub fn ir_emit_list_filter_loop(list_r: Int, ctor: String, keep_name: String, re
     ir_emit("label " + done_l)
     return result_r
 
+## emit the loop behind `xs.reduce(init, f)`. the caller stores the seed
+## into acc_name and the reducer into reducer_name before calling; this
+## walks the list front to back, replacing the accumulator each step, and
+## returns a register holding the final load of acc_name. unlike map and
+## filter it builds no container, so no ownership question arises here —
+## whatever the reducer returns simply becomes the next accumulator.
 pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, idx_name: String) -> Int:
     len_r := ir_reg()
     ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
@@ -131,6 +142,9 @@ pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: Str
     ir_emit("load " + out_r.to_string() + " " + acc_name)
     return out_r
 
+## emit `xs.is_empty()` as a length-against-zero compare, returning the
+## register holding the boolean. straight-line: no branch, no loop, and no
+## element is touched.
 pub fn ir_emit_list_is_empty(list_r: Int) -> Int:
     len_r := ir_reg()
     ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
@@ -146,11 +160,22 @@ fn ir_emit_list_item_eq(out_r: Int, elem_kind: String, item_r: Int, target_r: In
         return
     ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
 
+## emit the -1 that the index-search family uses for "not found". it is both
+## the search loop's starting value and the answer for a search call the
+## emitter cannot make sense of. callers convert it before it escapes:
+## index_of wraps it into an optional and contains compares it against zero,
+## so the bare sentinel is never a pith-level value.
 pub fn ir_emit_list_missing_index_result() -> Int:
     missing_r := ir_reg()
     ir_emit("iconst " + missing_r.to_string() + " -1")
     return missing_r
 
+## emit the linear scan behind `xs.index_of(v)`: returns a register holding
+## the first matching index, or -1 when nothing matches. result_name and
+## idx_name must be locals the caller reserved for this loop alone. how the
+## match is decided comes from elem_kind — a string element compares by
+## content, every other kind compares the raw slot value, so a struct or a
+## list element only ever matches the identical object.
 pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: String, result_name: String, idx_name: String) -> Int:
     missing_r := ir_emit_list_missing_index_result()
     ir_emit("store " + result_name + " " + missing_r.to_string())
@@ -187,6 +212,10 @@ pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: Str
     ir_emit("load " + out_r.to_string() + " " + result_name)
     return out_r
 
+## turn an index-search result into the boolean `xs.contains(v)` wants: true
+## for any index at or above zero, false for the -1 miss. it consumes the
+## register ir_emit_list_index_search_loop already produced, so contains
+## costs one scan and not two.
 pub fn ir_emit_list_contains_from_index(index_r: Int) -> Int:
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")

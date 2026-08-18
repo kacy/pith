@@ -15,6 +15,12 @@ pub struct IrBindParts:
     val_idx: Int
     type_idx: Int
 
+# true for the node kinds that are expressions even when they stand
+# alone as a statement, so ir_stmt lowers them through ir_expr and then
+# throws the value away. that discard is not free: a bare `spawn` has
+# to be detached, a discarded Result has to be freed, and a discarded
+# owned string has to be released — ir_stmt does all three, and a kind
+# added here without a matching discard rule leaks.
 pub fn ir_stmt_is_expr(kind: String) -> Bool:
     if kind == "call" or kind == "method_call" or kind == "spawn":
         return true
@@ -28,6 +34,14 @@ pub fn ir_stmt_is_expr(kind: String) -> Bool:
         return true
     return kind == "fail"
 
+# pick the condition and the body out of one arm of an if chain. pass
+# the `if` node for the leading arm and an `elif` node for each of the
+# rest; the else arm has no condition and is emitted directly instead.
+# the condition is the first child that is not a then / else / elif /
+# block, the body is the then or block child, and either is -1 when the
+# arm does not have one. ir_emit_if_branch reads -1 as "no test",
+# emitting the body unconditionally, so a malformed arm falls through
+# rather than being rejected here.
 pub fn ir_collect_if_branch(node: Node) -> IrIfBranch:
     mut cond_idx := 0 - 1
     mut body_idx := 0 - 1
@@ -39,6 +53,13 @@ pub fn ir_collect_if_branch(node: Node) -> IrIfBranch:
             body_idx = child
     return IrIfBranch(cond_idx, body_idx)
 
+# split a for statement's loop variables. the parser packs them into
+# the node's value as one string, so `for item, i in xs` arrives as
+# "item, i" and comes back here as two trimmed names. index_name is ""
+# for the one-variable form, which is how the loop emitters tell
+# whether an index local has to be materialized. only the first two
+# comma-separated names are read; anything after a second comma is
+# dropped without complaint.
 pub fn ir_for_binding_names(node: Node) -> IrForBindingNames:
     mut value_name := node.value
     mut index_name := ""
@@ -49,6 +70,12 @@ pub fn ir_for_binding_names(node: Node) -> IrForBindingNames:
             index_name = parts[1].trim()
     return IrForBindingNames(value_name, index_name)
 
+# the bare variable name from a binding node's value. the parser packs
+# the declaration's modifiers into that same string as a suffix, so
+# `mut x := 1` stores "x mut" and `weak p := q` stores "p weak"; this
+# takes them back off. callers that need to know which modifier was
+# present test the raw value for " mut" / " weak" themselves, before
+# calling this. same rule as ir_binding_name in ir_ast_helpers.
 pub fn ir_bind_stmt_name(raw_name: String) -> String:
     mut name := raw_name
     if name.contains(" mut"):
@@ -57,6 +84,13 @@ pub fn ir_bind_stmt_name(raw_name: String) -> String:
         name = name.split(" ")[0]
     return name
 
+# take a binding apart into its name, its initializer and its type
+# annotation. the annotation is optional and the children carry no
+# fixed order, so a type / generic_type / optional_type child is read
+# as the annotation and any other child as the initializer; each is -1
+# when absent. used for local `bind` statements and for module-level
+# globals and threadlocals alike, which is why callers resolve
+# type_idx first and only fall back to inferring from val_idx.
 pub fn ir_collect_bind_parts(node: Node) -> IrBindParts:
     mut val_idx := 0 - 1
     mut type_idx := 0 - 1

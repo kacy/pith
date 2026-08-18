@@ -3,22 +3,37 @@
 from ast import Node
 from ir_builder import ir_emit, ir_reg, ir_str
 
+## materialize an int literal in a fresh register. node.value is passed
+## through to the iconst verbatim, so the ir carries exactly the text the
+## parser recorded. the match compiler calls this too, to build the constant
+## a pattern is compared against.
 pub fn ir_emit_int_literal(node: Node) -> Int:
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " " + node.value)
     return r
 
+## materialize a string literal in a fresh register. the text is interned
+## into the module's string table, so every occurrence of the same literal
+## across the module shares one entry. the register holds a pointer to that
+## baked-in static, which carries no reference-count header: it is borrowed,
+## and releasing it would be releasing something that was never allocated.
 pub fn ir_emit_string_literal(node: Node) -> Int:
     si := ir_str(node.value)
     r := ir_reg()
     ir_emit("strref " + r.to_string() + " " + si)
     return r
 
+## materialize a float literal in a fresh register, passing node.value
+## through to the fconst unchanged — the ir text keeps the source spelling
+## and the consumer is what parses it into a double.
 pub fn ir_emit_float_literal(node: Node) -> Int:
     r := ir_reg()
     ir_emit("fconst " + r.to_string() + " " + node.value)
     return r
 
+## materialize a bool literal in a fresh register. it lowers to a plain int
+## constant, 1 for "true" and 0 for anything else, so a node holding some
+## other text quietly becomes false rather than failing here.
 pub fn ir_emit_bool_literal(node: Node) -> Int:
     r := ir_reg()
     if node.value == "true":

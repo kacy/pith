@@ -1,15 +1,25 @@
 # ir_utils.pith - small utility helpers used by IR lowering
 
+# append to a list and hand it back, for the `xs = ir_push_string(xs, v)`
+# form the emitter's module-level stacks are written in. despite the
+# signature this is not a copy — the returned list is the one passed in,
+# already mutated, so any other name bound to it also sees the new element.
 pub fn ir_push_string(items: List[String], value: String) -> List[String]:
     mut updated: List[String] := items
     updated.push(value)
     return updated
 
+# the Int twin of ir_push_string, used for the defer-scope depth stacks.
+# it shares the aliasing caveat: the returned list is the argument, mutated
+# in place, not a copy.
 pub fn ir_push_int(items: List[Int], value: Int) -> List[Int]:
     mut updated: List[Int] := items
     updated.push(value)
     return updated
 
+# flatten node indices to one tab-separated string so the tree cache can
+# keep them in a List[String] instead of a list of lists. round-trips
+# through ir_decode_int_list; an empty list encodes as "".
 pub fn ir_encode_int_list(items: List[Int]) -> String:
     mut encoded: List[String] := []
     for item in items:
@@ -24,6 +34,11 @@ fn ir_parse_cached_int(text: String) -> Int:
         i = i + 1
     return value
 
+# the tuple position a field name denotes, or -1 when the name is not all
+# digits. tuple field lowering asks this to turn `.0` / `.1` into a slot,
+# and treats -1 the same as an index past the tuple's arity: not a
+# positional access, emit nothing and let the caller fall back. the
+# rejection is the point here, not the arithmetic.
 pub fn ir_parse_field_index(text: String) -> Int:
     if text.len() == 0:
         return 0 - 1
@@ -38,6 +53,9 @@ pub fn ir_parse_field_index(text: String) -> Int:
         i = i + 1
     return value
 
+# the inverse of ir_encode_int_list. every call builds a fresh list, which
+# is what lets the tree cache hand the same cached entry to repeated
+# callers without any of them being able to disturb it.
 pub fn ir_decode_int_list(encoded: String) -> List[Int]:
     mut decoded: List[Int] := []
     if encoded.len() == 0:
@@ -47,18 +65,30 @@ pub fn ir_decode_int_list(encoded: String) -> List[Int]:
         decoded.push(ir_parse_cached_int(part))
     return decoded
 
+# a real element-by-element copy of the name-to-register map, for the
+# save/restore around emitting a nested scope (a lambda body, a select
+# arm). plain assignment only aliases the map, so a saved-off reference
+# would pick up every binding the nested scope inserted — exactly the
+# bindings the restore exists to drop.
 pub fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
     mut copy: Map[String, Int] := {}
     for key in src.keys():
         copy.insert(key, src[key])
     return copy
 
+# the same snapshot for the name-to-type map; the two are always saved and
+# restored together, since a scope that adds a register also adds its type.
 pub fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
     mut copy: Map[String, String] := {}
     for key in src.keys():
         copy.insert(key, src[key])
     return copy
 
+# read back a field position from ir_struct_field_index_lookup, which
+# stores each "Struct.field" index as a decimal string. multiply the result
+# by 8 for the byte offset. unlike ir_parse_field_index this trusts its
+# input — the digits came from the emitter's own to_string, so there is no
+# not-a-number answer.
 pub fn ir_unpack_field_index(meta: String) -> Int:
     mut value := 0
     mut i := 0

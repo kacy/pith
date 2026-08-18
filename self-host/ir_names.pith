@@ -1,5 +1,9 @@
 # ir_names.pith — IR symbol naming helpers
 
+# the name an `import a.b.c` binds when the import writes no `as`
+# clause: the last dotted segment, or the whole path when it has no
+# dot. this is the key the module-alias table is filled under, so a
+# later `c.foo` resolves back to the full path.
 pub fn ir_module_default_alias(module_path: String) -> String:
     mut last_dot := 0 - 1
     mut i := 0
@@ -11,6 +15,10 @@ pub fn ir_module_default_alias(module_path: String) -> String:
         return module_path
     return module_path.substring(last_dot + 1, module_path.len())
 
+# the symbol prefix every IR name from this module carries: the path
+# with dots turned into underscores, plus a trailing underscore. an
+# empty path gives an empty prefix, so a symbol declared in the module
+# being emitted keeps its bare written name.
 pub fn ir_import_symbol_prefix(module_path: String) -> String:
     if module_path.len() == 0:
         return ""
@@ -24,13 +32,25 @@ pub fn ir_import_symbol_prefix(module_path: String) -> String:
         i = i + 1
     return prefix + "_"
 
+# the flat IR symbol a name declared in module_path is emitted as. the
+# IR namespace is flat, so this is what keeps two modules that both
+# declare `parse` from colliding; call it wherever a written name is
+# turned into the symbol a `call` instruction names.
 pub fn ir_import_target_name(module_path: String, name: String) -> String:
     return ir_import_symbol_prefix(module_path) + name
 
+# a declaration's name with any generic parameter list cut off, so
+# `Box[T]` becomes `Box`. a generic declaration's node value keeps the
+# brackets it was written with; registries and emitted symbols are
+# keyed by the base name. a name with no `[` comes back unchanged.
 pub fn ir_base_decl_name(name: String) -> String:
     if name.contains("["):
         return name.substring(0, name.index_of("["))
     return name
 
+# the IR symbol for a method defined in another module's impl block.
+# methods are flattened to `Type_method` before the module prefix goes
+# on, so the two halves of the name must be joined in that order —
+# prefixing `Type` and `method` separately gives a different symbol.
 pub fn ir_import_impl_method_name(module_path: String, impl_type: String, method_name: String) -> String:
     return ir_import_target_name(module_path, impl_type + "_" + method_name)

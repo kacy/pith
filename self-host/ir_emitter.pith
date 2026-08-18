@@ -5,17 +5,48 @@
 
 import ir_emitter_core as core
 
+# declare the modules this one imports directly, as parallel lists of
+# ast root index and resolved module path. their strings are interned
+# into the emitted string table and their declarations become
+# resolvable names, so a call the checker accepted has a symbol to
+# lower to. emit_ir clears this, so set it again before every module.
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     core.set_import_roots(roots, paths)
 
+# declare every module in the build, not just the current module's
+# direct imports. impl-method collection needs the whole graph, since a
+# method can live in an impl block a module away from both the struct's
+# declaration and the call site. set once per build: unlike the import
+# roots, this survives emit_ir. when left empty, impl collection falls
+# back to the direct import roots.
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
     core.set_all_module_roots(roots, paths)
 
+# the resolved path of the module about to be emitted; "" for the entry
+# file. it lets an impl target declared in this module win over another
+# module that registered the same name globally. it is not cleared by
+# emit_ir, so a caller emitting several modules must set it each time
+# or the previous module's path leaks into the next.
 pub fn set_current_module_path(path: String):
     core.set_current_module_path(path)
 
+# switch the next emit_ir to a test build: `test` blocks are lowered to
+# functions and a generated main runs them, while the module's own main
+# is skipped. off, `test` blocks emit nothing. emit_ir turns this back
+# off, so set it per module — and only for the module under test, which
+# is why imported modules are emitted with it false.
 pub fn set_test_mode(enabled: Bool):
     core.set_test_mode(enabled)
 
+# lower one checked module, given its ast root, to text ir as
+# newline-joined lines. the module must already have passed the
+# checker — emission reads its recorded types — and the setters above
+# must be applied first, because they are the only source of
+# cross-module names. phases run in order: intern every string (the
+# string table heads the output), collect import metadata, then
+# declaration metadata, then emit globals and top-level items in
+# declaration order. emitting several modules means calling this once
+# per module; per-module state is reset on entry and the import roots
+# and test mode are consumed on the way out.
 pub fn emit_ir(root_idx: Int) -> String:
     return core.emit_ir(root_idx)

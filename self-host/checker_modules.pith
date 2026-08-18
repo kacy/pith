@@ -1,5 +1,11 @@
 # checker_modules.pith — module-name helpers for the semantic checker
 
+# the module tag every module-qualified checker key starts with: the
+# path with its dots turned into underscores, plus one trailing
+# underscore, so "std.log" gives "std_log_". an empty path is not
+# special-cased here and yields a bare "_" — go through
+# module_generic_target_name, which handles the empty case, rather than
+# concatenating this yourself.
 pub fn module_symbol_prefix(module_path: String) -> String:
     mut prefix := ""
     for ch in module_path:
@@ -9,11 +15,27 @@ pub fn module_symbol_prefix(module_path: String) -> String:
             prefix = prefix + ch
     return prefix + "_"
 
+# the module-qualified key a top-level name is filed under, so `info`
+# declared in std.log becomes "std_log_info". the checker keeps every
+# module's top-level names in shared tables, and this tag is what stops
+# two modules that both declare `parse` from overwriting each other: it
+# keys the generic-declaration map, the function-visibility map, and
+# the second binding every top-level function gets alongside its bare
+# name. an empty module_path — a single-file check, or a builtin —
+# returns name unchanged rather than prefixing it.
 pub fn module_generic_target_name(module_path: String, name: String) -> String:
     if module_path.len() == 0:
         return name
     return module_symbol_prefix(module_path) + name
 
+# trim leading and trailing commas off one name taken from a
+# `from m import a, b, c` list. a from-import node stores its names as
+# one space-joined string, so this exists in case a comma rides along
+# on the name beside it; commas inside the name are left alone, and a
+# part that is nothing but commas comes back as "", which the import
+# checker reads as no name at all and skips. the parser tokenizes the
+# commas away before joining, so on today's input this returns its
+# argument unchanged.
 pub fn clean_import_part(part: String) -> String:
     mut start := 0
     mut end := part.len()
@@ -23,6 +45,11 @@ pub fn clean_import_part(part: String) -> String:
         end = end - 1
     return part.substring(start, end)
 
+# the name a plain `import a.b.c` binds when it writes no `as` clause:
+# everything after the last dot, or the whole path when there is no
+# dot. the checker files this into the module-alias table, so a later
+# `c.foo` resolves back to the full path. note this cuts at the last
+# dot, unlike split_qualified_name, which cuts at the first.
 pub fn module_default_alias(module_path: String) -> String:
     mut last_dot := 0 - 1
     mut i := 0
@@ -34,6 +61,14 @@ pub fn module_default_alias(module_path: String) -> String:
         return module_path
     return module_path.substring(last_dot + 1, module_path.len())
 
+# the alternate spelling to try first when resolving `alias.member`
+# against one of six std modules that also spell members with their own
+# short prefix, so `log.info` is looked up as "log_info". every other
+# module path gets name back unchanged, which means a caller cannot
+# treat the result as a qualified name — it is a first guess, and the
+# resolvers here fall back to the bare name and only then report. this
+# is not the module-qualified key: that is module_generic_target_name,
+# which tags with the full dotted path.
 pub fn module_import_target_name(module_path: String, name: String) -> String:
     if module_path == "std.json":
         return "json_" + name
@@ -49,6 +84,12 @@ pub fn module_import_target_name(module_path: String, name: String) -> String:
         return "url_" + name
     return name
 
+# split a written name at its first dot into (qualifier, rest), the
+# shape `alias.Type` resolution works on. a name with no dot comes back
+# as (value, ""), and every caller tests that empty second half to mean
+# "this name was not qualified" before touching the alias table. the
+# split is at the first dot only, so "a.b.c" gives ("a", "b.c") — the
+# tail is handed on whole, not split further.
 pub fn split_qualified_name(value: String) -> (String, String):
     mut i := 0
     while i < value.len():

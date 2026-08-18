@@ -11,16 +11,36 @@
 mut method_decl_index_map: Map[String, Int] := {}
 mut method_decl_owner_map: Map[String, Int] := {}
 
+## forget every registered method, name keys and tid owners together.
+## only initialize_checker calls this, once per check run: the registry
+## deliberately spans modules, so resetting between them would hide an
+## earlier module's methods from a later one.
 pub fn checker_methods_reset():
     method_decl_index_map = {}
     method_decl_owner_map = {}
 
+## point a lookup key at the fn_decl node that declares the method.
+## registering a key that already exists overwrites it, so the last
+## declaration registered wins. every declaration gets a name key, and
+## one whose impl target resolves to a concrete type gets a tid key as
+## well; a name-key write has to be followed by register_method_owner or
+## clear_method_owner, or the owner map will still describe the
+## declaration this one replaced.
 pub fn register_method_signature(key: String, node_idx: Int):
     method_decl_index_map.insert(key, node_idx)
 
+## whether anything is registered under this exact key. dispatch calls
+## it to walk the key ladder — tid key, then the qualified name, then
+## the generic base name — so false means "try the next key", not "no
+## such method". it says nothing about ownership: a name key can exist
+## and belong to a same-named struct from another module, which is what
+## method_declaration_owner is for.
 pub fn has_method_declaration(key: String) -> Bool:
     return method_decl_index_map.contains_key(key)
 
+## the fn_decl node index this key resolves to, or -1 when the key was
+## never registered. callers feed the result straight to get_node, so
+## check has_method_declaration first rather than passing -1 on.
 pub fn get_method_declaration_index(key: String) -> Int:
     if method_decl_index_map.contains_key(key):
         return method_decl_index_map[key]

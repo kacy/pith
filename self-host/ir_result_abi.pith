@@ -5,6 +5,12 @@ from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_re
 from ir_type_helpers import ir_type_from_tid, ir_resolve_type_hint_with_state
 from types import get_type_info
 
+# true when a fallible call carries its outcome in ONE register with a
+# zero sentinel instead of the three-slot box: every non-empty result
+# kind except "tuple". "" means the call is not fallible at all.
+# careful — it also answers true for the string/bytes/float legacy
+# kinds, which the consumer never biases, so it is a wider net than the
+# +1 encoding the encode/decode helpers below implement.
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
     return result_kind.len() > 0 and result_kind != "tuple"
 
@@ -50,6 +56,11 @@ pub fn ir_emit_registered_rcall_boxed_into(result_reg: Int, fname: String, arg_c
 # returns match a two-value signature.
 mut result_abi_pair_return := false
 
+# declare whether the function about to be emitted returns the register
+# pair. nothing resets this on its own, so it has to be set at the top of
+# every function or the next one inherits the previous answer and emits
+# a `ret2` from a single-value signature; ir_prepare_func_emission is
+# where that happens for every function the emitter starts.
 pub fn ir_set_pair_return(active: Bool):
     result_abi_pair_return = active
 
@@ -69,6 +80,12 @@ pub fn ir_emit_ret_known_err_box(result_r: Int):
     ir_emit("iconst " + zf_r.to_string() + " 0")
     ir_emit("ret2 " + zf_r.to_string() + " " + err_r.to_string())
 
+# apply the zero-sentinel bias: an ok value travels as `v + 1` so that a
+# real 0 or false is not read as the error case. box kinds need no bias,
+# so they get `value_reg` back untouched.
+# no emitter path calls this today — the consumer biases a runtime call's
+# return itself (normalize_runtime_result), and only the decode below is
+# needed on this side.
 pub fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
     if ir_uses_result_abi(result_kind):
         one := ir_reg()
@@ -78,6 +95,11 @@ pub fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
         return encoded
     return value_reg
 
+# recover the real ok value from the `v + 1` a single-register result
+# carries. only meaningful on the success arm: the caller must have
+# already branched on the raw register (0 is the error case), because
+# decoding an error gives -1 rather than any signal. box kinds pass
+# through unchanged.
 pub fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
     if ir_uses_result_abi(result_kind):
         one := ir_reg()
@@ -87,6 +109,9 @@ pub fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
         return decoded
     return value_reg
 
+# load a result box's is_ok flag (slot 0) into a register ready to feed
+# a `brif`. only the exact name "is_ok" gives the flag as stored; every
+# other name — "is_err" is the one that matters — comes back negated.
 pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
     flag_r := ir_reg()
     ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
@@ -97,16 +122,32 @@ pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
     ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
     return r
 
+# a fresh register holding the integer 0, for the many places an
+# emitter needs a literal zero as a register: an unused result slot, a
+# missing struct field default, the value an unsupported path falls back
+# to. every call emits its own `iconst`, so hold the register you get
+# rather than calling twice for the same zero.
 pub fn ir_zero_reg() -> Int:
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+# the error payload to put in the err slot when a legacy single-register
+# call fails: an interned "<callee> failed" literal. such a call returns
+# a bare 0 and carries no error of its own, so the callee's name is the
+# whole diagnosis available.
 pub fn ir_emit_result_error_message(callee_name: String) -> Int:
     msg_r := ir_reg()
     ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
     return msg_r
 
+# the ir kind to annotate one slot of a result box with: the payload
+# type for "ok", the error type for "err", and "bool" for the is_ok /
+# is_err flag. `obj_tid` must be the tid of the RESULT itself — hand it
+# the payload's tid and it silently reports "unknown".
+# "unknown" is also the answer for a type the checker never recorded,
+# and it is an admission, not a kind: the consumer tracks nothing for
+# such a register, so no release or retain fires for it.
 pub fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
     if obj_tid < 0:
         if fname == "is_ok" or fname == "is_err":
@@ -123,6 +164,13 @@ pub fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
         return ir_type_from_tid(obj_info.value_type)
     return "bool"
 
+# load a payload out of a result box: slot 16 when `fname` is exactly
+# "err", slot 8 (the ok value) for anything else, so a misspelt name
+# reads the ok slot rather than failing. `obj_tid` is the result's tid,
+# used only to kind the emitted field line.
+# the load takes no count of its own. a caller that keeps the payload
+# alongside the box has to retain it; a caller that then releases the
+# shell inherits the count the callee left in the slot.
 pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
     mut offset := 8
     if fname == "err":
@@ -131,11 +179,22 @@ pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> In
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
     return r
 
+# the same ok slot (8), for a box whose own type id nobody has: the json
+# decoders build their result boxes themselves, so the only tid to hand
+# over is the payload's. `field_tid` is therefore the ok value's type,
+# not the result's — the opposite of ir_emit_result_value_field.
 pub fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_reg()
     ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
     return ok_r
 
+# the ok slot once more, for a payload named by its source type text
+# ("List[String]", an alias, a struct name) rather than by tid — the
+# generated decode bodies know the annotation they parsed, not a type id.
+# the alias and struct tables arrive as arguments because their registry
+# imports this module and not the other way round; call
+# ir_emit_result_ok_field_typed in ir_alias_registry, which passes the
+# live ones for you.
 pub fn ir_emit_result_ok_field_typed_with_state(result_r: Int, field_type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> Int:
     ok_r := ir_reg()
     ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_resolve_type_hint_with_state(field_type_name, type_aliases, struct_names) + " ok")

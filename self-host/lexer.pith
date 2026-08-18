@@ -979,6 +979,11 @@ fn scan_operator():
 # public api for module use
 # ---------------------------------------------------------------
 
+# point the scanner at `src` and reset every piece of scan state — the
+# position, the indent stack, the group depth, the queued interpolation
+# tokens. lex_all() does this for you; call it directly only if you are
+# driving the scanner one token at a time. it does not clear the loaded
+# token table that tok_kind() and friends read.
 pub fn init_lexer(src: String):
     # init brace characters via chr() since we can't write them as literals
     LBRACE = chr(123)
@@ -1007,21 +1012,48 @@ mut _tok_cols: List[Int] := []
 mut _tok_offsets: List[Int] := []
 mut _tok_lens: List[Int] := []
 
+# kind of token `i` in the loaded token table. the table is the
+# parallel-array copy of a token stream that lex_all() and load_tokens()
+# install, and it — not the List[Token] lex_all() returns — is what the
+# parser reads, so the parser walks the stream by index without copying
+# tokens. there is no bounds check: an index at or past tok_count() is a
+# runtime trap, so gate on tok_count() first.
 pub fn tok_kind(i: Int) -> String:
     return _tok_kinds[i]
+# source text of token `i`. empty for the kinds that carry no text —
+# newline, indent, dedent, eof. for an "err" token this is either a
+# message the lexer wrote (an unterminated string, a bad dedent) or the
+# single offending character.
 pub fn tok_value(i: Int) -> String:
     return _tok_values[i]
+# 1-based source line of token `i`'s first character. synthesized tokens
+# (indent, dedent, eof) report wherever the scanner was sitting when
+# they were produced.
 pub fn tok_line(i: Int) -> Int:
     return _tok_lines[i]
+# 1-based column of token `i`'s first character, which is what a caret
+# renderer needs to point at the token rather than beside it. columns
+# count bytes, not codepoints.
 pub fn tok_col(i: Int) -> Int:
     return _tok_cols[i]
+# byte offset of token `i`'s first character within the source that was
+# lexed. use with tok_len() to slice the original text back out.
 pub fn tok_offset(i: Int) -> Int:
     return _tok_offsets[i]
+# byte length of token `i`'s lexeme. zero for synthesized and
+# end-of-input tokens, which consume no source.
 pub fn tok_len(i: Int) -> Int:
     return _tok_lens[i]
+# number of tokens in the loaded table, counting the trailing eof. the
+# upper bound for every tok_* index.
 pub fn tok_count() -> Int:
     return _tok_kinds.len()
 
+# install `token_list` as the token table the tok_* accessors read,
+# discarding whatever was loaded before. this is how the parser hands a
+# stream over to itself: parse_with_file() loads the file's tokens, and
+# interpolation parsing swaps in a sub-lexed fragment here and puts the
+# outer stream back with load_token_snapshot().
 pub fn load_tokens(token_list: List[Token]):
     _tok_kinds = []
     _tok_values = []
@@ -1037,6 +1069,12 @@ pub fn load_tokens(token_list: List[Token]):
         _tok_offsets.push(tok.offset)
         _tok_lens.push(tok.len)
 
+# restore the token table from six parallel lists — the shape you get by
+# reading tok_kind()/tok_value()/… across a whole stream. the parser uses
+# this to put the outer token stream back after sub-parsing a string
+# interpolation. the six lists are copied column by column and their
+# lengths are never compared, so passing lists of unequal length leaves a
+# ragged table that traps only when an accessor reaches past a short one.
 pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: List[Int], cols: List[Int], offsets: List[Int], lens: List[Int]):
     _tok_kinds = []
     _tok_values = []
@@ -1057,6 +1095,16 @@ pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: Lis
     for ln in lens:
         _tok_lens.push(ln)
 
+# tokenize a whole source string, from a clean scanner, up to and
+# including the trailing eof token. the same stream is also installed as
+# the loaded token table, so a caller can go straight to parsing without
+# calling load_tokens() itself.
+#
+# lexing never fails: a stray character, an unterminated string or an
+# indentation level that matches no open block becomes an "err" token in
+# the stream and scanning carries on. a caller that cares has to scan the
+# result for kind "err" — and note a multi-byte character produces one
+# "err" token per byte, so errors arrive in runs.
 pub fn lex_all(src: String) -> List[Token]:
     init_lexer(src)
     _tok_kinds = []

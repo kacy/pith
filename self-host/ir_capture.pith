@@ -70,5 +70,26 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
         updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names, locals)
     return updated_free
 
+# the names a lambda body has to capture from the scope around it: every
+# identifier under `idx` that nothing inside it declares. the emitter
+# calls this with the lambda's parameters as `bound` and uses the result
+# in order as the closure's environment layout, so slot i belongs to
+# name i on both the capture side and the load side.
+#
+# `blocked_names` are names that are not variables at all — module
+# aliases, import renames, struct names, known functions — and are
+# skipped. `locals` is the enclosing scope's live variables, and it wins:
+# a name that is a real local is captured even when a global of the same
+# name is blocked, so a parameter named `host` shadows std.net.url.host.
+# an unknown name that is not blocked and is not a known function is
+# captured on the assumption that it is a local.
+#
+# only `bind` statements and lambda parameters add to the bound set as
+# the walk descends, and a bind counts only after its own initializer is
+# walked (`x := x` captures the outer x). names introduced any other way
+# are NOT bound: a `for` loop variable and an `if let` payload are seen
+# as free and captured, which emits a load of a name the enclosing frame
+# does not have and the ir consumer rejects with "unknown load source".
+# `self` is captured under that name like an ordinary variable.
 pub fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
     return ir_find_free_vars_walk(idx, bound, [], blocked_names, locals)

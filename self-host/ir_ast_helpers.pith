@@ -2,30 +2,72 @@
 
 from ast import get_node, Node
 
+# whether `value` appears in `items`, compared byte for byte with no
+# case folding. a linear scan, so it is sized for the short name lists
+# capture analysis carries around — bound names, free names, a lambda's
+# capture list. callers use it as the guard before pushing, which is what
+# keeps those lists free of duplicates.
 pub fn ir_list_contains(items: List[String], value: String) -> Bool:
     for item in items:
         if item == value:
             return true
     return false
 
+# whether a node of this kind carries literal string text in its `value`,
+# and so has to be interned into the module string table before any body
+# is emitted. the parser produces two such kinds: `string_lit` for a whole
+# literal and `lit` for one plain-text run between the interpolations of an
+# interpolated string; `string` and `str_lit` are older spellings accepted
+# here that parser.pith no longer emits. `string_interp` is deliberately
+# not one of them — that node holds no text of its own, only `lit` and
+# expression children.
 pub fn ir_is_string_literal_kind(kind: String) -> Bool:
     return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit"
 
+# the declaration behind a `pub` wrapper. the parser does not mark a
+# declaration public in place — it wraps it in a `pub` node holding the
+# real declaration as its only child — so a sweep that tests `.kind`
+# against "field" / "fn" / "struct" would skip every public one. call this
+# on each child first and public and private declarations look alike.
+# a node that is not a `pub` wrapper comes back unchanged, so this is safe
+# to call on anything. visibility is discarded: a caller that needs it has
+# to look at the original node.
 pub fn ir_unwrap_pub_node(idx: Int) -> Node:
     mut node := get_node(idx)
     if node.kind == "pub" and node.children.len() > 0:
         node = get_node(node.children[0])
     return node
 
+# the same `pub` unwrapping as ir_unwrap_pub_node, but keeping the node
+# index rather than the node. use this one when the result has to be
+# stored or walked further — ir_root_items caches the unwrapped indices of
+# a module's top-level declarations this way. `idx` itself is returned
+# when it is not a `pub` wrapper, so the result is always a real node
+# index, never -1.
 pub fn ir_unwrap_pub_child(idx: Int) -> Int:
     node := get_node(idx)
     if node.kind == "pub" and node.children.len() > 0:
         return node.children[0]
     return idx
 
+# whether this node kind is a `name := value` declaration. the emitter
+# uses it both to pick globals and threadlocals out of a module root's
+# children and to spot local declarations while walking a block. the
+# parser only ever emits "binding"; "bind" is an older spelling still
+# accepted here (and in the checker) but no longer produced.
 pub fn ir_is_binding_kind(kind: String) -> Bool:
     return kind == "bind" or kind == "binding"
 
+# the bare variable name from a binding node. the parser packs the
+# declaration's modifiers into that same value string as a suffix, so
+# `mut x := 1` stores "x mut" and `weak p := q` stores "p weak"; this
+# takes them back off. the `mut` case chops the last four bytes by
+# position rather than searching, which stays correct only because the
+# checker rejects `mut weak` (E261) and " mut" is therefore always last.
+# callers that need to know which modifier was present test the raw
+# node.value themselves, before calling this. same rule as
+# ir_bind_stmt_name in ir_control_helpers, which applies it to a value
+# string the caller already has in hand.
 pub fn ir_binding_name(node: Node) -> String:
     mut name := node.value
     if name.contains(" mut"):
@@ -34,6 +76,12 @@ pub fn ir_binding_name(node: Node) -> String:
         name = name.split(" ")[0]
     return name
 
+# whether a binding is initialized from a written-out collection literal
+# — `[...]`, `{...}` or a set literal, the `list` / `map` / `set` node
+# kinds. only the binding's direct children are looked at and no `pub`
+# unwrapping happens, so a collection that arrives through a call or any
+# other expression answers false. nothing calls this today; it is
+# imported by ir_emitter_core but unused there.
 pub fn ir_binding_has_collection_init(node: Node) -> Bool:
     for child in node.children:
         kind := get_node(child).kind

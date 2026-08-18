@@ -43,6 +43,22 @@ pub TID_FIRST_USER := 17
 #
 # unused fields default to empty/0/-1 depending on kind.
 
+# everything known about one type. this is a single record used for
+# every kind of type, so `kind` decides which of the remaining fields
+# mean anything and the rest are left empty:
+#
+#   struct     fields, field_types, field_pub, field_mut
+#   function   param_types, return_type
+#   optional / list / set / task / channel   inner
+#   map        key_type, value_type
+#   tuple      elements
+#   enum       variants, variant_types
+#   primitive  name only
+#
+# reading a field that does not belong to the kind gives an empty list
+# or zero rather than an error, so check `kind` first. build these
+# through the `ti_*` constructors, which set the right fields for each
+# kind and leave the others empty.
 pub struct TypeInfo:
     pub kind: String
     pub name: String

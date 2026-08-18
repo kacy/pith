@@ -2,14 +2,23 @@
 
 from ast import get_node, Node
 
+# the two halves of one `if` or `elif` — the condition and the body, as
+# arena indices. gathered in one pass so the emitter does not re-walk
+# the node's children looking for each part by position.
 pub struct IrIfBranch:
     cond_idx: Int
     body_idx: Int
 
+# the names a `for` loop binds: the element, and the index when the
+# loop declares one. `index_name` is "" for the common single-binding
+# form, which is the check for whether an index slot is needed at all.
 pub struct IrForBindingNames:
     value_name: String
     index_name: String
 
+# a binding statement taken apart: the name, the initializer, and the
+# written type annotation. `type_idx` is negative when the binding has
+# no annotation and its type must come from inferring the initializer.
 pub struct IrBindParts:
     name: String
     val_idx: Int

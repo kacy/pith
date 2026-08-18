@@ -7,6 +7,21 @@
 # node.value holds associated data (e.g. the literal value, operator name).
 # node.children holds indices of sub-nodes.
 
+# one node of the parsed syntax tree. nodes live in a single global
+# arena and refer to each other by INDEX, not by reference — `children`
+# holds arena indices, and every function here that takes a node takes
+# one of those indices. that is why the tree is walked with get_node()
+# rather than by following fields.
+#
+# `kind` is an untyped string tag ("fn_decl", "call", "binding", …) and
+# `value` is whatever text that kind needs — a function's name, a
+# literal's text, an operator. neither is checked, so a misspelled kind
+# silently matches nothing.
+#
+# line and col are the position of the LAST token that formed the node,
+# not the first, so a node spanning several tokens reports at its end.
+# that is the documented diagnostics limitation, and it is why anything
+# needing the declaration's own line searches the source text instead.
 pub struct Node:
     pub kind: String
     pub value: String

@@ -747,12 +747,12 @@ test "read_message rejects a length below its own header":
     # would ask recv_exact for a negative payload. the frame is pre-buffered,
     # so no real socket is touched.
     framed := bytes.concat(bytes.from_string_utf8("E"), be32(3))
-    conn := Conn(fd: - 1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_handle: 0)
     assert(conn.read_message().is_err)
 
 test "read_message rejects a length beyond the cap":
     # a frame length just past MAX_MESSAGE_LEN must be refused before it drives
     # a read. the frame is pre-buffered, so no real socket is touched.
     framed := bytes.concat(bytes.from_string_utf8("D"), be32(MAX_MESSAGE_LEN + 1))
-    conn := Conn(fd: - 1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_handle: 0)
     assert(conn.read_message().is_err)

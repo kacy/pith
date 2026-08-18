@@ -166,7 +166,7 @@ pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String)
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_owned_by(entry.parent, name, module_path)
-    return - 1
+    return -1
 
 ## the arena index of the binding a lookup from this scope would find,
 ## or -1. the checker uses it to retype a binding after the fact: an
@@ -181,7 +181,7 @@ pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_index(entry.parent, name)
-    return - 1
+    return -1
 
 ## replace the recorded type of an existing binding by arena index.
 pub fn set_binding_type_at(index: Int, type_id: Int):
@@ -198,7 +198,7 @@ pub fn lookup_binding_decl_node(scope_id: Int, name: String) -> Int:
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding_decl_node(entry.parent, name)
-    return - 1
+    return -1
 
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # the latest binding of the name in this scope wins (shadowing), so
@@ -210,7 +210,7 @@ pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     entry := scope_entries[scope_id]
     if entry.parent >= 0:
         return lookup_binding(entry.parent, name)
-    return - 1
+    return -1
 
 # check if a binding is mutable, walking the parent chain
 pub fn is_binding_mutable(scope_id: Int, name: String) -> Bool:

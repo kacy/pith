@@ -666,11 +666,11 @@ fn read_messages(data: Bytes, field: Int) -> List[Bytes]!protobuf.ProtoError:
 fn resource_attr(resource: Bytes, key: String) -> String!protobuf.ProtoError:
     for kv in read_messages(resource, 1)!:
         r := protobuf.reader(kv)
-        r.read_tag()!                 # key
+        r.read_tag()! # key
         found_key := r.read_string()!
-        r.read_tag()!                 # value (AnyValue)
+        r.read_tag()! # value (AnyValue)
         any_value := protobuf.reader(r.read_message()!)
-        any_value.read_tag()!         # string_value
+        any_value.read_tag()! # string_value
         if found_key == key:
             return any_value.read_string()!
     return ""
@@ -755,11 +755,11 @@ fn first_attr_value(point: Bytes) -> String!protobuf.ProtoError:
         tag := pr.read_tag()!
         if tag.field == 7:
             kv := protobuf.reader(pr.read_message()!)
-            kv.read_tag()!            # key
+            kv.read_tag()! # key
             kv.read_string()!
-            kv.read_tag()!            # value (AnyValue)
+            kv.read_tag()! # value (AnyValue)
             any_value := protobuf.reader(kv.read_message()!)
-            any_value.read_tag()!     # string_value
+            any_value.read_tag()! # string_value
             return any_value.read_string()!
         pr.skip(tag.wire)!
     return ""
@@ -785,8 +785,8 @@ test "a counter encodes as a monotonic sum with an int data point":
             sm.skip(tag.wire)!
             continue
         metric := sm.read_message()!
-        sum_bytes := first_message(metric, 7)!    # Sum
-        point := first_message(sum_bytes, 1)!      # NumberDataPoint
+        sum_bytes := first_message(metric, 7)! # Sum
+        point := first_message(sum_bytes, 1)! # NumberDataPoint
 
         mut as_double := 0.0
         pr := protobuf.reader(point)
@@ -843,9 +843,9 @@ test "a histogram encodes count and sum on its data point":
 test "a histogram encodes explicit buckets, min, and max":
     metrics.reset()
     h := metrics.histogram("latency_ms").buckets([10.0, 100.0])
-    h.observe(5.0)      # falls in the <=10 bucket
-    h.observe(50.0)     # falls in the (10,100] bucket
-    h.observe(500.0)    # overflow, above the last bound
+    h.observe(5.0) # falls in the <=10 bucket
+    h.observe(50.0) # falls in the (10,100] bucket
+    h.observe(500.0) # overflow, above the last bound
     encoded := encode_metrics(target("checkout", "http://collector.local:4318", PROTOCOL_HTTP), metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
@@ -942,7 +942,7 @@ test "each attribute type encodes to its AnyValue field":
     trace.set_sink(false)
 
     span_bytes := encode_span(spans[0])!
-    attrs := read_messages(span_bytes, 9)!    # Span.attributes
+    attrs := read_messages(span_bytes, 9)! # Span.attributes
     assert_eq(attrs.len(), 4)
 
     # string -> AnyValue.string_value = 1
@@ -1090,9 +1090,9 @@ test "the resource-attributes parser splits k=v pairs and skips junk":
     assert_eq(parsed.len(), 3)
     assert_eq(parsed[0].key, "region")
     assert_eq(parsed[0].s, "us-east")
-    assert_eq(parsed[1].key, "tier")     # surrounding spaces trimmed
+    assert_eq(parsed[1].key, "tier") # surrounding spaces trimmed
     assert_eq(parsed[1].s, "gold")
-    assert_eq(parsed[2].key, "empty")    # empty value is kept
+    assert_eq(parsed[2].key, "empty") # empty value is kept
     assert_eq(parsed[2].s, "")
     assert_eq(parse_resource_attributes("").len(), 0)
 

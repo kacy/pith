@@ -29,7 +29,8 @@ the language:
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
 | catalog workload, 200k requests | **~118 ms** | ~408 ms | ~70 ms | — |
-| grpc unary echo, conc=8, 16 B | 7476 calls/s | 14731 | 12005 | — |
+| grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
+| grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
 | http server under wrk, 30 s | 4648 req/s, rss flat (+0 kb) | 15444 req/s (+5.9 mb) | — | — |
 | event_ledger, 200k events | **351 ms (0.75x go)** | 466 ms | 111 ms | 132 ms |
 | std_pipeline, 50k records | 480 ms (1.50x go) | 319 ms | 145 ms | — |
@@ -125,7 +126,8 @@ the releases they had been skipping. flat memory was bought at list price.
 all numbers from one 2-core machine, medians of 5 where quick enough to
 repeat; the tables below were fully rerun 2026-07-15 (after the arc
 reclamation and weak-reference work), the grpc table again on 2026-07-19
-after the unary-response coalescing, and std_pipeline again on 2026-07-21
+after the unary-response coalescing and once more on 2026-08-17 with all
+three clients re-run together, and std_pipeline again on 2026-07-21
 after the byte-level scanner work. the standout change in the latest
 rerun: std_pipeline's `transform` phase fell from 347ms to 218ms once the
 url and path scanners stopped minting a one-character string per byte,
@@ -169,26 +171,51 @@ and no longer leaks.
 `bench/grpc` — unary echo calls over tls on loopback, the same grpc-go
 server for all three clients so the numbers reflect the client. pith is
 `std.net.grpc` over its own tls 1.3, http/2, hpack, and protobuf — no c,
-no async runtime. 20,000 calls each, july 2026:
+no async runtime. all three clients re-measured together on 2026-08-17,
+10,000 calls each, three repetitions with the client order ROTATED between
+them so no client benefits from running first (this bench had an ordering
+bias worth ~2x until #678, so the rotation is not ceremony):
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 4011 | 2750 | **3353** |
-| 1 KiB, sequential | 3862 | 2601 | **3220** |
-| 16 B, 8 concurrent, one connection | 13845 | 11435 | **6832** |
-| 1 KiB, 8 concurrent, one connection | 11242 | 9287 | **6084** |
+| 16 B, sequential | 3711 | 2716 | **4022** |
+| 1 KiB, sequential | 3600 | 2616 | **3638** |
+| 16 B, 8 concurrent, one connection | **13434** | 10937 | 7560 |
+| 1 KiB, 8 concurrent, one connection | **9643** | 9426 | 6815 |
 
-sequentially pith is ~84% of grpc-go and a bit ahead of tonic — close, for
-a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
-protobuf). concurrency over a single connection is the weaker spot: eight
-streams lift pith ~2x where go and rust scale ~3.5x. the ceiling there is
-not stream count but the per-call latency of the internal pipeline — every
+and the latency distribution at 16 B, which is where pith looks best:
+
+| 16 B | go | rust (tonic) | pith |
+|---|---|---|---|
+| sequential median | 235 µs | 326 µs | **228 µs** |
+| sequential p99 | 633 µs – 1.01 ms | 1.33 – 2.26 ms | **571 – 716 µs** |
+| conc=8 median | **479 µs** | 623 µs | 919 µs |
+
+**sequentially pith is now the fastest of the three** — ahead of grpc-go on
+throughput, on median latency, and by the widest margin on p99, where its
+tail is about half go's and a third of tonic's. that is the whole stack in
+pith: its own tls 1.3, http/2, hpack, protobuf, no c and no async runtime.
+tonic being the slowest of the three sequentially is worth knowing before
+treating rust as the automatic ceiling here.
+
+concurrency over a single connection is still the weaker spot: eight streams
+lift pith ~1.9x where go lifts ~3.6x. one number makes that diagnosable
+rather than merely bad — going from 16 B to 1 KiB narrows the conc=8 gap
+from 1.78x to 1.41x while the sequential columns barely move. a gap that
+shrinks as the payload grows is a FIXED PER-CALL COST being amortised, not
+a throughput ceiling. that fixed cost is the internal pipeline — every
 frame crosses worker → writer → socket → reader → worker, and each hop is a
 thread handoff (a futex wake plus a context switch). the single reader/writer
 is correct and required for hpack ordering. coalescing removed the redundant
 handoffs on that path (below); the ones that remain are structural — one
 context switch per pipeline thread per call — so the way to more parallelism
 past that is more connections, also below.
+
+read the conc=8 column with the box in mind: the server runs alongside the
+client on a 2-core machine, so eight in-flight calls oversubscribe it by
+construction and that column measures the machine as much as the runtime.
+it is a good symptom detector and a bad optimisation target. the sequential
+column is the clean measurement, and it is the one pith wins.
 
 this benchmark paid for itself on the first run: client sockets had no
 `TCP_NODELAY`, so nagle collided with the peer's delayed acks for a ~40ms

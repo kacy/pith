@@ -120,7 +120,16 @@ jobs:
           # that declares itself generated in its leading comment block is
           # skipped, since generated code mirrors the naming of whatever
           # produced it and is not ours to rename.
-          for f in $(find examples self-host std -name '*.pith' | sort); do
+          #
+          # tools/docsite/sample is golden-test INPUT rather than source:
+          # docsite renders that tree and the output is diffed, so the
+          # fixture deliberately contains an undocumented public function
+          # to pin how an undocumented item renders. documenting it would
+          # delete the case it exists to cover. a marker comment is no
+          # good either — the file's leading `##` block IS the module doc
+          # the golden captures.
+          for f in $(find examples self-host std tools -name '*.pith' \
+                          -not -path 'tools/docsite/sample/*' | sort); do
             ./self-host/pith_main lint "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL lint $f"

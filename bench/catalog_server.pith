@@ -638,7 +638,7 @@ fn handle_request(req: HttpRequestBytes) -> HttpResponse:
         if fast.is_ok:
             return http.response(200).with_body_bytes(fast.ok).header("Content-Type", JSON_MIME)
         mark := json.checkpoint()
-        root := req.body_json() catch - 1
+        root := req.body_json() catch -1
         if root < 0:
             json.restore(mark)
             return bad_json_response()

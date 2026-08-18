@@ -46,8 +46,12 @@ pub fn fmt_source(source: String) -> String:
                 formatted_lines.push(line.substring(0, indent_len) + format_comment(trimmed))
                 continue
 
-        # for code lines, normalize spacing
-        formatted_lines.push(format_code_line(line))
+        # for code lines, normalize spacing. the spacing pass appends a space
+        # after an operator without knowing whether anything follows it on the
+        # line, so a line that ends in one — a multi-line match arm's `=>`, a
+        # trailing binary operator — comes back with a space hanging off the
+        # end. trim again here so rule 4 holds for code lines too.
+        formatted_lines.push(trim_right(format_code_line(line)))
 
     # every slot above stood for a line the old loop terminated with a
     # newline, so the joined file needs one more to match.
@@ -448,3 +452,12 @@ test "formatting is idempotent across the minus cases":
     src := "fn f(a: Int) -> Int:" + chr(10) + "    b := [-1, -2]" + chr(10) + "    return a - 1" + chr(10)
     once := fmt_source(src)
     assert(fmt_source(once) == once)
+
+test "a line ending in an operator keeps no trailing space":
+    # the spacing pass puts a space after an operator before it knows whether
+    # anything follows on the line, so a multi-line match arm's `=>` came back
+    # with a space hanging off the end. self-host has no multi-line arms, so
+    # the fmt gate never exercised this until std came under it.
+    arm := "fn f(k: Int) -> Int:" + chr(10) + "    match k:" + chr(10) + "        1 =>" + chr(10) + "            return 2" + chr(10)
+    assert(fmt_source(arm).contains("1 =>" + chr(10)))
+    assert(not fmt_source(arm).contains(" " + chr(10)))

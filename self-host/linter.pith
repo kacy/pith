@@ -210,7 +210,16 @@ fn check_doc_comment(name: String, node_idx: Int, source: String):
     search := "fn " + name + "("
     mut found_line := 0 - 1
     for line, i in lines:
-        if line.contains(search):
+        if not line.contains(search):
+            continue
+        # a bare `contains` also matches a call site and any comment or
+        # string that happens to name the function, and the loop keeps the
+        # LAST hit — so a prose mention below the declaration became "the
+        # declaration", and the rule then read the line above THAT and
+        # reported a documented function as undocumented. only a line that
+        # opens with the declaration itself counts.
+        trimmed := line.trim()
+        if trimmed.starts_with("fn ") or trimmed.starts_with("pub fn "):
             found_line = i
     if found_line <= 0:
         # can't find or first line — skip

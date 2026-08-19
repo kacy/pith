@@ -56,6 +56,10 @@ fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
 
 pub mut current_scope := -1
 pub mut method_type_map: Map[String, Int] := {}
+# how each method key was declared — "inherent", "iface", or both joined
+# with a comma. a SAME-kind re-declaration is the E263 duplicate; the
+# inherent+interface pair is std/io's deliberate conformance idiom.
+mut method_decl_kind: Map[String, String] := {}
 pub mut method_visibility_map: Map[String, Bool] := {}
 # whether each module function was declared `pub`, keyed by its module-qualified
 # symbol. a call through a module alias consults this so a module's private
@@ -135,6 +139,7 @@ pub fn initialize_checker(file_path: String):
     reset_scope_arena()
     checker_reset_diagnostics(file_path)
     method_type_map = {}
+    method_decl_kind = {}
     method_visibility_map = {}
     function_visibility_map = {}
     checker_methods_reset()
@@ -897,7 +902,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             method_node_idx = cn.children[0]
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
-            register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub)
+            register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub, interface_name != "")
     active_assoc_bindings = {}
 
     # clear the suppression for the next impl block
@@ -919,10 +924,52 @@ fn method_owner_type_id(type_name: String) -> Int:
         return scoped
     return lookup_type_id(resolve_imported_type_name(type_name))
 
-fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool):
+fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool, from_interface: Bool):
     mut method_name := node.value
     fn_tid := resolve_function_signature(node)
     key := type_name + "." + method_name
+    owner := method_owner_type_id(type_name)
+    # a second impl block giving the same declaration the same method used to
+    # overwrite the first silently, and which body answered depended on
+    # module order. duplicates are keyed by the OWNER TID, not the bare name:
+    # two modules may each declare a struct with this name and each give its
+    # own struct the method, and an impl in another module may add NEW
+    # methods to a type it can see (std.fs extends std.io's FileStream) —
+    # both stay legal. a generic base has no tid and its name is globally
+    # unique, so it dedups by the name key. only a SAME-KIND collision is an
+    # error — std/io's conformance idiom declares each method twice on
+    # purpose, once in the inherent block and once in the interface impl
+    # (`impl StringReader: fn read` and `impl Reader for StringReader:
+    # fn read`, identical bodies), and that pair stays legal in either order.
+    mut kind_key := key
+    if owner >= 0:
+        kind_key = method_tid_key(owner, method_name)
+    else:
+        # a generic base has no tid, and its bare name is NOT globally
+        # unique — std.iter's MapIter and a user module's MapIter both
+        # register "MapIter.next". scope the duplicate check to the
+        # declaring module, so same-named generics in different modules
+        # never collide; a genuine duplicate within one module still
+        # errors.
+        kind_key = current_checker_module_path + ":" + key
+    mut already_declared := false
+    if owner >= 0:
+        already_declared = has_method_declaration(kind_key)
+    elif has_generic_declaration(type_name):
+        already_declared = method_decl_kind.contains_key(kind_key)
+    mut new_kind := "inherent"
+    if from_interface:
+        new_kind = "iface"
+    if already_declared and method_decl_kind.contains_key(kind_key):
+        if method_decl_kind[kind_key].contains(new_kind):
+            report_error_at(node_idx, "E263", "duplicate method '" + method_name + "' on '" + type_name + "': another impl block already declares it")
+    mut kinds := new_kind
+    if method_decl_kind.contains_key(kind_key):
+        if method_decl_kind[kind_key].contains(new_kind) == false:
+            kinds = method_decl_kind[kind_key] + "," + new_kind
+        else:
+            kinds = method_decl_kind[kind_key]
+    method_decl_kind.insert(kind_key, kinds)
     method_type_map.insert(key, fn_tid)
     method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx)
@@ -931,7 +978,6 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     # declaration the impl target actually resolves to, and remember that
     # owner on the name key so a same-named foreign struct cannot answer for
     # it. keep the owner in step with the latest name-key write.
-    owner := method_owner_type_id(type_name)
     if owner >= 0:
         register_method_signature(method_tid_key(owner, method_name), node_idx)
         register_method_owner(key, owner)
@@ -982,7 +1028,7 @@ fn fill_impl_defaults(node: Node):
             if owner >= 0:
                 provides_own = has_method_declaration(method_tid_key(owner, mn.value))
             if provides_own == false:
-                register_method_declaration(concrete_name, member, mn, true)
+                register_method_declaration(concrete_name, member, mn, true, true)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
     # match on base names so a generic instance like FilterIter[Range, Int]

@@ -122,45 +122,6 @@ fn await_output_or_fail(task: Task[String!]) -> String!BlockingError:
         fail blocking_failed(result.err)
     return result.ok
 
-# the text write_all resumes through bytes rather than re-slicing the String. a
-# write stops at whatever byte offset the pipe ran out at, and that offset can
-# be inside a multi-byte character — which a String cannot be cut at, so
-# resuming as text would stop the process outright on the first non-ascii
-# payload big enough to be split. std.io's write loops were put right this way
-# already; this is the copy that lives here.
-fn process_write_all(writer: ProcessStdin, data: String) -> Int!:
-    mut total := 0
-    mut remaining := bytes.from_string_utf8(data)
-    while not remaining.is_empty():
-        wrote := process_write_bytes(writer.handle, remaining)!
-        if wrote <= 0:
-            fail "write returned 0"
-        total = total + wrote
-        remaining = remaining.slice(wrote, remaining.len())
-    return total
-
-# the bytes are gathered and decoded once at the end. a pipe read of a fixed
-# number of bytes stops wherever the count lands, including halfway through a
-# character, so decoding each chunk as it arrived rejected the whole read
-# whenever a character straddled a chunk boundary — which a child printing more
-# than 4 KiB of ordinary accented text does routinely. a character split across
-# two reads is not a decode error, it is two reads.
-fn process_read_all_stdout(reader: ProcessStdout) -> String!:
-    buf := bytes.buffer_with_capacity(PROCESS_IO_CHUNK_SIZE)
-    mut chunk := process_read_bytes(reader.handle, PROCESS_IO_CHUNK_SIZE)!
-    while not chunk.is_empty():
-        buf.write(chunk)!
-        chunk = process_read_bytes(reader.handle, PROCESS_IO_CHUNK_SIZE)!
-    return buf.bytes().to_string_utf8()!
-
-fn process_read_all_stderr(reader: ProcessStderr) -> String!:
-    buf := bytes.buffer_with_capacity(PROCESS_IO_CHUNK_SIZE)
-    mut chunk := process_read_err_bytes(reader.handle, PROCESS_IO_CHUNK_SIZE)!
-    while not chunk.is_empty():
-        buf.write(chunk)!
-        chunk = process_read_err_bytes(reader.handle, PROCESS_IO_CHUNK_SIZE)!
-    return buf.bytes().to_string_utf8()!
-
 # waits for a process while respecting cancellation and deadlines.
 pub fn wait_ctx(process: Process, ctx: Context) -> Int!WaitError:
     task := spawn wait_worker(process)
@@ -259,26 +220,18 @@ impl Process:
     fn close():
         process_close(self.handle)
 
-impl ProcessStdin:
-    fn write(data: String) -> Int!:
-        return process_write_bytes(self.handle, bytes.from_string_utf8(data))!
+# ProcessStdin's write family lives on the struct's home module: std.io
+# declares write/write_all (plus the ctx, bytes and buffered variants) and
+# they resolve from here too. this module used to re-declare write and
+# write_all with its own (behaviorally identical) bodies, which made
+# "which body answers" a module-order accident — the duplicate impl block
+# is gone and E263 now rejects the shape.
 
-    fn write_all(data: String) -> Int!:
-        return process_write_all(self, data)
-
-impl ProcessStdout:
-    fn read(max_bytes: Int) -> String!:
-        return process_read_bytes(self.handle, max_bytes)!.to_string_utf8()!
-
-    fn read_all() -> String!:
-        return process_read_all_stdout(self)
-
-impl ProcessStderr:
-    fn read(max_bytes: Int) -> String!:
-        return process_read_err_bytes(self.handle, max_bytes)!.to_string_utf8()!
-
-    fn read_all() -> String!:
-        return process_read_all_stderr(self)
+# ProcessStdout and ProcessStderr read the same way: their read family
+# lives on the structs' home module, std.io, and resolves from here too.
+# the duplicate impl blocks that used to re-declare read/read_all with
+# their own (behaviorally identical) bodies are gone — see the
+# ProcessStdin note above.
 
 impl Output:
     fn success() -> Bool:

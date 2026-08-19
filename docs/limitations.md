@@ -78,21 +78,25 @@ something here that now works, the page is stale and a fix to it is welcome.
   (E209). bind it to a name first (`f := instance.field; f(args)`).
   function values held in locals, globals, list/map/tuple elements, and
   returned from calls are all directly callable.
-- **duplicate method names across impl blocks** — a struct's methods can be
-  declared in more than one impl block, including a block in a different
-  module than the struct (std.fs adds methods to std.io's FileStream this
-  way), and every method resolves from any call site that can see the value.
-  method dispatch is per-declaration: two modules can each declare a struct
-  with the same name and a call binds only to the receiver's own methods
-  (E209 otherwise, even when the other struct has the method). the remaining
-  gap is two impl blocks giving the *same* struct the *same* method name —
-  that is not rejected, and which body wins depends on module order, so give
-  methods on a shared type distinct names. a free function sharing a name
-  with a builtin method on a primitive receiver does not capture the method
-  either: `(1.5).to_int()` is the Float builtin even with a `fn to_int(text,
-  fallback)` in the build, and the free function answers only plain calls.
-  method syntax never reaches a free function (there is no ufcs) — a
-  primitive receiver resolves builtins, everything else resolves methods.
+- **duplicate method names across impl blocks are rejected** — a struct's
+  methods can be declared in more than one impl block, including a block in
+  a different module than the struct, and every method resolves from any
+  call site that can see the value. method dispatch is per-declaration: two
+  modules can each declare a struct with the same name and a call binds
+  only to the receiver's own methods (E209 otherwise, even when the other
+  struct has the method). a second impl block giving the *same* declaration
+  the *same* method name used to overwrite the first silently, with the
+  winning body decided by module order — that is now E263. one deliberate
+  exception: an interface impl may re-declare a method the inherent impl
+  also has (`impl StringReader: fn read` alongside `impl Reader for
+  StringReader: fn read`) — that pair is std/io's conformance idiom and
+  stays legal in either order; a second declaration of the same KIND is
+  what errors. a free function sharing a name with a builtin method on a
+  primitive receiver does not capture the method either: `(1.5).to_int()`
+  is the Float builtin even with a `fn to_int(text, fallback)` in the
+  build, and the free function answers only plain calls. method syntax
+  never reaches a free function (there is no ufcs) — a primitive receiver
+  resolves builtins, everything else resolves methods.
 - **interface depth** — interfaces support method signatures, default
   methods (a member with a body that implementors inherit unless they
   override it), associated types (`type Item` on the interface, bound

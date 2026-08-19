@@ -64,13 +64,7 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
     flag_eq := ir_reg()
     ir_emit("eq " + flag_eq.to_string() + " " + lf.to_string() + " " + rf.to_string())
 
-    val_eq := ir_reg()
-    inner_kind := ir_type_from_tid(info.inner)
-    if inner_kind == "string":
-        str_eq_name := ir_runtime_call_name("__str_eq")
-        ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + lv.to_string() + " " + rv.to_string())
-    else:
-        ir_emit("eq " + val_eq.to_string() + " " + lv.to_string() + " " + rv.to_string())
+    val_eq := ir_emit_inner_value_eq(ir_type_from_tid(info.inner), lv, rv)
 
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")
@@ -80,14 +74,7 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
     tail := ir_reg()
     ir_emit("or " + tail.to_string() + " " + both_none.to_string() + " " + val_eq.to_string())
 
-    if op == "eq":
-        ir_emit("and " + result_reg.to_string() + " " + flag_eq.to_string() + " " + tail.to_string())
-    else:
-        eq_result := ir_reg()
-        ir_emit("and " + eq_result.to_string() + " " + flag_eq.to_string() + " " + tail.to_string())
-        one_r := ir_reg()
-        ir_emit("iconst " + one_r.to_string() + " 1")
-        ir_emit("neq " + result_reg.to_string() + " " + eq_result.to_string() + " " + one_r.to_string())
+    ir_emit_guarded_eq(result_reg, op, flag_eq, tail)
 
 # `x == 5` where x is an Optional and 5 is a plain value of its inner type.
 # none never equals a plain value, so eq is `is_some and value == v` and neq
@@ -98,18 +85,31 @@ pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, p
     info := get_type_info(opt_tid)
     flag := ir_optional_flag_field(opt_r)
     value := ir_optional_value_field(opt_r, opt_tid)
+    val_eq := ir_emit_inner_value_eq(ir_type_from_tid(info.inner), value, plain_r)
+    ir_emit_guarded_eq(result_reg, op, flag, val_eq)
+
+# the payload-equality register for one inner kind, shared by both optional
+# compares above: a string inner compares by content through __str_eq;
+# everything else falls back to i64 equality, which is what the bare
+# type's `==` would do.
+fn ir_emit_inner_value_eq(inner_kind: String, a_r: Int, b_r: Int) -> Int:
     val_eq := ir_reg()
-    inner_kind := ir_type_from_tid(info.inner)
     if inner_kind == "string":
         str_eq_name := ir_runtime_call_name("__str_eq")
-        ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + value.to_string() + " " + plain_r.to_string())
+        ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + a_r.to_string() + " " + b_r.to_string())
     else:
-        ir_emit("eq " + val_eq.to_string() + " " + value.to_string() + " " + plain_r.to_string())
+        ir_emit("eq " + val_eq.to_string() + " " + a_r.to_string() + " " + b_r.to_string())
+    return val_eq
+
+# combine `guard_r and val_eq_r` into result_reg for op "eq", or the
+# negation of that conjunction for neq (compared against 1, the emitter's
+# bool encoding).
+fn ir_emit_guarded_eq(result_reg: Int, op: String, guard_r: Int, val_eq_r: Int):
     if op == "eq":
-        ir_emit("and " + result_reg.to_string() + " " + flag.to_string() + " " + val_eq.to_string())
+        ir_emit("and " + result_reg.to_string() + " " + guard_r.to_string() + " " + val_eq_r.to_string())
     else:
         eq_result := ir_reg()
-        ir_emit("and " + eq_result.to_string() + " " + flag.to_string() + " " + val_eq.to_string())
+        ir_emit("and " + eq_result.to_string() + " " + guard_r.to_string() + " " + val_eq_r.to_string())
         one_r := ir_reg()
         ir_emit("iconst " + one_r.to_string() + " 1")
         ir_emit("neq " + result_reg.to_string() + " " + eq_result.to_string() + " " + one_r.to_string())

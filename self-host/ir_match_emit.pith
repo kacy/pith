@@ -22,8 +22,13 @@ pub mut ir_match_subject_tid := 0 - 1
 
 pub mut ir_tail_match_node := 0 - 1
 
-## emit one arm's body as the function's return value.
-pub fn ir_emit_match_arm_return(body_idx: Int, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
+## emit one arm's body as the function's return value. an expression body
+## goes through the full return contract (emit_ret is the emitter core's
+## ir_emit_return_value): the bare `ret` this used to emit skipped the
+## defers, the borrow retain, the optional/result wrap, and the tracked
+## local cleanup — so every count an arm's payload binding had retained
+## leaked once per call, and a borrowed return could dangle.
+pub fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
     body := get_node(body_idx)
     if body.kind == "block":
         emit_block(body_idx)
@@ -31,15 +36,14 @@ pub fn ir_emit_match_arm_return(body_idx: Int, emit_expr: fn(Int) -> Int, emit_b
     mut expr_idx := body_idx
     if body.kind == "body" and body.children.len() > 0:
         expr_idx = body.children[0]
-    val_r := emit_expr(expr_idx)
-    ir_emit("ret " + val_r.to_string())
+    emit_ret(expr_idx)
     ir_last_was_ret = true
 
 # Lower a tail-position match: each matching arm returns its value. A no-match
 # fall-through lands on the function's default return.
 
 ## lower a function-tail match directly into returns.
-pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
+pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
     ir_match_subject_tid = ir_emission_tid(node.children[0])
@@ -69,7 +73,7 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
             body_l := ir_label()
             ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
             ir_emit_label(body_l)
-        ir_emit_match_arm_return(body_idx, emit_expr, emit_block)
+        ir_emit_match_arm_return(body_idx, emit_ret, emit_block)
         ir_emit_label(next_l)
         i = i + 1
 
@@ -371,6 +375,18 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
             inner_kind := ir_type_from_tid(subj_info.inner)
             if inner_kind.len() > 0:
                 ir_var_types.insert(pat.value, inner_kind)
+            # an rc payload is retained so the binding owns its own count —
+            # the subject's shell (or its cascade-released payload) can die at
+            # scope exit while the binding lives on. the prepass tracks the
+            # name, so exit cleanup releases it or a return transfers it,
+            # the same contract as an enum arm's payload binding below.
+            rc_kind := ir_rc_kind(inner_kind)
+            if rc_kind.len() > 0:
+                if not ir_untracked_rc_binds.contains(pat.value):
+                    old_r := ir_reg()
+                    ir_emit("load " + old_r.to_string() + " " + pat.value)
+                    ir_rc_release_reg(old_r, rc_kind)
+                ir_rc_retain_reg(inner_r, rc_kind)
             ir_emit("store " + pat.value + " " + inner_r.to_string())
             return
         ir_var_regs.insert(pat.value, subj_r)

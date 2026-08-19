@@ -1,0 +1,55 @@
+# required client authentication (mTLS): a server that requires a client
+# certificate, and a client that presents one, must complete the handshake
+# and exchange application data.
+#
+# this exercises the one handshake path that carries a client Certificate and
+# CertificateVerify. the server verifies the client's Finished over the full
+# handshake transcript, which per RFC 8446 4.4.4 includes those two messages —
+# a server that froze the transcript before appending them rejects every
+# genuine mTLS client, so this whole roundtrip failed until that was fixed.
+# a fresh client per call also proves the path is stable across connections,
+# not a one-shot fluke.
+import std.net.tls as tls
+import std.time as time
+
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+PORT := 50823
+
+fn run_server(rounds: Int) -> Int!:
+    cfg := tls.server_config(CERT, KEY)!.require_client_ca_file(CA)!
+    defer cfg.close()
+    listener := tls.listen("127.0.0.1", PORT, cfg)!
+    mut i := 0
+    while i < rounds:
+        conn := listener.accept()!
+        msg := conn.read(64)!
+        conn.write_all("echo:" + msg)!
+        conn.close()
+        i = i + 1
+    return 0
+
+# one authenticated call: present the client certificate, send, read the echo.
+fn attempt_call(msg: String) -> String!:
+    cfg := tls.client_config_with_ca_file(CA)!.with_client_certificate(CERT, KEY)!
+    defer cfg.close()
+    conn := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)!
+    defer conn.close()
+    conn.write_all(msg)!
+    return conn.read(64)!
+
+fn call_when_ready(msg: String, timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := attempt_call(msg) catch "ERR"
+        if got != "ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "ERR"
+
+fn main():
+    spawn run_server(2)
+    print(call_when_ready("alpha", 10000))
+    print(call_when_ready("beta", 10000))

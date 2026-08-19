@@ -9306,6 +9306,22 @@ fn ir_emit_enum_eq_fns():
         ir_emit("eq " + same_r.to_string() + " " + ra.to_string() + " " + rb.to_string())
         ir_emit("brif " + same_r.to_string() + " " + true_l + " " + check_l)
         ir_emit_label(check_l)
+        # a null on either side (identity above covered both-null) can never
+        # be equal, and dereferencing it for the tag would fault — a none
+        # optional's payload slot hands this helper a 0, and the widened
+        # T? == T compare reads the slot without branching on the flag.
+        zn_r := ir_reg()
+        ir_emit("iconst " + zn_r.to_string() + " 0")
+        a_ok_l := ir_label()
+        b_ok_l := ir_label()
+        na_r := ir_reg()
+        ir_emit("eq " + na_r.to_string() + " " + ra.to_string() + " " + zn_r.to_string())
+        ir_emit("brif " + na_r.to_string() + " " + false_l + " " + a_ok_l)
+        ir_emit_label(a_ok_l)
+        nb_r := ir_reg()
+        ir_emit("eq " + nb_r.to_string() + " " + rb.to_string() + " " + zn_r.to_string())
+        ir_emit("brif " + nb_r.to_string() + " " + false_l + " " + b_ok_l)
+        ir_emit_label(b_ok_l)
         ta := ir_reg()
         ir_emit("field " + ta.to_string() + " " + ra.to_string() + " 0 int __enum_tag")
         tb := ir_reg()

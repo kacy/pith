@@ -34,3 +34,23 @@ fn main():
     print(both(p))
     print(pair(p, q))
     print(mixed(p, q))
+    run_tail()
+
+# a clause on a function with no return type exercises the no-arrow path.
+fn shout[T](v: T) where T: Show:
+    print(v.show() + "!")
+
+# inline and clause bounds merged on the SAME parameter.
+fn tight[T: Show](v: T) -> String where T: Tag:
+    return v.show() + "#" + v.tag().to_string()
+
+fn contextual() -> Int:
+    # `where` stays an ordinary identifier outside the clause position
+    where := 7
+    return where
+
+fn run_tail():
+    p := Point(x: 5)
+    shout(p)
+    print(tight(p))
+    print("{contextual()}")

@@ -21,8 +21,10 @@ MAX_CODE_LENGTH := 30
 EOS_SYMBOL := 256
 
 # the fixed RFC 7541 Appendix B table, indexed by symbol (0..255, EOS at 256).
-fn huff_table() -> List[HuffEntry]:
-    return [
+# built once at module load, exactly like decode_map below — encode(),
+# encoded_length(), and build_decode_map() all read it, so a per-call
+# rebuild here was several hundred struct allocations on the encode path.
+huff_table: List[HuffEntry] := [
         HuffEntry(0x1ff8, 13),
         HuffEntry(0x7fffd8, 23),
         HuffEntry(0xfffffe2, 28),
@@ -296,7 +298,7 @@ decode_map: Map[Int, Int] := build_decode_map()
 
 # invert the code table into the (length, code) -> symbol map that `decode` walks.
 fn build_decode_map() -> Map[Int, Int]:
-    table := huff_table()
+    table := huff_table
     mut built: Map[Int, Int] := {}
     mut i := 0
     while i < table.len():
@@ -318,7 +320,7 @@ fn decode_key(length: Int, code: Int) -> Int:
 # huffman-encode bytes. the result is padded to a byte boundary with the
 # most-significant bits of the EOS symbol, per RFC 7541 §5.2.
 pub fn encode(input: Bytes) -> Bytes:
-    table := huff_table()
+    table := huff_table
     out := bytes.buffer()
     mut acc := 0
     mut nbits := 0
@@ -343,7 +345,7 @@ pub fn encode(input: Bytes) -> Bytes:
 # the number of bytes `encode` would produce for `input`, without encoding.
 # hpack uses this to choose the shorter of the raw and Huffman forms.
 pub fn encoded_length(input: Bytes) -> Int:
-    table := huff_table()
+    table := huff_table
     mut total_bits := 0
     mut i := 0
     while i < input.len():
@@ -394,7 +396,7 @@ fn hx(data: Bytes) -> String:
     return encoding.to_hex(data)
 
 test "huffman table is complete and well-formed":
-    table := huff_table()
+    table := huff_table
     assert_eq(table.len(), 257)
     assert_eq(table[48].length, 5)
     assert_eq(table[48].code, 0)

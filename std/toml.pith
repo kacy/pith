@@ -45,14 +45,19 @@ threadlocal mut float_values: Map[Int, Float] := {}
 threadlocal mut boolean_values: Map[Int, Bool] := {}
 
 # Table children: flat append-only storage with offset/count
-threadlocal mut table_keys_flat: List[String] := []
-threadlocal mut table_values_flat: List[Int] := []
-threadlocal mut table_key_offsets: Map[Int, Int] := {}
+# Table entries and array children live under stable per-node slot keys.
+# A single flat append-only list with a per-node offset window broke on
+# interleaving: TOML appends a table header, then that table's keys, then the
+# NEXT header, so a parent table's window straddled a sibling's children and
+# `[a]\nx=1\n[b]\ny=2` lost table `b` entirely (get_table returned -1). Slot
+# keys (handle:index) keep each node's children addressable regardless of
+# parse order, the same scheme std.json uses for objects.
+threadlocal mut table_keys_by_slot: Map[String, String] := {}
+threadlocal mut table_values_by_slot: Map[String, Int] := {}
 threadlocal mut table_key_counts: Map[Int, Int] := {}
 
 # Array children: flat append-only storage with offset/count
-threadlocal mut array_items_flat: List[Int] := []
-threadlocal mut array_item_offsets: Map[Int, Int] := {}
+threadlocal mut array_values_by_slot: Map[String, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
 
 # How many scopes open_scope() has handed out and not yet reclaimed.
@@ -67,29 +72,44 @@ fn allocate_node(kind: String) -> Int:
     integer_values.insert(idx, 0)
     float_values.insert(idx, 0.0)
     boolean_values.insert(idx, false)
-    table_key_offsets.insert(idx, 0)
     table_key_counts.insert(idx, 0)
-    array_item_offsets.insert(idx, 0)
     array_item_counts.insert(idx, 0)
     return idx
 
 # Sets a key-value pair in a table
-fn set_table_property(handle: Int, key: String, val: Int):
-    off := table_key_offsets[handle]
+fn table_slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
+fn array_slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
+fn clear_table_entries(handle: Int):
     cnt := table_key_counts[handle]
-    # for well-formed TOML, duplicates don't occur — just append
-    if cnt == 0:
-        table_key_offsets.insert(handle, table_keys_flat.len())
-    table_keys_flat.push(key)
-    table_values_flat.push(val)
+    mut i := 0
+    while i < cnt:
+        slot := table_slot_key(handle, i)
+        table_keys_by_slot.remove(slot)
+        table_values_by_slot.remove(slot)
+        i = i + 1
+
+fn clear_array_entries(handle: Int):
+    cnt := array_item_counts[handle]
+    mut i := 0
+    while i < cnt:
+        array_values_by_slot.remove(array_slot_key(handle, i))
+        i = i + 1
+
+fn set_table_property(handle: Int, key: String, val: Int):
+    cnt := table_key_counts[handle]
+    slot := table_slot_key(handle, cnt)
+    table_keys_by_slot.insert(slot, key)
+    table_values_by_slot.insert(slot, val)
     table_key_counts.insert(handle, cnt + 1)
 
 # Appends a value to an array
 fn push_array_element(handle: Int, val: Int):
     cnt := array_item_counts[handle]
-    if cnt == 0:
-        array_item_offsets.insert(handle, array_items_flat.len())
-    array_items_flat.push(val)
+    array_values_by_slot.insert(array_slot_key(handle, cnt), val)
     array_item_counts.insert(handle, cnt + 1)
 
 # ===============================================================
@@ -115,30 +135,27 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
             integer_values.remove(node_id)
             float_values.remove(node_id)
             boolean_values.remove(node_id)
-            table_key_offsets.remove(node_id)
+            clear_table_entries(node_id)
             table_key_counts.remove(node_id)
-            array_item_offsets.remove(node_id)
+            clear_array_entries(node_id)
             array_item_counts.remove(node_id)
         node_id = node_id - 1
-    # table_keys_flat and table_values_flat grow in lockstep, so one mark covers both.
-    while table_keys_flat.len() > table_flat_mark:
-        table_keys_flat.remove(table_keys_flat.len() - 1)
-    while table_values_flat.len() > table_flat_mark:
-        table_values_flat.remove(table_values_flat.len() - 1)
-    while array_items_flat.len() > array_flat_mark:
-        array_items_flat.remove(array_items_flat.len() - 1)
 
 # node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:
     return next_node_id
 
 # table-children position a compiler-lowered typed decode rolls back to.
+# vestigial: kept for the compiler's handle-decode ABI, which still passes
+# this mark to pool_restore. tables now reclaim per node (clear_table_entries
+# in toml_restore_to), so the value is ignored.
 pub fn pool_mark_table_len() -> Int:
-    return table_keys_flat.len()
+    return 0
 
 # array-children position a compiler-lowered typed decode rolls back to.
+# vestigial, as pool_mark_table_len above: arrays reclaim per node.
 pub fn pool_mark_array_len() -> Int:
-    return array_items_flat.len()
+    return 0
 
 # reclaims the pool nodes a compiler-lowered typed decode allocated.
 pub fn pool_restore(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
@@ -157,7 +174,7 @@ pub fn pool_restore(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: In
 # before the scope closes.
 pub fn open_scope() -> TomlScope:
     open_scope_depth = open_scope_depth + 1
-    return TomlScope(open_scope_depth, next_node_id, table_keys_flat.len(), array_items_flat.len())
+    return TomlScope(open_scope_depth, next_node_id, 0, 0)
 
 # closes a scope opened by open_scope() and reclaims the nodes parsed inside it.
 #
@@ -231,12 +248,12 @@ fn node_kind(handle: Int) -> String:
 fn table_lookup(handle: Int, key: String) -> Int:
     if node_kind(handle) != "table":
         return 0 - 1
-    off := table_key_offsets[handle]
     cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if table_keys_flat[off + i] == key:
-            return table_values_flat[off + i]
+        slot := table_slot_key(handle, i)
+        if table_keys_by_slot[slot] == key:
+            return table_values_by_slot[slot]
         i = i + 1
     return 0 - 1
 
@@ -478,13 +495,13 @@ fn ensure_table_path(root: Int, path: String) -> Int:
         if is_sep:
             key := path.substring(start, i)
             # look up existing child in current table
-            off := table_key_offsets[current]
             cnt := table_key_counts[current]
             mut found := 0 - 1
             mut j := 0
             while j < cnt:
-                if table_keys_flat[off + j] == key:
-                    found = table_values_flat[off + j]
+                slot := table_slot_key(current, j)
+                if table_keys_by_slot[slot] == key:
+                    found = table_values_by_slot[slot]
                 j = j + 1
             if found < 0:
                 found = allocate_node("table")
@@ -976,7 +993,7 @@ fn toml_array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
-    return array_items_flat[array_item_offsets[handle] + index]
+    return array_values_by_slot[array_slot_key(handle, index)]
 
 # ===============================================================
 # Public API — Table Introspection
@@ -990,11 +1007,10 @@ fn toml_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if node_kind(handle) != "table":
         return result
-    off := table_key_offsets[handle]
     cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        result.push(table_keys_flat[off + i])
+        result.push(table_keys_by_slot[table_slot_key(handle, i)])
         i = i + 1
     return result
 
@@ -1048,6 +1064,31 @@ pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!TomlDeco
 struct TomlNestedFixture:
     pub host: String
     pub port: Int
+
+test "toml keeps sibling tables and nested arrays addressable regardless of order":
+    # TOML interleaves a table header, its keys, then the next header — a flat
+    # per-node window straddled a sibling, so `[b]` was lost entirely.
+    nl := chr(10)
+    root := parse("[a]" + nl + "x = 1" + nl + "[b]" + nl + "y = 2" + nl)
+    a := get_table(root, "a")
+    b := get_table(root, "b")
+    assert(a >= 0)
+    assert(b >= 0)
+    assert(get_int(a, "x") == 1)
+    assert(get_int(b, "y") == 2)
+    assert(keys(root).len() == 2)
+    # the same interleaving hit sibling nested arrays: a = [[1,2],[3,4]]
+    doc := parse("a = [[1, 2], [3, 4]]")
+    arr := get_array(doc, "a")
+    assert(array_len(arr) == 2)
+    first := array_get(arr, 0)
+    second := array_get(arr, 1)
+    # before the fix, the second inner array read back as a bare int, not an
+    # array — type_of is the corruption signature.
+    assert(type_of(first) == "array")
+    assert(type_of(second) == "array")
+    assert(array_len(first) == 2)
+    assert(array_len(second) == 2)
 
 test "toml parses scalar values":
     doc := "title = " + chr(34) + "pith" + chr(34) + chr(10) + "version = 3" + chr(10) + "pi = 3.14" + chr(10) + "enabled = true"

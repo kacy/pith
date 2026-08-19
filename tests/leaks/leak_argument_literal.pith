@@ -1,0 +1,31 @@
+# churn the two argument-literal shapes that used to leak: a tuple literal
+# written straight into a call stranded one box per call (~64 bytes), and a
+# nested empty list literal built an untagged inner list whose string
+# elements were never owned (~30 bytes a round). the tuple literal is now
+# released once its call returns, and the nested literal takes the
+# parameter's element type through the coercion walk, so the inner list is
+# tagged and owns what is pushed into it.
+import leakprobe as probe
+
+fn sum_of(t: (Int, Int)) -> Int:
+    return t.0 + t.1
+
+fn poke(xs: List[List[String]]) -> Int:
+    inner := xs[0]
+    inner.push("deep " + inner.len().to_string())
+    return inner.len()
+
+fn round(i: Int) -> Int:
+    return sum_of((i, i + 1)) + poke([[]])
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

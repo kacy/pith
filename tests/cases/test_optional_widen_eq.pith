@@ -1,0 +1,36 @@
+# `==` / `!=` widen between T? and T: compare by (is_some, value), so none
+# never equals a plain value, a String? compares by content, and both orders
+# work. a generic function's optional parameter widens a plain argument the
+# same way every other argument position does — exercised through one shared
+# specialization with both none and a value, read back via == none,
+# unwrap_or, and match (the #148 evidence shapes).
+fn name_of(n: Int) -> String:
+    return "n" + n.to_string()
+
+fn pick[T](a: T, b: Int?) -> String:
+    if b == none:
+        return "none"
+    return "some {b.unwrap_or(0)}"
+
+fn via_match[T](a: T, b: Int?) -> Int:
+    match b:
+        none => 0 - 1
+        v => v
+
+fn main():
+    x: Int? := 5
+    y: Int? := none
+    s: String? := "n7"
+    print("{x == 5}")
+    print("{x == 6}")
+    print("{5 == x}")
+    print("{x != 5}")
+    print("{y == 5}")
+    print("{y != 5}")
+    print("{s == name_of(7)}")
+    print("{name_of(8) == s}")
+    print(pick("y", 5))
+    print(pick("x", none))
+    print(pick[String]("z", 7))
+    print("{via_match("q", 41)}")
+    print("{via_match("q", none)}")

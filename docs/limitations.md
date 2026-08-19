@@ -30,28 +30,32 @@ something here that now works, the page is stale and a fix to it is welcome.
   assignment, and the argument of a plain function, a method, a lambda and a
   function value. a collection literal in argument position takes the
   parameter's declared element type too, so `f([1, 2])` against a
-  `List[Int?]` parameter widens element by element. three argument positions
+  `List[Int?]` parameter widens element by element. two argument positions
   still need the value bound to a `T?` local first:
   - a builtin container store or query — `xs.push(3)` into a `List[Int?]`,
     `m.insert(k, 3)` into a `Map[K, Int?]`, `s.add(3)` into a `Set[Int?]`.
     the element type also feeds `contains`, `index_of` and `remove`, which
     compare rather than store, so widening there would answer against a
     freshly built optional and always miss.
-  - a parameter of a *generic function* — `fn pick[T](a: T, b: Int?)` still
-    needs `pick(x, v)` with `v: Int?` rather than `pick(x, 3)`. the lowering
-    bug that used to make this dangerous is fixed (a specialization now takes
-    a parameter's optional-ness from the declaration, so `pick(x, none)`
-    answers "none"), so widening here is no longer unsound in principle — it
-    is simply not wired up on the generic call path, and turning it on wants
-    its own verification pass. a method on a *generic struct* is unaffected
-    and does widen.
   - an enum variant payload — `Probe.Alpha(3)` against an `Int?` payload
     still needs the value bound to an `Int?` local first. destructuring is
     fine: a match binding on an optional payload has the payload's declared
     type, so `Probe.Alpha(b0) => b0.unwrap_or(0)` reads it like any other
     optional local.
-- **`==` does not widen** — `o == 5` where `o` is an `Int?` reports; compare
-  against `none` or unwrap first.
+
+  a parameter of a *generic function* now widens like any other argument —
+  `pick(x, 3)` against `fn pick[T](a: T, b: Int?)` builds `Some(3)`, in both
+  the inferred and the explicit `pick[String](x, 3)` forms. (this had been
+  deliberately held back until a specialization took a parameter's
+  optional-ness from the declaration rather than the call site; that lowering
+  bug is fixed, and `pick(x, none)` through the same specialization still
+  answers "none".)
+- **`==` and `!=` widen between `T?` and `T`** — `o == 5` where `o` is an
+  `Int?` compares by `(is_some, value)`: it is true only when `o` holds `5`,
+  and `none` never equals a plain value. both orders work, and a `String?`
+  compares by content. ordering operators (`<`, `>`, `<=`, `>=`) do not
+  widen — unwrap first, because there is no sensible order between `none`
+  and a value.
 - **a collection literal does not widen into an optional element that is
   itself a container** — `{"a": [1, 2]}` against a `Map[String, List[Int]?]`
   reports, because the literal walk recurses into a container target and an

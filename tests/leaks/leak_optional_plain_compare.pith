@@ -1,0 +1,32 @@
+# churn the widened mixed comparison, T? == T. the int shape reads two
+# fields and compares, so nothing is allocated; the string shape feeds a
+# FRESH string as the plain operand, which dies with the compare — the same
+# rule the value operator applies to its operands. before the release was
+# wired the fresh operand leaked one string per round.
+import leakprobe as probe
+
+fn name_of(n: Int) -> String:
+    return "n" + n.to_string()
+
+fn round(i: Int) -> Int:
+    s: String? := "n7"
+    x: Int? := i
+    mut hits := 0
+    if s == name_of(7):
+        hits = hits + 1
+    if name_of(8) == s:
+        hits = hits + 1
+    if x == i:
+        hits = hits + 1
+    if x != i + 1:
+        hits = hits + 1
+    return hits
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    print("{total}")

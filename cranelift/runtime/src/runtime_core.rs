@@ -354,17 +354,65 @@ const CLOSURE_TAG_WEAK: u8 = 8;
 // reading the first four bytes rather than by consulting a global set.
 const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
 
+// hard cap on capture slot indices, inline block included. codegen
+// bounds real closures far below this (a few hundred captures at the
+// pathological extreme), so a slot at or past the cap can only come
+// from a corrupted or hostile caller and is ignored exactly like a
+// negative slot — the defensive posture every slot had before the
+// spill existed. without the cap, `set_env` with an absurd slot
+// (say 1<<40) attempted a multi-terabyte vec resize and aborted.
+const PITH_CLOSURE_MAX_ENV_SLOTS: usize = PITH_CLOSURE_ENV_SLOTS + 4096;
+
+/// One captured value together with its release-kind tag. Storing the
+/// pair as a unit is what keeps the spill's values and tags from ever
+/// falling out of lockstep — there is no second vec to forget to grow.
+#[derive(Clone, Copy)]
+struct Capture {
+    value: i64,
+    tag: u8,
+}
+
 /// Captures beyond the inline slots. Closures capturing more than
 /// PITH_CLOSURE_ENV_SLOTS values are rare, so the common case pays
-/// nothing: the pointer stays null and every read of an inline slot
+/// nothing: the option stays None and every read of an inline slot
 /// never touches this. Allocated on the first spill store and grown to
 /// the highest slot written. Before this existed, the 17th capture was
 /// silently DROPPED — `set_env` bounds-checked and returned, `get_env`
 /// answered 0, and the program computed a wrong answer with no
-/// diagnostic anywhere.
+/// diagnostic anywhere. The VALUES here are released by the same paths
+/// that release the inline slots (pith_closure_release /
+/// cycle_closure_release_env); dropping this frees only the storage.
 struct ClosureOverflow {
-    env: Vec<i64>,
-    tags: Vec<u8>,
+    captures: Vec<Capture>,
+}
+
+/// Where a capture slot lives: the inline array or the heap spill,
+/// with the index already rebased into that storage. The 16-slot
+/// boundary test, the rebase past it, and the upper cap exist only in
+/// `classify` — every accessor matches on the result instead of
+/// re-deriving the arithmetic.
+enum EnvSlot {
+    Inline(usize),
+    Spill(usize),
+}
+
+impl EnvSlot {
+    /// `None` for a slot that is negative or absurdly large; callers
+    /// ignore those stores and answer 0 for those loads, exactly as
+    /// every out-of-range slot behaved before the spill existed.
+    fn classify(slot: i64) -> Option<EnvSlot> {
+        if slot < 0 {
+            return None;
+        }
+        let slot = slot as usize;
+        if slot < PITH_CLOSURE_ENV_SLOTS {
+            Some(EnvSlot::Inline(slot))
+        } else if slot < PITH_CLOSURE_MAX_ENV_SLOTS {
+            Some(EnvSlot::Spill(slot - PITH_CLOSURE_ENV_SLOTS))
+        } else {
+            None
+        }
+    }
 }
 
 #[repr(C)]
@@ -379,46 +427,72 @@ struct PithClosure {
     // outside the runtime reads past env_tags, so the early offsets the
     // codegen could bake stay where they were.
     cycle_flags: std::sync::atomic::AtomicU8,
-    // spill storage for capture slots >= PITH_CLOSURE_ENV_SLOTS; null for
-    // the overwhelmingly common closure that fits inline. written only
-    // during construction (the set_env calls straight after
-    // pith_closure_new, before the closure escapes), read-only after, so
-    // it needs no atomics — the same publication argument the inline env
-    // relies on. appended at the end, same contract as cycle_flags.
-    overflow: *mut ClosureOverflow,
+    // spill storage for capture slots >= PITH_CLOSURE_ENV_SLOTS; None for
+    // the overwhelmingly common closure that fits inline. the stakes here
+    // are HIGHER than the inline env's stale-read argument: a set_env past
+    // the inline block can grow the vec and move its buffer, so a racing
+    // get_env would read through a freed allocation, not merely observe an
+    // old value. it is still safe, for a structural reason rather than an
+    // atomicity one — codegen emits every set_env during construction,
+    // straight after pith_closure_new and before the handle escapes to any
+    // other task, so no concurrent reader can exist while the vec may
+    // still move; after construction the spill is read-only like the
+    // inline env. the growth path debug_asserts the refcount is still the
+    // single count from pith_closure_new to keep that contract honest.
+    // appended at the end: the layout is #[repr(C)] and nothing outside
+    // the runtime reads past env_tags (handles cross the ABI as i64), so
+    // an Option<Box> here is fine and the early offsets stay put.
+    overflow: Option<Box<ClosureOverflow>>,
 }
 
-impl Drop for PithClosure {
-    fn drop(&mut self) {
-        // frees only the spill storage itself. the VALUES in it are
-        // released by the same paths that release the inline slots
-        // (pith_closure_release / cycle_closure_release_env), before
-        // either Box::from_raw site lets this run.
-        if !self.overflow.is_null() {
-            unsafe { drop(Box::from_raw(self.overflow)) };
-            self.overflow = std::ptr::null_mut();
+impl PithClosure {
+    /// The spill capture for `idx` (already rebased past the inline
+    /// slots), growing the overflow storage to reach it. Construction-
+    /// time only — see the contract on the `overflow` field.
+    fn spill_capture(&mut self, idx: usize) -> &mut Capture {
+        // growing the vec can move its buffer, which is only safe while
+        // no other task can reach this closure; the single count from
+        // pith_closure_new is a cheap proxy for "has not escaped yet".
+        debug_assert_eq!(
+            self.ref_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "closure spill grew after construction"
+        );
+        let overflow = self
+            .overflow
+            .get_or_insert_with(|| Box::new(ClosureOverflow { captures: Vec::new() }));
+        if overflow.captures.len() <= idx {
+            overflow.captures.resize(idx + 1, Capture { value: 0, tag: 0 });
         }
+        &mut overflow.captures[idx]
     }
-}
 
-/// The spill slot for `idx` (already rebased past the inline slots),
-/// growing the overflow storage to reach it. Construction-time only.
-unsafe fn closure_overflow_slot(
-    closure: &mut PithClosure,
-    idx: usize,
-) -> (&mut i64, &mut u8) {
-    if closure.overflow.is_null() {
-        closure.overflow = Box::into_raw(Box::new(ClosureOverflow {
-            env: Vec::new(),
-            tags: Vec::new(),
-        }));
+    /// Every capture in walk order — inline slots 0..PITH_CLOSURE_ENV_SLOTS
+    /// first, then the spill in index order — as (value, tag) pairs. the
+    /// three capture walkers (the release walk, the cycle child scan, and
+    /// the cycle env release) all iterate through here, so none of them
+    /// can disagree about the order or forget the spill.
+    fn captures(&self) -> impl Iterator<Item = (i64, u8)> + '_ {
+        self.env
+            .iter()
+            .copied()
+            .zip(self.env_tags.iter().copied())
+            .chain(self.overflow.iter().flat_map(|overflow| {
+                overflow.captures.iter().map(|c| (c.value, c.tag))
+            }))
     }
-    let overflow = &mut *closure.overflow;
-    if overflow.env.len() <= idx {
-        overflow.env.resize(idx + 1, 0);
-        overflow.tags.resize(idx + 1, 0);
+
+    /// `captures`, but with the slots writable — the cycle env release
+    /// blanks each slot after dropping its count so the later shell free
+    /// can never release it a second time. Same walk order.
+    fn captures_mut(&mut self) -> impl Iterator<Item = (&mut i64, &mut u8)> {
+        self.env
+            .iter_mut()
+            .zip(self.env_tags.iter_mut())
+            .chain(self.overflow.iter_mut().flat_map(|overflow| {
+                overflow.captures.iter_mut().map(|c| (&mut c.value, &mut c.tag))
+            }))
     }
-    (&mut overflow.env[idx], &mut overflow.tags[idx])
 }
 
 /// Validate a closure handle by its magic word. Returns the typed
@@ -469,7 +543,7 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
         env: [0; PITH_CLOSURE_ENV_SLOTS],
         env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
         cycle_flags: std::sync::atomic::AtomicU8::new(0),
-        overflow: std::ptr::null_mut(),
+        overflow: None,
     }));
     ptr as i64
 }
@@ -522,13 +596,8 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         return;
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
-        release_captured_value(closure.env[slot], closure.env_tags[slot]);
-    }
-    if let Some(overflow) = closure.overflow.as_ref() {
-        for slot in 0..overflow.env.len() {
-            release_captured_value(overflow.env[slot], overflow.tags[slot]);
-        }
+    for (value, tag) in closure.captures() {
+        release_captured_value(value, tag);
     }
     let buffered = closure
         .cycle_flags
@@ -611,20 +680,9 @@ pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, 
     let Some(closure) = pith_closure_ref(handle) else {
         return;
     };
-    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
-        let value = closure.env[slot];
-        let tag = closure.env_tags[slot];
+    for (value, tag) in closure.captures() {
         if value != 0 && tag != 0 {
             f(value, tag);
-        }
-    }
-    if let Some(overflow) = closure.overflow.as_ref() {
-        for slot in 0..overflow.env.len() {
-            let value = overflow.env[slot];
-            let tag = overflow.tags[slot];
-            if value != 0 && tag != 0 {
-                f(value, tag);
-            }
         }
     }
 }
@@ -636,17 +694,10 @@ pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
     let Some(closure) = pith_closure_mut(handle) else {
         return;
     };
-    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
-        release_captured_value(closure.env[slot], closure.env_tags[slot]);
-        closure.env[slot] = 0;
-        closure.env_tags[slot] = 0;
-    }
-    if let Some(overflow) = closure.overflow.as_mut() {
-        for slot in 0..overflow.env.len() {
-            release_captured_value(overflow.env[slot], overflow.tags[slot]);
-            overflow.env[slot] = 0;
-            overflow.tags[slot] = 0;
-        }
+    for (value, tag) in closure.captures_mut() {
+        release_captured_value(*value, *tag);
+        *value = 0;
+        *tag = 0;
     }
 }
 
@@ -700,15 +751,13 @@ pub unsafe extern "C" fn pith_closure_get_fn(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64) {
-    if slot < 0 {
+    let Some(slot) = EnvSlot::classify(slot) else {
         return;
-    }
+    };
     if let Some(closure) = pith_closure_mut(handle) {
-        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
-            closure.env[slot as usize] = value;
-        } else {
-            let (env, _) = closure_overflow_slot(closure, slot as usize - PITH_CLOSURE_ENV_SLOTS);
-            *env = value;
+        match slot {
+            EnvSlot::Inline(idx) => closure.env[idx] = value,
+            EnvSlot::Spill(idx) => closure.spill_capture(idx).value = value,
         }
     }
 }
@@ -721,40 +770,41 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: i64, tag: i64) {
-    if slot < 0 {
+    let Some(slot) = EnvSlot::classify(slot) else {
         return;
-    }
+    };
     if let Some(closure) = pith_closure_mut(handle) {
-        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
-            closure.env[slot as usize] = value;
-            closure.env_tags[slot as usize] = tag as u8;
-        } else {
-            let (env, tags) =
-                closure_overflow_slot(closure, slot as usize - PITH_CLOSURE_ENV_SLOTS);
-            *env = value;
-            *tags = tag as u8;
+        match slot {
+            EnvSlot::Inline(idx) => {
+                closure.env[idx] = value;
+                closure.env_tags[idx] = tag as u8;
+            }
+            EnvSlot::Spill(idx) => {
+                let capture = closure.spill_capture(idx);
+                capture.value = value;
+                capture.tag = tag as u8;
+            }
         }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
-    if slot < 0 {
+    let Some(slot) = EnvSlot::classify(slot) else {
         return 0;
-    }
-    if let Some(closure) = pith_closure_ref(handle) {
-        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
-            return closure.env[slot as usize];
-        }
-        if let Some(overflow) = closure.overflow.as_ref() {
-            let idx = slot as usize - PITH_CLOSURE_ENV_SLOTS;
-            if idx < overflow.env.len() {
-                return overflow.env[idx];
-            }
-        }
-        0
-    } else {
-        0
+    };
+    let Some(closure) = pith_closure_ref(handle) else {
+        return 0;
+    };
+    match slot {
+        EnvSlot::Inline(idx) => closure.env[idx],
+        // an unwritten (or never-spilled) slot answers 0, like an
+        // unwritten inline slot
+        EnvSlot::Spill(idx) => closure
+            .overflow
+            .as_ref()
+            .and_then(|overflow| overflow.captures.get(idx))
+            .map_or(0, |capture| capture.value),
     }
 }
 
@@ -951,15 +1001,50 @@ mod tests {
         let handle = pith_closure_new(77);
         let first_spill = PITH_CLOSURE_ENV_SLOTS as i64;
         unsafe {
+            // the boundary pair: the last inline slot and the first spill
+            // slot are adjacent indices in different storage, so a rebase
+            // off by one would alias them or lose one of the writes.
+            pith_closure_set_env(handle, first_spill - 1, 41);
             pith_closure_set_env(handle, first_spill, 99);
             pith_closure_set_env(handle, first_spill + 5, 123);
+            assert_eq!(pith_closure_get_env(handle, first_spill - 1), 41);
             assert_eq!(pith_closure_get_env(handle, first_spill), 99);
             assert_eq!(pith_closure_get_env(handle, first_spill + 5), 123);
             // the gap between written spill slots reads as 0, as does a
             // slot past everything written
             assert_eq!(pith_closure_get_env(handle, first_spill + 1), 0);
             assert_eq!(pith_closure_get_env(handle, first_spill + 100), 0);
+            // a slot at or past the hard cap is ignored like a negative
+            // one — before the cap, this store attempted a terabyte-scale
+            // resize and aborted the process
+            pith_closure_set_env(handle, PITH_CLOSURE_MAX_ENV_SLOTS as i64, 7);
+            pith_closure_set_env(handle, 1 << 40, 7);
+            assert_eq!(pith_closure_get_env(handle, PITH_CLOSURE_MAX_ENV_SLOTS as i64), 0);
+            assert_eq!(pith_closure_get_env(handle, 1 << 40), 0);
             pith_closure_release(handle);
+        }
+    }
+
+    // a spilled slot's tag must drive the same release the inline tags
+    // do: the closure below captures a struct past the inline block, and
+    // the last closure release has to drop the count the caller moved
+    // into that spill slot.
+    #[test]
+    fn spilled_rc_capture_is_released_with_the_closure() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_retain(s); // the count the closure will own
+            assert_eq!(struct_counts(s).0, 2);
+            let handle = pith_closure_new(77);
+            pith_closure_set_env_rc(
+                handle,
+                PITH_CLOSURE_ENV_SLOTS as i64 + 3,
+                s,
+                CLOSURE_TAG_STRUCT as i64,
+            );
+            pith_closure_release(handle);
+            assert_eq!(struct_counts(s).0, 1, "spilled capture was not released");
+            pith_struct_release(s);
         }
     }
 }

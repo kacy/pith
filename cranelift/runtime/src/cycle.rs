@@ -1419,10 +1419,54 @@ mod tests {
             .expect("mutator thread");
         }
         let after = lock_mutators().len();
+        // the sequential answer is before + 1: the first thread pushes at
+        // most one fresh slot, marks it exited at join, and every later
+        // thread's CAS adopts it. the extra unit of slack is for a thread
+        // OUTSIDE this test — the registry is process-global and cargo
+        // runs other tests' threads concurrently, so one of them gating
+        // mid-loop legitimately pushes its own slot.
         assert!(
             after <= before + 2,
             "registry grew from {before} to {after} over 64 sequential threads"
         );
+    }
+
+    #[test]
+    fn concurrent_mutators_hold_distinct_slots() {
+        let _guard = locked();
+        // the property the resurrection CAS actually guarantees, which the
+        // sequential test above cannot see: an exited slot is handed to at
+        // most ONE adopter, so two simultaneously live mutators never share
+        // a state word (a shared word would let one thread's park report a
+        // different thread as stopped). eight threads register, rendezvous
+        // on a barrier while every one of them still holds its slot, and
+        // report the slot's address; all eight must be pairwise distinct.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let slot = mutator_slot().expect("thread-local storage is live");
+                    // no thread passes the barrier until all eight hold a
+                    // slot, so no slot can be marked exited and recycled
+                    // while another registration is still to come
+                    barrier.wait();
+                    tx.send(Arc::as_ptr(&slot) as usize)
+                        .expect("receiver outlives the senders");
+                })
+            })
+            .collect();
+        drop(tx);
+        let mut ptrs: Vec<usize> = rx.iter().collect();
+        for thread in threads {
+            thread.join().expect("mutator thread");
+        }
+        assert_eq!(ptrs.len(), 8);
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        assert_eq!(ptrs.len(), 8, "two live mutators shared a slot");
     }
 
     #[test]

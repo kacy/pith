@@ -1,0 +1,53 @@
+# a closure may capture more variables than the runtime's 16 inline
+# environment slots. slots past the inline block spill to a heap
+# extension; before that existed the runtime silently DROPPED the 17th
+# capture — the store was ignored, the read answered 0, and this program
+# printed 136 instead of 153 with no diagnostic anywhere.
+#
+# the string captures land in the spill region on purpose: a spilled
+# slot must carry its release tag too, or the strings would leak (or
+# worse, a recycled handle would be released twice). memcheck covers
+# the release path in CI.
+
+fn main():
+    a1 := 1
+    a2 := 2
+    a3 := 3
+    a4 := 4
+    a5 := 5
+    a6 := 6
+    a7 := 7
+    a8 := 8
+    a9 := 9
+    a10 := 10
+    a11 := 11
+    a12 := 12
+    a13 := 13
+    a14 := 14
+    a15 := 15
+    a16 := 16
+    a17 := 17
+    total := fn() => a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17
+    print("{total()}")
+
+    # heap captures past the inline slots: s17 and s18 spill
+    s1 := "a"
+    s2 := "b"
+    s3 := "c"
+    s4 := "d"
+    s5 := "e"
+    s6 := "f"
+    s7 := "g"
+    s8 := "h"
+    s9 := "i"
+    s10 := "j"
+    s11 := "k"
+    s12 := "l"
+    s13 := "m"
+    s14 := "n"
+    s15 := "o"
+    s16 := "p"
+    s17 := "q"
+    s18 := "r"
+    joined := fn() => s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18
+    print(joined())

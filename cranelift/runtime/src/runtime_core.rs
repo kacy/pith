@@ -354,6 +354,19 @@ const CLOSURE_TAG_WEAK: u8 = 8;
 // reading the first four bytes rather than by consulting a global set.
 const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
 
+/// Captures beyond the inline slots. Closures capturing more than
+/// PITH_CLOSURE_ENV_SLOTS values are rare, so the common case pays
+/// nothing: the pointer stays null and every read of an inline slot
+/// never touches this. Allocated on the first spill store and grown to
+/// the highest slot written. Before this existed, the 17th capture was
+/// silently DROPPED — `set_env` bounds-checked and returned, `get_env`
+/// answered 0, and the program computed a wrong answer with no
+/// diagnostic anywhere.
+struct ClosureOverflow {
+    env: Vec<i64>,
+    tags: Vec<u8>,
+}
+
 #[repr(C)]
 struct PithClosure {
     magic: u32,
@@ -366,6 +379,46 @@ struct PithClosure {
     // outside the runtime reads past env_tags, so the early offsets the
     // codegen could bake stay where they were.
     cycle_flags: std::sync::atomic::AtomicU8,
+    // spill storage for capture slots >= PITH_CLOSURE_ENV_SLOTS; null for
+    // the overwhelmingly common closure that fits inline. written only
+    // during construction (the set_env calls straight after
+    // pith_closure_new, before the closure escapes), read-only after, so
+    // it needs no atomics — the same publication argument the inline env
+    // relies on. appended at the end, same contract as cycle_flags.
+    overflow: *mut ClosureOverflow,
+}
+
+impl Drop for PithClosure {
+    fn drop(&mut self) {
+        // frees only the spill storage itself. the VALUES in it are
+        // released by the same paths that release the inline slots
+        // (pith_closure_release / cycle_closure_release_env), before
+        // either Box::from_raw site lets this run.
+        if !self.overflow.is_null() {
+            unsafe { drop(Box::from_raw(self.overflow)) };
+            self.overflow = std::ptr::null_mut();
+        }
+    }
+}
+
+/// The spill slot for `idx` (already rebased past the inline slots),
+/// growing the overflow storage to reach it. Construction-time only.
+unsafe fn closure_overflow_slot(
+    closure: &mut PithClosure,
+    idx: usize,
+) -> (&mut i64, &mut u8) {
+    if closure.overflow.is_null() {
+        closure.overflow = Box::into_raw(Box::new(ClosureOverflow {
+            env: Vec::new(),
+            tags: Vec::new(),
+        }));
+    }
+    let overflow = &mut *closure.overflow;
+    if overflow.env.len() <= idx {
+        overflow.env.resize(idx + 1, 0);
+        overflow.tags.resize(idx + 1, 0);
+    }
+    (&mut overflow.env[idx], &mut overflow.tags[idx])
 }
 
 /// Validate a closure handle by its magic word. Returns the typed
@@ -416,6 +469,7 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
         env: [0; PITH_CLOSURE_ENV_SLOTS],
         env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
         cycle_flags: std::sync::atomic::AtomicU8::new(0),
+        overflow: std::ptr::null_mut(),
     }));
     ptr as i64
 }
@@ -470,6 +524,11 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     for slot in 0..PITH_CLOSURE_ENV_SLOTS {
         release_captured_value(closure.env[slot], closure.env_tags[slot]);
+    }
+    if let Some(overflow) = closure.overflow.as_ref() {
+        for slot in 0..overflow.env.len() {
+            release_captured_value(overflow.env[slot], overflow.tags[slot]);
+        }
     }
     let buffered = closure
         .cycle_flags
@@ -559,6 +618,15 @@ pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, 
             f(value, tag);
         }
     }
+    if let Some(overflow) = closure.overflow.as_ref() {
+        for slot in 0..overflow.env.len() {
+            let value = overflow.env[slot];
+            let tag = overflow.tags[slot];
+            if value != 0 && tag != 0 {
+                f(value, tag);
+            }
+        }
+    }
 }
 
 /// The destruction body of a garbage closure: drop the counts it took on its
@@ -572,6 +640,13 @@ pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
         release_captured_value(closure.env[slot], closure.env_tags[slot]);
         closure.env[slot] = 0;
         closure.env_tags[slot] = 0;
+    }
+    if let Some(overflow) = closure.overflow.as_mut() {
+        for slot in 0..overflow.env.len() {
+            release_captured_value(overflow.env[slot], overflow.tags[slot]);
+            overflow.env[slot] = 0;
+            overflow.tags[slot] = 0;
+        }
     }
 }
 
@@ -625,11 +700,16 @@ pub unsafe extern "C" fn pith_closure_get_fn(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64) {
-    if slot < 0 || (slot as usize) >= PITH_CLOSURE_ENV_SLOTS {
+    if slot < 0 {
         return;
     }
     if let Some(closure) = pith_closure_mut(handle) {
-        closure.env[slot as usize] = value;
+        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
+            closure.env[slot as usize] = value;
+        } else {
+            let (env, _) = closure_overflow_slot(closure, slot as usize - PITH_CLOSURE_ENV_SLOTS);
+            *env = value;
+        }
     }
 }
 
@@ -641,22 +721,38 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: i64, tag: i64) {
-    if slot < 0 || (slot as usize) >= PITH_CLOSURE_ENV_SLOTS {
+    if slot < 0 {
         return;
     }
     if let Some(closure) = pith_closure_mut(handle) {
-        closure.env[slot as usize] = value;
-        closure.env_tags[slot as usize] = tag as u8;
+        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
+            closure.env[slot as usize] = value;
+            closure.env_tags[slot as usize] = tag as u8;
+        } else {
+            let (env, tags) =
+                closure_overflow_slot(closure, slot as usize - PITH_CLOSURE_ENV_SLOTS);
+            *env = value;
+            *tags = tag as u8;
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
-    if slot < 0 || (slot as usize) >= PITH_CLOSURE_ENV_SLOTS {
+    if slot < 0 {
         return 0;
     }
     if let Some(closure) = pith_closure_ref(handle) {
-        closure.env[slot as usize]
+        if (slot as usize) < PITH_CLOSURE_ENV_SLOTS {
+            return closure.env[slot as usize];
+        }
+        if let Some(overflow) = closure.overflow.as_ref() {
+            let idx = slot as usize - PITH_CLOSURE_ENV_SLOTS;
+            if idx < overflow.env.len() {
+                return overflow.env[idx];
+            }
+        }
+        0
     } else {
         0
     }
@@ -840,14 +936,30 @@ mod tests {
         unsafe {
             pith_closure_set_env(handle, 0, 42);
             pith_closure_set_env(handle, -1, 99);
-            pith_closure_set_env(handle, PITH_CLOSURE_ENV_SLOTS as i64, 99);
             assert_eq!(pith_closure_get_fn(handle), 77);
             assert_eq!(pith_closure_get_env(handle, 0), 42);
             assert_eq!(pith_closure_get_env(handle, -1), 0);
-            assert_eq!(
-                pith_closure_get_env(handle, PITH_CLOSURE_ENV_SLOTS as i64),
-                0
-            );
+        }
+    }
+
+    // slots past the inline block spill to the heap extension instead of
+    // being silently dropped — the old behavior ignored the store and
+    // answered 0, which made a 17-capture closure compute a wrong answer
+    // with no diagnostic. an unwritten spill slot still answers 0.
+    #[test]
+    fn closure_env_slots_past_the_inline_block_spill() {
+        let handle = pith_closure_new(77);
+        let first_spill = PITH_CLOSURE_ENV_SLOTS as i64;
+        unsafe {
+            pith_closure_set_env(handle, first_spill, 99);
+            pith_closure_set_env(handle, first_spill + 5, 123);
+            assert_eq!(pith_closure_get_env(handle, first_spill), 99);
+            assert_eq!(pith_closure_get_env(handle, first_spill + 5), 123);
+            // the gap between written spill slots reads as 0, as does a
+            // slot past everything written
+            assert_eq!(pith_closure_get_env(handle, first_spill + 1), 0);
+            assert_eq!(pith_closure_get_env(handle, first_spill + 100), 0);
+            pith_closure_release(handle);
         }
     }
 }

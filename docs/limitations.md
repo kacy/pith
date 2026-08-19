@@ -67,9 +67,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   destructures a variant and `if let v = maybe():` unwraps an optional, but
   neither form works as an expression, and literal patterns are not allowed
   in the let position.
-- **closure capture cap** — a closure captures at most 16 variables. captures
-  are heap-allocated per closure instance, so nesting and recursion are safe;
-  the cap is a fixed ceiling, not a correctness issue. (multi-line closure
+- **closure captures are unlimited** — the first 16 live inline in the
+  closure allocation and any beyond that spill to a heap extension, so a
+  closure capturing 17 or 40 variables computes the same answer as one
+  capturing 3. this used to be a silent cap: the runtime ignored stores
+  past slot 16 and answered 0 for reads, so the 17th capture read back as
+  zero with no diagnostic anywhere. captures are heap-allocated per
+  closure instance, so nesting and recursion are safe. (multi-line closure
   bodies — `fn(x):` with an indented block — work and infer their return
   type from their return statements.)
 - **function-value struct fields aren't callable through a field** —

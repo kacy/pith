@@ -106,18 +106,26 @@ jobs:
 
       - name: memcheck
         # generous triple of the step's normal time (apt ~1min + the
-        # curated suite ~8min): the two observed wedges were apt-mirror
-        # stalls that produced no output at all, so a hard cap converts
-        # hours of silence into a fast, visible failure.
+        # curated suite ~8min): the observed wedges were apt-mirror stalls
+        # that produced no output at all, so a hard cap converts hours of
+        # silence into a fast, visible failure.
         timeout-minutes: 30
         run: |
           # not `|| true`: `make memcheck` skips itself when valgrind is
           # missing, so a swallowed install failure would turn this step into a
           # guard that passes without running.
-          # the retry and timeout options are for the apt-mirror stalls above:
-          # a dead mirror times out and retries instead of hanging the step.
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq valgrind
+          #
+          # install valgrind with a hard wall-clock bound and a retry. the
+          # Acquire::*::Timeout options only bound an HTTP read, but the stalls
+          # seen in practice hung before that layer (dns, the dpkg lock, sudo
+          # itself) and sat until the step timeout with zero output. wrapping
+          # each apt call in `timeout` fails fast wherever it wedges, and a
+          # second attempt after a short sleep clears a transiently bad mirror.
+          install_valgrind() {
+            timeout 240 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq \
+              && timeout 240 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq valgrind
+          }
+          install_valgrind || { echo "apt install stalled or failed; retrying once after 15s"; sleep 15; install_valgrind; }
           make memcheck
 
       - name: verify bootstrap fixed point

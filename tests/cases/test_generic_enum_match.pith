@@ -37,3 +37,21 @@ fn main():
     # two instantiations of the same base coexist in one program
     print(describe(Opt.Some(7)))
     print(describe(b))
+    run_pairs()
+
+# a two-parameter base with a mixed generic+concrete payload list: per-slot
+# kind substitution has to leave the concrete Int slot alone while the A/B
+# slots take their instance kinds — and the match must read all of them
+# back through a function boundary.
+enum Pair[A, B]:
+    Both(A, B, Int)
+    Left(A)
+
+fn render(p: Pair[String, Int]) -> String:
+    match p:
+        Pair.Both(s, n, k) => "{s}={n}@{k}"
+        Pair.Left(s) => "left {s}"
+
+fn run_pairs():
+    print(render(Pair.Both("key", 7, 9)))
+    print(render(Pair.Left("solo")))

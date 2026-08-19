@@ -1158,6 +1158,13 @@ MEMCHECK_CASES := \
 	tests/cases/test_list_transform_ownership \
 	tests/cases/test_result_unwrap_or_fallback_leak \
 	tests/cases/test_result_arg_borrow_leak \
+	tests/cases/test_generic_enum_match \
+	tests/cases/test_closure_many_captures \
+	tests/cases/test_closure_capture_boundaries \
+	tests/cases/test_optional_match_ownership \
+	tests/cases/test_optional_payload_eq \
+	tests/cases/test_tail_match_defer \
+	tests/cases/test_argument_literal_ownership \
 	tests/cases/test_borrowed_operand_extraction \
 	tests/cases/test_unwrap_or_borrowed_fallback \
 	tests/cases/test_task_result_payloads \

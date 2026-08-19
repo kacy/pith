@@ -17,6 +17,11 @@ fn via_match[T](a: T, b: Int?) -> Int:
         none => 0 - 1
         v => v
 
+fn take[T](v: T?) -> String:
+    if v == none:
+        return "took none"
+    return "took some"
+
 fn main():
     x: Int? := 5
     y: Int? := none
@@ -34,3 +39,11 @@ fn main():
     print(pick[String]("z", 7))
     print("{via_match("q", 41)}")
     print("{via_match("q", none)}")
+    # the plain value on the LEFT of != — the one remaining corner of the
+    # 2x2 (side x operator) — and a plain argument widening into a fully
+    # generic T? parameter through an explicit specialization.
+    print("{5 != x}")
+    print("{6 != x}")
+    print("{name_of(8) != s}")
+    print(take[Int](5))
+    print(take[Int](none))

@@ -1,0 +1,52 @@
+# a user module's generic base sharing a name with std's must not collide
+# in the duplicate-method check: generic bases dedup by (module, name),
+# because bare generic names are not globally unique. std.iter declares
+# MapIter with next(); so does this file — both register in one compile,
+# which the first cut of E263 (keyed by bare name) rejected. std's own
+# MapIter is deliberately not driven here: a same-named generic instance
+# still misbinds across modules at runtime (the E209/#163 family), which
+# is a separate, pre-existing defect.
+import std.iter as iter
+
+pub struct MapIter[I, U]:
+    pub start: Int
+
+impl MapIter:
+    fn next() -> Int?:
+        return none
+
+# the legal conformance pair, in both orders: an inherent declaration and
+# an interface declaration of the same method stay legal, whichever comes
+# first — only a SAME-kind duplicate is E263.
+interface Pull:
+    fn pull() -> Int
+
+struct FirstInherent:
+    pub v: Int
+
+impl FirstInherent:
+    fn pull() -> Int:
+        return self.v
+
+impl Pull for FirstInherent:
+    fn pull() -> Int:
+        return self.v
+
+struct FirstIface:
+    pub v: Int
+
+impl Pull for FirstIface:
+    fn pull() -> Int:
+        return self.v + 1
+
+impl FirstIface:
+    fn pull() -> Int:
+        return self.v + 1
+
+fn main():
+    m := MapIter[Int, Int](start: 0)
+    print("{m.next() == none}")
+    r := iter.Range(3, 5)
+    print("{r.next() == none}")
+    print("{FirstInherent(v: 5).pull()}")
+    print("{FirstIface(v: 5).pull()}")

@@ -1,0 +1,43 @@
+# churn a closure with 20 captures — 4 of them heap strings landing in the
+# spill region past the 16 inline slots — created and dropped every round.
+# a spilled slot must carry its release tag: if the extension walk missed
+# one, each round would strand four strings, and this curve would climb.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    a1 := i
+    a2 := i + 1
+    a3 := i + 2
+    a4 := i + 3
+    a5 := i + 4
+    a6 := i + 5
+    a7 := i + 6
+    a8 := i + 7
+    a9 := i + 8
+    a10 := i + 9
+    a11 := i + 10
+    a12 := i + 11
+    a13 := i + 12
+    a14 := i + 13
+    a15 := i + 14
+    a16 := i + 15
+    s17 := "spill one {i}"
+    s18 := "spill two {i}"
+    s19 := "spill three {i}"
+    s20 := "spill four {i}"
+    f := fn():
+        base := a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16
+        return base + s17.len() + s18.len() + s19.len() + s20.len()
+    return f()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

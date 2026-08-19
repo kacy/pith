@@ -1578,6 +1578,35 @@ fn optional_types_match(a: Int, b: Int) -> Bool:
         return true
     return types_structurally_equal(a_info.inner, b_info.inner)
 
+# `x == 5` with x: Int? — the mixed comparison, where exactly one side is an
+# optional and the other is a plain value of its inner type. every other typed
+# position widens the plain side (argument, binding, field, return); == was
+# the position that never got the clause, so it reported E217. bare `none`
+# stays out deliberately: it has its own arms above, and #680's rule — none
+# satisfies only an optional — must not loosen through here.
+fn optional_plain_comparison(a: Int, b: Int) -> Bool:
+    if a < 0 or b < 0:
+        return false
+    if is_error_type(a) or is_error_type(b):
+        return false
+    if is_none_type(a) or is_none_type(b):
+        return false
+    a_info := get_type_info(a)
+    b_info := get_type_info(b)
+    if a_info.kind == "optional" and b_info.kind != "optional":
+        if a_info.inner < 0:
+            return false
+        if a_info.inner == b:
+            return true
+        return types_structurally_equal(a_info.inner, b)
+    if b_info.kind == "optional" and a_info.kind != "optional":
+        if b_info.inner < 0:
+            return false
+        if b_info.inner == a:
+            return true
+        return types_structurally_equal(b_info.inner, a)
+    return false
+
 fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
     if expected_tid < 0:
         return false
@@ -2611,12 +2640,12 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
 
     # comparison operators: eq, neq
     if op == "eq":
-        if left != right and optional_types_match(left, right) == false:
+        if left != right and optional_types_match(left, right) == false and optional_plain_comparison(left, right) == false:
             report_error("E217", "operator == type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
     if op == "neq":
-        if left != right and optional_types_match(left, right) == false:
+        if left != right and optional_types_match(left, right) == false and optional_plain_comparison(left, right) == false:
             report_error("E217", "operator != type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
@@ -3128,14 +3157,17 @@ fn check_generic_function_call_explicit(name: String, index_node: Node, arg_indi
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
 
+    # same widening rule as the inferred path: a plain value satisfies an
+    # optional parameter once the explicit type args make it concrete.
     mut vidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0 and vidx < arg_types.len():
             concrete := resolve_type_with_substitution_map(ptn, generic_params, subst_args)
             if is_error_type(concrete) == false and is_error_type(arg_types[vidx]) == false:
                 if arg_types[vidx] != concrete:
-                    if types_structurally_equal(arg_types[vidx], concrete) == false:
-                        report_error("E219", "argument type mismatch: expected " + get_type_name(concrete) + ", got " + get_type_name(arg_types[vidx]))
+                    if argument_widens_to_optional(argument_expression_index(arg_indices[vidx]), arg_types[vidx], concrete) == false:
+                        if types_structurally_equal(arg_types[vidx], concrete) == false:
+                            report_error("E219", "argument type mismatch: expected " + get_type_name(concrete) + ", got " + get_type_name(arg_types[vidx]))
         vidx = vidx + 1
     return ret_type
 
@@ -4125,7 +4157,10 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
         cn := get_node(child)
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
-    # validate arg types against concrete param types
+    # validate arg types against concrete param types. a plain value widens
+    # into an optional parameter here the same way it does on the non-generic
+    # paths — safe now that #148 made the specialization read the parameter's
+    # optional-ness off the declaration rather than the call site.
     mut vidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0:
@@ -4134,8 +4169,9 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
                 if is_error_type(concrete) == false:
                     if is_error_type(arg_types[vidx]) == false:
                         if arg_types[vidx] != concrete:
-                            if types_structurally_equal(arg_types[vidx], concrete) == false:
-                                report_error("E219", "argument type mismatch: expected " + get_type_name(concrete) + ", got " + get_type_name(arg_types[vidx]))
+                            if argument_widens_to_optional(argument_expression_index(arg_indices[vidx]), arg_types[vidx], concrete) == false:
+                                if types_structurally_equal(arg_types[vidx], concrete) == false:
+                                    report_error("E219", "argument type mismatch: expected " + get_type_name(concrete) + ", got " + get_type_name(arg_types[vidx]))
         vidx = vidx + 1
     return ret_type
 

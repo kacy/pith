@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
@@ -59,7 +59,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -3218,6 +3218,22 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
             if gen_right_tid >= 0 and left_node.kind == "none_lit":
                 ir_emit_optional_none_compare(r, op, right_r)
                 return r
+        # T? == T, the widened mixed comparison: compare is_some and the
+        # payload against the bare value. Deliberately the LAST arm — every
+        # both-sides-optional recovery above must get first refusal, and a
+        # side whose check-time tid is a suppressed generic marker is
+        # excluded by requiring a well-typed non-optional tid (TID_ERR and
+        # TID_NONE are primitives with tids >= 0, so name them). A fresh
+        # string on the plain side dies with the compare, the same rule the
+        # value operator applies to its operands.
+        if left_info.kind == "optional" and left_info.inner >= 0 and right_tid >= 0 and right_tid != TID_ERR and right_tid != TID_NONE and right_info.kind != "optional" and ir_generic_param_optional_tid(right_node) < 0:
+            ir_emit_optional_plain_compare(r, op, left_r, right_r, left_tid)
+            ir_release_owned_string_operand(node.children[1], right_r, ir_infer_type(node.children[1]))
+            return r
+        if right_info.kind == "optional" and right_info.inner >= 0 and left_tid >= 0 and left_tid != TID_ERR and left_tid != TID_NONE and left_info.kind != "optional" and ir_generic_param_optional_tid(left_node) < 0:
+            ir_emit_optional_plain_compare(r, op, right_r, left_r, right_tid)
+            ir_release_owned_string_operand(node.children[0], left_r, ir_infer_type(node.children[0]))
+            return r
     return 0 - 1
 
 # The scalar / string / bytes value operators: float arithmetic, string concat

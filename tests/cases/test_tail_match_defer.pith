@@ -1,0 +1,26 @@
+# a match in tail position returns through the FULL return contract —
+# defers run, tracked locals clean up, a borrowed return is retained. the
+# arm used to emit a bare `ret` that skipped all of it (#809); this pins
+# the defer half: cleanup must print BEFORE the caller uses the value, in
+# both the expression-arm and the none-arm shape, and a borrowed field
+# returned from an arm must survive the subject dying at scope exit.
+
+struct Node:
+    pub tag: String
+
+fn tag_of(box: Node?) -> String:
+    defer print("cleanup ran")
+    match box:
+        none => "empty"
+        v => v.tag
+
+fn borrowed_tail(n: Node) -> String:
+    defer print("borrow cleanup")
+    match n.tag.len():
+        0 => "zero"
+        _ => n.tag
+
+fn main():
+    print(tag_of(Node(tag: "seven")))
+    print(tag_of(none))
+    print(borrowed_tail(Node(tag: "kept")))

@@ -1,0 +1,62 @@
+# the capture boundary cases around the 16 inline slots: exactly 16 (the
+# last inline slot, no spill), 17 (the first spill — the shape that was
+# silently dropped before #805), and a sparse far write (slot 40 written
+# while the extension grew from a lower high-water mark). heap values sit
+# ON the boundary so slot 15 vs 16 confusion would misread or leak.
+
+fn main():
+    a1 := 1
+    a2 := 2
+    a3 := 3
+    a4 := 4
+    a5 := 5
+    a6 := 6
+    a7 := 7
+    a8 := 8
+    a9 := 9
+    a10 := 10
+    a11 := 11
+    a12 := 12
+    a13 := 13
+    a14 := 14
+    a15 := 15
+    s16 := "edge16"
+    sixteen := fn():
+        total := a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15
+        return s16 + " {total}"
+    print(sixteen())
+
+    s17 := "spill17"
+    seventeen := fn():
+        total := a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15
+        return s16 + "+" + s17 + " {total}"
+    print(seventeen())
+
+    b1 := 100
+    b2 := 200
+    b3 := 300
+    b4 := 400
+    b5 := 500
+    b6 := 600
+    b7 := 700
+    b8 := 800
+    b9 := 900
+    b10 := 1000
+    b11 := 1100
+    b12 := 1200
+    b13 := 1300
+    b14 := 1400
+    b15 := 1500
+    b16 := 1600
+    b17 := 1700
+    b18 := 1800
+    b19 := 1900
+    b20 := 2000
+    b21 := 2100
+    b22 := 2200
+    b23 := 2300
+    s40 := "deep40"
+    deep := fn():
+        total := a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 + b10 + b11 + b12 + b13 + b14 + b15 + b16 + b17 + b18 + b19 + b20 + b21 + b22 + b23
+        return s16 + "/" + s17 + "/" + s40 + " {total}"
+    print(deep())

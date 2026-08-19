@@ -386,13 +386,15 @@ gaps, all bounded leaks rather than dangling pointers:
   and errs toward the leak. tuples themselves are fully reclaimed:
   a tuple frees its box at the last count and releases any heap value
   it holds, the same as a struct.
-- **a tuple literal written straight into a call leaks its box.** every
-  other owned argument kind is released once the call returns, but an
-  optional and a result both lower to a tuple shell, so the kind cannot
-  tell a real tuple literal from a wrapper whose count the extraction
-  paths still hand on — releasing one would be a double free rather
-  than a leak. `f((a, b))` therefore strands one box per call; `t := (a,
-  b)` then `f(t)` does not, because scope cleanup releases the local.
+- **a tuple literal written straight into a call is released once the
+  call returns**, the same as every other owned argument kind. the kind
+  alone could never justify this — an optional and a result both lower
+  to a tuple shell, so a tuple-TYPED register might be a wrapper whose
+  count the extraction paths still hand on — but a syntactic `(a, b)` in
+  the source is unambiguous: the box is one only this call ever saw, and
+  a storing callee takes its own count. any other tuple-typed register
+  in argument position keeps the old bounded leak rather than risking a
+  double free.
   a fresh OPTIONAL in that position is narrower and is now reclaimed:
   when the argument expression is itself a call — `take(mk(i))` — the
   register is a wrapper the caller alone owns, and the same callee-body
@@ -412,19 +414,19 @@ gaps, all bounded leaks rather than dangling pointers:
   an optional parameter is covered too: `f(v: List[String]?)` takes the
   type from the container inside the optional and wraps the tagged
   container in a `Some`, which is also what stops the callee reading a
-  bare list handle as an optional tuple. one shape still misses out — an
-  argument literal that *has* elements types itself and is left alone, so
-  a nested `f([[]])` tags the outer list and not the inner one; bind the
-  inner list first. it errs toward the leak: a store into an untagged list takes no count, so the
-  caller's stays outstanding. what narrows it is the store: an untagged
-  list that is handed a container, struct, `Bytes` or closure adopts that
-  kind at the first store and owns it from then on, the same second
-  chance a map has. a string element is the case left, because string
-  stores stay on the constructor path — so it is an untagged
-  `List[String]` that still leaks. an empty *map* literal is not on this
-  list at all: its values are counted from the store rather than the
-  constructor, so `f({})` owns what is put into it whatever the checker
-  managed to record.
+  bare list handle as an optional tuple. a nested literal is covered too:
+  an argument literal that HAS elements but checks as an error because an
+  empty literal is nested inside (`f([[]])`) runs the same element-checked
+  coercion an assignment uses, so the declared type is recorded through
+  every nested literal and the inner list is tagged. the safety net for
+  anything that still slips through is the store: an untagged list handed
+  a container, struct, `Bytes` or closure adopts that kind at the first
+  store and owns it from then on, the same second chance a map has —
+  string elements are the one kind the second chance does not cover,
+  because string stores stay on the constructor path. an empty *map*
+  literal is not on this list at all: its values are counted from the
+  store rather than the constructor, so `f({})` owns what is put into it
+  whatever the checker managed to record.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

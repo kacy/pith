@@ -2916,7 +2916,18 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # function the ident load wrapped into one.
         if arg_kind.len() == 0 and (get_node(expr_idx).kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
             arg_kind = "closure"
-        if ir_owned_arg_kind_releases(arg_kind) and not ir_string_expr_is_borrowed(expr_idx):
+        # "tuple" stays off the general release list — an optional and a
+        # result lower to the same shell, so the KIND cannot tell a real
+        # tuple from a wrapper whose count an extraction still hands on. a
+        # SYNTACTIC tuple literal is the one unambiguous case: the node is
+        # `(a, b)` in the source, the register is a box only this call ever
+        # saw, and a storing callee took its own count — so `f((a, b))` no
+        # longer strands one box per call. any other tuple-typed register
+        # keeps the old bounded leak rather than risking a double free.
+        if arg_kind == "tuple":
+            if get_node(expr_idx).kind == "tuple" and not ir_string_expr_is_borrowed(expr_idx):
+                ir_rc_release_reg(reg, "tuple")
+        elif ir_owned_arg_kind_releases(arg_kind) and not ir_string_expr_is_borrowed(expr_idx):
             ir_rc_release_reg(reg, arg_kind)
 
 # the rc kinds an owned call argument hands back once the call returns.

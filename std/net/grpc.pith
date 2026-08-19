@@ -128,11 +128,16 @@ pub struct GrpcError:
     pub status: Int
     pub message: String
 
+# the grpc-status code names, indexed by code, built once at module load —
+# finish_client_span reads this table several times per RPC on the metrics
+# path, so a per-call rebuild of the 17 strings was pure waste (the same
+# reason REQUEST_HEADERS is cached below).
+GRPC_STATUS_NAMES := ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+
 # the human name of a grpc-status code, for error messages and logging.
 pub fn status_name(status: Int) -> String:
-    names := ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
-    if status >= 0 and status < names.len():
-        return names[status]
+    if status >= 0 and status < GRPC_STATUS_NAMES.len():
+        return GRPC_STATUS_NAMES[status]
     return "CODE_{status}"
 
 # a grpc channel: a reusable connection to one server. dial() opens it, unary()

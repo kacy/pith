@@ -91,35 +91,12 @@ pub ERROR_HTTP_1_1_REQUIRED := 13
 
 # the short RFC 9113 §7 name for an error code, for readable failures. an
 # unknown code is rendered with its number so nothing is lost.
+# the RFC 9113 §7 error-code names, indexed by code (a dense 0..13 range).
+ERROR_NAMES := ["NO_ERROR", "PROTOCOL_ERROR", "INTERNAL_ERROR", "FLOW_CONTROL_ERROR", "SETTINGS_TIMEOUT", "STREAM_CLOSED", "FRAME_SIZE_ERROR", "REFUSED_STREAM", "CANCEL", "COMPRESSION_ERROR", "CONNECT_ERROR", "ENHANCE_YOUR_CALM", "INADEQUATE_SECURITY", "HTTP_1_1_REQUIRED"]
+
 pub fn error_name(code: Int) -> String:
-    if code == ERROR_NO_ERROR:
-        return "NO_ERROR"
-    if code == ERROR_PROTOCOL_ERROR:
-        return "PROTOCOL_ERROR"
-    if code == ERROR_INTERNAL_ERROR:
-        return "INTERNAL_ERROR"
-    if code == ERROR_FLOW_CONTROL_ERROR:
-        return "FLOW_CONTROL_ERROR"
-    if code == ERROR_SETTINGS_TIMEOUT:
-        return "SETTINGS_TIMEOUT"
-    if code == ERROR_STREAM_CLOSED:
-        return "STREAM_CLOSED"
-    if code == ERROR_FRAME_SIZE_ERROR:
-        return "FRAME_SIZE_ERROR"
-    if code == ERROR_REFUSED_STREAM:
-        return "REFUSED_STREAM"
-    if code == ERROR_CANCEL:
-        return "CANCEL"
-    if code == ERROR_COMPRESSION_ERROR:
-        return "COMPRESSION_ERROR"
-    if code == ERROR_CONNECT_ERROR:
-        return "CONNECT_ERROR"
-    if code == ERROR_ENHANCE_YOUR_CALM:
-        return "ENHANCE_YOUR_CALM"
-    if code == ERROR_INADEQUATE_SECURITY:
-        return "INADEQUATE_SECURITY"
-    if code == ERROR_HTTP_1_1_REQUIRED:
-        return "HTTP_1_1_REQUIRED"
+    if code >= 0 and code < ERROR_NAMES.len():
+        return ERROR_NAMES[code]
     return "error {code}"
 
 # the default SETTINGS_MAX_FRAME_SIZE — the smallest a peer may advertise.

@@ -1714,29 +1714,7 @@ fn parse_fn_decl() -> Int:
         mut ret_children: List[Int] := [ret]
         ret_node = add_node_with_position("returns", "", ret_children)
 
-    # `where T: Bound + Bound, U: Bound` — the clause spelling of generic
-    # bounds. `where` is a contextual keyword: a bare identifier can never
-    # appear between the parameter list (or return type) and the body
-    # colon, so no lexer keyword is needed and `where` stays usable as a
-    # name everywhere else. each clause's bounds are merged onto the
-    # matching generic_param node, so the checker sees exactly the AST the
-    # inline spelling (`[T: Bound]`) produces and needs no changes.
-    if check("identifier") and _cur_tok_value() == "where":
-        advance_token()
-        mut more := true
-        while more:
-            wn_tok := expect("identifier")
-            expect("colon")
-            extra := parse_bound_list()
-            mut found := false
-            for gp_idx, gp_i in generics:
-                gp := get_node(gp_idx)
-                if found == false and gp.kind == "generic_param" and gp.value == wn_tok.value:
-                    generics[gp_i] = merge_generic_param_bounds(gp_idx, extra)
-                    found = true
-            if found == false:
-                parser_report_error_here("E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + name_tok.value + "'", "declare it in the bracket list: fn " + name_tok.value + "[" + wn_tok.value + "](...)")
-            more = match_tok("comma")
+    parse_optional_where_clause(generics, name_tok.value)
 
     # the child layout the checker and emitter walk: generics, params,
     # returns (when present), then the body.
@@ -1754,6 +1732,35 @@ fn parse_fn_decl() -> Int:
     children.push(add_node_with_position("body", "", body_children))
 
     return add_node_with_position("fn_decl", name_tok.value, children)
+
+# `where T: Bound + Bound, U: Bound` — the clause spelling of generic
+# bounds, shared by function declarations and interface member signatures.
+# `where` is a contextual keyword: a bare identifier can never appear
+# between the parameter list (or return type) and the colon or newline
+# that follows the signature, so no lexer keyword is needed and `where`
+# stays usable as a name everywhere else. each clause's bounds are merged
+# onto the matching generic_param node in `generics` (in place — the list
+# is the caller's), so the checker sees exactly the AST the inline
+# spelling (`[T: Bound]`) produces and needs no changes. a clause naming
+# an undeclared parameter is E264, reported at the offending name.
+fn parse_optional_where_clause(generics: List[Int], owner_name: String):
+    if check("identifier") == false or _cur_tok_value() != "where":
+        return
+    advance_token()
+    mut more := true
+    while more:
+        wn_tok := expect("identifier")
+        expect("colon")
+        extra := parse_bound_list()
+        mut found := false
+        for gp_idx, gp_i in generics:
+            gp := get_node(gp_idx)
+            if found == false and gp.kind == "generic_param" and gp.value == wn_tok.value:
+                generics[gp_i] = merge_generic_param_bounds(gp_idx, extra)
+                found = true
+        if found == false:
+            parser_report_error_at(wn_tok.current_line, wn_tok.current_column, "E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + owner_name + "'", "declare it in the bracket list: fn " + owner_name + "[" + wn_tok.value + "](...)")
+        more = match_tok("comma")
 
 # `Bound + Bound + ...` after a colon — one bound list, shared by the
 # inline bracket spelling and the where clause so the two grammars can
@@ -1952,11 +1959,22 @@ fn parse_interface_decl() -> Int:
 fn parse_fn_sig() -> Int:
     expect("kw_fn")
     name_tok := expect("identifier")
-    generics := parse_optional_generic_params()
+    mut generics := parse_optional_generic_params()
 
     expect("lparen")
     params := parse_param_list()
     expect("rparen")
+
+    mut ret_node := 0 - 1
+    if match_tok("arrow"):
+        ret := parse_type_expr()
+        mut ret_children: List[Int] := [ret]
+        ret_node = add_node_with_position("returns", "", ret_children)
+
+    # an interface member takes the where spelling of bounds exactly like
+    # a free function or an impl method; the merged generic_param nodes
+    # flow into the same fn_sig / fn_decl shape either way.
+    parse_optional_where_clause(generics, name_tok.value)
 
     mut children: List[Int] := []
     # store generic_param nodes so checker can detect E233
@@ -1964,11 +1982,8 @@ fn parse_fn_sig() -> Int:
         children.push(g)
     for p in params:
         children.push(p)
-
-    if match_tok("arrow"):
-        ret := parse_type_expr()
-        mut ret_children: List[Int] := [ret]
-        children.push(add_node_with_position("returns", "", ret_children))
+    if ret_node >= 0:
+        children.push(ret_node)
 
     # an interface member may carry a body, which makes it a default:
     # implementors inherit it unless they provide their own. a default

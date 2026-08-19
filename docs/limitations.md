@@ -117,10 +117,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   that mean the same thing: inline (`[T: Display + Hash]`) and a `where`
   clause after the signature (`fn f[T, U](t: T, u: U) -> Int where T:
   Display + Hash, U: Ord:`) — a clause naming something that is not a
-  declared type parameter is E264. `where` is a contextual keyword, so it
-  stays usable as an ordinary name everywhere else. clauses attach to
-  functions and methods; struct, interface, and impl headers still take
-  inline bounds only.
+  declared type parameter is E264, reported at the offending name. `where`
+  is a contextual keyword, so it stays usable as an ordinary name
+  everywhere else. clauses attach to functions and impl methods, and an
+  interface member signature parses one too — though generic interface
+  members themselves are not supported yet (the member's type parameter is
+  unknown in its body, E202), with either bound spelling. struct,
+  interface, and impl headers still take inline bounds only, and a
+  method's clause may name only the method's own type parameters, not the
+  owner's.
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the

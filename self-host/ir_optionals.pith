@@ -1,10 +1,12 @@
 # ir_optionals.pith - low-level optional IR helpers
 
 from ir_builder import ir_emit, ir_reg
+from ir_call_emit import ir_emit_call2
 from ir_metadata import ir_runtime_call_name
 from ir_result_abi import ir_zero_reg
+from ir_struct_registry import ir_boxed_enums
 from ir_type_helpers import ir_type_from_tid
-from types import get_type_info
+from types import get_type_info, get_type_name
 
 # load the is_some flag out of an optional's two-slot shell (offset 0):
 # 0 for none, 1 for Some. reading it is a pure probe — it never touches
@@ -46,9 +48,8 @@ pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: In
         ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
 
 # Structural equality between two Optionals of the same type. `opt_tid` is
-# the shared optional type id; used to pick the right value comparison
-# (String is content-compared, everything else falls back to i64 equality
-# which is what the bare type's `==` would do).
+# the shared optional type id; the payload comparison dispatches on its
+# inner type in ir_emit_inner_value_eq below, matching the bare type's `==`.
 #
 # Result semantics (for eq; neq negates):
 #   None == None       -> true
@@ -64,7 +65,7 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
     flag_eq := ir_reg()
     ir_emit("eq " + flag_eq.to_string() + " " + lf.to_string() + " " + rf.to_string())
 
-    val_eq := ir_emit_inner_value_eq(ir_type_from_tid(info.inner), lv, rv)
+    val_eq := ir_emit_inner_value_eq(info.inner, lv, rv)
 
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")
@@ -78,25 +79,33 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
 
 # `x == 5` where x is an Optional and 5 is a plain value of its inner type.
 # none never equals a plain value, so eq is `is_some and value == v` and neq
-# is its negation. a string inner compares by content through __str_eq, the
-# same as the optional-optional compare above. reads only — the payload read
-# borrows, so neither operand's count moves.
+# is its negation. the payload comparison dispatches on the inner type in
+# ir_emit_inner_value_eq, the same as the optional-optional compare above.
+# reads only — the payload read borrows, so neither operand's count moves.
 pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, plain_r: Int, opt_tid: Int):
     info := get_type_info(opt_tid)
     flag := ir_optional_flag_field(opt_r)
     value := ir_optional_value_field(opt_r, opt_tid)
-    val_eq := ir_emit_inner_value_eq(ir_type_from_tid(info.inner), value, plain_r)
+    val_eq := ir_emit_inner_value_eq(info.inner, value, plain_r)
     ir_emit_guarded_eq(result_reg, op, flag, val_eq)
 
-# the payload-equality register for one inner kind, shared by both optional
-# compares above: a string inner compares by content through __str_eq;
-# everything else falls back to i64 equality, which is what the bare
-# type's `==` would do.
-fn ir_emit_inner_value_eq(inner_kind: String, a_r: Int, b_r: Int) -> Int:
+# the payload-equality register for one inner type, shared by both optional
+# compares above. the dispatch mirrors ir_emit_value_binary's for the bare
+# type's `==`: strings compare by content through __str_eq, bytes through
+# bytes_eq, and a boxed enum through its per-enum structural helper — a
+# boxed enum value is a pointer, so a raw eq would be identity, not
+# equality. everything else (ints, floats, bools) is i64 equality.
+fn ir_emit_inner_value_eq(inner_tid: Int, a_r: Int, b_r: Int) -> Int:
+    inner_kind := ir_type_from_tid(inner_tid)
+    inner_name := get_type_name(inner_tid)
     val_eq := ir_reg()
     if inner_kind == "string":
         str_eq_name := ir_runtime_call_name("__str_eq")
         ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + a_r.to_string() + " " + b_r.to_string())
+    elif inner_kind == "bytes":
+        ir_emit_call2(val_eq, "bytes_eq", "bool", a_r, b_r)
+    elif ir_boxed_enums.contains_key(inner_name):
+        ir_emit_call2(val_eq, "__enum_eq_" + inner_name, "bool", a_r, b_r)
     else:
         ir_emit("eq " + val_eq.to_string() + " " + a_r.to_string() + " " + b_r.to_string())
     return val_eq

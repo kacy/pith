@@ -112,3 +112,22 @@ fn main():
     match missing:
         Option.Some(n) => print("missing? {n}")
         Option.None => print("missing")
+
+    # bounds have two spellings that mean the same thing: inline
+    # ([T: Sized]) and a where clause after the signature. the clause
+    # reads better once a function has several parameters or several
+    # bounds per parameter.
+    print(wingspan(Wing(feathers: 9)))
+
+struct Wing:
+    pub feathers: Int
+
+interface Sized:
+    fn size() -> Int
+
+impl Sized for Wing:
+    fn size() -> Int:
+        return self.feathers
+
+fn wingspan[T](v: T) -> String where T: Sized:
+    return "spans {v.size()}"

@@ -47,7 +47,7 @@ from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_dec
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
-from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
+from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
@@ -4476,10 +4476,13 @@ fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: 
     return r
 
 # Shape.Circle(2.5): build the boxed value and store each payload argument.
-fn ir_emit_variant_construction(node: Node, enum_name: String, variant_key: String) -> Int:
+fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant_key: String) -> Int:
     mut kinds: List[String] := []
     if ir_enum_payload_kinds.contains_key(variant_key):
-        kinds = ir_enum_payload_kinds[variant_key].split(",")
+        # a generic enum's declaration records parameter names as its payload
+        # kinds; the construction expression's checked type names the
+        # instance whose concrete types decide whether a payload is retained.
+        kinds = ir_resolved_variant_kinds_for_tid(ir_emission_tid(idx), variant_key, ir_enum_payload_kinds[variant_key].split(","))
     r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len())
     mut i := 0
     while i < kinds.len():
@@ -5293,7 +5296,7 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
         if ctor_recv.kind == "ident" and ir_boxed_enums.contains_key(ctor_recv.value):
             ctor_key := ctor_recv.value + "." + mname
             if ir_struct_field_index_lookup.contains_key(ctor_key):
-                return ir_emit_variant_construction(node, ctor_recv.value, ctor_key)
+                return ir_emit_variant_construction(idx, node, ctor_recv.value, ctor_key)
         # a module-qualified variant, `mod.Enum.Variant(...)`: the receiver is a
         # field access `mod.Enum` where mod is an import alias and Enum is a
         # boxed enum (registered by its base name across modules). resolve it the
@@ -5303,7 +5306,7 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
             if qual_mod.kind == "ident" and ir_module_aliases.contains_key(qual_mod.value) and ir_boxed_enums.contains_key(ctor_recv.value):
                 qual_key := ctor_recv.value + "." + mname
                 if ir_struct_field_index_lookup.contains_key(qual_key):
-                    return ir_emit_variant_construction(node, ctor_recv.value, qual_key)
+                    return ir_emit_variant_construction(idx, node, ctor_recv.value, qual_key)
     return 0 - 1
 
 # Methods whose lowering is chosen by the receiver's static type rather than by

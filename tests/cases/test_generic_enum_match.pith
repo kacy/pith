@@ -1,0 +1,39 @@
+# a generic enum used the way any enum is: construct a variant, match on
+# it, read the payload back. this never worked before the checker learned
+# to infer the instance from a constructor's arguments and to resolve a
+# bare pattern name (Opt.Some) against the subject's instance (Opt[Int]).
+# the inferred-subject match used to run NO arm at runtime, silently.
+
+enum Opt[T]:
+    Some(T)
+    Nothing
+
+fn describe(x: Opt[Int]) -> String:
+    match x:
+        Opt.Some(n) => "some {n}"
+        Opt.Nothing => "nothing"
+
+fn main():
+    # instance inferred from the payload argument
+    a := Opt.Some(5)
+    match a:
+        Opt.Some(n) => print("inferred some {n}")
+        Opt.Nothing => print("inferred nothing")
+
+    # annotated payload-free variant: the annotation supplies the instance
+    b: Opt[Int] := Opt.Nothing
+    match b:
+        Opt.Some(n) => print("annotated some {n}")
+        Opt.Nothing => print("annotated nothing")
+
+    # a heap payload must survive the round trip — the payload slot is
+    # retained at extraction because the instance, not the declaration,
+    # says the slot holds a string
+    s := Opt.Some("hello")
+    match s:
+        Opt.Some(v) => print("string {v}")
+        Opt.Nothing => print("string nothing")
+
+    # two instantiations of the same base coexist in one program
+    print(describe(Opt.Some(7)))
+    print(describe(b))

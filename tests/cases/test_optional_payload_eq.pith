@@ -1,0 +1,33 @@
+# T? == T and T? == T? must compare PAYLOADS the way the bare type's `==`
+# does. bytes and boxed enums are the kinds where that differs from raw
+# i64 equality: a Bytes handle and an enum box are pointers, so the old
+# lowering answered by identity — two equal-content values read as
+# different. the checker admitted these compares from the start; this
+# pins the lowering.
+
+import std.bytes as bytes
+
+enum Shade:
+    Plain
+    Tinted(Int)
+
+fn main():
+    a := bytes.from_string_utf8("abc")
+    b := bytes.from_string_utf8("abc")
+    c := bytes.from_string_utf8("xyz")
+    ob: Bytes? := a
+    print("{ob == b}")
+    print("{b == ob}")
+    print("{ob != b}")
+    print("{ob == c}")
+    ob2: Bytes? := b
+    print("{ob == ob2}")
+
+    s: Shade? := Shade.Tinted(3)
+    print("{s == Shade.Tinted(3)}")
+    print("{Shade.Tinted(3) == s}")
+    print("{s == Shade.Tinted(4)}")
+    print("{s == Shade.Plain}")
+    print("{s != Shade.Plain}")
+    n: Shade? := none
+    print("{n == Shade.Plain}")

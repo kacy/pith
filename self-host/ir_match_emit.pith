@@ -14,7 +14,7 @@ from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
 from ir_alias_registry import ir_emission_tid
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field
-from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind
+from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind, ir_struct_names, ir_struct_base_name
 from ir_ownership import ir_rc_retain_reg, ir_rc_release_reg
 from ir_type_helpers import ir_checked_type, ir_type_from_tid
 
@@ -210,6 +210,83 @@ pub fn ir_variant_enum_name(variant_key: String) -> String:
         i = i + 1
     return variant_key
 
+## the variant a pattern key names ("Opt.Some" -> "Some"), or the key
+## itself when it carries no dot.
+fn ir_variant_pattern_variant_name(variant_key: String) -> String:
+    mut i := 0
+    while i < variant_key.len():
+        if variant_key[i] == ".":
+            return variant_key.substring(i + 1, variant_key.len())
+        i = i + 1
+    return variant_key
+
+## whether an emission kind is a leftover type-parameter name — not a
+## builtin kind and not a registered struct or enum. a generic enum's
+## declaration records its payload kinds this way ("T"), and such a kind
+## says nothing about the slot's real type or its ownership.
+fn ir_payload_kind_is_unresolved(kind: String) -> Bool:
+    if kind.len() == 0 or kind == "unknown":
+        return false
+    if kind == "int" or kind == "float" or kind == "bool" or kind == "string" or kind == "bytes":
+        return false
+    if kind == "tuple" or kind == "closure" or kind == "channel" or kind == "task":
+        return false
+    if kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int":
+        return false
+    if kind.contains("?") or kind.contains("."):
+        return false
+    if ir_struct_names.contains_key(ir_struct_base_name(kind)):
+        return false
+    return true
+
+## the concrete payload kinds an enum instance's checked type gives this
+## variant, or an empty list. a generic enum erases to one IR struct, so
+## the declaration's payload kinds are bare parameter names — the instance
+## (Opt[Int]) is what knows that slot 0 is an int.
+fn ir_variant_kinds_from_tid(tid: Int, variant_name: String) -> List[String]:
+    mut out: List[String] := []
+    if tid < 0:
+        return out
+    info := get_type_info(tid)
+    if info.kind != "enum":
+        return out
+    mut vi := 0
+    for v in info.variants:
+        if v == variant_name and out.len() == 0:
+            if vi < info.variant_types.len():
+                for ptid in info.variant_types[vi]:
+                    out.push(ir_struct_base_name(ir_type_from_tid(ptid)))
+        vi = vi + 1
+    return out
+
+## merge a variant's declared payload kinds with the concrete ones its
+## checked instance type carries: an unresolved parameter-name slot takes
+## the instance's kind, everything else keeps the declaration's — a
+## concrete declared kind (including an optional payload's "tuple") is
+## already right and must stay untouched. the match path passes the
+## subject's tid; the constructor path passes its own expression's.
+pub fn ir_resolved_variant_kinds_for_tid(tid: Int, variant_key: String, kinds: List[String]) -> List[String]:
+    mut needs_instance := false
+    for k in kinds:
+        if ir_payload_kind_is_unresolved(k):
+            needs_instance = true
+    if needs_instance == false:
+        return kinds
+    concrete := ir_variant_kinds_from_tid(tid, ir_variant_pattern_variant_name(variant_key))
+    if concrete.len() == 0:
+        return kinds
+    mut out: List[String] := []
+    for k, i in kinds:
+        if ir_payload_kind_is_unresolved(k) and i < concrete.len() and concrete[i].len() > 0:
+            out.push(concrete[i])
+        else:
+            out.push(k)
+    return out
+
+## the match path's wrapper: resolve against the current subject.
+fn ir_resolved_variant_kinds(pat_value: String, kinds: List[String]) -> List[String]:
+    return ir_resolved_variant_kinds_for_tid(ir_match_subject_tid, pat_value, kinds)
+
 # Literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
 # each one loads its slot and ANDs an equality into the arm condition.
 # Binding and wildcard sub-patterns always match here; bindings are stored
@@ -220,7 +297,7 @@ pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) ->
     mut acc_r := tag_cond_r
     mut kinds: List[String] := []
     if ir_enum_payload_kinds.contains_key(pat.value):
-        kinds = ir_enum_payload_kinds[pat.value].split(",")
+        kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
     for sub_idx, i in pat.children:
         sub := get_node(sub_idx)
         if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
@@ -308,7 +385,7 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
         # names, so the exit cleanup releases them (or transfers on escape).
         mut kinds: List[String] := []
         if ir_enum_payload_kinds.contains_key(pat.value):
-            kinds = ir_enum_payload_kinds[pat.value].split(",")
+            kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
         for sub_idx, i in pat.children:
             sub := get_node(sub_idx)
             if sub.kind == "pat_binding":

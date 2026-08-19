@@ -1816,7 +1816,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         # has type annotation
         annotated := resolve_type_implementation(node.children[0])
         val_node := get_node(node.children[1])
-        val_type := c_check_expr(node.children[1], scope_id)
+        mut val_type := c_check_expr(node.children[1], scope_id)
         if is_error_type(annotated) == false:
             # an empty collection literal types as an error on its own;
             # under an annotation it takes the annotated type, and the
@@ -1825,6 +1825,16 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
             if is_error_type(val_type):
                 if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
                     propagate_expected_collection_type(node.children[1], annotated)
+                # `y: Opt[Int] := Opt.Nothing` — the constructor had no
+                # payload argument to infer its instance from, so it typed
+                # as the error wildcard. the annotation IS the instance:
+                # record it on the constructor expression so the match
+                # checker and the emitter both see a typed value.
+                elif generic_enum_construction_base(val_node) != "":
+                    ainfo := get_type_info(annotated)
+                    if ainfo.kind == "enum" and extract_base_type_name(ainfo.name) == generic_enum_construction_base(val_node):
+                        expression_type_cache.insert(node.children[1], annotated)
+                        val_type = annotated
             if value_matches_optional_target(node.children[1], val_type, annotated):
                 define_binding_at(scope_id, name, annotated, is_mut, node_idx)
                 return
@@ -1851,6 +1861,14 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
             if val_node.children.len() == 0:
                 if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
                     open_empty_literal_bindings.insert(lookup_binding_index(scope_id, name), node.children[0])
+            # `x := Opt.Nothing` — a generic enum constructor whose instance
+            # could not be inferred from arguments. left alone, the binding
+            # stays silently error-typed and a later match on it runs no arm
+            # at runtime. that silence is worse than the error, so demand
+            # the annotation here, where the fix is one edit away.
+            gbase := generic_enum_construction_base(val_node)
+            if gbase != "":
+                report_error_at(node.children[0], "E262", "cannot infer the type arguments of generic enum '" + gbase + "' from this constructor; annotate the binding")
 
 # `weak name := expr` holds its struct target without keeping it alive.
 # the binding's type is the optional of the target's type — every read
@@ -4161,6 +4179,137 @@ fn refine_empty_literal_binding(name: String, method: String, args: List[Int], s
     expression_type_cache.insert(recv_idx, refined)
     return refined
 
+# whether an enum declaration carries a variant of this name. used to tell
+# a variant constructor on a generic enum's bare name apart from a method
+# call that happens to share the receiver's name.
+fn enum_decl_has_variant(decl: Node, name: String) -> Bool:
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "variant" and strings_equal(cn.value, name):
+            return true
+    return false
+
+# the type argument a payload argument pins down, or -1. a payload declared
+# as the bare parameter binds the argument's type; one declared as the
+# parameter's optional binds the argument's inner type when the argument is
+# already an optional. deeper shapes — the parameter buried inside another
+# generic, like Chain[T] — bind nothing here, because by the time such a
+# payload is passed the bare parameter has always appeared in an earlier
+# slot (a recursive variant carries the element before the tail).
+fn generic_enum_param_binding(payload_idx: Int, param: String, arg_tid: Int) -> Int:
+    if payload_idx < 0 or arg_tid < 0:
+        return 0 - 1
+    if is_error_type(arg_tid) or is_none_type(arg_tid):
+        return 0 - 1
+    tn := get_node(payload_idx)
+    if tn.kind == "type" and strings_equal(tn.value, param):
+        return arg_tid
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        inner_n := get_node(tn.children[0])
+        if inner_n.kind == "type" and strings_equal(inner_n.value, param):
+            ainfo := get_type_info(arg_tid)
+            if ainfo.kind == "optional":
+                return ainfo.inner
+            return arg_tid
+    return 0 - 1
+
+# the generic enum a constructor expression names, or "" when the node is
+# not `Base.Variant(...)` on a generic enum's bare name. the binding checker
+# uses this twice: to hand an annotation's instance to a constructor that
+# had nothing to infer from, and to refuse an unannotated binding that
+# would otherwise stay silently untyped.
+fn generic_enum_construction_base(val_node: Node) -> String:
+    # a payload-carrying constructor parses as a method call; a payload-free
+    # variant written without parentheses (`Opt.Nothing`) parses as a field
+    # access. both name the same thing.
+    if val_node.kind != "method_call" and val_node.kind != "field_access":
+        return ""
+    if val_node.children.len() < 1:
+        return ""
+    recv := get_node(val_node.children[0])
+    if recv.kind != "ident":
+        return ""
+    if has_generic_declaration(recv.value) == false:
+        return ""
+    decl := get_node(get_generic_declaration_index(recv.value))
+    if decl.kind != "enum_decl":
+        return ""
+    mut mname := val_node.value
+    if mname.starts_with("."):
+        mname = mname.substring(1, mname.len())
+    if enum_decl_has_variant(decl, mname):
+        return recv.value
+    return ""
+
+# `Opt.Some(5)` — a variant constructor on a generic enum's bare name.
+# infer the instance from the payload arguments, instantiate it, and check
+# the arguments against the instantiated payload types. a constructor with
+# nothing to infer from (`Opt.Nothing`) returns the error type WITHOUT
+# reporting: a typed target supplies the instance in that case — the
+# annotated-binding path records it — and a generic function returning its
+# own enum (`return RecvResult.Closed`) has carried this shape since before
+# inference existed. only an unannotated binding turns the silence into an
+# error, in check_binding_statement.
+fn check_generic_enum_variant_construction(enum_name: String, decl_idx: Int, variant_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    decl := get_node(decl_idx)
+    generic_params := collect_generic_parameter_names(decl)
+    mut payload_nodes: List[Int] := []
+    mut found := false
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "variant" and strings_equal(cn.value, variant_name):
+            found = true
+            for vc in cn.children:
+                payload_nodes.push(vc)
+    if found == false:
+        report_error("E212", enum_name + " has no variant '" + variant_name + "'")
+        return TID_ERR
+    if arg_indices.len() != payload_nodes.len():
+        report_error("E207", variant_name + " expects " + payload_nodes.len().to_string() + " arguments, got " + arg_indices.len().to_string())
+        return TID_ERR
+    mut arg_types: List[Int] := []
+    mut arg_exprs: List[Int] := []
+    for ai in arg_indices:
+        a_node := get_node(ai)
+        mut a_expr := ai
+        if a_node.kind == "arg":
+            if a_node.children.len() > 0:
+                a_expr = a_node.children[0]
+        arg_exprs.push(a_expr)
+        arg_types.push(c_check_expr(a_expr, scope_id))
+    mut type_args: List[Int] := []
+    for param in generic_params:
+        mut bound := 0 - 1
+        for pn, i in payload_nodes:
+            if bound < 0:
+                bound = generic_enum_param_binding(pn, param, arg_types[i])
+        if bound < 0:
+            return TID_ERR
+        type_args.push(bound)
+    tid := instantiate_generic_type(decl_idx, type_args)
+    if tid < 0:
+        return TID_ERR
+    info := get_type_info(tid)
+    mut vi := 0
+    for v in info.variants:
+        if strings_equal(v, variant_name):
+            if vi < info.variant_types.len():
+                payload_types := info.variant_types[vi]
+                mut pi := 0
+                for at in arg_types:
+                    if pi < payload_types.len():
+                        if is_error_type(at) == false and at != payload_types[pi]:
+                            # a plain value satisfies an optional payload by
+                            # widening, the same rule a binding applies — a
+                            # recursive variant's tail (Chain[T]?) is handed
+                            # a plain Chain[Int] all over the tree.
+                            if value_matches_optional_target(arg_exprs[pi], at, payload_types[pi]) == false:
+                                if types_structurally_equal(at, payload_types[pi]) == false:
+                                    report_error("E219", "argument type mismatch: expected " + get_type_name(payload_types[pi]) + ", got " + get_type_name(at))
+                    pi = pi + 1
+        vi = vi + 1
+    return tid
+
 fn check_method_call(node: Node, scope_id: Int) -> Int:
     # node.value = method name
     # children[0] = receiver
@@ -4236,6 +4385,17 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 return TID_ERR
             record_definition(checker_current_node_index(), lookup_binding_decl_node(scope_id, module_name))
             return check_callable_type_with_args(callee_type, arg_indices, scope_id)
+
+    # a generic enum's bare name has no type id — only instances like
+    # Opt[Int] are registered — so `Opt.Some(5)` cannot reach the
+    # receiver-typed variant-constructor path below (the receiver checks as
+    # the error wildcard and the whole call used to type as error, silently).
+    # infer the instance from the payload arguments instead.
+    if recv_node.kind == "ident" and has_generic_declaration(recv_node.value):
+        gdecl_idx := get_generic_declaration_index(recv_node.value)
+        gdecl := get_node(gdecl_idx)
+        if gdecl.kind == "enum_decl" and enum_decl_has_variant(gdecl, method_name):
+            return check_generic_enum_variant_construction(recv_node.value, gdecl_idx, method_name, arg_indices, scope_id)
 
     mut receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type) and recv_node.kind == "ident":
@@ -5485,7 +5645,18 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         return
     type_name := parts.0
     variant_name := parts.1
-    enum_tid := lookup_type_id(type_name)
+    mut enum_tid := lookup_type_id(type_name)
+    # a generic enum registers only its instances (Opt[Int]), never the bare
+    # base, so a pattern's `Opt.Some` finds nothing by name and used to die
+    # here with "unknown type". the subject already names the instance, and
+    # its base name says whether the pattern is talking about that same enum
+    # — so resolve the pattern against the subject. a pattern naming a
+    # DIFFERENT enum keeps its table lookup and still fails the mismatch
+    # check below.
+    if expected_type >= 0:
+        einfo := get_type_info(expected_type)
+        if einfo.kind == "enum" and extract_base_type_name(einfo.name) == type_name:
+            enum_tid = expected_type
     if enum_tid < 0:
         report_error("E202", "unknown type: " + type_name)
         return

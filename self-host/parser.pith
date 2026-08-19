@@ -1717,10 +1717,55 @@ fn parse_fn_decl() -> Int:
     for p in params:
         children.push(p)
 
+    mut ret_node := 0 - 1
     if match_tok("arrow"):
         ret := parse_type_expr()
         mut ret_children: List[Int] := [ret]
-        children.push(add_node_with_position("returns", "", ret_children))
+        ret_node = add_node_with_position("returns", "", ret_children)
+
+    # `where T: Bound + Bound, U: Bound` — the clause spelling of generic
+    # bounds. `where` is a contextual keyword: a bare identifier can never
+    # appear between the parameter list (or return type) and the body
+    # colon, so no lexer keyword is needed and `where` stays usable as a
+    # name everywhere else. each clause's bounds are merged onto the
+    # matching generic_param node, so the checker sees exactly the AST the
+    # inline spelling (`[T: Bound]`) produces and needs no changes.
+    if check("identifier") and _cur_tok_value() == "where":
+        advance_token()
+        mut more := true
+        while more:
+            wn_tok := expect("identifier")
+            expect("colon")
+            mut extra: List[Int] := [parse_type_expr()]
+            while match_tok("plus"):
+                extra.push(parse_type_expr())
+            mut found := false
+            for g_idx, gi in generics:
+                gp := get_node(g_idx)
+                if gp.kind == "generic_param" and gp.value == wn_tok.value:
+                    mut merged: List[Int] := []
+                    for b in gp.children:
+                        merged.push(b)
+                    for e in extra:
+                        merged.push(e)
+                    generics[gi] = add_node_with_position("generic_param", gp.value, merged)
+                    found = true
+            if found == false:
+                parser_report_error_here("E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + name_tok.value + "'", "declare it in the bracket list: fn " + name_tok.value + "[" + wn_tok.value + "](...)")
+            more = match_tok("comma")
+
+    # generic_param nodes were pushed before any where clause was parsed,
+    # so rebuild the child list from the (possibly replaced) entries
+    mut rebuilt: List[Int] := []
+    for g in generics:
+        rebuilt.push(g)
+    mut ci := generics.len()
+    while ci < children.len():
+        rebuilt.push(children[ci])
+        ci = ci + 1
+    children = rebuilt
+    if ret_node >= 0:
+        children.push(ret_node)
 
     expect("colon")
     body := parse_block()

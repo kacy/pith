@@ -678,3 +678,15 @@ legal too.
 ```
 error[E263]: duplicate method 'read' on 'FileStream': another impl block already declares it
 ```
+
+### E264 — where clause names an undeclared type parameter
+
+a `where` clause put a bound on a name that is not one of the function's
+declared type parameters. the clause form and the inline form
+(`[T: Display]`) are two spellings of the same bounds, so a clause can
+only constrain names the bracket list declares. declare the parameter,
+or fix the spelling.
+
+```
+error[E264]: where clause names 'U', which is not a type parameter of 'f'
+```

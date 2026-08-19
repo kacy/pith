@@ -1216,15 +1216,28 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     cipher := cs.cipher
     while true:
         record := native_read_record(stream)!
-        if record.content_type == TLS_CONTENT_ALERT:
-            return bytes.empty()
-        if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+        # after the handshake every legitimate record is application_data (it
+        # wraps the real content type, alerts and post-handshake messages
+        # included). a middlebox-compatibility change_cipher_spec is the one
+        # tolerated plaintext record and is ignored. anything else in the
+        # clear — an alert above all — is an injection: treating a plaintext
+        # alert as end-of-data is a truncation attack, since an attacker who
+        # can splice `15 03 03 00 02 xx xx` onto the stream would end the
+        # caller's read early and a partial response would read as complete.
+        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
             continue
+        if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+            fail "unencrypted tls record after handshake"
         seq := cs.read_seq
         inner := open_record_for_cipher(cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
         cs.read_seq = seq + 1
         if inner.content_type == TLS_CONTENT_ALERT:
-            return bytes.empty()
+            # close_notify is the clean end of the stream; every other alert
+            # is a failure the caller must see rather than read as a quiet EOF.
+            alert := tls13.parse_alert(inner.payload)!
+            if alert.description == tls13.ALERT_CLOSE_NOTIFY:
+                return bytes.empty()
+            fail "tls alert " + tls13.alert_description_name(alert.description)
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             messages := tls13.decode_handshakes(inner.payload)!
             for message in messages:

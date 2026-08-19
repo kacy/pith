@@ -1454,6 +1454,24 @@ fn ir_self_list_field_element(field_name: String) -> String:
                     return get_node(tnode.children[0]).value
     return ""
 
+# the prepass policy for one owned-local candidate: track the name under its
+# rc kind, or poison it. a name bound with DIFFERENT rc kinds in sibling
+# branches cannot be tracked — the exit cleanup would fire the wrong
+# retain/release at runtime — and a name bound with a non-rc (or unknown)
+# type somewhere falls under the same rule. a poisoned name is dropped from
+# tracking entirely: a bounded leak, never a wild pointer. `names` is the
+# live tracking list (ir_string_locals — ir_rc_track_local appends to it),
+# so contains() here means "already tracked by an earlier binding".
+fn ir_prepass_track_or_poison(name: String, kind: String, names: List[String], poisoned: List[String]):
+    if kind.len() > 0:
+        if names.contains(name):
+            if ir_rc_local_kind(name) != kind and not poisoned.contains(name):
+                poisoned.push(name)
+        else:
+            ir_rc_track_local(name, kind)
+    elif not poisoned.contains(name):
+        poisoned.push(name)
+
 fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[String]):
     node := get_node(idx)
     if ir_is_binding_kind(node.kind):
@@ -1474,27 +1492,19 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
                 # retained; otherwise the element frees when the list is mutated and
                 # the returned value dangles. no-op outside a specialized body.
                 kind = ir_rc_kind(ir_substitute_type_name(ir_string_prepass_bind_type(parts, names)))
-            if kind.len() > 0:
-                if names.contains(parts.name):
-                    if ir_rc_local_kind(parts.name) != kind and not poisoned.contains(parts.name):
-                        # same name, different rc kind in a sibling branch:
-                        # tracking it would fire the wrong retain/release at
-                        # runtime. drop it — a leak, never a wild pointer.
-                        poisoned.push(parts.name)
-                else:
-                    ir_rc_track_local(parts.name, kind)
-                # remember the producing result/optional type so the cleanup path
-                # can cascade-release the payload (only for cascade-eligible locals)
-                if kind == "tuple" and parts.val_idx >= 0:
-                    ir_tuple_record_tid(parts.name, parts.val_idx)
-            elif not poisoned.contains(parts.name):
-                # bound with a non-rc (or unknown) type somewhere: same rule.
-                poisoned.push(parts.name)
+            ir_prepass_track_or_poison(parts.name, kind, names, poisoned)
+            # remember the producing result/optional type so the cleanup path
+            # can cascade-release the payload (only for cascade-eligible locals)
+            if kind == "tuple" and parts.val_idx >= 0:
+                ir_tuple_record_tid(parts.name, parts.val_idx)
     # a match on an OPTIONAL subject binds the unwrapped payload, and
     # ir_match_emit retains an rc payload so the binding owns its own count
     # (the subject's shell or cascade can die at scope exit while the
     # binding lives on). track each such binding for the exit cleanup,
     # under the same name-conflict poisoning as every other owned local.
+    # unlike the pat_variant hook below, this one keys on the match itself
+    # (it needs the subject's tid) and so sees only each arm's top-level
+    # pattern — a binding nested under pat_or is not tracked here.
     if node.kind == "match_expr" and node.children.len() > 1:
         subj_tid := ir_emission_tid(node.children[0])
         if subj_tid >= 0 and get_type_info(subj_tid).kind == "optional":
@@ -1505,14 +1515,7 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
                 if arm.children.len() > 0:
                     pn := get_node(arm.children[0])
                     if pn.kind == "pat_binding":
-                        if payload_kind.len() > 0:
-                            if names.contains(pn.value):
-                                if ir_rc_local_kind(pn.value) != payload_kind and not poisoned.contains(pn.value):
-                                    poisoned.push(pn.value)
-                            else:
-                                ir_rc_track_local(pn.value, payload_kind)
-                        elif not poisoned.contains(pn.value):
-                            poisoned.push(pn.value)
+                        ir_prepass_track_or_poison(pn.value, payload_kind, names, poisoned)
                 ai = ai + 1
     # a match arm's payload bindings are owned locals too: ir_match_emit
     # retains each rc payload, so track them here for the exit cleanup to
@@ -1527,20 +1530,11 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
                 mut payload_kind := ""
                 if pi < variant_kinds.len():
                     payload_kind = ir_rc_kind(variant_kinds[pi])
-                if payload_kind.len() > 0:
-                    if names.contains(sub.value):
-                        if ir_rc_local_kind(sub.value) != payload_kind and not poisoned.contains(sub.value):
-                            poisoned.push(sub.value)
-                    else:
-                        ir_rc_track_local(sub.value, payload_kind)
-                elif not poisoned.contains(sub.value):
-                    # a sibling arm binds this name with an rc payload while
-                    # this arm binds it as a plain value (Zed(Pack, _) versus
-                    # Beta(Int, _) sharing x0). releasing the rc kind at exit
-                    # would dereference whatever integer the last-run arm
-                    # stored — same rule as the := path above: drop the name,
-                    # a bounded leak, never a wild pointer.
-                    poisoned.push(sub.value)
+                # a plain-value slot (empty kind) poisons the name: a sibling
+                # arm may bind it with an rc payload (Zed(Pack, _) versus
+                # Beta(Int, _) sharing x0), and releasing the rc kind at exit
+                # would dereference whatever integer the last-run arm stored.
+                ir_prepass_track_or_poison(sub.value, payload_kind, names, poisoned)
     for child in node.children:
         ir_collect_string_bind_names(child, names, poisoned)
 
@@ -2910,24 +2904,25 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # variable/field/element the caller keeps) is not released; a fresh
         # literal (a list, a map, a struct init, a lambda) or a transferred
         # result is.
+        arg_node := get_node(expr_idx)
         mut arg_kind := ir_rc_kind(expr_type)
         # a fn type has no rc kind of its own, but the value in the register
         # is a closure handle either way: a lambda literal, or a named
         # function the ident load wrapped into one.
-        if arg_kind.len() == 0 and (get_node(expr_idx).kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
+        if arg_kind.len() == 0 and (arg_node.kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
             arg_kind = "closure"
         # "tuple" stays off the general release list — an optional and a
-        # result lower to the same shell, so the KIND cannot tell a real
-        # tuple from a wrapper whose count an extraction still hands on. a
-        # SYNTACTIC tuple literal is the one unambiguous case: the node is
-        # `(a, b)` in the source, the register is a box only this call ever
-        # saw, and a storing callee took its own count — so `f((a, b))` no
-        # longer strands one box per call. any other tuple-typed register
-        # keeps the old bounded leak rather than risking a double free.
-        if arg_kind == "tuple":
-            if get_node(expr_idx).kind == "tuple" and not ir_string_expr_is_borrowed(expr_idx):
-                ir_rc_release_reg(reg, "tuple")
-        elif ir_owned_arg_kind_releases(arg_kind) and not ir_string_expr_is_borrowed(expr_idx):
+        # result lower to the same shell, so the rc KIND cannot tell a real
+        # tuple from a wrapper whose count an extraction still hands on. the
+        # one unambiguous case is a SYNTACTIC tuple literal, judged by the
+        # AST node kind (not the rc kind, which is also spelled "tuple"):
+        # the node is `(a, b)` in the source, the register is a box only
+        # this call ever saw, and a storing callee took its own count — so
+        # `f((a, b))` no longer strands one box per call. any other
+        # tuple-typed register keeps the old bounded leak rather than
+        # risking a double free.
+        is_tuple_literal := arg_kind == "tuple" and arg_node.kind == "tuple"
+        if (ir_owned_arg_kind_releases(arg_kind) or is_tuple_literal) and not ir_string_expr_is_borrowed(expr_idx):
             ir_rc_release_reg(reg, arg_kind)
 
 # the rc kinds an owned call argument hands back once the call returns.
@@ -2945,8 +2940,9 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
 # holds a real tuple literal or a wrapper whose ownership the result and
 # optional extraction paths settle instead — ir_emit_struct_positional_init
 # excludes tuple from its field retain for the same reason. releasing one here
-# would drop a count those paths still hand on. a tuple literal written into an
-# argument therefore still leaks its box.
+# would drop a count those paths still hand on. the syntactic tuple-literal
+# case is handled by the caller, ir_release_owned_string_operand, which can
+# see the AST node where this kind list cannot.
 #
 # "string" and "bytes" never reach here: the branches above claim them first,
 # because a fresh string has shapes (an s[i] char, a concat) that no rc kind
@@ -3270,21 +3266,26 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
                 return r
         # T? == T, the widened mixed comparison: compare is_some and the
         # payload against the bare value. Deliberately the LAST arm — every
-        # both-sides-optional recovery above must get first refusal, and a
-        # side whose check-time tid is a suppressed generic marker is
-        # excluded by requiring a well-typed non-optional tid (TID_ERR and
-        # TID_NONE are primitives with tids >= 0, so name them). A fresh
+        # both-sides-optional recovery above must get first refusal. A fresh
         # string on the plain side dies with the compare, the same rule the
         # value operator applies to its operands.
-        if left_info.kind == "optional" and left_info.inner >= 0 and right_tid >= 0 and right_tid != TID_ERR and right_tid != TID_NONE and right_info.kind != "optional" and ir_generic_param_optional_tid(right_node) < 0:
+        if left_info.kind == "optional" and left_info.inner >= 0 and ir_plain_compare_operand_ok(right_tid, right_info, right_node):
             ir_emit_optional_plain_compare(r, op, left_r, right_r, left_tid)
             ir_release_owned_string_operand(node.children[1], right_r, ir_infer_type(node.children[1]))
             return r
-        if right_info.kind == "optional" and right_info.inner >= 0 and left_tid >= 0 and left_tid != TID_ERR and left_tid != TID_NONE and left_info.kind != "optional" and ir_generic_param_optional_tid(left_node) < 0:
+        if right_info.kind == "optional" and right_info.inner >= 0 and ir_plain_compare_operand_ok(left_tid, left_info, left_node):
             ir_emit_optional_plain_compare(r, op, right_r, left_r, right_tid)
             ir_release_owned_string_operand(node.children[0], left_r, ir_infer_type(node.children[0]))
             return r
     return 0 - 1
+
+# whether one side of a widened T? == T comparison qualifies as the plain
+# operand: a well-typed non-optional value. TID_ERR and TID_NONE are
+# primitives with tids >= 0, so they are named rather than caught by the
+# sign check, and a side whose check-time tid is a suppressed generic
+# marker is excluded via ir_generic_param_optional_tid.
+fn ir_plain_compare_operand_ok(tid: Int, info: TypeInfo, opnode: Node) -> Bool:
+    return tid >= 0 and tid != TID_ERR and tid != TID_NONE and info.kind != "optional" and ir_generic_param_optional_tid(opnode) < 0
 
 # The scalar / string / bytes value operators: float arithmetic, string concat
 # and ordered comparison (which call the runtime rather than compare pointers),
@@ -6955,98 +6956,97 @@ fn ir_emit_return_stmt(node: Node):
 # through the same machinery — the bare `ret` it used to emit skipped the
 # cleanup, so every count an arm binding had retained leaked per call.
 pub fn ir_emit_return_value(expr_child: Int):
-    if true:
-        # `return none` builds its optional below, from the function's own
-        # return kind. going through ir_expr for it would build one optional
-        # tuple here and a second one there, and strand the first — every
-        # `return none` in the tree leaked an optional per call.
-        mut r := 0
-        if node_kind(expr_child) == "none_lit":
-            r = ir_emit_zero_value()
-        elif ir_current_func_return_kind == "result_reg":
-            # forwarding handshake: a direct pair-returning call (an rcall or
-            # a legacy-builtin wrap) hands its (flag, payload) registers
-            # straight to this return, so no box is built only to be unpacked
-            # again below.
-            saved_defer := ir_rcall_defer_idx
-            ir_rcall_defer_idx = expr_child
+    # `return none` builds its optional below, from the function's own
+    # return kind. going through ir_expr for it would build one optional
+    # tuple here and a second one there, and strand the first — every
+    # `return none` in the tree leaked an optional per call.
+    mut r := 0
+    if node_kind(expr_child) == "none_lit":
+        r = ir_emit_zero_value()
+    elif ir_current_func_return_kind == "result_reg":
+        # forwarding handshake: a direct pair-returning call (an rcall or
+        # a legacy-builtin wrap) hands its (flag, payload) registers
+        # straight to this return, so no box is built only to be unpacked
+        # again below.
+        saved_defer := ir_rcall_defer_idx
+        ir_rcall_defer_idx = expr_child
+        ir_rcall_pair_ready = false
+        r = ir_expr(expr_child)
+        ir_rcall_defer_idx = saved_defer
+        if ir_rcall_pair_ready:
             ir_rcall_pair_ready = false
-            r = ir_expr(expr_child)
-            ir_rcall_defer_idx = saved_defer
-            if ir_rcall_pair_ready:
-                ir_rcall_pair_ready = false
-                ir_defer_emit_to_function_frame(false)
-                ir_emit_string_cleanup("")
-                ir_emit("ret2 " + ir_rcall_flag_reg.to_string() + " " + ir_rcall_val_reg.to_string())
-                ir_last_was_ret = true
-                return
-        else:
-            r = ir_expr(expr_child)
-        # hand the returned string's count to the caller: a returned local
-        # transfers its count (skip it in cleanup), a returned borrow gets
-        # a fresh count. fresh results already arrive owned.
-        mut exclude := ""
-        expr_node := get_node(expr_child)
-        # a returned tracked local transfers its count to the caller, so it
-        # must be skipped in the exit cleanup. trust the tracked kind directly:
-        # in a generic body the inferred type can miss (a tuple-lowered
-        # optional reads back as the optional type, whose rc_kind is empty),
-        # yet the local is still tracked and returning it must not release it.
-        if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
-            exclude = expr_node.value
-        else:
-            # substitute struct params (T -> the concrete type) so a specialized
-            # impl method returning a borrowed T still retains it. without this
-            # the inferred type stays "T", rc_kind reads empty, no retain fires,
-            # and the caller's arg release frees the value the method handed back.
-            ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_child)))
-            if ret_kind.len() > 0 and ir_string_expr_is_borrowed(expr_child):
-                ir_rc_retain_reg(r, ret_kind)
-        result_kind := ir_expr_result_kind(expr_child)
-        expr_tid := c_get_expr_type(expr_child)
-        mut expr_kind := ""
-        if expr_tid >= 0:
-            expr_kind = get_type_info(expr_tid).kind
-        if ir_current_func_optional_inner_kind.len() > 0:
-            # is the returned expression already an optional (so forward it),
-            # or the inner value (so wrap in Some)? the checker knows in the
-            # normal case; in a generic body a call like `c.maybe()` isn't
-            # resolved to optional at declaration time, so also trust the
-            # emitter's own retkind — an optional lowers to a tuple, and a
-            # tuple retkind can only be the optional wrapper unless the inner
-            # value is itself tuple-shaped.
-            # a local tracked as a tuple already holds the optional wrapper, so
-            # forwarding it (rather than wrapping in Some again) is the same
-            # signal as a tuple retkind — the guard against an Optional[Tuple]
-            # inner still applies.
-            ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
-            already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
-            if expr_node.kind == "none_lit":
-                r = ir_emit_optional_none_value()
-            elif already_optional == false:
-                r = ir_emit_optional_some_value(r)
-        elif ir_current_func_return_kind == "tuple":
-            if result_kind != "tuple":
-                r = ir_emit_ok_result_tuple(r)
-        elif ir_current_func_return_kind == "result_reg":
-            if result_kind == "tuple":
-                # forwarding a whole result (`return other_fallible()`): the
-                # expression produced a box, so unpack it into the pair. the
-                # take-ok convention applies — the payload leaves with its
-                # count and the destructor-less shell is freed.
-                ir_emit_return_box_as_pair(r, exclude)
-                ir_last_was_ret = true
-                return
             ir_defer_emit_to_function_frame(false)
-            ir_emit_string_cleanup(exclude)
-            one_r := ir_reg()
-            ir_emit("iconst " + one_r.to_string() + " 1")
-            ir_emit("ret2 " + one_r.to_string() + " " + r.to_string())
+            ir_emit_string_cleanup("")
+            ir_emit("ret2 " + ir_rcall_flag_reg.to_string() + " " + ir_rcall_val_reg.to_string())
+            ir_last_was_ret = true
+            return
+    else:
+        r = ir_expr(expr_child)
+    # hand the returned string's count to the caller: a returned local
+    # transfers its count (skip it in cleanup), a returned borrow gets
+    # a fresh count. fresh results already arrive owned.
+    mut exclude := ""
+    expr_node := get_node(expr_child)
+    # a returned tracked local transfers its count to the caller, so it
+    # must be skipped in the exit cleanup. trust the tracked kind directly:
+    # in a generic body the inferred type can miss (a tuple-lowered
+    # optional reads back as the optional type, whose rc_kind is empty),
+    # yet the local is still tracked and returning it must not release it.
+    if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
+        exclude = expr_node.value
+    else:
+        # substitute struct params (T -> the concrete type) so a specialized
+        # impl method returning a borrowed T still retains it. without this
+        # the inferred type stays "T", rc_kind reads empty, no retain fires,
+        # and the caller's arg release frees the value the method handed back.
+        ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_child)))
+        if ret_kind.len() > 0 and ir_string_expr_is_borrowed(expr_child):
+            ir_rc_retain_reg(r, ret_kind)
+    result_kind := ir_expr_result_kind(expr_child)
+    expr_tid := c_get_expr_type(expr_child)
+    mut expr_kind := ""
+    if expr_tid >= 0:
+        expr_kind = get_type_info(expr_tid).kind
+    if ir_current_func_optional_inner_kind.len() > 0:
+        # is the returned expression already an optional (so forward it),
+        # or the inner value (so wrap in Some)? the checker knows in the
+        # normal case; in a generic body a call like `c.maybe()` isn't
+        # resolved to optional at declaration time, so also trust the
+        # emitter's own retkind — an optional lowers to a tuple, and a
+        # tuple retkind can only be the optional wrapper unless the inner
+        # value is itself tuple-shaped.
+        # a local tracked as a tuple already holds the optional wrapper, so
+        # forwarding it (rather than wrapping in Some again) is the same
+        # signal as a tuple retkind — the guard against an Optional[Tuple]
+        # inner still applies.
+        ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
+        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
+        if expr_node.kind == "none_lit":
+            r = ir_emit_optional_none_value()
+        elif already_optional == false:
+            r = ir_emit_optional_some_value(r)
+    elif ir_current_func_return_kind == "tuple":
+        if result_kind != "tuple":
+            r = ir_emit_ok_result_tuple(r)
+    elif ir_current_func_return_kind == "result_reg":
+        if result_kind == "tuple":
+            # forwarding a whole result (`return other_fallible()`): the
+            # expression produced a box, so unpack it into the pair. the
+            # take-ok convention applies — the payload leaves with its
+            # count and the destructor-less shell is freed.
+            ir_emit_return_box_as_pair(r, exclude)
             ir_last_was_ret = true
             return
         ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup(exclude)
-        ir_emit("ret " + r.to_string())
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        ir_emit("ret2 " + one_r.to_string() + " " + r.to_string())
+        ir_last_was_ret = true
+        return
+    ir_defer_emit_to_function_frame(false)
+    ir_emit_string_cleanup(exclude)
+    ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
 
 # propagate `err_r` out of the current function as its error return: the

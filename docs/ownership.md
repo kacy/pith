@@ -429,13 +429,18 @@ gaps, all bounded leaks rather than dangling pointers:
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a
   probe (`.is_ok`, `.is_err`, `== none`), a payload read (`.ok`, `.err`),
-  an argument of a same-module call whose body provably only reads the
-  parameter, or — for a result — an extraction (`r.unwrap_or(d)`,
-  `r catch d`, `r!`) releases its payload: a probe never touches it, a
-  read borrows, a qualifying callee takes no count of its own (and
-  retains anything a result extraction hands out), and an extraction
-  hands its consumer a freshly retained count, so in every case the
-  local is still the last owner of the count the shell arrived with.
+  a `match` on an optional local, an argument of a same-module call whose
+  body provably only reads the parameter, or — for a result — an
+  extraction (`r.unwrap_or(d)`, `r catch d`, `r!`) releases its payload:
+  a probe never touches it, a read borrows, a qualifying callee takes no
+  count of its own (and retains anything a result extraction hands out),
+  and an extraction hands its consumer a freshly retained count, so in
+  every case the local is still the last owner of the count the shell
+  arrived with. a match qualifies because its arm binding retains its own
+  count — tracked like any owned local, released by the exit cleanup or
+  transferred by a return — so the subject keeps the count it had. a
+  match on a RESULT local still disqualifies: its binding path takes no
+  count of its own.
   the call-argument entry is judged by walking the callee's declaration
   with the same use rules as the local itself, transitively through
   same-module forwarding — so a callee that stores, returns, sends, or

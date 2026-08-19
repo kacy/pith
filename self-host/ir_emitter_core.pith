@@ -1220,6 +1220,21 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # generic loop below would hand ir_tuple_use_is_whitelisted.
     if node.kind == "call" and node.children.len() > 0:
         return ir_tuple_call_uses_safe(node, name, is_result)
+    # a match on an OPTIONAL local reads the shell's flag, and its payload
+    # binding owns its own retained count (taken at bind, tracked by the
+    # prepass, released by the exit cleanup) — so the local stays the last
+    # owner of the count the shell arrived with, the same contract as a
+    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT
+    # match stays disqualifying: its binding path takes no count.
+    if not is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(node.children[0])
+        if subj.kind == "ident" and subj.value == name:
+            mut mi := 1
+            while mi < node.children.len():
+                if not ir_tuple_uses_all_safe(node.children[mi], name, is_result):
+                    return false
+                mi = mi + 1
+            return true
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
@@ -1475,6 +1490,30 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
             elif not poisoned.contains(parts.name):
                 # bound with a non-rc (or unknown) type somewhere: same rule.
                 poisoned.push(parts.name)
+    # a match on an OPTIONAL subject binds the unwrapped payload, and
+    # ir_match_emit retains an rc payload so the binding owns its own count
+    # (the subject's shell or cascade can die at scope exit while the
+    # binding lives on). track each such binding for the exit cleanup,
+    # under the same name-conflict poisoning as every other owned local.
+    if node.kind == "match_expr" and node.children.len() > 1:
+        subj_tid := ir_emission_tid(node.children[0])
+        if subj_tid >= 0 and get_type_info(subj_tid).kind == "optional":
+            payload_kind := ir_rc_kind(ir_type_from_tid(get_type_info(subj_tid).inner))
+            mut ai := 1
+            while ai < node.children.len():
+                arm := get_node(node.children[ai])
+                if arm.children.len() > 0:
+                    pn := get_node(arm.children[0])
+                    if pn.kind == "pat_binding":
+                        if payload_kind.len() > 0:
+                            if names.contains(pn.value):
+                                if ir_rc_local_kind(pn.value) != payload_kind and not poisoned.contains(pn.value):
+                                    poisoned.push(pn.value)
+                            else:
+                                ir_rc_track_local(pn.value, payload_kind)
+                        elif not poisoned.contains(pn.value):
+                            poisoned.push(pn.value)
+                ai = ai + 1
     # a match arm's payload bindings are owned locals too: ir_match_emit
     # retains each rc payload, so track them here for the exit cleanup to
     # release (or transfer on escape), same as any other owned local.
@@ -6810,7 +6849,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "match_expr":
         if idx == ir_tail_match_node:
-            ir_emit_match_return(idx, node, ir_expr, ir_block)
+            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block)
             return ir_emit_zero_value()
         return ir_emit_match_expr(idx, node, ir_expr, ir_block)
     if kind == "if_expr":
@@ -6882,12 +6921,36 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
 
 fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:
+        ir_emit_return_value(node.children[0])
+    else:
+        ir_defer_emit_to_function_frame(false)
+        ir_emit_string_cleanup("")
+        r := ir_reg()
+        if ir_current_func_return_kind == "result_reg":
+            ir_emit("iconst " + r.to_string() + " 1")
+            zero_r := ir_reg()
+            ir_emit("iconst " + zero_r.to_string() + " 0")
+            ir_emit("ret2 " + r.to_string() + " " + zero_r.to_string())
+        else:
+            ir_emit("iconst " + r.to_string() + " 0")
+            ir_emit("ret " + r.to_string())
+        ir_last_was_ret = true
+
+# return one expression as the current function's value, with the full
+# return contract: borrow retain, optional/result wrapping from the
+# function's declared kind, defers, and the tracked-local cleanup (with the
+# returned local excluded so its count transfers to the caller). split out
+# of ir_emit_return_stmt so a tail-match arm's expression body returns
+# through the same machinery — the bare `ret` it used to emit skipped the
+# cleanup, so every count an arm binding had retained leaked per call.
+pub fn ir_emit_return_value(expr_child: Int):
+    if true:
         # `return none` builds its optional below, from the function's own
         # return kind. going through ir_expr for it would build one optional
         # tuple here and a second one there, and strand the first — every
         # `return none` in the tree leaked an optional per call.
         mut r := 0
-        if node_kind(node.children[0]) == "none_lit":
+        if node_kind(expr_child) == "none_lit":
             r = ir_emit_zero_value()
         elif ir_current_func_return_kind == "result_reg":
             # forwarding handshake: a direct pair-returning call (an rcall or
@@ -6895,9 +6958,9 @@ fn ir_emit_return_stmt(node: Node):
             # straight to this return, so no box is built only to be unpacked
             # again below.
             saved_defer := ir_rcall_defer_idx
-            ir_rcall_defer_idx = node.children[0]
+            ir_rcall_defer_idx = expr_child
             ir_rcall_pair_ready = false
-            r = ir_expr(node.children[0])
+            r = ir_expr(expr_child)
             ir_rcall_defer_idx = saved_defer
             if ir_rcall_pair_ready:
                 ir_rcall_pair_ready = false
@@ -6907,12 +6970,12 @@ fn ir_emit_return_stmt(node: Node):
                 ir_last_was_ret = true
                 return
         else:
-            r = ir_expr(node.children[0])
+            r = ir_expr(expr_child)
         # hand the returned string's count to the caller: a returned local
         # transfers its count (skip it in cleanup), a returned borrow gets
         # a fresh count. fresh results already arrive owned.
         mut exclude := ""
-        expr_node := get_node(node.children[0])
+        expr_node := get_node(expr_child)
         # a returned tracked local transfers its count to the caller, so it
         # must be skipped in the exit cleanup. trust the tracked kind directly:
         # in a generic body the inferred type can miss (a tuple-lowered
@@ -6925,11 +6988,11 @@ fn ir_emit_return_stmt(node: Node):
             # impl method returning a borrowed T still retains it. without this
             # the inferred type stays "T", rc_kind reads empty, no retain fires,
             # and the caller's arg release frees the value the method handed back.
-            ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(node.children[0])))
-            if ret_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
+            ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_child)))
+            if ret_kind.len() > 0 and ir_string_expr_is_borrowed(expr_child):
                 ir_rc_retain_reg(r, ret_kind)
-        result_kind := ir_expr_result_kind(node.children[0])
-        expr_tid := c_get_expr_type(node.children[0])
+        result_kind := ir_expr_result_kind(expr_child)
+        expr_tid := c_get_expr_type(expr_child)
         mut expr_kind := ""
         if expr_tid >= 0:
             expr_kind = get_type_info(expr_tid).kind
@@ -6973,18 +7036,6 @@ fn ir_emit_return_stmt(node: Node):
         ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + r.to_string())
-    else:
-        ir_defer_emit_to_function_frame(false)
-        ir_emit_string_cleanup("")
-        r := ir_reg()
-        if ir_current_func_return_kind == "result_reg":
-            ir_emit("iconst " + r.to_string() + " 1")
-            zero_r := ir_reg()
-            ir_emit("iconst " + zero_r.to_string() + " 0")
-            ir_emit("ret2 " + r.to_string() + " " + zero_r.to_string())
-        else:
-            ir_emit("iconst " + r.to_string() + " 0")
-            ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
 
 # propagate `err_r` out of the current function as its error return: the

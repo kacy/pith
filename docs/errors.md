@@ -650,3 +650,16 @@ end the block with `return`, `fail`, `continue` or `break`.
 ```
 error[E253]: a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression
 ```
+
+
+### E262 — generic enum instance cannot be inferred
+
+a payload-free variant of a generic enum carries nothing to infer the type
+argument from. bound without an annotation, the value would have no concrete
+type — and a later match on it could not be checked. annotate the binding;
+a constructor with a payload argument (`Opt.Some(5)`) infers its instance
+and needs no annotation.
+
+```
+error[E262]: cannot infer the type arguments of generic enum 'Opt' from this constructor; annotate the binding
+```

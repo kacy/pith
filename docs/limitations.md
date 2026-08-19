@@ -103,17 +103,23 @@ something here that now works, the page is stale and a fix to it is welcome.
   concrete `T`. an impl that omits an abstract (non-default) interface
   method is rejected at the impl block (E235). `where` clauses are the
   remaining gap — bounds must be written inline (`[T: Display + Hash]`).
-- **generic enums are constructed and matched through a typed context** — a
-  variant is built where the instantiation is already known (`fn f() ->
-  Chain[Int]: return Chain.Link(1, none)`, or an annotated binding), and
-  matched either there or inside a generic fn over `Chain[T]`. the explicit
-  form `Chain[Int].Link(...)` does not parse as a variant constructor,
-  matching a concrete instance by bare name outside a generic fn does not
-  resolve the enum, and a call like `head_of(pair)` does not infer `T` from
-  a `Chain[Int]` argument. self-referential generic types themselves work —
+- **generic enums construct, infer, and match like any other enum** — a
+  constructor with a payload argument infers its instance (`x :=
+  Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the
+  instance to a payload-free variant (`b: Opt[Int] := Opt.Nothing`), and a
+  match resolves the bare pattern name against the subject's instance, with
+  exhaustiveness checked. a payload-free constructor bound with no
+  annotation has nothing to infer from and is rejected (E262) rather than
+  left silently untyped. two gaps remain: the explicit form
+  `Chain[Int].Link(...)` does not parse as a variant constructor, and a
+  call like `head_of(pair)` does not infer `T` from a `Chain[Int]`
+  argument. self-referential generic types themselves work —
   `struct Node[T]: next: Node[T]?`, `Link(T, Chain[T]?)`, and mutually
   recursive pairs all instantiate (the instance registers before its fields
-  resolve, so the reference finds a floor).
+  resolve, so the reference finds a floor). one ownership caveat: a generic
+  enum erases to a single IR struct whose destructor is built from the
+  declaration, so a heap payload (`Opt[String]`) is not released when the
+  enum box itself dies — the same erasure gap generic struct fields have.
 
 ## standard library
 

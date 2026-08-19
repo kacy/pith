@@ -56,10 +56,11 @@ fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
 
 pub mut current_scope := -1
 pub mut method_type_map: Map[String, Int] := {}
-# how each method key was declared — "inherent", "iface", or both joined
-# with a comma. a SAME-kind re-declaration is the E263 duplicate; the
-# inherent+interface pair is std/io's deliberate conformance idiom.
-mut method_decl_kind: Map[String, String] := {}
+# every (method key, declaration kind) pair seen so far, keyed
+# "<key>#inherent" / "<key>#iface". a SAME-kind re-declaration is the E263
+# duplicate; the inherent+interface pair is std/io's deliberate
+# conformance idiom, so the two kinds are tracked independently.
+mut method_declared_kinds: Map[String, Bool] := {}
 pub mut method_visibility_map: Map[String, Bool] := {}
 # whether each module function was declared `pub`, keyed by its module-qualified
 # symbol. a call through a module alias consults this so a module's private
@@ -139,7 +140,7 @@ pub fn initialize_checker(file_path: String):
     reset_scope_arena()
     checker_reset_diagnostics(file_path)
     method_type_map = {}
-    method_decl_kind = {}
+    method_declared_kinds = {}
     method_visibility_map = {}
     function_visibility_map = {}
     checker_methods_reset()
@@ -952,24 +953,17 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
         # never collide; a genuine duplicate within one module still
         # errors.
         kind_key = current_checker_module_path + ":" + key
-    mut already_declared := false
-    if owner >= 0:
-        already_declared = has_method_declaration(kind_key)
-    elif has_generic_declaration(type_name):
-        already_declared = method_decl_kind.contains_key(kind_key)
     mut new_kind := "inherent"
     if from_interface:
         new_kind = "iface"
-    if already_declared and method_decl_kind.contains_key(kind_key):
-        if method_decl_kind[kind_key].contains(new_kind):
-            report_error_at(node_idx, "E263", "duplicate method '" + method_name + "' on '" + type_name + "': another impl block already declares it")
-    mut kinds := new_kind
-    if method_decl_kind.contains_key(kind_key):
-        if method_decl_kind[kind_key].contains(new_kind) == false:
-            kinds = method_decl_kind[kind_key] + "," + new_kind
-        else:
-            kinds = method_decl_kind[kind_key]
-    method_decl_kind.insert(kind_key, kinds)
+    # an impl target that resolves to neither a tid nor a generic base is
+    # exempt from the duplicate check: with no owner to key on, the check
+    # could only collide unrelated same-named types.
+    dup_check_applies := owner >= 0 or has_generic_declaration(type_name)
+    seen_key := kind_key + "#" + new_kind
+    if dup_check_applies and method_declared_kinds.contains_key(seen_key):
+        report_error_at(node_idx, "E263", "duplicate method '" + method_name + "' on '" + type_name + "': another impl block already declares it")
+    method_declared_kinds.insert(seen_key, true)
     method_type_map.insert(key, fn_tid)
     method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx)
@@ -1591,21 +1585,21 @@ fn optional_plain_comparison(a: Int, b: Int) -> Bool:
         return false
     if is_none_type(a) or is_none_type(b):
         return false
-    a_info := get_type_info(a)
-    b_info := get_type_info(b)
-    if a_info.kind == "optional" and b_info.kind != "optional":
-        if a_info.inner < 0:
-            return false
-        if a_info.inner == b:
-            return true
-        return types_structurally_equal(a_info.inner, b)
-    if b_info.kind == "optional" and a_info.kind != "optional":
-        if b_info.inner < 0:
-            return false
-        if b_info.inner == a:
-            return true
-        return types_structurally_equal(b_info.inner, a)
-    return false
+    return optional_accepts_plain(a, b) or optional_accepts_plain(b, a)
+
+# one direction of the widening rule: an optional with this tid accepts a
+# plain value of its inner type (exactly, or structurally). shared by both
+# orders of optional_plain_comparison and by the argument-position widening,
+# which layers its own guards and the recording side effect on top.
+fn optional_accepts_plain(opt_tid: Int, plain_tid: Int) -> Bool:
+    opt_info := get_type_info(opt_tid)
+    if opt_info.kind != "optional" or opt_info.inner < 0:
+        return false
+    if get_type_info(plain_tid).kind == "optional":
+        return false
+    if opt_info.inner == plain_tid:
+        return true
+    return types_structurally_equal(opt_info.inner, plain_tid)
 
 fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
     if expected_tid < 0:
@@ -1648,16 +1642,8 @@ fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int
         return false
     if is_none_type(actual_tid) or is_none_type(expected_tid):
         return false
-    expected_info := get_type_info(expected_tid)
-    if expected_info.kind != "optional":
+    if optional_accepts_plain(expected_tid, actual_tid) == false:
         return false
-    if expected_info.inner < 0:
-        return false
-    if get_type_info(actual_tid).kind == "optional":
-        return false
-    if actual_tid != expected_info.inner:
-        if types_structurally_equal(actual_tid, expected_info.inner) == false:
-            return false
     optional_widened_arguments.insert(expr_idx, true)
     return true
 
@@ -1753,14 +1739,14 @@ fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual:
         # a literal WITH elements types itself — but an empty literal nested
         # inside leaves the whole thing error-typed (`f([[]])`), and an
         # error-typed argument skips the coercion path the mismatch check
-        # would have run. run it here: the element walk qualifies the
-        # literal honestly and records the declared type through every
-        # nested literal, so the inner list is tagged and owns what is
-        # pushed into it. a genuinely wrong element still fails the
-        # coercion and leaves the literal exactly as it was.
+        # would have run. run it here for its recording effect: the element
+        # walk qualifies the literal honestly and records the declared type
+        # through every nested literal, so the inner list is tagged and owns
+        # what is pushed into it. a genuinely wrong element still fails the
+        # coercion and leaves the literal exactly as it was — either way
+        # this path is done.
         if node.kind == "list" or node.kind == "map" or node.kind == "set":
-            if collection_literal_coerces(expr_idx, expected, scope_id):
-                return
+            collection_literal_coerces(expr_idx, expected, scope_id)
         return
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
         # an optional-of-container parameter (`f(v: List[String]?)`) declares
@@ -1916,11 +1902,13 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                 # as the error wildcard. the annotation IS the instance:
                 # record it on the constructor expression so the match
                 # checker and the emitter both see a typed value.
-                elif generic_enum_construction_base(val_node) != "":
-                    ainfo := get_type_info(annotated)
-                    if ainfo.kind == "enum" and extract_base_type_name(ainfo.name) == generic_enum_construction_base(val_node):
-                        expression_type_cache.insert(node.children[1], annotated)
-                        val_type = annotated
+                else:
+                    gbase := generic_enum_construction_base(val_node)
+                    if gbase != "":
+                        ainfo := get_type_info(annotated)
+                        if ainfo.kind == "enum" and extract_base_type_name(ainfo.name) == gbase:
+                            expression_type_cache.insert(node.children[1], annotated)
+                            val_type = annotated
             if value_matches_optional_target(node.children[1], val_type, annotated):
                 define_binding_at(scope_id, name, annotated, is_mut, node_idx)
                 return
@@ -4212,6 +4200,13 @@ fn collect_function_return_type_with_subst(node: Node, params: List[String], arg
                 return resolve_type_with_substitution_map(cn.children[0], params, args)
     return TID_VOID
 
+# a method-call node's value sometimes carries the leading dot of its
+# spelling (`.next`); resolution always wants the bare name.
+fn normalized_method_name(raw: String) -> String:
+    if raw.starts_with("."):
+        return raw.substring(1, raw.len())
+    return raw
+
 # call arguments arrive wrapped in an `arg` node; the expression is inside.
 fn argument_expression_index(arg_idx: Int) -> Int:
     arg_node := get_node(arg_idx)
@@ -4327,9 +4322,7 @@ fn generic_enum_construction_base(val_node: Node) -> String:
     decl := get_node(get_generic_declaration_index(recv.value))
     if decl.kind != "enum_decl":
         return ""
-    mut mname := val_node.value
-    if mname.starts_with("."):
-        mname = mname.substring(1, mname.len())
+    mname := normalized_method_name(val_node.value)
     if enum_decl_has_variant(decl, mname):
         return recv.value
     return ""
@@ -4343,31 +4336,24 @@ fn generic_enum_construction_base(val_node: Node) -> String:
 # own enum (`return RecvResult.Closed`) has carried this shape since before
 # inference existed. only an unannotated binding turns the silence into an
 # error, in check_binding_statement.
-fn check_generic_enum_variant_construction(enum_name: String, decl_idx: Int, variant_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+fn check_generic_enum_variant_construction(decl_idx: Int, variant_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl)
+    # the caller's enum_decl_has_variant guard is the gate, so the variant
+    # is present by the time this runs; a miss here just yields no payloads.
     mut payload_nodes: List[Int] := []
-    mut found := false
     for child in decl.children:
         cn := get_node(child)
         if cn.kind == "variant" and strings_equal(cn.value, variant_name):
-            found = true
             for vc in cn.children:
                 payload_nodes.push(vc)
-    if found == false:
-        report_error("E212", enum_name + " has no variant '" + variant_name + "'")
-        return TID_ERR
     if arg_indices.len() != payload_nodes.len():
         report_error("E207", variant_name + " expects " + payload_nodes.len().to_string() + " arguments, got " + arg_indices.len().to_string())
         return TID_ERR
     mut arg_types: List[Int] := []
     mut arg_exprs: List[Int] := []
     for ai in arg_indices:
-        a_node := get_node(ai)
-        mut a_expr := ai
-        if a_node.kind == "arg":
-            if a_node.children.len() > 0:
-                a_expr = a_node.children[0]
+        a_expr := argument_expression_index(ai)
         arg_exprs.push(a_expr)
         arg_types.push(c_check_expr(a_expr, scope_id))
     mut type_args: List[Int] := []
@@ -4409,9 +4395,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     # children[1..] = arguments
     if node.children.len() < 1:
         return TID_ERR
-    mut method_name := node.value
-    if method_name.starts_with("."):
-        method_name = method_name.substring(1, method_name.len())
+    method_name := normalized_method_name(node.value)
     recv_node := get_node(node.children[0])
 
     mut arg_indices: List[Int] := []
@@ -4488,7 +4472,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         gdecl_idx := get_generic_declaration_index(recv_node.value)
         gdecl := get_node(gdecl_idx)
         if gdecl.kind == "enum_decl" and enum_decl_has_variant(gdecl, method_name):
-            return check_generic_enum_variant_construction(recv_node.value, gdecl_idx, method_name, arg_indices, scope_id)
+            return check_generic_enum_variant_construction(gdecl_idx, method_name, arg_indices, scope_id)
 
     mut receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type) and recv_node.kind == "ident":

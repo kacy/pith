@@ -1701,21 +1701,12 @@ fn parse_fn_decl() -> Int:
     advance_token()
     name_tok := expect("identifier")
 
-    # optional generic params
-    generics := parse_optional_generic_params()
+    # optional generic params; a where clause below may replace entries
+    mut generics := parse_optional_generic_params()
 
     expect("lparen")
     params := parse_param_list()
     expect("rparen")
-
-    mut children: List[Int] := []
-
-    # store generic_param nodes so checker can access bounds
-    for g in generics:
-        children.push(g)
-
-    for p in params:
-        children.push(p)
 
     mut ret_node := 0 - 1
     if match_tok("arrow"):
@@ -1736,34 +1727,24 @@ fn parse_fn_decl() -> Int:
         while more:
             wn_tok := expect("identifier")
             expect("colon")
-            mut extra: List[Int] := [parse_type_expr()]
-            while match_tok("plus"):
-                extra.push(parse_type_expr())
+            extra := parse_bound_list()
             mut found := false
-            for g_idx, gi in generics:
-                gp := get_node(g_idx)
-                if gp.kind == "generic_param" and gp.value == wn_tok.value:
-                    mut merged: List[Int] := []
-                    for b in gp.children:
-                        merged.push(b)
-                    for e in extra:
-                        merged.push(e)
-                    generics[gi] = add_node_with_position("generic_param", gp.value, merged)
+            for gp_idx, gp_i in generics:
+                gp := get_node(gp_idx)
+                if found == false and gp.kind == "generic_param" and gp.value == wn_tok.value:
+                    generics[gp_i] = merge_generic_param_bounds(gp_idx, extra)
                     found = true
             if found == false:
                 parser_report_error_here("E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + name_tok.value + "'", "declare it in the bracket list: fn " + name_tok.value + "[" + wn_tok.value + "](...)")
             more = match_tok("comma")
 
-    # generic_param nodes were pushed before any where clause was parsed,
-    # so rebuild the child list from the (possibly replaced) entries
-    mut rebuilt: List[Int] := []
+    # the child layout the checker and emitter walk: generics, params,
+    # returns (when present), then the body.
+    mut children: List[Int] := []
     for g in generics:
-        rebuilt.push(g)
-    mut ci := generics.len()
-    while ci < children.len():
-        rebuilt.push(children[ci])
-        ci = ci + 1
-    children = rebuilt
+        children.push(g)
+    for p in params:
+        children.push(p)
     if ret_node >= 0:
         children.push(ret_node)
 
@@ -1773,6 +1754,27 @@ fn parse_fn_decl() -> Int:
     children.push(add_node_with_position("body", "", body_children))
 
     return add_node_with_position("fn_decl", name_tok.value, children)
+
+# `Bound + Bound + ...` after a colon — one bound list, shared by the
+# inline bracket spelling and the where clause so the two grammars can
+# never drift apart.
+fn parse_bound_list() -> List[Int]:
+    mut bounds: List[Int] := [parse_type_expr()]
+    while match_tok("plus"):
+        bounds.push(parse_type_expr())
+    return bounds
+
+# a where clause adds bounds to a parameter that may already carry inline
+# ones. the merged node replaces the original in the declaration's child
+# list; the stale generic_param is simply orphaned in the arena.
+fn merge_generic_param_bounds(gp_idx: Int, extra: List[Int]) -> Int:
+    gp := get_node(gp_idx)
+    mut merged: List[Int] := []
+    for b in gp.children:
+        merged.push(b)
+    for e in extra:
+        merged.push(e)
+    return add_node_with_position("generic_param", gp.value, merged)
 
 fn parse_test_decl() -> Int:
     advance_token()
@@ -1836,10 +1838,7 @@ fn parse_generic_param() -> Int:
     name_tok := expect("identifier")
     # bounds: T: Comparable + Hash
     if match_tok("colon"):
-        mut bounds: List[Int] := [parse_type_expr()]
-        while match_tok("plus"):
-            bounds.push(parse_type_expr())
-        return add_node_with_position("generic_param", name_tok.value, bounds)
+        return add_node_with_position("generic_param", name_tok.value, parse_bound_list())
     mut empty: List[Int] := []
     return add_node_with_position("generic_param", name_tok.value, empty)
 

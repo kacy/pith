@@ -28,7 +28,7 @@ pub mut ir_tail_match_node := 0 - 1
 ## defers, the borrow retain, the optional/result wrap, and the tracked
 ## local cleanup — so every count an arm's payload binding had retained
 ## leaked once per call, and a borrowed return could dangle.
-pub fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
+fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
     body := get_node(body_idx)
     if body.kind == "block":
         emit_block(body_idx)
@@ -37,6 +37,8 @@ pub fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn
     if body.kind == "body" and body.children.len() > 0:
         expr_idx = body.children[0]
     emit_ret(expr_idx)
+    # emit_ret already sets this on every exit path; kept as belt-and-braces
+    # because emit_ret is a caller-supplied callback.
     ir_last_was_ret = true
 
 # Lower a tail-position match: each matching arm returns its value. A no-match
@@ -333,6 +335,30 @@ pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) ->
 
 # Bind any names a pattern introduces, in the branch where it matched.
 
+## give a match binding its own count on an rc payload: release whatever the
+## name held before (zero on first reach, a stale payload when an arm rebinds
+## the name in a loop), then retain the new value — the reassign dance for
+## ordinary locals. the subject's box or shell is released at scope exit,
+## which frees the payload, so a plain borrow would dangle; the prepass
+## tracks these names, so exit cleanup releases them (or a return transfers
+## the count to the caller).
+##
+## an untracked name (sibling arms bind it with different rc kinds) gets no
+## prologue zero-store, so loading it here would reference an undeclared
+## name — and the previous value's kind is unknowable anyway, so any release
+## could be the wrong one. skip the release (a bounded leak) but still
+## retain: the binding must own its count or it would dangle once the
+## subject dies. a kind with no rc kind (ints, "unknown") needs nothing.
+fn ir_bind_owned_rc_payload(name: String, value_r: Int, kind: String):
+    rc_kind := ir_rc_kind(kind)
+    if rc_kind.len() == 0:
+        return
+    if not ir_untracked_rc_binds.contains(name):
+        old_r := ir_reg()
+        ir_emit("load " + old_r.to_string() + " " + name)
+        ir_rc_release_reg(old_r, rc_kind)
+    ir_rc_retain_reg(value_r, rc_kind)
+
 ## bind pattern names to the matched subject's pieces.
 pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
     pat := get_node(pat_idx)
@@ -377,16 +403,9 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                 ir_var_types.insert(pat.value, inner_kind)
             # an rc payload is retained so the binding owns its own count —
             # the subject's shell (or its cascade-released payload) can die at
-            # scope exit while the binding lives on. the prepass tracks the
-            # name, so exit cleanup releases it or a return transfers it,
-            # the same contract as an enum arm's payload binding below.
-            rc_kind := ir_rc_kind(inner_kind)
-            if rc_kind.len() > 0:
-                if not ir_untracked_rc_binds.contains(pat.value):
-                    old_r := ir_reg()
-                    ir_emit("load " + old_r.to_string() + " " + pat.value)
-                    ir_rc_release_reg(old_r, rc_kind)
-                ir_rc_retain_reg(inner_r, rc_kind)
+            # scope exit while the binding lives on. same contract as an enum
+            # arm's payload binding below; rationale on ir_bind_owned_rc_payload.
+            ir_bind_owned_rc_payload(pat.value, inner_r, inner_kind)
             ir_emit("store " + pat.value + " " + inner_r.to_string())
             return
         ir_var_regs.insert(pat.value, subj_r)
@@ -410,25 +429,7 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                     kind = kinds[i]
                 slot_r := ir_reg()
                 ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
-                rc_kind := ir_rc_kind(kind)
-                if rc_kind.len() > 0:
-                    if not ir_untracked_rc_binds.contains(sub.value):
-                        # release whatever the binding held before (it is zero
-                        # on first reach and a stale payload when an arm rebinds
-                        # the name in a loop), then retain the new one so it
-                        # owns its count, mirroring the reassign dance for
-                        # ordinary locals.
-                        old_r := ir_reg()
-                        ir_emit("load " + old_r.to_string() + " " + sub.value)
-                        ir_rc_release_reg(old_r, rc_kind)
-                    # an untracked name (sibling arms bind it with different rc
-                    # kinds) gets no prologue zero-store, so loading it here
-                    # would reference an undeclared name — and the previous
-                    # value's kind is unknowable anyway, so any release could
-                    # be the wrong one. skip the release (a bounded leak) but
-                    # still retain: the binding must own its count or it would
-                    # dangle once the enum box is released at scope exit.
-                    ir_rc_retain_reg(slot_r, rc_kind)
+                ir_bind_owned_rc_payload(sub.value, slot_r, kind)
                 ir_var_regs.insert(sub.value, slot_r)
                 if kind != "unknown":
                     ir_var_types.insert(sub.value, kind)

@@ -15,8 +15,15 @@ fn poke(xs: List[List[String]]) -> Int:
     inner.push("deep " + inner.len().to_string())
     return inner.len()
 
+# a callee that STORES a tuple literal (`keep((i, i+1))` into a struct
+# field) is deliberately NOT in this round: the borrow walk sees the
+# store and holds the caller's release, and the field is not released by
+# the holder's destructor either, so the box strands — the documented
+# residual in docs/ownership.md ("real tuple literals still strand their
+# box"). the golden test_argument_literal_ownership covers that shape's
+# correctness; this gate covers the reclaimed ones.
 fn round(i: Int) -> Int:
-    return sum_of((i, i + 1)) + poke([[]])
+    return sum_of((i, i + 1)) + poke([[]]) + poke([["seed"]])
 
 fn main():
     n := probe.rounds()

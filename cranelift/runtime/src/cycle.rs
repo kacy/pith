@@ -308,10 +308,11 @@ impl MutatorSlot {
     }
 }
 
-// every mutator slot ever created, in registration order. slots are pushed
-// under the mutex and never removed (an exited thread's slot is marked, not
-// popped), so the stopper's scan holds the lock only long enough to read the
-// state words.
+// the mutator slot registry, in registration order. slots are pushed under
+// the mutex and never popped — an exited thread's slot is marked and later
+// RESURRECTED by the next registration — so the vec plateaus at the peak
+// number of concurrently live mutators and the stopper's scan holds the
+// lock only long enough to read the state words.
 static MUTATORS: Mutex<Vec<Arc<MutatorSlot>>> = Mutex::new(Vec::new());
 
 /// the stop request. set by the stopper, polled by mutators at gates and
@@ -382,10 +383,33 @@ thread_local! {
 }
 
 fn register_new_slot() -> Arc<MutatorSlot> {
+    let mut mutators = lock_mutators();
+    // reuse an exited thread's slot instead of growing the registry. on the
+    // os-thread backend every task is a fresh thread, so a push-only vec
+    // grows for the life of the process; with reuse it plateaus at the peak
+    // number of concurrently live mutators. the resurrection CAS runs under
+    // the registry lock, and a resurrected slot has exactly a fresh slot's
+    // contract: an EXITED state means the owning thread's teardown already
+    // ran (it can never gate again), and the adopting thread's first gate
+    // poll observes any stop already in progress before it mutates.
+    for slot in mutators.iter() {
+        if slot
+            .state
+            .compare_exchange(
+                MUTATOR_EXITED,
+                MUTATOR_RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Arc::clone(slot);
+        }
+    }
     let slot = Arc::new(MutatorSlot {
         state: AtomicU8::new(MUTATOR_RUNNING),
     });
-    lock_mutators().push(Arc::clone(&slot));
+    mutators.push(Arc::clone(&slot));
     slot
 }
 
@@ -1375,6 +1399,30 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn exited_mutator_slots_are_reused_not_accumulated() {
+        let _guard = locked();
+        // each spawned thread registers a slot on first use and marks it
+        // exited at teardown; a later registration must adopt an exited
+        // slot instead of growing the registry. sequential joins make the
+        // exited state visible to the next spawn, so the registry may only
+        // grow by a bounded handful over many short-lived threads — the
+        // os-thread backend's task-per-thread shape in miniature.
+        let before = lock_mutators().len();
+        for _ in 0..64 {
+            std::thread::spawn(|| {
+                let _ = mutator_slot();
+            })
+            .join()
+            .expect("mutator thread");
+        }
+        let after = lock_mutators().len();
+        assert!(
+            after <= before + 2,
+            "registry grew from {before} to {after} over 64 sequential threads"
+        );
     }
 
     #[test]

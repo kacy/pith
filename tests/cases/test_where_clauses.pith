@@ -1,0 +1,36 @@
+interface Show:
+    fn show() -> String
+
+interface Tag:
+    fn tag() -> Int
+
+struct Point:
+    pub x: Int
+
+impl Show for Point:
+    fn show() -> String:
+        return "P{self.x}"
+
+impl Tag for Point:
+    fn tag() -> Int:
+        return self.x * 10
+
+fn describe[T](v: T) -> String where T: Show:
+    return v.show()
+
+fn both[T](v: T) -> String where T: Show + Tag:
+    return v.show() + "/" + v.tag().to_string()
+
+fn pair[A, B](a: A, b: B) -> String where A: Show, B: Tag:
+    return a.show() + ":" + b.tag().to_string()
+
+fn mixed[T: Show, U](t: T, u: U) -> String where U: Tag:
+    return t.show() + "+" + u.tag().to_string()
+
+fn main():
+    p := Point(x: 3)
+    q := Point(x: 4)
+    print(describe(p))
+    print(both(p))
+    print(pair(p, q))
+    print(mixed(p, q))

@@ -113,8 +113,14 @@ something here that now works, the page is stale and a fix to it is welcome.
   own methods and in generic `T.Item` position — a
   `fn f[T: Container](c: T) -> T.Item` returns the right type for each
   concrete `T`. an impl that omits an abstract (non-default) interface
-  method is rejected at the impl block (E235). `where` clauses are the
-  remaining gap — bounds must be written inline (`[T: Display + Hash]`).
+  method is rejected at the impl block (E235). bounds have two spellings
+  that mean the same thing: inline (`[T: Display + Hash]`) and a `where`
+  clause after the signature (`fn f[T, U](t: T, u: U) -> Int where T:
+  Display + Hash, U: Ord:`) — a clause naming something that is not a
+  declared type parameter is E264. `where` is a contextual keyword, so it
+  stays usable as an ordinary name everywhere else. clauses attach to
+  functions and methods; struct, interface, and impl headers still take
+  inline bounds only.
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the

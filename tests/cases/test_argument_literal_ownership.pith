@@ -1,0 +1,27 @@
+# the two argument-literal shapes that used to leak, plus the correctness
+# side of each fix. a tuple literal written straight into a call is released
+# once the call returns — and a callee that STORES the tuple takes its own
+# count, so the stored copy must survive the caller-side release. a nested
+# empty list literal takes the parameter's element type, so the inner list
+# is tagged and owns the strings pushed into it.
+struct Holder:
+    pub pair: (Int, Int)
+
+fn sum_of(t: (Int, Int)) -> Int:
+    return t.0 + t.1
+
+fn keep(t: (Int, Int)) -> Holder:
+    return Holder(pair: t)
+
+fn poke(xs: List[List[String]]) -> Int:
+    inner := xs[0]
+    inner.push("deep")
+    inner.push("deeper")
+    return inner.len()
+
+fn main():
+    print("{sum_of((3, 4))}")
+    h := keep((7, 8))
+    print("{h.pair.0} {h.pair.1}")
+    print("{poke([[]])}")
+    print("{poke([["seed"]])}")

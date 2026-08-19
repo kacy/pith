@@ -1742,7 +1742,7 @@ fn propagate_expected_collection_type(literal_idx: Int, expected_tid: Int):
 # reporting rather than being stamped over. the container this builds is
 # the one the equivalent `mut xs: T := []` then `f(xs)` already builds, so
 # it is a shape the ownership rules cover rather than a new one.
-fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual: Int):
+fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual: Int, scope_id: Int):
     if is_error_type(actual) == false:
         return
     if expected < 0:
@@ -1750,6 +1750,17 @@ fn propagate_empty_argument_collection_type(arg_idx: Int, expected: Int, actual:
     expr_idx := argument_expression_index(arg_idx)
     node := get_node(expr_idx)
     if node.children.len() != 0:
+        # a literal WITH elements types itself — but an empty literal nested
+        # inside leaves the whole thing error-typed (`f([[]])`), and an
+        # error-typed argument skips the coercion path the mismatch check
+        # would have run. run it here: the element walk qualifies the
+        # literal honestly and records the declared type through every
+        # nested literal, so the inner list is tagged and owns what is
+        # pushed into it. a genuinely wrong element still fails the
+        # coercion and leaves the literal exactly as it was.
+        if node.kind == "list" or node.kind == "map" or node.kind == "set":
+            if collection_literal_coerces(expr_idx, expected, scope_id):
+                return
         return
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
         # an optional-of-container parameter (`f(v: List[String]?)`) declares
@@ -3316,7 +3327,7 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 arg_expr_idx = arg_node.children[0]
         arg_type := c_check_expr(arg_expr_idx, scope_id)
         if idx < fn_info.param_types.len():
-            propagate_empty_argument_collection_type(arg_expr_idx, fn_info.param_types[idx], arg_type)
+            propagate_empty_argument_collection_type(arg_expr_idx, fn_info.param_types[idx], arg_type, scope_id)
         if is_error_type(arg_type) == false:
             if idx < fn_info.param_types.len():
                 expected := fn_info.param_types[idx]
@@ -4585,7 +4596,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                             pa_expr = pa_node.children[0]
                     pa_type := c_check_expr(pa_expr, scope_id)
                     if pi < payload_types.len():
-                        propagate_empty_argument_collection_type(pa_expr, payload_types[pi], pa_type)
+                        propagate_empty_argument_collection_type(pa_expr, payload_types[pi], pa_type, scope_id)
                     if is_error_type(pa_type) == false and pi < payload_types.len():
                         if pa_type != payload_types[pi]:
                             if types_structurally_equal(pa_type, payload_types[pi]) == false:
@@ -4652,7 +4663,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                     arg_expr = arg_node.children[0]
             atype := c_check_expr(arg_expr, scope_id)
             if aidx < param_types.len():
-                propagate_empty_argument_collection_type(arg_expr, param_types[aidx], atype)
+                propagate_empty_argument_collection_type(arg_expr, param_types[aidx], atype, scope_id)
             if is_error_type(atype) == false:
                 if aidx < param_types.len():
                     if atype != param_types[aidx]:
@@ -5154,7 +5165,7 @@ fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, secon
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)
     actual := c_check_expr(expr_idx, scope_id)
-    propagate_empty_argument_collection_type(arg_idx, expected, actual)
+    propagate_empty_argument_collection_type(arg_idx, expected, actual, scope_id)
     if is_error_type(actual) == false:
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:

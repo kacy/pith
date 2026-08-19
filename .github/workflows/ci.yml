@@ -4,6 +4,11 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    # the default job timeout is six hours. twice in one day a run wedged
+    # with zero output inside the memcheck step's apt-get preamble (a
+    # mirror stall), and each time it sat until someone noticed — the run
+    # for #811 burned four hours. a wedged run should fail in minutes.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -100,11 +105,19 @@ jobs:
         run: make pithgen-check
 
       - name: memcheck
+        # generous triple of the step's normal time (apt ~1min + the
+        # curated suite ~8min): the two observed wedges were apt-mirror
+        # stalls that produced no output at all, so a hard cap converts
+        # hours of silence into a fast, visible failure.
+        timeout-minutes: 30
         run: |
           # not `|| true`: `make memcheck` skips itself when valgrind is
           # missing, so a swallowed install failure would turn this step into a
           # guard that passes without running.
-          sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+          # the retry and timeout options are for the apt-mirror stalls above:
+          # a dead mirror times out and retries instead of hanging the step.
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq valgrind
           make memcheck
 
       - name: verify bootstrap fixed point

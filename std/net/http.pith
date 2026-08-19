@@ -2792,7 +2792,11 @@ impl ClientRequest:
         for key in self.headers:
             if header_key_matches(key, "Content-Length"):
                 continue
-            req = req + key + ": " + self.headers[key] + crlf
+            # strip CR/LF/NUL so an untrusted value reflected into a header
+            # (.bearer, .cookie, .header with attacker input) cannot inject a
+            # second header or splice a whole request into the outbound
+            # stream — the same guard the response path applies.
+            req = req + strip_header_controls(key) + ": " + strip_header_controls(self.headers[key]) + crlf
         if header_lookup(self.headers, "Connection") == "":
             req = req + "Connection: close" + crlf
         req = req + "Content-Length: " + self.body.len().to_string() + crlf + crlf
@@ -3217,6 +3221,16 @@ test "http builds and parses responses":
     assert(parsed.is_success())
     assert_eq(parsed.header_value("content-type"), "text/plain")
     assert_eq(parsed.body_text()!, "created")
+
+test "http strips control characters from outbound request headers":
+    # a client that reflects untrusted input into a request header (a bearer
+    # token, a cookie, a custom header) must not be able to inject a second
+    # header or splice a second request into the outbound stream.
+    crlf := chr(13) + chr(10)
+    req := get_request("example.test", 80, "/").header("X-Echo", "value" + crlf + "Injected: evil")
+    wire := req.to_bytes()!.to_string_utf8()!
+    assert(not wire.contains(crlf + "Injected:"))
+    assert(wire.contains("X-Echo: valueInjected: evil"))
 
 test "http strips control characters from response headers":
     # a handler that reflects untrusted input into a header value must not be

@@ -663,3 +663,18 @@ and needs no annotation.
 ```
 error[E262]: cannot infer the type arguments of generic enum 'Opt' from this constructor; annotate the binding
 ```
+
+
+### E263 — duplicate method across impl blocks
+
+two impl blocks gave the same declaration the same method name with the
+same kind of declaration, so one body would silently shadow the other and
+which one answered depended on module order. remove or rename one of the
+two. an interface impl re-declaring a method the inherent impl also has is
+not a duplicate — that pair is the conformance idiom std/io uses — and an
+impl in another module adding new method names to a type it can see stays
+legal too.
+
+```
+error[E263]: duplicate method 'read' on 'FileStream': another impl block already declares it
+```

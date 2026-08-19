@@ -1,0 +1,19 @@
+# two impl blocks giving the same struct the same method used to be
+# accepted, with the winning body decided by registration order. the
+# second declaration of the same kind is now rejected. (an interface impl
+# re-declaring an inherent method stays legal — that pair is std/io's
+# conformance idiom.)
+struct S:
+    pub v: Int
+
+impl S:
+    fn foo() -> Int:
+        return 1
+
+impl S:
+    fn foo() -> Int:
+        return 2
+
+fn main():
+    s := S(3)
+    print("{s.foo()}")

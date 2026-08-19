@@ -55,43 +55,6 @@ fn atomic_temp_path(target_path: String) -> String:
     prefix := "." + path.base(target_path) + "."
     return temp_path_impl(dir_path, prefix, ".tmp")
 
-# the bytes are gathered and decoded once at the end. a read of a fixed number
-# of bytes stops wherever the count lands, including halfway through a
-# character, so decoding each chunk as it arrived rejected the whole read
-# whenever a character straddled a chunk boundary — an ordinary thing for a
-# 4 KiB read of ordinary text to do. a character split across two chunks is not
-# a decode error, it is two chunks.
-fn fs_read_all(stream: FileStream) -> String!:
-    return fs_read_all_bytes(stream)!.to_string_utf8()!
-
-fn fs_read_all_bytes(stream: FileStream) -> Bytes!:
-    buf := bytes.buffer_with_capacity(FS_IO_CHUNK_SIZE)
-    mut chunk := stream.read_bytes(FS_IO_CHUNK_SIZE)!
-    while not chunk.is_empty():
-        buf.write(chunk)!
-        chunk = stream.read_bytes(FS_IO_CHUNK_SIZE)!
-    return buf.bytes()
-
-# the text write_all resumes through its bytes counterpart rather than
-# re-slicing the String. a write stops at whatever byte offset the sink ran out
-# at, and that offset can be inside a multi-byte character — which a String
-# cannot be cut at, so resuming as text would stop the process outright on the
-# first non-ascii payload big enough to be split. std.io's write loops were put
-# right this way already; this is the copy that lives here.
-fn fs_write_all(stream: FileStream, data: String) -> Int!:
-    return fs_write_all_bytes(stream, bytes.from_string_utf8(data))
-
-fn fs_write_all_bytes(stream: FileStream, data: Bytes) -> Int!:
-    mut total := 0
-    mut remaining := data
-    while not remaining.is_empty():
-        wrote := stream.write_bytes(remaining)!
-        if wrote <= 0:
-            fail "write returned 0"
-        total = total + wrote
-        remaining = remaining.slice(wrote, remaining.len())
-    return total
-
 # ===============================================================
 # File Existence and Type
 # ===============================================================
@@ -174,33 +137,12 @@ pub fn create(path: String) -> FileStream!:
 pub fn open_append(path: String) -> FileStream!:
     return FileStream(file_open_append(path)!)
 
-impl FileStream:
-    fn read(max_bytes: Int) -> String!:
-        return file_read_bytes(self.handle, max_bytes)!.to_string_utf8()!
-
-    fn read_all() -> String!:
-        return fs_read_all(self)
-
-    fn read_bytes(max_bytes: Int) -> Bytes!:
-        return file_read_bytes(self.handle, max_bytes)
-
-    fn read_all_bytes() -> Bytes!:
-        return fs_read_all_bytes(self)
-
-    fn write(data: String) -> Int!:
-        return file_write_bytes(self.handle, bytes.from_string_utf8(data))!
-
-    fn write_all(data: String) -> Int!:
-        return fs_write_all(self, data)
-
-    fn write_bytes(data: Bytes) -> Int!:
-        return file_write_bytes(self.handle, data)
-
-    fn write_all_bytes(data: Bytes) -> Int!:
-        return fs_write_all_bytes(self, data)
-
-    fn close():
-        file_close(self.handle)
+# FileStream's methods live on the struct's home module: std.io declares
+# read/read_all/write/write_all/close and the rest, and they resolve from
+# here too. this module used to re-declare nine of them with its own
+# (behaviorally identical) bodies, which made "which body answers" a
+# module-order accident — the duplicate impl block is gone and E263 now
+# rejects the shape.
 
 # ===============================================================
 # File and Directory Management

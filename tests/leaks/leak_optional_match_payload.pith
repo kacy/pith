@@ -1,0 +1,39 @@
+# churn a match on an rc-payload optional, in the three shapes that used to
+# leak the payload (~110-170 bytes per round): a same-function match, a
+# callee that matches its optional parameter, and the call-produced variant
+# where the fresh optional is matched straight from argument position. the
+# arm binding now retains its own count and the exit cleanup releases it,
+# match is a whitelisted use in the payload-release cascade, and a tail
+# match's expression arm returns through the full return contract.
+import leakprobe as probe
+
+struct Node:
+    pub val: Int
+    pub tag: String
+
+fn mk(i: Int) -> Node?:
+    return Node(val: i, tag: "node " + i.to_string())
+
+fn val_of(box: Node?) -> Int:
+    match box:
+        none => 0
+        v => v.val
+
+fn round(i: Int) -> Int:
+    o := mk(i)
+    here := match o:
+        none => 0
+        v => v.val
+    return here + val_of(o) + val_of(mk(i + 1))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

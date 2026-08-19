@@ -1,0 +1,40 @@
+# a match on an rc-payload optional, in every position that used to leak or
+# misbehave: same-function match, match on a local passed to a callee that
+# matches its parameter, a tail match whose arm returns the binding's field,
+# and an arm that returns the binding WHOLE (the transfer case — the tail
+# return must exclude it from cleanup, not release it under the caller).
+struct Node:
+    pub val: Int
+    pub tag: String
+
+fn mk(i: Int) -> Node?:
+    return Node(val: i, tag: "node " + i.to_string())
+
+fn val_of(box: Node?) -> Int:
+    match box:
+        none => 0
+        v => v.val
+
+fn tag_of(box: Node?) -> String:
+    match box:
+        none => "empty"
+        v => v.tag
+
+fn take_whole(box: Node?) -> Node:
+    match box:
+        none => Node(val: 0 - 1, tag: "missing")
+        v => v
+
+fn main():
+    o := mk(7)
+    r := match o:
+        none => 0
+        v => v.val
+    print("{r}")
+    print("{val_of(o)}")
+    print(tag_of(o))
+    print(tag_of(none))
+    w := take_whole(mk(9))
+    print("{w.val} {w.tag}")
+    n: Node? := none
+    print("{val_of(n)}")

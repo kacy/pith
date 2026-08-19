@@ -1155,7 +1155,15 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 if client_cert_required and (client_certs.len() == 0 or not client_cert_verify_seen):
                     fail "client finished arrived before client certificate verification"
                 verify_data := tls13.parse_finished(message.body)!
-                if not tls13.verify_finished_sha256(client_hs_secret, application_transcript, verify_data)!:
+                # verify the client Finished over the LIVE transcript, which by
+                # now includes the client Certificate and CertificateVerify
+                # appended above (RFC 8446 4.4.4). application_transcript is the
+                # snapshot taken at the server Finished and is deliberately kept
+                # for the application-secret derivation below, which is keyed on
+                # exactly that earlier point — using it here rejected every
+                # genuine mTLS client, since the client computes its Finished
+                # over the full transcript.
+                if not tls13.verify_finished_sha256(client_hs_secret, transcript.bytes(), verify_data)!:
                     fail "client finished verification failed"
                 transcript_append(transcript, message)!
                 client_finished_seen = true

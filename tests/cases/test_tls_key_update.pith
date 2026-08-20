@@ -1,0 +1,57 @@
+# TLS 1.3 KeyUpdate, exercised pith-to-pith. The client sends data, requests a
+# key update (which asks the server to rekey too), then sends more data. Every
+# message must still round-trip: a mishandled KeyUpdate shows up as a failed
+# read or a wrong echo, because the record sequence resets and the AEAD keys
+# change on both sides. This is the interop path a conformant peer's KeyUpdate
+# takes; before it was handled, the second message would fail the tag.
+
+import std.net.tls as tls
+
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+PORT := 50795
+
+fn serve(listener: tls.Listener):
+    r := listener.accept()
+    if r.is_err:
+        return
+    conn := r.ok
+    mut i := 0
+    while i < 3:
+        msg := conn.read(64)
+        if msg.is_err:
+            break
+        got := msg.ok
+        if got.len() == 0:
+            break
+        conn.write_all("echo:" + got) catch 0
+        i = i + 1
+    conn.close()
+
+fn main() -> Int!:
+    server_cfg := tls.server_config(CERT, KEY)!
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    spawn serve(listener)
+
+    cfg := tls.client_config_with_ca_file(CA)!
+    conn := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)!
+    print("version:" + conn.version_name())
+
+    conn.write_all("one")!
+    print(conn.read(64)!)
+
+    # rekey both directions, then keep talking.
+    updated := conn.request_key_update()!
+    print("key-updated:" + updated.to_string())
+
+    conn.write_all("two")!
+    print(conn.read(64)!)
+    conn.write_all("three")!
+    print(conn.read(64)!)
+
+    conn.close()
+    cfg.close()
+    listener.close()
+    server_cfg.close()
+    return 0

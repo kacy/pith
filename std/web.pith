@@ -483,10 +483,23 @@ fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String
 
 # true when `path` lives under `prefix`: the prefix itself, or anything
 # below it. "/api" scopes "/api" and "/api/me" but not "/apiary".
+#
+# this compares on path segments, exactly as the router matches routes, so the
+# two never disagree. a raw `starts_with` would let "//api/me" — which the
+# router collapses to "/api/me" and happily matches a guarded route — slip the
+# group guard, because "//api/me" does not start with "/api/". segmenting both
+# sides closes that bypass.
 fn path_in_scope(path: String, prefix: String) -> Bool:
-    if path == prefix:
-        return true
-    return path.starts_with(prefix + "/")
+    prefix_parts := http.path_segments(prefix)
+    path_parts := http.path_segments(path)
+    if path_parts.len() < prefix_parts.len():
+        return false
+    mut i := 0
+    while i < prefix_parts.len():
+        if path_parts[i] != prefix_parts[i]:
+            return false
+        i = i + 1
+    return true
 
 # the middleware onion for `path`: app-wide first, then any group middleware
 # whose prefix covers it — so a group guard runs inside the logging and
@@ -1158,6 +1171,21 @@ test "the synthesized OPTIONS answer runs through the middleware chain":
     resp := dispatch(app, request_for("OPTIONS", "/about"))
 
     assert_eq(resp.body_text()!, "a()")
+
+fn deny_group(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    return http.text(401, "blocked")
+
+test "a group guard is not bypassed by a leading or doubled empty path segment":
+    # the router collapses empty segments, so "//api/items" and "/api//items"
+    # both reach the guarded handler; the scope check must collapse them too or
+    # the group guard is skipped.
+    app := bare().group("/api", deny_group).get("/api/items", show_user)
+    assert_eq(dispatch(app, request_for("GET", "/api/items")).status, 401)
+    assert_eq(dispatch(app, request_for("GET", "//api/items")).status, 401)
+    assert_eq(dispatch(app, request_for("GET", "/api//items")).status, 401)
+    # a path genuinely outside the group is still unguarded.
+    open_app := bare().group("/api", deny_group).get("/items", show_user)
+    assert_eq(dispatch(open_app, request_for("GET", "/items")).status, 200)
 
 test "a group guard also wraps the synthesized OPTIONS answer":
     app := bare().group("/api", bracket_b).get("/api/items", show_user)

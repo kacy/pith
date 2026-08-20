@@ -3,7 +3,7 @@
 pith's native tls stack lives in `std.net.tls` and `std.net.tls13`.
 
 the current shape is:
-- tls 1.3 only
+- tls 1.3, with a tls 1.2 fallback (ecdhe + aead only)
 - client and server handshakes in pith
 - alpn
 - strict and optional verified client auth
@@ -268,10 +268,14 @@ there are also small wrappers on `Conn` for the common cases:
 - `ip_addresses`
 - `is_ca`
 
-`version_name()` currently returns `tls1.3` for native connections.
+`version_name()` returns `tls1.3` or `tls1.2` for native connections.
 `cipher_suite_name()` returns one of:
-- `TLS_AES_128_GCM_SHA256`
-- `TLS_CHACHA20_POLY1305_SHA256`
+- `TLS_AES_128_GCM_SHA256` (1.3)
+- `TLS_CHACHA20_POLY1305_SHA256` (1.3)
+- `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (1.2)
+- `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (1.2)
+- `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (1.2)
+- `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (1.2)
 
 ## verification hooks
 
@@ -301,9 +305,36 @@ there are three current server modes:
 in optional mode, a client may omit its certificate.
 if it does send one, pith verifies it against the configured ca bundle.
 
+## the tls 1.2 fallback
+
+both the client and server negotiate tls 1.3 and, when a peer cannot speak 1.3,
+fall back to tls 1.2 — the highest version a peer supports wins, and anything
+below 1.2 is refused. this matches go's crypto/tls and rustls. the fallback is
+deliberately narrow and forward-secret: only the four ecdhe-rsa/ecdhe-ecdsa
+aes-128-gcm and chacha20-poly1305 suites are offered or accepted, so static-rsa
+key exchange, cbc suites, rc4, 3des, dhe, and psk are refused by construction.
+
+downgrade protection is built in: the client offers `supported_versions`
+{1.3, 1.2} plus extended master secret (rfc 7627) and renegotiation_info
+(rfc 5746); a 1.3-capable server that negotiates 1.2 marks its random with the
+rfc 8446 downgrade sentinel, and a 1.3-capable client that lands on 1.2 aborts
+if it sees that sentinel (an active attacker stripped the 1.3 offer). the
+client also requires the server to have negotiated extended master secret.
+
+`require_tls13()` locks a config to tls 1.3, refusing the fallback — the
+equivalent of a minimum version of 1.3:
+
+```pith
+cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.require_tls13()
+```
+
+what the 1.2 fallback does not do (v1): session resumption, renegotiation
+(refused), client-certificate auth (the server refuses a 1.2 CertificateRequest
+path), aes-256 suites, or sni-based server config selection. it needs a
+≥2048-bit rsa server key.
+
 ## current limits
 
-- tls 1.3 only
-- no tls 1.2 compatibility mode
+- the 1.2 fallback is ecdhe + aead only, with the caveats above
 - config selection is the dynamic handshake hook today
 - the connection state exposes peer identity summaries, not full verified chains yet

@@ -80,9 +80,19 @@ pub fn row(values: List[Value], names: List[String]) -> Row:
     return Row(values: values, names: names)
 
 impl Row:
-    # the raw value at a column index.
-    pub fn get(col: Int) -> Value:
+    # the value at a column index, or Null when the index is out of range. a
+    # server can send a DataRow with fewer fields than its RowDescription
+    # named; strict list indexing would then abort the whole process on an
+    # ordinary row.int("col") rather than fall back to the zero value the
+    # accessors promise. all accessors read through here.
+    fn value_at(col: Int) -> Value:
+        if col < 0 or col >= self.values.len():
+            return Value.Null
         return self.values[col]
+
+    # the raw value at a column index (Null when out of range).
+    pub fn get(col: Int) -> Value:
+        return self.value_at(col)
 
     # typed accessors. they coerce where it is lossless (an Integer read as Real)
     # and fall back to a zero value otherwise, so callers that know their schema
@@ -94,7 +104,7 @@ impl Row:
     # three that never loses anything, which is why an exact column should be
     # read with it.
     pub fn as_int(col: Int) -> Int:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Integer(n) => n
             Value.Real(f) => f.to_int()
             Value.Numeric(d) => decimal.to_int(d).unwrap_or(0)
@@ -102,7 +112,7 @@ impl Row:
 
     # the column read as a Float (an Integer coerces exactly, a Numeric rounds).
     pub fn as_real(col: Int) -> Float:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Real(f) => f
             Value.Integer(n) => n.to_float()
             Value.Numeric(d) => decimal.to_float(d)
@@ -112,26 +122,26 @@ impl Row:
     # does not, because a Float has already lost whatever it was going to lose,
     # so a float column reads as zero here rather than pretending otherwise.
     pub fn as_decimal(col: Int) -> decimal.Decimal:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Numeric(d) => d
             Value.Integer(n) => decimal.from_int(n)
             _ => decimal.zero()
 
     # the column read as text, or "" when it is not text.
     pub fn as_text(col: Int) -> String:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Text(s) => s
             _ => ""
 
     # the column read as a byte blob, or empty when it is not a blob.
     pub fn as_blob(col: Int) -> Bytes:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Blob(b) => b
             _ => bytes.empty()
 
     # true when the column is null.
     pub fn is_null(col: Int) -> Bool:
-        return match self.values[col]:
+        return match self.value_at(col):
             Value.Null => true
             _ => false
 
@@ -350,6 +360,18 @@ test "typed accessors read a column by index":
     assert_eq(r.int_at(0), 42)
     assert_eq(r.text_at(1), "ada")
     assert_eq(r.bool_at(2), false)
+
+test "a short row does not abort when a named column has no value":
+    # a server can send a DataRow with fewer fields than its RowDescription
+    # named; strict list indexing would abort the process. every accessor must
+    # fall back to the zero value instead.
+    r := row([integer(7)], ["id", "email", "total"])
+    assert_eq(r.int("id"), 7)
+    assert_eq(r.text("email"), "")
+    assert_eq(r.int("total"), 0)
+    assert_eq(r.as_int(5), 0)
+    assert_eq(r.as_text(5), "")
+    assert(r.is_null(5))
 
 test "a missing column reads as a zero value":
     r := row([integer(1)], ["id"])

@@ -489,6 +489,10 @@ fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!
     write_bytes_if_any(out, transcript_hash)!
     return out.bytes()
 
+# Verify a signature over `message` under a certificate's public key for the
+# given TLS signature scheme (RSA-PKCS1, ECDSA-P256, RSA-PSS, or Ed25519), the
+# check behind CertificateVerify and the TLS 1.2 ServerKeyExchange. An unknown
+# scheme returns false.
 pub fn verify_certificate_signature(public_key: Bytes, scheme: Int, message: Bytes, signed: Bytes) -> Bool!:
     if scheme == SIG_RSA_PKCS1_SHA256:
         return signature.verify_rsa_pkcs1_sha256(public_key, message, signed)
@@ -976,6 +980,9 @@ pub fn negotiated_server_version(body: Bytes) -> Int!:
             return checked_read(binary.read_u16_be(dr))!
     return legacy_version
 
+# Parse a TLS 1.3 ServerHello body into the fields the key schedule needs. Fails
+# unless the server negotiated 1.3 with a key share; use negotiated_server_version
+# to branch before calling this.
 pub fn parse_server_hello(body: Bytes) -> ServerHello!:
     r := binary.reader(body)
     legacy_version := checked_read(binary.read_u16_be(r))!

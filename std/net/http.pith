@@ -1105,7 +1105,39 @@ fn transfer_encoding_value(raw_head: Bytes) -> String:
     return (decode_utf8(header_value_bytes(raw_head, "Transfer-Encoding")) catch "").to_lower()
 
 fn uses_chunked_transfer_encoding(raw_head: Bytes) -> Bool:
-    return transfer_encoding_value(raw_head).contains("chunked")
+    return transfer_encoding_is_chunked(transfer_encoding_value(raw_head))
+
+# a Transfer-Encoding is chunked only when `chunked` is its FINAL coding
+# (RFC 9112 6.1). match it as a comma-separated token, not a substring — a
+# substring test also fires on `xchunked` or a `chunked` that some other
+# coding follows, both of which must NOT be read as a chunked body.
+fn transfer_encoding_is_chunked(te_value: String) -> Bool:
+    if te_value.len() == 0:
+        return false
+    mut last := ""
+    for part in te_value.split(","):
+        trimmed := part.trim()
+        if trimmed.len() > 0:
+            last = trimmed
+    return last == "chunked"
+
+# decide how a REQUEST body is framed, rejecting the ambiguous shapes an
+# attacker uses to smuggle a second request past a front-end proxy that
+# frames it the other way (RFC 9112 6.1, 6.3):
+#   - Transfer-Encoding and Content-Length together — the proxy and this
+#     server can disagree on where the body ends, so refuse it outright.
+#   - a Transfer-Encoding this server cannot frame (anything whose final
+#     coding is not `chunked`) — refuse rather than fall back to a length.
+# returns true when the body is chunked, false when it is length-delimited.
+fn request_body_is_chunked(raw_head: Bytes) -> Bool!:
+    te := transfer_encoding_value(raw_head)
+    if te.len() == 0:
+        return false
+    if header_value_bytes(raw_head, "Content-Length").len() > 0:
+        fail "ambiguous request framing: both Transfer-Encoding and Content-Length"
+    if not transfer_encoding_is_chunked(te):
+        fail "unsupported Transfer-Encoding: " + te
+    return true
 
 fn chunk_size_line_bytes(raw: Bytes) -> Bytes:
     mut end := raw.len()
@@ -1935,7 +1967,7 @@ fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
     return bytes.empty()
 
 fn stream_request_body_buffered(head_bytes: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    if uses_chunked_transfer_encoding(head_bytes):
+    if request_body_is_chunked(head_bytes)!:
         return stream_chunked_body_from_reader(reader, writer)
     content_length := content_length_from_head_bytes(head_bytes)!
     return stream_exact_bytes_from_reader(reader, writer, content_length)
@@ -1944,7 +1976,7 @@ fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestB
     head_bytes := read_request_head_buffered_bytes(reader)!
     if head_bytes.is_empty():
         return build_http_request(bytes.empty(), bytes.empty())
-    if uses_chunked_transfer_encoding(head_bytes):
+    if request_body_is_chunked(head_bytes)!:
         return build_http_request(head_bytes, read_chunked_body(reader, MAX_REQUEST_BODY)!)
     content_length := content_length_from_head_bytes(head_bytes)!
     # reject an over-large declared length before allocating for it, so a hostile
@@ -2009,6 +2041,11 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
             fail HEADER_LIMIT_MESSAGE
         line = read_head_line_bounded(reader, MAX_HEADER_BYTES - raw.len())!
     raw.write(bytes.from_string_utf8(crlf))!
+    # this legacy path frames the body by Content-Length only. reject a
+    # Transfer-Encoding (and the ambiguous TE+CL smuggling shape) rather than
+    # silently ignoring it and mis-framing the body.
+    if request_body_is_chunked(raw.bytes())!:
+        fail "chunked request bodies are not supported on the string reader; use read_request_bytes"
     content_length := content_length_from_head_bytes(raw.bytes())!
     if content_length > MAX_REQUEST_BODY:
         fail BODY_LIMIT_MESSAGE
@@ -3088,7 +3125,7 @@ fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
     head_bytes := read_request_head_tls(conn)!
     if head_bytes.is_empty():
         return build_http_request(bytes.empty(), bytes.empty())
-    if uses_chunked_transfer_encoding(head_bytes):
+    if request_body_is_chunked(head_bytes)!:
         return build_http_request(head_bytes, read_chunked_body_tls(conn, MAX_REQUEST_BODY)!)
     content_length := content_length_from_head_bytes(head_bytes)!
     # reject an over-large declared length before allocating for it, matching the
@@ -3241,6 +3278,25 @@ test "http strips control characters from response headers":
     # no injected header line survives; the value collapses onto one line
     assert(not payload.contains(crlf + "Injected:"))
     assert(payload.contains("X-Echo: valueInjected: evil"))
+
+test "http rejects a request that smuggles both transfer-encoding and content-length":
+    crlf := chr(13) + chr(10)
+    raw := "POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Content-Length: 6" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + "0" + crlf + crlf
+    result := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(8))
+    assert(result.is_err)
+
+test "http frames the request body by the chunked transfer-encoding token, not a substring":
+    crlf := chr(13) + chr(10)
+    # a substring match on "chunked" would frame `xchunked` as a chunked body;
+    # it must be treated as an unframable encoding and rejected, not read as CL.
+    head := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Transfer-Encoding: xchunked" + crlf + crlf)
+    assert(request_body_is_chunked(head).is_err)
+    # a genuine `chunked` (the final token, with other codings before it) is chunked
+    good := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Transfer-Encoding: gzip, chunked" + crlf + crlf)
+    assert(request_body_is_chunked(good)! == true)
+    # a plain length-delimited request is not chunked and does not fail
+    plain := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Content-Length: 3" + crlf + crlf)
+    assert(request_body_is_chunked(plain)! == false)
 
 test "http accepts zero content length":
     crlf := chr(13) + chr(10)

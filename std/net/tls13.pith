@@ -40,6 +40,11 @@ EXT_PSK_KEY_EXCHANGE_MODES := 45
 EXT_SUPPORTED_GROUPS := 10
 EXT_SIGNATURE_ALGORITHMS := 13
 EXT_SUPPORTED_VERSIONS := 43
+# extensions a combined 1.2+1.3 ClientHello adds for the 1.2 fallback: extended
+# master secret (rfc 7627) and renegotiation_info (rfc 5746). a 1.3 server
+# ignores both.
+EXT_EXTENDED_MASTER_SECRET := 23
+EXT_RENEGOTIATION_INFO := 65281
 EXT_KEY_SHARE := 51
 CIPHER_TLS_AES_128_GCM_SHA256 := 4865
 CIPHER_TLS_CHACHA20_POLY1305_SHA256 := 4867
@@ -484,7 +489,11 @@ fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!
     write_bytes_if_any(out, transcript_hash)!
     return out.bytes()
 
-fn verify_certificate_signature(public_key: Bytes, scheme: Int, message: Bytes, signed: Bytes) -> Bool!:
+# Verify a signature over `message` under a certificate's public key for the
+# given TLS signature scheme (RSA-PKCS1, ECDSA-P256, RSA-PSS, or Ed25519), the
+# check behind CertificateVerify and the TLS 1.2 ServerKeyExchange. An unknown
+# scheme returns false.
+pub fn verify_certificate_signature(public_key: Bytes, scheme: Int, message: Bytes, signed: Bytes) -> Bool!:
     if scheme == SIG_RSA_PKCS1_SHA256:
         return signature.verify_rsa_pkcs1_sha256(public_key, message, signed)
     if scheme == SIG_ECDSA_SECP256R1_SHA256:
@@ -577,6 +586,76 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
     write_u8(body, session_id.len())!
     write_bytes_if_any(body, session_id)!
     write_u16_vector(body, [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_CHACHA20_POLY1305_SHA256])!
+    write_u8(body, 1)!
+    write_u8(body, 0)!
+    write_u16_be(body, extensions.len())!
+    write_bytes_if_any(body, extensions)!
+    return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
+
+# The supported_versions extension offering both TLS 1.3 and 1.2, highest first,
+# for a combined ClientHello. The server picks the highest it supports.
+fn supported_versions_client_extension_both() -> Bytes!:
+    data := bytes.buffer_with_capacity(5)
+    defer data.free()
+    write_u8(data, 4)!
+    write_u16_be(data, TLS13_VERSION)!
+    write_u16_be(data, TLS_LEGACY_VERSION)!
+    return extension_record(EXT_SUPPORTED_VERSIONS, data.bytes())
+
+# An empty extended_master_secret extension (rfc 7627): a bare flag.
+fn extended_master_secret_extension() -> Bytes!:
+    return extension_record(EXT_EXTENDED_MASTER_SECRET, bytes.empty())
+
+# A renegotiation_info extension carrying an empty renegotiated_connection
+# (rfc 5746): this connection is initial, and we refuse renegotiation.
+fn renegotiation_info_extension() -> Bytes!:
+    data := bytes.buffer_with_capacity(1)
+    defer data.free()
+    write_u8(data, 0)!
+    return extension_record(EXT_RENEGOTIATION_INFO, data.bytes())
+
+# The ClientHello extensions for a combined 1.2+1.3 offer: the common set, but
+# with supported_versions offering both and the two 1.2-fallback extensions
+# added. No PSK — resumption is a 1.3-only path that never offers 1.2.
+fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String]) -> Bytes!:
+    if x25519_public_key.len() != 32:
+        fail "x25519 public key must be 32 bytes"
+    if p256_public_key.len() != 0 and p256_public_key.len() != 65:
+        fail "p-256 public key must be a 65-byte uncompressed point"
+    mut groups := [GROUP_X25519]
+    if p256_public_key.len() > 0:
+        groups.push(GROUP_SECP256R1)
+    out := bytes.buffer()
+    defer out.free()
+    write_bytes_if_any(out, server_name_extension(server_name)!)!
+    write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
+    write_bytes_if_any(out, supported_versions_client_extension_both()!)!
+    write_bytes_if_any(out, supported_groups_extension(groups)!)!
+    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
+    write_bytes_if_any(out, extended_master_secret_extension()!)!
+    write_bytes_if_any(out, renegotiation_info_extension()!)!
+    write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
+    return out.bytes()
+
+# Encode a ClientHello that offers TLS 1.3 and, as a fallback, the TLS 1.2 suites
+# in `tls12_suites`. The 1.3 suites lead the cipher list so a 1.3 server still
+# prefers 1.3; a 1.2-only server picks a fallback suite. Never carries a PSK.
+pub fn encode_client_hello_offering_tls12(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], tls12_suites: List[Int]) -> Bytes!:
+    if random.len() != 32:
+        fail "tls client random must be 32 bytes"
+    if session_id.len() > 32:
+        fail "tls session id too long"
+    extensions := client_extensions_offering_tls12(server_name, x25519_public_key, p256_public_key, alpn_protocols)!
+    mut suites := [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_CHACHA20_POLY1305_SHA256]
+    for suite in tls12_suites:
+        suites.push(suite)
+    body := bytes.buffer()
+    defer body.free()
+    write_u16_be(body, TLS_LEGACY_VERSION)!
+    write_bytes_if_any(body, random)!
+    write_u8(body, session_id.len())!
+    write_bytes_if_any(body, session_id)!
+    write_u16_vector(body, suites)!
     write_u8(body, 1)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
@@ -813,6 +892,97 @@ pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher
     return encode_handshake(HANDSHAKE_SERVER_HELLO, body.bytes())
 
 # parse the server hello body from a tls handshake message.
+# A ClientHello parsed without assuming TLS 1.3: enough for a server to decide
+# which version to negotiate and, on the 1.2 fallback path, to pick a suite and
+# a curve. Unlike parse_client_hello it never fails for lacking a 1.3 key share.
+pub struct LenientClientHello:
+    pub random: Bytes
+    pub session_id: Bytes
+    pub cipher_suites: List[Int]
+    pub supported_versions: List[Int]
+    pub supported_groups: List[Int]
+    pub server_name: String
+    pub alpn_protocols: List[String]
+
+# Read a raw sequence of big-endian u16s that fills `data` exactly.
+fn parse_u16_sequence(data: Bytes) -> List[Int]!:
+    r := binary.reader(data)
+    mut out: List[Int] := []
+    while binary.remaining(r) > 0:
+        out.push(checked_read(binary.read_u16_be(r))!)
+    return out
+
+# Read a u16-length-prefixed list of big-endian u16s (e.g. supported_groups).
+fn parse_u16_prefixed_list(data: Bytes) -> List[Int]!:
+    r := binary.reader(data)
+    if binary.remaining(r) < 2:
+        return []
+    total := checked_read(binary.read_u16_be(r))!
+    return parse_u16_sequence(checked_bytes(binary.read_bytes(r, total))!)
+
+# Parse a ClientHello body leniently. Used by the server to branch on version
+# and to drive the TLS 1.2 fallback handshake.
+pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    random := checked_bytes(binary.read_bytes(r, 32))!
+    session_len := checked_read(binary.read_u8(r))!
+    session_id := checked_bytes(binary.read_bytes(r, session_len))!
+    cipher_len := checked_read(binary.read_u16_be(r))!
+    cipher_suites := parse_u16_sequence(checked_bytes(binary.read_bytes(r, cipher_len))!)!
+    compression_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, compression_len))!
+    mut supported_versions: List[Int] := []
+    mut supported_groups: List[Int] := []
+    mut server_name := ""
+    mut alpn_protocols: List[String] := []
+    if binary.remaining(r) > 0:
+        extension_len := checked_read(binary.read_u16_be(r))!
+        extensions := checked_bytes(binary.read_bytes(r, extension_len))!
+        er := binary.reader(extensions)
+        while binary.remaining(er) > 0:
+            extension_type := checked_read(binary.read_u16_be(er))!
+            data_len := checked_read(binary.read_u16_be(er))!
+            data := checked_bytes(binary.read_bytes(er, data_len))!
+            if extension_type == EXT_SUPPORTED_VERSIONS:
+                supported_versions = parse_supported_versions_list(data)!
+            elif extension_type == EXT_SUPPORTED_GROUPS:
+                supported_groups = parse_u16_prefixed_list(data)!
+            elif extension_type == EXT_SERVER_NAME:
+                server_name = parse_server_name_extension(data)!
+            elif extension_type == EXT_ALPN:
+                alpn_protocols = parse_alpn_protocol_list(data)!
+    return LenientClientHello(random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols)
+
+# The protocol version a server negotiated, read from a ServerHello body: the
+# supported_versions extension value when present (a 1.3 server always sends it),
+# otherwise the legacy version field (a 1.2 server, which has no such extension).
+# The caller branches on this before committing to a 1.3 or 1.2 parse.
+pub fn negotiated_server_version(body: Bytes) -> Int!:
+    r := binary.reader(body)
+    legacy_version := checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    session_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, session_len))!
+    checked_read(binary.read_u16_be(r))!
+    checked_read(binary.read_u8(r))!
+    if binary.remaining(r) == 0:
+        return legacy_version
+    extension_len := checked_read(binary.read_u16_be(r))!
+    extensions := checked_bytes(binary.read_bytes(r, extension_len))!
+    er := binary.reader(extensions)
+    while binary.remaining(er) > 0:
+        extension_type := checked_read(binary.read_u16_be(er))!
+        data_len := checked_read(binary.read_u16_be(er))!
+        data := checked_bytes(binary.read_bytes(er, data_len))!
+        if extension_type == EXT_SUPPORTED_VERSIONS:
+            dr := binary.reader(data)
+            return checked_read(binary.read_u16_be(dr))!
+    return legacy_version
+
+# Parse a TLS 1.3 ServerHello body into the fields the key schedule needs. Fails
+# unless the server negotiated 1.3 with a key share; use negotiated_server_version
+# to branch before calling this.
 pub fn parse_server_hello(body: Bytes) -> ServerHello!:
     r := binary.reader(body)
     legacy_version := checked_read(binary.read_u16_be(r))!

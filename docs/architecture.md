@@ -21,7 +21,7 @@ they are useful context when reading old notes, but they are not tracked as the
 current build/run path.
 
 networking and protocol layers now live mostly in the Pith stdlib. that
-includes `std.net.http`, `std.net.websocket`, and the native TLS 1.3 stack in
+includes `std.net.http`, `std.net.websocket`, and the native TLS stack (1.3 with a 1.2 fallback) in
 `std.net.tls` / `std.net.tls13`. Rust stays on the lower-level runtime side for
 storage, syscall-facing helpers, and the Cranelift backend.
 

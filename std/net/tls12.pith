@@ -418,17 +418,66 @@ pub fn parse_server_key_exchange(body: Bytes) -> Tls12ServerKeyExchange!:
     signature := checked_bytes(binary.read_bytes(r, signature_len))!
     return Tls12ServerKeyExchange(named_curve, public_point, signature_scheme, signature, signed_params)
 
-# Encode an ECDHE ServerKeyExchange body from its already-computed signature.
-pub fn encode_server_key_exchange(named_curve: Int, public_point: Bytes, signature_scheme: Int, signature: Bytes) -> Bytes!:
-    out := bytes.buffer_with_capacity(public_point.len() + signature.len() + 8)
+# The signed ECParameters portion of a ServerKeyExchange: curve type (named),
+# named curve, and the u8-prefixed public point. This is exactly the byte range
+# the server signs (after the two randoms) and the client verifies.
+pub fn server_key_exchange_params(named_curve: Int, public_point: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(public_point.len() + 4)
     defer out.free()
     checked_write(binary.write_u8(out, CURVE_TYPE_NAMED))!
     checked_write(binary.write_u16_be(out, named_curve))!
     checked_write(binary.write_u8(out, public_point.len()))!
     out.write(public_point)!
+    return out.bytes()
+
+# Encode an ECDHE ServerKeyExchange body from its already-computed signature.
+pub fn encode_server_key_exchange(named_curve: Int, public_point: Bytes, signature_scheme: Int, signature: Bytes) -> Bytes!:
+    params := server_key_exchange_params(named_curve, public_point)!
+    out := bytes.buffer_with_capacity(params.len() + signature.len() + 4)
+    defer out.free()
+    out.write(params)!
     checked_write(binary.write_u16_be(out, signature_scheme))!
     checked_write(binary.write_u16_be(out, signature.len()))!
     out.write(signature)!
+    return out.bytes()
+
+# Overwrite the last 8 bytes of a 32-byte random with the TLS 1.2 downgrade
+# sentinel, which a 1.3-capable server sets when it negotiates 1.2 so a
+# 1.3-capable client can detect a stripped 1.3 offer.
+pub fn apply_downgrade_sentinel(random: Bytes) -> Bytes!:
+    if random.len() != 32:
+        fail "tls server random must be 32 bytes"
+    return bytes.concat(bytes.slice(random, 0, 24), downgrade_sentinel_tls12())
+
+# Encode a 1.2 ServerHello body: version, random, session id, the selected
+# suite, null compression, and the extensions we always send — extended master
+# secret, an empty renegotiation_info, and ALPN when a protocol was selected.
+pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, alpn_protocol: String) -> Bytes!:
+    ext := bytes.buffer()
+    defer ext.free()
+    checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
+    checked_write(binary.write_u16_be(ext, 0))!
+    checked_write(binary.write_u16_be(ext, EXT_RENEGOTIATION_INFO))!
+    checked_write(binary.write_u16_be(ext, 1))!
+    checked_write(binary.write_u8(ext, 0))!
+    if alpn_protocol != "":
+        name := bytes.from_string_utf8(alpn_protocol)
+        checked_write(binary.write_u16_be(ext, EXT_ALPN))!
+        checked_write(binary.write_u16_be(ext, name.len() + 3))!
+        checked_write(binary.write_u16_be(ext, name.len() + 1))!
+        checked_write(binary.write_u8(ext, name.len()))!
+        ext.write(name)!
+    extensions := ext.bytes()
+    out := bytes.buffer()
+    defer out.free()
+    checked_write(binary.write_u16_be(out, TLS12_VERSION))!
+    out.write(random)!
+    checked_write(binary.write_u8(out, session_id.len()))!
+    out.write(session_id)!
+    checked_write(binary.write_u16_be(out, cipher_suite))!
+    checked_write(binary.write_u8(out, 0))!
+    checked_write(binary.write_u16_be(out, extensions.len()))!
+    out.write(extensions)!
     return out.bytes()
 
 # The bytes a ServerKeyExchange signature covers: the two randoms then the
@@ -613,3 +662,15 @@ test "a server hello with extensions parses its suite and flags":
     assert_eq(hello.extended_master_secret, true)
     assert_eq(hello.renegotiation_info.len(), 1)
     assert(bytes.eq(hello.random, random))
+
+test "the server hello encodes the sentinel and round-trips its flags":
+    base := encoding.from_hex("00112233445566778899aabbccddeeff0011223344556677")!
+    random := apply_downgrade_sentinel(bytes.concat(base, encoding.from_hex("aabbccddeeff0011")!))!
+    assert_eq(random.len(), 32)
+    assert(has_downgrade_sentinel(random))
+    body := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2")!
+    hello := parse_server_hello(body)!
+    assert_eq(hello.cipher_suite, TLS12_ECDHE_RSA_AES128_GCM_SHA256)
+    assert(hello.extended_master_secret)
+    assert_eq(hello.alpn_protocol, "h2")
+    assert(has_downgrade_sentinel(hello.random))

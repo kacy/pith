@@ -258,7 +258,11 @@ pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
     let a_bytes = a_ref.data.as_slice();
     let b_bytes = b_ref.data.as_slice();
     let max_len = a_bytes.len().max(b_bytes.len());
-    let mut diff = (a_bytes.len() ^ b_bytes.len()) as u8;
+    // fold the length difference in without narrowing it: casting the xor to
+    // u8 dropped the high bits, so two inputs whose lengths differ by an exact
+    // multiple of 256 (e.g. 16 vs 272) started the accumulator at 0 and could
+    // then compare equal if the longer input's extra bytes were all zero.
+    let mut diff = ((a_bytes.len() ^ b_bytes.len() != 0) as u8) * 0xff;
 
     for i in 0..max_len {
         let left = a_bytes.get(i).copied().unwrap_or(0);
@@ -588,6 +592,12 @@ mod tests {
             let e1 = pith_bytes_from_vec(Vec::new());
             let e2 = pith_bytes_from_vec(Vec::new());
             assert_eq!(pith_crypto_constant_time_eq(e1, e2), 1);
+            // lengths differing by an exact multiple of 256 must NOT read as
+            // equal even when the longer input's extra bytes are all zero: the
+            // length term used to be truncated to u8, so 0x100 vanished.
+            let short = pith_bytes_from_vec(vec![0u8; 16]);
+            let long = pith_bytes_from_vec(vec![0u8; 272]);
+            assert_eq!(pith_crypto_constant_time_eq(short, long), 0);
         }
     }
 

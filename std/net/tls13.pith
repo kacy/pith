@@ -28,6 +28,7 @@ pub MAX_CIPHERTEXT_RECORD := 16640
 HANDSHAKE_CLIENT_HELLO := 1
 HANDSHAKE_SERVER_HELLO := 2
 HANDSHAKE_NEW_SESSION_TICKET := 4
+HANDSHAKE_KEY_UPDATE := 24
 HANDSHAKE_ENCRYPTED_EXTENSIONS := 8
 HANDSHAKE_CERTIFICATE := 11
 HANDSHAKE_CERTIFICATE_REQUEST := 13
@@ -1168,6 +1169,29 @@ pub fn encode_finished(verify_data: Bytes) -> Bytes!:
         fail "empty tls finished verify data"
     return encode_handshake(HANDSHAKE_FINISHED, verify_data)
 
+# encode a KeyUpdate handshake message (RFC 8446 §4.6.3). request_update asks the
+# peer to update its own sending keys in response (update_requested = 1),
+# otherwise it just announces our own update (update_not_requested = 0).
+pub fn encode_key_update(request_update: Bool) -> Bytes!:
+    body := bytes.buffer_with_capacity(1)
+    defer body.free()
+    if request_update:
+        write_u8(body, 1)!
+    else:
+        write_u8(body, 0)!
+    return encode_handshake(HANDSHAKE_KEY_UPDATE, body.bytes())
+
+# parse a KeyUpdate body into its update_requested flag.
+pub fn parse_key_update(body: Bytes) -> Bool!:
+    if body.len() != 1:
+        fail "malformed key update message"
+    return body[0] == 1
+
+# the next-generation application traffic secret (RFC 8446 §7.2):
+# HKDF-Expand-Label(secret, "traffic upd", "", Hash.length).
+pub fn next_application_traffic_secret_sha256(secret: Bytes) -> Bytes!:
+    return hkdf_expand_label_sha256(secret, "traffic upd", bytes.empty(), 32)
+
 ## Parse a NewSessionTicket handshake body.
 pub fn parse_new_session_ticket(body: Bytes) -> NewSessionTicketMessage!:
     r := binary.reader(body)
@@ -1684,6 +1708,18 @@ test "tls13 builds certificate verify input":
     assert_eq(server_input[64 + SERVER_CERT_VERIFY_CONTEXT.len()], 0)
     assert(not bytes.eq(server_input, client_input))
     assert(not verify_server_certificate_sha256(bytes.empty(), 9999, transcript, bytes.empty())!)
+
+test "tls13 key update round-trips and derives the next traffic secret":
+    requested := decode_handshakes(encode_key_update(true)!)!
+    assert_eq(requested[0].message_type, HANDSHAKE_KEY_UPDATE)
+    assert(parse_key_update(requested[0].body)!)
+    announced := decode_handshakes(encode_key_update(false)!)!
+    assert(not parse_key_update(announced[0].body)!)
+    # the next-generation secret is 32 bytes and differs from its input.
+    secret := hkdf_expand_label_sha256(encoding.from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")!, "test", bytes.empty(), 32)!
+    next := next_application_traffic_secret_sha256(secret)!
+    assert_eq(next.len(), 32)
+    assert(not bytes.eq(next, secret))
 
 test "tls13 names alert descriptions and marks close_notify":
     # close_notify is the one alert the read path treats as a clean end of

@@ -493,6 +493,12 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
         fail "the jwks endpoint answered with something that is not utf-8"
     return text.ok
 
+# a jwks endpoint carries the process's entire root of trust, so it must come
+# over an authenticated channel. http is tolerated only for a sidecar on the
+# loopback interface, where there is no network path to tamper with.
+fn is_loopback_host(host: String) -> Bool:
+    return host == "localhost" or host == "127.0.0.1" or host == "::1" or host.starts_with("127.")
+
 fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> http.HttpResponse!:
     if target.scheme == "https":
         port := target.port
@@ -501,6 +507,11 @@ fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> htt
         return http.https_request_port("GET", target.host, port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
     if target.scheme != "http":
         fail "a jwks url must be https, or http for a loopback sidecar: " + target.scheme
+    # enforce what the http exception is FOR: a loopback sidecar. an http url to
+    # any other host would fetch the trust root in cleartext, letting anyone on
+    # the path substitute their own signing key and forge tokens for any user.
+    if not is_loopback_host(target.host):
+        fail "a jwks url may use http only for a loopback host, not: " + target.host
     port := target.port
     mut plain_port := port
     if plain_port <= 0:
@@ -555,6 +566,18 @@ fn eddsa_document() -> String:
 
 fn at(instant: Int) -> jwt.Options:
     return jwt.at_time(jwt.default_options(), instant)
+
+test "jwks refuses an http url to a non-loopback host":
+    assert(is_loopback_host("localhost"))
+    assert(is_loopback_host("127.0.0.1"))
+    assert(is_loopback_host("127.0.0.5"))
+    assert(is_loopback_host("::1"))
+    assert(not is_loopback_host("issuer.internal"))
+    assert(not is_loopback_host("evil.example"))
+    # a fetch to a non-loopback http endpoint fails at the scheme/host check,
+    # before any network i/o — the trust root must not travel in cleartext.
+    result := fetch("http://issuer.internal/.well-known/jwks.json", 100, 65536)
+    assert(result.is_err)
 
 test "an rsa jwk becomes the pkcs#1 der openssl writes":
     set := parse(rsa_document("rsa-1"))!

@@ -1632,11 +1632,33 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     native_write_all(stream, record)!
     return count
 
+# send a close_notify alert, best-effort, before the socket closes. this is
+# what lets a peer tell a clean shutdown from a truncation: without it, an
+# attacker who cuts the tcp connection looks identical to us finishing, and a
+# peer reading a length-delimited stream cannot know it got everything (RFC 8446
+# §6.1). a failure here (already-closed, poisoned connection) just falls through
+# to closing the socket.
+fn send_close_notify(cs: NativeConnState) -> Int!:
+    cs.write_mu.lock()
+    defer cs.write_mu.unlock()
+    if cs.failed:
+        return 0
+    alert := bytes.buffer_with_capacity(2)
+    defer alert.free()
+    alert.write_byte(1)!
+    alert.write_byte(tls13.ALERT_CLOSE_NOTIFY)!
+    seq := cs.write_seq
+    cs.write_seq = seq + 1
+    record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
+    native_write_all(TcpStream(cs.fd), record)!
+    return 0
+
 fn native_conn_close(handle: Int):
     if not native_conn_has(handle):
         return
-    fd := native_conn_get(handle).fd
-    tcp_close(fd)
+    cs := native_conn_get(handle)
+    send_close_notify(cs) catch 0
+    tcp_close(cs.fd)
     native_conn_drop(handle)
 
 # create a client config using system certificate roots.

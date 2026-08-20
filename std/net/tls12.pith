@@ -61,6 +61,11 @@ fn checked_read(result: Int!binary.BinaryError) -> Int!:
         fail result.err.message
     return result.ok
 
+fn checked_bytes(result: Bytes!binary.BinaryError) -> Bytes!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
 # ---------------------------------------------------------------
 # the PRF (RFC 5246 section 5)
 # ---------------------------------------------------------------
@@ -311,6 +316,169 @@ fn decode_record(data: Bytes) -> Tls12Record!:
     return Tls12Record(content_type, bytes.slice(data, 5, data.len()))
 
 # ---------------------------------------------------------------
+# handshake message bodies
+# ---------------------------------------------------------------
+#
+# The outer handshake framing (type + 3-byte length) is identical to TLS 1.3,
+# so callers use tls13.encode_handshake / tls13.decode_handshakes for that and
+# these functions only encode/parse the 1.2-specific message bodies.
+
+# The named curve id for an ECDHE key share we support (secp256r1 = 23,
+# x25519 = 29), plus the "named_curve" ECParameters curve type (3).
+pub NAMED_CURVE_SECP256R1 := 23
+pub NAMED_CURVE_X25519 := 29
+CURVE_TYPE_NAMED := 3
+
+# extension type ids that appear in a 1.2 ServerHello.
+EXT_ALPN := 16
+EXT_EXTENDED_MASTER_SECRET := 23
+EXT_RENEGOTIATION_INFO := 65281
+
+# A parsed 1.2 ServerHello: the selected suite, the server random (checked for
+# the downgrade sentinel by the caller), and the security-relevant extensions.
+pub struct Tls12ServerHello:
+    pub server_version: Int
+    pub random: Bytes
+    pub session_id: Bytes
+    pub cipher_suite: Int
+    pub extended_master_secret: Bool
+    pub renegotiation_info: Bytes
+    pub alpn_protocol: String
+
+# Parse a 1.2 ServerHello body. Compression other than null is refused (this
+# stack never offers it), and the extensions we care about — extended master
+# secret, renegotiation_info, and ALPN — are extracted; the caller enforces the
+# EMS-required and renegotiation-empty policy.
+pub fn parse_server_hello(body: Bytes) -> Tls12ServerHello!:
+    r := binary.reader(body)
+    version := checked_read(binary.read_u16_be(r))!
+    random := checked_bytes(binary.read_bytes(r, 32))!
+    session_id_len := checked_read(binary.read_u8(r))!
+    session_id := checked_bytes(binary.read_bytes(r, session_id_len))!
+    cipher := checked_read(binary.read_u16_be(r))!
+    compression := checked_read(binary.read_u8(r))!
+    if compression != 0:
+        fail "tls 1.2 server selected a compression method"
+    mut ems := false
+    mut reneg := bytes.empty()
+    mut alpn := ""
+    if binary.remaining(r) > 0:
+        ext_total := checked_read(binary.read_u16_be(r))!
+        ext_data := checked_bytes(binary.read_bytes(r, ext_total))!
+        er := binary.reader(ext_data)
+        while binary.remaining(er) > 0:
+            ext_type := checked_read(binary.read_u16_be(er))!
+            ext_len := checked_read(binary.read_u16_be(er))!
+            ext_value := checked_bytes(binary.read_bytes(er, ext_len))!
+            if ext_type == EXT_EXTENDED_MASTER_SECRET:
+                ems = true
+            elif ext_type == EXT_RENEGOTIATION_INFO:
+                reneg = ext_value
+            elif ext_type == EXT_ALPN:
+                alpn = first_alpn_protocol(ext_value)!
+    return Tls12ServerHello(version, random, session_id, cipher, ems, reneg, alpn)
+
+# The first protocol name from an ALPN extension value (a u16-prefixed list of
+# u8-prefixed names), or "" when the list is empty.
+fn first_alpn_protocol(ext_value: Bytes) -> String!:
+    r := binary.reader(ext_value)
+    if binary.remaining(r) < 2:
+        return ""
+    list_len := checked_read(binary.read_u16_be(r))!
+    if list_len == 0:
+        return ""
+    name_len := checked_read(binary.read_u8(r))!
+    name := checked_bytes(binary.read_bytes(r, name_len))!
+    return name.to_string_utf8()!
+
+# The ECDHE parameters and signature from a ServerKeyExchange. signed_params is
+# the exact ECParameters byte range the server signed (curve type, named curve,
+# and public point); the caller verifies the signature over
+# client_random ++ server_random ++ signed_params.
+pub struct Tls12ServerKeyExchange:
+    pub named_curve: Int
+    pub public_point: Bytes
+    pub signature_scheme: Int
+    pub signature: Bytes
+    pub signed_params: Bytes
+
+# Parse an ECDHE ServerKeyExchange body. Only the named_curve form is accepted.
+pub fn parse_server_key_exchange(body: Bytes) -> Tls12ServerKeyExchange!:
+    r := binary.reader(body)
+    curve_type := checked_read(binary.read_u8(r))!
+    if curve_type != CURVE_TYPE_NAMED:
+        fail "tls 1.2 server key exchange is not a named curve"
+    named_curve := checked_read(binary.read_u16_be(r))!
+    point_len := checked_read(binary.read_u8(r))!
+    public_point := checked_bytes(binary.read_bytes(r, point_len))!
+    # the signed ECParameters are exactly the bytes read so far.
+    signed_params := bytes.slice(body, 0, 4 + point_len)
+    signature_scheme := checked_read(binary.read_u16_be(r))!
+    signature_len := checked_read(binary.read_u16_be(r))!
+    signature := checked_bytes(binary.read_bytes(r, signature_len))!
+    return Tls12ServerKeyExchange(named_curve, public_point, signature_scheme, signature, signed_params)
+
+# Encode an ECDHE ServerKeyExchange body from its already-computed signature.
+pub fn encode_server_key_exchange(named_curve: Int, public_point: Bytes, signature_scheme: Int, signature: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(public_point.len() + signature.len() + 8)
+    defer out.free()
+    checked_write(binary.write_u8(out, CURVE_TYPE_NAMED))!
+    checked_write(binary.write_u16_be(out, named_curve))!
+    checked_write(binary.write_u8(out, public_point.len()))!
+    out.write(public_point)!
+    checked_write(binary.write_u16_be(out, signature_scheme))!
+    checked_write(binary.write_u16_be(out, signature.len()))!
+    out.write(signature)!
+    return out.bytes()
+
+# The bytes a ServerKeyExchange signature covers: the two randoms then the
+# signed ECParameters.
+pub fn server_key_exchange_signed_data(client_random: Bytes, server_random: Bytes, signed_params: Bytes) -> Bytes:
+    return bytes.concat(bytes.concat(client_random, server_random), signed_params)
+
+# Encode a ClientKeyExchange body: the client's ECDHE public point, u8-prefixed.
+pub fn encode_client_key_exchange(public_point: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(public_point.len() + 1)
+    defer out.free()
+    checked_write(binary.write_u8(out, public_point.len()))!
+    out.write(public_point)!
+    return out.bytes()
+
+# Parse a ClientKeyExchange body into the client's ECDHE public point.
+pub fn parse_client_key_exchange(body: Bytes) -> Bytes!:
+    r := binary.reader(body)
+    point_len := checked_read(binary.read_u8(r))!
+    return checked_bytes(binary.read_bytes(r, point_len))!
+
+# Parse a 1.2 Certificate message body (a u24-prefixed list of u24-prefixed
+# certificates) into raw DER certificates, leaf first. Unlike 1.3 there is no
+# request context and no per-certificate extensions.
+pub fn parse_certificate_message(body: Bytes) -> List[Bytes]!:
+    r := binary.reader(body)
+    total := checked_read(binary.read_u24_be(r))!
+    list := checked_bytes(binary.read_bytes(r, total))!
+    lr := binary.reader(list)
+    mut certs: List[Bytes] := []
+    while binary.remaining(lr) > 0:
+        cert_len := checked_read(binary.read_u24_be(lr))!
+        certs.push(checked_bytes(binary.read_bytes(lr, cert_len))!)
+    return certs
+
+# Encode a 1.2 Certificate message body from a leaf-first list of DER certs.
+pub fn encode_certificate_message(certificates: List[Bytes]) -> Bytes!:
+    inner := bytes.buffer()
+    defer inner.free()
+    for cert in certificates:
+        checked_write(binary.write_u24_be(inner, cert.len()))!
+        inner.write(cert)!
+    list_bytes := inner.bytes()
+    out := bytes.buffer_with_capacity(list_bytes.len() + 3)
+    defer out.free()
+    checked_write(binary.write_u24_be(out, list_bytes.len()))!
+    out.write(list_bytes)!
+    return out.bytes()
+
+# ---------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------
 
@@ -386,3 +554,62 @@ test "the suite policy accepts only ecdhe aead and refuses the rest":
     assert_eq(suite_iv_len(TLS12_ECDHE_RSA_AES128_GCM_SHA256), 4)
     assert_eq(suite_key_len(TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256), 32)
     assert_eq(suite_iv_len(TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256), 12)
+
+test "the server key exchange round-trips and exposes the signed params":
+    point := encoding.from_hex("04aabbccdd")!
+    sig := encoding.from_hex("30450220deadbeef")!
+    body := encode_server_key_exchange(NAMED_CURVE_SECP256R1, point, 1027, sig)!
+    ske := parse_server_key_exchange(body)!
+    assert_eq(ske.named_curve, NAMED_CURVE_SECP256R1)
+    assert(bytes.eq(ske.public_point, point))
+    assert_eq(ske.signature_scheme, 1027)
+    assert(bytes.eq(ske.signature, sig))
+    # signed params = curve_type(1) + named_curve(2) + point_len(1) + point
+    expected_params := bytes.concat(encoding.from_hex("03001705")!, point)
+    assert(bytes.eq(ske.signed_params, expected_params))
+    # a non-named-curve form is refused.
+    assert(parse_server_key_exchange(encoding.from_hex("010017")!).is_err)
+
+test "the client key exchange round-trips":
+    point := encoding.from_hex("0401020304050607")!
+    body := encode_client_key_exchange(point)!
+    parsed := parse_client_key_exchange(body)!
+    assert(bytes.eq(parsed, point))
+
+test "the certificate message round-trips leaf first":
+    leaf := encoding.from_hex("11111111")!
+    intermediate := encoding.from_hex("2222222222")!
+    body := encode_certificate_message([leaf, intermediate])!
+    certs := parse_certificate_message(body)!
+    assert_eq(certs.len(), 2)
+    assert(bytes.eq(certs[0], leaf))
+    assert(bytes.eq(certs[1], intermediate))
+
+test "a server hello with extensions parses its suite and flags":
+    # version 0303, 32-byte random, empty session id, suite c02f, null
+    # compression, then extensions: extended_master_secret (0017,0000) and
+    # renegotiation_info (ff01,0001,00).
+    random := encoding.from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")!
+    out := bytes.buffer()
+    defer out.free()
+    checked_write(binary.write_u16_be(out, TLS12_VERSION))!
+    out.write(random)!
+    checked_write(binary.write_u8(out, 0))!
+    checked_write(binary.write_u16_be(out, TLS12_ECDHE_RSA_AES128_GCM_SHA256))!
+    checked_write(binary.write_u8(out, 0))!
+    ext := bytes.buffer()
+    defer ext.free()
+    checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
+    checked_write(binary.write_u16_be(ext, 0))!
+    checked_write(binary.write_u16_be(ext, EXT_RENEGOTIATION_INFO))!
+    checked_write(binary.write_u16_be(ext, 1))!
+    checked_write(binary.write_u8(ext, 0))!
+    ext_bytes := ext.bytes()
+    checked_write(binary.write_u16_be(out, ext_bytes.len()))!
+    out.write(ext_bytes)!
+    hello := parse_server_hello(out.bytes())!
+    assert_eq(hello.server_version, TLS12_VERSION)
+    assert_eq(hello.cipher_suite, TLS12_ECDHE_RSA_AES128_GCM_SHA256)
+    assert_eq(hello.extended_master_secret, true)
+    assert_eq(hello.renegotiation_info.len(), 1)
+    assert(bytes.eq(hello.random, random))

@@ -252,10 +252,10 @@ pub struct ConnectionState:
 struct NativeConnState:
     fd: Int
     cipher: Int
-    read_key: Bytes
-    read_iv: Bytes
-    write_key: Bytes
-    write_iv: Bytes
+    mut read_key: Bytes
+    mut read_iv: Bytes
+    mut write_key: Bytes
+    mut write_iv: Bytes
     mut read_seq: Int
     mut write_seq: Int
     mut pending: Bytes
@@ -266,6 +266,11 @@ struct NativeConnState:
     write_mu: Mutex
     read_mu: Mutex
     mut failed: Bool
+    # the current application traffic secrets, kept so a 1.3 KeyUpdate can
+    # derive the next generation of keys. empty on a 1.2 connection, which has
+    # no KeyUpdate.
+    mut read_secret: Bytes
+    mut write_secret: Bytes
 
 mut native_conn_mu := Mutex()
 mut native_conn_states: Map[Int, NativeConnState] := {}
@@ -939,8 +944,8 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
     touch_client_cached_session_locked(cache_key)
     return session
 
-fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false)
+fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret)
     return Conn(native_conn_register(cs))
 
 fn native_fail_alert(record: tls13.Record) -> Bool!:
@@ -1116,7 +1121,7 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
     # a fresh cipher epoch starts at sequence 0 for the Finished, so the first
     # application record in each direction is sequence 1.
-    return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, 1, 1, "", bytes.empty(), state)
+    return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, 1, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
 
 fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
     mut transcript_buf := transcript
@@ -1255,7 +1260,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         peer = peer_identity_from_cached_session(cached_session)
     state := connection_state_from_peer(772, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, client_cert_requested, false)
     run_verify_connection_hook(config, state)!
-    return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state)
+    return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state, server_app_secret, client_app_secret)
 
 # pick a TLS 1.2 suite from what the client offered, in server preference order.
 # only ECDHE-RSA AEAD suites are eligible because the server key is RSA; an
@@ -1375,7 +1380,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     state := connection_state_from_peer(TLS_VERSION_12, cipher, selected_alpn, false, peer, false, false)
     client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
     server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
-    return allocate_native_conn(stream, TLS_VERSION_12, cipher, client_keys, server_keys, 1, 1, "", bytes.empty(), state)
+    return allocate_native_conn(stream, TLS_VERSION_12, cipher, client_keys, server_keys, 1, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
 
 fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     first_record := native_read_record(stream)!
@@ -1516,7 +1521,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
     state := connection_state_from_peer(772, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
-    return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state)
+    return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state, client_app_secret, server_app_secret)
 
 fn record_bytes(record: tls13.Record) -> Bytes!:
     out := bytes.buffer_with_capacity(record.payload.len() + 5)
@@ -1596,7 +1601,10 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             messages := tls13.decode_handshakes(inner.payload)!
             for message in messages:
-                remember_client_ticket_from_message(handle, cipher, message)!
+                if message.message_type == tls13.HANDSHAKE_KEY_UPDATE:
+                    apply_peer_key_update(cs, cipher, message)!
+                else:
+                    remember_client_ticket_from_message(handle, cipher, message)!
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
@@ -1660,6 +1668,54 @@ fn native_conn_close(handle: Int):
     send_close_notify(cs) catch 0
     tcp_close(cs.fd)
     native_conn_drop(handle)
+
+# rotate our send keys to the next generation (RFC 8446 §7.2): announce the
+# update under the current keys, then switch. the caller holds no write lock; we
+# take it so a concurrent app-data write cannot interleave with the rotation.
+fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool) -> Bool!:
+    cs.write_mu.lock()
+    defer cs.write_mu.unlock()
+    if cs.failed:
+        return false
+    update := tls13.encode_key_update(request_peer_update)!
+    seq := cs.write_seq
+    cs.write_seq = seq + 1
+    record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_HANDSHAKE, update)!
+    native_write_all(TcpStream(cs.fd), record)!
+    next_secret := tls13.next_application_traffic_secret_sha256(cs.write_secret)!
+    keys := traffic_keys_for_cipher(cipher, next_secret)!
+    cs.write_key = keys.key
+    cs.write_iv = keys.iv
+    cs.write_seq = 0
+    cs.write_secret = next_secret
+    return true
+
+# a peer sent a KeyUpdate: switch our receive keys to the next generation (we
+# already hold read_mu here), and if it asked us to update in turn, rotate our
+# send keys and announce it. this is what keeps a conformant peer's KeyUpdate
+# from silently killing the connection.
+fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
+    if cs.version != TLS_VERSION_13 or cs.read_secret.len() == 0:
+        fail "unexpected key update on a non-1.3 connection"
+    request_peer_update := tls13.parse_key_update(message.body)!
+    next_secret := tls13.next_application_traffic_secret_sha256(cs.read_secret)!
+    keys := traffic_keys_for_cipher(cipher, next_secret)!
+    cs.read_key = keys.key
+    cs.read_iv = keys.iv
+    cs.read_seq = 0
+    cs.read_secret = next_secret
+    if request_peer_update:
+        rotate_send_keys(cs, cipher, false)!
+    return true
+
+# send a KeyUpdate that asks the peer to rekey too, and rotate our send keys.
+fn native_conn_request_key_update(handle: Int) -> Bool!:
+    if not native_conn_has(handle):
+        fail "tls connection is closed"
+    cs := native_conn_get(handle)
+    if cs.version != TLS_VERSION_13 or cs.write_secret.len() == 0:
+        fail "key update requires a tls 1.3 connection"
+    return rotate_send_keys(cs, cs.cipher, true)
 
 # create a client config using system certificate roots.
 #
@@ -1953,6 +2009,12 @@ impl Conn:
 
     fn cipher_suite_name() -> String:
         return cipher_suite_name(self.cipher_suite())
+
+    # Ask the peer to rekey and rotate our own send keys (TLS 1.3 KeyUpdate).
+    # Useful on a long-lived connection to bound how much data one key protects.
+    # Fails on a 1.2 connection, which has no KeyUpdate.
+    fn request_key_update() -> Bool!:
+        return native_conn_request_key_update(self.handle)
 
     fn negotiated_protocol() -> String:
         return self.state().negotiated_protocol

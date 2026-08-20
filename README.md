@@ -83,7 +83,8 @@ and stays current. highlights you should know before diving in:
 strong reference cycles leak unless broken with a `weak` field, closure
 environments that capture back to themselves leak (no weak captures yet),
 removed container elements aren't reclaimed until the container dies,
-tls is 1.3-only with no 1.2 fallback, and
+tls negotiates 1.3 with a 1.2 fallback (ecdhe+aead only, `require_tls13()` to
+opt out), and
 performance sits between go and rust on service-shaped work but
 behind go on heavy string churn — measured numbers, not vibes, in
 [docs/performance.md](docs/performance.md).

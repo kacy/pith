@@ -153,6 +153,7 @@ TLS_VERSION_12 := 771
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
 TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
+TLS_SIG_RSA_PKCS1_SHA256 := 1025
 TLS_GROUP_X25519 := 29
 TLS_GROUP_SECP256R1 := 23
 TLS_MAX_PLAINTEXT_RECORD := 16384
@@ -1256,6 +1257,126 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     run_verify_connection_hook(config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state)
 
+# pick a TLS 1.2 suite from what the client offered, in server preference order.
+# only ECDHE-RSA AEAD suites are eligible because the server key is RSA; an
+# ECDHE-ECDSA suite would need an ECDSA certificate we do not serve.
+fn select_tls12_suite(offered: List[Int]) -> Int:
+    for candidate in [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]:
+        if offered.contains(candidate):
+            return candidate
+    return 0
+
+# pick an ECDHE curve from the client's supported_groups (x25519 preferred).
+# a client that sent no groups is treated as offering x25519, which every peer
+# that reaches this fallback supports.
+fn select_tls12_curve(groups: List[Int]) -> Int:
+    if groups.len() == 0 or groups.contains(tls12.NAMED_CURVE_X25519):
+        return tls12.NAMED_CURVE_X25519
+    if groups.contains(tls12.NAMED_CURVE_SECP256R1):
+        return tls12.NAMED_CURVE_SECP256R1
+    return 0
+
+# The TLS 1.2 server handshake, reached when a client did not offer 1.3 but
+# offered a suite we can serve. Sends ServerHello (with the downgrade sentinel),
+# Certificate, ServerKeyExchange, ServerHelloDone; reads ClientKeyExchange,
+# ChangeCipherSpec, Finished; then sends its own ChangeCipherSpec and Finished.
+fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello_message: tls13.HandshakeMessage, lenient: tls13.LenientClientHello) -> Conn!:
+    cipher := select_tls12_suite(lenient.cipher_suites)
+    if cipher == 0:
+        fail "no supported tls 1.2 cipher suite offered"
+    curve := select_tls12_curve(lenient.supported_groups)
+    if curve == 0:
+        fail "no supported tls 1.2 curve offered"
+    selected_alpn := select_alpn_protocol(config, lenient.alpn_protocols)!
+    client_random := lenient.random
+    # a 1.3-capable server marks its random so a downgraded 1.3 client can tell.
+    server_random := tls12.apply_downgrade_sentinel(random.bytes(32)!)!
+
+    mut keypair := ecdh.x25519_keypair()!
+    if curve == tls12.NAMED_CURVE_SECP256R1:
+        keypair.close()
+        keypair = ecdh.p256_keypair()!
+
+    server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, lenient.session_id, cipher, selected_alpn)!)!
+    certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message(native_server_certificate_chain(config)!)!)!
+    params := tls12.server_key_exchange_params(curve, keypair.public_key)!
+    signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, params)
+    ske_signature := signature.sign_rsa_pkcs1_sha256_pkcs8(native_server_private_key(config)!, signed_data)!
+    server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, TLS_SIG_RSA_PKCS1_SHA256, ske_signature)!)!
+    server_done := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO_DONE, bytes.empty())!
+
+    transcript := bytes.buffer()
+    transcript.write(tls13.encode_handshake(client_hello_message.message_type, client_hello_message.body)!)!
+    transcript.write(server_hello)!
+    transcript.write(certificate)!
+    transcript.write(server_key_exchange)!
+    transcript.write(server_done)!
+
+    flight := bytes.buffer()
+    flight.write(server_hello)!
+    flight.write(certificate)!
+    flight.write(server_key_exchange)!
+    flight.write(server_done)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, flight.bytes())!)!
+    flight.free()
+
+    # ClientKeyExchange (plaintext handshake).
+    cke_record := native_read_record(stream)!
+    if cke_record.content_type == TLS_CONTENT_ALERT:
+        native_fail_alert(cke_record)!
+    if cke_record.content_type != TLS_CONTENT_HANDSHAKE:
+        fail "expected tls 1.2 client key exchange"
+    cke_messages := tls13.decode_handshakes(cke_record.payload)!
+    if cke_messages.len() == 0 or cke_messages[0].message_type != tls12.TLS12_CLIENT_KEY_EXCHANGE:
+        fail "expected tls 1.2 client key exchange"
+    client_point := tls12.parse_client_key_exchange(cke_messages[0].body)!
+    transcript.write(tls13.encode_handshake(cke_messages[0].message_type, cke_messages[0].body)!)!
+
+    pre_master := keypair.shared_secret(client_point)!
+    keypair.close()
+    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
+    master := tls12.extended_master_secret(pre_master, session_hash)!
+    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+
+    # client ChangeCipherSpec, then the encrypted client Finished.
+    mut saw_ccs := false
+    while not saw_ccs:
+        record := native_read_record(stream)!
+        if record.content_type == TLS_CONTENT_ALERT:
+            native_fail_alert(record)!
+        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            saw_ccs = true
+        elif record.content_type != TLS_CONTENT_HANDSHAKE:
+            fail "expected client change cipher spec"
+    finished_record := native_read_record(stream)!
+    if finished_record.content_type == TLS_CONTENT_ALERT:
+        native_fail_alert(finished_record)!
+    client_inner := open_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, record_bytes(finished_record)!)!
+    if client_inner.content_type != TLS_CONTENT_HANDSHAKE:
+        fail "expected an encrypted client finished"
+    client_finished := tls13.decode_handshakes(client_inner.payload)!
+    if client_finished.len() == 0 or client_finished[0].message_type != tls12.TLS12_FINISHED:
+        fail "expected a client finished message"
+    expected_client := tls12.finished_verify_data(master, "client finished", tls12.handshake_hash_sha256(transcript.bytes()))!
+    if not subtle.equal(expected_client, client_finished[0].body):
+        fail "tls 1.2 client finished verification failed"
+    transcript.write(tls13.encode_handshake(tls12.TLS12_FINISHED, client_finished[0].body)!)!
+
+    # server ChangeCipherSpec, then the encrypted server Finished.
+    ccs := bytes.buffer_with_capacity(1)
+    ccs.write_byte(1)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_CHANGE_CIPHER_SPEC, ccs.bytes())!)!
+    ccs.free()
+    server_verify := tls12.finished_verify_data(master, "server finished", tls12.handshake_hash_sha256(transcript.bytes()))!
+    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, server_verify)!
+    native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, TLS_CONTENT_HANDSHAKE, server_finished)!)!
+
+    peer := empty_peer_identity()
+    state := connection_state_from_peer(TLS_VERSION_12, cipher, selected_alpn, false, peer, false, false)
+    client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
+    server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
+    return allocate_native_conn(stream, TLS_VERSION_12, cipher, client_keys, server_keys, 1, 1, "", bytes.empty(), state)
+
 fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     first_record := native_read_record(stream)!
     if first_record.content_type == TLS_CONTENT_ALERT:
@@ -1265,6 +1386,14 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     client_messages := tls13.decode_handshakes(first_record.payload)!
     if client_messages.len() == 0 or client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
         fail "expected tls client hello"
+    # a client that did not offer 1.3 takes the 1.2 fallback if this config
+    # allows it and it offered a suite we can serve. a 1.3-capable client (our
+    # own included) always has 772 in supported_versions and stays on the 1.3
+    # path, whose parser is stricter.
+    lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body)!
+    if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
+        if config_offers_tls12(config) and select_tls12_suite(lenient_hello.cipher_suites) != 0:
+            return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
     client_hello := tls13.parse_client_hello(client_messages[0].body)!
     handshake_config := select_server_config(config, client_hello)!
     fallback_cipher := select_cipher(client_hello)!

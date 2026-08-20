@@ -146,8 +146,13 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## standard library
 
-- **tls 1.2** — tls is 1.3 only, client and server. there is no 1.2
-  compatibility mode, so peers that cannot speak 1.3 will not connect.
+- **tls 1.2** — the client and server speak tls 1.3 and, as a fallback, tls
+  1.2 (ecdhe + aead only; the four ecdhe-rsa/ecdhe-ecdsa aes-128-gcm and
+  chacha20-poly1305 suites), negotiating the highest a peer supports and
+  refusing anything below 1.2 — the same posture as go's crypto/tls and rustls.
+  `require_tls13()` locks a config to 1.3. the 1.2 fallback does not yet do
+  session resumption, renegotiation, or client-certificate auth, needs a
+  ≥2048-bit rsa server key, and has no aes-256 suites.
 - **testing** — `std/testing` covers assertions but not discovery, fixtures, or
   parameterized cases. the project's own suite is golden-snapshot based (see
   `tests/`).

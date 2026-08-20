@@ -1,0 +1,615 @@
+# TLS 1.2 protocol layer: the PRF, key schedule, AEAD record protection, and the
+# constants a 1.2 handshake needs. This is the fallback below std.net.tls13 —
+# reached only when a peer cannot speak 1.3 — and it is deliberately narrow:
+# forward-secret ECDHE key exchange, AEAD ciphers only (no CBC, no static RSA,
+# no RC4/3DES), Extended Master Secret required, and no renegotiation. The
+# connection state machine in std.net.tls drives these pieces; this module holds
+# no per-connection state and every function here is pure.
+#
+# Nothing here is safe on its own without the downgrade protection the caller
+# wires in: a 1.3-capable client that ends up on 1.2 must check the ServerHello
+# random for the RFC 8446 downgrade sentinel (has_downgrade_sentinel below).
+
+import std.binary as binary
+import std.bits as bits
+import std.bytes as bytes
+import std.crypto.aead as aead
+import std.crypto.hmac as hmac
+import std.encoding as encoding
+import std.hash as hash
+
+# ---------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------
+
+# The protocol version on the wire for TLS 1.2 (0x0303).
+pub TLS12_VERSION := 771
+
+# TLS record content types (shared with 1.3's wire framing).
+pub TLS12_CONTENT_CHANGE_CIPHER_SPEC := 20
+pub TLS12_CONTENT_ALERT := 21
+pub TLS12_CONTENT_HANDSHAKE := 22
+pub TLS12_CONTENT_APPLICATION_DATA := 23
+
+# Handshake message types used by a TLS 1.2 handshake.
+pub TLS12_HELLO_REQUEST := 0
+pub TLS12_CLIENT_HELLO := 1
+pub TLS12_SERVER_HELLO := 2
+pub TLS12_CERTIFICATE := 11
+pub TLS12_SERVER_KEY_EXCHANGE := 12
+pub TLS12_CERTIFICATE_REQUEST := 13
+pub TLS12_SERVER_HELLO_DONE := 14
+pub TLS12_CERTIFICATE_VERIFY := 15
+pub TLS12_CLIENT_KEY_EXCHANGE := 16
+pub TLS12_FINISHED := 20
+
+# The four cipher suites this fallback offers, all ECDHE + AEAD.
+pub TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 := 49195
+pub TLS12_ECDHE_RSA_AES128_GCM_SHA256 := 49199
+pub TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 := 52392
+pub TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 := 52393
+
+# convert the typed BinaryError from std.binary into this module's generic
+# error so a `!` can propagate it.
+fn checked_write(result: Int!binary.BinaryError) -> Int!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn checked_read(result: Int!binary.BinaryError) -> Int!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn checked_bytes(result: Bytes!binary.BinaryError) -> Bytes!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+# ---------------------------------------------------------------
+# the PRF (RFC 5246 section 5)
+# ---------------------------------------------------------------
+
+# P_SHA256(secret, seed): the HMAC-SHA256 expansion the TLS 1.2 PRF is built on.
+# A(0) = seed, A(i) = HMAC(secret, A(i-1)); the output is the concatenation of
+# HMAC(secret, A(i) ++ seed) truncated to `length`.
+fn p_hash_sha256(secret: Bytes, seed: Bytes, length: Int) -> Bytes!:
+    if length < 0:
+        fail "tls 1.2 prf length must be non-negative"
+    out := bytes.buffer_with_capacity(length)
+    defer out.free()
+    mut a := seed
+    while out.len() < length:
+        a = hmac.sha256(secret, a)
+        out.write(hmac.sha256(secret, bytes.concat(a, seed)))!
+    return bytes.slice(out.bytes(), 0, length)
+
+# The TLS 1.2 PRF: PRF(secret, label, seed) = P_SHA256(secret, label ++ seed).
+pub fn prf_sha256(secret: Bytes, label: String, seed: Bytes, length: Int) -> Bytes!:
+    return p_hash_sha256(secret, bytes.concat(bytes.from_string_utf8(label), seed), length)
+
+# ---------------------------------------------------------------
+# key schedule
+# ---------------------------------------------------------------
+
+# The Extended Master Secret (RFC 7627): PRF over the ECDHE pre-master secret
+# and the handshake session hash. This binds the master secret to the full
+# handshake transcript, defeating the triple-handshake class; this fallback
+# requires it and offers no non-extended master-secret derivation.
+pub fn extended_master_secret(pre_master: Bytes, session_hash: Bytes) -> Bytes!:
+    return prf_sha256(pre_master, "extended master secret", session_hash, 48)
+
+# The record-protection key material for one direction pair, expanded from the
+# master secret. For an AEAD suite there are no MAC keys: a GCM suite has a
+# 16-byte key and a 4-byte implicit salt per direction; a ChaCha20-Poly1305
+# suite has a 32-byte key and a 12-byte IV per direction.
+pub struct KeyBlock:
+    pub client_write_key: Bytes
+    pub server_write_key: Bytes
+    pub client_write_iv: Bytes
+    pub server_write_iv: Bytes
+
+# Expand the key block: PRF(master, "key expansion", server_random ++ client_random).
+# The layout for an AEAD suite (no MAC keys) is client_key, server_key,
+# client_iv, server_iv (RFC 5246 section 6.3 with zero-length MAC keys).
+pub fn key_block(master: Bytes, server_random: Bytes, client_random: Bytes, key_len: Int, iv_len: Int) -> KeyBlock!:
+    seed := bytes.concat(server_random, client_random)
+    material := prf_sha256(master, "key expansion", seed, 2 * key_len + 2 * iv_len)!
+    mut pos := 0
+    client_key := bytes.slice(material, pos, pos + key_len)
+    pos = pos + key_len
+    server_key := bytes.slice(material, pos, pos + key_len)
+    pos = pos + key_len
+    client_iv := bytes.slice(material, pos, pos + iv_len)
+    pos = pos + iv_len
+    server_iv := bytes.slice(material, pos, pos + iv_len)
+    return KeyBlock(client_key, server_key, client_iv, server_iv)
+
+# The Finished message verify_data: PRF(master, label, SHA256(transcript))[0..12].
+# The label is "client finished" or "server finished".
+pub fn finished_verify_data(master: Bytes, label: String, handshake_hash: Bytes) -> Bytes!:
+    return prf_sha256(master, label, handshake_hash, 12)
+
+# SHA-256 over the handshake transcript, the input to Finished and to the
+# Extended Master Secret session hash.
+pub fn handshake_hash_sha256(transcript: Bytes) -> Bytes:
+    return hash.sha256_bytes(transcript)
+
+# ---------------------------------------------------------------
+# cipher-suite policy
+# ---------------------------------------------------------------
+
+# The suites this fallback offers, in preference order (AES-GCM before ChaCha to
+# match the 1.3 stack and common server preference).
+pub fn offered_suites() -> List[Int]:
+    return [TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
+
+# True only for the four ECDHE+AEAD suites above. Everything else — static RSA,
+# every CBC suite, RC4, 3DES, DHE, PSK, anon — is refused, which is what keeps
+# the fallback free of the padding-oracle and forward-secrecy failures that make
+# a naive 1.2 fallback dangerous.
+pub fn is_supported_suite(suite: Int) -> Bool:
+    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+
+# True when the suite uses ChaCha20-Poly1305 (RFC 7905 nonce), false for AES-GCM.
+pub fn suite_uses_chacha(suite: Int) -> Bool:
+    return suite == TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+
+# True when the suite authenticates with an ECDSA certificate rather than RSA.
+pub fn suite_is_ecdsa(suite: Int) -> Bool:
+    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+
+# The AEAD key length for the suite (16 for AES-128-GCM, 32 for ChaCha20).
+pub fn suite_key_len(suite: Int) -> Int:
+    if suite_uses_chacha(suite):
+        return 32
+    return 16
+
+# The write-IV length for the suite (4-byte GCM salt, 12-byte ChaCha IV).
+pub fn suite_iv_len(suite: Int) -> Int:
+    if suite_uses_chacha(suite):
+        return 12
+    return 4
+
+# ---------------------------------------------------------------
+# downgrade protection (RFC 8446 section 4.1.3)
+# ---------------------------------------------------------------
+
+# The sentinel a TLS-1.3-capable server writes into the last 8 bytes of its
+# ServerHello random when it negotiates TLS 1.2 ("DOWNGRD" followed by 0x01).
+pub fn downgrade_sentinel_tls12() -> Bytes:
+    return bytes.concat(bytes.from_string_utf8("DOWNGRD"), single_byte(1))
+
+# The variant marking a downgrade to TLS 1.1 or below ("DOWNGRD" + 0x00).
+pub fn downgrade_sentinel_tls11() -> Bytes:
+    return bytes.concat(bytes.from_string_utf8("DOWNGRD"), single_byte(0))
+
+# A one-byte Bytes value.
+fn single_byte(value: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(1)
+    defer out.free()
+    out.write_byte(value) catch 0
+    return out.bytes()
+
+# True when a ServerHello random carries either downgrade sentinel in its last 8
+# bytes. A 1.3-capable client that finds itself on 1.2 (or lower) MUST treat
+# this as an active downgrade and abort — a MITM stripping the 1.3 offer cannot
+# forge it, because the sentinel is inside the server's signed/authenticated
+# random only for a genuinely 1.3-capable server.
+pub fn has_downgrade_sentinel(server_random: Bytes) -> Bool:
+    if server_random.len() != 32:
+        return false
+    tail := bytes.slice(server_random, 24, 32)
+    return bytes.eq(tail, downgrade_sentinel_tls12()) or bytes.eq(tail, downgrade_sentinel_tls11())
+
+# ---------------------------------------------------------------
+# record protection
+# ---------------------------------------------------------------
+
+# The additional authenticated data for a TLS 1.2 AEAD record:
+# seq(8) ++ type(1) ++ version(2) ++ plaintext_length(2). Unlike 1.3, the
+# sequence number is authenticated here rather than folded into the nonce.
+fn record_aad(sequence: Int, content_type: Int, plaintext_len: Int) -> Bytes!:
+    out := bytes.buffer_with_capacity(13)
+    defer out.free()
+    checked_write(binary.write_u64_be(out, sequence))!
+    checked_write(binary.write_u8(out, content_type))!
+    checked_write(binary.write_u16_be(out, TLS12_VERSION))!
+    checked_write(binary.write_u16_be(out, plaintext_len))!
+    return out.bytes()
+
+# The record header: type(1) ++ version(2) ++ length(2).
+fn record_header(content_type: Int, length: Int) -> Bytes!:
+    out := bytes.buffer_with_capacity(5)
+    defer out.free()
+    checked_write(binary.write_u8(out, content_type))!
+    checked_write(binary.write_u16_be(out, TLS12_VERSION))!
+    checked_write(binary.write_u16_be(out, length))!
+    return out.bytes()
+
+# The 8-byte big-endian explicit nonce a GCM record carries on the wire.
+fn explicit_nonce(sequence: Int) -> Bytes!:
+    out := bytes.buffer_with_capacity(8)
+    defer out.free()
+    checked_write(binary.write_u64_be(out, sequence))!
+    return out.bytes()
+
+# The 12-byte ChaCha20-Poly1305 nonce: the 12-byte write IV xored with the
+# 64-bit sequence number, right-aligned (RFC 7905, identical to TLS 1.3).
+fn chacha_nonce(static_iv: Bytes, sequence: Int) -> Bytes!:
+    if static_iv.len() != 12:
+        fail "tls 1.2 chacha iv must be 12 bytes"
+    if sequence < 0:
+        fail "tls 1.2 sequence must be non-negative"
+    out := bytes.buffer_with_capacity(12)
+    defer out.free()
+    mut i := 0
+    while i < 12:
+        mut seq_byte := 0
+        if i >= 4:
+            shift := (11 - i) * 8
+            seq_byte = bits.band(bits.shr(sequence, shift), 255)
+        out.write_byte(bits.xor(static_iv[i], seq_byte))!
+        i = i + 1
+    return out.bytes()
+
+# One decrypted TLS 1.2 record: the true outer content type and its plaintext.
+pub struct Tls12Record:
+    pub content_type: Int
+    pub payload: Bytes
+
+# Seal an AES-128-GCM record. The GCM nonce is salt(4) ++ explicit(8), and the
+# 8-byte explicit nonce is prepended to the ciphertext on the wire (RFC 5288).
+pub fn seal_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
+    if salt.len() != 4:
+        fail "tls 1.2 gcm salt must be 4 bytes"
+    nonce_explicit := explicit_nonce(sequence)!
+    nonce := bytes.concat(salt, nonce_explicit)
+    aad := record_aad(sequence, content_type, plaintext.len())!
+    ciphertext := aead.aes_128_gcm_seal(key, nonce, aad, plaintext)!
+    payload := bytes.concat(nonce_explicit, ciphertext)
+    return bytes.concat(record_header(content_type, payload.len())!, payload)
+
+# Open an AES-128-GCM record produced by seal_aes_128_gcm. The record has
+# already been split from the stream; `record` is the full header+payload.
+pub fn open_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, record: Bytes) -> Tls12Record!:
+    if salt.len() != 4:
+        fail "tls 1.2 gcm salt must be 4 bytes"
+    outer := decode_record(record)!
+    if outer.payload.len() < 8 + 16:
+        fail "tls 1.2 gcm record too short"
+    nonce_explicit := bytes.slice(outer.payload, 0, 8)
+    ciphertext := bytes.slice(outer.payload, 8, outer.payload.len())
+    nonce := bytes.concat(salt, nonce_explicit)
+    plaintext_len := ciphertext.len() - 16
+    aad := record_aad(sequence, outer.content_type, plaintext_len)!
+    plaintext := aead.aes_128_gcm_open(key, nonce, aad, ciphertext)!
+    return Tls12Record(outer.content_type, plaintext)
+
+# Seal a ChaCha20-Poly1305 record (RFC 7905): no explicit nonce on the wire.
+pub fn seal_chacha20_poly1305(key: Bytes, static_iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
+    nonce := chacha_nonce(static_iv, sequence)!
+    aad := record_aad(sequence, content_type, plaintext.len())!
+    ciphertext := aead.chacha20_poly1305_seal(key, nonce, aad, plaintext)!
+    return bytes.concat(record_header(content_type, ciphertext.len())!, ciphertext)
+
+# Open a ChaCha20-Poly1305 record produced by seal_chacha20_poly1305.
+pub fn open_chacha20_poly1305(key: Bytes, static_iv: Bytes, sequence: Int, record: Bytes) -> Tls12Record!:
+    outer := decode_record(record)!
+    if outer.payload.len() < 16:
+        fail "tls 1.2 chacha record too short"
+    nonce := chacha_nonce(static_iv, sequence)!
+    plaintext_len := outer.payload.len() - 16
+    aad := record_aad(sequence, outer.content_type, plaintext_len)!
+    plaintext := aead.chacha20_poly1305_open(key, nonce, aad, outer.payload)!
+    return Tls12Record(outer.content_type, plaintext)
+
+# Split one TLS record (header + payload) into its type and payload. The caller
+# has already framed exactly one record off the stream by its length prefix.
+fn decode_record(data: Bytes) -> Tls12Record!:
+    if data.len() < 5:
+        fail "tls 1.2 record too short"
+    content_type := data[0]
+    length := checked_read(binary.read_u16_be_at(data, 3))!
+    if data.len() != 5 + length:
+        fail "tls 1.2 record length mismatch"
+    return Tls12Record(content_type, bytes.slice(data, 5, data.len()))
+
+# ---------------------------------------------------------------
+# handshake message bodies
+# ---------------------------------------------------------------
+#
+# The outer handshake framing (type + 3-byte length) is identical to TLS 1.3,
+# so callers use tls13.encode_handshake / tls13.decode_handshakes for that and
+# these functions only encode/parse the 1.2-specific message bodies.
+
+# The named curve id for an ECDHE key share we support (secp256r1 = 23,
+# x25519 = 29), plus the "named_curve" ECParameters curve type (3).
+pub NAMED_CURVE_SECP256R1 := 23
+pub NAMED_CURVE_X25519 := 29
+CURVE_TYPE_NAMED := 3
+
+# extension type ids that appear in a 1.2 ServerHello.
+EXT_ALPN := 16
+EXT_EXTENDED_MASTER_SECRET := 23
+EXT_RENEGOTIATION_INFO := 65281
+
+# A parsed 1.2 ServerHello: the selected suite, the server random (checked for
+# the downgrade sentinel by the caller), and the security-relevant extensions.
+pub struct Tls12ServerHello:
+    pub server_version: Int
+    pub random: Bytes
+    pub session_id: Bytes
+    pub cipher_suite: Int
+    pub extended_master_secret: Bool
+    pub renegotiation_info: Bytes
+    pub alpn_protocol: String
+
+# Parse a 1.2 ServerHello body. Compression other than null is refused (this
+# stack never offers it), and the extensions we care about — extended master
+# secret, renegotiation_info, and ALPN — are extracted; the caller enforces the
+# EMS-required and renegotiation-empty policy.
+pub fn parse_server_hello(body: Bytes) -> Tls12ServerHello!:
+    r := binary.reader(body)
+    version := checked_read(binary.read_u16_be(r))!
+    random := checked_bytes(binary.read_bytes(r, 32))!
+    session_id_len := checked_read(binary.read_u8(r))!
+    session_id := checked_bytes(binary.read_bytes(r, session_id_len))!
+    cipher := checked_read(binary.read_u16_be(r))!
+    compression := checked_read(binary.read_u8(r))!
+    if compression != 0:
+        fail "tls 1.2 server selected a compression method"
+    mut ems := false
+    mut reneg := bytes.empty()
+    mut alpn := ""
+    if binary.remaining(r) > 0:
+        ext_total := checked_read(binary.read_u16_be(r))!
+        ext_data := checked_bytes(binary.read_bytes(r, ext_total))!
+        er := binary.reader(ext_data)
+        while binary.remaining(er) > 0:
+            ext_type := checked_read(binary.read_u16_be(er))!
+            ext_len := checked_read(binary.read_u16_be(er))!
+            ext_value := checked_bytes(binary.read_bytes(er, ext_len))!
+            if ext_type == EXT_EXTENDED_MASTER_SECRET:
+                ems = true
+            elif ext_type == EXT_RENEGOTIATION_INFO:
+                reneg = ext_value
+            elif ext_type == EXT_ALPN:
+                alpn = first_alpn_protocol(ext_value)!
+    return Tls12ServerHello(version, random, session_id, cipher, ems, reneg, alpn)
+
+# The first protocol name from an ALPN extension value (a u16-prefixed list of
+# u8-prefixed names), or "" when the list is empty.
+fn first_alpn_protocol(ext_value: Bytes) -> String!:
+    r := binary.reader(ext_value)
+    if binary.remaining(r) < 2:
+        return ""
+    list_len := checked_read(binary.read_u16_be(r))!
+    if list_len == 0:
+        return ""
+    name_len := checked_read(binary.read_u8(r))!
+    name := checked_bytes(binary.read_bytes(r, name_len))!
+    return name.to_string_utf8()!
+
+# The ECDHE parameters and signature from a ServerKeyExchange. signed_params is
+# the exact ECParameters byte range the server signed (curve type, named curve,
+# and public point); the caller verifies the signature over
+# client_random ++ server_random ++ signed_params.
+pub struct Tls12ServerKeyExchange:
+    pub named_curve: Int
+    pub public_point: Bytes
+    pub signature_scheme: Int
+    pub signature: Bytes
+    pub signed_params: Bytes
+
+# Parse an ECDHE ServerKeyExchange body. Only the named_curve form is accepted.
+pub fn parse_server_key_exchange(body: Bytes) -> Tls12ServerKeyExchange!:
+    r := binary.reader(body)
+    curve_type := checked_read(binary.read_u8(r))!
+    if curve_type != CURVE_TYPE_NAMED:
+        fail "tls 1.2 server key exchange is not a named curve"
+    named_curve := checked_read(binary.read_u16_be(r))!
+    point_len := checked_read(binary.read_u8(r))!
+    public_point := checked_bytes(binary.read_bytes(r, point_len))!
+    # the signed ECParameters are exactly the bytes read so far.
+    signed_params := bytes.slice(body, 0, 4 + point_len)
+    signature_scheme := checked_read(binary.read_u16_be(r))!
+    signature_len := checked_read(binary.read_u16_be(r))!
+    signature := checked_bytes(binary.read_bytes(r, signature_len))!
+    return Tls12ServerKeyExchange(named_curve, public_point, signature_scheme, signature, signed_params)
+
+# Encode an ECDHE ServerKeyExchange body from its already-computed signature.
+pub fn encode_server_key_exchange(named_curve: Int, public_point: Bytes, signature_scheme: Int, signature: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(public_point.len() + signature.len() + 8)
+    defer out.free()
+    checked_write(binary.write_u8(out, CURVE_TYPE_NAMED))!
+    checked_write(binary.write_u16_be(out, named_curve))!
+    checked_write(binary.write_u8(out, public_point.len()))!
+    out.write(public_point)!
+    checked_write(binary.write_u16_be(out, signature_scheme))!
+    checked_write(binary.write_u16_be(out, signature.len()))!
+    out.write(signature)!
+    return out.bytes()
+
+# The bytes a ServerKeyExchange signature covers: the two randoms then the
+# signed ECParameters.
+pub fn server_key_exchange_signed_data(client_random: Bytes, server_random: Bytes, signed_params: Bytes) -> Bytes:
+    return bytes.concat(bytes.concat(client_random, server_random), signed_params)
+
+# Encode a ClientKeyExchange body: the client's ECDHE public point, u8-prefixed.
+pub fn encode_client_key_exchange(public_point: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(public_point.len() + 1)
+    defer out.free()
+    checked_write(binary.write_u8(out, public_point.len()))!
+    out.write(public_point)!
+    return out.bytes()
+
+# Parse a ClientKeyExchange body into the client's ECDHE public point.
+pub fn parse_client_key_exchange(body: Bytes) -> Bytes!:
+    r := binary.reader(body)
+    point_len := checked_read(binary.read_u8(r))!
+    return checked_bytes(binary.read_bytes(r, point_len))!
+
+# Parse a 1.2 Certificate message body (a u24-prefixed list of u24-prefixed
+# certificates) into raw DER certificates, leaf first. Unlike 1.3 there is no
+# request context and no per-certificate extensions.
+pub fn parse_certificate_message(body: Bytes) -> List[Bytes]!:
+    r := binary.reader(body)
+    total := checked_read(binary.read_u24_be(r))!
+    list := checked_bytes(binary.read_bytes(r, total))!
+    lr := binary.reader(list)
+    mut certs: List[Bytes] := []
+    while binary.remaining(lr) > 0:
+        cert_len := checked_read(binary.read_u24_be(lr))!
+        certs.push(checked_bytes(binary.read_bytes(lr, cert_len))!)
+    return certs
+
+# Encode a 1.2 Certificate message body from a leaf-first list of DER certs.
+pub fn encode_certificate_message(certificates: List[Bytes]) -> Bytes!:
+    inner := bytes.buffer()
+    defer inner.free()
+    for cert in certificates:
+        checked_write(binary.write_u24_be(inner, cert.len()))!
+        inner.write(cert)!
+    list_bytes := inner.bytes()
+    out := bytes.buffer_with_capacity(list_bytes.len() + 3)
+    defer out.free()
+    checked_write(binary.write_u24_be(out, list_bytes.len()))!
+    out.write(list_bytes)!
+    return out.bytes()
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+test "the tls 1.2 prf matches the rfc 5246 sha-256 test vector":
+    # the canonical PRF-SHA256 vector (secret/label/seed -> 100 bytes).
+    secret := encoding.from_hex("9bbe436ba940f017b17652849a71db35")!
+    seed := encoding.from_hex("a0ba9f936cda311827a6f796ffd5198c")!
+    expected := "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66"
+    out := prf_sha256(secret, "test label", seed, 100)!
+    assert_eq(out.len(), 100)
+    assert_eq(encoding.to_hex(out), expected)
+
+test "the extended master secret and key block have the right sizes":
+    pre_master := encoding.from_hex("0102030405060708090a0b0c0d0e0f101112131415161718")!
+    session_hash := hash.sha256_bytes(bytes.from_string_utf8("transcript"))
+    master := extended_master_secret(pre_master, session_hash)!
+    assert_eq(master.len(), 48)
+    server_random := encoding.from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")!
+    client_random := encoding.from_hex("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100")!
+    kb := key_block(master, server_random, client_random, 16, 4)!
+    assert_eq(kb.client_write_key.len(), 16)
+    assert_eq(kb.server_write_key.len(), 16)
+    assert_eq(kb.client_write_iv.len(), 4)
+    assert_eq(kb.server_write_iv.len(), 4)
+
+test "an aes-128-gcm record round-trips and rejects tampering":
+    key := encoding.from_hex("000102030405060708090a0b0c0d0e0f")!
+    salt := encoding.from_hex("aabbccdd")!
+    plaintext := bytes.from_string_utf8("hello tls 1.2")
+    record := seal_aes_128_gcm(key, salt, 7, TLS12_CONTENT_APPLICATION_DATA, plaintext)!
+    opened := open_aes_128_gcm(key, salt, 7, record)!
+    assert_eq(opened.content_type, TLS12_CONTENT_APPLICATION_DATA)
+    assert_eq(opened.payload.to_string_utf8()!, "hello tls 1.2")
+    # opening at the wrong sequence changes the AAD and must fail the tag.
+    assert(open_aes_128_gcm(key, salt, 8, record).is_err)
+    # a flipped ciphertext byte must fail the tag.
+    mut raw := record
+    flipped := bytes.concat(bytes.slice(raw, 0, raw.len() - 1), single_byte(bits.xor(raw[raw.len() - 1], 1)))
+    assert(open_aes_128_gcm(key, salt, 7, flipped).is_err)
+
+test "a chacha20-poly1305 record round-trips":
+    key := encoding.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")!
+    iv := encoding.from_hex("000102030405060708090a0b")!
+    plaintext := bytes.from_string_utf8("chacha payload")
+    record := seal_chacha20_poly1305(key, iv, 3, TLS12_CONTENT_APPLICATION_DATA, plaintext)!
+    opened := open_chacha20_poly1305(key, iv, 3, record)!
+    assert_eq(opened.payload.to_string_utf8()!, "chacha payload")
+    assert(open_chacha20_poly1305(key, iv, 4, record).is_err)
+
+test "the downgrade sentinel is recognised in a server random":
+    prefix := encoding.from_hex("000102030405060708090a0b0c0d0e0f10111213141516171819")!
+    normal_tail := encoding.from_hex("aabbccddeeff0011")!
+    normal := bytes.concat(bytes.slice(prefix, 0, 24), normal_tail)
+    assert_eq(normal.len(), 32)
+    assert_eq(has_downgrade_sentinel(normal), false)
+    poisoned := bytes.concat(bytes.slice(prefix, 0, 24), downgrade_sentinel_tls12())
+    assert_eq(has_downgrade_sentinel(poisoned), true)
+    poisoned11 := bytes.concat(bytes.slice(prefix, 0, 24), downgrade_sentinel_tls11())
+    assert_eq(has_downgrade_sentinel(poisoned11), true)
+
+test "the suite policy accepts only ecdhe aead and refuses the rest":
+    assert(is_supported_suite(TLS12_ECDHE_RSA_AES128_GCM_SHA256))
+    assert(is_supported_suite(TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256))
+    # static RSA (0x009c), an ECDHE-RSA CBC suite (0xc013), RC4 (0x0005),
+    # and 3DES (0x000a) are all refused.
+    assert_eq(is_supported_suite(156), false)
+    assert_eq(is_supported_suite(49171), false)
+    assert_eq(is_supported_suite(5), false)
+    assert_eq(is_supported_suite(10), false)
+    assert(suite_uses_chacha(TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256))
+    assert_eq(suite_uses_chacha(TLS12_ECDHE_RSA_AES128_GCM_SHA256), false)
+    assert_eq(suite_key_len(TLS12_ECDHE_RSA_AES128_GCM_SHA256), 16)
+    assert_eq(suite_iv_len(TLS12_ECDHE_RSA_AES128_GCM_SHA256), 4)
+    assert_eq(suite_key_len(TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256), 32)
+    assert_eq(suite_iv_len(TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256), 12)
+
+test "the server key exchange round-trips and exposes the signed params":
+    point := encoding.from_hex("04aabbccdd")!
+    sig := encoding.from_hex("30450220deadbeef")!
+    body := encode_server_key_exchange(NAMED_CURVE_SECP256R1, point, 1027, sig)!
+    ske := parse_server_key_exchange(body)!
+    assert_eq(ske.named_curve, NAMED_CURVE_SECP256R1)
+    assert(bytes.eq(ske.public_point, point))
+    assert_eq(ske.signature_scheme, 1027)
+    assert(bytes.eq(ske.signature, sig))
+    # signed params = curve_type(1) + named_curve(2) + point_len(1) + point
+    expected_params := bytes.concat(encoding.from_hex("03001705")!, point)
+    assert(bytes.eq(ske.signed_params, expected_params))
+    # a non-named-curve form is refused.
+    assert(parse_server_key_exchange(encoding.from_hex("010017")!).is_err)
+
+test "the client key exchange round-trips":
+    point := encoding.from_hex("0401020304050607")!
+    body := encode_client_key_exchange(point)!
+    parsed := parse_client_key_exchange(body)!
+    assert(bytes.eq(parsed, point))
+
+test "the certificate message round-trips leaf first":
+    leaf := encoding.from_hex("11111111")!
+    intermediate := encoding.from_hex("2222222222")!
+    body := encode_certificate_message([leaf, intermediate])!
+    certs := parse_certificate_message(body)!
+    assert_eq(certs.len(), 2)
+    assert(bytes.eq(certs[0], leaf))
+    assert(bytes.eq(certs[1], intermediate))
+
+test "a server hello with extensions parses its suite and flags":
+    # version 0303, 32-byte random, empty session id, suite c02f, null
+    # compression, then extensions: extended_master_secret (0017,0000) and
+    # renegotiation_info (ff01,0001,00).
+    random := encoding.from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")!
+    out := bytes.buffer()
+    defer out.free()
+    checked_write(binary.write_u16_be(out, TLS12_VERSION))!
+    out.write(random)!
+    checked_write(binary.write_u8(out, 0))!
+    checked_write(binary.write_u16_be(out, TLS12_ECDHE_RSA_AES128_GCM_SHA256))!
+    checked_write(binary.write_u8(out, 0))!
+    ext := bytes.buffer()
+    defer ext.free()
+    checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
+    checked_write(binary.write_u16_be(ext, 0))!
+    checked_write(binary.write_u16_be(ext, EXT_RENEGOTIATION_INFO))!
+    checked_write(binary.write_u16_be(ext, 1))!
+    checked_write(binary.write_u8(ext, 0))!
+    ext_bytes := ext.bytes()
+    checked_write(binary.write_u16_be(out, ext_bytes.len()))!
+    out.write(ext_bytes)!
+    hello := parse_server_hello(out.bytes())!
+    assert_eq(hello.server_version, TLS12_VERSION)
+    assert_eq(hello.cipher_suite, TLS12_ECDHE_RSA_AES128_GCM_SHA256)
+    assert_eq(hello.extended_master_secret, true)
+    assert_eq(hello.renegotiation_info.len(), 1)
+    assert(bytes.eq(hello.random, random))

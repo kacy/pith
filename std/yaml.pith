@@ -935,22 +935,29 @@ fn parse_block_scalar(parent_indent: Int, header: String) -> Int:
         content.remove(content.len() - 1)
         trailing = trailing + 1
 
-    mut body := ""
+    # collect the folded pieces and join once. appending to `body` directly
+    # recopied the whole accumulated block on every line, which made a block
+    # scalar of n lines cost O(n²) — the same trap decode_double_quoted and
+    # repeat_newlines already avoid. each piece carries its own separator.
+    mut parts: List[String] := []
     mut j := 0
     while j < content.len():
         line := content[j]
         if j == 0:
-            body = line
+            parts.push(line)
         elif style == "|":
-            body = body + chr(10) + line
+            parts.push(chr(10))
+            parts.push(line)
         elif line == "":
             # a blank line inside a folded block is a real line break
-            body = body + chr(10)
+            parts.push(chr(10))
         elif content[j - 1] == "":
-            body = body + line
+            parts.push(line)
         else:
-            body = body + " " + line
+            parts.push(" ")
+            parts.push(line)
         j = j + 1
+    body := parts.join("")
 
     if content.len() == 0:
         if chomp == "keep":
@@ -1819,3 +1826,15 @@ test "the yaml scalar scanner and the tree parser agree on a flat mapping":
     assert_eq(cfg.require_string("host")!, require_string(root, "host")!)
     assert_eq(cfg.require_int("port")!, require_int(root, "port")!)
     assert_eq(cfg.require_bool("debug")!, require_bool(root, "debug")!)
+
+test "yaml folds literal and folded block scalars correctly":
+    nl := chr(10)
+    # a literal block keeps every newline; a folded block joins lines with a
+    # space and keeps a blank line as one newline. this locks the folding after
+    # the quadratic-append rewrite.
+    literal := parse("text: |" + nl + "  line one" + nl + "  line two" + nl)
+    assert_eq(get_string(literal, "text"), "line one" + nl + "line two" + nl)
+    folded := parse("text: >" + nl + "  line one" + nl + "  line two" + nl)
+    assert_eq(get_string(folded, "text"), "line one line two" + nl)
+    stripped := parse("text: |-" + nl + "  only" + nl)
+    assert_eq(get_string(stripped, "text"), "only")

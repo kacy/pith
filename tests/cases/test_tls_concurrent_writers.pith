@@ -1,0 +1,75 @@
+# a single tls Conn written from several tasks at once. every record's AEAD
+# nonce is (write iv) xor (record sequence), so two writers that both read the
+# same write_seq before either advances it seal two records under the same
+# nonce — catastrophic for GCM, and the peer rejects the second record's tag.
+# the write path serializes the seal-and-send under a per-connection lock, so
+# every record gets a distinct sequence and the server decrypts all of them.
+# the assertion is pure outcome: the server receives exactly WRITERS*MSG_LEN
+# bytes; a reused nonce shows up as a short byte count or a failed read.
+
+import std.net.tls as tls
+import std.time as time
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+PORT := 50793
+WRITERS := 16
+MSG := "0123456789"
+MSG_LEN := 10
+EXPECTED := 160
+
+fn serve_conn(listener_handle: Int, fd: Int):
+    conn_r := tls.listener_from_handle(listener_handle).handshake(fd)
+    if conn_r.is_err:
+        return
+    conn := conn_r.ok
+    mut total := 0
+    while total < EXPECTED:
+        r := conn.read(4096)
+        if r.is_err:
+            break
+        chunk := r.ok
+        if chunk.len() == 0:
+            break
+        total = total + chunk.len()
+    conn.write_all("total:" + total.to_string()) catch 0
+    conn.close()
+
+fn run_server(listener_handle: Int):
+    listener := tls.listener_from_handle(listener_handle)
+    while true:
+        fd_r := listener.accept_socket()
+        if fd_r.is_err:
+            return
+        spawn serve_conn(listener_handle, fd_r.ok)
+
+fn writer(conn: tls.Conn, done: Channel[Bool]):
+    conn.write_all(MSG) catch 0
+    done.send(true)
+
+fn main() -> Int!:
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    spawn run_server(listener.handle)
+
+    cfg := tls.client_config_with_ca_file(CA_PATH)!
+    conn := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)!
+
+    done := Channel[Bool](WRITERS)
+    mut started := 0
+    while started < WRITERS:
+        spawn writer(conn, done)
+        started = started + 1
+
+    mut finished := 0
+    while finished < WRITERS:
+        done.recv()
+        finished = finished + 1
+
+    echo := conn.read(64)!
+    conn.close()
+    cfg.close()
+    print(echo)
+    return 0

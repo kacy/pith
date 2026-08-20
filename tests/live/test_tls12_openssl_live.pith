@@ -1,0 +1,78 @@
+# TLS 1.2 fallback interop against openssl s_server. The pith client offers 1.3
+# and 1.2; pointed at a 1.2-only openssl server it negotiates the 1.2 fallback,
+# verifies the certificate, and exchanges application data. Also checks that a
+# server offering both versions still lands on 1.3, and that require_tls13()
+# refuses a 1.2-only server. openssl is the interop oracle a pith-to-pith test
+# cannot provide, since two pith peers always agree on 1.3.
+
+import std.net.tls as tls
+import std.os.process as process
+import std.time as time
+
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+PORT := 44380
+
+fn server_command(extra: List[String]) -> process.Command:
+    base := process.command("openssl").arg("s_server").arg("-accept").arg(PORT.to_string()).arg("-cert").arg(CERT).arg("-key").arg(KEY).arg("-www").arg("-quiet")
+    return base.args(extra)
+
+fn probe_version(require13: Bool) -> String!:
+    mut attempt := 0
+    while attempt < 30:
+        cfg := build_config(require13)!
+        r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
+        if r.is_ok:
+            conn := r.ok
+            outcome := connection_outcome(conn, require13)
+            conn.close()
+            cfg.close()
+            return outcome
+        cfg.close()
+        if require13:
+            # a refused dial is the expected outcome under require_tls13; retry
+            # briefly first in case the server is not up yet.
+            if attempt >= 5:
+                return "refused"
+        attempt = attempt + 1
+        time.delay(40)
+    if require13:
+        return "refused"
+    return "no-connection"
+
+fn build_config(require13: Bool) -> tls.Config!:
+    cfg := tls.client_config_with_ca_file(CA)!
+    if require13:
+        return cfg.require_tls13()
+    return cfg
+
+fn connection_outcome(conn: tls.Conn, require13: Bool) -> String:
+    if require13:
+        return "accepted-bug"
+    version := conn.version_name()
+    cipher := conn.cipher_suite_name()
+    if conn.write_all("GET / HTTP/1.0\r\n\r\n").is_err:
+        return "write-failed"
+    body := conn.read(32) catch ""
+    if not body.starts_with("HTTP"):
+        return "no-body"
+    return version + " " + cipher
+
+fn run_case(label: String, extra: List[String], require13: Bool):
+    proc_r := server_command(extra).start()
+    if proc_r.is_err:
+        print(label + ": openssl-unavailable")
+        return
+    proc := proc_r.ok
+    outcome := probe_version(require13) catch "config-error"
+    print(label + ": " + outcome)
+    proc.kill()
+    proc.wait()
+
+fn main() -> Int!:
+    run_case("aes128gcm", ["-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256"], false)
+    run_case("chacha20", ["-tls1_2", "-cipher", "ECDHE-RSA-CHACHA20-POLY1305"], false)
+    run_case("prefers13", [], false)
+    run_case("strict", ["-tls1_2"], true)
+    return 0

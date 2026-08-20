@@ -12,6 +12,7 @@ import std.crypto.subtle as subtle
 import std.crypto.x509 as x509
 import std.encoding as encoding
 import std.io as io
+import std.net.tls12 as tls12
 import std.net.tls13 as tls13
 import std.os.certs as os_certs
 import std.time as time
@@ -30,6 +31,7 @@ mut next_native_conn_handle := 1000000
 mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
 mut native_config_resumption_enabled: Map[Int, Bool] := {}
+mut native_config_require_tls13: Map[Int, Bool] := {}
 mut native_client_cert_pem: Map[Int, String] := {}
 mut native_client_key_der: Map[Int, Bytes] := {}
 mut native_server_cert_pem: Map[Int, String] := {}
@@ -146,6 +148,8 @@ TLS_HANDSHAKE_CERTIFICATE := 11
 TLS_HANDSHAKE_CERTIFICATE_REQUEST := 13
 TLS_HANDSHAKE_CERTIFICATE_VERIFY := 15
 TLS_HANDSHAKE_FINISHED := 20
+TLS_VERSION_13 := 772
+TLS_VERSION_12 := 771
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
 TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
@@ -257,6 +261,7 @@ struct NativeConnState:
     cache_key: String
     resumption_master_secret: Bytes
     state: ConnectionState
+    version: Int
     write_mu: Mutex
     read_mu: Mutex
     mut failed: Bool
@@ -445,6 +450,11 @@ fn config_requests_client_certificate(config: Config) -> Bool:
 fn config_resumption_enabled(config: Config) -> Bool:
     return config_get(native_config_resumption_enabled, config.handle, false)
 
+# true when this config may negotiate the TLS 1.2 fallback (the default);
+# require_tls13() turns it off.
+fn config_offers_tls12(config: Config) -> Bool:
+    return not config_get(native_config_require_tls13, config.handle, false)
+
 fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
     cert_pem := config_get(native_client_cert_pem, config.handle, "")
     if cert_pem == "":
@@ -560,6 +570,14 @@ pub fn cipher_suite_name(cipher: Int) -> String:
         return "TLS_AES_128_GCM_SHA256"
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return "TLS_CHACHA20_POLY1305_SHA256"
+    if cipher == tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256:
+        return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+    if cipher == tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256:
+        return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    if cipher == tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256:
+        return "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+    if cipher == tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256:
+        return "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
     return "unknown"
 
 fn select_cipher(client: tls13.ClientHello) -> Int!:
@@ -582,6 +600,26 @@ fn seal_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, con
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return tls13.seal_application_chacha20_poly1305(key, iv, sequence, content_type, plaintext)
     fail "unsupported tls cipher suite"
+
+# version-aware record protection for the connection's application-data I/O. A
+# 1.2 connection uses the TLS 1.2 AEAD record layout (explicit GCM nonce,
+# sequence in the AAD); a 1.3 connection uses the 1.3 layout. The handshake
+# paths call the version-specific functions directly.
+fn open_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
+    if version == TLS_VERSION_12:
+        if tls12.suite_uses_chacha(cipher):
+            chacha := tls12.open_chacha20_poly1305(key, iv, sequence, record)!
+            return tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
+        gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
+        return tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
+    return open_record_for_cipher(cipher, key, iv, sequence, record)
+
+fn seal_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
+    if version == TLS_VERSION_12:
+        if tls12.suite_uses_chacha(cipher):
+            return tls12.seal_chacha20_poly1305(key, iv, sequence, content_type, plaintext)
+        return tls12.seal_aes_128_gcm(key, iv, sequence, content_type, plaintext)
+    return seal_record_for_cipher(cipher, key, iv, sequence, content_type, plaintext)
 
 fn parse_certificate_chain(message: tls13.HandshakeMessage) -> List[x509.Certificate]!:
     cert_msg := tls13.parse_certificate_message(message.body)!
@@ -900,8 +938,8 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
     touch_client_cached_session_locked(cache_key)
     return session
 
-fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), write_mu: Mutex(), read_mu: Mutex(), failed: false)
+fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false)
     return Conn(native_conn_register(cs))
 
 fn native_fail_alert(record: tls13.Record) -> Bool!:
@@ -929,14 +967,157 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello)!)!
             transcript := bytes.buffer()
             transcript.write(client_hello)!
-            return native_client_handshake_after_client_hello(stream, server_name, config, keypair, p256pair, cached_session, true, cache_key, transcript)
-    client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
+            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, true, cache_key, transcript)
+    # a non-resumption hello offers the TLS 1.2 fallback unless the config is
+    # locked to 1.3. resumption is a 1.3-only path (a 1.2 ticket is never
+    # cached), so its hello above stays 1.3-only.
+    mut client_hello := bytes.empty()
+    if config_offers_tls12(config):
+        client_hello = tls13.encode_client_hello_offering_tls12(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, tls12.offered_suites())!
+    else:
+        client_hello = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello)!)!
     transcript := bytes.buffer()
     transcript.write(client_hello)!
-    return native_client_handshake_after_client_hello(stream, server_name, config, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
+    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
 
-fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
+# The TLS 1.2 client handshake, reached from after_client_hello when the server
+# negotiated 1.2. The ClientHello (in `transcript`) and the ServerHello (in
+# `server_hello_message`) have already been exchanged; this drives the rest:
+# Certificate, ServerKeyExchange, ServerHelloDone → ClientKeyExchange,
+# ChangeCipherSpec, Finished → server ChangeCipherSpec, Finished.
+fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer) -> Conn!:
+    hello := tls12.parse_server_hello(server_hello_message.body)!
+    # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
+    # not mark its random. the sentinel means a 1.3-capable server fell back to
+    # 1.2 — our 1.3 offer was stripped by an active attacker.
+    if tls12.has_downgrade_sentinel(hello.random):
+        fail "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2"
+    if not tls12.is_supported_suite(hello.cipher_suite):
+        fail "server selected an unsupported tls 1.2 cipher suite"
+    # extended master secret is required (rfc 7627): it binds the master secret
+    # to the full transcript and closes the triple-handshake class.
+    if not hello.extended_master_secret:
+        fail "server did not negotiate extended master secret"
+    if hello.renegotiation_info.len() > 1 or (hello.renegotiation_info.len() == 1 and hello.renegotiation_info[0] != 0):
+        fail "server sent a non-empty renegotiation info"
+    cipher := hello.cipher_suite
+    server_random := hello.random
+    transcript_append(transcript, server_hello_message)!
+
+    # read the server's plaintext flight (Certificate, ServerKeyExchange,
+    # ServerHelloDone), buffering so a message split across records still
+    # decodes, and record the exact bytes into the transcript.
+    flight := bytes.buffer()
+    defer flight.free()
+    mut have_done := false
+    while not have_done:
+        record := native_read_record(stream)!
+        if record.content_type == TLS_CONTENT_ALERT:
+            native_fail_alert(record)!
+        if record.content_type != TLS_CONTENT_HANDSHAKE:
+            fail "expected a tls 1.2 handshake record"
+        flight.write(record.payload)!
+        for message in tls13.decode_handshakes(flight.bytes()) catch []:
+            if message.message_type == tls12.TLS12_SERVER_HELLO_DONE:
+                have_done = true
+    server_flight := flight.bytes()
+    transcript.write(server_flight)!
+    messages := tls13.decode_handshakes(server_flight)!
+
+    mut certs: List[x509.Certificate] := []
+    mut ske_curve := 0
+    mut ske_point := bytes.empty()
+    mut have_ske := false
+    for message in messages:
+        if message.message_type == tls12.TLS12_CERTIFICATE:
+            for der in tls12.parse_certificate_message(message.body)!:
+                certs.push(x509.parse_der(der)!)
+        elif message.message_type == tls12.TLS12_SERVER_KEY_EXCHANGE:
+            if certs.len() == 0:
+                fail "tls 1.2 server key exchange arrived before the certificate"
+            ske := tls12.parse_server_key_exchange(message.body)!
+            signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, ske.signed_params)
+            if not tls13.verify_certificate_signature(certs[0].subject_public_key, ske.signature_scheme, signed_data, ske.signature)!:
+                fail "tls 1.2 server key exchange signature is invalid"
+            ske_curve = ske.named_curve
+            ske_point = ske.public_point
+            have_ske = true
+        elif message.message_type == tls12.TLS12_CERTIFICATE_REQUEST:
+            fail "tls 1.2 client certificate authentication is not supported"
+        elif message.message_type != tls12.TLS12_SERVER_HELLO_DONE:
+            fail "unexpected tls 1.2 handshake message"
+    if certs.len() == 0 or not have_ske:
+        fail "incomplete tls 1.2 server flight"
+
+    if not verify_certificate_chain(certs, config, server_name)!:
+        fail "tls 1.2 server certificate verification failed"
+
+    # ECDH with whichever curve the server chose from our key shares.
+    mut pre_master := bytes.empty()
+    mut client_point := bytes.empty()
+    if ske_curve == tls12.NAMED_CURVE_X25519:
+        pre_master = keypair.shared_secret(ske_point)!
+        client_point = keypair.public_key
+    elif ske_curve == tls12.NAMED_CURVE_SECP256R1:
+        pre_master = p256pair.shared_secret(ske_point)!
+        client_point = p256pair.public_key
+    else:
+        fail "server selected an unsupported tls 1.2 curve"
+    keypair.close()
+    p256pair.close()
+
+    # ClientKeyExchange, then derive the keys over the transcript so far.
+    cke_message := tls13.encode_handshake(tls12.TLS12_CLIENT_KEY_EXCHANGE, tls12.encode_client_key_exchange(client_point)!)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, cke_message)!)!
+    transcript.write(cke_message)!
+    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
+    master := tls12.extended_master_secret(pre_master, session_hash)!
+    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+
+    # ChangeCipherSpec, then the encrypted client Finished over the transcript
+    # through ClientKeyExchange.
+    ccs := bytes.buffer_with_capacity(1)
+    ccs.write_byte(1)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_CHANGE_CIPHER_SPEC, ccs.bytes())!)!
+    ccs.free()
+    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12.finished_verify_data(master, "client finished", tls12.handshake_hash_sha256(transcript.bytes()))!)!
+    native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, TLS_CONTENT_HANDSHAKE, client_finished)!)!
+    transcript.write(client_finished)!
+
+    # the server answers with ChangeCipherSpec (possibly after a plaintext
+    # NewSessionTicket we did not ask for and ignore) and its encrypted Finished.
+    mut saw_ccs := false
+    while not saw_ccs:
+        record := native_read_record(stream)!
+        if record.content_type == TLS_CONTENT_ALERT:
+            native_fail_alert(record)!
+        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            saw_ccs = true
+        elif record.content_type != TLS_CONTENT_HANDSHAKE:
+            fail "expected server change cipher spec"
+    finished_record := native_read_record(stream)!
+    if finished_record.content_type == TLS_CONTENT_ALERT:
+        native_fail_alert(finished_record)!
+    server_inner := open_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, record_bytes(finished_record)!)!
+    if server_inner.content_type != TLS_CONTENT_HANDSHAKE:
+        fail "expected an encrypted server finished"
+    finished_messages := tls13.decode_handshakes(server_inner.payload)!
+    if finished_messages.len() == 0 or finished_messages[0].message_type != tls12.TLS12_FINISHED:
+        fail "expected a server finished message"
+    expected_finished := tls12.finished_verify_data(master, "server finished", tls12.handshake_hash_sha256(transcript.bytes()))!
+    if not subtle.equal(expected_finished, finished_messages[0].body):
+        fail "tls 1.2 server finished verification failed"
+
+    peer := peer_identity_from_certificates(certs)
+    state := connection_state_from_peer(TLS_VERSION_12, cipher, hello.alpn_protocol, false, peer, false, false)
+    server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
+    client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
+    # a fresh cipher epoch starts at sequence 0 for the Finished, so the first
+    # application record in each direction is sequence 1.
+    return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, 1, 1, "", bytes.empty(), state)
+
+fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
     mut transcript_buf := transcript
     alpn_protocols := config_alpn_protocols(config)
     mut peer := empty_peer_identity()
@@ -951,6 +1132,15 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     server_messages := tls13.decode_handshakes(first_record.payload)!
     if server_messages.len() == 0 or server_messages[0].message_type != TLS_HANDSHAKE_SERVER_HELLO:
         fail "expected tls server hello"
+    # branch on the version the server negotiated. a 1.2 ServerHello would fail
+    # the 1.3 parser (no supported_versions, no key share), so decide here.
+    negotiated := tls13.negotiated_server_version(server_messages[0].body)!
+    if negotiated == TLS_VERSION_12:
+        if not config_offers_tls12(config):
+            fail "server negotiated tls 1.2 but this config requires tls 1.3"
+        return native_client_handshake_tls12(stream, server_name, config, client_random, keypair, p256pair, server_messages[0], transcript_buf)
+    if negotiated != TLS_VERSION_13:
+        fail "server negotiated an unsupported tls version"
     server_hello := tls13.parse_server_hello(server_messages[0].body)!
     transcript_append(transcript_buf, server_messages[0])!
 
@@ -1064,7 +1254,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         peer = peer_identity_from_cached_session(cached_session)
     state := connection_state_from_peer(772, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, client_cert_requested, false)
     run_verify_connection_hook(config, state)!
-    return allocate_native_conn(stream, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state)
+    return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state)
 
 fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     first_record := native_read_record(stream)!
@@ -1197,7 +1387,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
     state := connection_state_from_peer(772, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
-    return allocate_native_conn(stream, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state)
+    return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state)
 
 fn record_bytes(record: tls13.Record) -> Bytes!:
     out := bytes.buffer_with_capacity(record.payload.len() + 5)
@@ -1266,7 +1456,7 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             fail "unencrypted tls record after handshake"
         seq := cs.read_seq
         cs.read_seq = seq + 1
-        inner := open_record_for_cipher(cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
+        inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
@@ -1309,7 +1499,7 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     # consume the sequence number before the send: if the write fails partway,
     # the connection is poisoned and no retry can reseal at this same sequence.
     cs.write_seq = seq + 1
-    record := seal_record_for_cipher(cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
+    record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
     native_write_all(stream, record)!
     return count
 
@@ -1510,6 +1700,16 @@ impl Config:
         config_put(native_config_resumption_enabled, self.handle, true)
         return self
 
+    # Restrict this config to TLS 1.3 only, refusing the TLS 1.2 fallback.
+    #
+    # By default a client offers 1.3 and 1.2 and takes the highest a server
+    # supports, and a server answers either; this is the same posture as Go's
+    # crypto/tls and rustls. Call this when a peer must not be allowed to
+    # negotiate 1.2 — the equivalent of setting a minimum version of 1.3.
+    fn require_tls13() -> Config:
+        config_put(native_config_require_tls13, self.handle, true)
+        return self
+
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
         config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
         return self
@@ -1542,6 +1742,7 @@ impl Config:
         config_drop(native_config_roots_pem, self.handle)
         config_drop(native_config_alpn, self.handle)
         config_drop(native_config_resumption_enabled, self.handle)
+        config_drop(native_config_require_tls13, self.handle)
         config_drop(native_config_verify_connection, self.handle)
         config_drop(native_server_config_selector, self.handle)
         config_drop(native_client_cert_pem, self.handle)
@@ -1757,7 +1958,7 @@ test "tls config helpers track alpn, client auth, and resumption":
     optional_cfg.close()
 
 test "closing a client config empties every registry map it wrote to":
-    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["pith.rpc"]).with_client_certificate("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.enable_session_resumption().with_verify_connection(verify_state_accept)
+    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["pith.rpc"]).with_client_certificate("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.enable_session_resumption().require_tls13().with_verify_connection(verify_state_accept)
     assert(is_native_config(cfg))
 
     cfg.close()
@@ -1768,6 +1969,7 @@ test "closing a client config empties every registry map it wrote to":
     assert(not config_has(native_config_roots_pem, cfg.handle))
     assert(not config_has(native_config_alpn, cfg.handle))
     assert(not config_has(native_config_resumption_enabled, cfg.handle))
+    assert(not config_has(native_config_require_tls13, cfg.handle))
     assert(not config_has(native_config_verify_connection, cfg.handle))
     assert(not config_has(native_client_cert_pem, cfg.handle))
     assert(not config_has(native_client_key_der, cfg.handle))

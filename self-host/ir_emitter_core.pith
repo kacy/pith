@@ -1538,9 +1538,6 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
     for child in node.children:
         ir_collect_rc_bind_names(child, names, poisoned)
 
-# prologue for the collected names: zero-store each one and retain string
-# params (params are locals under the same rule, so the exit cleanup
-# releasing them stays balanced with the caller's count).
 mut ir_current_arc_func := ""
 # true while emitting main's own body — not a lambda defined inside it, and
 # not a test function. error returns emitted under this flag also report the
@@ -1569,6 +1566,9 @@ fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
     for child in node.children:
         ir_collect_reassigned_string_params(child, names)
 
+# prologue for the collected names: zero-store each one and retain string
+# params (params are locals under the same rule, so the exit cleanup
+# releasing them stays balanced with the caller's count).
 fn ir_emit_rc_prologue(body_idx: Int):
     mut poisoned: List[String] := []
     if body_idx >= 0:
@@ -6771,10 +6771,6 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     return r
 
 # `expr catch:` with a block. the ok arm is the same extraction the inline
-# catch performs; the error arm disposes of the failed result and then runs
-# the user's block, which the checker guarantees leaves (return, fail,
-# continue or break). the trailing jmp is dead code on every real path — it
-# only keeps the ir well formed.
 # consume a pair at a `catch:` block with no box on either path: the ok
 # payload arrives owned, and the err arm drops the error by its kind
 # before the user's block runs, matching the box path's disposal.
@@ -6799,6 +6795,10 @@ fn ir_emit_catch_block_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# catch performs; the error arm disposes of the failed result and then runs
+# the user's block, which the checker guarantees leaves (return, fail,
+# continue or break). the trailing jmp is dead code on every real path — it
+# only keeps the ir well formed.
 fn ir_emit_catch_block(node: Node) -> Int:
     saved_defer := ir_rcall_defer_idx
     ir_rcall_defer_idx = node.children[0]
@@ -9013,10 +9013,6 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
     ir_emit("funcref " + fr.to_string() + " __dtor_" + sname)
     ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
 
-# one destructor per known struct with rc fields: releases each such
-# field, then the runtime frees the allocation. every module emits its
-# own copy (module prefixing keeps the names distinct), so construction
-# sites never need cross-module destructor references.
 # one destructor per rc payload kind for owned optionals. an optional that owns
 # a struct/list/map/set/bytes/closure payload attaches the matching dtor, which
 # releases the payload (slot 1) when the optional tuple dies. release on a null
@@ -9037,6 +9033,10 @@ fn ir_emit_optional_dtors():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
+# one destructor per known struct with rc fields: releases each such
+# field, then the runtime frees the allocation. every module emits its
+# own copy (module prefixing keeps the names distinct), so construction
+# sites never need cross-module destructor references.
 fn ir_emit_struct_dtors():
     for sname in ir_struct_names.keys():
         if sname.index_of("[") >= 0:
@@ -9238,9 +9238,6 @@ fn ir_emit_enum_tracers():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
-# one equality helper per boxed enum: same pointer or same tag with
-# equal payloads. string payloads compare by content and nested boxed
-# enums recurse; struct payloads keep pointer identity.
 # one destructor per rc-bearing tuple signature seen in this module.
 # emitted after the bodies, since tuple shapes are only discovered at
 # their literal sites. mirrors ir_emit_struct_dtors, keyed by the
@@ -9288,6 +9285,9 @@ fn ir_emit_tuple_tracers():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
+# one equality helper per boxed enum: same pointer or same tag with
+# equal payloads. string payloads compare by content and nested boxed
+# enums recurse; struct payloads keep pointer identity.
 fn ir_emit_enum_eq_fns():
     for ename in ir_boxed_enums.keys():
         if not ir_enum_variant_lists.contains_key(ename):

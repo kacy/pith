@@ -120,9 +120,12 @@ threadlocal mut object_key_counts: Map[Int, Int] := {}
 threadlocal mut object_keys_by_slot: Map[String, String] := {}
 threadlocal mut object_values_by_slot: Map[String, Int] := {}
 
-# Array children: flat append-only storage with offset/count
-threadlocal mut array_items_flat: List[Int] := []
-threadlocal mut array_item_offsets: Map[Int, Int] := {}
+# Array children live under stable per-array slot keys, exactly like object
+# entries — a single flat append-only list broke on interleaving, since a
+# child array parsed between two parent pushes landed inside the parent's
+# window ([[1],[2]] read element 1 back as the int 2). the count is kept for
+# length and bounds; the values hang off (handle, index) slot keys.
+threadlocal mut array_values_by_slot: Map[String, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
 
 # How many scopes open_scope() has handed out and not yet reclaimed. A scope
@@ -140,7 +143,6 @@ fn allocate_node(kind: String) -> Int:
     float_values.insert(node_id, 0.0)
     boolean_values.insert(node_id, false)
     object_key_counts.insert(node_id, 0)
-    array_item_offsets.insert(node_id, 0)
     array_item_counts.insert(node_id, 0)
     return node_id
 
@@ -172,12 +174,23 @@ fn set_object_property(handle: Int, key: String, value: Int):
     object_values_by_slot.insert(slot, value)
     object_key_counts.insert(handle, count + 1)
 
+fn array_slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
+fn array_slot_value(handle: Int, index: Int) -> Int:
+    return array_values_by_slot[array_slot_key(handle, index)]
+
+fn clear_array_entries(handle: Int):
+    count := array_item_counts[handle]
+    mut i := 0
+    while i < count:
+        array_values_by_slot.remove(array_slot_key(handle, i))
+        i = i + 1
+
 # Appends a value to an array node
 fn push_array_element(handle: Int, value: Int):
     count := array_item_counts[handle]
-    if count == 0:
-        array_item_offsets.insert(handle, array_items_flat.len())
-    array_items_flat.push(value)
+    array_values_by_slot.insert(array_slot_key(handle, count), value)
     array_item_counts.insert(handle, count + 1)
 
 # ===============================================================
@@ -1048,7 +1061,7 @@ pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!JsonDeco
 # handler that parses a body and answers from it needs nothing extra.
 pub fn open_scope() -> JsonScope:
     open_scope_depth = open_scope_depth + 1
-    return JsonScope(open_scope_depth, next_node_id, array_items_flat.len())
+    return JsonScope(open_scope_depth, next_node_id, 0)
 
 # closes a scope opened by open_scope() and reclaims the nodes parsed inside it.
 #
@@ -1074,7 +1087,7 @@ pub fn checkpoint() -> JsonCheckpoint:
     return json_checkpoint()
 
 fn json_checkpoint() -> JsonCheckpoint:
-    return JsonCheckpoint(next_node_id, 0, array_items_flat.len())
+    return JsonCheckpoint(next_node_id, 0, 0)
 
  # restores parser state captured by checkpoint().
 pub fn restore(mark: JsonCheckpoint):
@@ -1102,11 +1115,9 @@ fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
             boolean_values.remove(node_id)
             clear_object_entries(node_id)
             object_key_counts.remove(node_id)
-            array_item_offsets.remove(node_id)
+            clear_array_entries(node_id)
             array_item_counts.remove(node_id)
         node_id = node_id - 1
-    while array_items_flat.len() > array_len_mark:
-        array_items_flat.remove(array_items_flat.len() - 1)
 
 # the typed decoders (decode[T], decode_text[T], ...) own the parse that fills
 # the node pool, then copy scalars and strings out into a concrete struct. once
@@ -1119,9 +1130,11 @@ fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
 pub fn pool_mark_node_id() -> Int:
     return next_node_id
 
-# flat-array position a compiler-lowered typed decode rolls back to.
+# retained for the compiler's decode-lowering ABI: it still passes this mark
+# to pool_restore, but arrays now reclaim per node (clear_array_entries in
+# json_restore_to), so the value is vestigial and reclaim ignores it.
 pub fn pool_mark_array_len() -> Int:
-    return array_items_flat.len()
+    return 0
 
 # reclaims the pool nodes a compiler-lowered typed decode allocated. safe once
 # the concrete struct is built: its string fields are independent heap copies
@@ -1201,7 +1214,7 @@ fn json_array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
-    return array_items_flat[array_item_offsets[handle] + index]
+    return array_slot_value(handle, index)
 
 # ===============================================================
 # Public API — Object Operations
@@ -1511,13 +1524,12 @@ fn json_write(out: StringBuffer, handle: Int) -> Int!:
         return write_escaped_string(out, string_values[handle])
     if kind == "array":
         mut total := out.write_all("[")!
-        off := array_item_offsets[handle]
         cnt := array_item_counts[handle]
         mut i := 0
         while i < cnt:
             if i > 0:
                 total = total + out.write_all(",")!
-            total = total + json_write(out, array_items_flat[off + i])!
+            total = total + json_write(out, array_slot_value(handle, i))!
             i = i + 1
         total = total + out.write_all("]")!
         return total
@@ -1578,13 +1590,12 @@ fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
         return write_escaped_bytes(out, string_values[handle])
     if kind == "array":
         mut total := out.write_byte(91)!
-        off := array_item_offsets[handle]
         cnt := array_item_counts[handle]
         mut i := 0
         while i < cnt:
             if i > 0:
                 total = total + out.write_byte(44)!
-            total = total + json_write_bytes(out, array_items_flat[off + i])!
+            total = total + json_write_bytes(out, array_slot_value(handle, i))!
             i = i + 1
         total = total + out.write_byte(93)!
         return total
@@ -1788,6 +1799,32 @@ test "json rejects an unterminated string":
     assert(parse(dq + "bare-unclosed") < 0)
     # the well-formed counterpart still parses
     assert(parse(dq + "ok" + dq) >= 0)
+
+test "json parses nested arrays without interleaving corruption":
+    # a child array parsed between two parent pushes must not land inside the
+    # parent's window — [[10,11],[20,21]] once read element 1 back as int 20.
+    root := parse("[[10, 11], [20, 21], [30]]")
+    assert(type_of(root) == "array")
+    assert(array_len(root) == 3)
+    a := array_get(root, 0)
+    b := array_get(root, 1)
+    c := array_get(root, 2)
+    assert(type_of(a) == "array")
+    assert(type_of(b) == "array")
+    assert(type_of(c) == "array")
+    assert(get_int(array_get(a, 1)) == 11)
+    assert(get_int(array_get(b, 0)) == 20)
+    assert(get_int(array_get(b, 1)) == 21)
+    assert(get_int(array_get(c, 0)) == 30)
+    # arrays nested inside objects inside arrays round-trip through encode too.
+    # braces/quotes via chr() so the pith string does not open interpolation.
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    obj := lb + dq + "pt" + dq + ":[1, 2]" + rb
+    doc := parse("[" + obj + ", " + obj + "]")
+    expect := "[" + lb + dq + "pt" + dq + ":[1,2]" + rb + "," + lb + dq + "pt" + dq + ":[1,2]" + rb + "]"
+    assert(encode(doc) == expect)
 
 test "json parses arrays and primitive values":
     arr := parse("[42,3.5,false,null," + chr(34) + "ok" + chr(34) + "]")

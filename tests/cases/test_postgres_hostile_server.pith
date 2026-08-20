@@ -115,6 +115,45 @@ fn serve(listener: Int, replies: List[Bytes], piece: Int) -> Int!:
     tcp_close(conn)
     return 0
 
+# extract the client nonce from a SASLInitialResponse: the client-first is
+# "n,,n=,r=<nonce>", so the nonce is the ascii tail after the last "r=".
+fn client_nonce_from(request: Bytes) -> String:
+    text := bytes.to_string_utf8(request) catch ""
+    marker := text.last_index_of("r=")
+    if marker < 0:
+        return ""
+    return text.substring(marker + 2, text.len())
+
+# drive a full SCRAM handshake that ECHOES the client nonce (so the client
+# reaches its later checks), then sends `final_reply` — a forged SASLFinal or
+# a premature AuthenticationOk. this is the faithful shape a real MITM has:
+# the nonce matches, and the client must still reject on the signature round.
+fn serve_scram_reject(listener: Int, final_reply: Bytes) -> Int!:
+    conn := tcp_accept(listener)!
+    tcp_read_bytes(conn, 4096)!
+    tcp.write_all_bytes(conn, auth_sasl()) catch 0
+    initial := tcp_read_bytes(conn, 4096)!
+    nonce := client_nonce_from(initial)
+    cont := pg_msg(82, cat([be32(11), str("r=" + nonce + "srv,s=QSXCR+Q6sek8bf92,i=4096")]))
+    tcp.write_all_bytes(conn, cont) catch 0
+    tcp_read_bytes(conn, 4096)!
+    tcp.write_all_bytes(conn, final_reply) catch 0
+    tcp_close(conn)
+    return 0
+
+fn scram_reject_case(label: String, port: Int, final_reply: Bytes) -> Int!:
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve_scram_reject(listener, final_reply)
+    conn := postgres.connect("127.0.0.1", port, "user", "pencil", "db")
+    if conn.is_err:
+        print(label + ": " + conn.err)
+    else:
+        print(label + ": unexpectedly connected")
+        conn.ok.close()
+    await task
+    tcp_close(listener)
+    return 0
+
 # drive a real connect against the scripted stub and report how it ended.
 fn connect_case(label: String, port: Int, replies: List[Bytes]) -> Int!:
     listener := tcp_listen("127.0.0.1", port)!
@@ -157,19 +196,11 @@ fn main() -> Int!:
     # a SASLFinal whose v= does not match the signature derived from the
     # password must end the handshake: only a server that verified the
     # password can compute the real one.
-    connect_case("forged signature", 17561, [
-        auth_sasl(),
-        sasl_continue(),
-        pg_msg(82, cat([be32(12), str("v=Zm9yZ2Vk")])),
-])!
+    scram_reject_case("forged signature", 17561, pg_msg(82, cat([be32(12), str("v=Zm9yZ2Vk")])))!
 
     # an AuthenticationOk with the SCRAM signature round skipped is what a MITM
     # that never saw the password would send.
-    connect_case("skipped verification", 17562, [
-        auth_sasl(),
-        sasl_continue(),
-        cat([auth_ok(), ready()]),
-])!
+    scram_reject_case("skipped verification", 17562, cat([auth_ok(), ready()]))!
 
     # a DataRow field length that runs past its message must not swallow the
     # row or push the cursor out of range.

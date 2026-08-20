@@ -330,8 +330,8 @@ cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.require_tls13()
 
 what the 1.2 fallback does not do (v1): session resumption, renegotiation
 (refused), client-certificate auth (the server refuses a 1.2 CertificateRequest
-path), aes-256 suites, or sni-based server config selection. it needs a
-≥2048-bit rsa server key.
+path), or aes-256 suites. sni-based server config selection works on 1.2. rsa
+(≥2048-bit) and ecdsa (p-256) server certificates are both supported.
 
 ## current limits
 

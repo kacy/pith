@@ -51,6 +51,22 @@ pub fn sign_ed25519_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
 pub fn sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
     return crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key, message)!
 
+# sign with a p-256 pkcs#8 private key using ecdsa and sha-256, returning the
+# signature as asn.1 der — the form x.509 and tls carry, unlike the raw r‖s of
+# sign_ecdsa_p256_sha256_pkcs8 above.
+pub fn sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8_private_key, message)!
+
+test "ecdsa p-256 asn.1 signatures verify and are der-encoded":
+    pk8 := encoding.from_hex("308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe")!
+    public_point := encoding.from_hex("04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe")!
+    msg := bytes.from_string_utf8("ecdsa asn1 message")
+    sig := sign_ecdsa_p256_sha256_asn1_pkcs8(pk8, msg)!
+    # a der ecdsa signature is a SEQUENCE (0x30)
+    assert_eq(sig[0], 48)
+    assert(verify_ecdsa_p256_sha256_asn1(public_point, msg, sig))
+    assert(not verify_ecdsa_p256_sha256_asn1(public_point, bytes.from_string_utf8("other"), sig))
+
 test "ed25519 verification matches rfc 8032 empty message vector":
     public_key := encoding.from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")!
     sig := encoding.from_hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")!

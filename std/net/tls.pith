@@ -154,6 +154,8 @@ TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
 TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
 TLS_SIG_RSA_PKCS1_SHA256 := 1025
+TLS_SIG_ECDSA_SECP256R1_SHA256 := 1027
+OID_EC_PUBLIC_KEY := "1.2.840.10045.2.1"
 TLS_GROUP_X25519 := 29
 TLS_GROUP_SECP256R1 := 23
 TLS_MAX_PLAINTEXT_RECORD := 16384
@@ -1267,11 +1269,39 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     run_verify_connection_hook(config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state, server_app_secret, client_app_secret)
 
+# true when the configured server certificate carries an EC (P-256) public key
+# rather than RSA, so the handshake signs with ECDSA.
+fn server_key_is_ecdsa(config: Config) -> Bool!:
+    chain := native_server_certificate_chain(config)!
+    if chain.len() == 0:
+        return false
+    leaf := x509.parse_der(chain[0])!
+    return leaf.public_key_algorithm == OID_EC_PUBLIC_KEY
+
+# sign server handshake data with the certificate's key: ECDSA (asn.1 der) for
+# an EC certificate, otherwise RSA. `rsa_pss` selects RSA-PSS (tls 1.3
+# CertificateVerify) over RSA-PKCS1 (tls 1.2 ServerKeyExchange). Returns the
+# signature scheme id and the signature bytes.
+struct ServerSignature:
+    scheme: Int
+    signature: Bytes
+
+fn sign_server_handshake(config: Config, is_ecdsa: Bool, rsa_pss: Bool, message: Bytes) -> ServerSignature!:
+    key := native_server_private_key(config)!
+    if is_ecdsa:
+        return ServerSignature(TLS_SIG_ECDSA_SECP256R1_SHA256, signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!)
+    if rsa_pss:
+        return ServerSignature(TLS_SIG_RSA_PSS_RSAE_SHA256, signature.sign_rsa_pss_sha256_pkcs8(key, message)!)
+    return ServerSignature(TLS_SIG_RSA_PKCS1_SHA256, signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!)
+
 # pick a TLS 1.2 suite from what the client offered, in server preference order.
 # only ECDHE-RSA AEAD suites are eligible because the server key is RSA; an
 # ECDHE-ECDSA suite would need an ECDSA certificate we do not serve.
-fn select_tls12_suite(offered: List[Int]) -> Int:
-    for candidate in [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]:
+fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
+    mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
+    if is_ecdsa:
+        preference = [tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
+    for candidate in preference:
         if offered.contains(candidate):
             return candidate
     return 0
@@ -1291,14 +1321,16 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
 # Certificate, ServerKeyExchange, ServerHelloDone; reads ClientKeyExchange,
 # ChangeCipherSpec, Finished; then sends its own ChangeCipherSpec and Finished.
 fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello_message: tls13.HandshakeMessage, lenient: tls13.LenientClientHello) -> Conn!:
-    cipher := select_tls12_suite(lenient.cipher_suites)
+    # select the certificate/config by server name first: the cert's key type
+    # decides which suite family (ECDHE-RSA vs ECDHE-ECDSA) we can serve.
+    handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols)!
+    is_ecdsa := server_key_is_ecdsa(handshake_config)!
+    cipher := select_tls12_suite(lenient.cipher_suites, is_ecdsa)
     if cipher == 0:
         fail "no supported tls 1.2 cipher suite offered"
     curve := select_tls12_curve(lenient.supported_groups)
     if curve == 0:
         fail "no supported tls 1.2 curve offered"
-    # select the certificate/config by server name, the same as the 1.3 path.
-    handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols)!
     selected_alpn := select_alpn_protocol(handshake_config, lenient.alpn_protocols)!
     client_random := lenient.random
     # a 1.3-capable server marks its random so a downgraded 1.3 client can tell.
@@ -1313,8 +1345,8 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!)!
     params := tls12.server_key_exchange_params(curve, keypair.public_key)!
     signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, params)
-    ske_signature := signature.sign_rsa_pkcs1_sha256_pkcs8(native_server_private_key(handshake_config)!, signed_data)!
-    server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, TLS_SIG_RSA_PKCS1_SHA256, ske_signature)!)!
+    ske_sig := sign_server_handshake(handshake_config, is_ecdsa, false, signed_data)!
+    server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, ske_sig.scheme, ske_sig.signature)!)!
     server_done := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO_DONE, bytes.empty())!
 
     transcript := bytes.buffer()
@@ -1404,7 +1436,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # path, whose parser is stricter.
     lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body)!
     if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
-        if config_offers_tls12(config) and select_tls12_suite(lenient_hello.cipher_suites) != 0:
+        if config_offers_tls12(config) and select_tls12_suite(lenient_hello.cipher_suites, server_key_is_ecdsa(config) catch false) != 0:
             return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
     client_hello := tls13.parse_client_hello(client_messages[0].body)!
     handshake_config := select_server_config(config, client_hello)!
@@ -1446,8 +1478,8 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         certificate := tls13.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!
         transcript.write(certificate)!
         cert_verify_input := tls13.server_certificate_verify_input_sha256(transcript.bytes())!
-        cert_signature := signature.sign_rsa_pss_sha256_pkcs8(native_server_private_key(handshake_config)!, cert_verify_input)!
-        certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, cert_signature)!
+        cert_verify_sig := sign_server_handshake(handshake_config, server_key_is_ecdsa(handshake_config)!, true, cert_verify_input)!
+        certificate_verify := tls13.encode_certificate_verify(cert_verify_sig.scheme, cert_verify_sig.signature)!
         transcript.write(certificate_verify)!
         server_flight.write(certificate)!
         server_flight.write(certificate_verify)!

@@ -151,8 +151,8 @@ something here that now works, the page is stale and a fix to it is welcome.
   chacha20-poly1305 suites), negotiating the highest a peer supports and
   refusing anything below 1.2 — the same posture as go's crypto/tls and rustls.
   `require_tls13()` locks a config to 1.3. the 1.2 fallback does not yet do
-  session resumption, renegotiation, or client-certificate auth, needs a
-  ≥2048-bit rsa server key, and has no aes-256 suites.
+  session resumption, renegotiation, or client-certificate auth, supports rsa (≥2048-bit) and ecdsa (p-256) server certificates, and has no
+  aes-256 suites.
 - **testing** — `std/testing` covers assertions but not discovery, fixtures, or
   parameterized cases. the project's own suite is golden-snapshot based (see
   `tests/`).

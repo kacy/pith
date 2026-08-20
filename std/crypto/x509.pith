@@ -80,6 +80,16 @@ pub struct Certificate:
     # empty lists mean the certificate constrains no dnsnames.
     pub permitted_dns: List[String]
     pub excluded_dns: List[String]
+    # keyUsage: has_key_usage is false when the extension is absent (rfc 5280
+    # treats that as "valid for any purpose"). when present, key_cert_sign is
+    # the keyCertSign bit, which a certificate must carry to sign others.
+    pub has_key_usage: Bool
+    pub key_cert_sign: Bool
+    # basicConstraints pathLenConstraint: has_path_len is false when absent.
+    # when present, path_len bounds how many intermediate cas may appear below
+    # this one on a valid path.
+    pub has_path_len: Bool
+    pub path_len: Int
 
 # result from native certificate verification preflight.
 pub struct VerificationResult:
@@ -263,16 +273,42 @@ fn parse_san(data: Bytes, extn_value: DerValue, dns_names: List[String], ip_addr
         pos = name.next
     return true
 
-fn parse_basic_constraints(data: Bytes, extn_value: DerValue) -> Bool!:
+# The cA flag and optional pathLenConstraint from a basicConstraints extension.
+struct BasicConstraints:
+    is_ca: Bool
+    has_path_len: Bool
+    path_len: Int
+
+# read a small non-negative der integer body into an Int. path lengths are
+# tiny; an absurd value is clamped so the multiply can never wrap.
+fn der_small_int(body: Bytes) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < body.len():
+        if value > 1000000:
+            return 1000000
+        value = value * 256 + body[i]
+        i = i + 1
+    return value
+
+fn parse_basic_constraints(data: Bytes, extn_value: DerValue) -> BasicConstraints!:
     inner := value_bytes(data, extn_value)
     seq := expect_tag(inner, 0, TAG_SEQUENCE)!
     if seq.value_start >= seq.value_end:
-        return false
-    first := read_value(inner, seq.value_start)!
-    if first.tag != TAG_BOOLEAN:
-        return false
-    body := value_bytes(inner, first)
-    return body.len() > 0 and body[0] != 0
+        return BasicConstraints(false, false, 0)
+    mut pos := seq.value_start
+    first := read_value(inner, pos)!
+    mut is_ca := false
+    if first.tag == TAG_BOOLEAN:
+        body := value_bytes(inner, first)
+        is_ca = body.len() > 0 and body[0] != 0
+        pos = first.next
+    # pathLenConstraint is only meaningful for a ca and follows the cA boolean.
+    if is_ca and pos < seq.value_end:
+        next := read_value(inner, pos)!
+        if next.tag == TAG_INTEGER:
+            return BasicConstraints(true, true, der_small_int(value_bytes(inner, next)))
+    return BasicConstraints(is_ca, false, 0)
 
 fn parse_eku(data: Bytes, extn_value: DerValue, eku_oids: List[String]) -> Bool!:
     inner := value_bytes(data, extn_value)
@@ -326,6 +362,8 @@ struct ParsedExtensions:
     has_eku: Bool
     has_key_usage: Bool
     key_cert_sign: Bool
+    has_path_len: Bool
+    path_len: Int
 
 fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String], eku_oids: List[String], permitted_dns: List[String], excluded_dns: List[String]) -> ParsedExtensions!:
     extensions := expect_tag(data, value.value_start, TAG_SEQUENCE)!
@@ -333,6 +371,8 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
     mut has_eku := false
     mut has_key_usage := false
     mut key_cert_sign := false
+    mut has_path_len := false
+    mut path_len := 0
     mut pos := extensions.value_start
     while pos < extensions.value_end:
         ext := expect_tag(data, pos, TAG_SEQUENCE)!
@@ -353,7 +393,10 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
         if oid == OID_SUBJECT_ALT_NAME:
             parse_san(data, child, dns_names, ip_addresses)!
         elif oid == OID_BASIC_CONSTRAINTS:
-            is_ca = parse_basic_constraints(data, child)!
+            bc := parse_basic_constraints(data, child)!
+            is_ca = bc.is_ca
+            has_path_len = bc.has_path_len
+            path_len = bc.path_len
         elif oid == OID_EXTENDED_KEY_USAGE:
             has_eku = true
             parse_eku(data, child, eku_oids)!
@@ -371,7 +414,7 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
             # ordinary certificate.
             fail "unrecognised critical extension: " + oid
         pos = ext.next
-    return ParsedExtensions(is_ca, has_eku, has_key_usage, key_cert_sign)
+    return ParsedExtensions(is_ca, has_eku, has_key_usage, key_cert_sign, has_path_len, path_len)
 
 fn skip_optional_tbs_field(tag: Int) -> Bool:
     return tag == 129 or tag == 161 or tag == 130 or tag == 162
@@ -408,19 +451,27 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     mut excluded_dns: List[String] := []
     mut is_ca := false
     mut has_eku := false
+    mut has_key_usage := false
+    mut key_cert_sign := false
+    mut has_path_len := false
+    mut path_len := 0
     while pos < tbs.value_end:
         child := read_value(data, pos)!
         if child.tag == TAG_EXTENSIONS:
             parsed := parse_extensions(data, child, dns_names, ip_addresses, eku_oids, permitted_dns, excluded_dns)!
             is_ca = parsed.is_ca
             has_eku = parsed.has_eku
+            has_key_usage = parsed.has_key_usage
+            key_cert_sign = parsed.key_cert_sign
+            has_path_len = parsed.has_path_len
+            path_len = parsed.path_len
         elif not skip_optional_tbs_field(child.tag):
             fail "unexpected tbs certificate field"
         pos = child.next
 
     issuer_dn := data.slice(issuer.header_start, issuer.next)
     subject_dn := data.slice(subject.header_start, subject.next)
-    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns)
+    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns, has_key_usage, key_cert_sign, has_path_len, path_len)
 
 # parse a der-encoded x.509 certificate.
 pub fn parse_der(data: Bytes) -> Certificate!:
@@ -642,6 +693,8 @@ fn validity_contains(cert: Certificate, now_ms: Int) -> Bool:
 EXPIRED_REASON := "certificate is expired or not yet valid"
 EKU_REASON := "certificate is not valid for tls server authentication"
 NAME_CONSTRAINT_REASON := "certificate name is outside a ca name constraint"
+KEY_USAGE_REASON := "certificate issuer is not permitted to sign certificates"
+PATH_LEN_REASON := "certificate chain exceeds a ca path length constraint"
 
 fn verify_signature_for_algorithm(cert: Certificate, issuer: Certificate) -> Bool:
     if cert.signature_algorithm == "1.2.840.113549.1.1.11":
@@ -721,6 +774,13 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             signature_verified = verify_signature(current, issuer)
             if not root_ca_ok or not signature_verified:
                 return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+            # a ca with a keyUsage that omits keyCertSign may not sign a
+            # certificate, and a pathLenConstraint bounds how many intermediates
+            # may sit below it (next_chain_index-1 of them do here).
+            if issuer.has_key_usage and not issuer.key_cert_sign:
+                return VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
+            if issuer.has_path_len and next_chain_index - 1 > issuer.path_len:
+                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
             # a name-constrained intermediate may not sign outside its namespace.
             if not name_constraints_permit_leaf(chain[0], issuer):
                 return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
@@ -737,6 +797,10 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             issuer_ok = true
             root_ca_ok = root.is_ca
             signature_verified = verify_signature(current, root)
+            if root_ca_ok and signature_verified and root.has_key_usage and not root.key_cert_sign:
+                return VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
+            if root_ca_ok and signature_verified and root.has_path_len and next_chain_index - 1 > root.path_len:
+                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
             # a name-constrained root may not anchor a chain outside its namespace.
             if root_ca_ok and signature_verified and not name_constraints_permit_leaf(chain[0], root):
                 return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
@@ -935,6 +999,21 @@ test "x509 verifies server chains against trusted roots":
     assert(not bad_host.ok)
     assert(not bad_host.hostname_ok)
     assert(not bad_roots.ok)
+
+test "x509 enforces keyCertSign and pathLenConstraint on ca certificates":
+    fx := "tests/live/fixtures/"
+    root := parse_pem(read_file(fx + "constraint-root.crt")!)!
+    # a well-formed chain through a keyCertSign ca still verifies.
+    good := verify_server_chain([parse_pem(read_file(fx + "constraint-leaf-good.crt")!)!, parse_pem(read_file(fx + "constraint-int-good.crt")!)!], [root], "leaf.test")
+    assert(good.ok)
+    # an intermediate whose keyUsage omits keyCertSign may not sign the leaf.
+    no_sign := verify_server_chain([parse_pem(read_file(fx + "constraint-leaf-no-keycertsign.crt")!)!, parse_pem(read_file(fx + "constraint-int-no-keycertsign.crt")!)!], [root], "leaf.test")
+    assert(not no_sign.ok)
+    assert_eq(no_sign.reason, KEY_USAGE_REASON)
+    # a pathlen:0 intermediate may not have another intermediate below it.
+    too_deep := verify_server_chain([parse_pem(read_file(fx + "constraint-leaf-pathlen.crt")!)!, parse_pem(read_file(fx + "constraint-int-below-pathlen0.crt")!)!, parse_pem(read_file(fx + "constraint-int-pathlen0.crt")!)!], [root], "leaf.test")
+    assert(not too_deep.ok)
+    assert_eq(too_deep.reason, PATH_LEN_REASON)
 
 test "x509 verifies client chains against trusted roots":
     cert := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!

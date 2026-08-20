@@ -489,7 +489,10 @@ fn form_encode_fields(fields: Map[String, String]) -> String:
         pairs.push(form_component_encode(key) + "=" + form_component_encode(fields[key]))
     return pairs.join("&")
 
-fn path_segments(path: String) -> List[String]:
+# Splits a request path into its non-empty segments, so "/a//b/" and "/a/b"
+# both yield ["a", "b"]. Route matching and group-scope checks share this, so
+# they agree on which routes a path reaches.
+pub fn path_segments(path: String) -> List[String]:
     mut parts: List[String] := []
     for part in normalize_path(path).split("/"):
         if part != "":
@@ -519,103 +522,36 @@ fn route_param_from_path(path: String, pattern: String, name: String) -> String:
         pat := pattern_parts[i]
         if pat.starts_with(":"):
             if pat.substring(1, pat.len()) == name:
-                return path_parts[i]
+                # the value is one path segment; percent-decode it so a caller
+                # sees "a b", not the raw "a%20b" that arrived on the wire.
+                return url_mod.decode(path_parts[i])
         elif pat != path_parts[i]:
             return ""
         i = i + 1
     return ""
 
-fn query_param_from_string(qs: String, name: String) -> String:
-    if qs.len() == 0:
-        return ""
-    mut start := 0
-    mut pos := 0
-    qs_len := qs.len()
-    while pos <= qs_len:
-        mut at_end := pos == qs_len
-        if not at_end:
-            at_end = char_eq(qs, pos, "&")
-        if at_end and pos > start:
-            pair := qs.substring(start, pos)
-            mut eq := -1
-            mut ei := 0
-            pair_len := pair.len()
-            while ei < pair_len:
-                if char_eq(pair, ei, "="):
-                    eq = ei
-                    break
-                ei = ei + 1
-            if eq >= 0:
-                key := pair.substring(0, eq)
-                if str_eq(key, name):
-                    if eq + 1 < pair_len:
-                        return pair.substring(eq + 1, pair_len)
-                    return ""
-            elif str_eq(pair, name):
-                return ""
-            if at_end and pos == qs_len:
-                break
-            start = pos + 1
-        elif at_end:
-            start = pos + 1
-        pos = pos + 1
-    return ""
-
-fn query_has_param_from_string(qs: String, name: String) -> Bool:
-    if qs.len() == 0:
-        return false
-    mut start := 0
-    mut pos := 0
-    qs_len := qs.len()
-    while pos <= qs_len:
-        mut at_end := pos == qs_len
-        if not at_end:
-            at_end = char_eq(qs, pos, "&")
-        if at_end and pos > start:
-            pair := qs.substring(start, pos)
-            mut eq := pair.index_of("=")
-            if eq >= 0:
-                if pair.substring(0, eq) == name:
-                    return true
-            elif pair == name:
-                return true
-            start = pos + 1
-        elif at_end:
-            start = pos + 1
-        pos = pos + 1
-    return false
-
+# splits a query string into decoded (key, value) pairs, first occurrence
+# winning, so every reader of a request's query agrees on one answer. keys and
+# values are percent-decoded and "+" becomes a space, the same transform the
+# encode side applies in reverse; a pair with no "=" is a present key with an
+# empty value. splitting on the raw "&"/"=" before decoding is deliberate — a
+# "%26" in a value must not read as a separator.
 fn query_params_map_from_string(qs: String) -> Map[String, String]:
     mut result: Map[String, String] := {}
     if qs.len() == 0:
         return result
-    mut start := 0
-    mut pos := 0
-    qs_len := qs.len()
-    while pos <= qs_len:
-        mut at_end := pos == qs_len
-        if not at_end:
-            at_end = char_eq(qs, pos, "&")
-        if at_end and pos > start:
-            pair := qs.substring(start, pos)
-            mut eq := -1
-            mut ei := 0
-            pair_len := pair.len()
-            while ei < pair_len:
-                if char_eq(pair, ei, "="):
-                    eq = ei
-                    break
-                ei = ei + 1
-            if eq >= 0:
-                result.insert(pair.substring(0, eq), pair.substring(eq + 1, pair_len))
-            else:
-                result.insert(pair, "")
-            if at_end and pos == qs_len:
-                break
-            start = pos + 1
-        elif at_end:
-            start = pos + 1
-        pos = pos + 1
+    for pair in qs.split("&"):
+        if pair.len() == 0:
+            continue
+        eq := pair.index_of("=")
+        if eq < 0:
+            key := url_mod.decode(pair)
+            if not result.contains_key(key):
+                result.insert(key, "")
+            continue
+        key := url_mod.decode(pair.substring(0, eq))
+        if not result.contains_key(key):
+            result.insert(key, url_mod.decode(pair.substring(eq + 1, pair.len())))
     return result
 
 fn parse_json_or_fail(text: String) -> Int!:
@@ -1518,7 +1454,10 @@ pub fn get_header(req: String, name: String) -> String:
     return ""
 # looks up one query parameter in a packed request string.
 pub fn get_query_param(req: String, name: String) -> String:
-    return query_param_from_string(req_field(req, 2), name)
+    params := query_params_map_from_string(req_field(req, 2))
+    if params.contains_key(name):
+        return params[name]
+    return ""
 # ===============================================================
 # Response Building — pre-built status lines avoid repeated formatting
 # ===============================================================
@@ -3690,3 +3629,27 @@ test "http instrumentation logs requests and records metrics":
     assert(log_text.contains(chr(34) + "message" + chr(34) + ":" + chr(34) + "request complete" + chr(34)))
     assert(log_text.contains(chr(34) + "trace_id" + chr(34) + ":" + chr(34)))
     remove_file(log_path)
+
+test "query values are percent-decoded and plus becomes space":
+    req := build_http_request(bytes.from_string_utf8("GET /s?q=a+b%20c&city=S%C3%A3o HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.query_param("q")!, "a b c")
+    assert_eq(req.query_param("city")!, "São")
+
+test "duplicate query keys resolve first-wins across both readers":
+    req := build_http_request(bytes.from_string_utf8("GET /s?x=1&x=2 HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.query_param("x")!, "1")
+    packed := pack_request(req)!
+    assert_eq(get_query_param(packed, "x"), "1")
+
+test "a query key with no value is present and empty":
+    req := build_http_request(bytes.from_string_utf8("GET /s?flag&y=2 HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.has_query_param("flag")!, true)
+    assert_eq(req.query_param("flag")!, "")
+
+test "an encoded separator in a query value is not split":
+    req := build_http_request(bytes.from_string_utf8("GET /s?q=a%26b HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.query_param("q")!, "a&b")
+
+test "a route parameter is percent-decoded":
+    req := build_http_request(bytes.from_string_utf8("GET /users/a%20b HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.path_param("/users/:id", "id")!, "a b")

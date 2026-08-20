@@ -241,12 +241,22 @@ pub unsafe extern "C" fn pith_bytes_eq(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
-    let a_bytes = pith_bytes_ref(a)
-        .map(|bytes| bytes.data.as_slice())
-        .unwrap_or(&[]);
-    let b_bytes = pith_bytes_ref(b)
-        .map(|bytes| bytes.data.as_slice())
-        .unwrap_or(&[]);
+    // an invalid handle (null, or a freed/fabricated id) must never read as a
+    // match: this is the primitive that gates every MAC, tag, and password
+    // comparison. degrading a bad handle to an empty slice made two invalid
+    // handles compare EQUAL (both len 0). fail closed instead. this branch is
+    // on handle validity, not on secret content, so it leaks no timing about
+    // the compared values.
+    let a_ref = match pith_bytes_ref(a) {
+        Some(r) => r,
+        None => return 0,
+    };
+    let b_ref = match pith_bytes_ref(b) {
+        Some(r) => r,
+        None => return 0,
+    };
+    let a_bytes = a_ref.data.as_slice();
+    let b_bytes = b_ref.data.as_slice();
     let max_len = a_bytes.len().max(b_bytes.len());
     let mut diff = (a_bytes.len() ^ b_bytes.len()) as u8;
 
@@ -558,6 +568,28 @@ pub unsafe extern "C" fn pith_byte_buffer_clear(handle: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_fails_closed_on_invalid_handles() {
+        unsafe {
+            // this gates every mac/tag/password compare — an invalid handle
+            // must NOT read as equal. two invalid handles used to both degrade
+            // to empty slices and compare equal.
+            assert_eq!(pith_crypto_constant_time_eq(12345, 67890), 0);
+            let real = pith_bytes_from_vec(b"secret".to_vec());
+            assert_eq!(pith_crypto_constant_time_eq(0, real), 0);
+            assert_eq!(pith_crypto_constant_time_eq(real, 0), 0);
+            // valid equal and unequal comparisons still work
+            let same = pith_bytes_from_vec(b"secret".to_vec());
+            let other = pith_bytes_from_vec(b"secreu".to_vec());
+            assert_eq!(pith_crypto_constant_time_eq(real, same), 1);
+            assert_eq!(pith_crypto_constant_time_eq(real, other), 0);
+            // two genuinely-empty byte values are still equal
+            let e1 = pith_bytes_from_vec(Vec::new());
+            let e2 = pith_bytes_from_vec(Vec::new());
+            assert_eq!(pith_crypto_constant_time_eq(e1, e2), 1);
+        }
+    }
 
     #[test]
     fn invalid_bytes_handles_return_safe_defaults() {

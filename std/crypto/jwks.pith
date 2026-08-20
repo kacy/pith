@@ -229,6 +229,20 @@ fn read_key(node: Int) -> Key!:
         exponent := decode_member(node, "e", kid)!
         if exponent.len() == 0 or exponent.len() > MAX_EXPONENT_BYTES:
             fail "jwks key '" + kid + "' has an out-of-range exponent"
+        # reject e < 3 and even e. e = 1 makes RSA the identity function — a
+        # PKCS#1 v1.5 "signature" is then just the padded digest, forgeable by
+        # anyone with no private key — and an even e is not a valid RSA
+        # exponent at all. real keys use 65537. leading zero bytes are stripped
+        # first so 00 01 cannot masquerade as a multi-byte value.
+        mut sig_start := 0
+        while sig_start < exponent.len() and exponent[sig_start] == 0:
+            sig_start = sig_start + 1
+        significant := exponent.len() - sig_start
+        last_byte := exponent[exponent.len() - 1]
+        exponent_is_odd := last_byte % 2 == 1
+        exponent_at_least_3 := significant > 1 or (significant == 1 and last_byte >= 3)
+        if not (exponent_is_odd and exponent_at_least_3):
+            fail "jwks key '" + kid + "' has an insecure rsa exponent"
         return Key(kid, algorithm, rsa_public_key_der(modulus, exponent))
     if algorithm == jwt.ES256:
         x := padded(decode_member(node, "x", kid)!, P256_COORDINATE_LEN)!
@@ -493,6 +507,12 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
         fail "the jwks endpoint answered with something that is not utf-8"
     return text.ok
 
+# a jwks endpoint carries the process's entire root of trust, so it must come
+# over an authenticated channel. http is tolerated only for a sidecar on the
+# loopback interface, where there is no network path to tamper with.
+fn is_loopback_host(host: String) -> Bool:
+    return host == "localhost" or host == "127.0.0.1" or host == "::1" or host.starts_with("127.")
+
 fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> http.HttpResponse!:
     if target.scheme == "https":
         port := target.port
@@ -501,6 +521,11 @@ fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> htt
         return http.https_request_port("GET", target.host, port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
     if target.scheme != "http":
         fail "a jwks url must be https, or http for a loopback sidecar: " + target.scheme
+    # enforce what the http exception is FOR: a loopback sidecar. an http url to
+    # any other host would fetch the trust root in cleartext, letting anyone on
+    # the path substitute their own signing key and forge tokens for any user.
+    if not is_loopback_host(target.host):
+        fail "a jwks url may use http only for a loopback host, not: " + target.host
     port := target.port
     mut plain_port := port
     if plain_port <= 0:
@@ -555,6 +580,18 @@ fn eddsa_document() -> String:
 
 fn at(instant: Int) -> jwt.Options:
     return jwt.at_time(jwt.default_options(), instant)
+
+test "jwks refuses an http url to a non-loopback host":
+    assert(is_loopback_host("localhost"))
+    assert(is_loopback_host("127.0.0.1"))
+    assert(is_loopback_host("127.0.0.5"))
+    assert(is_loopback_host("::1"))
+    assert(not is_loopback_host("issuer.internal"))
+    assert(not is_loopback_host("evil.example"))
+    # a fetch to a non-loopback http endpoint fails at the scheme/host check,
+    # before any network i/o — the trust root must not travel in cleartext.
+    result := fetch("http://issuer.internal/.well-known/jwks.json", 100, 65536)
+    assert(result.is_err)
 
 test "an rsa jwk becomes the pkcs#1 der openssl writes":
     set := parse(rsa_document("rsa-1"))!
@@ -617,6 +654,20 @@ fn with_kid(token: String, kid: String) -> String:
     rest := token.substring(token.index_of("."), token.len())
     header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"ES256\",\"kid\":\"" + kid + "\"}}"))
     return header + rest
+
+test "an rsa key with the identity exponent e=1 is refused":
+    # "AQ" is base64url for the single byte 0x01, i.e. e = 1 — RSA's identity,
+    # which makes signatures forgeable with no private key.
+    lb := chr(123)
+    rb := chr(125)
+    q := chr(34)
+    doc := lb + q + "keys" + q + ":[" + lb + q + "kty" + q + ":" + q + "RSA" + q + "," + q + "kid" + q + ":" + q + "bad-e" + q + "," + q + "n" + q + ":" + q + RSA_N + q + "," + q + "e" + q + ":" + q + "AQ" + q + rb + "]" + rb
+    result := parse(doc)
+    assert(result.is_err)
+    # the same document with the real exponent parses, so it is the exponent
+    # that is rejected, not the key material.
+    ok := parse(rsa_document("good-e"))
+    assert(ok.is_ok)
 
 test "a symmetric key in a key set is refused":
     # the attack: publish the hmac secret as a key, or talk an issuer into

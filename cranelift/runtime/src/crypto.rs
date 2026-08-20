@@ -455,6 +455,33 @@ pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, me
     pith_bytes_from_vec(sig.as_ref().to_vec())
 }
 
+/// Sign `message` with an ECDSA P-256 key (SHA-256), producing an ASN.1 DER
+/// signature — the form TLS carries in ServerKeyExchange and CertificateVerify,
+/// unlike the raw r||s of the FIXED variant above. The per-signature nonce
+/// comes from ring's system rng and is never chosen here. Returns 0 on a
+/// malformed key.
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let rng = rand::SystemRandom::new();
+    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
+        &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        pkcs8,
+        &rng,
+    ) else {
+        return 0;
+    };
+    let Ok(sig) = key_pair.sign(&rng, message) else {
+        return 0;
+    };
+    pith_bytes_from_vec(sig.as_ref().to_vec())
+}
+
 /// BLAKE2b digest of `data`, keyed when `key` is non-empty. `out_len` selects
 /// the digest length (1 to 64 bytes). Returns a bytes handle, or 0 on invalid
 /// input.

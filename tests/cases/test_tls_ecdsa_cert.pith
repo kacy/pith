@@ -1,0 +1,38 @@
+# An ECDSA (P-256) server certificate, exercised pith-to-pith. The server loads
+# an EC key and cert, and the client verifies the chain against the EC CA. Two
+# pith peers agree on 1.3, so this covers the server signing CertificateVerify
+# with ecdsa_secp256r1_sha256 and the client verifying an ECDSA chain. (The 1.2
+# ECDHE-ECDSA suites are covered by openssl interop.) A broken ECDSA signing or
+# verify path shows up as a failed dial or a wrong echo.
+
+import std.net.tls as tls
+
+CERT := "tests/live/fixtures/localhost-ecdsa.crt"
+KEY := "tests/live/fixtures/localhost-ecdsa.key"
+CA := "tests/live/fixtures/localhost-ecdsa-ca.crt"
+PORT := 50797
+
+fn serve(listener: tls.Listener):
+    r := listener.accept()
+    if r.is_err:
+        return
+    conn := r.ok
+    msg := conn.read(64) catch ""
+    conn.write_all("echo:" + msg) catch 0
+    conn.close()
+
+fn main() -> Int!:
+    server_cfg := tls.server_config(CERT, KEY)!
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    spawn serve(listener)
+
+    cfg := tls.client_config_with_ca_file(CA)!
+    conn := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)!
+    print("version:" + conn.version_name())
+    conn.write_all("hi")!
+    print(conn.read(64)!)
+    conn.close()
+    cfg.close()
+    listener.close()
+    server_cfg.close()
+    return 0

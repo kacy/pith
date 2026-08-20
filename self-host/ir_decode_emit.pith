@@ -1392,6 +1392,9 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
         if optional_inner_tid >= 0:
             helper_name := ir_json_object_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
+                # advance i: a bare continue re-tests `while i < field_count` on
+                # the same field and hangs the compiler (this loop indexes by hand).
+                i = i + 1
                 continue
             has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
             branch := ir_begin_decode_field_branch(has_r, "json_object_optional_field", "tuple")
@@ -1406,6 +1409,9 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
             continue
         helper_name := ir_json_object_helper_name(field_tid)
         if helper_name.len() == 0:
+            # advance i: a bare continue re-tests `while i < field_count` on
+            # the same field and hangs the compiler (this loop indexes by hand).
+            i = i + 1
             continue
         if default_idx >= 0:
             has_r := ir_emit_json_object_has(handle_r, key_r, module_path)

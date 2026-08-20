@@ -483,11 +483,6 @@ fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
     report_error("E202", "unknown generic type: " + base)
     return TID_ERR
 
-# resolve with substitution map (for generic instantiation)
-fn resolve_type_with_substitution(node_idx: Int, subst_active: Bool, subst_key: String) -> Int:
-    # no substitution — use the normal path
-    return resolve_type_implementation(node_idx)
-
 # resolve the associated type `member` of a concrete or generic-instance type.
 # for a concrete impl (IntBox.Item = Int) this is just the bound type; for a
 # generic instance (MapIter[Range,Int].Item = U) the binding is resolved with
@@ -2384,7 +2379,6 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     tid_float := lookup_type_id("Float")
     tid_string := lookup_type_id("String")
     tid_bool := lookup_type_id("Bool")
-    tid_err := lookup_type_id("<error>")
     if node.kind == "int_lit":
         return tid_int
     if node.kind == "float_lit":

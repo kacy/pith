@@ -239,6 +239,15 @@ fn decode_b64url(text: String, what: String) -> Bytes!:
     decoded := encoding.b64_url_raw_decode(text)
     if decoded.is_err:
         fail what + " is not valid base64url"
+    # reject NON-CANONICAL base64url (RFC 7515 §2). the last character of an
+    # unpadded encoding carries spare bits a decoder discards, so a token has
+    # up to 16 equivalent string forms that all decode to the same bytes and
+    # all verify — which defeats anything keyed on the raw token string:
+    # replay caches, jti dedup, revocation blocklists, one-time links. a
+    # conformant issuer emits canonical form, so re-encoding the decoded bytes
+    # reproduces the input exactly; if it differs, the input was malleable.
+    if encoding.b64_url_raw_encode(decoded.ok) != text:
+        fail what + " is not canonical base64url"
     return decoded.ok
 
 fn decode_b64url_text(text: String, what: String) -> String!:
@@ -644,6 +653,14 @@ test "an algorithm confusion attempt is refused":
     assert(verify_ps256(forged, public_key, options).is_err)
     # it is a perfectly good HS256 token; it is simply not an rsa one.
     assert(verify_hs256(forged, public_key, options).is_ok)
+
+test "jwt rejects non-canonical base64url in a segment":
+    # "QQ" and "QR" both decode to the single byte 0x41, but only "QQ" is
+    # canonical (its last character's two spare bits are zero). accepting "QR"
+    # would give every token equivalent string forms that all verify, defeating
+    # replay caches and revocation blocklists keyed on the token string.
+    assert(decode_b64url("QQ", "seg").is_ok)
+    assert(decode_b64url("QR", "seg").is_err)
 
 test "an alg none token is rejected":
     header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"none\",\"typ\":\"JWT\"}}"))

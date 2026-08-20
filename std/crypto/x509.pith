@@ -489,8 +489,14 @@ pub fn matches_hostname(cert: Certificate, host: String) -> Bool:
         pattern := name.to_lower()
         if pattern == target or wildcard_matches(pattern, target):
             return true
-    if cert.dns_names.len() == 0 and cert.ip_addresses.len() == 0:
-        return cert.subject_common_name.to_lower() == target
+    # deliberately NO Common Name fallback. RFC 9525 (and every modern TLS
+    # client since ~2017) matches a hostname only against subjectAltName; a
+    # CN-only certificate matches nothing here. this also closes a
+    # name-constraint bypass: a name-constrained sub-CA could issue a leaf
+    # with NO SAN and an arbitrary CN (CN=www.bank.com), which
+    # name_constraints_permit_leaf — checking only SAN dnsNames — waved
+    # through, and a CN fallback would then have matched. subject_common_name
+    # remains available for display, just not for identity.
     return false
 
 impl Certificate:
@@ -787,6 +793,18 @@ pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certifi
     if trusted_roots.len() == 0:
         return VerificationResult(false, true, false, false, false, "trusted roots are empty")
     return verify_chain_issuers(chain, trusted_roots, true)
+
+test "x509 does not match a hostname against a certificate's common name":
+    # a leaf with NO subjectAltName and CN=www.bank.com must not match the
+    # hostname www.bank.com — RFC 9525, and the close of a name-constraint
+    # bypass (a constrained sub-CA could mint such a leaf for any name).
+    cert := parse_pem(read_file("tests/live/fixtures/cn-only-no-san.crt")!)!
+    assert_eq(cert.subject_common_name, "www.bank.com")
+    assert(not cert.matches_hostname("www.bank.com"))
+    # a cert that carries the name as a SAN still matches (the localhost
+    # fixture has DNS:localhost).
+    ok := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!
+    assert(ok.matches_hostname("localhost"))
 
 test "x509 rejects a certificate carrying an unrecognised critical extension":
     # a CT precertificate is a CA-signed cert whose only mark of not-a-real-cert

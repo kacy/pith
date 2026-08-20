@@ -236,9 +236,13 @@ pub struct ConnectionState:
     pub client_auth_requested: Bool
     pub client_auth_verified: Bool
 
-# per-connection native tls state. a connection's reader advances read_seq and
-# pending while its writer advances write_seq — disjoint fields — so only the
-# map that holds these structs needs a lock; the struct itself does not.
+# per-connection native tls state. the record sequence numbers feed the AEAD
+# nonce, and reusing a nonce under one key is catastrophic for GCM (it leaks the
+# authentication key), so each direction's read-seal-write / read-open-advance
+# must be atomic against a second caller on the same direction. write_mu and
+# read_mu serialize those spans; a single Conn shared across tasks is therefore
+# safe, and `failed` fences a connection off once a record operation errors so a
+# retry cannot reseal at a sequence a partial record already consumed.
 struct NativeConnState:
     fd: Int
     cipher: Int
@@ -252,6 +256,9 @@ struct NativeConnState:
     cache_key: String
     resumption_master_secret: Bytes
     state: ConnectionState
+    write_mu: Mutex
+    read_mu: Mutex
+    mut failed: Bool
 
 mut native_conn_mu := Mutex()
 mut native_conn_states: Map[Int, NativeConnState] := {}
@@ -889,7 +896,7 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
     return session
 
 fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state))
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), write_mu: Mutex(), read_mu: Mutex(), failed: false)
     return Conn(native_conn_register(cs))
 
 fn native_fail_alert(record: tls13.Record) -> Bool!:
@@ -1211,6 +1218,15 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     if size <= 0:
         size = 4096
     cs := native_conn_get(handle)
+    # serialize the whole read: the pending tail and the record loop both touch
+    # cs.pending and cs.read_seq, and read_seq drives the AEAD nonce, so two
+    # concurrent readers must not interleave here. write uses a separate mutex,
+    # so full-duplex read/write is unaffected.
+    cs.read_mu.lock()
+    defer cs.read_mu.unlock()
+    errdefer cs.failed = true
+    if cs.failed:
+        fail "tls connection is unusable after an earlier record error"
     pending := cs.pending
     if pending.len() > 0:
         if pending.len() > size:
@@ -1237,8 +1253,8 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
             fail "unencrypted tls record after handshake"
         seq := cs.read_seq
-        inner := open_record_for_cipher(cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
         cs.read_seq = seq + 1
+        inner := open_record_for_cipher(cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
@@ -1262,6 +1278,15 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     if data.len() == 0:
         return 0
     cs := native_conn_get(handle)
+    # hold the write lock across the whole seal-and-send so a second writer on
+    # this connection cannot claim the same sequence number (a reused AEAD
+    # nonce) or interleave its record bytes on the wire.
+    cs.write_mu.lock()
+    defer cs.write_mu.unlock()
+    # any seal or write error poisons the connection.
+    errdefer cs.failed = true
+    if cs.failed:
+        fail "tls connection is unusable after an earlier record error"
     stream := TcpStream(cs.fd)
     cipher := cs.cipher
     mut count := data.len()
@@ -1269,9 +1294,11 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
         count = TLS_MAX_PLAINTEXT_RECORD
     chunk := data.slice(0, count)
     seq := cs.write_seq
+    # consume the sequence number before the send: if the write fails partway,
+    # the connection is poisoned and no retry can reseal at this same sequence.
+    cs.write_seq = seq + 1
     record := seal_record_for_cipher(cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
     native_write_all(stream, record)!
-    cs.write_seq = seq + 1
     return count
 
 fn native_conn_close(handle: Int):

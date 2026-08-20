@@ -156,6 +156,14 @@ impl Conn:
         return tcp.write_all_bytes(self.fd, data)!
 
     fn send_packet(seq: Int, payload: Bytes) -> Int!:
+        # the packet length is a 3-byte field. a payload at or past 0xFFFFFF
+        # would need the protocol's continuation framing (0xFFFFFF chunks),
+        # which this driver does not implement — and le_int would silently
+        # truncate the length mod 2^24, letting the server read the overflow
+        # bytes as a fresh packet (arbitrary sql smuggled past a bound param).
+        # refuse it loudly instead.
+        if bytes.len(payload) >= 16777215:
+            fail "mysql: packet payload of " + bytes.len(payload).to_string() + " bytes exceeds the 16 MiB single-packet limit"
         out := bytes.buffer()
         out.write(le_int(bytes.len(payload), 3)) catch 0
         out.write_byte(seq) catch 0
@@ -528,9 +536,16 @@ fn lenenc_bytes(n: Int) -> Bytes:
     elif n < 65536:
         out.write_byte(252) catch 0
         out.write(le_int(n, 2)) catch 0
-    else:
+    elif n < 16777216:
         out.write_byte(253) catch 0
         out.write(le_int(n, 3)) catch 0
+    else:
+        # the 8-byte form (0xfe). the old code always used the 3-byte form
+        # here, silently truncating a value >= 2^24 mod 2^24 while still
+        # appending its full bytes — smuggling one parameter's tail into the
+        # next parameter's length field inside COM_STMT_EXECUTE.
+        out.write_byte(254) catch 0
+        out.write(le_int(n, 8)) catch 0
     result := out.bytes()
     out.free()
     return result
@@ -852,6 +867,14 @@ test "little-endian integers round-trip":
     assert_eq(four.le(4), 305419896)
     two := Reader(data: le_int(258, 2), pos: 0)
     assert_eq(two.le(2), 258)
+
+test "length-encoded values round-trip across all four size forms":
+    # the >= 2^24 case regressed to the 3-byte form and truncated mod 2^24,
+    # which both loses the value and smuggles the overflow bytes into the next
+    # field. every size boundary must round-trip exactly now.
+    for n in [0, 250, 251, 65535, 65536, 16777215, 16777216, 4294967296]:
+        r := Reader(data: lenenc_bytes(n), pos: 0)
+        assert_eq(r.lenenc(), n)
 
 test "length-encoded values parse":
     buf := bytes.buffer()

@@ -8,6 +8,7 @@ import std.binary as binary
 import std.crypto.ecdh as ecdh
 import std.crypto.random as random
 import std.crypto.signature as signature
+import std.crypto.subtle as subtle
 import std.crypto.x509 as x509
 import std.encoding as encoding
 import std.io as io
@@ -740,7 +741,11 @@ fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, sel
     if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     expected_binder := tls13.resumption_binder_verify_data_sha256(entry.psk, client_hello.psk_binder_input)!
-    if not bytes.eq(expected_binder, client_hello.psk_binder):
+    # the binder is a MAC that proves the client holds the PSK; compare it in
+    # constant time. an ordinary byte-equality short-circuits on the first
+    # differing byte, which leaks the correct binder one byte at a time and lets
+    # an attacker who holds only the ticket forge it and resume as its owner.
+    if not subtle.equal(expected_binder, client_hello.psk_binder):
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     touch_server_ticket_locked(ticket_key)
     return ServerResumptionDecision(true, entry.cipher, entry.psk)
@@ -1154,6 +1159,13 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
                 if client_cert_required and (client_certs.len() == 0 or not client_cert_verify_seen):
                     fail "client finished arrived before client certificate verification"
+                # a certificate is public, so presenting one proves nothing on
+                # its own — only CertificateVerify proves the client holds the
+                # matching private key (RFC 8446 4.4.2). without this, optional
+                # mTLS would record a peer identity from a victim's certificate
+                # that the client never proved it owns.
+                if client_certs.len() > 0 and not client_cert_verify_seen:
+                    fail "client presented a certificate without a certificate verify"
                 verify_data := tls13.parse_finished(message.body)!
                 # verify the client Finished over the LIVE transcript, which by
                 # now includes the client Certificate and CertificateVerify

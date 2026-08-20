@@ -264,6 +264,11 @@ impl Conn:
             if msg.mtype == 69:
                 fail "postgres: {error_text(msg.payload)}"
             elif msg.mtype == 82:
+                # bytes.get reads 0 past the end, so a truncated (empty)
+                # Authentication message would read as auth==0 = AuthenticationOk
+                # and report a verified connection having sent no credentials.
+                if bytes.len(msg.payload) < 4:
+                    fail "postgres: truncated Authentication message"
                 auth := read_be(msg.payload, 0, 4)
                 if auth == 0:
                     # AuthenticationOk — keep reading until ReadyForQuery. once
@@ -274,7 +279,13 @@ impl Conn:
                         fail "postgres: server skipped SCRAM signature verification"
                     continue
                 elif auth == 3:
-                    # cleartext password
+                    # cleartext password — only over an encrypted channel. on a
+                    # plaintext connection an on-path attacker could answer with
+                    # AuthenticationCleartextPassword and receive the password
+                    # verbatim (a silent downgrade the client cannot otherwise
+                    # refuse), so require tls.
+                    if not self.secure:
+                        fail "postgres: server asked for a cleartext password on an unencrypted connection"
                     self.send(112, cstring(password))!
                 elif auth == 10:
                     # AuthenticationSASL: begin SCRAM-SHA-256.
@@ -319,6 +330,10 @@ struct ScramFinal:
 # build the SCRAM client-final-message from the server-first-message, together
 # with the server signature the backend has to answer with.
 fn scram_client_final(server_first: String, client_first_bare: String, password: String) -> ScramFinal!:
+    mut client_nonce := ""
+    for cpart in client_first_bare.split(","):
+        if cpart.starts_with("r="):
+            client_nonce = cpart.substring(2, cpart.len())
     mut server_nonce := ""
     mut salt_b64 := ""
     mut iterations := 0
@@ -329,6 +344,18 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
             salt_b64 = part.substring(2, part.len())
         elif part.starts_with("i="):
             iterations = parse_int(part.substring(2, part.len()))!
+        elif part.starts_with("e="):
+            fail "postgres: SCRAM error from server: " + part.substring(2, part.len())
+
+    # RFC 5802 5.1: the server nonce MUST begin with the client nonce, or a
+    # relayed server-first from another session would be accepted, destroying
+    # the freshness the nonce exists to guarantee.
+    if client_nonce == "" or not server_nonce.starts_with(client_nonce):
+        fail "postgres: SCRAM server nonce does not extend the client nonce"
+    # RFC 7677: the iteration count floor is 4096. a server sending i=1 makes a
+    # captured ClientProof brute-forceable at one HMAC per guess.
+    if iterations < 4096:
+        fail "postgres: SCRAM iteration count " + iterations.to_string() + " is below the RFC 7677 minimum of 4096"
 
     salt := encoding.b64_decode(salt_b64)!
     pw := bytes.from_string_utf8(password)
@@ -692,6 +719,18 @@ test "scram-sha-256 client-final matches the RFC 7677 vector":
     final := scram_client_final(server_first, client_first_bare, "pencil")!
     assert_eq(final.message, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
     assert_eq(final.server_signature, "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+
+test "scram rejects a mismatched nonce, a sub-4096 iteration count, and a server error":
+    cfb := "n=user,r=clientnonce"
+    salt := "W22ZaJ0SNY7soEsUEjb6gQ=="
+    # a server nonce that does not extend the client nonce (relayed/forged)
+    assert(scram_client_final("r=DIFFERENT,s=" + salt + ",i=4096", cfb, "pencil").is_err)
+    # an iteration count below the RFC 7677 floor
+    assert(scram_client_final("r=clientnonceX,s=" + salt + ",i=1", cfb, "pencil").is_err)
+    # a SCRAM error in server-first-message surfaces, not a downstream failure
+    assert(scram_client_final("e=unknown-user", cfb, "pencil").is_err)
+    # a well-formed server-first still succeeds
+    assert(scram_client_final("r=clientnonceX,s=" + salt + ",i=4096", cfb, "pencil").is_ok)
 
 test "SASLFinal verifies only the exact server signature":
     assert(scram_server_verified("v=abc", "abc"))

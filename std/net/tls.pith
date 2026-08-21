@@ -854,14 +854,32 @@ fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, sel
     touch_server_ticket_locked(ticket_key)
     return ServerResumptionDecision(true, entry.cipher, entry.psk)
 
-fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer) -> Bool!:
-    if config_has_client_certificate(config):
+fn client_key_is_ecdsa(config: Config) -> Bool!:
+    chain := native_config_client_cert_chain(config)!
+    leaf := x509.parse_der(chain[0])!
+    return leaf.public_key_algorithm == OID_EC_PUBLIC_KEY
+
+# `cert_usable` reports whether the server's CertificateRequest advertised a
+# scheme this client's key can produce. a client that cannot satisfy the
+# request declines with an empty Certificate (rfc 8446 §4.4.2) — it must not
+# abort, and it must never fall back to signing with an unadvertised scheme.
+fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer, cert_usable: Bool) -> Bool!:
+    if config_has_client_certificate(config) and cert_usable:
         client_certs := native_config_client_cert_chain(config)!
         client_certificate := tls13.encode_certificate_message(client_certs)!
         transcript.write(client_certificate)!
         client_cert_input := tls13.client_certificate_verify_input_sha256(transcript.bytes())!
-        client_sig := signature.sign_rsa_pss_sha256_pkcs8(native_client_private_key(config)!, client_cert_input)!
-        client_certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, client_sig)!
+        # sign with whatever key the certificate carries: ecdsa p-256 for an ec
+        # certificate, rsa-pss otherwise — the same split the server side makes.
+        leaf := x509.parse_der(client_certs[0])!
+        mut client_scheme := TLS_SIG_RSA_PSS_RSAE_SHA256
+        mut client_sig := bytes.empty()
+        if leaf.public_key_algorithm == OID_EC_PUBLIC_KEY:
+            client_scheme = TLS_SIG_ECDSA_SECP256R1_SHA256
+            client_sig = signature.sign_ecdsa_p256_sha256_asn1_pkcs8(native_client_private_key(config)!, client_cert_input)!
+        else:
+            client_sig = signature.sign_rsa_pss_sha256_pkcs8(native_client_private_key(config)!, client_cert_input)!
+        client_certificate_verify := tls13.encode_certificate_verify(client_scheme, client_sig)!
         transcript.write(client_certificate_verify)!
         flight.write(client_certificate)!
         flight.write(client_certificate_verify)!
@@ -1160,7 +1178,15 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
     if inner.content_type != TLS_CONTENT_HANDSHAKE:
         tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
         fail "expected an encrypted tls 1.2 finished"
-    messages := tls13.decode_handshakes(inner.payload) catch:
+    messages := tls13.decode_handshakes_prefix(inner.payload)
+    if tls13.handshakes_encoded_len(messages) != inner.payload.len():
+        mut excess_after_finished := false
+        for message in messages:
+            if message.message_type == tls12.TLS12_FINISHED:
+                excess_after_finished = true
+        if excess_after_finished:
+            tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
+            fail "excess data after tls 1.2 finished"
         tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
         fail "malformed tls 1.2 finished record"
     if messages.len() == 0 or messages[0].message_type != tls12.TLS12_FINISHED:
@@ -1427,6 +1453,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     mut cert_verified := false
     mut cert_verify_seen := false
     mut client_cert_requested := false
+    mut client_cert_usable := true
     mut negotiated_alpn := ""
     # the client has sent nothing in the handshake epoch yet, so a rejection
     # while reading the server's encrypted flight seals its alert with the
@@ -1449,7 +1476,15 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         if inner.content_type != TLS_CONTENT_HANDSHAKE:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "expected tls handshake payload"
-        messages := tls13.decode_handshakes(inner.payload) catch:
+        messages := tls13.decode_handshakes_prefix(inner.payload)
+        if tls13.handshakes_encoded_len(messages) != inner.payload.len():
+            mut excess_after_finished := false
+            for message in messages:
+                if message.message_type == TLS_HANDSHAKE_FINISHED:
+                    excess_after_finished = true
+            if excess_after_finished:
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "excess data after tls server finished"
             send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
             fail "malformed tls server handshake record"
         for message in messages:
@@ -1468,9 +1503,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 request := tls13.parse_certificate_request(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls certificate request"
-                if request.signature_schemes.len() > 0 and not request.signature_schemes.contains(TLS_SIG_RSA_PSS_RSAE_SHA256):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_HANDSHAKE_FAILURE) catch 0
-                    fail "server requested an unsupported client certificate signature"
+                if request.signature_schemes.len() > 0 and config_has_client_certificate(config):
+                    mut our_scheme := TLS_SIG_RSA_PSS_RSAE_SHA256
+                    if client_key_is_ecdsa(config) catch false:
+                        our_scheme = TLS_SIG_ECDSA_SECP256R1_SHA256
+                    client_cert_usable = request.signature_schemes.contains(our_scheme)
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE:
                 if did_resume:
@@ -1536,7 +1573,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
 
     client_flight := bytes.buffer()
     if client_cert_requested:
-        append_client_certificate_flight(config, transcript_buf, client_flight)!
+        append_client_certificate_flight(config, transcript_buf, client_flight, client_cert_usable)!
     client_verify := tls13.finished_verify_data_sha256(client_hs_secret, transcript_buf.bytes())!
     client_finished := tls13.encode_finished(client_verify)!
     transcript_buf.write(client_finished)!
@@ -1847,7 +1884,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     client_cert_requested := config_requests_client_certificate(handshake_config)
     client_cert_required := config_requires_client_certificate(handshake_config)
     if client_cert_requested and not did_resume:
-        certificate_request := tls13.encode_certificate_request([TLS_SIG_RSA_PSS_RSAE_SHA256])!
+        certificate_request := tls13.encode_certificate_request([TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_ECDSA_SECP256R1_SHA256])!
         transcript.write(certificate_request)!
         server_flight.write(certificate_request)!
     if not did_resume:
@@ -1903,7 +1940,18 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         if inner.content_type != TLS_CONTENT_HANDSHAKE:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "expected tls client finished"
-        messages := tls13.decode_handshakes(inner.payload) catch:
+        messages := tls13.decode_handshakes_prefix(inner.payload)
+        if tls13.handshakes_encoded_len(messages) != inner.payload.len():
+            # data past the end of a complete flight is excess (the peer must
+            # start a fresh record after Finished); a ragged tail with no
+            # Finished in sight is simply malformed.
+            mut excess_after_finished := false
+            for message in messages:
+                if message.message_type == TLS_HANDSHAKE_FINISHED:
+                    excess_after_finished = true
+            if excess_after_finished:
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "excess data after tls client finished"
             send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
             fail "malformed tls client handshake record"
         for message in messages:

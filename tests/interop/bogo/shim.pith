@@ -194,6 +194,10 @@ fn main() -> Int!:
         # the runner generates fresh certificates per run; without a supplied
         # anchor the reference shims run unverified, and so does this one.
         cfg = cfg.dangerously_skip_verification()
+    if cert_file != "" and key_file != "":
+        cfg = cfg.with_client_certificate(cert_file, key_file) catch:
+            fail_test("client certificate load failed")
+            return 1
     cfg = cfg.enable_session_resumption()
     if min_version == 772:
         cfg = cfg.require_tls13()

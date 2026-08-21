@@ -574,6 +574,31 @@ pub fn decode_handshakes(data: Bytes) -> List[HandshakeMessage]!:
         messages.push(HandshakeMessage(message_type, body))
     return messages
 
+# decode every complete handshake message at the front of `data` and report
+# how many trailing bytes did not form one. decode_handshakes above fails on a
+# ragged tail; this variant lets a caller distinguish a record that carries
+# data past the end of a flight (excess data after a Finished, an
+# unexpected_message condition) from one that is simply malformed.
+pub fn decode_handshakes_prefix(data: Bytes) -> List[HandshakeMessage]:
+    mut messages: List[HandshakeMessage] := []
+    r := binary.reader(data)
+    while binary.remaining(r) >= 4:
+        message_type := checked_read(binary.read_u8(r)) catch 0 - 1
+        length := checked_read(binary.read_u24_be(r)) catch 0 - 1
+        if message_type < 0 or length < 0 or length > binary.remaining(r):
+            return messages
+        body := checked_bytes(binary.read_bytes(r, length)) catch bytes.empty()
+        messages.push(HandshakeMessage(message_type, body))
+    return messages
+
+# the byte length the messages of decode_handshakes_prefix consumed; the
+# difference from the record payload length is the ragged tail.
+pub fn handshakes_encoded_len(messages: List[HandshakeMessage]) -> Int:
+    mut total := 0
+    for message in messages:
+        total = total + 4 + message.body.len()
+    return total
+
 # encode a tls 1.3 client hello offering only an x25519 key share.
 pub fn encode_client_hello(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes) -> Bytes!:
     return encode_client_hello_with_options(server_name, random, session_id, x25519_public_key, bytes.empty(), [], bytes.empty(), 0, bytes.empty())

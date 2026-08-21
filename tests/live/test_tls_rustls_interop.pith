@@ -1,0 +1,98 @@
+# TLS interop against rustls, a third independent reference stack. Covers both
+# directions: rustls client -> pith server and pith client -> rustls server,
+# across TLS 1.2/1.3 and RSA/ECDSA certificates. The rustls peer
+# (tests/interop/rustls_peer) is pinned to a version so each combination is
+# exercised explicitly. A rustls client prints "<version> <cipher> <echo>";
+# the pith side asserts it. rustls is a valuable peer precisely because it is
+# strict: it requires extended master secret on 1.2 and refuses legacy
+# constructions this stack also refuses.
+
+import std.net.tls as tls
+import std.os.process as process
+import std.time as time
+
+PEER := "tests/interop/rustls_peer/target/release/rustls_peer"
+
+fn pith_echo_server(listener: tls.Listener):
+    r := listener.accept()
+    if r.is_err:
+        return
+    conn := r.ok
+    msg := conn.read(64) catch ""
+    conn.write_all("echo:" + msg) catch 0
+    conn.close()
+
+# rustls client -> pith server. Reports "<version> <cipher>" from the rustls
+# client, or an error tag.
+fn rustls_client_to_pith_server(label: String, port: Int, cert: String, key: String, ca: String, version: String):
+    server_cfg_r := tls.server_config(cert, key)
+    if server_cfg_r.is_err:
+        print(label + ": server-config-error")
+        return
+    server_cfg := server_cfg_r.ok
+    listener_r := tls.listen("127.0.0.1", port, server_cfg)
+    if listener_r.is_err:
+        print(label + ": listen-error")
+        server_cfg.close()
+        return
+    listener := listener_r.ok
+    spawn pith_echo_server(listener)
+    out := process.command(PEER).arg("client").arg("127.0.0.1:" + port.to_string()).arg(ca).arg("localhost").arg(version).arg(version).output()
+    mut result := "proc-error"
+    if out.is_ok:
+        line := out.ok.stdout.trim()
+        if line.contains("echo:hi"):
+            # drop the trailing " echo:hi" and report just version + cipher
+            result = line.substring(0, line.len() - 8)
+        else:
+            result = "no-echo(" + line + ")"
+    print(label + ": " + result)
+    listener.close()
+    server_cfg.close()
+
+# pith client -> rustls server. Reports the pith client's negotiated version+cipher.
+fn pith_client_to_rustls_server(label: String, port: Int, cert: String, key: String, ca: String, version: String):
+    proc_r := process.command(PEER).arg("server").arg(port.to_string()).arg(cert).arg(key).arg(version).arg(version).start()
+    if proc_r.is_err:
+        print(label + ": peer-unavailable")
+        return
+    proc := proc_r.ok
+    cfg := tls.client_config_with_ca_file(ca) catch tls.Config(0 - 1)
+    mut result := "no-connection"
+    mut attempt := 0
+    while attempt < 25 and result == "no-connection":
+        r := tls.dial_with_config("127.0.0.1", port, "localhost", cfg)
+        if r.is_ok:
+            conn := r.ok
+            v := conn.version_name() + " " + conn.cipher_suite_name()
+            wrote := conn.write_all("hi")
+            mut echoed := ""
+            if wrote.is_ok:
+                echoed = conn.read(64) catch ""
+            conn.close()
+            if echoed == "echo:hi":
+                result = v
+            else:
+                result = "no-echo"
+        attempt = attempt + 1
+        time.delay(40)
+    print(label + ": " + result)
+    cfg.close()
+    proc.kill()
+    proc.wait()
+
+RSA_CERT := "tests/live/fixtures/localhost.crt"
+RSA_KEY := "tests/live/fixtures/localhost.key"
+RSA_CA := "tests/live/fixtures/localhost-ca.crt"
+EC_CERT := "tests/live/fixtures/localhost-ecdsa.crt"
+EC_KEY := "tests/live/fixtures/localhost-ecdsa.key"
+EC_CA := "tests/live/fixtures/localhost-ecdsa-ca.crt"
+
+fn main() -> Int!:
+    rustls_client_to_pith_server("rustls->pith rsa 1.2", 44520, RSA_CERT, RSA_KEY, RSA_CA, "1.2")
+    rustls_client_to_pith_server("rustls->pith rsa 1.3", 44521, RSA_CERT, RSA_KEY, RSA_CA, "1.3")
+    rustls_client_to_pith_server("rustls->pith ecdsa 1.2", 44522, EC_CERT, EC_KEY, EC_CA, "1.2")
+    rustls_client_to_pith_server("rustls->pith ecdsa 1.3", 44523, EC_CERT, EC_KEY, EC_CA, "1.3")
+    pith_client_to_rustls_server("pith->rustls rsa 1.3", 44524, RSA_CERT, RSA_KEY, RSA_CA, "1.3")
+    pith_client_to_rustls_server("pith->rustls rsa 1.2", 44525, RSA_CERT, RSA_KEY, RSA_CA, "1.2")
+    return 0

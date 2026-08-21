@@ -1519,6 +1519,10 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     server_random := random.bytes(32)!
     server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
+    # a middlebox-compatibility change_cipher_spec follows the ServerHello
+    # (rfc 8446 appendix d.4): a bare plaintext record, outside the transcript,
+    # so networks that expect a 1.2-shaped exchange let the 1.3 flight through.
+    send_change_cipher_spec(stream)!
 
     transcript := bytes.buffer()
     transcript_append(transcript, client_messages[0])!

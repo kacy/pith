@@ -567,9 +567,9 @@ fn traffic_keys_for_cipher(cipher: Int, secret: Bytes) -> tls13.TrafficKeys!:
 
 # return a small printable tls version label for connection state.
 pub fn version_name(version: Int) -> String:
-    if version == 772:
+    if version == TLS_VERSION_13:
         return "tls1.3"
-    if version == 771:
+    if version == TLS_VERSION_12:
         return "tls1.2"
     return "unknown"
 
@@ -1001,6 +1001,44 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     transcript.write(client_hello)!
     return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
 
+# send a plaintext ChangeCipherSpec record (the single 0x01 byte) — the marker
+# that the sender's next record is under the newly negotiated 1.2 keys.
+fn send_change_cipher_spec(stream: TcpStream) -> Bool!:
+    ccs := bytes.buffer_with_capacity(1)
+    defer ccs.free()
+    ccs.write_byte(1)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_CHANGE_CIPHER_SPEC, ccs.bytes())!)!
+    return true
+
+# the TLS 1.2 Finished verify_data for `label` over the handshake transcript so
+# far ("client finished" or "server finished").
+fn tls12_finished_bytes(master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
+    return tls12.finished_verify_data(master, label, tls12.handshake_hash_sha256(transcript.bytes()))!
+
+# read the peer's ChangeCipherSpec — skipping a plaintext NewSessionTicket it
+# may send first — and then its encrypted Finished, returning the verify_data
+# for the caller to compare against its own computation.
+fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, peer_iv: Bytes) -> Bytes!:
+    mut saw_ccs := false
+    while not saw_ccs:
+        record := native_read_record(stream)!
+        if record.content_type == TLS_CONTENT_ALERT:
+            native_fail_alert(record)!
+        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            saw_ccs = true
+        elif record.content_type != TLS_CONTENT_HANDSHAKE:
+            fail "expected a tls 1.2 change cipher spec"
+    finished_record := native_read_record(stream)!
+    if finished_record.content_type == TLS_CONTENT_ALERT:
+        native_fail_alert(finished_record)!
+    inner := open_conn_record(TLS_VERSION_12, cipher, peer_key, peer_iv, 0, record_bytes(finished_record)!)!
+    if inner.content_type != TLS_CONTENT_HANDSHAKE:
+        fail "expected an encrypted tls 1.2 finished"
+    messages := tls13.decode_handshakes(inner.payload)!
+    if messages.len() == 0 or messages[0].message_type != tls12.TLS12_FINISHED:
+        fail "expected a tls 1.2 finished message"
+    return messages[0].body
+
 # The TLS 1.2 client handshake, reached from after_client_hello when the server
 # negotiated 1.2. The ClientHello (in `transcript`) and the ServerHello (in
 # `server_hello_message`) have already been exchanged; this drives the rest:
@@ -1102,36 +1140,14 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
 
     # ChangeCipherSpec, then the encrypted client Finished over the transcript
     # through ClientKeyExchange.
-    ccs := bytes.buffer_with_capacity(1)
-    ccs.write_byte(1)!
-    native_write_all(stream, tls13.encode_record(TLS_CONTENT_CHANGE_CIPHER_SPEC, ccs.bytes())!)!
-    ccs.free()
-    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12.finished_verify_data(master, "client finished", tls12.handshake_hash_sha256(transcript.bytes()))!)!
+    send_change_cipher_spec(stream)!
+    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "client finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, TLS_CONTENT_HANDSHAKE, client_finished)!)!
     transcript.write(client_finished)!
 
-    # the server answers with ChangeCipherSpec (possibly after a plaintext
-    # NewSessionTicket we did not ask for and ignore) and its encrypted Finished.
-    mut saw_ccs := false
-    while not saw_ccs:
-        record := native_read_record(stream)!
-        if record.content_type == TLS_CONTENT_ALERT:
-            native_fail_alert(record)!
-        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
-            saw_ccs = true
-        elif record.content_type != TLS_CONTENT_HANDSHAKE:
-            fail "expected server change cipher spec"
-    finished_record := native_read_record(stream)!
-    if finished_record.content_type == TLS_CONTENT_ALERT:
-        native_fail_alert(finished_record)!
-    server_inner := open_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, record_bytes(finished_record)!)!
-    if server_inner.content_type != TLS_CONTENT_HANDSHAKE:
-        fail "expected an encrypted server finished"
-    finished_messages := tls13.decode_handshakes(server_inner.payload)!
-    if finished_messages.len() == 0 or finished_messages[0].message_type != tls12.TLS12_FINISHED:
-        fail "expected a server finished message"
-    expected_finished := tls12.finished_verify_data(master, "server finished", tls12.handshake_hash_sha256(transcript.bytes()))!
-    if not subtle.equal(expected_finished, finished_messages[0].body):
+    # the server answers with ChangeCipherSpec and its encrypted Finished.
+    server_verify_data := read_tls12_peer_finished(stream, cipher, keys.server_write_key, keys.server_write_iv)!
+    if not subtle.equal(tls12_finished_bytes(master, "server finished", transcript)!, server_verify_data):
         fail "tls 1.2 server finished verification failed"
 
     # the server must not name an ALPN protocol we did not offer.
@@ -1283,7 +1299,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         fail "server resumed the session with a different alpn protocol"
     if did_resume:
         peer = peer_identity_from_cached_session(cached_session)
-    state := connection_state_from_peer(772, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, client_cert_requested, false)
+    state := connection_state_from_peer(TLS_VERSION_13, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, client_cert_requested, false)
     run_verify_connection_hook(config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state, server_app_secret, client_app_secret)
 
@@ -1291,8 +1307,6 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
 # rather than RSA, so the handshake signs with ECDSA.
 fn server_key_is_ecdsa(config: Config) -> Bool!:
     chain := native_server_certificate_chain(config)!
-    if chain.len() == 0:
-        return false
     leaf := x509.parse_der(chain[0])!
     return leaf.public_key_algorithm == OID_EC_PUBLIC_KEY
 
@@ -1313,8 +1327,8 @@ fn sign_server_handshake(config: Config, is_ecdsa: Bool, rsa_pss: Bool, message:
     return ServerSignature(TLS_SIG_RSA_PKCS1_SHA256, signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!)
 
 # pick a TLS 1.2 suite from what the client offered, in server preference order.
-# only ECDHE-RSA AEAD suites are eligible because the server key is RSA; an
-# ECDHE-ECDSA suite would need an ECDSA certificate we do not serve.
+# the eligible family follows the server certificate's key type: ECDHE-ECDSA
+# AEAD suites for an EC certificate, ECDHE-RSA for an RSA one.
 fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
     mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
     if is_ecdsa:
@@ -1401,37 +1415,15 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     master := tls12.extended_master_secret(pre_master, session_hash)!
     keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
 
-    # client ChangeCipherSpec, then the encrypted client Finished.
-    mut saw_ccs := false
-    while not saw_ccs:
-        record := native_read_record(stream)!
-        if record.content_type == TLS_CONTENT_ALERT:
-            native_fail_alert(record)!
-        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
-            saw_ccs = true
-        elif record.content_type != TLS_CONTENT_HANDSHAKE:
-            fail "expected client change cipher spec"
-    finished_record := native_read_record(stream)!
-    if finished_record.content_type == TLS_CONTENT_ALERT:
-        native_fail_alert(finished_record)!
-    client_inner := open_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, record_bytes(finished_record)!)!
-    if client_inner.content_type != TLS_CONTENT_HANDSHAKE:
-        fail "expected an encrypted client finished"
-    client_finished := tls13.decode_handshakes(client_inner.payload)!
-    if client_finished.len() == 0 or client_finished[0].message_type != tls12.TLS12_FINISHED:
-        fail "expected a client finished message"
-    expected_client := tls12.finished_verify_data(master, "client finished", tls12.handshake_hash_sha256(transcript.bytes()))!
-    if not subtle.equal(expected_client, client_finished[0].body):
+    # read the client's ChangeCipherSpec and encrypted Finished, then verify it.
+    client_verify_data := read_tls12_peer_finished(stream, cipher, keys.client_write_key, keys.client_write_iv)!
+    if not subtle.equal(tls12_finished_bytes(master, "client finished", transcript)!, client_verify_data):
         fail "tls 1.2 client finished verification failed"
-    transcript.write(tls13.encode_handshake(tls12.TLS12_FINISHED, client_finished[0].body)!)!
+    transcript.write(tls13.encode_handshake(tls12.TLS12_FINISHED, client_verify_data)!)!
 
-    # server ChangeCipherSpec, then the encrypted server Finished.
-    ccs := bytes.buffer_with_capacity(1)
-    ccs.write_byte(1)!
-    native_write_all(stream, tls13.encode_record(TLS_CONTENT_CHANGE_CIPHER_SPEC, ccs.bytes())!)!
-    ccs.free()
-    server_verify := tls12.finished_verify_data(master, "server finished", tls12.handshake_hash_sha256(transcript.bytes()))!
-    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, server_verify)!
+    # send our ChangeCipherSpec and encrypted Finished.
+    send_change_cipher_spec(stream)!
+    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "server finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, TLS_CONTENT_HANDSHAKE, server_finished)!)!
 
     peer := empty_peer_identity()
@@ -1584,7 +1576,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     server_app_keys := traffic_keys_for_cipher(cipher, server_app_secret)!
     client_app_keys := traffic_keys_for_cipher(cipher, client_app_secret)!
     initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
-    state := connection_state_from_peer(772, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
+    state := connection_state_from_peer(TLS_VERSION_13, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state, client_app_secret, server_app_secret)
 

@@ -20,7 +20,9 @@ CONTENT_HANDSHAKE := 22
 CONTENT_APPLICATION_DATA := 23
 TLS_LEGACY_VERSION := 771
 TLS13_VERSION := 772
-MAX_PLAINTEXT_RECORD := 16384
+# rfc 8446 §5.1 caps a record's plaintext at 2^14 bytes; larger handshake
+# flights fragment across records.
+pub MAX_PLAINTEXT_RECORD := 16384
 # rfc 8446 §5.2 caps a tlsciphertext at 2^14 + 256 bytes: the plaintext limit
 # plus room for the content type byte and aead expansion. anything larger is a
 # malformed (or hostile) record and is rejected before it is buffered.

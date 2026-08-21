@@ -1560,7 +1560,7 @@ clean:
 # implementation, which a pith-to-pith test cannot show; test_tls_echo_live is
 # the in-process pith suite (echo, resumption, dynamic sni selection, mutual
 # tls, optional client auth) and asserts internally, so its golden is empty.
-TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live test_tls_echo_live
+TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live test_tls_echo_live test_tls_large_chain_live
 
 tls-live-interop: build
 	@echo "--- tls live tests (openssl interop + in-process suite) ---"

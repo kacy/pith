@@ -42,6 +42,7 @@ pub TLS12_SERVER_HELLO_DONE := 14
 pub TLS12_CERTIFICATE_VERIFY := 15
 pub TLS12_CLIENT_KEY_EXCHANGE := 16
 pub TLS12_FINISHED := 20
+pub TLS12_NEW_SESSION_TICKET := 4
 
 # The four cipher suites this fallback offers, all ECDHE + AEAD. The decimal
 # values are the IANA registry ids, quoted in hex beside each one.
@@ -509,6 +510,19 @@ pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, 
     checked_write(binary.write_u16_be(out, extensions.len()))!
     out.write(extensions)!
     return out.bytes()
+
+# validate a 1.2 NewSessionTicket body (rfc 5077 §3.3): a u32 lifetime hint
+# and a u16-prefixed opaque ticket, nothing after. this stack never uses 1.2
+# tickets, but a message that does not even parse is a malformed flight and
+# must be refused rather than skipped.
+pub fn validate_new_session_ticket(body: Bytes) -> Bool!:
+    r := binary.reader(body)
+    checked_read(binary.read_u32_be(r))!
+    ticket_len := checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, ticket_len))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls 1.2 new session ticket bytes"
+    return true
 
 # The bytes a ServerKeyExchange signature covers: the two randoms then the
 # signed ECParameters.

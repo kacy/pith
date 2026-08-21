@@ -1132,7 +1132,23 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
             native_fail_alert(record)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
             saw_ccs = true
-        elif record.content_type != TLS_CONTENT_HANDSHAKE:
+        elif record.content_type == TLS_CONTENT_HANDSHAKE:
+            # the only message with a place between the peer's key exchange
+            # and its ChangeCipherSpec is a NewSessionTicket (rfc 5077 §3.3).
+            # this stack never uses 1.2 tickets, but the flight must still
+            # parse — a foreign message or a mangled ticket is refused, not
+            # skipped.
+            ticket_messages := tls13.decode_handshakes(record.payload) catch:
+                tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
+                fail "malformed tls 1.2 pre-finished handshake record"
+            for ticket_message in ticket_messages:
+                if ticket_message.message_type != tls12.TLS12_NEW_SESSION_TICKET:
+                    tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
+                    fail "unexpected tls 1.2 handshake message before finished"
+                tls12.validate_new_session_ticket(ticket_message.body) catch:
+                    tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
+                    fail "malformed tls 1.2 new session ticket"
+        else:
             tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
             fail "expected a tls 1.2 change cipher spec"
     finished_record := native_read_record(stream)!
@@ -1982,6 +1998,44 @@ fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.
     remember_client_cached_session(cache_key, cached_session_from_peer(ticket_message.ticket, psk, cipher, state.negotiated_protocol, peer, expires_at_ms))
     return true
 
+# send a fatal alert on an established connection, best-effort, before the
+# connection is poisoned for the error already in flight. claims a write
+# sequence under the write lock exactly like a data record, so a concurrent
+# writer can never reuse the nonce.
+fn send_conn_fatal_alert(cs: NativeConnState, description: Int) -> Int!:
+    cs.write_mu.lock()
+    defer cs.write_mu.unlock()
+    if cs.failed:
+        return 0
+    alert := bytes.buffer_with_capacity(2)
+    defer alert.free()
+    alert.write_byte(ALERT_LEVEL_FATAL)!
+    alert.write_byte(description)!
+    seq := cs.write_seq
+    cs.write_seq = seq + 1
+    record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
+    native_write_all(TcpStream(cs.fd), record)!
+    return 0
+
+# read one record on an established connection, answering an oversized or
+# structurally invalid one with the matching sealed fatal alert. truncation
+# and eof stay alert-free — the peer is gone.
+fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream) -> tls13.Record!:
+    header := stream.read_exact_bytes(5)!
+    if header.len() != 5:
+        fail "truncated tls record header"
+    length := checked_read(binary.read_u16_be_at(header, 3))!
+    if length > tls13.MAX_CIPHERTEXT_RECORD:
+        send_conn_fatal_alert(cs, ALERT_RECORD_OVERFLOW) catch 0
+        fail "tls record overflow"
+    payload := stream.read_exact_bytes(length)!
+    if payload.len() != length:
+        fail "truncated tls record payload"
+    record := tls13.decode_record(header.concat(payload)) catch:
+        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+        fail "malformed tls record"
+    return record
+
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
     if size <= 0:
@@ -2008,7 +2062,7 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     stream := TcpStream(cs.fd)
     cipher := cs.cipher
     while true:
-        record := native_read_record(stream)!
+        record := read_conn_record_alerting(cs, stream)!
         # after the handshake every legitimate record is application_data (it
         # wraps the real content type, alerts and post-handshake messages
         # included). a middlebox-compatibility change_cipher_spec is the one
@@ -2020,24 +2074,35 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
             continue
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "unencrypted tls record after handshake"
         seq := cs.read_seq
         cs.read_seq = seq + 1
-        inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
+        inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!) catch:
+            send_conn_fatal_alert(cs, ALERT_BAD_RECORD_MAC) catch 0
+            fail "tls record failed to open"
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
-            alert := tls13.parse_alert(inner.payload)!
+            alert := tls13.parse_alert(inner.payload) catch:
+                send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls alert"
             if alert.description == tls13.ALERT_CLOSE_NOTIFY:
                 return bytes.empty()
             fail "tls alert " + tls13.alert_description_name(alert.description)
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
-            messages := tls13.decode_handshakes(inner.payload)!
+            messages := tls13.decode_handshakes(inner.payload) catch:
+                send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls post-handshake record"
             for message in messages:
                 if message.message_type == tls13.HANDSHAKE_KEY_UPDATE:
-                    apply_peer_key_update(cs, cipher, message)!
+                    apply_peer_key_update(cs, cipher, message) catch:
+                        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                        fail "malformed tls key update"
                 else:
-                    remember_client_ticket_from_message(handle, cipher, message)!
+                    remember_client_ticket_from_message(handle, cipher, message) catch:
+                        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                        fail "malformed tls session ticket"
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload

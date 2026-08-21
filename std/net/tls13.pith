@@ -36,20 +36,20 @@ HANDSHAKE_CERTIFICATE := 11
 HANDSHAKE_CERTIFICATE_REQUEST := 13
 HANDSHAKE_CERTIFICATE_VERIFY := 15
 HANDSHAKE_FINISHED := 20
-EXT_SERVER_NAME := 0
-EXT_ALPN := 16
-EXT_PRE_SHARED_KEY := 41
+pub EXT_SERVER_NAME := 0
+pub EXT_ALPN := 16
+pub EXT_PRE_SHARED_KEY := 41
 EXT_PSK_KEY_EXCHANGE_MODES := 45
-EXT_SUPPORTED_GROUPS := 10
+pub EXT_SUPPORTED_GROUPS := 10
 EXT_SIGNATURE_ALGORITHMS := 13
-EXT_SUPPORTED_VERSIONS := 43
+pub EXT_SUPPORTED_VERSIONS := 43
 # extensions a combined 1.2+1.3 ClientHello adds for the 1.2 fallback: extended
 # master secret (rfc 7627) and renegotiation_info (rfc 5746). a 1.3 server
 # ignores both.
 EXT_EXTENDED_MASTER_SECRET := 23
 EXT_RENEGOTIATION_INFO := 65281
 EXT_EC_POINT_FORMATS := 11
-EXT_KEY_SHARE := 51
+pub EXT_KEY_SHARE := 51
 CIPHER_TLS_AES_128_GCM_SHA256 := 4865
 CIPHER_TLS_CHACHA20_POLY1305_SHA256 := 4867
 GROUP_X25519 := 29
@@ -1119,6 +1119,44 @@ pub fn negotiated_server_version(body: Bytes) -> Int!:
             dr := binary.reader(data)
             return checked_read(binary.read_u16_be(dr))!
     return legacy_version
+
+# list the extension type ids in a ServerHello body, without interpreting any
+# of them. lets the client reject an extension it never offered with the exact
+# unsupported_extension alert before the full parse runs (rfc 8446 §4.1.3).
+pub fn server_hello_extension_types(body: Bytes) -> List[Int]!:
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    session_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, session_len))!
+    checked_read(binary.read_u16_be(r))!
+    checked_read(binary.read_u8(r))!
+    out: List[Int] := []
+    if binary.remaining(r) == 0:
+        return out
+    extension_len := checked_read(binary.read_u16_be(r))!
+    extensions := checked_bytes(binary.read_bytes(r, extension_len))!
+    er := binary.reader(extensions)
+    while binary.remaining(er) > 0:
+        extension_type := checked_read(binary.read_u16_be(er))!
+        data_len := checked_read(binary.read_u16_be(er))!
+        checked_bytes(binary.read_bytes(er, data_len))!
+        out.push(extension_type)
+    return out
+
+# list the extension type ids in an EncryptedExtensions body.
+pub fn encrypted_extensions_types(body: Bytes) -> List[Int]!:
+    r := binary.reader(body)
+    extension_len := checked_read(binary.read_u16_be(r))!
+    extensions := checked_bytes(binary.read_bytes(r, extension_len))!
+    out: List[Int] := []
+    er := binary.reader(extensions)
+    while binary.remaining(er) > 0:
+        extension_type := checked_read(binary.read_u16_be(er))!
+        data_len := checked_read(binary.read_u16_be(er))!
+        checked_bytes(binary.read_bytes(er, data_len))!
+        out.push(extension_type)
+    return out
 
 # Parse a TLS 1.3 ServerHello body into the fields the key schedule needs. Fails
 # unless the server negotiated 1.3 with a key share; use negotiated_server_version

@@ -344,9 +344,11 @@ pub NAMED_CURVE_X25519 := 29
 CURVE_TYPE_NAMED := 3
 
 # extension type ids that appear in a 1.2 ServerHello.
-EXT_ALPN := 16
-EXT_EXTENDED_MASTER_SECRET := 23
-EXT_RENEGOTIATION_INFO := 65281
+pub EXT_SERVER_NAME := 0
+pub EXT_EC_POINT_FORMATS := 11
+pub EXT_ALPN := 16
+pub EXT_EXTENDED_MASTER_SECRET := 23
+pub EXT_RENEGOTIATION_INFO := 65281
 # TLS_EMPTY_RENEGOTIATION_INFO_SCSV (rfc 5746): a client may signal secure
 # renegotiation support through this cipher-suite value instead of the extension.
 pub SCSV_EMPTY_RENEGOTIATION_INFO := 255
@@ -361,6 +363,29 @@ pub struct Tls12ServerHello:
     pub extended_master_secret: Bool
     pub renegotiation_info: Bytes
     pub alpn_protocol: String
+
+# list the extension type ids in a 1.2 ServerHello body, without interpreting
+# them — the client rejects an unoffered one before the full parse.
+pub fn server_hello_extension_types(body: Bytes) -> List[Int]!:
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    session_id_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, session_id_len))!
+    checked_read(binary.read_u16_be(r))!
+    checked_read(binary.read_u8(r))!
+    out: List[Int] := []
+    if binary.remaining(r) == 0:
+        return out
+    ext_total := checked_read(binary.read_u16_be(r))!
+    ext_data := checked_bytes(binary.read_bytes(r, ext_total))!
+    er := binary.reader(ext_data)
+    while binary.remaining(er) > 0:
+        ext_type := checked_read(binary.read_u16_be(er))!
+        ext_len := checked_read(binary.read_u16_be(er))!
+        checked_bytes(binary.read_bytes(er, ext_len))!
+        out.push(ext_type)
+    return out
 
 # Parse a 1.2 ServerHello body. Compression other than null is refused (this
 # stack never offers it), and the extensions we care about — extended master

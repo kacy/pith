@@ -165,6 +165,7 @@ ALERT_DECODE_ERROR := 50
 ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
+ALERT_UNSUPPORTED_EXTENSION := 110
 
 # the compatibility change_cipher_spec carries exactly one byte of value 1
 # (rfc 8446 §5); any other content is a malformed record.
@@ -1112,6 +1113,28 @@ fn native_fail_alert(record: tls13.Record) -> Bool!:
         fail "tls alert " + alert.ok.description.to_string()
     fail "tls alert"
 
+# whether the client offered a given extension type. this stack's client hello
+# is fixed except for server_name, which it sends only when it dialed with one.
+# a server response carrying anything outside this set is unsolicited
+# (rfc 8446 §4.1.3/§4.2, rfc 5246 §7.4.1.4).
+fn client_offered_server_hello_extension(extension_type: Int, offered_server_name: Bool) -> Bool:
+    # a 1.3 ServerHello may only carry these three (§4.1.3).
+    return extension_type == tls13.EXT_SUPPORTED_VERSIONS or extension_type == tls13.EXT_KEY_SHARE or extension_type == tls13.EXT_PRE_SHARED_KEY
+
+fn client_offered_encrypted_extension(extension_type: Int, offered_server_name: Bool, offered_alpn: Bool) -> Bool:
+    if extension_type == tls13.EXT_SERVER_NAME:
+        return offered_server_name
+    if extension_type == tls13.EXT_ALPN:
+        return offered_alpn
+    return extension_type == tls13.EXT_SUPPORTED_GROUPS
+
+fn client_offered_tls12_extension(extension_type: Int, offered_server_name: Bool, offered_alpn: Bool) -> Bool:
+    if extension_type == tls12.EXT_SERVER_NAME:
+        return offered_server_name
+    if extension_type == tls12.EXT_ALPN:
+        return offered_alpn
+    return extension_type == tls12.EXT_EXTENDED_MASTER_SECRET or extension_type == tls12.EXT_RENEGOTIATION_INFO or extension_type == tls12.EXT_EC_POINT_FORMATS
+
 fn native_client_handshake(stream: TcpStream, server_name: String, config: Config) -> Conn!:
     # on any handshake failure, close the socket and the ephemeral keys rather
     # than leaking an fd and two registry slots per failed dial. close() is
@@ -1282,6 +1305,10 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # the whole 1.2 server flight is plaintext, so every rejection below can
     # answer with a plaintext fatal alert before the socket closes, mirroring
     # what the server side does for a hello it refuses.
+    for ext_type in tls12.server_hello_extension_types(server_hello_message.body) catch []:
+        if not client_offered_tls12_extension(ext_type, server_name != "", config_alpn_protocols(config).len() > 0):
+            send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
+            fail "server sent an unoffered tls 1.2 extension"
     hello := tls12.parse_server_hello(server_hello_message.body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls 1.2 server hello"
@@ -1497,6 +1524,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         # handshake bytes past the hello have no legitimate reading.
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "trailing plaintext bytes after tls server hello"
+    for sh_ext_type in tls13.server_hello_extension_types(server_messages[0].body) catch []:
+        if not client_offered_server_hello_extension(sh_ext_type, server_name != ""):
+            send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
+            fail "server sent an unoffered tls server hello extension"
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls server hello"
@@ -1588,6 +1619,13 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
                 fail "excess data after tls server finished"
             if message.message_type == TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS:
+                mut ee_unsupported := false
+                for ext_type in tls13.encrypted_extensions_types(message.body) catch []:
+                    if not client_offered_encrypted_extension(ext_type, server_name != "", alpn_protocols.len() > 0):
+                        ee_unsupported = true
+                if ee_unsupported:
+                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNSUPPORTED_EXTENSION) catch 0
+                    fail "server sent an unoffered encrypted extension"
                 encrypted_extensions := tls13.parse_encrypted_extensions(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls encrypted extensions"
@@ -1618,6 +1656,13 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 certs = certificates_from_message(server_cert_msg) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls server certificate"
+                # this client requests no certificate-entry extensions
+                # (status_request, sct), so any that appear are unsolicited
+                # (rfc 8446 §4.4.2).
+                for entry in server_cert_msg.certificates:
+                    if entry.extensions.len() != 0:
+                        send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNSUPPORTED_EXTENSION) catch 0
+                        fail "server sent an unoffered certificate extension"
                 # the same keyUsage rule as the 1.2 path: CertificateVerify is
                 # signed with this leaf key, so digitalSignature is required
                 # even when chain verification is skipped.

@@ -335,7 +335,13 @@ client offered it, and renegotiation_info only when the client advertised
 secure renegotiation (the rfc 5746 extension or the SCSV cipher value).
 
 a refused handshake is answered with a fatal alert before the connection
-closes, so the peer learns why instead of seeing a bare tcp reset:
+closes, so the peer learns why instead of seeing a bare tcp reset. rejections
+before any key switch send the alert in plaintext; once a side's records have
+entered an encrypted epoch its alerts are sealed with the current keys — the
+1.3 client uses its handshake keys while reading the server's flight, the 1.3
+server answers a bad client reply under the application epoch its delivered
+Finished established, and the 1.2 client rides the epoch its own Finished
+opened. the codes:
 `protocol_version` when no version this stack speaks was offered (the client
 hello's legacy_version must also be at least 0x0303, the value rfc 8446 froze
 it at), `handshake_failure` when the version was fine but no common cipher

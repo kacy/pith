@@ -1555,13 +1555,15 @@ clean:
 	cargo clean
 	rm -rf .pith-build
 
-# openssl-driven tls interop live tests, compared against goldens. these prove
-# the tls 1.2 client and the 1.3 resumption binder interoperate with a real
-# foreign implementation (openssl), which a pith-to-pith test cannot show.
-TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live
+# tls live tests, compared against goldens. the openssl cases prove the 1.2
+# client and the 1.3 resumption binder interoperate with a real foreign
+# implementation, which a pith-to-pith test cannot show; test_tls_echo_live is
+# the in-process pith suite (echo, resumption, dynamic sni selection, mutual
+# tls, optional client auth) and asserts internally, so its golden is empty.
+TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live test_tls_echo_live
 
 tls-live-interop: build
-	@echo "--- tls live interop (openssl) ---"
+	@echo "--- tls live tests (openssl interop + in-process suite) ---"
 	@command -v openssl >/dev/null 2>&1 || { echo "openssl not found; skipping tls live interop"; exit 0; }
 	@pass=0; fail=0; \
 	for name in $(TLS_LIVE_INTEROP_CASES); do \

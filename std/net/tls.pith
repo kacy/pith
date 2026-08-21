@@ -2039,8 +2039,9 @@ impl Listener:
     fn accept_socket() -> Int!:
         if config_has(native_listener_config, self.handle):
             fd := tcp_accept(self.handle)!
-            # bound the handshake (and the connection's reads) so a slow or
-            # silent client can't pin a server task before it authenticates.
+            # bound the handshake so a slow or silent client can't pin a server
+            # task before it authenticates; handshake() clears this deadline once
+            # the handshake completes so it does not cap application reads.
             tcp_set_timeout(fd, SERVER_HANDSHAKE_TIMEOUT_MS)
             return fd
         fail "native tls listener not found"
@@ -2055,7 +2056,14 @@ impl Listener:
         # the socket belongs to this call, so every error exit has to close it:
         # once the handshake fails there is no Conn for the caller to close.
         errdefer note_failed_handshake(fd)
-        return native_server_handshake(TcpStream(fd), Config(config_handle))!
+        conn := native_server_handshake(TcpStream(fd), Config(config_handle))!
+        # accept_socket set a short read deadline to bound the handshake against a
+        # slow or silent client. clear it now that the handshake is done, so the
+        # connection's application reads are not silently capped at that window —
+        # a long-lived stream (grpc, websocket) or a slow client would otherwise
+        # be killed. an application that wants a read deadline sets its own.
+        tcp_set_timeout(fd, 0)
+        return conn
 
     fn close():
         if config_has(native_listener_config, self.handle):

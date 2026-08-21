@@ -1,4 +1,5 @@
-.PHONY: tls-live-interop pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+.PHONY: tls-live-interop tls-go-interop pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -1574,3 +1575,17 @@ tls-live-interop: build
 	done; \
 	if [ $$fail -ne 0 ]; then echo "$$fail tls live interop cases failed"; exit 1; fi; \
 	echo "all tls live interop cases passed"
+
+# interop against Go's crypto/tls (a second independent reference stack), both
+# directions across tls 1.2/1.3 and rsa/ecdsa. builds the small go peer first.
+tls-go-interop: build
+	@echo "--- tls interop (go crypto/tls) ---"
+	@command -v go >/dev/null 2>&1 || { echo "go not found; skipping tls go interop"; exit 0; }
+	@(cd tests/interop/tls_peer && go build -o tls_peer .) || { echo "go build failed"; exit 1; }
+	@actual=$$(timeout 120 ./target/release/pith run tests/live/test_tls_go_interop.pith 2>/dev/null); \
+	expected=$$(cat tests/live/expected/test_tls_go_interop.txt); \
+	if [ "$$actual" = "$$expected" ]; then \
+		echo "ok   tls go interop"; \
+	else \
+		echo "FAIL tls go interop"; echo "--- expected ---"; echo "$$expected"; echo "--- actual ---"; echo "$$actual"; exit 1; \
+	fi

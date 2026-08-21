@@ -85,6 +85,9 @@ pub struct Certificate:
     # the keyCertSign bit, which a certificate must carry to sign others.
     pub has_key_usage: Bool
     pub key_cert_sign: Bool
+    # digitalSignature (bit 0): required of a tls peer certificate when the
+    # keyUsage extension is present — the handshake is signed with the leaf key.
+    pub digital_signature: Bool
     # basicConstraints pathLenConstraint: has_path_len is false when absent.
     # when present, path_len bounds how many intermediate cas may appear below
     # this one on a valid path.
@@ -356,12 +359,24 @@ fn parse_key_usage_cert_sign(data: Bytes, extn_value: DerValue) -> Bool!:
         return false
     return bits.band(bits.shr(body[1], 2), 1) == 1
 
+# whether the keyUsage extension asserts digitalSignature (bit 0), the usage a
+# tls peer certificate must carry: every suite this stack speaks authenticates
+# the handshake with a signature from the leaf key.
+fn parse_key_usage_digital_signature(data: Bytes, extn_value: DerValue) -> Bool!:
+    inner := value_bytes(data, extn_value)
+    bit_str := expect_tag(inner, 0, TAG_BIT_STRING)!
+    body := value_bytes(inner, bit_str)
+    if body.len() < 2:
+        return false
+    return bits.band(bits.shr(body[1], 7), 1) == 1
+
 # extension data gathered in one pass over the certificate's extensions.
 struct ParsedExtensions:
     is_ca: Bool
     has_eku: Bool
     has_key_usage: Bool
     key_cert_sign: Bool
+    digital_signature: Bool
     has_path_len: Bool
     path_len: Int
 
@@ -371,6 +386,7 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
     mut has_eku := false
     mut has_key_usage := false
     mut key_cert_sign := false
+    mut digital_signature := false
     mut has_path_len := false
     mut path_len := 0
     mut pos := extensions.value_start
@@ -403,6 +419,7 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
         elif oid == OID_KEY_USAGE:
             has_key_usage = true
             key_cert_sign = parse_key_usage_cert_sign(data, child)!
+            digital_signature = parse_key_usage_digital_signature(data, child)!
         elif oid == OID_NAME_CONSTRAINTS:
             parse_name_constraints(data, child, permitted_dns, excluded_dns)!
         elif is_critical:
@@ -414,7 +431,7 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
             # ordinary certificate.
             fail "unrecognised critical extension: " + oid
         pos = ext.next
-    return ParsedExtensions(is_ca, has_eku, has_key_usage, key_cert_sign, has_path_len, path_len)
+    return ParsedExtensions(is_ca, has_eku, has_key_usage, key_cert_sign, digital_signature, has_path_len, path_len)
 
 fn skip_optional_tbs_field(tag: Int) -> Bool:
     return tag == 129 or tag == 161 or tag == 130 or tag == 162
@@ -453,6 +470,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     mut has_eku := false
     mut has_key_usage := false
     mut key_cert_sign := false
+    mut digital_signature := false
     mut has_path_len := false
     mut path_len := 0
     while pos < tbs.value_end:
@@ -463,6 +481,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
             has_eku = parsed.has_eku
             has_key_usage = parsed.has_key_usage
             key_cert_sign = parsed.key_cert_sign
+            digital_signature = parsed.digital_signature
             has_path_len = parsed.has_path_len
             path_len = parsed.path_len
         elif not skip_optional_tbs_field(child.tag):
@@ -471,7 +490,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
 
     issuer_dn := data.slice(issuer.header_start, issuer.next)
     subject_dn := data.slice(subject.header_start, subject.next)
-    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns, has_key_usage, key_cert_sign, has_path_len, path_len)
+    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns, has_key_usage, key_cert_sign, digital_signature, has_path_len, path_len)
 
 # parse a der-encoded x.509 certificate.
 pub fn parse_der(data: Bytes) -> Certificate!:
@@ -694,6 +713,7 @@ EXPIRED_REASON := "certificate is expired or not yet valid"
 EKU_REASON := "certificate is not valid for tls server authentication"
 NAME_CONSTRAINT_REASON := "certificate name is outside a ca name constraint"
 KEY_USAGE_REASON := "certificate issuer is not permitted to sign certificates"
+LEAF_KEY_USAGE_REASON := "certificate key usage does not permit digital signatures"
 PATH_LEN_REASON := "certificate chain exceeds a ca path length constraint"
 
 fn verify_signature_for_algorithm(cert: Certificate, issuer: Certificate) -> Bool:
@@ -827,11 +847,23 @@ pub fn preflight_server_certificate(cert: Certificate, trusted_root: Certificate
     # server certificate, even if it chains and its name matches.
     if not leaf_permits_server_auth(cert):
         return VerificationResult(false, hostname_ok, false, false, false, EKU_REASON)
+    if not leaf_permits_signing(cert):
+        return VerificationResult(false, hostname_ok, false, false, false, LEAF_KEY_USAGE_REASON)
     issuer_ok := issuer_matches(cert, trusted_root)
     root_ca_ok := trusted_root.is_ca
     signature_verified := verify_signature(cert, trusted_root)
     ok := hostname_ok and issuer_ok and root_ca_ok and signature_verified
     return VerificationResult(ok, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+
+# whether a peer's leaf certificate may sign the handshake. every suite this
+# stack speaks (ecdhe on 1.2, certificateverify on 1.3) authenticates with a
+# signature from the leaf key, so a keyUsage extension that withholds
+# digitalSignature makes the certificate unusable as a tls peer. an absent
+# extension permits every usage (rfc 5280 §4.2.1.3).
+fn leaf_permits_signing(leaf: Certificate) -> Bool:
+    if not leaf.has_key_usage:
+        return true
+    return leaf.digital_signature
 
 # verify a server certificate chain against trusted roots.
 pub fn verify_server_chain(chain: List[Certificate], trusted_roots: List[Certificate], host: String) -> VerificationResult:
@@ -847,6 +879,8 @@ pub fn verify_server_chain(chain: List[Certificate], trusted_roots: List[Certifi
     # before doing the more expensive chain walk.
     if not leaf_permits_server_auth(leaf):
         return VerificationResult(false, hostname_ok, false, false, false, EKU_REASON)
+    if not leaf_permits_signing(leaf):
+        return VerificationResult(false, hostname_ok, false, false, false, LEAF_KEY_USAGE_REASON)
 
     return verify_chain_issuers(chain, trusted_roots, hostname_ok)
 
@@ -856,6 +890,8 @@ pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certifi
         return VerificationResult(false, true, false, false, false, "certificate chain is empty")
     if trusted_roots.len() == 0:
         return VerificationResult(false, true, false, false, false, "trusted roots are empty")
+    if not leaf_permits_signing(chain[0]):
+        return VerificationResult(false, true, false, false, false, LEAF_KEY_USAGE_REASON)
     return verify_chain_issuers(chain, trusted_roots, true)
 
 test "x509 does not match a hostname against a certificate's common name":
@@ -1014,6 +1050,21 @@ test "x509 enforces keyCertSign and pathLenConstraint on ca certificates":
     too_deep := verify_server_chain([parse_pem(read_file(fx + "constraint-leaf-pathlen.crt")!)!, parse_pem(read_file(fx + "constraint-int-below-pathlen0.crt")!)!, parse_pem(read_file(fx + "constraint-int-pathlen0.crt")!)!], [root], "leaf.test")
     assert(not too_deep.ok)
     assert_eq(too_deep.reason, PATH_LEN_REASON)
+
+test "x509 requires digitalSignature key usage of a tls leaf":
+    fx := "tests/live/fixtures/"
+    root := parse_pem(read_file(fx + "keyusage-root.crt")!)!
+    # a leaf whose keyUsage grants only keyEncipherment cannot sign a handshake.
+    enc := verify_server_chain([parse_pem(read_file(fx + "keyusage-leaf-encipherment.crt")!)!], [root], "leaf.test")
+    assert(not enc.ok)
+    assert_eq(enc.reason, LEAF_KEY_USAGE_REASON)
+    # the same subject with digitalSignature verifies.
+    signing := verify_server_chain([parse_pem(read_file(fx + "keyusage-leaf-signing.crt")!)!], [root], "leaf.test")
+    assert(signing.ok)
+    # the client-chain path applies the same leaf rule.
+    enc_client := verify_client_chain([parse_pem(read_file(fx + "keyusage-leaf-encipherment.crt")!)!], [root])
+    assert(not enc_client.ok)
+    assert_eq(enc_client.reason, LEAF_KEY_USAGE_REASON)
 
 test "x509 verifies client chains against trusted roots":
     cert := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!

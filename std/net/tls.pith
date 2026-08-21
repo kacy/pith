@@ -1094,7 +1094,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             binder_input := tls13.client_hello_psk_binder_input(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0)!
             binder := tls13.resumption_binder_verify_data_sha256(cached_session.psk, binder_input)!
             client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0, binder)!
-            native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello)!)!
+            native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
             transcript.write(client_hello)!
             return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, true, cache_key, transcript)
@@ -1110,7 +1110,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
         client_hello = tls13.encode_client_hello_offering_tls12(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, tls12.offered_suites(), true)!
     else:
         client_hello = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
-    native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello)!)!
+    native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
     transcript := bytes.buffer()
     transcript.write(client_hello)!
     return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)

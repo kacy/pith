@@ -517,6 +517,13 @@ fn valid_content_type(content_type: Int) -> Bool:
 
 # encode one tls record.
 pub fn encode_record(content_type: Int, payload: Bytes) -> Bytes!:
+    return encode_record_with_version(content_type, TLS_LEGACY_VERSION, payload)
+
+# encode a record with an explicit legacy record version. the one legitimate
+# caller of a non-0x0303 version is the initial ClientHello, whose record
+# SHOULD carry 0x0301 (rfc 8446 §5.1) — strict peers refuse a first record
+# claiming 0x0303, and every mainstream client sends 0x0301 there.
+pub fn encode_record_with_version(content_type: Int, record_version: Int, payload: Bytes) -> Bytes!:
     if not valid_content_type(content_type):
         fail tls13_fail("invalid tls record content type")
     if payload.len() > MAX_PLAINTEXT_RECORD:
@@ -524,10 +531,13 @@ pub fn encode_record(content_type: Int, payload: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(payload.len() + 5)
     defer out.free()
     write_u8(out, content_type)!
-    write_u16_be(out, TLS_LEGACY_VERSION)!
+    write_u16_be(out, record_version)!
     write_u16_be(out, payload.len())!
     write_bytes_if_any(out, payload)!
     return out.bytes()
+
+# the record version of an initial ClientHello (rfc 8446 §5.1): 0x0301.
+pub INITIAL_RECORD_VERSION := 769
 
 # decode one tls record from the start of a byte slice.
 pub fn decode_record(data: Bytes) -> Record!:

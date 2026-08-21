@@ -277,6 +277,11 @@ there are also small wrappers on `Conn` for the common cases:
 - `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (1.2)
 - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (1.2)
 
+ecdhe key exchange uses x25519 or nist p-256 (secp256r1) on both 1.3 and the
+1.2 fallback. the client offers both and prefers x25519; the server keys with
+whichever group the client sent a share for, so a client restricted to p-256
+(as some fips deployments are) still negotiates.
+
 ## verification hooks
 
 `with_verify_connection(...)` runs after normal certificate verification succeeds.

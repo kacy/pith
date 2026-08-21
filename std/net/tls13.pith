@@ -892,21 +892,23 @@ pub fn parse_client_hello(body: Bytes) -> ClientHello!:
     parsed := parse_client_hello_extensions(body, extensions)!
     if not parsed.supported_versions.contains(TLS13_VERSION):
         fail "client did not offer tls 1.3"
-    if parsed.key_share.group != GROUP_X25519 or parsed.key_share.key_share.len() != 32:
-        fail "client hello missing x25519 key share"
+    ks_group := parsed.key_share.group
+    ks_len := parsed.key_share.key_share.len()
+    if not ((ks_group == GROUP_X25519 and ks_len == 32) or (ks_group == GROUP_SECP256R1 and ks_len == 65)):
+        fail "client hello key share must be x25519 or secp256r1"
     return ClientHello(legacy_version, random, session_id, parsed.server_name, cipher_suites, parsed.supported_versions, parsed.key_share.group, parsed.key_share.key_share, parsed.signature_schemes, parsed.alpn_protocols, parsed.psk_mode_dhe, parsed.psk.identity, parsed.psk.binder, parsed.psk.obfuscated_ticket_age, parsed.psk.binder_input)
 
 # encode a tls 1.3 server hello.
 pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, x25519_public_key: Bytes) -> Bytes!:
-    return encode_server_hello_with_options(random, session_id, cipher_suite, x25519_public_key, 0 - 1)
+    return encode_server_hello_with_options(random, session_id, cipher_suite, x25519_public_key, GROUP_X25519, 0 - 1)
 
 ## Encode a ServerHello with optional selected PSK identity.
-pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher_suite: Int, x25519_public_key: Bytes, selected_psk_identity: Int) -> Bytes!:
+pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher_suite: Int, key_share_public_key: Bytes, key_share_group: Int, selected_psk_identity: Int) -> Bytes!:
     if random.len() != 32:
         fail "tls server random must be 32 bytes"
     if session_id.len() > 32:
         fail "tls session id too long"
-    mut extensions := supported_versions_server_extension(TLS13_VERSION)!.concat(key_share_server_extension(GROUP_X25519, x25519_public_key)!)
+    mut extensions := supported_versions_server_extension(TLS13_VERSION)!.concat(key_share_server_extension(key_share_group, key_share_public_key)!)
     if selected_psk_identity >= 0:
         extensions = extensions.concat(pre_shared_key_server_extension(selected_psk_identity)!)
     body := bytes.buffer()
@@ -1681,7 +1683,7 @@ test "tls13 parses alpn, certificate request, and new session ticket":
     ee := parse_encrypted_extensions(decode_handshakes(encode_encrypted_extensions_with_alpn("pith.rpc")!)![0].body)!
     cert_request := parse_certificate_request(decode_handshakes(encode_certificate_request([SIG_RSA_PSS_RSAE_SHA256])!)![0].body)!
     ticket := parse_new_session_ticket(decode_handshakes(encode_new_session_ticket(60, 9, bytes.from_string_utf8("n"), bytes.from_string_utf8("ticket"))!)![0].body)!
-    server_hello := parse_server_hello(decode_handshakes(encode_server_hello_with_options(encoding.from_hex("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")!, bytes.from_string_utf8("id"), CIPHER_TLS_AES_128_GCM_SHA256, encoding.from_hex("303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f")!, 0)!)![0].body)!
+    server_hello := parse_server_hello(decode_handshakes(encode_server_hello_with_options(encoding.from_hex("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")!, bytes.from_string_utf8("id"), CIPHER_TLS_AES_128_GCM_SHA256, encoding.from_hex("303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f")!, GROUP_X25519, 0)!)![0].body)!
 
     assert_eq(ee.alpn_protocol, "pith.rpc")
     assert_eq(cert_request.request_context.len(), 0)

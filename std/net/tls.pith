@@ -1494,10 +1494,16 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     cipher := resumption.cipher
     did_resume := resumption.did_resume
 
-    keypair := ecdh.x25519_keypair()!
+    # key with the group the client offered a share for. x25519 is preferred by
+    # the client parser; a client that only offered secp256r1 (common in FIPS
+    # deployments) still negotiates rather than being dropped.
+    mut keypair := ecdh.x25519_keypair()!
+    if client_hello.key_share_group == TLS_GROUP_SECP256R1:
+        keypair.close()
+        keypair = ecdh.p256_keypair()!
     errdefer keypair.close()
     server_random := random.bytes(32)!
-    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, selected_psk_identity(did_resume))!
+    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
 
     transcript := bytes.buffer()

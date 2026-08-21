@@ -1,0 +1,157 @@
+# Wycheproof known-answer vectors for the crypto primitives the TLS stack is
+# built on: AES-128-GCM, ChaCha20-Poly1305, ECDSA P-256, RSA PKCS#1 v1.5 and
+# PSS verification, HKDF-SHA256, and HMAC-SHA256. The primitives come from a
+# vetted library, so what these vectors anchor is the glue: argument order,
+# nonce and tag layout, key encodings, and length handling. Vector files live
+# in tests/wycheproof/ (see the header comment in each for the field layout);
+# "valid" vectors must succeed with the expected output, "invalid" ones must
+# be rejected, and "acceptable" ones may go either way but are counted.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.encoding as encoding
+import std.crypto.aead as aead
+import std.crypto.signature as signature
+import std.crypto.kdf as kdf
+import std.crypto.hmac as hmac
+
+fn field_bytes(field: String) -> Bytes!:
+    if field == "-":
+        return bytes.empty()
+    return encoding.from_hex(field)!
+
+struct SuiteTally:
+    mut valid_ok: Int
+    mut invalid_rejected: Int
+    mut acceptable: Int
+    mut violations: Int
+
+fn tally() -> SuiteTally:
+    return SuiteTally(0, 0, 0, 0)
+
+fn record(t: SuiteTally, suite: String, tc_id: String, result: String, ok: Bool):
+    if result == "acceptable":
+        t.acceptable = t.acceptable + 1
+        return
+    if result == "valid":
+        if ok:
+            t.valid_ok = t.valid_ok + 1
+        else:
+            t.violations = t.violations + 1
+            print("VIOLATION {suite} tc {tc_id}: valid vector failed")
+        return
+    if ok:
+        t.violations = t.violations + 1
+        print("VIOLATION {suite} tc {tc_id}: invalid vector accepted")
+    else:
+        t.invalid_rejected = t.invalid_rejected + 1
+
+fn report(t: SuiteTally, suite: String):
+    print("{suite}: {(t.valid_ok + t.invalid_rejected + t.acceptable).to_string()} vectors, {t.valid_ok.to_string()} valid ok, {t.invalid_rejected.to_string()} invalid rejected, {t.acceptable.to_string()} acceptable")
+
+fn vectors(path: String) -> List[List[String]]!:
+    body := fs.read_file(path)!
+    mut out: List[List[String]] := []
+    for line in body.split("\n"):
+        if line.len() == 0 or line.starts_with("#"):
+            continue
+        out.push(line.split("|"))
+    return out
+
+# tcId|result|key|iv|aad|msg|ct_and_tag — seal must reproduce ct||tag for valid
+# vectors and open must round-trip; invalid vectors must fail to open.
+fn run_aead(suite: String, path: String, use_chacha: Bool) -> Bool!:
+    t := tally()
+    for parts in vectors(path)!:
+        key := field_bytes(parts[2])!
+        iv := field_bytes(parts[3])!
+        aad := field_bytes(parts[4])!
+        msg := field_bytes(parts[5])!
+        sealed := field_bytes(parts[6])!
+        result := parts[1]
+        mut ok := true
+        if result == "valid":
+            mut resealed := bytes.empty()
+            mut opened := bytes.empty()
+            if use_chacha:
+                resealed = aead.chacha20_poly1305_seal(key, iv, aad, msg) catch bytes.empty()
+                opened = aead.chacha20_poly1305_open(key, iv, aad, sealed) catch bytes.from_string_utf8("!open-failed")
+            else:
+                resealed = aead.aes_128_gcm_seal(key, iv, aad, msg) catch bytes.empty()
+                opened = aead.aes_128_gcm_open(key, iv, aad, sealed) catch bytes.from_string_utf8("!open-failed")
+            ok = bytes.eq(resealed, sealed) and bytes.eq(opened, msg)
+        else:
+            # only open is meaningful: sealing the message would just produce
+            # the correct ciphertext again. reaching the line after the catch
+            # means open ACCEPTED the invalid input, which record() flags.
+            if use_chacha:
+                aead.chacha20_poly1305_open(key, iv, aad, sealed) catch:
+                    record(t, suite, parts[0], result, false)
+                    continue
+            else:
+                aead.aes_128_gcm_open(key, iv, aad, sealed) catch:
+                    record(t, suite, parts[0], result, false)
+                    continue
+            ok = true
+        record(t, suite, parts[0], result, ok)
+    report(t, suite)
+    return t.violations == 0
+
+# tcId|result|pubkey|msg|sig — verification returns a Bool.
+fn run_verify(suite: String, path: String, kind: String) -> Bool!:
+    t := tally()
+    for parts in vectors(path)!:
+        key := field_bytes(parts[2])!
+        msg := field_bytes(parts[3])!
+        sig := field_bytes(parts[4])!
+        mut ok := false
+        if kind == "ecdsa":
+            ok = signature.verify_ecdsa_p256_sha256_asn1(key, msg, sig)
+        elif kind == "pkcs1":
+            ok = signature.verify_rsa_pkcs1_sha256(key, msg, sig)
+        else:
+            ok = signature.verify_rsa_pss_sha256(key, msg, sig)
+        record(t, suite, parts[0], parts[1], ok)
+    report(t, suite)
+    return t.violations == 0
+
+# tcId|result|ikm|salt|info|size|okm — extract then expand.
+fn run_hkdf(suite: String, path: String) -> Bool!:
+    t := tally()
+    for parts in vectors(path)!:
+        ikm := field_bytes(parts[2])!
+        salt := field_bytes(parts[3])!
+        info := field_bytes(parts[4])!
+        size := parse_int(parts[5])!
+        okm := field_bytes(parts[6])!
+        prk := kdf.hkdf_extract_sha256(salt, ikm)
+        derived := kdf.hkdf_expand_sha256(prk, info, size) catch bytes.empty()
+        ok := derived.len() > 0 and bytes.eq(derived, okm)
+        record(t, suite, parts[0], parts[1], ok)
+    report(t, suite)
+    return t.violations == 0
+
+# tcId|result|key|msg|tag — recompute the full-length tag.
+fn run_hmac(suite: String, path: String) -> Bool!:
+    t := tally()
+    for parts in vectors(path)!:
+        key := field_bytes(parts[2])!
+        msg := field_bytes(parts[3])!
+        tag := field_bytes(parts[4])!
+        ok := bytes.eq(hmac.sha256(key, msg), tag)
+        record(t, suite, parts[0], parts[1], ok)
+    report(t, suite)
+    return t.violations == 0
+
+fn main() -> Int!:
+    mut all_ok := true
+    all_ok = run_aead("aes-128-gcm", "tests/wycheproof/aes_gcm_128.txt", false)! and all_ok
+    all_ok = run_aead("chacha20-poly1305", "tests/wycheproof/chacha20_poly1305.txt", true)! and all_ok
+    all_ok = run_verify("ecdsa-p256-sha256", "tests/wycheproof/ecdsa_p256_sha256.txt", "ecdsa")! and all_ok
+    all_ok = run_verify("rsa-pkcs1-2048-sha256", "tests/wycheproof/rsa_pkcs1_2048_sha256.txt", "pkcs1")! and all_ok
+    all_ok = run_verify("rsa-pss-2048-sha256", "tests/wycheproof/rsa_pss_2048_sha256.txt", "pss")! and all_ok
+    all_ok = run_hkdf("hkdf-sha256", "tests/wycheproof/hkdf_sha256.txt")! and all_ok
+    all_ok = run_hmac("hmac-sha256", "tests/wycheproof/hmac_sha256.txt")! and all_ok
+    if not all_ok:
+        fail "wycheproof violations"
+    return 0

@@ -310,6 +310,8 @@ fn decode_record(data: Bytes) -> Tls12Record!:
     if data.len() < 5:
         fail "tls 1.2 record too short"
     content_type := data[0]
+    if checked_read(binary.read_u16_be_at(data, 1))! != TLS12_VERSION:
+        fail "tls 1.2 record has an unexpected version"
     length := checked_read(binary.read_u16_be_at(data, 3))!
     if data.len() != 5 + length:
         fail "tls 1.2 record length mismatch"

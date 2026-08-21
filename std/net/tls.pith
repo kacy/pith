@@ -166,6 +166,16 @@ ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
 
+# the compatibility change_cipher_spec carries exactly one byte of value 1
+# (rfc 8446 §5); any other content is a malformed record.
+fn is_valid_change_cipher_spec(record: tls13.Record) -> Bool:
+    return record.payload.len() == 1 and record.payload[0] == 1
+
+# a peer may send at most a couple of compatibility change_cipher_spec records
+# during a handshake (rfc 8446 appendix d.4 — one before its second flight); a
+# flood of them is an empty-fragment denial-of-service and is refused.
+MAX_HANDSHAKE_CHANGE_CIPHER_SPEC := 8
+
 TLS_VERSION_13 := 772
 TLS_VERSION_12 := 771
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
@@ -1185,6 +1195,9 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            if not is_valid_change_cipher_spec(record):
+                tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
+                fail "malformed tls change cipher spec"
             saw_ccs = true
         elif record.content_type == TLS_CONTENT_HANDSHAKE:
             # the only message with a place between the peer's key exchange
@@ -1534,9 +1547,17 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     # after the Finished, nothing may remain in the flight buffer.
     mut server_flight_pending := bytes.empty()
     mut server_finished := false
+    mut client_ccs_count := 0
     while not server_finished:
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            if not is_valid_change_cipher_spec(record):
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls change cipher spec"
+            client_ccs_count = client_ccs_count + 1
+            if client_ccs_count > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC:
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "too many tls change cipher spec records"
             continue
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
@@ -2041,9 +2062,17 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # of the flight is excess, whether it shares the record or trails as an
     # incomplete message.
     mut client_flight_pending := bytes.empty()
+    mut server_ccs_count := 0
     while not client_finished_seen:
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            if not is_valid_change_cipher_spec(record):
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls change cipher spec"
+            server_ccs_count = server_ccs_count + 1
+            if server_ccs_count > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC:
+                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "too many tls change cipher spec records"
             continue
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
@@ -2241,7 +2270,11 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         # can splice `15 03 03 00 02 xx xx` onto the stream would end the
         # caller's read early and a partial response would read as complete.
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
-            continue
+            # rfc 8446 §5: change_cipher_spec is only tolerated during the
+            # handshake. one arriving on an established connection is an
+            # injected plaintext record, not a compatibility artifact.
+            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+            fail "change cipher spec after tls handshake"
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
             send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "unencrypted tls record after handshake"

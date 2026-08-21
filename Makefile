@@ -1,4 +1,4 @@
-.PHONY: pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+.PHONY: tls-live-interop pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -1553,3 +1553,24 @@ test: build
 clean:
 	cargo clean
 	rm -rf .pith-build
+
+# openssl-driven tls interop live tests, compared against goldens. these prove
+# the tls 1.2 client and the 1.3 resumption binder interoperate with a real
+# foreign implementation (openssl), which a pith-to-pith test cannot show.
+TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live
+
+tls-live-interop: build
+	@echo "--- tls live interop (openssl) ---"
+	@command -v openssl >/dev/null 2>&1 || { echo "openssl not found; skipping tls live interop"; exit 0; }
+	@pass=0; fail=0; \
+	for name in $(TLS_LIVE_INTEROP_CASES); do \
+		actual=$$(timeout 120 ./target/release/pith run "tests/live/$$name.pith" 2>/dev/null); \
+		expected=$$(cat "tests/live/expected/$$name.txt"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; echo "--- expected ---"; echo "$$expected"; echo "--- actual ---"; echo "$$actual"; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "$$fail tls live interop cases failed"; exit 1; fi; \
+	echo "all tls live interop cases passed"

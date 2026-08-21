@@ -43,11 +43,14 @@ pub TLS12_CERTIFICATE_VERIFY := 15
 pub TLS12_CLIENT_KEY_EXCHANGE := 16
 pub TLS12_FINISHED := 20
 
-# The four cipher suites this fallback offers, all ECDHE + AEAD.
+# The four cipher suites this fallback offers, all ECDHE + AEAD. The decimal
+# values are the IANA registry ids, quoted in hex beside each one.
 pub TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 := 49195
 pub TLS12_ECDHE_RSA_AES128_GCM_SHA256 := 49199
 pub TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 := 52392
 pub TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 := 52393
+# 0xC02B (ECDHE-ECDSA-AES128-GCM), 0xC02F (ECDHE-RSA-AES128-GCM),
+# 0xCCA8 (ECDHE-RSA-CHACHA20), 0xCCA9 (ECDHE-ECDSA-CHACHA20).
 
 # convert the typed BinaryError from std.binary into this module's generic
 # error so a `!` can propagate it.
@@ -260,6 +263,8 @@ pub struct Tls12Record:
 
 # Seal an AES-128-GCM record. The GCM nonce is salt(4) ++ explicit(8), and the
 # 8-byte explicit nonce is prepended to the ciphertext on the wire (RFC 5288).
+# The caller must never reuse a sequence number under one key: a repeated GCM
+# (key, nonce) pair leaks the authentication key and voids the AEAD guarantee.
 pub fn seal_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
     if salt.len() != 4:
         fail "tls 1.2 gcm salt must be 4 bytes"
@@ -271,7 +276,10 @@ pub fn seal_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, content_type: In
     return bytes.concat(record_header(content_type, payload.len())!, payload)
 
 # Open an AES-128-GCM record produced by seal_aes_128_gcm. The record has
-# already been split from the stream; `record` is the full header+payload.
+# already been split from the stream; `record` is the full header+payload. Any
+# error — a framing problem or a failed authentication tag — is fatal to the
+# connection and must not be retried; the two are not distinguished, because TLS
+# forbids continuing past a bad_record_mac.
 pub fn open_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, record: Bytes) -> Tls12Record!:
     if salt.len() != 4:
         fail "tls 1.2 gcm salt must be 4 bytes"
@@ -286,14 +294,17 @@ pub fn open_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, record: Bytes) -
     plaintext := aead.aes_128_gcm_open(key, nonce, aad, ciphertext)!
     return Tls12Record(outer.content_type, plaintext)
 
-# Seal a ChaCha20-Poly1305 record (RFC 7905): no explicit nonce on the wire.
+# Seal a ChaCha20-Poly1305 record (RFC 7905): no explicit nonce on the wire, the
+# nonce is derived from the sequence number. As with GCM, the caller must never
+# reuse a sequence number under one key.
 pub fn seal_chacha20_poly1305(key: Bytes, static_iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
     nonce := chacha_nonce(static_iv, sequence)!
     aad := record_aad(sequence, content_type, plaintext.len())!
     ciphertext := aead.chacha20_poly1305_seal(key, nonce, aad, plaintext)!
     return bytes.concat(record_header(content_type, ciphertext.len())!, ciphertext)
 
-# Open a ChaCha20-Poly1305 record produced by seal_chacha20_poly1305.
+# Open a ChaCha20-Poly1305 record produced by seal_chacha20_poly1305. As with
+# open_aes_128_gcm, any error is fatal to the connection and must not be retried.
 pub fn open_chacha20_poly1305(key: Bytes, static_iv: Bytes, sequence: Int, record: Bytes) -> Tls12Record!:
     outer := decode_record(record)!
     if outer.payload.len() < 16:

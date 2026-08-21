@@ -334,6 +334,23 @@ extension only when the client asked for it — extended master secret when the
 client offered it, and renegotiation_info only when the client advertised
 secure renegotiation (the rfc 5746 extension or the SCSV cipher value).
 
+a refused handshake is answered with a fatal alert before the connection
+closes, so the peer learns why instead of seeing a bare tcp reset:
+`protocol_version` when no version this stack speaks was offered (the client
+hello's legacy_version must also be at least 0x0303, the value rfc 8446 froze
+it at), `handshake_failure` when the version was fine but no common cipher
+suite, signature algorithm, or required extension could be agreed,
+`no_application_protocol` for an alpn mismatch, `illegal_parameter` for an
+unusable key share, `decrypt_error` for a psk binder that does not validate
+against a recognized ticket (rfc 8446 §4.2.11.2 requires the abort), and
+`decode_error` / `record_overflow` / `unexpected_message` for malformed input.
+the 1.2 fallback engages only when the client actually offered tls 1.2 —
+through supported_versions when present, or legacy_version otherwise — never
+as an answer to a version the client did not offer. its ServerHello carries an
+empty session id (echoing the client's would falsely announce a resumed
+session under rfc 5246 §7.4.1.3), and its ServerKeyExchange signature uses a
+scheme from the client's signature_algorithms extension, preferring rsa-pss.
+
 `require_tls13()` locks a config to tls 1.3, refusing the fallback — the
 equivalent of a minimum version of 1.3:
 

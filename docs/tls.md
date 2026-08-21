@@ -235,8 +235,10 @@ the fields are:
 - `peer_certificate_count`
 - `peer_certificates`
 - `peer_chain_present`
-- `client_auth_requested`
-- `client_auth_verified`
+- `client_auth_requested` — whether this endpoint, acting as a server, asked the
+  peer for a client certificate; always false on a client connection
+- `client_auth_verified` — whether this endpoint, acting as a server, verified
+  the peer's client certificate; always false on a client connection
 
 there are also small wrappers on `Conn` for the common cases:
 - `version()`

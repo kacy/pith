@@ -1330,7 +1330,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         fail "server resumed the session with a different alpn protocol"
     if did_resume:
         peer = peer_identity_from_cached_session(cached_session)
-    state := connection_state_from_peer(TLS_VERSION_13, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, client_cert_requested, false)
+    # client_auth_requested/verified describe this endpoint's server role in
+    # verifying a peer's client certificate; on a client connection both are
+    # false even when the server asked this client for a certificate.
+    state := connection_state_from_peer(TLS_VERSION_13, server_hello.cipher_suite, negotiated_alpn, did_resume, peer, false, false)
     run_verify_connection_hook(config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state, server_app_secret, client_app_secret)
 

@@ -379,8 +379,14 @@ fn default_client_extensions_with_options(server_name: String, x25519_public_key
     out := bytes.buffer()
     defer out.free()
     write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
+    # a client that would accept session tickets must advertise its psk key
+    # exchange mode in every hello (rfc 8446 §4.2.9): a compliant server must
+    # not send a usable NewSessionTicket to a client that did not, so gating
+    # this on already-having-a-psk meant the first handshake never yielded a
+    # resumable session against a strict server. mainstream clients always
+    # send it. pre_shared_key itself stays last, as the rfc requires.
+    write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     if psk_identity.len() > 0:
-        write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
         write_bytes_if_any(out, pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
     return out.bytes()
 
@@ -657,6 +663,7 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
     write_bytes_if_any(out, extended_master_secret_extension()!)!
     write_bytes_if_any(out, renegotiation_info_extension()!)!
     write_bytes_if_any(out, ec_point_formats_extension()!)!
+    write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return out.bytes()
 
@@ -832,24 +839,36 @@ fn parse_client_psk_extension(body: Bytes, extension_body_start: Int, extension_
     if binders_len_pos < 0 or binders_len_pos > body.len():
         fail "malformed tls psk binder input"
     binder_input := client_hello_binder_transcript(body.slice(0, binders_len_pos), body.len())!
+    # walk every identity and every binder: rfc 8446 §4.2.11 pairs the two
+    # lists one to one, so unequal counts are a malformed offer even though
+    # only the first identity is ever selected here.
     mut identity := bytes.empty()
     mut obfuscated_ticket_age := 0
+    mut identity_count := 0
     ir := binary.reader(identities)
-    if binary.remaining(ir) > 0:
+    while binary.remaining(ir) > 0:
         ticket_len := checked_read(binary.read_u16_be(ir))!
-        identity = checked_bytes(binary.read_bytes(ir, ticket_len))!
-        obfuscated_ticket_age = checked_read(binary.read_u32_be(ir))!
+        entry := checked_bytes(binary.read_bytes(ir, ticket_len))!
+        age := checked_read(binary.read_u32_be(ir))!
+        if identity_count == 0:
+            identity = entry
+            obfuscated_ticket_age = age
+        identity_count = identity_count + 1
     binders_len := checked_read(binary.read_u16_be(r))!
     binders := checked_bytes(binary.read_bytes(r, binders_len))!
     if binary.remaining(r) != 0:
         fail "malformed tls pre_shared_key extension"
     mut binder := bytes.empty()
+    mut binder_count := 0
     br := binary.reader(binders)
-    if binary.remaining(br) > 0:
+    while binary.remaining(br) > 0:
         binder_len := checked_read(binary.read_u8(br))!
-        binder = checked_bytes(binary.read_bytes(br, binder_len))!
-        if binary.remaining(br) != 0:
-            fail "multiple tls psk binders are not supported"
+        entry := checked_bytes(binary.read_bytes(br, binder_len))!
+        if binder_count == 0:
+            binder = entry
+        binder_count = binder_count + 1
+    if identity_count == 0 or binder_count != identity_count:
+        fail "tls psk identities and binders do not correspond"
     if binder.len() == 0:
         fail "tls psk binder is empty"
     return ClientPskExtension(identity, binder, obfuscated_ticket_age, binder_input)
@@ -864,11 +883,21 @@ fn parse_client_hello_extensions(body: Bytes, extensions: Bytes) -> ParsedClient
     mut psk := empty_client_psk_extension()
     extension_body_start := body.len() - extensions.len()
     mut extension_offset := 0
+    mut seen_extensions: List[Int] := []
     r := binary.reader(extensions)
     while binary.remaining(r) > 0:
         extension_type := checked_read(binary.read_u16_be(r))!
         data_len := checked_read(binary.read_u16_be(r))!
         data := checked_bytes(binary.read_bytes(r, data_len))!
+        # rfc 8446 §4.2: there must not be more than one extension of the same
+        # type in a given extension block.
+        if seen_extensions.contains(extension_type):
+            fail "duplicate tls client hello extension"
+        # rfc 8446 §4.2.11: pre_shared_key, once present, must be the final
+        # extension — its binders cover everything before them.
+        if seen_extensions.contains(EXT_PRE_SHARED_KEY):
+            fail "tls pre_shared_key extension must be last"
+        seen_extensions.push(extension_type)
         if extension_type == EXT_SUPPORTED_VERSIONS:
             supported_versions = parse_supported_versions_list(data)!
         elif extension_type == EXT_KEY_SHARE:
@@ -996,6 +1025,7 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
     mut extended_master_secret := false
     mut secure_renegotiation := false
     mut signature_schemes: List[Int] := []
+    mut seen_extensions: List[Int] := []
     if binary.remaining(r) > 0:
         extension_len := checked_read(binary.read_u16_be(r))!
         extensions := checked_bytes(binary.read_bytes(r, extension_len))!
@@ -1004,6 +1034,11 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
             extension_type := checked_read(binary.read_u16_be(er))!
             data_len := checked_read(binary.read_u16_be(er))!
             data := checked_bytes(binary.read_bytes(er, data_len))!
+            # rfc 8446 §4.2: at most one extension of a given type per block;
+            # even the lenient pass refuses a duplicated one.
+            if seen_extensions.contains(extension_type):
+                fail "duplicate tls client hello extension"
+            seen_extensions.push(extension_type)
             if extension_type == EXT_SUPPORTED_VERSIONS:
                 supported_versions = parse_supported_versions_list(data)!
             elif extension_type == EXT_SUPPORTED_GROUPS:
@@ -1018,6 +1053,8 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
                 secure_renegotiation = true
             elif extension_type == EXT_SIGNATURE_ALGORITHMS:
                 signature_schemes = parse_signature_scheme_list(data)!
+    if binary.remaining(r) != 0:
+        fail "trailing tls client hello bytes"
     return LenientClientHello(random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols, extended_master_secret, secure_renegotiation, legacy_version, signature_schemes)
 
 # The protocol version a server negotiated, read from a ServerHello body: the
@@ -1068,11 +1105,16 @@ pub fn parse_server_hello(body: Bytes) -> ServerHello!:
     mut key_share_group := 0
     mut key_share := bytes.empty()
     mut selected_psk_identity := 0 - 1
+    mut seen_extensions: List[Int] := []
     er := binary.reader(extensions)
     while binary.remaining(er) > 0:
         extension_type := checked_read(binary.read_u16_be(er))!
         data_len := checked_read(binary.read_u16_be(er))!
         data := checked_bytes(binary.read_bytes(er, data_len))!
+        # rfc 8446 §4.2: at most one extension of a given type per block.
+        if seen_extensions.contains(extension_type):
+            fail "duplicate tls server hello extension"
+        seen_extensions.push(extension_type)
         if extension_type == EXT_SUPPORTED_VERSIONS:
             dr := binary.reader(data)
             supported_version = checked_read(binary.read_u16_be(dr))!
@@ -1104,11 +1146,16 @@ pub fn parse_encrypted_extensions(body: Bytes) -> EncryptedExtensions!:
     if binary.remaining(r) != 0:
         fail "trailing tls encrypted extensions bytes"
     mut alpn_protocol := ""
+    mut seen_extensions: List[Int] := []
     er := binary.reader(extensions)
     while binary.remaining(er) > 0:
         extension_type := checked_read(binary.read_u16_be(er))!
         data_len := checked_read(binary.read_u16_be(er))!
         data := checked_bytes(binary.read_bytes(er, data_len))!
+        # rfc 8446 §4.2: at most one extension of a given type per block.
+        if seen_extensions.contains(extension_type):
+            fail "duplicate tls encrypted extensions extension"
+        seen_extensions.push(extension_type)
         if extension_type == EXT_ALPN:
             protocols := parse_alpn_protocol_list(data)!
             if protocols.len() > 0:

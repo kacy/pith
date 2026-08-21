@@ -46,6 +46,7 @@ EXT_SUPPORTED_VERSIONS := 43
 # ignores both.
 EXT_EXTENDED_MASTER_SECRET := 23
 EXT_RENEGOTIATION_INFO := 65281
+EXT_EC_POINT_FORMATS := 11
 EXT_KEY_SHARE := 51
 CIPHER_TLS_AES_128_GCM_SHA256 := 4865
 CIPHER_TLS_CHACHA20_POLY1305_SHA256 := 4867
@@ -612,6 +613,18 @@ fn supported_versions_client_extension_list(versions: List[Int]) -> Bytes!:
 fn extended_master_secret_extension() -> Bytes!:
     return extension_record(EXT_EXTENDED_MASTER_SECRET, bytes.empty())
 
+# An ec_point_formats extension offering the uncompressed point format. rfc
+# 8422 makes uncompressed implied when the extension is absent, but strict 1.2
+# servers (boringssl's reference implementation among them) refuse ECDHE
+# without it, so a 1.2-capable hello carries it explicitly like every
+# mainstream client does.
+fn ec_point_formats_extension() -> Bytes!:
+    data := bytes.buffer_with_capacity(2)
+    defer data.free()
+    write_u8(data, 1)!
+    write_u8(data, 0)!
+    return extension_record(EXT_EC_POINT_FORMATS, data.bytes())
+
 # A renegotiation_info extension carrying an empty renegotiated_connection
 # (rfc 5746): this connection is initial, and we refuse renegotiation.
 fn renegotiation_info_extension() -> Bytes!:
@@ -643,6 +656,7 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
     write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
     write_bytes_if_any(out, extended_master_secret_extension()!)!
     write_bytes_if_any(out, renegotiation_info_extension()!)!
+    write_bytes_if_any(out, ec_point_formats_extension()!)!
     write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return out.bytes()
 

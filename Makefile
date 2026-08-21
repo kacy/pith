@@ -1,4 +1,4 @@
-.PHONY: tls-live-interop tls-go-interop tls-rustls-interop pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
 
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
@@ -1593,6 +1593,23 @@ tls-rustls-interop: build
 	else \
 		echo "FAIL tls rustls interop"; echo "--- expected ---"; echo "$$expected"; echo "--- actual ---"; echo "$$actual"; exit 1; \
 	fi
+
+# run the BoringSSL test runner (BoGo) against the pith shim. needs a
+# boringssl checkout (pass BOGO=/path/to/boringssl) and go; not part of ci —
+# the checkout is large and the suite is a workbench, not a gate. unknown
+# runner flags make the shim exit 89, which the runner counts as a skip, and
+# tests/interop/bogo/config.json disables the cases this stack refuses by
+# design. BOGO_TESTS narrows the run, e.g. BOGO_TESTS='Basic*'.
+tls-bogo: build
+	@echo "--- bogo (boringssl test runner) ---"
+	@command -v go >/dev/null 2>&1 || { echo "go not found; skipping bogo"; exit 0; }
+	@[ -n "$(BOGO)" ] && [ -d "$(BOGO)/ssl/test/runner" ] || { echo "set BOGO=/path/to/boringssl (ssl/test/runner missing); skipping"; exit 0; }
+	@./target/release/pith build tests/interop/bogo/shim.pith >/dev/null
+	@cd "$(BOGO)/ssl/test/runner" && go test \
+		-shim-path "$(CURDIR)/tests/interop/bogo/shim" \
+		-shim-config "$(CURDIR)/tests/interop/bogo/config.json" \
+		-allow-unimplemented -loose-errors -pipe \
+		$(if $(BOGO_TESTS),-test "$(BOGO_TESTS)",)
 
 # interop against Go's crypto/tls (a second independent reference stack), both
 # directions across tls 1.2/1.3 and rsa/ecdsa. builds the small go peer first.

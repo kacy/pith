@@ -32,6 +32,7 @@ mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
 mut native_config_resumption_enabled: Map[Int, Bool] := {}
 mut native_config_require_tls13: Map[Int, Bool] := {}
+mut native_config_skip_verification: Map[Int, Bool] := {}
 mut native_config_require_tls12: Map[Int, Bool] := {}
 mut native_client_cert_pem: Map[Int, String] := {}
 mut native_client_key_der: Map[Int, Bytes] := {}
@@ -649,6 +650,11 @@ fn parse_certificate_chain(message: tls13.HandshakeMessage) -> List[x509.Certifi
     return chain
 
 fn verify_certificate_chain(certs: List[x509.Certificate], config: Config, server_name: String) -> Bool!:
+    # dangerously_skip_verification() disables the chain and hostname checks
+    # only; record protection, the downgrade sentinel, and every other
+    # handshake check still apply.
+    if config_get(native_config_skip_verification, config.handle, false):
+        return true
     roots := native_config_roots(config)!
     result := x509.verify_server_chain(certs, roots, server_name)
     if not result.ok:
@@ -2161,6 +2167,16 @@ impl Config:
         config_put(native_config_require_tls13, self.handle, true)
         return self
 
+    # Disable certificate-chain and hostname verification on a client config.
+    # The connection is still encrypted, but the peer is UNAUTHENTICATED — an
+    # active attacker can freely impersonate the server. This exists for test
+    # harnesses (conformance runners present freshly generated certificates)
+    # and must never ship in production configuration; prefer
+    # client_config_with_ca_file with the peer's real root.
+    fn dangerously_skip_verification() -> Config:
+        config_put(native_config_skip_verification, self.handle, true)
+        return self
+
     # Restrict this client config to TLS 1.2 only — a maximum-version cap. The
     # client offers only 1.2 (no 1.3), so it will not negotiate 1.3 even with a
     # 1.3-capable server. This is the inverse of require_tls13(); the two are
@@ -2203,6 +2219,7 @@ impl Config:
         config_drop(native_config_resumption_enabled, self.handle)
         config_drop(native_config_require_tls13, self.handle)
         config_drop(native_config_require_tls12, self.handle)
+        config_drop(native_config_skip_verification, self.handle)
         config_drop(native_config_verify_connection, self.handle)
         config_drop(native_server_config_selector, self.handle)
         config_drop(native_client_cert_pem, self.handle)

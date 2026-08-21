@@ -351,6 +351,13 @@ empty session id (echoing the client's would falsely announce a resumed
 session under rfc 5246 §7.4.1.3), and its ServerKeyExchange signature uses a
 scheme from the client's signature_algorithms extension, preferring rsa-pss.
 
+`dangerously_skip_verification()` disables certificate-chain and hostname
+verification on a client config. the connection is still encrypted, but the
+peer is unauthenticated — an active attacker can impersonate the server
+freely. it exists for test harnesses (conformance runners present freshly
+generated certificates) and must never appear in production configuration;
+prefer `client_config_with_ca_file` with the peer's real root.
+
 `require_tls13()` locks a config to tls 1.3, refusing the fallback — the
 equivalent of a minimum version of 1.3:
 
@@ -362,6 +369,24 @@ what the 1.2 fallback does not do (v1): session resumption, renegotiation
 (refused), client-certificate auth (the server refuses a 1.2 CertificateRequest
 path), or aes-256 suites. sni-based server config selection works on 1.2. rsa
 (≥2048-bit) and ecdsa (p-256) server certificates are both supported.
+
+## conformance harnesses
+
+three external suites drive this stack beyond the pith-to-pith and
+openssl/go/rustls interop gates:
+
+- `make tls-live-interop`, `make tls-go-interop`, and `make tls-rustls-interop`
+  run in ci on every build.
+- `make tls-bogo BOGO=/path/to/boringssl` runs the BoringSSL test runner
+  against a pith shim (`tests/interop/bogo/`). unknown runner flags make the
+  shim exit 89, which the runner counts as unimplemented and skips;
+  `tests/interop/bogo/config.json` disables the cases this stack refuses by
+  design (static rsa, tls 1.2 resumption) with a reason for each. it is a
+  workbench rather than a ci gate: the checkout is large, and the interesting
+  output is the failure list.
+- tlsfuzzer runs ad hoc against a live pith server; the version-negotiation,
+  legacy-version, conversation, and record-padding suites pass with flags
+  matching this stack's documented cipher policy.
 
 ## current limits
 

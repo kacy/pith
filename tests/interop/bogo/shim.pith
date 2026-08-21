@@ -1,0 +1,216 @@
+# A shim for the BoringSSL test runner (BoGo). The runner starts this program
+# once per test with a set of flags describing the configuration under test,
+# listens on a loopback port, and expects the shim to connect, send its
+# 64-bit little-endian shim id, run the TLS handshake (client by default,
+# server with -server), then echo every received application byte XORed with
+# 0xff until the peer shuts down. Exit 0 reports success, a non-zero exit with
+# a message on stderr reports failure, and the special exit code 89 tells the
+# runner a flag or feature is unimplemented so it can skip the test.
+# See boringssl's ssl/test/PORTING.md for the contract.
+
+import std.net.tls as tls
+import std.net.tcp as tcp
+import std.io as io
+import std.bytes as bytes
+import std.bits as bits
+
+fn unimplemented(flag: String):
+    print_err("unimplemented: " + flag)
+    exit(89)
+
+fn fail_test(reason: String):
+    print_err(reason)
+    exit(1)
+
+fn shim_id_bytes(id: Int) -> Bytes!:
+    out := bytes.buffer_with_capacity(8)
+    defer out.free()
+    mut index := 0
+    while index < 8:
+        out.write_byte(bits.band(bits.shr(id, index * 8), 255))!
+        index = index + 1
+    return out.bytes()
+
+fn xor_transform(data: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(data.len())
+    defer out.free()
+    mut index := 0
+    while index < data.len():
+        out.write_byte(bits.xor(data[index], 255))!
+        index = index + 1
+    return out.bytes()
+
+# the post-handshake exchange: echo until the peer closes, transforming each
+# byte so the runner can tell live traffic from a reflection. either close
+# flavor ends the exchange, matching the reference shim.
+fn exchange(conn: tls.Conn, writes_first: Bool, shuts_down: Bool) -> Int:
+    if writes_first:
+        wrote := conn.write_all("hello")
+        if wrote.is_err:
+            fail_test("initial write failed")
+    if shuts_down:
+        conn.close()
+        return 0
+    mut done := false
+    while not done:
+        read := conn.read_bytes(512)
+        if read.is_err:
+            done = true
+        elif read.ok.len() == 0:
+            done = true
+        else:
+            reply := xor_transform(read.ok) catch bytes.empty()
+            if reply.len() == 0:
+                fail_test("transform failed")
+            wrote := conn.write_all_bytes(reply)
+            if wrote.is_err:
+                fail_test("write failed")
+    conn.close()
+    return 0
+
+fn main() -> Int!:
+    argv := args()
+    mut port := 0
+    mut shim_id := 0
+    mut ipv6 := false
+    mut is_server := false
+    mut key_file := ""
+    mut cert_file := ""
+    mut trust_cert := ""
+    mut min_version := 0
+    mut max_version := 0
+    mut expect_version := 0
+    mut writes_first := false
+    mut shuts_down := false
+    mut resume_count := 0
+
+    mut index := 1
+    while index < argv.len():
+        flag := argv[index]
+        if flag == "-is-handshaker-supported":
+            print("No")
+            return 0
+        elif flag == "-port":
+            index = index + 1
+            port = parse_int(argv[index])!
+        elif flag == "-shim-id":
+            index = index + 1
+            shim_id = parse_int(argv[index])!
+        elif flag == "-ipv6":
+            ipv6 = true
+        elif flag == "-server":
+            is_server = true
+        elif flag == "-key-file":
+            index = index + 1
+            key_file = argv[index]
+        elif flag == "-cert-file":
+            index = index + 1
+            cert_file = argv[index]
+        elif flag == "-trust-cert":
+            index = index + 1
+            trust_cert = argv[index]
+        elif flag == "-min-version":
+            index = index + 1
+            min_version = parse_int(argv[index])!
+        elif flag == "-max-version":
+            index = index + 1
+            max_version = parse_int(argv[index])!
+        elif flag == "-expect-version":
+            index = index + 1
+            expect_version = parse_int(argv[index])!
+        elif flag == "-resume-count":
+            index = index + 1
+            resume_count = parse_int(argv[index])!
+        elif flag == "-expect-no-hrr":
+            # this stack never sends or accepts a HelloRetryRequest, so the
+            # expectation holds by construction.
+            resume_count = resume_count
+        elif flag == "-shim-writes-first":
+            writes_first = true
+        elif flag == "-shim-shuts-down":
+            shuts_down = true
+        else:
+            unimplemented(flag)
+        index = index + 1
+
+    # versions arrive as wire values; this stack speaks exactly 771 and 772.
+    if min_version != 0 and min_version != 771 and min_version != 772:
+        unimplemented("-min-version " + min_version.to_string())
+    if max_version != 0 and max_version != 771 and max_version != 772:
+        unimplemented("-max-version " + max_version.to_string())
+
+    mut host := "127.0.0.1"
+    if ipv6:
+        host = "::1"
+
+    if is_server:
+        if cert_file == "" or key_file == "":
+            unimplemented("-server without credentials")
+        mut cfg := tls.server_config(cert_file, key_file) catch:
+            fail_test("server config failed")
+            return 1
+        cfg = cfg.enable_session_resumption()
+        if min_version == 772:
+            cfg = cfg.require_tls13()
+        if max_version == 771:
+            # a 1.2-capped server is not a supported configuration.
+            unimplemented("-max-version 771 (server)")
+        # the listener exists to hold the config; the runner owns the socket.
+        mut listener := tls.Listener(0 - 1)
+        mut bound := false
+        mut probe := 39000
+        while not bound and probe < 39060:
+            attempt := tls.listen("127.0.0.1", probe, cfg)
+            if attempt.is_ok:
+                listener = attempt.ok
+                bound = true
+            probe = probe + 1
+        if not bound:
+            fail_test("no local port for config listener")
+        mut round := 0
+        while round <= resume_count:
+            stream := io.connect(host, port) catch:
+                fail_test("connect failed")
+                return 1
+            tcp.write_all_bytes(stream.fd, shim_id_bytes(shim_id)!) catch:
+                fail_test("shim id write failed")
+                return 1
+            conn := listener.handshake(stream.fd)!
+            if expect_version != 0 and conn.version() != expect_version:
+                fail_test("wrong version negotiated")
+            exchange(conn, writes_first, shuts_down)
+            round = round + 1
+        return 0
+
+    mut cfg := tls.client_config() catch:
+        fail_test("client config failed")
+        return 1
+    if trust_cert != "":
+        cfg.close()
+        cfg = tls.client_config_with_ca_file(trust_cert) catch:
+            fail_test("trust cert load failed")
+            return 1
+    else:
+        # the runner generates fresh certificates per run; without a supplied
+        # anchor the reference shims run unverified, and so does this one.
+        cfg = cfg.dangerously_skip_verification()
+    cfg = cfg.enable_session_resumption()
+    if min_version == 772:
+        cfg = cfg.require_tls13()
+    if max_version == 771:
+        cfg = cfg.require_tls12()
+    mut round := 0
+    while round <= resume_count:
+        stream := io.connect(host, port) catch:
+            fail_test("connect failed")
+            return 1
+        tcp.write_all_bytes(stream.fd, shim_id_bytes(shim_id)!) catch:
+            fail_test("shim id write failed")
+            return 1
+        # the runner's generated leaf certificates carry a "test" SAN.
+        conn := tls.client(stream, "test", cfg)!
+        if expect_version != 0 and conn.version() != expect_version:
+            fail_test("wrong version negotiated")
+        exchange(conn, writes_first, shuts_down)
+        round = round + 1
+    return 0

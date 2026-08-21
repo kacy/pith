@@ -1,0 +1,62 @@
+# TLS 1.2 handshake, exercised pith-to-pith via a client capped at 1.2
+# (require_tls12). Two pith peers otherwise always agree on 1.3, so without this
+# cap the whole 1.2 client and server — where every recent auth/robustness bug
+# lived — had no CI gate. Each case asserts a pure outcome.
+
+import std.net.tls as tls
+
+RSA_CERT := "tests/live/fixtures/localhost.crt"
+RSA_KEY := "tests/live/fixtures/localhost.key"
+RSA_CA := "tests/live/fixtures/localhost-ca.crt"
+EC_CERT := "tests/live/fixtures/localhost-ecdsa.crt"
+EC_KEY := "tests/live/fixtures/localhost-ecdsa.key"
+EC_CA := "tests/live/fixtures/localhost-ecdsa-ca.crt"
+
+fn reject_hook(state: tls.ConnectionState) -> String:
+    return "rejected by policy"
+
+fn echo_serve(listener: tls.Listener):
+    r := listener.accept()
+    if r.is_err:
+        return
+    conn := r.ok
+    msg := conn.read(64) catch ""
+    conn.write_all("echo:" + msg) catch 0
+    conn.close()
+
+# a case: stand up a server config, dial it with a 1.2-capped client, report.
+fn run_case(label: String, port: Int, server_cfg: tls.Config, client_cfg: tls.Config):
+    listener_r := tls.listen("127.0.0.1", port, server_cfg)
+    if listener_r.is_err:
+        print(label + ": listen-error")
+        return
+    listener := listener_r.ok
+    spawn echo_serve(listener)
+    r := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)
+    if r.is_err:
+        print(label + ": refused")
+    else:
+        conn := r.ok
+        wrote := conn.write_all("hi")
+        mut echoed := ""
+        if wrote.is_ok:
+            echoed = conn.read(64) catch ""
+        print(label + ": " + conn.version_name() + " " + conn.cipher_suite_name() + " " + (echoed == "echo:hi").to_string())
+        conn.close()
+    listener.close()
+    server_cfg.close()
+    client_cfg.close()
+
+fn main() -> Int!:
+    # 1: a 1.2-capped client and a normal server negotiate 1.2 and exchange data.
+    run_case("rsa", 50810, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
+    # 2: an ECDSA server serves an ECDHE-ECDSA suite over 1.2.
+    run_case("ecdsa", 50811, tls.server_config(EC_CERT, EC_KEY)!, tls.client_config_with_ca_file(EC_CA)!.require_tls12())
+    # 3: a server requiring client certs refuses the fallback (no mTLS bypass).
+    run_case("mtls-required", 50812, tls.server_config(RSA_CERT, RSA_KEY)!.require_client_ca_file(RSA_CA)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
+    # 4: a client-side verify-connection hook runs on the 1.2 path and rejects,
+    # failing the dial (proves the hook is not bypassed on the fallback).
+    run_case("verify-hook", 50813, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_verify_connection(reject_hook))
+    # 5: ALPN is negotiated over 1.2.
+    run_case("alpn", 50814, tls.server_config(RSA_CERT, RSA_KEY)!.with_alpn(["h2"]), tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_alpn(["h2"]))
+    return 0

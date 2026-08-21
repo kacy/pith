@@ -218,11 +218,16 @@ mut native_client_session_cache_order: List[String] := []
 # back into the locking wrappers.
 mut native_session_mu := Mutex()
 
-# reusable tls configuration.
+# A reusable TLS configuration (roots, certificates, ALPN, verification hooks).
+# A config is a handle into a registry; build it, hand it to dial/listen as many
+# times as you like, and close it when done — see Config.close for the timing.
 pub struct Config:
     pub handle: Int
 
-# a tls connection.
+# An established TLS connection. It is a handle, cheap to copy, and safe to share
+# across tasks under one contract: at most one reader and one writer at a time
+# (the two directions run concurrently). read_bytes/write_bytes below carry the
+# per-call details.
 pub struct Conn:
     pub handle: Int
 
@@ -1805,6 +1810,9 @@ pub fn client_config_with_ca_file(path: String) -> Config!:
     return native_config_handle(read_file(path)!)
 
 # create a server config from pem certificate and private key files.
+# Build a server config from a PEM certificate chain and its private key. The
+# key must be a PKCS#8 "PRIVATE KEY" PEM; RSA (>=2048-bit) and ECDSA (P-256)
+# certificates are both supported. The chain is leaf-first.
 pub fn server_config(cert_path: String, key_path: String) -> Config!:
     return native_server_config_handle(read_file(cert_path)!, read_file(key_path)!)
 
@@ -1841,7 +1849,9 @@ pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
 pub fn conn_from_handle(handle: Int) -> Conn:
     return Conn(handle)
 
-# listen for tls connections.
+# Listen for TLS connections on host:port. The listener borrows `config` rather
+# than taking ownership — close the config only after the listener and its
+# in-flight handshakes are done (see Config.close for why the timing matters).
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:
     if is_native_server_config(config):
         fd := tcp_listen(host, port)!
@@ -2120,6 +2130,10 @@ impl Conn:
     fn client_auth_verified() -> Bool:
         return self.state().client_auth_verified
 
+    # Read and decrypt up to `max_bytes` of application data. An empty result
+    # means the peer closed the session cleanly (it sent close_notify); a
+    # non-clean close or a protocol error fails instead. Post-handshake records
+    # (session tickets, key updates) are processed transparently.
     fn read_bytes(max_bytes: Int) -> Bytes!:
         if is_native_conn(self.handle):
             return native_conn_read_bytes(self.handle, max_bytes)
@@ -2128,6 +2142,9 @@ impl Conn:
     fn read(max_bytes: Int) -> String!:
         return self.read_bytes(max_bytes)!.to_string_utf8()!
 
+    # Encrypt and write at most one TLS record (up to 16 KB) from `data`,
+    # returning the number of bytes consumed. A caller with more than one
+    # record's worth to send should use write_all_bytes, which loops.
     fn write_bytes(data: Bytes) -> Int!:
         if is_native_conn(self.handle):
             return native_conn_write_bytes(self.handle, data)

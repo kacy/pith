@@ -382,16 +382,23 @@ pub fn parse_server_hello(body: Bytes) -> Tls12ServerHello!:
         ext_total := checked_read(binary.read_u16_be(r))!
         ext_data := checked_bytes(binary.read_bytes(r, ext_total))!
         er := binary.reader(ext_data)
+        mut seen_extensions: List[Int] := []
         while binary.remaining(er) > 0:
             ext_type := checked_read(binary.read_u16_be(er))!
             ext_len := checked_read(binary.read_u16_be(er))!
             ext_value := checked_bytes(binary.read_bytes(er, ext_len))!
+            # at most one extension of a given type per hello (rfc 5246 §7.4.1.4).
+            if seen_extensions.contains(ext_type):
+                fail "duplicate tls 1.2 server hello extension"
+            seen_extensions.push(ext_type)
             if ext_type == EXT_EXTENDED_MASTER_SECRET:
                 ems = true
             elif ext_type == EXT_RENEGOTIATION_INFO:
                 reneg = ext_value
             elif ext_type == EXT_ALPN:
                 alpn = first_alpn_protocol(ext_value)!
+    if binary.remaining(r) != 0:
+        fail "trailing tls 1.2 server hello bytes"
     return Tls12ServerHello(version, random, session_id, cipher, ems, reneg, alpn)
 
 # The first protocol name from an ALPN extension value (a u16-prefixed list of
@@ -432,6 +439,8 @@ pub fn parse_server_key_exchange(body: Bytes) -> Tls12ServerKeyExchange!:
     signature_scheme := checked_read(binary.read_u16_be(r))!
     signature_len := checked_read(binary.read_u16_be(r))!
     signature := checked_bytes(binary.read_bytes(r, signature_len))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls 1.2 server key exchange bytes"
     return Tls12ServerKeyExchange(named_curve, public_point, signature_scheme, signature, signed_params)
 
 # The signed ECParameters portion of a ServerKeyExchange: curve type (named),
@@ -518,7 +527,10 @@ pub fn encode_client_key_exchange(public_point: Bytes) -> Bytes!:
 pub fn parse_client_key_exchange(body: Bytes) -> Bytes!:
     r := binary.reader(body)
     point_len := checked_read(binary.read_u8(r))!
-    return checked_bytes(binary.read_bytes(r, point_len))!
+    point := checked_bytes(binary.read_bytes(r, point_len))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls 1.2 client key exchange bytes"
+    return point
 
 # Parse a 1.2 Certificate message body (a u24-prefixed list of u24-prefixed
 # certificates) into raw DER certificates, leaf first. Unlike 1.3 there is no
@@ -527,6 +539,8 @@ pub fn parse_certificate_message(body: Bytes) -> List[Bytes]!:
     r := binary.reader(body)
     total := checked_read(binary.read_u24_be(r))!
     list := checked_bytes(binary.read_bytes(r, total))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls 1.2 certificate bytes"
     lr := binary.reader(list)
     mut certs: List[Bytes] := []
     while binary.remaining(lr) > 0:

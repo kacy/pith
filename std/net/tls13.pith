@@ -1185,6 +1185,10 @@ pub fn encode_key_update(request_update: Bool) -> Bytes!:
 pub fn parse_key_update(body: Bytes) -> Bool!:
     if body.len() != 1:
         fail "malformed key update message"
+    # RFC 8446 §4.6.3: only 0 (update_not_requested) and 1 (update_requested)
+    # are defined; any other value is a fatal illegal_parameter.
+    if body[0] > 1:
+        fail "invalid key update request value"
     return body[0] == 1
 
 # the next-generation application traffic secret (RFC 8446 §7.2):
@@ -1202,8 +1206,11 @@ pub fn parse_new_session_ticket(body: Bytes) -> NewSessionTicketMessage!:
     ticket_len := checked_read(binary.read_u16_be(r))!
     ticket := checked_bytes(binary.read_bytes(r, ticket_len))!
     extension_len := checked_read(binary.read_u16_be(r))!
-    extensions := checked_bytes(binary.read_bytes(r, extension_len))!
-    if extensions.len() != 0 or binary.remaining(r) != 0:
+    # the extensions block (e.g. early_data) is read and discarded — RFC 8446
+    # §4.6.1 allows it and requires ignoring unknown ones. rejecting it here
+    # poisoned an otherwise-complete connection.
+    checked_bytes(binary.read_bytes(r, extension_len))!
+    if binary.remaining(r) != 0:
         fail "trailing tls new session ticket bytes"
     return NewSessionTicketMessage(lifetime, age_add, nonce, ticket)
 

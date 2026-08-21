@@ -4,7 +4,8 @@ pith's native tls stack lives in `std.net.tls` and `std.net.tls13`.
 
 the current shape is:
 - tls 1.3, with a tls 1.2 fallback (ecdhe + aead only)
-- client and server handshakes in pith
+- client and server handshakes in pith, in tls 1.3 middlebox-compatibility mode
+  (rfc 8446 appendix d.4: both ends emit the dummy change_cipher_spec)
 - alpn
 - strict and optional verified client auth
 - session tickets and client-side resumption

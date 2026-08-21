@@ -318,8 +318,13 @@ downgrade protection is built in: the client offers `supported_versions`
 {1.3, 1.2} plus extended master secret (rfc 7627) and renegotiation_info
 (rfc 5746); a 1.3-capable server that negotiates 1.2 marks its random with the
 rfc 8446 downgrade sentinel, and a 1.3-capable client that lands on 1.2 aborts
-if it sees that sentinel (an active attacker stripped the 1.3 offer). the
-client also requires the server to have negotiated extended master secret.
+if it sees that sentinel (an active attacker stripped the 1.3 offer). extended
+master secret is mandatory on both sides: the client requires the server to
+negotiate it, and the server refuses a 1.2 client that did not offer it rather
+than fall back to the weaker rfc 5246 master secret. the server echoes an
+extension only when the client asked for it — extended master secret when the
+client offered it, and renegotiation_info only when the client advertised
+secure renegotiation (the rfc 5746 extension or the SCSV cipher value).
 
 `require_tls13()` locks a config to tls 1.3, refusing the fallback — the
 equivalent of a minimum version of 1.3:

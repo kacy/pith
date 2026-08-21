@@ -932,6 +932,8 @@ pub struct LenientClientHello:
     pub supported_groups: List[Int]
     pub server_name: String
     pub alpn_protocols: List[String]
+    pub extended_master_secret: Bool
+    pub secure_renegotiation: Bool
 
 # Read a raw sequence of big-endian u16s that fills `data` exactly.
 fn parse_u16_sequence(data: Bytes) -> List[Int]!:
@@ -965,6 +967,8 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
     mut supported_groups: List[Int] := []
     mut server_name := ""
     mut alpn_protocols: List[String] := []
+    mut extended_master_secret := false
+    mut secure_renegotiation := false
     if binary.remaining(r) > 0:
         extension_len := checked_read(binary.read_u16_be(r))!
         extensions := checked_bytes(binary.read_bytes(r, extension_len))!
@@ -981,7 +985,11 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
                 server_name = parse_server_name_extension(data)!
             elif extension_type == EXT_ALPN:
                 alpn_protocols = parse_alpn_protocol_list(data)!
-    return LenientClientHello(random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols)
+            elif extension_type == EXT_EXTENDED_MASTER_SECRET:
+                extended_master_secret = true
+            elif extension_type == EXT_RENEGOTIATION_INFO:
+                secure_renegotiation = true
+    return LenientClientHello(random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols, extended_master_secret, secure_renegotiation)
 
 # The protocol version a server negotiated, read from a ServerHello body: the
 # supported_versions extension value when present (a 1.3 server always sends it),

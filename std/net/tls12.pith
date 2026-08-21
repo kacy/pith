@@ -346,6 +346,9 @@ CURVE_TYPE_NAMED := 3
 EXT_ALPN := 16
 EXT_EXTENDED_MASTER_SECRET := 23
 EXT_RENEGOTIATION_INFO := 65281
+# TLS_EMPTY_RENEGOTIATION_INFO_SCSV (rfc 5746): a client may signal secure
+# renegotiation support through this cipher-suite value instead of the extension.
+pub SCSV_EMPTY_RENEGOTIATION_INFO := 255
 
 # A parsed 1.2 ServerHello: the selected suite, the server random (checked for
 # the downgrade sentinel by the caller), and the security-relevant extensions.
@@ -463,16 +466,21 @@ pub fn apply_downgrade_sentinel(random: Bytes) -> Bytes!:
     return bytes.concat(bytes.slice(random, 0, 24), downgrade_sentinel_tls12())
 
 # Encode a 1.2 ServerHello body: version, random, session id, the selected
-# suite, null compression, and the extensions we always send — extended master
-# secret, an empty renegotiation_info, and ALPN when a protocol was selected.
-pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, alpn_protocol: String) -> Bytes!:
+# suite, null compression, and extensions — extended master secret always, an
+# empty renegotiation_info when the client advertised secure renegotiation, and
+# ALPN when a protocol was selected.
+pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, alpn_protocol: String, secure_renegotiation: Bool) -> Bytes!:
     ext := bytes.buffer()
     defer ext.free()
     checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
     checked_write(binary.write_u16_be(ext, 0))!
-    checked_write(binary.write_u16_be(ext, EXT_RENEGOTIATION_INFO))!
-    checked_write(binary.write_u16_be(ext, 1))!
-    checked_write(binary.write_u8(ext, 0))!
+    # renegotiation_info echoes back only when the client advertised secure
+    # renegotiation (rfc 5746 §3.6); sending it unsolicited is an unadvertised
+    # extension the client never asked for.
+    if secure_renegotiation:
+        checked_write(binary.write_u16_be(ext, EXT_RENEGOTIATION_INFO))!
+        checked_write(binary.write_u16_be(ext, 1))!
+        checked_write(binary.write_u8(ext, 0))!
     if alpn_protocol != "":
         name := bytes.from_string_utf8(alpn_protocol)
         checked_write(binary.write_u16_be(ext, EXT_ALPN))!
@@ -681,9 +689,13 @@ test "the server hello encodes the sentinel and round-trips its flags":
     random := apply_downgrade_sentinel(bytes.concat(base, encoding.from_hex("aabbccddeeff0011")!))!
     assert_eq(random.len(), 32)
     assert(has_downgrade_sentinel(random))
-    body := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2")!
+    body := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", true)!
     hello := parse_server_hello(body)!
     assert_eq(hello.cipher_suite, TLS12_ECDHE_RSA_AES128_GCM_SHA256)
     assert(hello.extended_master_secret)
+    assert_eq(hello.renegotiation_info.len(), 1)
     assert_eq(hello.alpn_protocol, "h2")
     assert(has_downgrade_sentinel(hello.random))
+    # a client that did not advertise secure renegotiation gets no such extension
+    quiet := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", false)!
+    assert_eq(parse_server_hello(quiet)!.renegotiation_info.len(), 0)

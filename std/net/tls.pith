@@ -1384,6 +1384,11 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
 # Certificate, ServerKeyExchange, ServerHelloDone; reads ClientKeyExchange,
 # ChangeCipherSpec, Finished; then sends its own ChangeCipherSpec and Finished.
 fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello_message: tls13.HandshakeMessage, lenient: tls13.LenientClientHello) -> Conn!:
+    # this fallback mandates extended master secret; a client that did not offer
+    # it is refused cleanly here rather than after the handshake at Finished, and
+    # the ServerHello never advertises an EMS extension the client did not send.
+    if not lenient.extended_master_secret:
+        fail "tls 1.2 client did not offer extended master secret"
     # select the certificate/config by server name first: the cert's key type
     # decides which suite family (ECDHE-RSA vs ECDHE-ECDSA) we can serve.
     handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols)!
@@ -1395,6 +1400,12 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     if curve == 0:
         fail "no supported tls 1.2 curve offered"
     selected_alpn := select_alpn_protocol(handshake_config, lenient.alpn_protocols)!
+    # rfc 5746 §3.6: echo renegotiation_info only when the client signalled secure
+    # renegotiation, via the extension or the SCSV cipher value.
+    mut secure_renegotiation := lenient.secure_renegotiation
+    for offered_suite in lenient.cipher_suites:
+        if offered_suite == tls12.SCSV_EMPTY_RENEGOTIATION_INFO:
+            secure_renegotiation = true
     client_random := lenient.random
     # a 1.3-capable server marks its random so a downgraded 1.3 client can tell.
     server_random := tls12.apply_downgrade_sentinel(random.bytes(32)!)!
@@ -1405,7 +1416,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
         keypair = ecdh.p256_keypair()!
     errdefer keypair.close()
 
-    server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, lenient.session_id, cipher, selected_alpn)!)!
+    server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, lenient.session_id, cipher, selected_alpn, secure_renegotiation)!)!
     certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!)!
     params := tls12.server_key_exchange_params(curve, keypair.public_key)!
     signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, params)

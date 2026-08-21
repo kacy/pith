@@ -1,0 +1,57 @@
+# TLS 1.3 session resumption interop against openssl s_server. The PSK binder is
+# a MAC over the truncated ClientHello *handshake message* (header included);
+# computing it over the bare body made openssl reject the binder, so resumption
+# with any non-pith peer failed. This dials openssl twice with resumption
+# enabled: the first is a full handshake that banks a ticket, the second must
+# resume. openssl is the oracle a pith-to-pith test cannot be — both pith ends
+# would agree on a wrong transcript.
+
+import std.net.tls as tls
+import std.os.process as process
+import std.time as time
+
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+PORT := 44460
+
+fn dial(cfg: tls.Config) -> String:
+    r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
+    if r.is_err:
+        return "dial-error"
+    conn := r.ok
+    wrote := conn.write_all("GET / HTTP/1.0\r\n\r\n")
+    mut body := ""
+    if wrote.is_ok:
+        body = conn.read(16) catch ""
+    resumed := conn.did_resume()
+    conn.close()
+    if body.len() == 0:
+        return "no-body"
+    if resumed:
+        return "resumed"
+    return "full"
+
+fn main() -> Int!:
+    server := process.command("openssl").arg("s_server").arg("-accept").arg(PORT.to_string()).arg("-cert").arg(CERT).arg("-key").arg(KEY).arg("-tls1_3").arg("-www").arg("-quiet").start()
+    if server.is_err:
+        print("first: openssl-unavailable")
+        print("second: openssl-unavailable")
+        return 0
+    proc := server.ok
+    cfg := tls.client_config_with_ca_file(CA)!.enable_session_resumption()
+    mut first := "no-connection"
+    mut attempt := 0
+    while attempt < 25 and first == "no-connection":
+        outcome := dial(cfg)
+        if outcome != "dial-error":
+            first = outcome
+        attempt = attempt + 1
+        time.delay(40)
+    print("first: " + first)
+    time.delay(200)
+    print("second: " + dial(cfg))
+    cfg.close()
+    proc.kill()
+    proc.wait()
+    return 0

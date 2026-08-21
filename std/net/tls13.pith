@@ -663,6 +663,20 @@ pub fn encode_client_hello_offering_tls12(server_name: String, random: Bytes, se
     write_bytes_if_any(body, extensions)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
 
+# The PSK binder is a MAC over the truncated ClientHello *handshake message* —
+# the 4-byte handshake header (type + full length) followed by the body up to
+# the binders — not the bare body (RFC 8446 §4.2.11.2). full_body_length is the
+# ClientHello body length including the 35-byte one-binder section that follows.
+# Both the client (building the hello) and the server (parsing it) must hash the
+# same bytes, so this is the one place that prepends the header.
+fn client_hello_binder_transcript(truncated_body: Bytes, full_body_length: Int) -> Bytes!:
+    out := bytes.buffer_with_capacity(truncated_body.len() + 4)
+    defer out.free()
+    write_u8(out, HANDSHAKE_CLIENT_HELLO)!
+    write_u24_be(out, full_body_length)!
+    write_bytes_if_any(out, truncated_body)!
+    return out.bytes()
+
 ## Encode the ClientHello prefix used when computing a PSK binder. The key
 ## share offer must match the real ClientHello exactly, so this takes the same
 ## p256_public_key.
@@ -685,7 +699,10 @@ pub fn client_hello_psk_binder_input(server_name: String, random: Bytes, session
     write_u8(body, 0)!
     write_u16_be(body, extensions.len() + 2 + 1 + 32)!
     write_bytes_if_any(body, extensions)!
-    return body.bytes()
+    truncated := body.bytes()
+    # the full body adds the 35-byte binders section (u16 list length + u8
+    # binder length + 32-byte binder) after this truncated prefix.
+    return client_hello_binder_transcript(truncated, truncated.len() + 35)
 
 fn parse_alpn_protocol_list(data: Bytes) -> List[String]!:
     mut protocols: List[String] := []
@@ -782,7 +799,7 @@ fn parse_client_psk_extension(body: Bytes, extension_body_start: Int, extension_
     binders_len_pos := extension_body_start + extension_offset + 4 + 2 + identity_len
     if binders_len_pos < 0 or binders_len_pos > body.len():
         fail "malformed tls psk binder input"
-    binder_input := body.slice(0, binders_len_pos)
+    binder_input := client_hello_binder_transcript(body.slice(0, binders_len_pos), body.len())!
     mut identity := bytes.empty()
     mut obfuscated_ticket_age := 0
     ir := binary.reader(identities)

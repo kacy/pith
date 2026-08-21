@@ -32,6 +32,7 @@ mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
 mut native_config_resumption_enabled: Map[Int, Bool] := {}
 mut native_config_require_tls13: Map[Int, Bool] := {}
+mut native_config_require_tls12: Map[Int, Bool] := {}
 mut native_client_cert_pem: Map[Int, String] := {}
 mut native_client_key_der: Map[Int, Bytes] := {}
 mut native_server_cert_pem: Map[Int, String] := {}
@@ -468,6 +469,11 @@ fn config_resumption_enabled(config: Config) -> Bool:
 # require_tls13() turns it off.
 fn config_offers_tls12(config: Config) -> Bool:
     return not config_get(native_config_require_tls13, config.handle, false)
+
+# true when this config offers only TLS 1.2 (a max-version cap: it will not offer
+# 1.3). require_tls12() sets it.
+fn config_max_is_tls12(config: Config) -> Bool:
+    return config_get(native_config_require_tls12, config.handle, false)
 
 fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
     cert_pem := config_get(native_client_cert_pem, config.handle, "")
@@ -997,8 +1003,12 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     # locked to 1.3. resumption is a 1.3-only path (a 1.2 ticket is never
     # cached), so its hello above stays 1.3-only.
     mut client_hello := bytes.empty()
-    if config_offers_tls12(config):
-        client_hello = tls13.encode_client_hello_offering_tls12(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, tls12.offered_suites())!
+    if config_max_is_tls12(config):
+        # offer only 1.2 (no 1.3): a max-version cap. a 1.2 server response is
+        # then expected rather than a downgrade.
+        client_hello = tls13.encode_client_hello_offering_tls12(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, tls12.offered_suites(), false)!
+    elif config_offers_tls12(config):
+        client_hello = tls13.encode_client_hello_offering_tls12(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, tls12.offered_suites(), true)!
     else:
         client_hello = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello)!)!
@@ -1049,12 +1059,15 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
 # `server_hello_message`) have already been exchanged; this drives the rest:
 # Certificate, ServerKeyExchange, ServerHelloDone → ClientKeyExchange,
 # ChangeCipherSpec, Finished → server ChangeCipherSpec, Finished.
-fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer) -> Conn!:
+fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
     hello := tls12.parse_server_hello(server_hello_message.body)!
     # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
     # not mark its random. the sentinel means a 1.3-capable server fell back to
     # 1.2 — our 1.3 offer was stripped by an active attacker.
-    if tls12.has_downgrade_sentinel(hello.random):
+    # a client that offered 1.3 and landed on 1.2 must reject the RFC 8446
+    # downgrade sentinel (our 1.3 offer was stripped). a client that offered only
+    # 1.2 never expected 1.3, so a marked random is legitimate there.
+    if offered_tls13 and tls12.has_downgrade_sentinel(hello.random):
         fail "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2"
     if not tls12.is_supported_suite(hello.cipher_suite):
         fail "server selected an unsupported tls 1.2 cipher suite"
@@ -1070,10 +1083,19 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
 
     # read the server's plaintext flight (Certificate, ServerKeyExchange,
     # ServerHelloDone), buffering so a message split across records still
-    # decodes, and record the exact bytes into the transcript.
+    # decodes, and record the exact bytes into the transcript. flight_prefix
+    # holds any flight bytes that arrived in the same record as the ServerHello
+    # (a peer that coalesces its whole flight into one record, as our own server
+    # does) — without seeding them the loop would block reading records that
+    # already came.
     flight := bytes.buffer()
     defer flight.free()
     mut have_done := false
+    if flight_prefix.len() > 0:
+        flight.write(flight_prefix)!
+        for message in tls13.decode_handshakes(flight.bytes()) catch []:
+            if message.message_type == tls12.TLS12_SERVER_HELLO_DONE:
+                have_done = true
     while not have_done:
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_ALERT:
@@ -1190,7 +1212,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     if negotiated == TLS_VERSION_12:
         if not config_offers_tls12(config):
             fail "server negotiated tls 1.2 but this config requires tls 1.3"
-        return native_client_handshake_tls12(stream, server_name, config, client_random, keypair, p256pair, server_messages[0], transcript_buf)
+        server_hello_encoded_len := 4 + server_messages[0].body.len()
+        mut server_flight_prefix := bytes.empty()
+        if first_record.payload.len() > server_hello_encoded_len:
+            server_flight_prefix = first_record.payload.slice(server_hello_encoded_len, first_record.payload.len())
+        return native_client_handshake_tls12(stream, server_name, config, client_random, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
     if negotiated != TLS_VERSION_13:
         fail "server negotiated an unsupported tls version"
     server_hello := tls13.parse_server_hello(server_messages[0].body)!
@@ -1989,6 +2015,14 @@ impl Config:
         config_put(native_config_require_tls13, self.handle, true)
         return self
 
+    # Restrict this client config to TLS 1.2 only — a maximum-version cap. The
+    # client offers only 1.2 (no 1.3), so it will not negotiate 1.3 even with a
+    # 1.3-capable server. This is the inverse of require_tls13(); the two are
+    # mutually exclusive and require_tls12 takes effect if both are set.
+    fn require_tls12() -> Config:
+        config_put(native_config_require_tls12, self.handle, true)
+        return self
+
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
         config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
         return self
@@ -2022,6 +2056,7 @@ impl Config:
         config_drop(native_config_alpn, self.handle)
         config_drop(native_config_resumption_enabled, self.handle)
         config_drop(native_config_require_tls13, self.handle)
+        config_drop(native_config_require_tls12, self.handle)
         config_drop(native_config_verify_connection, self.handle)
         config_drop(native_server_config_selector, self.handle)
         config_drop(native_client_cert_pem, self.handle)
@@ -2270,6 +2305,7 @@ test "closing a client config empties every registry map it wrote to":
     assert(not config_has(native_config_alpn, cfg.handle))
     assert(not config_has(native_config_resumption_enabled, cfg.handle))
     assert(not config_has(native_config_require_tls13, cfg.handle))
+    assert(not config_has(native_config_require_tls12, cfg.handle))
     assert(not config_has(native_config_verify_connection, cfg.handle))
     assert(not config_has(native_client_cert_pem, cfg.handle))
     assert(not config_has(native_client_key_der, cfg.handle))

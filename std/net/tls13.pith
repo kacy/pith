@@ -596,11 +596,16 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
 # The supported_versions extension offering both TLS 1.3 and 1.2, highest first,
 # for a combined ClientHello. The server picks the highest it supports.
 fn supported_versions_client_extension_both() -> Bytes!:
-    data := bytes.buffer_with_capacity(5)
+    return supported_versions_client_extension_list([TLS13_VERSION, TLS_LEGACY_VERSION])!
+
+# a supported_versions client extension listing exactly `versions`, highest
+# first. Used to offer {1.3, 1.2} for the fallback or {1.2} for a max-version cap.
+fn supported_versions_client_extension_list(versions: List[Int]) -> Bytes!:
+    data := bytes.buffer_with_capacity(1 + versions.len() * 2)
     defer data.free()
-    write_u8(data, 4)!
-    write_u16_be(data, TLS13_VERSION)!
-    write_u16_be(data, TLS_LEGACY_VERSION)!
+    write_u8(data, versions.len() * 2)!
+    for version in versions:
+        write_u16_be(data, version)!
     return extension_record(EXT_SUPPORTED_VERSIONS, data.bytes())
 
 # An empty extended_master_secret extension (rfc 7627): a bare flag.
@@ -618,7 +623,7 @@ fn renegotiation_info_extension() -> Bytes!:
 # The ClientHello extensions for a combined 1.2+1.3 offer: the common set, but
 # with supported_versions offering both and the two 1.2-fallback extensions
 # added. No PSK — resumption is a 1.3-only path that never offers 1.2.
-fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String]) -> Bytes!:
+fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], offer_tls13: Bool) -> Bytes!:
     if x25519_public_key.len() != 32:
         fail "x25519 public key must be 32 bytes"
     if p256_public_key.len() != 0 and p256_public_key.len() != 65:
@@ -626,11 +631,14 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
     mut groups := [GROUP_X25519]
     if p256_public_key.len() > 0:
         groups.push(GROUP_SECP256R1)
+    mut versions := [TLS13_VERSION, TLS_LEGACY_VERSION]
+    if not offer_tls13:
+        versions = [TLS_LEGACY_VERSION]
     out := bytes.buffer()
     defer out.free()
     write_bytes_if_any(out, server_name_extension(server_name)!)!
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
-    write_bytes_if_any(out, supported_versions_client_extension_both()!)!
+    write_bytes_if_any(out, supported_versions_client_extension_list(versions)!)!
     write_bytes_if_any(out, supported_groups_extension(groups)!)!
     write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
     write_bytes_if_any(out, extended_master_secret_extension()!)!
@@ -641,13 +649,15 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
 # Encode a ClientHello that offers TLS 1.3 and, as a fallback, the TLS 1.2 suites
 # in `tls12_suites`. The 1.3 suites lead the cipher list so a 1.3 server still
 # prefers 1.3; a 1.2-only server picks a fallback suite. Never carries a PSK.
-pub fn encode_client_hello_offering_tls12(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], tls12_suites: List[Int]) -> Bytes!:
+pub fn encode_client_hello_offering_tls12(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], tls12_suites: List[Int], offer_tls13: Bool) -> Bytes!:
     if random.len() != 32:
         fail "tls client random must be 32 bytes"
     if session_id.len() > 32:
         fail "tls session id too long"
-    extensions := client_extensions_offering_tls12(server_name, x25519_public_key, p256_public_key, alpn_protocols)!
-    mut suites := [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_CHACHA20_POLY1305_SHA256]
+    extensions := client_extensions_offering_tls12(server_name, x25519_public_key, p256_public_key, alpn_protocols, offer_tls13)!
+    mut suites: List[Int] := []
+    if offer_tls13:
+        suites = [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_CHACHA20_POLY1305_SHA256]
     for suite in tls12_suites:
         suites.push(suite)
     body := bytes.buffer()

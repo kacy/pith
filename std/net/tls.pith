@@ -159,6 +159,7 @@ OID_EC_PUBLIC_KEY := "1.2.840.10045.2.1"
 TLS_GROUP_X25519 := 29
 TLS_GROUP_SECP256R1 := 23
 TLS_MAX_PLAINTEXT_RECORD := 16384
+TLS_MAX_HANDSHAKE_FLIGHT := 65536
 TLS_SESSION_TICKET_LIFETIME := 86400
 TLS_MAX_SERVER_SESSION_TICKETS := 64
 TLS_MAX_CLIENT_SESSION_CACHE := 32
@@ -962,8 +963,14 @@ fn native_fail_alert(record: tls13.Record) -> Bool!:
     fail "tls alert"
 
 fn native_client_handshake(stream: TcpStream, server_name: String, config: Config) -> Conn!:
+    # on any handshake failure, close the socket and the ephemeral keys rather
+    # than leaking an fd and two registry slots per failed dial. close() is
+    # idempotent, so the success-path close in the continuations is harmless.
+    errdefer tcp_close(stream.fd)
     keypair := ecdh.x25519_keypair()!
+    errdefer keypair.close()
     p256pair := ecdh.p256_keypair()!
+    errdefer p256pair.close()
     client_random := random.bytes(32)!
     session_id := random.bytes(32)!
     alpn_protocols := config_alpn_protocols(config)
@@ -1031,6 +1038,11 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         if record.content_type != TLS_CONTENT_HANDSHAKE:
             fail "expected a tls 1.2 handshake record"
         flight.write(record.payload)!
+        # a legitimate server flight (certificate chain and key exchange) is far
+        # under this; the cap stops a malicious server from growing the buffer
+        # without ever sending ServerHelloDone.
+        if flight.len() > TLS_MAX_HANDSHAKE_FLIGHT:
+            fail "tls 1.2 server handshake flight is too large"
         for message in tls13.decode_handshakes(flight.bytes()) catch []:
             if message.message_type == tls12.TLS12_SERVER_HELLO_DONE:
                 have_done = true
@@ -1122,8 +1134,14 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     if not subtle.equal(expected_finished, finished_messages[0].body):
         fail "tls 1.2 server finished verification failed"
 
+    # the server must not name an ALPN protocol we did not offer.
+    if hello.alpn_protocol != "" and not config_alpn_protocols(config).contains(hello.alpn_protocol):
+        fail "tls 1.2 server negotiated an unoffered alpn protocol"
     peer := peer_identity_from_certificates(certs)
     state := connection_state_from_peer(TLS_VERSION_12, cipher, hello.alpn_protocol, false, peer, false, false)
+    # the connection-verification hook runs on the 1.2 path too, so pinning and
+    # policy checks a caller installed apply regardless of the negotiated version.
+    run_verify_connection_hook(config, state)!
     server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
     client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
     # a fresh cipher epoch starts at sequence 0 for the Finished, so the first
@@ -1340,6 +1358,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     if curve == tls12.NAMED_CURVE_SECP256R1:
         keypair.close()
         keypair = ecdh.p256_keypair()!
+    errdefer keypair.close()
 
     server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, lenient.session_id, cipher, selected_alpn)!)!
     certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!)!
@@ -1417,6 +1436,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
 
     peer := empty_peer_identity()
     state := connection_state_from_peer(TLS_VERSION_12, cipher, selected_alpn, false, peer, false, false)
+    run_verify_connection_hook(handshake_config, state)!
     client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
     server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
     return allocate_native_conn(stream, TLS_VERSION_12, cipher, client_keys, server_keys, 1, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
@@ -1436,7 +1456,12 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # path, whose parser is stricter.
     lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body)!
     if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
-        if config_offers_tls12(config) and select_tls12_suite(lenient_hello.cipher_suites, server_key_is_ecdsa(config) catch false) != 0:
+        # the 1.2 fallback does not implement client-certificate authentication,
+        # so a config that requests or requires it must never drop to a path
+        # that ignores it — that would authenticate nobody. such a client falls
+        # through to the strict 1.3 parser below, which rejects a 1.2-only hello.
+        wants_client_auth := config_requires_client_certificate(config) or config_requests_client_certificate(config)
+        if config_offers_tls12(config) and not wants_client_auth and select_tls12_suite(lenient_hello.cipher_suites, server_key_is_ecdsa(config) catch false) != 0:
             return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
     client_hello := tls13.parse_client_hello(client_messages[0].body)!
     handshake_config := select_server_config(config, client_hello)!
@@ -1447,6 +1472,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     did_resume := resumption.did_resume
 
     keypair := ecdh.x25519_keypair()!
+    errdefer keypair.close()
     server_random := random.bytes(32)!
     server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, selected_psk_identity(did_resume))!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
@@ -1647,6 +1673,11 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
+            # a zero-length application record is legal (padding / traffic
+            # shaping); skip it rather than returning empty, which the caller
+            # reads as a clean close_notify end-of-stream.
+            if payload.len() == 0:
+                continue
             if payload.len() > size:
                 cs.pending = payload.slice(size, payload.len())
                 return payload.slice(0, size)

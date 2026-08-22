@@ -286,6 +286,14 @@ than one record's plaintext ceiling — a certificate chain past 2^14 bytes,
 say — split on the wire, and messages a peer fragments (to any size, down to
 one byte per record) reassemble on read, during the handshake and after it.
 
+HelloRetryRequest (rfc 8446 §4.1.4) works on both sides. the client honors a
+cookie retry — echoing the cookie in a second hello and rebuilding the
+transcript over the synthetic message_hash — and refuses a retry that changes
+nothing, duplicates an extension, or arrives twice. the server sends a retry
+when a client advertises a group it can serve but offers no usable key share,
+and verifies a resumption binder in the second hello over the retry
+transcript.
+
 ecdhe key exchange uses x25519 or nist p-256 (secp256r1) on both 1.3 and the
 1.2 fallback. the client offers both and prefers x25519; the server keys with
 whichever group the client sent a share for, so a client restricted to p-256
@@ -393,9 +401,12 @@ openssl/go/rustls interop gates:
   against a pith shim (`tests/interop/bogo/`). unknown runner flags make the
   shim exit 89, which the runner counts as unimplemented and skips;
   `tests/interop/bogo/config.json` disables the cases this stack refuses by
-  design (static rsa, tls 1.2 resumption) with a reason for each. it is a
-  workbench rather than a ci gate: the checkout is large, and the interesting
-  output is the failure list.
+  design (static rsa, tls 1.2 resumption) with a reason for each.
+- `make tls-bogo-gate BOGO=...` turns the same run into a gate: any failure
+  not in `tests/interop/bogo/known_failures.txt` fails it, and baseline
+  entries that now pass are listed for pruning. ci runs the gate nightly
+  against a pinned boringssl checkout (`.github/workflows/bogo.yml`); the
+  per-build pipeline keeps the lighter interop and live-tls gates.
 - tlsfuzzer runs ad hoc against a live pith server; the version-negotiation,
   legacy-version, conversation, and record-padding suites pass with flags
   matching this stack's documented cipher policy.

@@ -892,28 +892,42 @@ fn parse_client_key_share(data: Bytes) -> ClientKeyShareExtension!:
     r := binary.reader(data)
     list_len := checked_read(binary.read_u16_be(r))!
     list := checked_bytes(binary.read_bytes(r, list_len))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls key share bytes"
     kr := binary.reader(list)
-    # clients may offer several key shares. prefer the groups this stack can
-    # key with — x25519 first, then p-256 — and only fall back to reporting the
-    # first unknown entry (for the caller's error path) when no usable share
-    # exists; a client offering, say, secp384r1 ahead of secp256r1 must get the
-    # p-256 exchange rather than a refusal for the group it listed first.
+    # clients may offer several key shares — at most one per group (rfc 8446
+    # §4.2.8). the whole list is walked so duplicates are seen even when an
+    # early entry already decides the exchange; preference is x25519, then
+    # p-256, then p-384, with the first entry kept as a fallback so the
+    # caller's error path can name the group a client offered alone.
     mut fallback := ClientKeyShareExtension(0, bytes.empty())
+    mut x25519 := ClientKeyShareExtension(0, bytes.empty())
     mut p256 := ClientKeyShareExtension(0, bytes.empty())
+    mut p384 := ClientKeyShareExtension(0, bytes.empty())
+    mut seen_groups: List[Int] := []
     mut seen := false
     while binary.remaining(kr) > 0:
         group := checked_read(binary.read_u16_be(kr))!
         key_len := checked_read(binary.read_u16_be(kr))!
         key := checked_bytes(binary.read_bytes(kr, key_len))!
+        if seen_groups.contains(group):
+            fail "duplicate tls key share group"
+        seen_groups.push(group)
         if group == GROUP_X25519:
-            return ClientKeyShareExtension(group, key)
-        if group == GROUP_SECP256R1 and p256.group == 0:
+            x25519 = ClientKeyShareExtension(group, key)
+        if group == GROUP_SECP256R1:
             p256 = ClientKeyShareExtension(group, key)
+        if group == GROUP_SECP384R1:
+            p384 = ClientKeyShareExtension(group, key)
         if not seen:
             fallback = ClientKeyShareExtension(group, key)
             seen = true
+    if x25519.group == GROUP_X25519:
+        return x25519
     if p256.group == GROUP_SECP256R1:
         return p256
+    if p384.group == GROUP_SECP384R1:
+        return p384
     return fallback
 
 fn parse_signature_scheme_list(data: Bytes) -> List[Int]!:
@@ -1381,7 +1395,18 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
     cipher_len := checked_read(binary.read_u16_be(r))!
     cipher_suites := parse_u16_sequence(checked_bytes(binary.read_bytes(r, cipher_len))!)!
     compression_len := checked_read(binary.read_u8(r))!
-    checked_bytes(binary.read_bytes(r, compression_len))!
+    compression := checked_bytes(binary.read_bytes(r, compression_len))!
+    # rfc 5246 §7.4.1.2 / rfc 8446 §4.1.2: the compression list must include
+    # null — whichever version is negotiated, null is the one this stack
+    # speaks.
+    mut has_null_compression := false
+    mut ci := 0
+    while ci < compression.len():
+        if compression[ci] == 0:
+            has_null_compression = true
+        ci = ci + 1
+    if not has_null_compression:
+        fail "tls client hello compression must include null"
     mut supported_versions: List[Int] := []
     mut supported_groups: List[Int] := []
     mut server_name := ""

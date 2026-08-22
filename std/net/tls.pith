@@ -2133,12 +2133,25 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     if not lenient_hello.key_share_present:
         send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
         fail "tls client hello is missing a key share"
-    client_hello := tls13.parse_client_hello(client_messages[0].body) catch:
-        # the lenient parse and version checks above already passed, so what
-        # remains wrong here is a parameter: a key share in a group this stack
-        # does not serve, a malformed psk offer, a non-null compression.
+    parsed_client_hello := tls13.parse_client_hello(client_messages[0].body)
+    if parsed_client_hello.is_err:
+        # the lenient parse and version checks above already passed. a psk
+        # offer lacking its companion modes extension has its own alert
+        # (rfc 8446 §4.2.9); what else remains wrong is a parameter — a key
+        # share in a group this stack does not serve, a malformed psk offer,
+        # a non-null compression.
+        if parsed_client_hello.err == "tls psk offered without key exchange modes":
+            send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+            fail "tls psk offered without key exchange modes"
+        if parsed_client_hello.err == "tls psk offer has no binders":
+            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+            fail "tls psk offer has no binders"
+        if parsed_client_hello.err == "tls psk binder has an invalid length":
+            send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
+            fail "tls psk binder failed verification"
         send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
         fail "unsupported tls client hello"
+    client_hello := parsed_client_hello.ok
     handshake_config := select_server_config(config, client_hello) catch:
         send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
         fail "no server configuration for this client hello"
@@ -2341,7 +2354,11 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "excess data after tls client finished"
 
-    initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
+    # rfc 8446 §4.6.1: a ticket is only useful to a client that offered the
+    # psk_dhe_ke mode; one that did not gets none.
+    mut initial_write_seq := 0
+    if client_hello.psk_mode_dhe:
+        initial_write_seq = send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
     state := connection_state_from_peer(TLS_VERSION_13, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state, client_app_secret, server_app_secret)
@@ -2528,7 +2545,14 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                         send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                         fail "malformed tls key update"
                 else:
-                    remember_client_ticket_from_message(handle, cipher, message) catch:
+                    remembered := remember_client_ticket_from_message(handle, cipher, message)
+                    if remembered.is_err:
+                        # a structurally broken ticket is a decode error; one
+                        # whose flags are duplicated or padded is a bad
+                        # parameter.
+                        if remembered.err == "tls ticket flags are not minimally encoded" or remembered.err == "duplicate tls new session ticket extension":
+                            send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
+                            fail "invalid tls session ticket"
                         send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                         fail "malformed tls session ticket"
             continue

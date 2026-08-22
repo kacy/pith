@@ -359,6 +359,26 @@ CURVE_TYPE_NAMED := 3
 # extension type ids that appear in a 1.2 ServerHello.
 pub EXT_SERVER_NAME := 0
 pub EXT_EC_POINT_FORMATS := 11
+
+# Validate an ec_point_formats extension (rfc 8422 §5.1.2): a u8-prefixed
+# format list that fills the data exactly and includes uncompressed (0) —
+# every implementation must support uncompressed, so a list without it can
+# never interoperate.
+pub fn validate_ec_point_formats(data: Bytes) -> Bool!:
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u8(r))!
+    formats := checked_bytes(binary.read_bytes(r, list_len))!
+    if binary.remaining(r) != 0 or formats.len() == 0:
+        fail "malformed tls ec point formats"
+    mut has_uncompressed := false
+    mut i := 0
+    while i < formats.len():
+        if formats[i] == 0:
+            has_uncompressed = true
+        i = i + 1
+    if not has_uncompressed:
+        fail "tls ec point formats omit uncompressed"
+    return true
 pub EXT_ALPN := 16
 pub EXT_EXTENDED_MASTER_SECRET := 23
 pub EXT_RENEGOTIATION_INFO := 65281
@@ -436,7 +456,9 @@ pub fn parse_server_hello(body: Bytes) -> Tls12ServerHello!:
             if seen_extensions.contains(ext_type):
                 fail "duplicate tls 1.2 server hello extension"
             seen_extensions.push(ext_type)
-            if ext_type == EXT_EXTENDED_MASTER_SECRET:
+            if ext_type == EXT_EC_POINT_FORMATS:
+                validate_ec_point_formats(ext_value)!
+            elif ext_type == EXT_EXTENDED_MASTER_SECRET:
                 ems = true
             elif ext_type == EXT_RENEGOTIATION_INFO:
                 reneg = ext_value

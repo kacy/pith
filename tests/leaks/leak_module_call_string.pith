@@ -1,0 +1,23 @@
+# a module-qualified call returning a fresh string — `mod.helper(...)` — is a
+# user function call that parses as a method call. the ownership classifier's
+# method-call branch fell through to the builtin fresh-name list for it, called
+# the result borrowed, and the call site retained a count nobody released: one
+# leaked string per call. url.decode put two of these on every http request
+# (#899), which is how it surfaced. the local module and the std module are
+# both churned here, so the case fails whichever resolution path regresses.
+import leakprobe as probe
+import std.net.url as url
+
+fn churn_round(i: Int):
+    decoded := url.decode("alpha%20{i}+beta")
+    bound := probe.fresh_string(i)
+    probe.fresh_string(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

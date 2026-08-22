@@ -250,5 +250,8 @@ without wiring anything up.
 
 the drivers themselves — `std.postgres` and `std.mysql` — remain available for
 lower-level work: raw connections, prepared statements you manage by hand, and
-the simple-vs-extended protocol choice. `std.db` is the path most applications
-want; reach for the driver directly when you need the control.
+the simple-vs-extended protocol choice. tls to the database also lives here —
+`std.postgres.connect_tls` and `std.mysql.connect_tls` take a `tls.Config` and a
+server name, and `std.db` has no tls path of its own. `std.db` is the path most
+applications want; reach for the driver directly when you need an encrypted
+connection or the extra control.

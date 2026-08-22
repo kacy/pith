@@ -2,7 +2,7 @@
 
 pith speaks grpc end to end, in pure pith: no C, no tokio, no rustls. you write a
 `.proto`, run one codegen step, and get typed messages, a typed client, and a
-typed server. http/2, tls 1.3, hpack, and flow control are all handled underneath.
+typed server. http/2, tls (1.2 and 1.3), hpack, and flow control are all handled underneath.
 
 there's one idea worth holding onto: **codegen owns the wire; you own the
 handlers.** protogen turns a `.proto` into messages, their encoders and decoders,
@@ -229,7 +229,7 @@ status code and message — the same `NOT_FOUND` your handler raised arrives her
 serve over tls with a cert and key; dial with a tls config that offers alpn `h2`:
 
 ```pith
-grpc.serve_Catalog_tls("0.0.0.0", 443, "server.crt", "server.key", get_product, search)!
+cat.serve_Catalog_tls("0.0.0.0", 443, "server.crt", "server.key", get_product, search)!
 ```
 ```pith
 cfg := tls.client_config_with_ca_file("ca.crt")!.with_alpn(["h2"])

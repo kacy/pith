@@ -76,8 +76,9 @@ pub struct Certificate:
     # every listed purpose object identifier.
     pub has_eku: Bool
     pub eku_oids: List[String]
-    # dnsname name-constraints copied from this certificate when it is a ca.
-    # empty lists mean the certificate constrains no dnsnames.
+    # dnsname name-constraints copied from this certificate when it is a ca
+    # (the iPAddress pair is below). empty lists mean the certificate
+    # constrains no dnsnames.
     pub permitted_dns: List[String]
     pub excluded_dns: List[String]
     # keyUsage: has_key_usage is false when the extension is absent (rfc 5280
@@ -93,6 +94,12 @@ pub struct Certificate:
     # this one on a valid path.
     pub has_path_len: Bool
     pub path_len: Int
+    # dnsname and iPAddress name-constraints copied from this certificate when
+    # it is a ca. an iPAddress subtree base is the network address followed by
+    # the netmask (8 bytes for ipv4, 32 for ipv6); empty lists constrain
+    # nothing of that name type (rfc 5280 §4.2.1.10).
+    pub permitted_ip: List[Bytes]
+    pub excluded_ip: List[Bytes]
 
 # result from native certificate verification preflight.
 pub struct VerificationResult:
@@ -335,7 +342,22 @@ fn collect_dns_subtrees(inner: Bytes, subtrees: DerValue, out: List[String]) -> 
         pos = subtree.next
     return true
 
-fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List[String], excluded_dns: List[String]) -> Bool!:
+# collect the iPAddress subtree bases (network ++ netmask) from a GeneralSubtrees
+# sequence. only 8-byte (ipv4) and 32-byte (ipv6) bases are kept; anything else
+# is a malformed constraint and is skipped rather than trusted.
+fn collect_ip_subtrees(inner: Bytes, subtrees: DerValue, out: List[Bytes]) -> Bool!:
+    mut pos := subtrees.value_start
+    while pos < subtrees.value_end:
+        subtree := expect_tag(inner, pos, TAG_SEQUENCE)!
+        base := read_value(inner, subtree.value_start)!
+        if base.tag == TAG_IP_ADDRESS:
+            body := value_bytes(inner, base)
+            if body.len() == 8 or body.len() == 32:
+                out.push(body)
+        pos = subtree.next
+    return true
+
+fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List[String], excluded_dns: List[String], permitted_ip: List[Bytes], excluded_ip: List[Bytes]) -> Bool!:
     inner := value_bytes(data, extn_value)
     constraints := expect_tag(inner, 0, TAG_SEQUENCE)!
     mut pos := constraints.value_start
@@ -343,8 +365,10 @@ fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List
         field := read_value(inner, pos)!
         if field.tag == TAG_PERMITTED_SUBTREES:
             collect_dns_subtrees(inner, field, permitted_dns)!
+            collect_ip_subtrees(inner, field, permitted_ip)!
         elif field.tag == TAG_EXCLUDED_SUBTREES:
             collect_dns_subtrees(inner, field, excluded_dns)!
+            collect_ip_subtrees(inner, field, excluded_ip)!
         pos = field.next
     return true
 
@@ -380,7 +404,7 @@ struct ParsedExtensions:
     has_path_len: Bool
     path_len: Int
 
-fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String], eku_oids: List[String], permitted_dns: List[String], excluded_dns: List[String]) -> ParsedExtensions!:
+fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String], eku_oids: List[String], permitted_dns: List[String], excluded_dns: List[String], permitted_ip: List[Bytes], excluded_ip: List[Bytes]) -> ParsedExtensions!:
     extensions := expect_tag(data, value.value_start, TAG_SEQUENCE)!
     mut is_ca := false
     mut has_eku := false
@@ -421,7 +445,7 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
             key_cert_sign = parse_key_usage_cert_sign(data, child)!
             digital_signature = parse_key_usage_digital_signature(data, child)!
         elif oid == OID_NAME_CONSTRAINTS:
-            parse_name_constraints(data, child, permitted_dns, excluded_dns)!
+            parse_name_constraints(data, child, permitted_dns, excluded_dns, permitted_ip, excluded_ip)!
         elif is_critical:
             # RFC 5280 §4.2 / §6.1: a certificate carrying a critical extension
             # this validator does not recognise MUST be rejected. otherwise a
@@ -466,6 +490,8 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     mut eku_oids: List[String] := []
     mut permitted_dns: List[String] := []
     mut excluded_dns: List[String] := []
+    mut permitted_ip: List[Bytes] := []
+    mut excluded_ip: List[Bytes] := []
     mut is_ca := false
     mut has_eku := false
     mut has_key_usage := false
@@ -476,7 +502,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     while pos < tbs.value_end:
         child := read_value(data, pos)!
         if child.tag == TAG_EXTENSIONS:
-            parsed := parse_extensions(data, child, dns_names, ip_addresses, eku_oids, permitted_dns, excluded_dns)!
+            parsed := parse_extensions(data, child, dns_names, ip_addresses, eku_oids, permitted_dns, excluded_dns, permitted_ip, excluded_ip)!
             is_ca = parsed.is_ca
             has_eku = parsed.has_eku
             has_key_usage = parsed.has_key_usage
@@ -490,7 +516,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
 
     issuer_dn := data.slice(issuer.header_start, issuer.next)
     subject_dn := data.slice(subject.header_start, subject.next)
-    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns, has_key_usage, key_cert_sign, digital_signature, has_path_len, path_len)
+    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns, has_key_usage, key_cert_sign, digital_signature, has_path_len, path_len, permitted_ip, excluded_ip)
 
 # parse a der-encoded x.509 certificate.
 pub fn parse_der(data: Bytes) -> Certificate!:
@@ -563,9 +589,9 @@ pub fn matches_hostname(cert: Certificate, host: String) -> Bool:
     # client since ~2017) matches a hostname only against subjectAltName; a
     # CN-only certificate matches nothing here. this also closes a
     # name-constraint bypass: a name-constrained sub-CA could issue a leaf
-    # with NO SAN and an arbitrary CN (CN=www.bank.com), which
-    # name_constraints_permit_leaf — checking only SAN dnsNames — waved
-    # through, and a CN fallback would then have matched. subject_common_name
+    # with NO SAN and an arbitrary CN (CN=www.bank.com). name_constraints
+    # checks SAN entries, not the CN, so such a leaf carries nothing to
+    # constrain, and a CN fallback would then have matched. subject_common_name
     # remains available for display, just not for identity.
     return false
 
@@ -609,8 +635,47 @@ fn dns_constraint_matches(constraint: String, name: String) -> Bool:
 
 # enforce a ca's dnsname name-constraints against the leaf's dns sans. a leaf
 # name inside an excluded subtree is rejected; when the ca lists permitted
-# dnsname subtrees, every leaf dns name must fall inside one of them. only
-# dnsname constraints are enforced (see module notes); other name types pass.
+# subtrees of a name type, every leaf name of that type must fall inside one of
+# them. dnsname and iPAddress constraints are enforced; other name types (rfc
+# 822, directoryName) are not, so a constraint of those types does not
+# restrict the chain.
+# parse an ip san string back to its raw bytes: a dotted-quad to 4 bytes, or
+# the hex form read_ip_address emits for ipv6 to 16. returns empty on anything
+# it cannot parse, which the caller treats as "matches no constraint".
+fn ip_string_to_bytes(text: String) -> Bytes:
+    if text.contains("."):
+        parts := text.split(".")
+        if parts.len() != 4:
+            return bytes.empty()
+        out := bytes.buffer_with_capacity(4)
+        defer out.free()
+        for part in parts:
+            n := parse_int(part)
+            if n.is_err or n.ok < 0 or n.ok > 255:
+                return bytes.empty()
+            out.write_byte(n.ok) catch 0
+        return out.bytes()
+    decoded := encoding.from_hex(text)
+    if decoded.is_err:
+        return bytes.empty()
+    return decoded.ok
+
+# whether an ip address falls inside a name-constraint subtree base, which is
+# the network address followed by its netmask (rfc 5280 §4.2.1.10). the address
+# and the base's two halves must share a length, and every address bit must
+# match the network under the mask.
+fn ip_in_subtree(ip: Bytes, base: Bytes) -> Bool:
+    half := base.len() / 2
+    if ip.len() != half:
+        return false
+    mut i := 0
+    while i < half:
+        mask := base[half + i]
+        if bits.band(ip[i], mask) != bits.band(base[i], mask):
+            return false
+        i = i + 1
+    return true
+
 fn name_constraints_permit_leaf(leaf: Certificate, ca: Certificate) -> Bool:
     for name in leaf.dns_names:
         for excluded in ca.excluded_dns:
@@ -621,6 +686,24 @@ fn name_constraints_permit_leaf(leaf: Certificate, ca: Certificate) -> Bool:
             mut inside := false
             for permitted in ca.permitted_dns:
                 if dns_constraint_matches(permitted, name):
+                    inside = true
+            if not inside:
+                return false
+    # iPAddress constraints follow the same shape: an excluded subtree rejects
+    # a matching leaf ip, and a non-empty permitted set requires every leaf ip
+    # to sit inside one. only leaf ips that parse are checked; an unparseable
+    # one matches no permitted subtree and is refused when the set is present.
+    for ip_text in leaf.ip_addresses:
+        leaf_ip := ip_string_to_bytes(ip_text)
+        for excluded in ca.excluded_ip:
+            if ip_in_subtree(leaf_ip, excluded):
+                return false
+    if ca.permitted_ip.len() > 0:
+        for ip_text in leaf.ip_addresses:
+            leaf_ip := ip_string_to_bytes(ip_text)
+            mut inside := false
+            for permitted in ca.permitted_ip:
+                if ip_in_subtree(leaf_ip, permitted):
                     inside = true
             if not inside:
                 return false
@@ -950,6 +1033,27 @@ test "x509 accepts a serverauth leaf and an eku-less leaf":
     # server-auth check must not reject it.
     assert(not ca.has_eku)
     assert(leaf_permits_server_auth(ca))
+
+test "x509 enforces ipaddress name-constraints on the chain":
+    inrange := parse_pem(read_file("tests/live/fixtures/ipnc-inrange-leaf.crt")!)!
+    outrange := parse_pem(read_file("tests/live/fixtures/ipnc-outrange-leaf.crt")!)!
+    intermediate := parse_pem(read_file("tests/live/fixtures/ipnc-int.crt")!)!
+    root := parse_pem(read_file("tests/live/fixtures/ipnc-root.crt")!)!
+
+    # the intermediate is permitted the 10.0.0.0/8 block only.
+    assert_eq(intermediate.permitted_ip.len(), 1)
+    assert(inrange.ip_addresses.contains("10.1.2.3"))
+    assert(outrange.ip_addresses.contains("8.8.8.8"))
+
+    # 10.1.2.3 sits inside the permitted block, so the chain verifies.
+    good := verify_server_chain([inrange, intermediate], [root], "10.1.2.3")
+    assert(good.ok)
+
+    # 8.8.8.8 is outside it; the constrained intermediate may not vouch for it
+    # even though the signature verifies and the ip san matches the host.
+    bad := verify_server_chain([outrange, intermediate], [root], "8.8.8.8")
+    assert(not bad.ok)
+    assert_eq(bad.reason, NAME_CONSTRAINT_REASON)
 
 test "x509 enforces dnsname name-constraints on the chain":
     good := parse_pem(read_file("tests/live/fixtures/nc-good-leaf.crt")!)!

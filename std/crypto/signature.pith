@@ -32,6 +32,18 @@ pub fn verify_rsa_pkcs1_sha384(public_key: Bytes, message: Bytes, signature: Byt
 pub fn verify_rsa_pss_sha256(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
     return crypto_verify_rsa_pss_sha256(public_key, message, signature)
 
+# verify an rsa pss signature over sha-384.
+pub fn verify_rsa_pss_sha384(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_rsa_pss_sha384(public_key, message, signature)
+
+# verify an rsa pss signature over sha-512.
+pub fn verify_rsa_pss_sha512(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_rsa_pss_sha512(public_key, message, signature)
+
+# verify an rsa pkcs#1 v1.5 signature over sha-512.
+pub fn verify_rsa_pkcs1_sha512(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_rsa_pkcs1_sha512(public_key, message, signature)
+
 # sign with an rsa pkcs#8 private key using pss and sha-256.
 pub fn sign_rsa_pss_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
     return crypto_sign_rsa_pss_sha256_pkcs8(pkcs8_private_key, message)!
@@ -56,6 +68,50 @@ pub fn sign_ecdsa_p256_sha256_pkcs8(pkcs8_private_key: Bytes, message: Bytes) ->
 # sign_ecdsa_p256_sha256_pkcs8 above.
 pub fn sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
     return crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8_private_key, message)!
+
+# sign with an rsa pkcs#8 private key using pss and sha-384.
+pub fn sign_rsa_pss_sha384_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_rsa_pss_sha384_pkcs8(pkcs8_private_key, message)!
+
+# sign with an rsa pkcs#8 private key using pss and sha-512.
+pub fn sign_rsa_pss_sha512_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_rsa_pss_sha512_pkcs8(pkcs8_private_key, message)!
+
+# sign with an rsa pkcs#8 private key using pkcs#1 v1.5 and sha-384.
+pub fn sign_rsa_pkcs1_sha384_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_rsa_pkcs1_sha384_pkcs8(pkcs8_private_key, message)!
+
+# sign with an rsa pkcs#8 private key using pkcs#1 v1.5 and sha-512.
+pub fn sign_rsa_pkcs1_sha512_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_rsa_pkcs1_sha512_pkcs8(pkcs8_private_key, message)!
+
+# sign with a p-384 pkcs#8 private key using ecdsa and sha-384, asn.1 der.
+pub fn sign_ecdsa_p384_sha384_asn1_pkcs8(pkcs8_private_key: Bytes, message: Bytes) -> Bytes!:
+    return crypto_sign_ecdsa_p384_sha384_asn1_pkcs8(pkcs8_private_key, message)!
+
+test "rsa pss/pkcs1 sha-384 and sha-512 signatures round-trip":
+    key := encoding.pem_decode(read_file("tests/live/fixtures/sig-rsa2048-pkcs8.pem")!)!.body
+    pubkey := read_file_bytes("tests/live/fixtures/sig-rsa2048-pub.der")!
+    message := bytes.from_string_utf8("pith wider signature schemes")
+    pss384 := sign_rsa_pss_sha384_pkcs8(key, message)!
+    assert(verify_rsa_pss_sha384(pubkey, message, pss384))
+    assert(not verify_rsa_pss_sha256(pubkey, message, pss384))
+    pss512 := sign_rsa_pss_sha512_pkcs8(key, message)!
+    assert(verify_rsa_pss_sha512(pubkey, message, pss512))
+    pkcs1_384 := sign_rsa_pkcs1_sha384_pkcs8(key, message)!
+    assert(verify_rsa_pkcs1_sha384(pubkey, message, pkcs1_384))
+    pkcs1_512 := sign_rsa_pkcs1_sha512_pkcs8(key, message)!
+    assert(verify_rsa_pkcs1_sha512(pubkey, message, pkcs1_512))
+    # pkcs#1 v1.5 is deterministic; the same key and message reproduce the tag.
+    assert(bytes.eq(pkcs1_384, sign_rsa_pkcs1_sha384_pkcs8(key, message)!))
+
+test "ecdsa p-384 sha-384 asn.1 signatures verify":
+    key := encoding.pem_decode(read_file("tests/live/fixtures/sig-p384-pkcs8.pem")!)!.body
+    point := read_file_bytes("tests/live/fixtures/sig-p384-pub-point.bin")!
+    message := bytes.from_string_utf8("pith p-384 signature")
+    sig := sign_ecdsa_p384_sha384_asn1_pkcs8(key, message)!
+    assert(verify_ecdsa_p384_sha384_asn1(point, message, sig))
+    assert(not verify_ecdsa_p384_sha384_asn1(point, bytes.from_string_utf8("other"), sig))
 
 test "ecdsa p-256 asn.1 signatures verify and are der-encoded":
     pk8 := encoding.from_hex("308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe")!

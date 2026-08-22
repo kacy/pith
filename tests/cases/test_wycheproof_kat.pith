@@ -107,8 +107,14 @@ fn run_verify(suite: String, path: String, kind: String) -> Bool!:
         mut ok := false
         if kind == "ecdsa":
             ok = signature.verify_ecdsa_p256_sha256_asn1(key, msg, sig)
+        elif kind == "ecdsa384":
+            ok = signature.verify_ecdsa_p384_sha384_asn1(key, msg, sig)
         elif kind == "pkcs1":
             ok = signature.verify_rsa_pkcs1_sha256(key, msg, sig)
+        elif kind == "pkcs1_512":
+            ok = signature.verify_rsa_pkcs1_sha512(key, msg, sig)
+        elif kind == "pss384":
+            ok = signature.verify_rsa_pss_sha384(key, msg, sig)
         else:
             ok = signature.verify_rsa_pss_sha256(key, msg, sig)
         record(t, suite, parts[0], parts[1], ok)
@@ -150,6 +156,9 @@ fn main() -> Int!:
     all_ok = run_verify("ecdsa-p256-sha256", "tests/wycheproof/ecdsa_p256_sha256.txt", "ecdsa")! and all_ok
     all_ok = run_verify("rsa-pkcs1-2048-sha256", "tests/wycheproof/rsa_pkcs1_2048_sha256.txt", "pkcs1")! and all_ok
     all_ok = run_verify("rsa-pss-2048-sha256", "tests/wycheproof/rsa_pss_2048_sha256.txt", "pss")! and all_ok
+    all_ok = run_verify("rsa-pss-2048-sha384", "tests/wycheproof/rsa_pss_2048_sha384.txt", "pss384")! and all_ok
+    all_ok = run_verify("rsa-pkcs1-2048-sha512", "tests/wycheproof/rsa_pkcs1_2048_sha512.txt", "pkcs1_512")! and all_ok
+    all_ok = run_verify("ecdsa-p384-sha384", "tests/wycheproof/ecdsa_p384_sha384.txt", "ecdsa384")! and all_ok
     all_ok = run_hkdf("hkdf-sha256", "tests/wycheproof/hkdf_sha256.txt")! and all_ok
     all_ok = run_hmac("hmac-sha256", "tests/wycheproof/hmac_sha256.txt")! and all_ok
     if not all_ok:

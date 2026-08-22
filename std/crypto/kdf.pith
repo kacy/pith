@@ -118,6 +118,14 @@ pub fn hkdf_extract_sha256(salt: Bytes, secret: Bytes) -> Bytes:
 pub fn hkdf_expand_sha256(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
     return hkdf_expand(hmac.sha256, 32, prk, info, length)
 
+# hkdf extract with hmac-sha384.
+pub fn hkdf_extract_sha384(salt: Bytes, secret: Bytes) -> Bytes:
+    return hkdf_extract(hmac.sha384, 48, salt, secret)
+
+# hkdf expand with hmac-sha384.
+pub fn hkdf_expand_sha384(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
+    return hkdf_expand(hmac.sha384, 48, prk, info, length)
+
 # hkdf extract with hmac-sha512.
 pub fn hkdf_extract_sha512(salt: Bytes, secret: Bytes) -> Bytes:
     return hkdf_extract(hmac.sha512, 64, salt, secret)
@@ -133,6 +141,10 @@ pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Byte
 # derive bytes with HKDF-SHA512.
 pub fn hkdf_sha512(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
     return hkdf_expand_sha512(hkdf_extract_sha512(salt, secret), info, length)
+
+# derive bytes with HKDF-SHA384.
+pub fn hkdf_sha384(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+    return hkdf_expand_sha384(hkdf_extract_sha384(salt, secret), info, length)
 
 # derive bytes with PBKDF2-HMAC-SHA256.
 pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
@@ -159,6 +171,14 @@ test "hkdf extract and expand match rfc 5869 vector":
 
     assert_eq(encoding.to_hex(prk), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
     assert_eq(encoding.to_hex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+test "hkdf sha384 matches rfc 5869 style vector":
+    ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!
+    salt := encoding.from_hex("000102030405060708090a0b0c")!
+    info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
+    okm := hkdf_sha384(ikm, salt, info, 42)!
+
+    assert_eq(encoding.to_hex(okm), "9b5097a86038b805309076a44b3a9f38063e25b516dcbf369f394cfab43685f748b6457763e4f0204fc5")
 
 test "hkdf sha512 matches known vector":
     ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!

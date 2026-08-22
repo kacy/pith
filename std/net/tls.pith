@@ -2551,12 +2551,17 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client certificate verify arrived before certificate")
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate verify")
+                if not scheme_matches_certificate_key(cv.signature_scheme, client_certs[0].public_key_algorithm):
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls client signature scheme does not match the certificate key type")
                 if not (tls13.verify_client_certificate_for_cipher(cipher, client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECRYPT_ERROR, "client certificate verify failed")
                 client_cert_verify_seen = true
                 transcript_append(transcript, message)!
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
-                if client_cert_required and (client_certs.len() == 0 or not client_cert_verify_seen):
+                if client_cert_required and not did_resume and (client_certs.len() == 0 or not client_cert_verify_seen):
+                    # a resumed session presents no certificate: its
+                    # authentication is the original handshake's, which this
+                    # ticket is bound to (rfc 8446 §2.2).
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client finished arrived before client certificate verification")
                 # a certificate is public, so presenting one proves nothing on
                 # its own — only CertificateVerify proves the client holds the
@@ -2859,6 +2864,10 @@ fn native_conn_close(handle: Int):
 fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool) -> Bool!:
     cs.write_mu.lock()
     defer cs.write_mu.unlock()
+    # a failure between consuming the sequence and installing the new key
+    # leaves the send epoch desynced from the peer; poison the connection
+    # rather than keep writing under a half-rotated state.
+    errdefer cs.failed = true
     if cs.failed:
         return false
     update := tls13.encode_key_update(request_peer_update)!

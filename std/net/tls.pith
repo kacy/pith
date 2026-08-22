@@ -180,6 +180,7 @@ MAX_HANDSHAKE_CHANGE_CIPHER_SPEC := 8
 TLS_VERSION_13 := 772
 TLS_VERSION_12 := 771
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
+TLS_CIPHER_AES_256_GCM_SHA384 := 4866
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
 TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
 TLS_SIG_RSA_PSS_RSAE_SHA384 := 2053
@@ -604,6 +605,8 @@ fn transcript_append(transcript: ByteBuffer, message: tls13.HandshakeMessage) ->
 fn traffic_keys_for_cipher(cipher: Int, secret: Bytes) -> tls13.TrafficKeys!:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
         return tls13.traffic_keys_aes_128_gcm_sha256(secret)
+    if cipher == TLS_CIPHER_AES_256_GCM_SHA384:
+        return tls13.traffic_keys_aes_256_gcm_sha384(secret)
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return tls13.traffic_keys_chacha20_poly1305_sha256(secret)
     fail "unsupported tls cipher suite"
@@ -620,6 +623,8 @@ pub fn version_name(version: Int) -> String:
 pub fn cipher_suite_name(cipher: Int) -> String:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
         return "TLS_AES_128_GCM_SHA256"
+    if cipher == TLS_CIPHER_AES_256_GCM_SHA384:
+        return "TLS_AES_256_GCM_SHA384"
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return "TLS_CHACHA20_POLY1305_SHA256"
     if cipher == tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256:
@@ -635,6 +640,8 @@ pub fn cipher_suite_name(cipher: Int) -> String:
 fn select_cipher(client: tls13.ClientHello) -> Int!:
     if client.cipher_suites.contains(TLS_CIPHER_AES_128_GCM_SHA256):
         return TLS_CIPHER_AES_128_GCM_SHA256
+    if client.cipher_suites.contains(TLS_CIPHER_AES_256_GCM_SHA384):
+        return TLS_CIPHER_AES_256_GCM_SHA384
     if client.cipher_suites.contains(TLS_CIPHER_CHACHA20_POLY1305_SHA256):
         return TLS_CIPHER_CHACHA20_POLY1305_SHA256
     fail "client did not offer a supported tls cipher suite"
@@ -642,6 +649,8 @@ fn select_cipher(client: tls13.ClientHello) -> Int!:
 fn open_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
         return tls13.open_application_aes_128_gcm(key, iv, sequence, record)
+    if cipher == TLS_CIPHER_AES_256_GCM_SHA384:
+        return tls13.open_application_aes_256_gcm(key, iv, sequence, record)
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return tls13.open_application_chacha20_poly1305(key, iv, sequence, record)
     fail "unsupported tls cipher suite"
@@ -649,6 +658,8 @@ fn open_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, rec
 fn seal_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
         return tls13.seal_application_aes_128_gcm(key, iv, sequence, content_type, plaintext)
+    if cipher == TLS_CIPHER_AES_256_GCM_SHA384:
+        return tls13.seal_application_aes_256_gcm(key, iv, sequence, content_type, plaintext)
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return tls13.seal_application_chacha20_poly1305(key, iv, sequence, content_type, plaintext)
     fail "unsupported tls cipher suite"
@@ -831,10 +842,10 @@ fn selected_psk_identity(did_resume: Bool) -> Int:
         return 0
     return 0 - 1
 
-fn handshake_secret_for_resumption(did_resume: Bool, psk: Bytes, shared_secret: Bytes) -> Bytes!:
+fn handshake_secret_for_resumption(cipher: Int, did_resume: Bool, psk: Bytes, shared_secret: Bytes) -> Bytes!:
     if did_resume:
-        return tls13.handshake_secret_from_early_secret_sha256(tls13.early_secret_from_psk_sha256(psk), shared_secret)
-    return tls13.handshake_secret_sha256(shared_secret)
+        return tls13.handshake_secret_from_early_secret_for_cipher(cipher, tls13.early_secret_from_psk_for_cipher(cipher, psk), shared_secret)
+    return tls13.handshake_secret_for_cipher(cipher, shared_secret)
 
 fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, selected_alpn: String, fallback_cipher: Int) -> ServerResumptionDecision!:
     if not config_resumption_enabled(config) or config_requires_client_certificate(config):
@@ -859,7 +870,7 @@ fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, sel
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
-    expected_binder := tls13.resumption_binder_verify_data_sha256(entry.psk, client_hello.psk_binder_input)!
+    expected_binder := tls13.resumption_binder_verify_data_for_cipher(entry.cipher, entry.psk, client_hello.psk_binder_input)!
     # the binder is a MAC that proves the client holds the PSK; compare it in
     # constant time. an ordinary byte-equality short-circuits on the first
     # differing byte, which leaks the correct binder one byte at a time and lets
@@ -881,12 +892,12 @@ fn client_key_is_ecdsa(config: Config) -> Bool!:
 # scheme this client's key can produce. a client that cannot satisfy the
 # request declines with an empty Certificate (rfc 8446 §4.4.2) — it must not
 # abort, and it must never fall back to signing with an unadvertised scheme.
-fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer, cert_usable: Bool, request_schemes: List[Int]) -> Bool!:
+fn append_client_certificate_flight(config: Config, cipher: Int, transcript: ByteBuffer, flight: ByteBuffer, cert_usable: Bool, request_schemes: List[Int]) -> Bool!:
     if config_has_client_certificate(config) and cert_usable:
         client_certs := native_config_client_cert_chain(config)!
         client_certificate := tls13.encode_certificate_message(client_certs)!
         transcript.write(client_certificate)!
-        client_cert_input := tls13.client_certificate_verify_input_sha256(transcript.bytes())!
+        client_cert_input := tls13.client_certificate_verify_input_for_cipher(cipher, transcript.bytes())!
         # sign the CertificateVerify with a scheme the server's request
         # advertised, keyed on this certificate's key type — the same
         # selection the server side makes for its own signature.
@@ -908,8 +919,8 @@ fn send_new_session_ticket_if_enabled(stream: TcpStream, config: Config, client_
         return 0
     ticket_nonce := random.bytes(8)!
     ticket := random.bytes(32)!
-    resumption_master_secret := tls13.resumption_master_secret_sha256(master_secret, transcript.bytes())!
-    ticket_psk := tls13.resumption_psk_sha256(resumption_master_secret, ticket_nonce)!
+    resumption_master_secret := tls13.resumption_master_secret_for_cipher(cipher, master_secret, transcript.bytes())!
+    ticket_psk := tls13.resumption_psk_for_cipher(cipher, resumption_master_secret, ticket_nonce)!
     remember_server_ticket(server_ticket_key(ticket), SessionTicketEntry(config.handle, cipher, ticket_psk, selected_alpn, time.now(), ttl_ms(TLS_SESSION_TICKET_LIFETIME)))
     ticket_message := tls13.encode_new_session_ticket(TLS_SESSION_TICKET_LIFETIME, 0, ticket_nonce, ticket)!
     ticket_record := seal_record_for_cipher(cipher, server_app_keys.key, server_app_keys.iv, 0, TLS_CONTENT_HANDSHAKE, ticket_message)!
@@ -1163,7 +1174,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
         cached_session = lookup_resumable_client_session(cache_key)
         if cached_session.ticket.len() > 0:
             binder_input := tls13.client_hello_psk_binder_input(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0)!
-            binder := tls13.resumption_binder_verify_data_sha256(cached_session.psk, binder_input)!
+            binder := tls13.resumption_binder_verify_data_for_cipher(cached_session.cipher, cached_session.psk, binder_input)!
             client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0, binder)!
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
@@ -1558,9 +1569,9 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
             fail "server selected an unexpected tls psk identity"
         did_resume = true
-    handshake_secret := handshake_secret_for_resumption(did_resume, cached_session.psk, shared_secret)!
-    server_hs_secret := tls13.server_handshake_traffic_secret_sha256(handshake_secret, transcript_buf.bytes())!
-    client_hs_secret := tls13.client_handshake_traffic_secret_sha256(handshake_secret, transcript_buf.bytes())!
+    handshake_secret := handshake_secret_for_resumption(server_hello.cipher_suite, did_resume, cached_session.psk, shared_secret)!
+    server_hs_secret := tls13.server_handshake_traffic_secret_for_cipher(server_hello.cipher_suite, handshake_secret, transcript_buf.bytes())!
+    client_hs_secret := tls13.client_handshake_traffic_secret_for_cipher(server_hello.cipher_suite, handshake_secret, transcript_buf.bytes())!
     server_hs_keys := traffic_keys_for_cipher(server_hello.cipher_suite, server_hs_secret)!
     client_hs_keys := traffic_keys_for_cipher(server_hello.cipher_suite, client_hs_secret)!
     # the middlebox-compatibility change_cipher_spec goes out here, before any
@@ -1694,7 +1705,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls certificate verify"
-                if not (tls13.verify_server_certificate_sha256(certs[0].subject_public_key, cv.signature_scheme, transcript_buf.bytes(), cv.signature) catch false):
+                if not (tls13.verify_server_certificate_for_cipher(server_hello.cipher_suite, certs[0].subject_public_key, cv.signature_scheme, transcript_buf.bytes(), cv.signature) catch false):
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
                     fail "certificate verify failed"
                 cert_verify_seen = true
@@ -1706,7 +1717,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 verify_data := tls13.parse_finished(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls server finished"
-                if not (tls13.verify_finished_sha256(server_hs_secret, transcript_buf.bytes(), verify_data) catch false):
+                if not (tls13.verify_finished_for_cipher(server_hello.cipher_suite, server_hs_secret, transcript_buf.bytes(), verify_data) catch false):
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
                     fail "server finished verification failed"
                 transcript_append(transcript_buf, message)!
@@ -1719,23 +1730,23 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             fail "excess data after tls server finished"
 
     application_transcript := transcript_buf.bytes()
-    master_secret := tls13.master_secret_sha256(handshake_secret)!
-    server_app_secret := tls13.server_application_traffic_secret_sha256(master_secret, application_transcript)!
-    client_app_secret := tls13.client_application_traffic_secret_sha256(master_secret, application_transcript)!
+    master_secret := tls13.master_secret_for_cipher(server_hello.cipher_suite, handshake_secret)!
+    server_app_secret := tls13.server_application_traffic_secret_for_cipher(server_hello.cipher_suite, master_secret, application_transcript)!
+    client_app_secret := tls13.client_application_traffic_secret_for_cipher(server_hello.cipher_suite, master_secret, application_transcript)!
     server_app_keys := traffic_keys_for_cipher(server_hello.cipher_suite, server_app_secret)!
     client_app_keys := traffic_keys_for_cipher(server_hello.cipher_suite, client_app_secret)!
 
     client_flight := bytes.buffer()
     if client_cert_requested:
-        append_client_certificate_flight(config, transcript_buf, client_flight, client_cert_usable, client_cert_request_schemes)!
-    client_verify := tls13.finished_verify_data_sha256(client_hs_secret, transcript_buf.bytes())!
+        append_client_certificate_flight(config, server_hello.cipher_suite, transcript_buf, client_flight, client_cert_usable, client_cert_request_schemes)!
+    client_verify := tls13.finished_verify_data_for_cipher(server_hello.cipher_suite, client_hs_secret, transcript_buf.bytes())!
     client_finished := tls13.encode_finished(client_verify)!
     transcript_buf.write(client_finished)!
     client_flight.write(client_finished)!
     write_sealed_flight(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, client_flight.bytes())!
     mut resumption_master_secret := bytes.empty()
     if config_resumption_enabled(config) and not config_has_client_certificate(config):
-        resumption_master_secret = tls13.resumption_master_secret_sha256(master_secret, transcript_buf.bytes())!
+        resumption_master_secret = tls13.resumption_master_secret_for_cipher(server_hello.cipher_suite, master_secret, transcript_buf.bytes())!
     if did_resume and negotiated_alpn != cached_session.alpn_protocol:
         fail "server resumed the session with a different alpn protocol"
     if did_resume:
@@ -2101,9 +2112,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
 
     shared_secret := keypair.shared_secret(client_hello.key_share)!
     keypair.close()
-    handshake_secret := handshake_secret_for_resumption(did_resume, resumption.psk, shared_secret)!
-    server_hs_secret := tls13.server_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
-    client_hs_secret := tls13.client_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
+    handshake_secret := handshake_secret_for_resumption(cipher, did_resume, resumption.psk, shared_secret)!
+    server_hs_secret := tls13.server_handshake_traffic_secret_for_cipher(cipher, handshake_secret, transcript.bytes())!
+    client_hs_secret := tls13.client_handshake_traffic_secret_for_cipher(cipher, handshake_secret, transcript.bytes())!
     server_hs_keys := traffic_keys_for_cipher(cipher, server_hs_secret)!
     client_hs_keys := traffic_keys_for_cipher(cipher, client_hs_secret)!
 
@@ -2120,7 +2131,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     if not did_resume:
         certificate := tls13.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!
         transcript.write(certificate)!
-        cert_verify_input := tls13.server_certificate_verify_input_sha256(transcript.bytes())!
+        cert_verify_input := tls13.server_certificate_verify_input_for_cipher(cipher, transcript.bytes())!
         cert_verify_scheme := select_server_signature_scheme(server_key_is_ecdsa(handshake_config)!, true, client_hello.signature_schemes)
         if cert_verify_scheme == 0:
             fail "client does not accept this server's signature algorithm"
@@ -2129,7 +2140,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         transcript.write(certificate_verify)!
         server_flight.write(certificate)!
         server_flight.write(certificate_verify)!
-    server_verify := tls13.finished_verify_data_sha256(server_hs_secret, transcript.bytes())!
+    server_verify := tls13.finished_verify_data_for_cipher(cipher, server_hs_secret, transcript.bytes())!
     server_finished := tls13.encode_finished(server_verify)!
     server_flight.write(server_finished)!
     write_sealed_flight(stream, cipher, server_hs_keys.key, server_hs_keys.iv, 0, server_flight.bytes())!
@@ -2141,9 +2152,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # alert with the server application keys at sequence 0. the secrets are
     # keyed on the transcript snapshot at the server Finished, which is exactly
     # application_transcript.
-    master_secret := tls13.master_secret_sha256(handshake_secret)!
-    server_app_secret := tls13.server_application_traffic_secret_sha256(master_secret, application_transcript)!
-    client_app_secret := tls13.client_application_traffic_secret_sha256(master_secret, application_transcript)!
+    master_secret := tls13.master_secret_for_cipher(cipher, handshake_secret)!
+    server_app_secret := tls13.server_application_traffic_secret_for_cipher(cipher, master_secret, application_transcript)!
+    client_app_secret := tls13.client_application_traffic_secret_for_cipher(cipher, master_secret, application_transcript)!
     server_app_keys := traffic_keys_for_cipher(cipher, server_app_secret)!
     client_app_keys := traffic_keys_for_cipher(cipher, client_app_secret)!
     mut client_hs_seq := 0
@@ -2225,7 +2236,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls client certificate verify"
-                if not (tls13.verify_client_certificate_sha256(client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
+                if not (tls13.verify_client_certificate_for_cipher(cipher, client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
                     fail "client certificate verify failed"
                 client_cert_verify_seen = true
@@ -2253,7 +2264,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 # exactly that earlier point — using it here rejected every
                 # genuine mTLS client, since the client computes its Finished
                 # over the full transcript.
-                if not (tls13.verify_finished_sha256(client_hs_secret, transcript.bytes(), verify_data) catch false):
+                if not (tls13.verify_finished_for_cipher(cipher, client_hs_secret, transcript.bytes(), verify_data) catch false):
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
                     fail "client finished verification failed"
                 transcript_append(transcript, message)!
@@ -2289,7 +2300,7 @@ fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.
     ticket_message := tls13.parse_new_session_ticket(message.body)!
     if ticket_message.ticket_lifetime <= 0:
         return false
-    psk := tls13.resumption_psk_sha256(cs.resumption_master_secret, ticket_message.nonce)!
+    psk := tls13.resumption_psk_for_cipher(cs.cipher, cs.resumption_master_secret, ticket_message.nonce)!
     expires_at_ms := time.now() + ttl_ms(ticket_message.ticket_lifetime)
     state := cs.state
     peer := peer_identity_from_connection_state(state)
@@ -2496,7 +2507,7 @@ fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool)
     cs.write_seq = seq + 1
     record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_HANDSHAKE, update)!
     native_write_all(TcpStream(cs.fd), record)!
-    next_secret := tls13.next_application_traffic_secret_sha256(cs.write_secret)!
+    next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.write_secret)!
     keys := traffic_keys_for_cipher(cipher, next_secret)!
     cs.write_key = keys.key
     cs.write_iv = keys.iv
@@ -2512,7 +2523,7 @@ fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.Handsh
     if cs.version != TLS_VERSION_13 or cs.read_secret.len() == 0:
         fail "unexpected key update on a non-1.3 connection"
     request_peer_update := tls13.parse_key_update(message.body)!
-    next_secret := tls13.next_application_traffic_secret_sha256(cs.read_secret)!
+    next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.read_secret)!
     keys := traffic_keys_for_cipher(cipher, next_secret)!
     cs.read_key = keys.key
     cs.read_iv = keys.iv

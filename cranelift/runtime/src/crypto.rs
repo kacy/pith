@@ -385,6 +385,75 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha256(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha384(
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    let Some(public_key) = bytes_slice(public_key) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Some(sig) = bytes_slice(sig) else {
+        return 0;
+    };
+    verify_with(
+        &signature::RSA_PSS_2048_8192_SHA384,
+        public_key,
+        message,
+        sig,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha512(
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    let Some(public_key) = bytes_slice(public_key) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Some(sig) = bytes_slice(sig) else {
+        return 0;
+    };
+    verify_with(
+        &signature::RSA_PSS_2048_8192_SHA512,
+        public_key,
+        message,
+        sig,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha512(
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    let Some(public_key) = bytes_slice(public_key) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Some(sig) = bytes_slice(sig) else {
+        return 0;
+    };
+    verify_with(
+        &signature::RSA_PKCS1_2048_8192_SHA512,
+        public_key,
+        message,
+        sig,
+    )
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
     let Some(pkcs8) = bytes_slice(pkcs8) else {
         return 0;
@@ -393,6 +462,72 @@ pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, messa
         return 0;
     };
     sign_rsa_with(&signature::RSA_PSS_SHA256, pkcs8, message)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    sign_rsa_with(&signature::RSA_PSS_SHA384, pkcs8, message)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    sign_rsa_with(&signature::RSA_PSS_SHA512, pkcs8, message)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    sign_rsa_with(&signature::RSA_PKCS1_SHA384, pkcs8, message)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    sign_rsa_with(&signature::RSA_PKCS1_SHA512, pkcs8, message)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p384_sha384_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
+    let Some(pkcs8) = bytes_slice(pkcs8) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let rng = rand::SystemRandom::new();
+    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
+        &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+        pkcs8,
+        &rng,
+    ) else {
+        return 0;
+    };
+    let Ok(sig) = key_pair.sign(&rng, message) else {
+        return 0;
+    };
+    pith_bytes_from_vec(sig.as_ref().to_vec())
 }
 
 #[no_mangle]

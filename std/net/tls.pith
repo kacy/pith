@@ -194,6 +194,20 @@ TLS_SIG_RSA_PKCS1_SHA384 := 1281
 TLS_SIG_RSA_PKCS1_SHA512 := 1537
 TLS_SIG_ECDSA_SECP256R1_SHA256 := 1027
 OID_EC_PUBLIC_KEY := "1.2.840.10045.2.1"
+OID_RSA_ENCRYPTION := "1.2.840.113549.1.1.1"
+
+# whether a signature scheme is one the peer certificate's key type can carry:
+# the rsa_pss_rsae and rsa_pkcs1 code points demand an rsaEncryption key (an
+# id-RSASSA-PSS certificate has its own rsa_pss_pss code points, which this
+# stack does not speak), and the ecdsa points demand an ec key. the signature
+# would often verify anyway — the key material is the same rsa key — which is
+# exactly why the type must be checked rather than trusted to fail.
+fn scheme_matches_certificate_key(scheme: Int, key_algorithm: String) -> Bool:
+    if scheme == TLS_SIG_ECDSA_SECP256R1_SHA256 or scheme == tls13.SIG_ECDSA_SECP384R1_SHA384:
+        return key_algorithm == OID_EC_PUBLIC_KEY
+    if scheme == tls13.SIG_ED25519:
+        return true
+    return key_algorithm == OID_RSA_ENCRYPTION
 TLS_GROUP_X25519 := 29
 TLS_GROUP_SECP256R1 := 23
 TLS_MAX_PLAINTEXT_RECORD := 16384
@@ -1357,7 +1371,16 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # the whole 1.2 server flight is plaintext, so every rejection below can
     # answer with a plaintext fatal alert before the socket closes, mirroring
     # what the server side does for a hello it refuses.
-    for ext_type in tls12.server_hello_extension_types(server_hello_message.body) catch []:
+    tls12_extension_types := tls12.server_hello_extension_types(server_hello_message.body) catch []
+    mut seen_tls12_extensions: List[Int] := []
+    for ext_type in tls12_extension_types:
+        # duplicates first: a block with two of a type is malformed whatever
+        # the types are, and earns decode_error over unsupported_extension.
+        if seen_tls12_extensions.contains(ext_type):
+            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+            fail "server duplicated a tls 1.2 extension"
+        seen_tls12_extensions.push(ext_type)
+    for ext_type in tls12_extension_types:
         if not client_offered_tls12_extension(ext_type, server_name != "", config_alpn_protocols(config).len() > 0):
             send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
             fail "server sent an unoffered tls 1.2 extension"
@@ -1462,6 +1485,9 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
                 send_fatal_alert(stream, ALERT_BAD_CERTIFICATE) catch 0
                 fail "server certificate key usage does not permit signing"
             signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, ske.signed_params)
+            if not scheme_matches_certificate_key(ske.signature_scheme, certs[0].public_key_algorithm):
+                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "tls signature scheme does not match the certificate key type"
             if not tls13.verify_certificate_signature(certs[0].subject_public_key, ske.signature_scheme, signed_data, ske.signature)!:
                 send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
                 fail "tls 1.2 server key exchange signature is invalid"
@@ -1646,7 +1672,14 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         # handshake bytes past the hello have no legitimate reading.
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "trailing plaintext bytes after tls server hello"
-    for sh_ext_type in tls13.server_hello_extension_types(server_messages[0].body) catch []:
+    sh_extension_types := tls13.server_hello_extension_types(server_messages[0].body) catch []
+    mut seen_sh_extensions: List[Int] := []
+    for sh_ext_type in sh_extension_types:
+        if seen_sh_extensions.contains(sh_ext_type):
+            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+            fail "server duplicated a tls server hello extension"
+        seen_sh_extensions.push(sh_ext_type)
+    for sh_ext_type in sh_extension_types:
         if not client_offered_server_hello_extension(sh_ext_type, server_name != ""):
             send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
             fail "server sent an unoffered tls server hello extension"
@@ -1759,9 +1792,18 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 fail "excess data after tls server finished"
             if message.message_type == TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS:
                 mut ee_unsupported := false
+                mut ee_duplicated := false
+                mut seen_ee_extensions: List[Int] := []
                 for ext_type in tls13.encrypted_extensions_types(message.body) catch []:
+                    if seen_ee_extensions.contains(ext_type):
+                        ee_duplicated = true
+                    seen_ee_extensions.push(ext_type)
                     if not client_offered_encrypted_extension(ext_type, server_name != "", alpn_protocols.len() > 0):
                         ee_unsupported = true
+                if ee_duplicated:
+                    # rfc 8446 §4.2: at most one extension of a type per block.
+                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
+                    fail "server duplicated an encrypted extension"
                 if ee_unsupported:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNSUPPORTED_EXTENSION) catch 0
                     fail "server sent an unoffered encrypted extension"
@@ -1824,6 +1866,9 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls certificate verify"
+                if not scheme_matches_certificate_key(cv.signature_scheme, certs[0].public_key_algorithm):
+                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_ILLEGAL_PARAMETER) catch 0
+                    fail "tls signature scheme does not match the certificate key type"
                 if not (tls13.verify_server_certificate_for_cipher(server_hello.cipher_suite, certs[0].subject_public_key, cv.signature_scheme, transcript_buf.bytes(), cv.signature) catch false):
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
                     fail "certificate verify failed"

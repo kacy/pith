@@ -45,6 +45,7 @@ EXT_TLS_FLAGS := 62
 pub EXT_SUPPORTED_GROUPS := 10
 EXT_SIGNATURE_ALGORITHMS := 13
 pub EXT_COOKIE := 44
+pub EXT_CERTIFICATE_AUTHORITIES := 47
 pub EXT_SUPPORTED_VERSIONS := 43
 # extensions a combined 1.2+1.3 ClientHello adds for the 1.2 fallback: extended
 # master secret (rfc 7627) and renegotiation_info (rfc 5746). a 1.3 server
@@ -210,6 +211,27 @@ fn write_u16_vector(out: ByteBuffer, values: List[Int]) -> Bool!:
     write_u16_be(out, values.len() * 2)!
     for value in values:
         write_u16_be(out, value)!
+    return true
+
+# Validate the shape of a certificate_authorities extension (rfc 8446 §4.2.4):
+# a u16-prefixed list of u16-prefixed distinguished names that fills the data
+# exactly. The names themselves are opaque here.
+pub fn validate_certificate_authorities(data: Bytes) -> Bool!:
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u16_be(r))!
+    list := checked_bytes(binary.read_bytes(r, list_len))!
+    if binary.remaining(r) != 0:
+        fail "trailing tls certificate authorities bytes"
+    # the grammar's minimums: the list holds at least one name, and a name is
+    # at least one byte.
+    if list.len() == 0:
+        fail "empty tls certificate authorities list"
+    lr := binary.reader(list)
+    while binary.remaining(lr) > 0:
+        name_len := checked_read(binary.read_u16_be(lr))!
+        if name_len == 0:
+            fail "empty tls certificate authority name"
+        checked_bytes(binary.read_bytes(lr, name_len))!
     return true
 
 fn extension_record(extension_type: Int, data: Bytes) -> Bytes!:
@@ -1312,6 +1334,8 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
                 signature_schemes = parse_signature_scheme_list(data)!
             elif extension_type == EXT_KEY_SHARE:
                 key_share_present = true
+            elif extension_type == EXT_CERTIFICATE_AUTHORITIES:
+                validate_certificate_authorities(data)!
     if binary.remaining(r) != 0:
         fail "trailing tls client hello bytes"
     return LenientClientHello(key_share_present, random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols, extended_master_secret, secure_renegotiation, legacy_version, signature_schemes)
@@ -1519,6 +1543,8 @@ pub fn parse_certificate_request(body: Bytes) -> CertificateRequestMessage!:
             sr := binary.reader(list)
             while binary.remaining(sr) > 0:
                 signature_schemes.push(checked_read(binary.read_u16_be(sr))!)
+        elif extension_type == EXT_CERTIFICATE_AUTHORITIES:
+            validate_certificate_authorities(data)!
     return CertificateRequestMessage(request_context, signature_schemes)
 
 ## Encode a CertificateRequest handshake message.

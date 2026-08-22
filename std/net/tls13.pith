@@ -40,6 +40,7 @@ pub EXT_SERVER_NAME := 0
 pub EXT_ALPN := 16
 pub EXT_PRE_SHARED_KEY := 41
 EXT_PSK_KEY_EXCHANGE_MODES := 45
+EXT_TLS_FLAGS := 62
 pub EXT_SUPPORTED_GROUPS := 10
 EXT_SIGNATURE_ALGORITHMS := 13
 pub EXT_SUPPORTED_VERSIONS := 43
@@ -446,6 +447,11 @@ fn inner_plaintext(content_type: Int, plaintext: Bytes) -> Bytes!:
 fn open_inner_plaintext(data: Bytes) -> Record!:
     if data.len() == 0:
         fail "empty tls inner plaintext"
+    # rfc 8446 §5.4: TLSInnerPlaintext (content + type + padding) is capped at
+    # 2^14 + 1 bytes. the ciphertext bound alone admits ~255 bytes more, so an
+    # oversized plaintext only becomes visible after decryption.
+    if data.len() > MAX_PLAINTEXT_RECORD + 1:
+        fail "tls record overflow"
     mut pos := data.len() - 1
     while pos > 0 and data[pos] == 0:
         pos = pos - 1
@@ -933,10 +939,19 @@ fn parse_client_psk_extension(body: Bytes, extension_body_start: Int, extension_
     while binary.remaining(br) > 0:
         binder_len := checked_read(binary.read_u8(br))!
         entry := checked_bytes(binary.read_bytes(br, binder_len))!
+        # a binder is an hmac over the suite's hash: 32 or 48 bytes. any other
+        # size can never verify, and rfc 8446 §4.2.11.2 names decrypt_error
+        # for a binder that does not check out (the caller maps this message).
+        if entry.len() != 32 and entry.len() != 48:
+            fail "tls psk binder has an invalid length"
         if binder_count == 0:
             binder = entry
         binder_count = binder_count + 1
-    if identity_count == 0 or binder_count != identity_count:
+    if binder_count == 0 or identity_count == 0:
+        # a psk offer with an empty identities or binders vector violates the
+        # message grammar outright (rfc 8446 §4.2.11: both are <1..>-vectors).
+        fail "tls psk offer has no binders"
+    if binder_count != identity_count:
         fail "tls psk identities and binders do not correspond"
     if binder.len() == 0:
         fail "tls psk binder is empty"
@@ -982,6 +997,10 @@ fn parse_client_hello_extensions(body: Bytes, extensions: Bytes) -> ParsedClient
         elif extension_type == EXT_PRE_SHARED_KEY:
             psk = parse_client_psk_extension(body, extension_body_start, extension_offset, data)!
         extension_offset = extension_offset + 4 + data_len
+    # rfc 8446 §4.2.9: a psk offer without psk_key_exchange_modes must abort
+    # the handshake (with missing_extension — the caller maps this message).
+    if psk.identity.len() > 0 and not seen_extensions.contains(EXT_PSK_KEY_EXCHANGE_MODES):
+        fail "tls psk offered without key exchange modes"
     return ParsedClientHelloExtensions(supported_versions, signature_schemes, server_name, alpn_protocols, key_share, psk_mode_dhe, psk)
 
 # Parse a ClientHello body for the TLS 1.3 server path. Fails unless the client
@@ -1050,6 +1069,7 @@ pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher
 # which version to negotiate and, on the 1.2 fallback path, to pick a suite and
 # a curve. Unlike parse_client_hello it never fails for lacking a 1.3 key share.
 pub struct LenientClientHello:
+    pub key_share_present: Bool
     pub random: Bytes
     pub session_id: Bytes
     pub cipher_suites: List[Int]
@@ -1100,6 +1120,7 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
     mut extended_master_secret := false
     mut secure_renegotiation := false
     mut signature_schemes: List[Int] := []
+    mut key_share_present := false
     mut seen_extensions: List[Int] := []
     if binary.remaining(r) > 0:
         extension_len := checked_read(binary.read_u16_be(r))!
@@ -1128,9 +1149,11 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
                 secure_renegotiation = true
             elif extension_type == EXT_SIGNATURE_ALGORITHMS:
                 signature_schemes = parse_signature_scheme_list(data)!
+            elif extension_type == EXT_KEY_SHARE:
+                key_share_present = true
     if binary.remaining(r) != 0:
         fail "trailing tls client hello bytes"
-    return LenientClientHello(random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols, extended_master_secret, secure_renegotiation, legacy_version, signature_schemes)
+    return LenientClientHello(key_share_present, random, session_id, cipher_suites, supported_versions, supported_groups, server_name, alpn_protocols, extended_master_secret, secure_renegotiation, legacy_version, signature_schemes)
 
 # The protocol version a server negotiated, read from a ServerHello body: the
 # supported_versions extension value when present (a 1.3 server always sends it),
@@ -1435,10 +1458,28 @@ pub fn parse_new_session_ticket(body: Bytes) -> NewSessionTicketMessage!:
     ticket_len := checked_read(binary.read_u16_be(r))!
     ticket := checked_bytes(binary.read_bytes(r, ticket_len))!
     extension_len := checked_read(binary.read_u16_be(r))!
-    # the extensions block (e.g. early_data) is read and discarded — RFC 8446
-    # §4.6.1 allows it and requires ignoring unknown ones. rejecting it here
-    # poisoned an otherwise-complete connection.
-    checked_bytes(binary.read_bytes(r, extension_len))!
+    # the extensions (e.g. early_data) are walked but their unknown values are
+    # ignored — RFC 8446 §4.6.1 requires tolerating them. the block's shape is
+    # still validated: no duplicate types, and a flags extension
+    # (draft-ietf-tls-tlsflags) must be non-empty and minimally encoded.
+    ticket_extensions := checked_bytes(binary.read_bytes(r, extension_len))!
+    er := binary.reader(ticket_extensions)
+    mut seen_ticket_extensions: List[Int] := []
+    while binary.remaining(er) > 0:
+        ticket_ext_type := checked_read(binary.read_u16_be(er))!
+        ticket_ext_len := checked_read(binary.read_u16_be(er))!
+        ticket_ext_data := checked_bytes(binary.read_bytes(er, ticket_ext_len))!
+        if seen_ticket_extensions.contains(ticket_ext_type):
+            fail "duplicate tls new session ticket extension"
+        seen_ticket_extensions.push(ticket_ext_type)
+        if ticket_ext_type == EXT_TLS_FLAGS:
+            fr := binary.reader(ticket_ext_data)
+            flags_len := checked_read(binary.read_u8(fr))!
+            flag_bytes := checked_bytes(binary.read_bytes(fr, flags_len))!
+            if flag_bytes.len() == 0 or binary.remaining(fr) != 0:
+                fail "malformed tls ticket flags"
+            if flag_bytes[flag_bytes.len() - 1] == 0:
+                fail "tls ticket flags are not minimally encoded"
     if binary.remaining(r) != 0:
         fail "trailing tls new session ticket bytes"
     return NewSessionTicketMessage(lifetime, age_add, nonce, ticket)

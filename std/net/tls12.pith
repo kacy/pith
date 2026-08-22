@@ -204,7 +204,20 @@ pub fn has_downgrade_sentinel(server_random: Bytes) -> Bool:
     if server_random.len() != 32:
         return false
     tail := bytes.slice(server_random, 24, 32)
+    if bytes.eq(tail, jdk11_downgrade_random()):
+        # jdk 11 shipped a broken variant of the sentinel (a fixed random
+        # value instead of the rfc bytes); it marks the same downgrade.
+        return true
     return bytes.eq(tail, downgrade_sentinel_tls12()) or bytes.eq(tail, downgrade_sentinel_tls11())
+
+# The non-standard downgrade marker JDK 11 sends in place of the RFC 8446
+# sentinel.
+fn jdk11_downgrade_random() -> Bytes:
+    out := bytes.buffer_with_capacity(8)
+    defer out.free()
+    for value in [237, 191, 180, 168, 194, 71, 16, 255]:
+        out.write_byte(value) catch 0
+    return out.bytes()
 
 # ---------------------------------------------------------------
 # record protection
@@ -371,6 +384,9 @@ pub fn server_hello_extension_types(body: Bytes) -> List[Int]!:
     checked_read(binary.read_u16_be(r))!
     checked_bytes(binary.read_bytes(r, 32))!
     session_id_len := checked_read(binary.read_u8(r))!
+    # rfc 5246 §7.4.1.3 caps a session id at 32 bytes.
+    if session_id_len > 32:
+        fail "tls session id too long"
     checked_bytes(binary.read_bytes(r, session_id_len))!
     checked_read(binary.read_u16_be(r))!
     checked_read(binary.read_u8(r))!
@@ -396,6 +412,9 @@ pub fn parse_server_hello(body: Bytes) -> Tls12ServerHello!:
     version := checked_read(binary.read_u16_be(r))!
     random := checked_bytes(binary.read_bytes(r, 32))!
     session_id_len := checked_read(binary.read_u8(r))!
+    # rfc 5246 §7.4.1.3 caps a session id at 32 bytes.
+    if session_id_len > 32:
+        fail "tls session id too long"
     session_id := checked_bytes(binary.read_bytes(r, session_id_len))!
     cipher := checked_read(binary.read_u16_be(r))!
     compression := checked_read(binary.read_u8(r))!

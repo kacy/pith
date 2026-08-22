@@ -165,6 +165,9 @@ ALERT_DECODE_ERROR := 50
 ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
+ALERT_INAPPROPRIATE_FALLBACK := 86
+ALERT_MISSING_EXTENSION := 109
+ALERT_NO_RENEGOTIATION := 100
 ALERT_UNSUPPORTED_EXTENSION := 110
 
 # the compatibility change_cipher_spec carries exactly one byte of value 1
@@ -179,6 +182,7 @@ MAX_HANDSHAKE_CHANGE_CIPHER_SPEC := 8
 
 TLS_VERSION_13 := 772
 TLS_VERSION_12 := 771
+TLS_FALLBACK_SCSV := 22016
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_AES_256_GCM_SHA384 := 4866
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
@@ -313,6 +317,12 @@ struct NativeConnState:
     # no KeyUpdate.
     mut read_secret: Bytes
     mut write_secret: Bytes
+    # KeyUpdates received since the last application-data record — a flood
+    # guard — and whether we already answered an update_requested since our
+    # last write (rfc 8446 §4.6.3 lets a receiver coalesce several requests
+    # into one response, and strict peers refuse extra responses).
+    mut key_updates_received: Int
+    mut key_update_responded: Bool
 
 mut native_conn_mu := Mutex()
 mut native_conn_states: Map[Int, NativeConnState] := {}
@@ -670,11 +680,18 @@ fn seal_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, con
 # paths call the version-specific functions directly.
 fn open_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
     if version == TLS_VERSION_12:
+        mut opened := tls13.Record(0, TLS_VERSION_12, bytes.empty())
         if tls12.suite_uses_chacha(cipher):
             chacha := tls12.open_chacha20_poly1305(key, iv, sequence, record)!
-            return tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
-        gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
-        return tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
+            opened = tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
+        else:
+            gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
+            opened = tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
+        # rfc 5246 §6.2.1: a 1.2 plaintext fragment is capped at 2^14 bytes;
+        # the ciphertext bound admits more, so check after decryption.
+        if opened.payload.len() > tls13.MAX_PLAINTEXT_RECORD:
+            fail "tls record overflow"
+        return opened
     return open_record_for_cipher(cipher, key, iv, sequence, record)
 
 fn seal_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
@@ -1041,7 +1058,7 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
     return session
 
 fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret)
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret, key_updates_received: 0, key_update_responded: false)
     return Conn(native_conn_register(cs))
 
 # write a plaintext fatal alert before tearing a handshake down, so the peer
@@ -1164,7 +1181,11 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     p256pair := ecdh.p256_keypair()!
     errdefer p256pair.close()
     client_random := random.bytes(32)!
-    session_id := random.bytes(32)!
+    # the 32-byte legacy_session_id is 1.3 middlebox-compatibility theater
+    # (rfc 8446 D.4); a hello capped at 1.2 sends none, like a real 1.2 client.
+    mut session_id := bytes.empty()
+    if not config_max_is_tls12(config):
+        session_id = random.bytes(32)!
     alpn_protocols := config_alpn_protocols(config)
     mut cache_key := ""
     mut cached_session := empty_cached_session()
@@ -1179,7 +1200,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
             transcript.write(client_hello)!
-            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, true, cache_key, transcript)
+            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, true, cache_key, transcript)
     # a non-resumption hello offers the TLS 1.2 fallback unless the config is
     # locked to 1.3. resumption is a 1.3-only path (a 1.2 ticket is never
     # cached), so its hello above stays 1.3-only.
@@ -1195,7 +1216,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
     transcript := bytes.buffer()
     transcript.write(client_hello)!
-    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
+    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
 
 # send a plaintext ChangeCipherSpec record (the single 0x01 byte) — the marker
 # that the sender's next record is under the newly negotiated 1.2 keys.
@@ -1320,7 +1341,7 @@ fn scan_tls12_server_flight(stream: TcpStream, flight: Bytes) -> Bool!:
             fail "unexpected tls 1.2 handshake message"
     return have_done
 
-fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
+fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
     # the whole 1.2 server flight is plaintext, so every rejection below can
     # answer with a plaintext fatal alert before the socket closes, mirroring
     # what the server side does for a hello it refuses.
@@ -1328,9 +1349,22 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         if not client_offered_tls12_extension(ext_type, server_name != "", config_alpn_protocols(config).len() > 0):
             send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
             fail "server sent an unoffered tls 1.2 extension"
-    hello := tls12.parse_server_hello(server_hello_message.body) catch:
+    parsed_hello := tls12.parse_server_hello(server_hello_message.body)
+    if parsed_hello.is_err:
+        # selecting a compression method we never offered is a negotiation
+        # violation with its own alert; anything else is a parse failure.
+        if parsed_hello.err == "tls 1.2 server selected a compression method":
+            send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+            fail "tls 1.2 server selected a compression method"
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls 1.2 server hello"
+    hello := parsed_hello.ok
+    # a 1.2 server echoing the session id we offered claims to resume a
+    # session that does not exist — this stack never offers 1.2 resumption,
+    # and the id it sends is the 1.3 compatibility placeholder.
+    if session_id.len() > 0 and bytes.eq(hello.session_id, session_id):
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls 1.2 server echoed the compatibility session id"
     # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
     # not mark its random. the sentinel means a 1.3-capable server fell back to
     # 1.2 — our 1.3 offer was stripped by an active attacker.
@@ -1490,7 +1524,7 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # application record in each direction is sequence 1.
     return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, server_finished.records_read, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
 
-fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
+fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
     mut transcript_buf := transcript
     alpn_protocols := config_alpn_protocols(config)
     mut peer := empty_peer_identity()
@@ -1534,7 +1568,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         mut server_flight_prefix := bytes.empty()
         if hello_bytes.len() > server_hello_encoded_len:
             server_flight_prefix = hello_bytes.slice(server_hello_encoded_len, hello_bytes.len())
-        return native_client_handshake_tls12(stream, server_name, config, client_random, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
+        return native_client_handshake_tls12(stream, server_name, config, client_random, session_id, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
     if negotiated != TLS_VERSION_13:
         send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
         fail "server negotiated an unsupported tls version"
@@ -1550,6 +1584,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls server hello"
+    # rfc 8446 §4.1.3: legacy_session_id_echo must equal what we offered; a
+    # mismatch means the hello answers someone else's offer.
+    if not bytes.eq(server_hello.session_id, session_id):
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls server hello echoed a different session id"
     transcript_append(transcript_buf, server_messages[0])!
 
     # the server picked one of our offered groups; derive with that keypair.
@@ -1613,7 +1652,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+            # a plaintext handshake record where ciphertext is due is, to the
+            # record layer, data that fails to authenticate — bad_record_mac,
+            # the same verdict a garbled ciphertext earns.
+            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
             fail "expected encrypted tls handshake record"
         inner := open_record_for_cipher(server_hello.cipher_suite, server_hs_keys.key, server_hs_keys.iv, server_hs_seq, record_bytes(record)!) catch:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
@@ -1848,10 +1890,10 @@ fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
     return 0
 
 # pick an ECDHE curve from the client's supported_groups (x25519 preferred).
-# a client that sent no groups is treated as offering x25519, which every peer
-# that reaches this fallback supports.
+# every suite this server offers is ECDHE, so a client that advertised no
+# usable curve — or no supported_groups at all — has nothing to negotiate.
 fn select_tls12_curve(groups: List[Int]) -> Int:
-    if groups.len() == 0 or groups.contains(tls12.NAMED_CURVE_X25519):
+    if groups.contains(tls12.NAMED_CURVE_X25519):
         return tls12.NAMED_CURVE_X25519
     if groups.contains(tls12.NAMED_CURVE_SECP256R1):
         return tls12.NAMED_CURVE_SECP256R1
@@ -2035,11 +2077,25 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls client hello"
-    # rfc 8446 §4.1.2 froze the client hello's legacy_version at 0x0303. every
-    # protocol this stack speaks needs at least that on the wire, so a lower
-    # value is a pre-1.2 client or a tampered hello, and is refused whichever
-    # version the supported_versions extension goes on to claim.
-    if lenient_hello.legacy_version < TLS_VERSION_12:
+    # rfc 7507: a client that fell back from a higher version marks the retry
+    # with TLS_FALLBACK_SCSV in its cipher list. when the fallback landed
+    # below the best version this server speaks, the original attempt was cut
+    # short by something other than us — answer inappropriate_fallback so the
+    # client retries at full strength instead of settling.
+    mut client_best := lenient_hello.legacy_version
+    if lenient_hello.supported_versions.len() > 0:
+        client_best = 0
+        for offered_version in lenient_hello.supported_versions:
+            if offered_version > client_best:
+                client_best = offered_version
+    if lenient_hello.cipher_suites.contains(TLS_FALLBACK_SCSV) and client_best < TLS_VERSION_13:
+        send_fatal_alert(stream, ALERT_INAPPROPRIATE_FALLBACK) catch 0
+        fail "tls client signalled an inappropriate fallback"
+    # rfc 8446 §4.1.2 froze the client hello's legacy_version at 0x0303, and
+    # §4.2.1 makes supported_versions authoritative when present — the legacy
+    # field is only meaningful without the extension, where a lower value is a
+    # pre-1.2 client this stack does not speak.
+    if lenient_hello.supported_versions.len() == 0 and lenient_hello.legacy_version < TLS_VERSION_12:
         send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
         fail "tls client hello legacy version below 1.2"
     if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
@@ -2068,12 +2124,37 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
             fail "no supported tls 1.2 cipher suite offered"
         return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
-    client_hello := tls13.parse_client_hello(client_messages[0].body) catch:
-        # the lenient parse and version checks above already passed, so what
-        # remains wrong here is a parameter: a key share in a group this stack
-        # does not serve, a missing required extension, a non-null compression.
+    # rfc 8446 §9.2: a 1.3 client hello must carry supported_groups; one
+    # without it gets the missing_extension alert rather than a parameter
+    # complaint.
+    if lenient_hello.supported_groups.len() == 0:
+        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+        fail "tls client hello is missing supported groups"
+    # rfc 8446 §9.2 also demands a key_share (this stack serves no psk-only
+    # mode); absence has its own alert, and the lenient walk saw every
+    # extension regardless of ordering quirks the strict parser rejects.
+    if not lenient_hello.key_share_present:
+        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+        fail "tls client hello is missing a key share"
+    parsed_client_hello := tls13.parse_client_hello(client_messages[0].body)
+    if parsed_client_hello.is_err:
+        # the lenient parse and version checks above already passed. a psk
+        # offer lacking its companion modes extension has its own alert
+        # (rfc 8446 §4.2.9); what else remains wrong is a parameter — a key
+        # share in a group this stack does not serve, a malformed psk offer,
+        # a non-null compression.
+        if parsed_client_hello.err == "tls psk offered without key exchange modes":
+            send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+            fail "tls psk offered without key exchange modes"
+        if parsed_client_hello.err == "tls psk offer has no binders":
+            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+            fail "tls psk offer has no binders"
+        if parsed_client_hello.err == "tls psk binder has an invalid length":
+            send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
+            fail "tls psk binder failed verification"
         send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
         fail "unsupported tls client hello"
+    client_hello := parsed_client_hello.ok
     handshake_config := select_server_config(config, client_hello) catch:
         send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
         fail "no server configuration for this client hello"
@@ -2276,7 +2357,11 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "excess data after tls client finished"
 
-    initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
+    # rfc 8446 §4.6.1: a ticket is only useful to a client that offered the
+    # psk_dhe_ke mode; one that did not gets none.
+    mut initial_write_seq := 0
+    if client_hello.psk_mode_dhe:
+        initial_write_seq = send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
     state := connection_state_from_peer(TLS_VERSION_13, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
     return allocate_native_conn(stream, TLS_VERSION_13, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state, client_app_secret, server_app_secret)
@@ -2370,6 +2455,11 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
 
     stream := TcpStream(cs.fd)
     cipher := cs.cipher
+    # per-read DoS guards: a peer streaming empty records or warning alerts
+    # costs a decrypt each without ever yielding data, so both are capped
+    # within one read call (mirroring the limits BoringSSL enforces).
+    mut empty_records := 0
+    mut warning_alerts := 0
     while true:
         record := read_conn_record_alerting(cs, stream)!
         # after the handshake every legitimate record is application_data (it
@@ -2386,22 +2476,52 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # injected plaintext record, not a compatibility artifact.
             send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "change cipher spec after tls handshake"
-        if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+        # tls 1.3 wraps every post-handshake record as application_data, so any
+        # other outer type is plaintext injection. tls 1.2 keeps the real
+        # content type on the (encrypted) record, so alert and handshake outer
+        # types are legitimate there and only decrypt below.
+        if cs.version == TLS_VERSION_13 and record.content_type != TLS_CONTENT_APPLICATION_DATA:
             send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "unencrypted tls record after handshake"
+        if cs.version == TLS_VERSION_12 and record.content_type != TLS_CONTENT_APPLICATION_DATA and record.content_type != TLS_CONTENT_ALERT and record.content_type != TLS_CONTENT_HANDSHAKE:
+            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+            fail "unexpected tls record after handshake"
         seq := cs.read_seq
         cs.read_seq = seq + 1
-        inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!) catch:
+        opened := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)
+        if opened.is_err:
+            # an oversized plaintext is a protocol violation with its own
+            # alert; everything else that fails to open is a bad tag.
+            if opened.err == "tls record overflow":
+                send_conn_fatal_alert(cs, ALERT_RECORD_OVERFLOW) catch 0
+                fail "tls plaintext record overflow"
             send_conn_fatal_alert(cs, ALERT_BAD_RECORD_MAC) catch 0
             fail "tls record failed to open"
+        inner := opened.ok
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
             alert := tls13.parse_alert(inner.payload) catch:
                 send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                 fail "malformed tls alert"
+            if alert.level != 1 and alert.level != 2:
+                send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "unknown tls alert level"
             if alert.description == tls13.ALERT_CLOSE_NOTIFY:
                 return bytes.empty()
+            if alert.level == 1:
+                # tls 1.3 has no warning alerts besides close_notify (rfc 8446
+                # §6); one is a peer error. tls 1.2 warning alerts are advisory
+                # and skipped, but only a few times — a stream of them burns a
+                # decrypt each while yielding nothing.
+                if cs.version == TLS_VERSION_13:
+                    send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                    fail "unexpected tls warning alert"
+                warning_alerts = warning_alerts + 1
+                if warning_alerts > 4:
+                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+                    fail "too many tls warning alerts"
+                continue
             fail "tls alert " + tls13.alert_description_name(alert.description)
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             if inner.payload.len() == 0:
@@ -2416,12 +2536,26 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             messages := tls13.decode_handshakes_prefix(combined)
             config_put(native_conn_handshake_pending, handle, combined.slice(tls13.handshakes_encoded_len(messages), combined.len()))
             for message in messages:
+                # a HelloRequest to a client or ClientHello to a server on an
+                # established 1.2 connection is a renegotiation attempt; this
+                # stack refuses renegotiation (rfc 5746 makes the refusal
+                # explicit with the no_renegotiation alert).
+                if cs.version == TLS_VERSION_12 and (message.message_type == tls12.TLS12_HELLO_REQUEST or message.message_type == tls12.TLS12_CLIENT_HELLO):
+                    send_conn_fatal_alert(cs, ALERT_NO_RENEGOTIATION) catch 0
+                    fail "tls renegotiation refused"
                 if message.message_type == tls13.HANDSHAKE_KEY_UPDATE:
                     apply_peer_key_update(cs, cipher, message) catch:
                         send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                         fail "malformed tls key update"
                 else:
-                    remember_client_ticket_from_message(handle, cipher, message) catch:
+                    remembered := remember_client_ticket_from_message(handle, cipher, message)
+                    if remembered.is_err:
+                        # a structurally broken ticket is a decode error; one
+                        # whose flags are duplicated or padded is a bad
+                        # parameter.
+                        if remembered.err == "tls ticket flags are not minimally encoded" or remembered.err == "duplicate tls new session ticket extension":
+                            send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
+                            fail "invalid tls session ticket"
                         send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                         fail "malformed tls session ticket"
             continue
@@ -2430,7 +2564,12 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # a zero-length application record is legal (padding / traffic
             # shaping); skip it rather than returning empty, which the caller
             # reads as a clean close_notify end-of-stream.
+            cs.key_updates_received = 0
             if payload.len() == 0:
+                empty_records = empty_records + 1
+                if empty_records > 32:
+                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+                    fail "too many empty tls records"
                 continue
             if payload.len() > size:
                 cs.pending = payload.slice(size, payload.len())
@@ -2462,6 +2601,9 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     cs.write_seq = seq + 1
     record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
     native_write_all(stream, record)!
+    # an application write opens a new coalescing window: the next
+    # update_requested from the peer earns a fresh KeyUpdate response.
+    cs.key_update_responded = false
     return count
 
 # send a close_notify alert, best-effort, before the socket closes. this is
@@ -2522,6 +2664,11 @@ fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool)
 fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
     if cs.version != TLS_VERSION_13 or cs.read_secret.len() == 0:
         fail "unexpected key update on a non-1.3 connection"
+    # a peer streaming KeyUpdates costs a full key derivation each while
+    # yielding no data; bound how many arrive between application records.
+    cs.key_updates_received = cs.key_updates_received + 1
+    if cs.key_updates_received > 32:
+        fail "too many tls key updates"
     request_peer_update := tls13.parse_key_update(message.body)!
     next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.read_secret)!
     keys := traffic_keys_for_cipher(cipher, next_secret)!
@@ -2529,8 +2676,12 @@ fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.Handsh
     cs.read_iv = keys.iv
     cs.read_seq = 0
     cs.read_secret = next_secret
-    if request_peer_update:
+    if request_peer_update and not cs.key_update_responded:
+        # several requests may arrive before we next write; answer the batch
+        # with one KeyUpdate (rfc 8446 §4.6.3) — a strict peer treats a second
+        # response as unsolicited.
         rotate_send_keys(cs, cipher, false)!
+        cs.key_update_responded = true
     return true
 
 # send a KeyUpdate that asks the peer to rekey too, and rotate our send keys.

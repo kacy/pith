@@ -39,8 +39,10 @@ end
 ```
 
 open any `.pith` file inside a project (a directory with a `pith.toml`
-or `.git`) and diagnostics, hover (`K`), document symbols, and
-formatting (`vim.lsp.buf.format()`) work out of the box.
+or `.git`) and the server works out of the box: diagnostics, hover (`K`),
+go-to-definition, references, completion, document and workspace symbols,
+rename, code actions, signature help, inlay hints, semantic tokens, and
+formatting (`vim.lsp.buf.format()`).
 
 if `pith` is not on your PATH, put an absolute path in `pith_cmd`.
 pointing it straight at the frontend binary — for example

@@ -1,51 +1,33 @@
-# Pith Style Guide
+# style guide
 
-This guide establishes best practices for writing readable, maintainable Pith code. The goal is code that humans can understand quickly and reason about confidently.
+how to write pith that reads well. the goal is code someone else can follow
+quickly and change confidently.
 
-## Core Philosophy
+code is read far more often than it is written, so when the two conflict:
+clarity over brevity, explicit over clever, consistency over novelty.
 
-> **Code is read much more often than it is written.**
+## naming
 
-- Clarity over brevity
-- Explicit over clever
-- Consistency over novelty
+use descriptive names. single letters are fine in three places: loop indices
+(`i`, `j`), a receiver in a short method (`p` for a `Point`), and mathematical
+conventions (`x`, `y` for coordinates). everywhere else, spell it out.
 
-These principles are adapted from Go's readability philosophy, tailored for Pith's specific features and constraints.
-
----
-
-## Naming Conventions
-
-### Variables
-
-Use descriptive names. Avoid single-letter variables except in these specific cases:
-
-**OK to use single letters:**
-- Loop indices: `i`, `j`, `k` for nested loops
-- Receivers in short methods: `p` for a `Point` receiver in a 3-line function
-- Mathematical conventions: `x`, `y` for coordinates in geometry code
-
-**Always use full words:**
 ```pith
-# GOOD
+# good
 mut character_index := 0
 mut current_line := ""
-mut total_count := 0
 mut buffer_capacity := 1024
 
-# BAD - cryptic abbreviations
+# bad
 mut pos := 0
 mut cur := ""
-mut cnt := 0
 mut cap := 1024
 ```
 
-### Loop Variables
-
-Use the full name of what you're iterating over:
+name a loop variable after what it holds:
 
 ```pith
-# GOOD
+# good
 for item in items:
     process(item)
 
@@ -53,80 +35,36 @@ for character in input_line:
     if is_whitespace(character):
         continue
 
-# BAD - cryptic
+# bad
 for n in items:
     process(n)
-
-for c in line:
-    if is_ws(c):
-        continue
 ```
 
-For index-based iteration, use meaningful names:
+for index-based loops, `i` is fine when the body is short and the intent is
+obvious; reach for a real name when the loop runs long or nests.
 
 ```pith
-# GOOD
 mut line_index := 0
 while line_index < lines.len():
-    current_line := lines[line_index]
-    process_line(current_line)
+    process_line(lines[line_index])
     line_index = line_index + 1
-
-# OK for simple cases
-mut i := 0
-while i < items.len():
-    process(items[i])
-    i = i + 1
 ```
 
-### Function Parameters
-
-Parameters should be descriptive, especially when the function is public or long:
-
-```pith
-# GOOD - public API
-pub fn read_file_contents(file_path: String) -> String:
-    return read_file(file_path)
-
-# GOOD - short helper with clear context
-fn is_whitespace(char: String) -> Bool:
-    return char == " " or char == "\t" or char == "\n"
-
-# BAD - cryptic
-fn read(p: String) -> String:
-    return read_file(p)
-
-fn is_ws(c: String) -> Bool:
-    return c == " " or c == "\t"
-```
-
-### Function Names
-
-All functions use `snake_case`. Names should describe what the function does:
+functions are `snake_case` and say what they do. predicates returning `Bool`
+start with `is_`, `has_`, or `can_`.
 
 ```pith
-# GOOD
+# good
 fn calculate_checksum(data: String) -> Int:
 fn parse_http_request(raw_request: String) -> Request:
-fn validate_email_address(address: String) -> Bool:
+fn is_valid_email(address: String) -> Bool:
 
-# BAD - vague
+# bad
 fn calc(s: String) -> Int:
-fn parse(r: String) -> Request:
 fn check(a: String) -> Bool:
 ```
 
-**Predicate functions** (returning Bool) should start with `is_`, `has_`, or `can_`:
-
-```pith
-fn is_valid_email(address: String) -> Bool:
-fn has_permission(user: User, resource: String) -> Bool:
-fn can_execute(command: String) -> Bool:
-```
-
-### Type Names
-
-All types use `PascalCase`:
+types are `PascalCase`. the linter enforces both conventions (E300 and E301).
 
 ```pith
 struct HttpRequest:
@@ -134,451 +72,270 @@ struct HttpRequest:
     pub path: String
     pub headers: List[Header]
 
-struct Header:
-    pub name: String
-    pub value: String
-
 type UserId = Int
-type EmailAddress = String
 ```
 
----
+## organization
 
-## Code Organization
-
-### Group Related Declarations
-
-Separate logical sections with blank lines:
+group related declarations and separate the groups with a blank line.
 
 ```pith
-# GOOD
 mut input_buffer := ""
 mut output_buffer := ""
 
 mut current_position := 0
 mut total_lines := 0
-
-# BAD - jumbled
-mut buf1 := ""
-mut pos := 0
-mut buf2 := ""
-mut lines := 0
 ```
 
-### Keep Functions Small
-
-A function should do one thing. If you can't describe it in a single sentence, it might be too big.
-
-```pith
-# GOOD - clear purpose
-pub fn read_configuration_file(path: String) -> Configuration:
-    raw_contents := read_file(path)
-    return parse_configuration(raw_contents)
-
-# GOOD - helper for single task
-fn parse_configuration(contents: String) -> Configuration:
-    mut config := Configuration{}
-    mut current_section := ""
-    # ... parsing logic ...
-    return config
-
-# BAD - doing too much
-pub fn load_and_parse_and_validate_and_return_config(p: String) -> Configuration:
-    # 50 lines of mixed concerns
-```
-
-### Early Returns
-
-Prefer early returns over deep nesting:
+keep functions small. if you cannot describe one in a sentence, it is doing
+too much. prefer early returns to deep nesting:
 
 ```pith
-# GOOD - flat, readable
-fn find_user_by_id(users: List[User], target_id: Int) -> Option[User]:
+fn find_active_user(users: List[User], target_id: Int) -> User?:
     for user in users:
         if user.id != target_id:
             continue
         if not user.is_active:
             continue
-        return Some(user)
-    return None
-
-# BAD - deeply nested
-fn find_user_by_id(users: List[User], target_id: Int) -> Option[User]:
-    for user in users:
-        if user.id == target_id:
-            if user.is_active:
-                return Some(user)
-    return None
+        return user
+    return none
 ```
 
----
+the nested version of the same function is harder to extend, because every new
+condition adds a level rather than a line.
 
-## Comments and Documentation
+## comments
 
-### Public API Documentation
-
-Every public function must have a doc comment. The comment should explain:
-1. What the function does
-2. What parameters it accepts
-3. What it returns
-4. Any error conditions
+every `pub` item needs a doc comment — a `#` comment on the line directly above
+it. this is enforced (E304), and it is what the documentation site renders.
 
 ```pith
-# Reads the entire contents of a file at the given path.
-# Returns the file contents as a string.
-# Returns an empty string if the file doesn't exist.
-# Errors if the file cannot be read (permissions, etc.).
-pub fn read_file(path: String) -> String:
-    return read_file_internal(path)
+# Read a whole file as text. Fails when the file is missing or unreadable.
+pub fn read_config(path: String) -> String!:
+    return fs.read(path)!
 ```
 
-### Internal Comments
-
-Use comments to explain *why*, not *what*:
+inside a function, explain *why*, not *what*. the code already says what.
 
 ```pith
-# GOOD - explains the reasoning
-# We use a simple linear scan because the list is always small (< 100 items).
+# good: a linear scan beats a map here — the list is never above ~100 entries
 mut current_index := 0
-while current_index < items.len():
-    # ...
 
-# BAD - states the obvious
-# Increment the index by 1
+# bad: increment the index by one
 current_index = current_index + 1
 ```
 
-### Section Comments
+## errors and optionals
 
-Use section comments to group related functionality:
+pith has two failure shapes and they mean different things. an optional (`T?`,
+returning `none`) is for an absence that is ordinary and expected. a result
+(`T!`, built with `fail`) is for an operation that could not be completed.
 
-```pith
-# ============================================================
-# File Operations
-# ============================================================
-
-pub fn read_file(path: String) -> String:
-    # ...
-
-pub fn write_file(path: String, contents: String):
-    # ...
-
-# ============================================================
-# Directory Operations  
-# ============================================================
-
-pub fn list_directory(path: String) -> List[String]:
-    # ...
-```
-
----
-
-## Error Handling
-
-### Use the Error Operator for Simple Cases
+propagate with `!` when the caller cannot do better:
 
 ```pith
-# GOOD - simple error propagation
 pub fn load_user_data(user_id: Int) -> UserData!:
-    raw_data := fetch_from_database(user_id)!  # propagate errors
-    return parse_user_data(raw_data)
+    raw := fetch_from_database(user_id)!
+    return parse_user_data(raw)
 ```
 
-### Handle Errors Explicitly for Complex Cases
+handle explicitly when you can add context. `.is_err` and `.err` are fields,
+not method calls:
 
 ```pith
-# GOOD - explicit error handling with context
-pub fn save_configuration(config: Configuration, path: String) -> Result[Unit, String]:
-    json_string := serialize_to_json(config)
-    
-    write_result := write_file_safe(path, json_string)
-    if write_result.is_err():
-        error_message := "Failed to save config to " + path + ": " + write_result.error()
-        return Err(error_message)
-    
-    return Ok(Unit)
+pub fn save_configuration(config: Configuration, path: String) -> Int!:
+    written := fs.write(path, encode_config(config))
+    if written.is_err:
+        fail "could not save config to {path}: {written.err}"
+    return 0
 ```
 
----
-
-## Common Patterns
-
-### String Building
+consume an optional by testing it, or with `unwrap_or` for a default. `?`
+unwraps, and needs a `T!` context to propagate the empty case into:
 
 ```pith
-# GOOD - descriptive variable names
+fn describe(users: List[User], target_id: Int) -> String!:
+    found := find_active_user(users, target_id)
+    if found == none:
+        fail "no active user with that id"
+    return found?.name
+```
+
+## common patterns
+
+building a string:
+
+```pith
 mut result_lines := ""
 for line in input_lines:
-    trimmed_line := trim_whitespace(line)
+    trimmed_line := line.trim()
     if trimmed_line.len() == 0:
         continue
     result_lines = result_lines + trimmed_line + "\n"
 ```
 
-### Working with Collections
+a collection literal with no elements needs a type, either from an annotation
+or from the first thing stored into it:
 
 ```pith
-# GOOD - use descriptive names
-mut active_users := [] as List[User]
+mut active_users: List[User] := []
 for user in all_users:
     if not user.is_active:
-        continue
-    if user.last_login_days > 30:
         continue
     active_users.push(user)
 ```
 
-### Mathematical Operations
+mathematical code may use conventional short names:
 
 ```pith
-# OK - mathematical conventions apply
 fn calculate_distance(x1: Float, y1: Float, x2: Float, y2: Float) -> Float:
     dx := x2 - x1
     dy := y2 - y1
-    return square_root(dx * dx + dy * dy)
+    return math.sqrt(dx * dx + dy * dy)
 ```
 
----
+## what to avoid
 
-## Anti-Patterns to Avoid
+**cryptic abbreviations.** `g_ooff` is not a name. `buf`, `tmp`, and `cur` are
+barely better. write `buffer`, `temporary_file`, `current_user`.
 
-### 1. Cryptic Abbreviations
+**mixing abbreviation styles.** pick one and hold it. `current_position` next
+to `pos` next to `idx` next to `current_pos` means four names for one idea.
 
-```pith
-# BAD
-g_ooff  # What is this? Object offset? Outgoing offer?
-buf
-tmp
-cur
-
-# GOOD
-global_object_offset
-buffer
-temporary_file
-current_user
-```
-
-### 2. Mixing Abbreviation Styles
+**deep nesting.** invert the conditions and return early instead:
 
 ```pith
-# BAD - inconsistent
-current_position
-pos
-idx
-current_index
-current_pos
-
-# GOOD - consistent
-current_position
-next_position
-start_position
-end_position
-```
-
-### 3. Deep Nesting
-
-```pith
-# BAD
-if condition_a:
-    if condition_b:
-        if condition_c:
-            do_something()
-
-# GOOD
 if not condition_a:
     return
 if not condition_b:
     return
-if not condition_c:
-    return
 do_something()
 ```
 
-### 4. Long Chains of Single Letters
+**long chains of single letters.** cryptographic and codec code attracts these,
+and it is exactly the code that most needs to be checkable by eye. name the
+state (`hash_state_a`) or, when the spec's own letters are the clearest
+reference, say so in a comment above the block.
+
+## abbreviations that are fine
+
+these are common enough to read as words:
+
+| short | means | use it for |
+|-------|-------|------------|
+| `ctx` | context | request or execution context |
+| `cfg` | configuration | when `config` is already taken |
+| `err` | error | a local error value |
+| `id` | identifier | ids of any kind |
+| `req` | request | http and rpc handlers |
+| `resp` | response | http and rpc handlers |
+
+when in doubt, spell it out.
+
+## file structure
+
+start a file with a short description of what the module is for:
 
 ```pith
-# BAD - cryptographic code becomes unreadable
-mut a := h0
-mut b := h1
-mut c := h2
-# ...
-
-# BETTER - use descriptive names or add comments
-mut hash_state_a := initial_hash_value_a
-mut hash_state_b := initial_hash_value_b
-# ...
-```
-
----
-
-## Standard Abbreviations
-
-These abbreviations are acceptable because they are industry-standard:
-
-| Abbreviation | Full Form | Usage |
-|--------------|-----------|-------|
-| `ctx` | context | For request/execution context objects |
-| `cfg` | configuration | Only when it conflicts with `config` |
-| `err` | error | When used as a local error variable |
-| `fn` | function | In documentation, not code |
-| `id` | identifier | For IDs (database, user, etc.) |
-| `num` | number | In mathematical contexts |
-| `req` | request | HTTP/request context |
-| `resp` | response | HTTP/response context |
-| `str` | string | Only in low-level string manipulation |
-| `val` | value | Only in generic/map contexts |
-
-When in doubt, spell it out.
-
----
-
-## File Structure
-
-### Header Comments
-
-Every file should start with a brief description:
-
-```pith
-# http_client.pith - HTTP client implementation with connection pooling
+# std.net.http.client - http/1.1 client with connection pooling
 #
-# This module provides functions for making HTTP requests with support
-# for keep-alive connections, retries, and custom headers.
+# keep-alive connections, retries, and custom headers.
 
-from std.net.tcp import connect, read, write_all, close
+import std.net.tcp as tcp
 ```
 
-### Import Organization
-
-Group imports by source:
+imports go at the top, grouped standard library first and then modules from
+your own package. there is no relative-import syntax: every import names a
+module path.
 
 ```pith
-# Standard library imports
-from std.fs import read_file, write_file
-from std.json import parse, encode
+import std.fs as fs
+import std.json as json
 
-# Third-party imports (when Pith supports them)
-# from external.lib import something
-
-# Local/module imports
-from .types import Request, Response
-from .utils import format_headers
+import myapp.types as types
 ```
 
----
+## before you submit
 
-## Review Checklist
+- every `pub` item has a doc comment
+- names are descriptive, and abbreviations are from the table above
+- functions do one thing
+- early returns instead of nesting
+- comments explain why
 
-Before submitting code, verify:
+`make fmt` and `make lint` check the mechanical half of this list. the rest is
+what review is for.
 
-- [ ] All public functions have doc comments
-- [ ] Variable names are descriptive (not single letters unless loop indices)
-- [ ] Function names describe what they do
-- [ ] No cryptic abbreviations
-- [ ] Early returns preferred over deep nesting
-- [ ] Related declarations are grouped
-- [ ] Functions are small and focused
-- [ ] Comments explain "why", not "what"
-
----
-
-## Examples
-
-### Complete Example: Configuration Parser
+## a worked example
 
 ```pith
-# config_parser.pith - Parse configuration files in key=value format
+# config_parser.pith - parse key=value configuration files
 #
-# Supports comments (#), empty lines, and basic validation.
+# supports # comments, blank lines, and reports per-line errors.
 
-from std.fs import read_file
-from std.string import trim, split
+import std.fs as fs
 
-struct Configuration:
+pub struct Configuration:
     pub settings: Map[String, String]
     pub errors: List[String]
 
-# Parse a configuration file from the given path.
-# Returns a Configuration with settings and any parsing errors.
-# Empty or missing files return an empty configuration (not an error).
-pub fn parse_configuration_file(file_path: String) -> Configuration:
-    file_contents := read_file(file_path)
-    if file_contents.len() == 0:
-        return Configuration{settings: {}, errors: []}
-    
-    return parse_configuration_contents(file_contents)
-
-fn parse_configuration_contents(contents: String) -> Configuration:
-    mut configuration := Configuration{settings: {}, errors: []}
-    mut line_number := 1
-    
-    raw_lines := split(contents, "\n")
-    for raw_line in raw_lines:
-        current_line := trim(raw_line)
-        
-        if should_skip_line(current_line):
-            line_number = line_number + 1
-            continue
-        
-        parse_result := parse_setting_line(current_line, line_number)
-        if parse_result.is_error:
-            configuration.errors.push(parse_result.error_message)
-        else:
-            configuration.settings[parse_result.key] = parse_result.value
-        
-        line_number = line_number + 1
-    
-    return configuration
-
-fn should_skip_line(line: String) -> Bool:
-    if line.len() == 0:
-        return true
-    if line[0] == "#":
-        return true
-    return false
-
-struct ParseResult:
+pub struct ParseResult:
     pub is_error: Bool
     pub key: String
     pub value: String
     pub error_message: String
 
+# Parse a configuration file. A missing or empty file yields an empty
+# configuration rather than an error; malformed lines are collected in
+# `errors` so the caller can report all of them at once.
+pub fn parse_configuration_file(file_path: String) -> Configuration:
+    file_contents := fs.read(file_path) catch ""
+    if file_contents.len() == 0:
+        return Configuration({}, [])
+    return parse_configuration_contents(file_contents)
+
+fn parse_configuration_contents(contents: String) -> Configuration:
+    mut settings: Map[String, String] := {}
+    mut errors: List[String] := []
+    mut line_number := 1
+
+    for raw_line in contents.split("\n"):
+        current_line := raw_line.trim()
+        if should_skip_line(current_line):
+            line_number = line_number + 1
+            continue
+
+        parsed := parse_setting_line(current_line, line_number)
+        if parsed.is_error:
+            errors.push(parsed.error_message)
+        else:
+            settings[parsed.key] = parsed.value
+        line_number = line_number + 1
+
+    return Configuration(settings, errors)
+
+fn should_skip_line(line: String) -> Bool:
+    if line.len() == 0:
+        return true
+    return line[0] == "#"
+
 fn parse_setting_line(line: String, line_number: Int) -> ParseResult:
-    equals_position := find_character(line, "=")
+    equals_position := line.index_of("=")
     if equals_position < 0:
-        return ParseResult{
-            is_error: true,
-            error_message: "Line " + int_to_string(line_number) + ": Missing '=' in setting"
-        }
-    
-    setting_key := trim(slice(line, 0, equals_position))
-    setting_value := trim(slice(line, equals_position + 1, line.len()))
-    
-    return ParseResult{
-        is_error: false,
-        key: setting_key,
-        value: setting_value
-    }
+        return ParseResult(true, "", "", "line {line_number}: missing '=' in setting")
+
+    setting_key := line.substring(0, equals_position).trim()
+    setting_value := line.substring(equals_position + 1, line.len()).trim()
+    return ParseResult(false, setting_key, setting_value, "")
 ```
 
-This example demonstrates:
-- Descriptive variable names (`configuration`, `line_number`, not `cfg`, `num`)
-- Clear function names (`should_skip_line`, `parse_setting_line`)
-- Early returns to avoid nesting
-- Grouped related declarations
-- Doc comments on public functions
-- Small, focused functions
+what the example is demonstrating: descriptive names, small functions with one
+job each, early returns, a doc comment that says what the caller needs to know
+rather than restating the signature, and errors collected instead of thrown
+away.
 
----
+## contributing
 
-## Contributing
-
-When contributing to the Pith codebase:
-
-1. Follow this style guide
-2. Update this guide if you introduce new patterns
-3. Prefer readability over cleverness
-4. Ask yourself: "Will someone understand this in 6 months?"
-
----
-
-*Last updated: March 2026*
+follow this guide, and update it when you introduce a pattern it does not
+cover. the question worth asking before you submit is whether someone reading
+this in six months will understand it.

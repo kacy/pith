@@ -17,7 +17,7 @@ unbuffered channels are rendezvous channels. buffered channels queue up to their
 jobs := Channel[Int](1)
 jobs.send(7)
 value := jobs.recv()
-print(value?)
+print("{value?}")
 ```
 
 the basic channel surface is:
@@ -226,8 +226,11 @@ the choice `std.web`'s accept loops make: they cap connections on a counter and
 refuse past it, because a loop parked on a permit is a server that has stopped
 answering, health check included.
 
-all four park rather than spin, so a blocked green task frees its worker
-for other tasks instead of holding it.
+`Mutex`, `Semaphore` and `WaitGroup` park rather than spin, so a green task
+blocked on any of them frees its worker for other tasks instead of holding it.
+`AtomicInt` is the exception and has no blocking operation at all — it is a
+lock-free load, store and compare-and-set, which is exactly why it is the tool
+for the path that must not wait.
 
 ## groups
 
@@ -237,13 +240,10 @@ a group fans work out and fails as a unit. it is the shape you want for
 ```pith
 import std.concurrent as concurrent
 
-fn flush_room(room: Room) -> Int!:
-    return room.flush()
-
 fn flush_all(rooms: List[Room]) -> Int!:
     g := concurrent.group(concurrent.background())
     for room in rooms:
-        g.go(flush_room)
+        g.go(fn() => room.flush())
     return g.wait()!
 ```
 
@@ -399,11 +399,15 @@ worker tasks trade a request back and forth per call. on that last shape the
 green backend cut internal context switches from about five per grpc call to
 well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
-trading a million messages through one bounded channel — it runs 2.6x faster
-than the os-thread backend and ahead of rust and zig, at 2.3x go (~46ms
-against go's ~75 when pinned to one worker; see `bench/README.md`). it does
-the least for tasks that are already cpu-bound and rarely wait — those never
-hit the handoffs green makes cheap.
+trading a million messages through one bounded channel — it runs well ahead of
+the os-thread backend and of zig, but behind go and rust at the default worker
+count (~95 ms median against their ~71 and ~69 on the 2026-08-22 rerun — and
+bimodal: 2 of 15 launches land at 59-66 ms, faster than either, when the task
+placement race goes well). pinned to one worker it turns the go comparison
+around at ~46 ms to ~71: the benchmark is pure handoff, which one worker does
+without crossing a core. see the coordination table in
+`docs/performance.md`. it does the least for tasks that are already
+cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 
 the machinery behind that: coroutine stacks are pooled and reused rather
 than mapped and unmapped per task, so a fan-out of short tasks costs

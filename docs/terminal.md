@@ -2,9 +2,8 @@
 
 pith talks to the terminal through `std.term` and its submodules. the base
 module (`std.term`) colors and styles text; this page covers the raw layer
-underneath, `std.term.tty`, which the terminal-ui stack is being built on.
-higher layers — escape parsing, sessions, widgets — arrive module by module
-and will be documented here as they land.
+underneath, `std.term.tty`, and the escape parsing and session handling built
+on it. the widget layer above these lives in [docs/tui.md](tui.md).
 
 ## what the tty layer is
 
@@ -19,9 +18,8 @@ fn main() -> Int!:
     if not is_tty(0):
         fail "run me on a terminal"
     raw_enter()
-    cols, rows := (0, 0)
     dims := size()!
-    write_str("\{dims.0}x\{dims.1}\r\n")!
+    write_str("{dims.0}x{dims.1}\r\n")!
     restore()
     return 0
 ```
@@ -77,9 +75,7 @@ frames compose and snapshot in tests without a terminal anywhere near them:
 ```pith
 import std.term.ansi as ansi
 
-frame := ansi.cursor_to(0, 0) + ansi.clear_line()
-       + ansi.sgr(ansi.rgb(255, 0, 128), ansi.COLOR_DEFAULT, ansi.ATTR_BOLD)
-       + "deep pink" + ansi.reset()
+frame := ansi.cursor_to(0, 0) + ansi.clear_line() + ansi.sgr(ansi.rgb(255, 0, 128), ansi.COLOR_DEFAULT, ansi.ATTR_BOLD) + "deep pink" + ansi.reset()
 ```
 
 coordinates are 0-based and translated to the terminal's 1-based form at the

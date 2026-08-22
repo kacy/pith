@@ -32,7 +32,7 @@ impl Counter:
 
 fn main():
     for v in Counter(0, 5):
-        print(v)
+        print("{v}")
 ```
 
 Two things to keep in mind:
@@ -104,7 +104,7 @@ fn main():
             fn(x: Int) => x * 10,
         ),
     )
-    print(out)   # [60, 70, 80, 90]
+    print("{out}")   # [60, 70, 80, 90]
 ```
 
 `to_list` pulls from `map_iter`, which pulls from `filter_iter`, which

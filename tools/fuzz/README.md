@@ -22,7 +22,7 @@ something is wrong.
 ## running it
 
 ```
-make fuzz-check     # generated programs, fixed seed, deterministic (ci gate)
+make fuzz-check     # generated + mutated corpus, fixed seed, deterministic (ci gate)
 make fuzz           # generated + corpus mutation, wider net
 ```
 

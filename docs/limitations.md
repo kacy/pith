@@ -80,12 +80,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   closure instance, so nesting and recursion are safe. (multi-line closure
   bodies — `fn(x):` with an indented block — work and infer their return
   type from their return statements.)
-- **function-value struct fields aren't callable through a field** —
-  a function value stored in a struct field can be passed and returned,
-  but `instance.field(args)` parses as a method call and is rejected
-  (E209). bind it to a name first (`f := instance.field; f(args)`).
-  function values held in locals, globals, list/map/tuple elements, and
-  returned from calls are all directly callable.
 - **duplicate method names across impl blocks are rejected** — a struct's
   methods can be declared in more than one impl block, including a block in
   a different module than the struct, and every method resolves from any
@@ -153,12 +147,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   `require_tls13()` locks a config to 1.3. the 1.2 fallback does not yet do
   session resumption, renegotiation, or client-certificate auth, supports rsa (≥2048-bit) and ecdsa (p-256) server certificates, and has no
   aes-256 suites.
-- **testing** — `std/testing` covers assertions but not discovery, fixtures, or
-  parameterized cases. the project's own suite is golden-snapshot based (see
+- **testing** — `test` blocks are discovered and run by `pith test` (with
+  `--filter`), and `std/testing` adds assertions and a `with_temp_dir` fixture
+  helper. parameterized cases have no support: a table-driven test is a loop you
+  write yourself. the project's own suite is golden-snapshot based (see
   `tests/`).
-- **http/2 is client-only** — `std.net.http2` is a native http/2 client
-  (multiplexed streams, hpack, tls with alpn). there is no http/2 server yet,
-  and `std.net.http` stays http/1.1.
+- **plaintext http/2 needs an explicit listener** — over tls, `web.listen_tls`
+  offers alpn `["h2", "http/1.1"]` and serves whichever the client picks. there
+  is no such negotiation without tls, so plaintext http/2 means calling
+  `listen_h2c` directly. `std.net.http` itself stays http/1.1.
 - **regex is deliberately small** — `std.regex` covers literals, `.`,
   classes, `\d \w \s` escapes, `* + ?` (greedy), alternation, capturing
   groups, and `^ $` anchors. it does not support `{n,m}` counts, lazy
@@ -185,8 +182,10 @@ something here that now works, the page is stale and a fix to it is welcome.
   the closure's check time. queries answer instantly from the last snapshot
   throughout. see [docs/lsp.md](lsp.md) for the feature list and the measured
   numbers.
-- **no package registry** — dependencies are local path entries in `pith.toml`;
-  there is no fetch, lock, or hosted index yet.
+- **no package registry** — dependencies are local path entries in `pith.toml`.
+  `pith package lock` writes a `pith.lock` and `pith package install` copies
+  those paths into `.pith/packages`, but nothing fetches over the network and
+  there is no hosted index.
 - **no debugger** — runtime stack traces are thin and there is no stepping.
 - **a diagnostic points at its construct's last token** — columns are exact
   now (a token's recorded position is where it starts, and the caret lands on
@@ -277,8 +276,8 @@ macos and the bsds os threads are still the default with `PITH_GREEN=1` as the
 opt-in. green wins every shape this repo measures: spawn is ~30x the os-thread
 backend at a seventeenth of the memory, and the channel fan-out benchmark runs
 2.6x faster than os threads and ahead of rust and zig. the whole regression
-corpus, 268 cases at both worker counts, produces byte-identical output to the
-fixed os-thread answers (`make verify-green-corpus`, run in ci). what follows is
+corpus, 380 cases at both worker counts, produces byte-identical output to the
+recorded goldens (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
 
 the structural cost is that a green worker runs many tasks, so a call with no

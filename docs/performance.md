@@ -9,10 +9,12 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-the short version, all on the same 2-core machine, rerun 2026-08-08 and
-reconfirmed 2026-08-11 (every row within run-to-run noise, comparators
-reproducing their published figures — the one thing that moved was a weak-
-reference leak, found and fixed on the rerun, in cyclic_graph below). the
+the short version, all on the same 2-core machine, rerun 2026-08-08,
+reconfirmed 2026-08-11, and rerun again 2026-08-22 (comparators reproducing
+their published figures each time — on 2026-08-08 the one mover was a weak-
+reference leak, found and fixed on the rerun, in cyclic_graph below; the
+2026-08-22 rerun moved catalog and chan_fanout in pith's favor and corrected
+the http row, below). the
 concurrency rows are the green backend, which is the default on linux; rows
 marked `PITH_GREEN=0` are the os-thread opt-out, kept for contrast. the go,
 rust and zig columns double as canaries — they are the same programs as in the
@@ -21,19 +23,19 @@ the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **~133 ms** (bimodal, best 61) | ~71 ms | ~73 ms | ~205 ms |
+| chan_fanout, 1m msgs | **~95 ms** (bimodal: 13/15 runs 96-100, 2/15 runs 59-66) | ~71 ms | ~69 ms | ~203 ms |
 | chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
 | 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
 | 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
 
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| catalog workload, 200k requests | **~118 ms** | ~408 ms | ~70 ms | — |
+| catalog workload, 200k requests | **~92 ms** | ~376 ms | ~68 ms | — |
 | grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
 | grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
-| http server under wrk, 30 s | 4648 req/s, rss flat (+0 kb) | 15444 req/s (+5.9 mb) | — | — |
-| event_ledger, 200k events | **351 ms (0.75x go)** | 466 ms | 111 ms | 132 ms |
-| std_pipeline, 50k records | 480 ms (1.50x go) | 319 ms | 145 ms | — |
+| http server under wrk, 20 s | 7.7-7.9k req/s, rss grows ~30 mb/min | 28-31.5k req/s, plateaus ~13.7 mb | — | — |
+| event_ledger, 200k events | **339 ms (0.83x go)** | 406 ms | 105 ms | 127 ms |
+| std_pipeline, 50k records | 439 ms (1.76x go) | 249 ms | 134 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
 to ~27 ms at flat memory — the argument-ownership fixes took a per-call
@@ -50,14 +52,27 @@ stream in one ByteBuffer — the shape the go version always used with
 `strings.Builder`, idiom for idiom — took `gen` from 299 to 120 ms, even
 with go's 122. see bench/README.md for the full phase table.
 
-the http row is the one not to read as a regression. both servers dropped by
-about the same 45% against july, because `wrk` itself competes for the two
-cores; the ratio between them barely moved, and the number worth keeping is
-the memory column, where pith is now exactly flat over a sustained run while
-the go server grows ~6 mb — a shape that reproduces run to run.
+the http row resolved on the 2026-08-22 rerun, in two parts, neither of them
+the story the earlier tables told. first, the shifting go figure was the box,
+not the language: the same go binary read anywhere from 15.6k to 31.5k req/s
+depending on what had run before it, while pith read 7.7-7.9k regardless of
+position, duration, or a 90-second cooldown — pith is the position-stable arm,
+and the july-vs-august "ratio moved" was two measurements of go taken under
+different box states. `wrk` sharing the two cores caps both arms, so read the
+row as a ratio under contention, not as a capacity.
 
-reading the rest honestly: on channel coordination green matches rust and beats
-zig, runs ~1.9x behind go at the default worker count (placement is still
+second, the memory column in the previous table was backwards. pith's rss is
+not flat: under steady load it grows linearly with no plateau — 5.4 to 57 mb
+over a 120-second run, ~63 bytes per request across 825,900 requests — while
+go plateaus at ~13.7 mb after its first warm-up interval. monotonic linear
+growth under a steady workload is a leak signature, and it is filed as #899;
+the "+0 kb" the old row reported can only have been a short-window read taken
+before the growth was visible. until it is fixed, the http server's memory
+behavior is a reason not to leave it under sustained load, and this paragraph
+is the honest version of the row above.
+
+reading the rest honestly: on channel coordination green beats zig comfortably
+but runs ~1.9x behind both go and rust at the default worker count (placement is still
 decided by first-resume luck, hence the bimodal spread), and beats go pinned to
 one worker. raw spawn/await is still go's, though by ~3.4x now rather than ~7x;
 what the green backend buys over pith's own os-thread backend there is ~34x the
@@ -169,8 +184,8 @@ in a single pass, filled straight into the struct.
 `bench/chan_fanout`, the coordination benchmark, was the one pith lost
 outright — ~580ms against go's ~69 for a million messages between eight
 tasks. the green wake-path work on 2026-07-26 (details below) brought
-the green backend to ~133ms on the 2026-07-29 rerun — level with rust,
-ahead of zig, ~1.8x go — with ~46ms, faster than go on this box, when the
+the green backend to ~133ms on the 2026-07-29 rerun — ahead of zig, ~1.8x
+behind both go and rust — with ~46ms, faster than go on this box, when the
 pipeline is pinned to one worker. the batch benchmarks measure compute and pith is competitive
 there; coordination is now a genuine strength of the green backend
 rather than the standing embarrassment it was.
@@ -738,7 +753,7 @@ constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
 
-`bench/zstd_decode` — the pure-pith zstd decoder against the crate-backed
+`bench/zstd_codec.pith` — the pure-pith zstd decoder against the crate-backed
 kernel, on a corpus built from the repo itself (2:1 to 11:1 — realistic
 content-encoding shapes; run it with `make zstd-pure-bench`). the decoder
 started at 129x the kernel and three optimization passes brought it to
@@ -891,9 +906,13 @@ os thread per connection — sustains ~16,800 req/s on this 2-core machine,
 a bit over half go's ~31,600. go's netpoller stays well ahead.
 
 the per-request growth was long recorded here as ~0.8 kb, then remeasured
-2026-07-23 at **~2.8 kb/request** (twice, `wrk -t2 -c8` for 15s), and now
-sits **flat** — ~200 kb total over 190k+ requests, so about a byte each,
-which is noise.
+2026-07-23 at **~2.8 kb/request** (twice, `wrk -t2 -c8` for 15s), and then
+sat **flat** — ~200 kb total over 190k+ requests, about a byte each. that
+held until sometime after 2026-07-23: the 2026-08-22 rerun measures ~63
+bytes/request growth on the same harness, on both backends (#899). the
+history below is the previous round of this same fight, kept because the
+first attempt then blamed the wrong construct and the next one may want
+the map.
 
 getting there took two goes, and the first was a wrong turn worth
 recording. the growth was first blamed on a result-typed local:
@@ -937,13 +956,16 @@ in 2.1s every time, and the entire self-hosted compiler in under 7s.
   per byte. moving them to byte-level scanning cut the run from 7.1m to 2.9m
   cstring allocations (the remaining 2.9m are csv field materialization),
   alongside 2.4m list pushes and 1.1m byte-buffer writes.
-- every list/map access takes a global mutex plus a hashset lookup to
-  validate the handle (`cranelift/runtime/src/handle_registry.rs`).
-- lists and maps store non-int elements as one heap allocation per element
-  (`collections/list.rs`, `collections/map.rs`); ints already have an
-  unboxed fast path.
+- ~~every list/map access takes a global mutex plus a hashset lookup to
+  validate the handle~~ — fixed. validity is now a lock-free magic-tag read
+  (`list_magic_ok`, `map_magic_ok`); the registry is touched only when a
+  handle is registered or unregistered.
+- ~~lists and maps store non-int elements as one heap allocation per element~~
+  — fixed. packed storage is chosen by element *size*, not by element type
+  (`uses_value_storage`: `elem_size == 8`), so strings, collections, structs,
+  bytes and closures all live unboxed in `values8` alongside ints.
 
-## the big one: memory is never freed (found july 2026, profiling)
+## the big one: memory was never freed (found july 2026, profiling — since fixed)
 
 `perf` on std_pipeline shows ~23% of wall time inside the kernel zeroing
 fresh pages (`clear_page_rep` plus fault handling). the reason: the native
@@ -956,10 +978,12 @@ measured at 200k records: pith peaks at 1.65 gb rss, go at 313 mb. the
 benchmarks finish because the process exits before the leak matters; a
 long-running server pays this as unbounded growth.
 
-fixing this is the single biggest performance and correctness item in the
-backend — bigger than everything in the table below combined. it needs the
-compiler to emit releases (or a region strategy) for the native path, not
-just runtime tweaks.
+this was the single biggest performance and correctness item in the backend,
+and it is now closed: the compiler emits releases for the native path. the
+subsections below record how, in the order the pieces landed. std_pipeline's
+peak rss at 200k records is 239 mb today, level with go's 238 mb — see the
+table above. everything from here to the end of this section is history, not
+an open problem.
 
 ### string arc (landed july 2026)
 
@@ -1156,7 +1180,8 @@ gone.
 too, mirroring `Semaphore`. contexts are not a hot loop today, so it is
 not proven costly — but it is the identical one-line-per-callsite
 conversion and worth doing in the same pass. `Channel`, `Task`,
-`Process`, `Mutex`, `Semaphore`, `WaitGroup` also use the registry;
+`Process`, `Semaphore`, `WaitGroup` also use the registry (`Mutex` and
+`Channel` no longer do — both validate through their own magic tag);
 most are created rarely, but channel send/recv could be hot in
 channel-heavy code and deserves a measurement before converting. the
 end state is that nothing validates a live handle through a global

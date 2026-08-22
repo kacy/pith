@@ -31,10 +31,16 @@ clients also print per-call median and p99 as extra detail.
 
 ## the proto
 
-one method, one bytes field, so the payload size is easy to vary:
+one bytes field, so the payload size is easy to vary. the service declares
+all four call shapes; the benchmark below exercises `Unary`:
 
 ```proto
-service Echo { rpc Unary(EchoRequest) returns (EchoResponse); }
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc BidiStream(stream EchoRequest) returns (stream EchoResponse);
+}
 message EchoRequest  { bytes payload = 1; }
 message EchoResponse { bytes payload = 1; }
 ```

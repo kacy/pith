@@ -34,7 +34,7 @@ page has room where a terminal listing does not:
   inherent `read` and the `read` satisfying `Reader` stay separate items
 
 The renderer emits every module as a real `<section>`. The page is a complete
-document before any script runs: with JavaScript off, all 82 modules are
+document before any script runs: with JavaScript off, every module is
 visible, browser find searches the whole stdlib, and anchor links work. The
 script only hides the inactive sections, filters the sidebar, and drives the
 command palette, which builds its index by reading `data-search` off the DOM

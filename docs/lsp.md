@@ -64,9 +64,10 @@ what `pith check` reports.
   is not a plain identifier (first byte alpha or `_`, the rest
   alphanumeric or `_`) is refused with null.
 - **code actions** — one quickfix per diagnostic in the request whose
-  compiler fix is mechanically applicable. today that is exactly
-  E216's "declare with 'mut'", which returns a WorkspaceEdit inserting
-  `mut ` in front of the binding. every other fix the compiler
+  compiler fix is mechanically applicable. the gate is the fix text
+  rather than the code: a fix beginning `declare with 'mut': mut `
+  becomes a WorkspaceEdit inserting `mut ` in front of the binding.
+  E216 is what produces that fix today. every other fix the compiler
   attaches is prose advice ("import it from the module that defines
   it", "use ? to unwrap an optional value"); those stay in the
   diagnostic message and produce no action, because an action without

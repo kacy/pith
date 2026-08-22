@@ -178,8 +178,8 @@ other kinds of test, all wired through the `Makefile`:
 the rust runtime is linked into every pith program, so a panic in it is a crash
 in somebody's server. `make check-no-panics` scans `cranelift/*/src` for the
 constructs that stop a process — `panic!`, `unreachable!`, `.unwrap()`,
-`.expect(...)` — plus `std::mem::transmute` and `std::mem::forget`, which
-reinterpret memory and want the same scrutiny. `std::process::exit` is scanned
+`.expect(...)` — plus `std::mem::transmute`, `std::mem::forget` and
+`from_utf8_unchecked`, which reinterpret memory and want the same scrutiny. `std::process::exit` is scanned
 in the runtime and the codegen crate only: the cli and the build script are
 programs, and a program exiting non-zero after printing a diagnostic is normal.
 
@@ -248,11 +248,9 @@ that keeps filling up looks exactly like a leak.
 
 ## on the roadmap
 
-a few things are not here yet: skipping and tagging tests (so the live suites can
-fold in and be skipped by default), benchmarks, and machine-readable output for
-CI. the leak gate covers a curated set of ownership shapes rather than every
-program, and the shapes that are known to leak today are deliberately left out of
-it — `xs.map(f)` and `xs.filter(f)` build untagged lists whose elements are never
-released, and a struct value stored straight into a container still takes a count
-too many. both are written up in [ownership.md](ownership.md). adding a case for
-either one is the last step of fixing it, not the first.
+a few things are not here yet: tagging tests, benchmarks, and machine-readable
+output for CI. skipping has since landed — see `skip_test` above, which is what
+lets the live suites fold in and skip themselves when their service is not
+reachable. the leak gate covers a curated set of ownership shapes rather than
+every program; a case is added as the last step of fixing a shape, not the
+first, which is why the gate reads as a list of leaks that no longer happen.

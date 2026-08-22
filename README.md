@@ -6,7 +6,7 @@
 a small language that compiles to native code and is written in
 itself. python-shaped syntax, result types instead of exceptions,
 reference counting instead of a garbage collector. the compiler is
-about 23,000 lines of pith; the standard library is another 31,000,
+about 26,000 lines of pith; the standard library is another 39,000,
 and it goes deeper than you'd guess — the TLS 1.2 and 1.3 stack, the native
 http/2 client, the regex engine, the postgres and mysql wire protocols,
 and gzip compression are all pith source you can read.
@@ -143,7 +143,7 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-87 modules, ~38,000 lines, all pith. the areas: io and filesystems
+126 modules, ~39,000 lines, all pith. the areas: io and filesystems
 (fs, glob, path, process), networking (tcp, dns, url, http, http2,
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling — plus db, a
@@ -174,12 +174,13 @@ runtime, see [docs/tui.md](docs/tui.md)), and lazy iterators (std.iter).
 
 ## proof it's usable
 
-four real programs live in `tools/` and run against golden output in
-ci: a static site generator (toml config, markdown subset, layouts,
-feeds), a web log analyzer (combined format, gzip input, csv export),
-a json api client that talks to a pith http server — both ends of the
-conversation in pith — and a worker pool running a jobs file through
-spawn and channels. they are the honest answer to "what does
+real programs live in `tools/` and run against golden output in ci: a
+static site generator (toml config, markdown subset, layouts, feeds), a
+web log analyzer (combined format, gzip input, csv export), a json api
+client that talks to a pith http server — both ends of the conversation
+in pith — a worker pool running a jobs file through spawn and channels,
+the protobuf code generator, and the documentation site generator that
+builds the stdlib reference. they are the honest answer to "what does
 non-trivial pith look like."
 
 ## cli
@@ -214,23 +215,27 @@ from greeter import greet
 make build            # native backend
 make self-host        # the compiler, compiled by itself
 make test             # the full suite
-make run-examples     # 92 example programs against snapshots
+make run-examples     # 129 example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 
 ## project layout
 
 ```
-self-host/     the compiler, in pith (~23,000 lines): lexer, parser,
+self-host/     the compiler, in pith (~26,000 lines): lexer, parser,
                checker, formatter, linter, docgen, ir emitter
-cranelift/     the native backend, in rust (~12,500 lines): ir
+cranelift/     the native backend, in rust (~13,500 lines): ir
                consumer, codegen, runtime (arc, collections, net)
-std/           the standard library (77 modules)
-examples/      94 runnable programs with expected output
+std/           the standard library (126 modules)
+examples/      139 runnable programs, 132 with expected output
 tests/         regression, invalid-program, and golden fixtures
-tools/         the four real programs
+tools/         real programs in pith: codegen, generators, fuzzers,
+               log and parquet readers
 docs/          architecture, ownership, errors, grammar, limitations
 ```
+
+line counts here are code: comments and blank lines are excluded.
+`make status-audit` prints the current corpus numbers.
 
 start with [docs/architecture.md](docs/architecture.md) if you want
 to change the compiler, [docs/contributing.md](docs/contributing.md)

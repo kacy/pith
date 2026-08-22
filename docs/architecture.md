@@ -22,7 +22,7 @@ current build/run path.
 
 networking and protocol layers now live mostly in the Pith stdlib. that
 includes `std.net.http`, `std.net.websocket`, and the native TLS stack (1.3 with a 1.2 fallback) in
-`std.net.tls` / `std.net.tls13`. Rust stays on the lower-level runtime side for
+`std.net.tls` / `std.net.tls13` / `std.net.tls12`. Rust stays on the lower-level runtime side for
 storage, syscall-facing helpers, and the Cranelift backend.
 
 ## ownership boundaries
@@ -72,7 +72,8 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
   fn-value parameter (grep for `emit_expr`)
 - IR driver: `self-host/ir_driver.pith`
 - Cranelift lowering: `cranelift/codegen/src/ir_consumer.rs` (the ir
-  instruction format is documented at the top of that file)
+  instruction format is specified in [ir-contract.md](ir-contract.md), which
+  is authoritative for both sides)
 - runtime support: `cranelift/runtime/src/` if native code needs new helpers
 
 ### add or change tls or protocol behavior

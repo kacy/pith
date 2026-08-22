@@ -270,12 +270,7 @@ at debug/symbol/linker overhead as a likely size target before reading too much
 into the file-size number alone.
 
 this is the better comparison point today if you want to isolate runtime,
-language, and service-logic costs from the current long-running HTTP server
-behavior.
-
-note: the live HTTP catalog benchmark is still exploratory on the Pith side.
-the Pith service currently exits after its first successful request, so the
-stable comparison point today is the workload benchmark above.
+language, and service-logic costs from HTTP and socket handling.
 
 ## cyclic graph benchmark (weak references)
 
@@ -514,10 +509,8 @@ three caveats matter when reading this benchmark:
 - the local go toolchain in this environment could not resolve `encoding/csv`
   or `hash/fnv`, so the go workload carries tiny csv and fnv helpers while
   still using go's json, gzip, sha256, url, path, and fs packages.
-- the pith version keeps the config setup local for now. importing `std.config`
-  with this full module mix currently exposes a checker symbol-collision bug,
-  so the benchmark still times the larger csv/url/path/gzip/hash/fs pipeline
-  while avoiding that unrelated compile failure.
+- the pith version keeps the config setup local, so the benchmark times the
+  csv/url/path/gzip/hash/fs pipeline rather than config parsing.
 
 ## zstd codec benchmark (pure-pith encoder and decoder)
 

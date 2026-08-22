@@ -165,6 +165,8 @@ ALERT_DECODE_ERROR := 50
 ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
+ALERT_INAPPROPRIATE_FALLBACK := 86
+ALERT_MISSING_EXTENSION := 109
 ALERT_NO_RENEGOTIATION := 100
 ALERT_UNSUPPORTED_EXTENSION := 110
 
@@ -180,6 +182,7 @@ MAX_HANDSHAKE_CHANGE_CIPHER_SPEC := 8
 
 TLS_VERSION_13 := 772
 TLS_VERSION_12 := 771
+TLS_FALLBACK_SCSV := 22016
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_AES_256_GCM_SHA384 := 4866
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
@@ -1884,10 +1887,10 @@ fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
     return 0
 
 # pick an ECDHE curve from the client's supported_groups (x25519 preferred).
-# a client that sent no groups is treated as offering x25519, which every peer
-# that reaches this fallback supports.
+# every suite this server offers is ECDHE, so a client that advertised no
+# usable curve — or no supported_groups at all — has nothing to negotiate.
 fn select_tls12_curve(groups: List[Int]) -> Int:
-    if groups.len() == 0 or groups.contains(tls12.NAMED_CURVE_X25519):
+    if groups.contains(tls12.NAMED_CURVE_X25519):
         return tls12.NAMED_CURVE_X25519
     if groups.contains(tls12.NAMED_CURVE_SECP256R1):
         return tls12.NAMED_CURVE_SECP256R1
@@ -2071,11 +2074,25 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls client hello"
-    # rfc 8446 §4.1.2 froze the client hello's legacy_version at 0x0303. every
-    # protocol this stack speaks needs at least that on the wire, so a lower
-    # value is a pre-1.2 client or a tampered hello, and is refused whichever
-    # version the supported_versions extension goes on to claim.
-    if lenient_hello.legacy_version < TLS_VERSION_12:
+    # rfc 7507: a client that fell back from a higher version marks the retry
+    # with TLS_FALLBACK_SCSV in its cipher list. when the fallback landed
+    # below the best version this server speaks, the original attempt was cut
+    # short by something other than us — answer inappropriate_fallback so the
+    # client retries at full strength instead of settling.
+    mut client_best := lenient_hello.legacy_version
+    if lenient_hello.supported_versions.len() > 0:
+        client_best = 0
+        for offered_version in lenient_hello.supported_versions:
+            if offered_version > client_best:
+                client_best = offered_version
+    if lenient_hello.cipher_suites.contains(TLS_FALLBACK_SCSV) and client_best < TLS_VERSION_13:
+        send_fatal_alert(stream, ALERT_INAPPROPRIATE_FALLBACK) catch 0
+        fail "tls client signalled an inappropriate fallback"
+    # rfc 8446 §4.1.2 froze the client hello's legacy_version at 0x0303, and
+    # §4.2.1 makes supported_versions authoritative when present — the legacy
+    # field is only meaningful without the extension, where a lower value is a
+    # pre-1.2 client this stack does not speak.
+    if lenient_hello.supported_versions.len() == 0 and lenient_hello.legacy_version < TLS_VERSION_12:
         send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
         fail "tls client hello legacy version below 1.2"
     if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
@@ -2104,10 +2121,22 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
             fail "no supported tls 1.2 cipher suite offered"
         return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
+    # rfc 8446 §9.2: a 1.3 client hello must carry supported_groups; one
+    # without it gets the missing_extension alert rather than a parameter
+    # complaint.
+    if lenient_hello.supported_groups.len() == 0:
+        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+        fail "tls client hello is missing supported groups"
+    # rfc 8446 §9.2 also demands a key_share (this stack serves no psk-only
+    # mode); absence has its own alert, and the lenient walk saw every
+    # extension regardless of ordering quirks the strict parser rejects.
+    if not lenient_hello.key_share_present:
+        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
+        fail "tls client hello is missing a key share"
     client_hello := tls13.parse_client_hello(client_messages[0].body) catch:
         # the lenient parse and version checks above already passed, so what
         # remains wrong here is a parameter: a key share in a group this stack
-        # does not serve, a missing required extension, a non-null compression.
+        # does not serve, a malformed psk offer, a non-null compression.
         send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
         fail "unsupported tls client hello"
     handshake_config := select_server_config(config, client_hello) catch:

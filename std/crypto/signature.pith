@@ -32,6 +32,12 @@ pub fn verify_rsa_pkcs1_sha384(public_key: Bytes, message: Bytes, signature: Byt
 pub fn verify_rsa_pss_sha256(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
     return crypto_verify_rsa_pss_sha256(public_key, message, signature)
 
+# verify an ecdsa signature over sha-384 made with a p-256 key (asn.1 der).
+# tls 1.2's legacy code points bind the hash but not the curve, so a p-256
+# certificate may sign sha-384 there.
+pub fn verify_ecdsa_p256_sha384_asn1(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_ecdsa_p256_sha384_asn1(public_key, message, signature)
+
 # verify an rsa pss signature over sha-384.
 pub fn verify_rsa_pss_sha384(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
     return crypto_verify_rsa_pss_sha384(public_key, message, signature)

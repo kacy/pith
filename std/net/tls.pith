@@ -889,7 +889,11 @@ fn handshake_secret_for_resumption(cipher: Int, did_resume: Bool, psk: Bytes, sh
     return tls13.handshake_secret_for_cipher(cipher, shared_secret)
 
 fn select_server_resumption(config: Config, hrr_prefix: Bytes, client_hello: tls13.ClientHello, selected_alpn: String, fallback_cipher: Int) -> ServerResumptionDecision!:
-    if not config_resumption_enabled(config) or config_requires_client_certificate(config):
+    # a client-certificate config resumes too: the ticket is bound to this
+    # config's handle, so it only exists because the original handshake
+    # already satisfied its authentication (rfc 8446 §2.2). the resumed
+    # session then skips the CertificateRequest.
+    if not config_resumption_enabled(config):
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     if not client_hello.psk_mode_dhe or client_hello.psk_identity.len() == 0:
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
@@ -1243,7 +1247,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     mut cache_key := ""
     mut cached_session := empty_cached_session()
     mut offering_psk := false
-    if config_resumption_enabled(config) and not config_has_client_certificate(config):
+    if config_resumption_enabled(config):
         cache_key = resume_cache_key(config, server_name)
         cached_session = lookup_resumable_client_session(cache_key)
         if cached_session.ticket.len() > 0:
@@ -1507,7 +1511,16 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
             signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, ske.signed_params)
             if not scheme_matches_certificate_key(ske.signature_scheme, certs[0].public_key_algorithm):
                 fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls signature scheme does not match the certificate key type")
-            if not tls13.verify_certificate_signature(certs[0].subject_public_key, ske.signature_scheme, signed_data, ske.signature)!:
+            # tls 1.2's ecdsa code points bind the hash but not the curve
+            # (rfc 5246 §7.4.1.4.1) — the curve comes from the certificate. a
+            # p-256 certificate signing sha-384 is legitimate there, so the
+            # verifier is picked from both.
+            mut ske_signature_ok := false
+            if ske.signature_scheme == tls13.SIG_ECDSA_SECP384R1_SHA384 and certs[0].public_key_algorithm == OID_EC_PUBLIC_KEY and certs[0].subject_public_key.len() == 65:
+                ske_signature_ok = signature.verify_ecdsa_p256_sha384_asn1(certs[0].subject_public_key, signed_data, ske.signature)
+            else:
+                ske_signature_ok = tls13.verify_certificate_signature(certs[0].subject_public_key, ske.signature_scheme, signed_data, ske.signature)!
+            if not ske_signature_ok:
                 fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 server key exchange signature is invalid")
             ske_curve = ske.named_curve
             ske_point = ske.public_point
@@ -1823,9 +1836,18 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 negotiated_alpn = encrypted_extensions.alpn_protocol
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_REQUEST:
+                if did_resume:
+                    # rfc 8446 §4.3.2: certificate requests belong to full
+                    # handshakes; a resumed session's authentication is the
+                    # original one.
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "tls certificate request in a resumed handshake")
                 client_cert_requested = true
                 request := tls13.parse_certificate_request(message.body) catch:
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate request")
+                if request.signature_schemes.len() == 0:
+                    # rfc 8446 §4.3.2: signature_algorithms is mandatory in a
+                    # CertificateRequest.
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "tls certificate request is missing signature algorithms")
                 if request.request_context.len() != 0:
                     # rfc 8446 §4.3.2: the context is only non-empty for
                     # post-handshake authentication, which this stack refuses.
@@ -1902,7 +1924,9 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     client_flight.write(client_finished)!
     write_sealed_flight(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, client_flight.bytes())!
     mut resumption_master_secret := bytes.empty()
-    if config_resumption_enabled(config) and not config_has_client_certificate(config):
+    # a client-certificate config resumes too: the ticket revives a session
+    # whose authentication already happened (rfc 8446 §2.2).
+    if config_resumption_enabled(config):
         resumption_master_secret = tls13.resumption_master_secret_for_cipher(server_hello.cipher_suite, master_secret, transcript_buf.bytes())!
     if did_resume and negotiated_alpn != cached_session.alpn_protocol:
         fail "server resumed the session with a different alpn protocol"
@@ -2183,8 +2207,14 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # allows it and it offered a suite we can serve. a 1.3-capable client (our
     # own included) always has 772 in supported_versions and stays on the 1.3
     # path, whose parser is stricter.
-    mut lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
+    parsed_lenient := tls13.parse_client_hello_lenient(client_messages[0].body)
+    if parsed_lenient.is_err:
+        # a compression list without null is a parameter error with its own
+        # alert; anything else that fails the lenient pass is malformed.
+        if parsed_lenient.err == "tls client hello compression must include null":
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls client hello compression must include null")
         fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls client hello")
+    mut lenient_hello := parsed_lenient.ok
     # rfc 7507: a client that fell back from a higher version marks the retry
     # with TLS_FALLBACK_SCSV in its cipher list. when the fallback landed
     # below the best version this server speaks, the original attempt was cut

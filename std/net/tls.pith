@@ -656,6 +656,10 @@ pub fn cipher_suite_name(cipher: Int) -> String:
         return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
     if cipher == tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256:
         return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    if cipher == tls12.TLS12_ECDHE_RSA_AES256_GCM_SHA384:
+        return "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+    if cipher == tls12.TLS12_ECDHE_ECDSA_AES256_GCM_SHA384:
+        return "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
     if cipher == tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256:
         return "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
     if cipher == tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256:
@@ -708,6 +712,9 @@ fn open_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: 
         if tls12.suite_uses_chacha(cipher):
             chacha := tls12.open_chacha20_poly1305(key, iv, sequence, record)!
             opened = tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
+        elif tls12.suite_uses_sha384(cipher):
+            gcm256 := tls12.open_aes_256_gcm(key, iv, sequence, record)!
+            opened = tls13.Record(gcm256.content_type, TLS_VERSION_12, gcm256.payload)
         else:
             gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
             opened = tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
@@ -722,6 +729,8 @@ fn seal_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: 
     if version == TLS_VERSION_12:
         if tls12.suite_uses_chacha(cipher):
             return tls12.seal_chacha20_poly1305(key, iv, sequence, content_type, plaintext)
+        if tls12.suite_uses_sha384(cipher):
+            return tls12.seal_aes_256_gcm(key, iv, sequence, content_type, plaintext)
         return tls12.seal_aes_128_gcm(key, iv, sequence, content_type, plaintext)
     return seal_record_for_cipher(cipher, key, iv, sequence, content_type, plaintext)
 
@@ -1286,8 +1295,8 @@ fn send_change_cipher_spec(stream: TcpStream) -> Bool!:
 
 # the TLS 1.2 Finished verify_data for `label` over the handshake transcript so
 # far ("client finished" or "server finished").
-fn tls12_finished_bytes(master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
-    return tls12.finished_verify_data(master, label, tls12.handshake_hash_sha256(transcript.bytes()))!
+fn tls12_finished_bytes(cipher: Int, master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
+    return tls12.finished_verify_data_for_suite(cipher, master, label, tls12.handshake_hash_for_suite(cipher, transcript.bytes()))!
 
 # read the peer's ChangeCipherSpec — skipping a plaintext NewSessionTicket it
 # may send first — and then its encrypted Finished, returning the verify_data
@@ -1321,21 +1330,13 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
                 fail "malformed tls change cipher spec"
             saw_ccs = true
         elif record.content_type == TLS_CONTENT_HANDSHAKE:
-            # the only message with a place between the peer's key exchange
-            # and its ChangeCipherSpec is a NewSessionTicket (rfc 5077 §3.3).
-            # this stack never uses 1.2 tickets, but the flight must still
-            # parse — a foreign message or a mangled ticket is refused, not
-            # skipped.
-            ticket_messages := tls13.decode_handshakes(record.payload) catch:
-                tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
-                fail "malformed tls 1.2 pre-finished handshake record"
-            for ticket_message in ticket_messages:
-                if ticket_message.message_type != tls12.TLS12_NEW_SESSION_TICKET:
-                    tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
-                    fail "unexpected tls 1.2 handshake message before finished"
-                tls12.validate_new_session_ticket(ticket_message.body) catch:
-                    tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_DECODE_ERROR)
-                    fail "malformed tls 1.2 new session ticket"
+            # a NewSessionTicket is the only message with a place between the
+            # peer's key exchange and its ChangeCipherSpec (rfc 5077 §3.3) —
+            # but a server may only send one when the client offered the
+            # session_ticket extension, and this stack never does. anything
+            # here is unsolicited.
+            tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
+            fail "unsolicited tls 1.2 handshake message before finished"
         else:
             tls12_finished_stage_alert(stream, cipher, alert_key, alert_iv, alert_seq, ALERT_UNEXPECTED_MESSAGE)
             fail "expected a tls 1.2 change cipher spec"
@@ -1444,10 +1445,11 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2")
     if not tls12.is_supported_suite(hello.cipher_suite):
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unsupported tls 1.2 cipher suite")
-    # extended master secret is required (rfc 7627): it binds the master secret
-    # to the full transcript and closes the triple-handshake class.
-    if not hello.extended_master_secret:
-        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "server did not negotiate extended master secret")
+    # extended master secret (rfc 7627) is always offered and taken whenever
+    # the server agrees; a server that does not speak it still gets the
+    # rfc 5246 derivation. that is safe here: the attacks rfc 7627 closes
+    # need 1.2 resumption or renegotiation to exploit, and this stack
+    # refuses both.
     if hello.renegotiation_info.len() > 1 or (hello.renegotiation_info.len() == 1 and hello.renegotiation_info[0] != 0):
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server sent a non-empty renegotiation info")
     cipher := hello.cipher_suite
@@ -1560,20 +1562,24 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     cke_message := tls13.encode_handshake(tls12.TLS12_CLIENT_KEY_EXCHANGE, tls12.encode_client_key_exchange(client_point)!)!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, cke_message)!)!
     transcript.write(cke_message)!
-    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
-    master := tls12.extended_master_secret(pre_master, session_hash)!
-    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+    session_hash := tls12.handshake_hash_for_suite(cipher, transcript.bytes())
+    mut master := bytes.empty()
+    if hello.extended_master_secret:
+        master = tls12.extended_master_secret_for_suite(cipher, pre_master, session_hash)!
+    else:
+        master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
+    keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
 
     # ChangeCipherSpec, then the encrypted client Finished over the transcript
     # through ClientKeyExchange.
     send_change_cipher_spec(stream)!
-    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "client finished", transcript)!)!
+    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "client finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, TLS_CONTENT_HANDSHAKE, client_finished)!)!
     transcript.write(client_finished)!
 
     # the server answers with ChangeCipherSpec and its encrypted Finished.
     server_finished := read_tls12_peer_finished(stream, cipher, keys.server_write_key, keys.server_write_iv, keys.client_write_key, keys.client_write_iv, 1)!
-    if not subtle.equal(tls12_finished_bytes(master, "server finished", transcript)!, server_finished.verify_data):
+    if not subtle.equal(tls12_finished_bytes(cipher, master, "server finished", transcript)!, server_finished.verify_data):
         # the client's Finished went out sealed at sequence 0, so its alert
         # rides the same epoch at sequence 1.
         send_fatal_alert_sealed(stream, TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 1, ALERT_DECRYPT_ERROR) catch 0
@@ -2020,9 +2026,9 @@ fn sign_with_scheme(config: Config, scheme: Int, message: Bytes) -> ServerSignat
 # the eligible family follows the server certificate's key type: ECDHE-ECDSA
 # AEAD suites for an EC certificate, ECDHE-RSA for an RSA one.
 fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
-    mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
+    mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_AES256_GCM_SHA384, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
     if is_ecdsa:
-        preference = [tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
+        preference = [tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_ECDSA_AES256_GCM_SHA384, tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
     for candidate in preference:
         if offered.contains(candidate):
             return candidate
@@ -2045,11 +2051,10 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
 # Certificate, ServerKeyExchange, ServerHelloDone; reads ClientKeyExchange,
 # ChangeCipherSpec, Finished; then sends its own ChangeCipherSpec and Finished.
 fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello_message: tls13.HandshakeMessage, lenient: tls13.LenientClientHello) -> Conn!:
-    # this fallback mandates extended master secret; a client that did not offer
-    # it is refused cleanly here rather than after the handshake at Finished, and
-    # the ServerHello never advertises an EMS extension the client did not send.
-    if not lenient.extended_master_secret:
-        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client did not offer extended master secret")
+    # extended master secret is negotiated whenever the client offers it (the
+    # ServerHello only advertises an EMS extension the client sent); a client
+    # without it gets the rfc 5246 derivation — safe here, since this stack
+    # refuses the 1.2 resumption and renegotiation the rfc 7627 attacks need.
     # select the certificate/config by server name first: the cert's key type
     # decides which suite family (ECDHE-RSA vs ECDHE-ECDSA) we can serve.
     handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols) catch:
@@ -2058,7 +2063,13 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     cipher := select_tls12_suite(lenient.cipher_suites, is_ecdsa)
     if cipher == 0:
         fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 cipher suite offered")
-    curve := select_tls12_curve(lenient.supported_groups)
+    mut curve := select_tls12_curve(lenient.supported_groups)
+    if curve == 0 and not lenient.extensions_present:
+        # an extension-less hello is a legacy client with no way to advertise
+        # curves; rfc 4492 §4 has the server assume support, and p-256 is the
+        # universal assumption. a client that sent extensions but no usable
+        # curve made a choice, and is refused below.
+        curve = tls12.NAMED_CURVE_SECP256R1
     if curve == 0:
         fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 curve offered")
     if is_ecdsa and not lenient.supported_groups.contains(tls12.NAMED_CURVE_SECP256R1):
@@ -2091,7 +2102,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     # session (rfc 5246 §7.4.1.3), which a 1.3-style hello's random
     # legacy_session_id would trigger falsely. this fallback does not resume,
     # so it always sends an empty id. (the echo is a 1.3-only requirement.)
-    server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, bytes.empty(), cipher, selected_alpn, secure_renegotiation)!)!
+    server_hello := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO, tls12.encode_server_hello(server_random, bytes.empty(), cipher, selected_alpn, secure_renegotiation, lenient.extended_master_secret)!)!
     certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!)!
     params := tls12.server_key_exchange_params(curve, keypair.public_key)!
     signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, params)
@@ -2151,13 +2162,17 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
 
     pre_master := keypair.shared_secret(client_point)!
     keypair.close()
-    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
-    master := tls12.extended_master_secret(pre_master, session_hash)!
-    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+    session_hash := tls12.handshake_hash_for_suite(cipher, transcript.bytes())
+    mut master := bytes.empty()
+    if lenient.extended_master_secret:
+        master = tls12.extended_master_secret_for_suite(cipher, pre_master, session_hash)!
+    else:
+        master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
+    keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
 
     # read the client's ChangeCipherSpec and encrypted Finished, then verify it.
     client_finished := read_tls12_peer_finished(stream, cipher, keys.client_write_key, keys.client_write_iv, bytes.empty(), bytes.empty(), 0)!
-    if not subtle.equal(tls12_finished_bytes(master, "client finished", transcript)!, client_finished.verify_data):
+    if not subtle.equal(tls12_finished_bytes(cipher, master, "client finished", transcript)!, client_finished.verify_data):
         # the server has not sent its own ChangeCipherSpec yet, so its write
         # epoch is still plaintext and the plaintext alert is the correct one.
         fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 client finished verification failed")
@@ -2165,7 +2180,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
 
     # send our ChangeCipherSpec and encrypted Finished.
     send_change_cipher_spec(stream)!
-    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "server finished", transcript)!)!
+    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "server finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, TLS_CONTENT_HANDSHAKE, server_finished)!)!
 
     peer := empty_peer_identity()
@@ -2287,11 +2302,18 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             retry_cipher := select_cipher_from_list(lenient_hello.cipher_suites)
             if retry_cipher == 0:
                 fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client did not offer a supported tls cipher suite")
-            hrr_message := tls13.encode_hello_retry_request(lenient_hello.session_id, retry_cipher, retry_group)!
+            mut hrr_message := tls13.encode_hello_retry_request_with_ech(lenient_hello.session_id, retry_cipher, retry_group, lenient_hello.ech_inner_present)!
+            hello1_encoded := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
+            message_hash_prefix := tls13.hrr_transcript_prefix_for_cipher(retry_cipher, hello1_encoded)!
+            if lenient_hello.ech_inner_present:
+                # the retry carries its confirmation in a trailing ech
+                # extension (eight zero bytes until patched), derived over the
+                # message_hash transcript plus this zero-padded retry.
+                hrr_ech := tls13.ech_accept_confirmation_for_cipher(retry_cipher, lenient_hello.random, "hrr ech accept confirmation", message_hash_prefix.concat(hrr_message))!
+                hrr_message = tls13.patch_bytes(hrr_message, hrr_message.len() - 8, hrr_ech)!
             native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, hrr_message)!)!
             send_change_cipher_spec(stream)!
-            hello1_encoded := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
-            hrr_prefix = tls13.hrr_transcript_prefix_for_cipher(retry_cipher, hello1_encoded)!.concat(hrr_message)
+            hrr_prefix = message_hash_prefix.concat(hrr_message)
             hello_buf.clear()
             client_messages = []
             mut second_hello_ccs := 0
@@ -2356,8 +2378,24 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         keypair.close()
         keypair = ecdh.p384_keypair()!
     errdefer keypair.close()
-    server_random := random.bytes(32)!
-    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
+    mut server_random := random.bytes(32)!
+    if lenient_hello.ech_inner_present:
+        # the last eight bytes carry the ech acceptance confirmation
+        # (draft-ietf-tls-esni §7.2): encoded as zeros first, then patched
+        # with a mac derived over this zero-padded hello.
+        zero_tail := bytes.buffer_with_capacity(8)
+        defer zero_tail.free()
+        mut zt := 0
+        while zt < 8:
+            zero_tail.write_byte(0)
+            zt = zt + 1
+        server_random = server_random.slice(0, 24).concat(zero_tail.bytes())
+    mut server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
+    if lenient_hello.ech_inner_present:
+        hello_now := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
+        ech_context := hrr_prefix.concat(hello_now).concat(server_hello)
+        ech_confirmation := tls13.ech_accept_confirmation_for_cipher(cipher, lenient_hello.random, "ech accept confirmation", ech_context)!
+        server_hello = tls13.patch_bytes(server_hello, 4 + 2 + 24, ech_confirmation)!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
     # a middlebox-compatibility change_cipher_spec follows the ServerHello
     # (rfc 8446 appendix d.4): a bare plaintext record, outside the transcript,
@@ -2751,6 +2789,9 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                 cs.pending = payload.slice(size, payload.len())
                 return payload.slice(0, size)
             return payload
+        # no branch claimed the record: an encrypted change_cipher_spec, or
+        # any other inner content type, has no post-handshake meaning.
+        fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "unexpected tls record content")
 
 fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     if data.len() == 0:

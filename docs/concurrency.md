@@ -17,7 +17,7 @@ unbuffered channels are rendezvous channels. buffered channels queue up to their
 jobs := Channel[Int](1)
 jobs.send(7)
 value := jobs.recv()
-print(value?)
+print("{value?}")
 ```
 
 the basic channel surface is:
@@ -237,13 +237,10 @@ a group fans work out and fails as a unit. it is the shape you want for
 ```pith
 import std.concurrent as concurrent
 
-fn flush_room(room: Room) -> Int!:
-    return room.flush()
-
 fn flush_all(rooms: List[Room]) -> Int!:
     g := concurrent.group(concurrent.background())
     for room in rooms:
-        g.go(flush_room)
+        g.go(fn() => room.flush())
     return g.wait()!
 ```
 

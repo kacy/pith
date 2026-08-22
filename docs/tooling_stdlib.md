@@ -120,12 +120,14 @@ builders produce the matching outgoing envelopes.
 
 `std.testing` now includes a few helpers for stdlib and self-hosting tests:
 
-- `assert_eq_text(got, want)` for string comparisons with a compact length hint
+- `assert_eq_text(got, want)` for string comparisons, showing a window around
+  the first byte that differs
 - `assert_file_exists(path)` for file checks
 - `assert_dir_exists(path)` for directory checks
 - `with_temp_dir(prefix, run)` for scoped filesystem tests
 
 prefer these in examples and small helper programs when they make the test
-intent clearer than hand-written checks. note that a failing `std.testing` check
-only tallies — it does not fail a colocated `test` block, which uses the built-in
-`assert` / `assert_eq`. see [testing.md](testing.md) for the full picture.
+intent clearer than hand-written checks. a failing `std.testing` check both
+tallies and fails the colocated `test` block it runs inside, so it does not
+vanish into a count nobody reads. see [testing.md](testing.md) for the full
+picture.

@@ -7,16 +7,9 @@ logger with typed fields.
 ```pith
 import std.log as log
 
-logger := log.root()
-    .with([log.str("service", "api")])
-    .target("http")
-    .json()
+logger := log.root().with([log.str("service", "api")]).target("http").json()
 
-logger.info()
-    .str("route", "/health")
-    .int("status", 200)
-    .duration_ms("elapsed_ms", 4)
-    .msg("request complete")
+logger.info().str("route", "/health").int("status", 200).duration_ms("elapsed_ms", 4).msg("request complete")
 ```
 
 ## compatibility
@@ -67,7 +60,7 @@ requests := metrics.counter("requests total")
 latency := metrics.histogram("request latency ms")
 
 requests.inc()
-latency.observe(12)
+latency.observe(12.0)
 
 print(metrics.snapshot_text())
 ```

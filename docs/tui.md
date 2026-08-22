@@ -206,7 +206,7 @@ on a real terminal: `pith run examples/tui_demo.pith`.
 - a runtime trap mid-frame restores the terminal (the raw-mode atexit
   hook), but SIGKILL or a segfault cannot — run `reset` if a killed
   program leaves the terminal raw.
-- truecolor is available through `style.rgb()`, but the default palette
+- truecolor is available through `ansi.rgb()`, but the default palette
   sticks to indexed colors; there is no terminal capability detection.
 - the session owns the process-global signal queue, so an open session
   cannot coexist with `std.shutdown.on_signals` (see

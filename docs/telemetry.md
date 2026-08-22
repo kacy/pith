@@ -54,10 +54,9 @@ metrics.counter("orders_total").inc()
 metrics.counter("orders_total").labels(["region", "eu"]).inc()
 metrics.gauge("cpu_load").set(0.7)
 
-metrics.histogram("request_seconds")
-    .buckets([0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
-    .describe("request latency", "s")
-    .observe(0.234)
+latency := metrics.histogram("request_seconds").buckets([0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
+latency.describe("request latency", "s")
+latency.observe(0.234)
 ```
 
 `labels(["k1", "v1", "k2", "v2"])` takes a flat key/value list and returns an
@@ -88,8 +87,11 @@ run it in the background next to your app:
 import std.metrics as metrics
 import std.prometheus as prometheus
 
+fn serve_metrics() -> Int!:
+    return prometheus.serve("0.0.0.0", 9464)!
+
 fn main() -> Int!:
-    spawn prometheus.serve("0.0.0.0", 9464)
+    spawn serve_metrics()
     run_server()!
     return 0
 ```

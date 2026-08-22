@@ -32,7 +32,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 ```
 
 with the endpoint set, `init()` turns tracing on, tells `std.metrics` to start
-collecting, and spawns a background thread that ships finished spans and the
+collecting, and spawns a background task that ships finished spans and the
 current metric snapshot to the collector. every call your service makes over the
 std grpc or http client now produces a client span and RED metrics, and any
 inbound `traceparent` is joined to the right trace.
@@ -136,8 +136,9 @@ and `SERVER`.
 
 ### spans nest on their own
 
-the current span is tracked per os thread, so a span started inside another is
-parented under it automatically — you don't thread a context object through every
+the current span is held in `threadlocal` state — one copy per green task on
+the green backend, one per os thread on the os-thread backend — so a span
+started inside another is parented under it automatically — you don't thread a context object through every
 call.
 
 ```pith
@@ -148,13 +149,13 @@ outer.end()
 ```
 
 when tracing is off, `start` returns a non-recording span that touches no
-per-thread state, and `end` on it does nothing. the check is a single bool, so
+per-task state, and `end` on it does nothing. the check is a single bool, so
 instrumented code you leave in an uninstrumented build stays cheap.
 
 ### crossing a spawn
 
-a spawned task runs on a fresh thread with no current span, so the one place
-propagation is explicit is a `spawn`. capture the parent context before, restore
+a spawned task starts with its own copy of that state and so has no current
+span, which makes `spawn` the one place propagation is explicit. capture the parent context before, restore
 it inside:
 
 ```pith
@@ -162,7 +163,7 @@ ctx := trace.current_context()
 spawn work_item(ctx)
 
 fn work_item(ctx: trace.SpanContext):
-    trace.with_context(ctx)     # re-establish the parent on this thread
+    trace.with_context(ctx)     # re-establish the parent in this task
     span := trace.start("work_item")
     ... work ...
     span.end()
@@ -310,9 +311,11 @@ see [docs/signals.md](signals.md) for the drain itself.
 
 ## what isn't here yet
 
-- **OTLP logs** — logs aren't exported over OTLP. `std.log` records already carry
-  the current trace and span ids, so they correlate in a backend that ingests
-  logs separately.
+- **OTLP logs** — logs aren't exported over OTLP, and `std.log` does not read
+  the active span: it has no dependency on `std.trace`, so a record emitted
+  inside a `trace.start()` span carries no trace or span id of its own. to
+  correlate logs with traces, pass the ids into the logger yourself with
+  `with([log.str("trace_id", ...)])`.
 - **grpc without tls** — the OTLP/grpc transport requires tls; there's no
   cleartext h2c for a bare local collector on `:4317`. use `http/protobuf` or an
   `https` grpc endpoint.

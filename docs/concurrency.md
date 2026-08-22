@@ -226,8 +226,11 @@ the choice `std.web`'s accept loops make: they cap connections on a counter and
 refuse past it, because a loop parked on a permit is a server that has stopped
 answering, health check included.
 
-all four park rather than spin, so a blocked green task frees its worker
-for other tasks instead of holding it.
+`Mutex`, `Semaphore` and `WaitGroup` park rather than spin, so a green task
+blocked on any of them frees its worker for other tasks instead of holding it.
+`AtomicInt` is the exception and has no blocking operation at all — it is a
+lock-free load, store and compare-and-set, which is exactly why it is the tool
+for the path that must not wait.
 
 ## groups
 

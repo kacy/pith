@@ -738,7 +738,7 @@ constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
 
-`bench/zstd_decode` — the pure-pith zstd decoder against the crate-backed
+`bench/zstd_codec.pith` — the pure-pith zstd decoder against the crate-backed
 kernel, on a corpus built from the repo itself (2:1 to 11:1 — realistic
 content-encoding shapes; run it with `make zstd-pure-bench`). the decoder
 started at 129x the kernel and three optimization passes brought it to
@@ -937,13 +937,16 @@ in 2.1s every time, and the entire self-hosted compiler in under 7s.
   per byte. moving them to byte-level scanning cut the run from 7.1m to 2.9m
   cstring allocations (the remaining 2.9m are csv field materialization),
   alongside 2.4m list pushes and 1.1m byte-buffer writes.
-- every list/map access takes a global mutex plus a hashset lookup to
-  validate the handle (`cranelift/runtime/src/handle_registry.rs`).
-- lists and maps store non-int elements as one heap allocation per element
-  (`collections/list.rs`, `collections/map.rs`); ints already have an
-  unboxed fast path.
+- ~~every list/map access takes a global mutex plus a hashset lookup to
+  validate the handle~~ — fixed. validity is now a lock-free magic-tag read
+  (`list_magic_ok`, `map_magic_ok`); the registry is touched only when a
+  handle is registered or unregistered.
+- ~~lists and maps store non-int elements as one heap allocation per element~~
+  — fixed. packed storage is chosen by element *size*, not by element type
+  (`uses_value_storage`: `elem_size == 8`), so strings, collections, structs,
+  bytes and closures all live unboxed in `values8` alongside ints.
 
-## the big one: memory is never freed (found july 2026, profiling)
+## the big one: memory was never freed (found july 2026, profiling — since fixed)
 
 `perf` on std_pipeline shows ~23% of wall time inside the kernel zeroing
 fresh pages (`clear_page_rep` plus fault handling). the reason: the native
@@ -956,10 +959,12 @@ measured at 200k records: pith peaks at 1.65 gb rss, go at 313 mb. the
 benchmarks finish because the process exits before the leak matters; a
 long-running server pays this as unbounded growth.
 
-fixing this is the single biggest performance and correctness item in the
-backend — bigger than everything in the table below combined. it needs the
-compiler to emit releases (or a region strategy) for the native path, not
-just runtime tweaks.
+this was the single biggest performance and correctness item in the backend,
+and it is now closed: the compiler emits releases for the native path. the
+subsections below record how, in the order the pieces landed. std_pipeline's
+peak rss at 200k records is 239 mb today, level with go's 238 mb — see the
+table above. everything from here to the end of this section is history, not
+an open problem.
 
 ### string arc (landed july 2026)
 
@@ -1156,7 +1161,8 @@ gone.
 too, mirroring `Semaphore`. contexts are not a hot loop today, so it is
 not proven costly — but it is the identical one-line-per-callsite
 conversion and worth doing in the same pass. `Channel`, `Task`,
-`Process`, `Mutex`, `Semaphore`, `WaitGroup` also use the registry;
+`Process`, `Semaphore`, `WaitGroup` also use the registry (`Mutex` and
+`Channel` no longer do — both validate through their own magic tag);
 most are created rarely, but channel send/recv could be hot in
 channel-heavy code and deserves a measurement before converting. the
 end state is that nothing validates a live handle through a global

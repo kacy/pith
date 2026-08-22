@@ -41,10 +41,11 @@ struct_alias ALIAS TARGET    makes ALIAS resolve to TARGET's layout.
 global NAME INIT_KIND ...    a module-level global and how to initialize it.
 ```
 
-one wrinkle worth stating plainly: `RETTYPE` in a `func` header does not change
-the function's machine signature. **every function is lowered as `nparam` i64
-parameters returning one i64** (see abi conventions below). `RETTYPE` is
-descriptive; the real return handling is driven per-call by the call's retkind.
+one wrinkle worth stating plainly: **a function is lowered as `nparam` i64
+parameters returning one i64, except under the register-result abi**, where it
+returns two values (see abi conventions below). apart from that case `RETTYPE`
+is descriptive, and the real return handling is driven per-call by the call's
+retkind.
 
 ## instructions
 
@@ -101,12 +102,18 @@ concat REG A B              REG = A followed by B, as a fresh heap string.
 
 ```
 call REG FNAME RETKIND NARGS ARG...
+rcall FLAG_REG VAL_REG FNAME PAYLOAD_KIND NARGS ARG...
 ```
 
-one form covers everything: runtime functions, user functions, struct
-construction, and void calls. `RETKIND` names how to treat the result (see the
-type vocabulary). a void call is a `call` with a `void` retkind whose result
-register is simply never read — there is no separate `callv` instruction.
+`call` covers everything that returns a single value: runtime functions, user
+functions, struct construction, and void calls. `RETKIND` names how to treat the
+result (see the type vocabulary). a void call is a `call` with a `void` retkind
+whose result register is simply never read — there is no separate `callv`.
+
+`rcall` is the register-result form. it calls a function whose retkind is
+`result_reg` or `result_reg_f` and lands the two returned values in two
+registers: `FLAG_REG` takes the ok flag, `VAL_REG` the payload, interpreted as
+`PAYLOAD_KIND`.
 
 **memory and fields**
 
@@ -132,6 +139,7 @@ closure_ref REG NAME        REG = a closure value wrapping NAME.
 
 ```
 ret REG                     return REG from the current function.
+ret2 FLAG_REG VAL_REG       return both registers, under the register-result abi.
 brif COND THEN ELSE         branch to label THEN if COND is nonzero, else ELSE.
 jmp LABEL                   unconditional branch.
 label NAME                  a branch target.
@@ -154,6 +162,7 @@ global's init kind:
 | `struct:NAME` | a struct pointer known to be of type NAME |
 | `tuple` | a tuple (a struct-shaped allocation) |
 | `result`, `result_int`, `result_bool` | a fallible result (see encoding below) |
+| `result_reg`, `result_reg_f` | a fallible result returned in registers: `(is_ok, payload)`, the payload i64 or f64 |
 | `optional` | an optional value |
 | `void` | no meaningful result |
 | `unknown` | the emitter did not commit to a kind |
@@ -165,10 +174,13 @@ kind was knowable is a missed optimization or a latent bug, not a convenience.
 
 ## abi conventions
 
-**uniform i64.** every function, runtime or user, is `(i64, i64, ...) -> i64` at
-the machine level. pointers are i64. floats are bitcast to i64 across call and
-return boundaries and cast back where float math is needed. this is why
-`RETTYPE` on the `func` header is only descriptive.
+**i64 parameters, one or two returns.** parameters are always i64: pointers are
+i64, and floats are bitcast to i64 across call boundaries and cast back where
+float math is needed. returns are i64 too, except for the register-result abi.
+a function whose retkind is `result_reg` returns two values, `(is_ok: i64,
+payload: i64)`; `result_reg_f` returns `(is_ok: i64, payload: f64)`. everything
+else returns a single i64. `push_return_types` in the consumer is the authority,
+and `RETTYPE` does drive the machine signature for those two kinds.
 
 **result encoding.** `result_int` and `result_bool` use a zero sentinel for the
 error case: a real value `v` is carried as `v + 1`, and `0` means "error". the
@@ -184,7 +196,7 @@ instruction — the struct declaration is what makes the call special.
 
 **runtime functions.** the set of runtime functions and their machine signatures
 lives in `cranelift/runtime-abi/runtime_functions.txt`, one
-`key | symbol | params | returns | class` row each. `cranelift/codegen/build.rs`
+`key | symbol | params | returns` row each. `cranelift/codegen/build.rs`
 turns that file into the import table the consumer declares. the emitter has its
 own, separate notion of which runtime calls exist and what kind they return
 (`ir_builtin_result_retkind`, `ir_method_tables`) — the two are not yet a single
@@ -197,8 +209,6 @@ information the emitter already has. they are documented here because they are
 part of the real contract, and because they are the natural candidates for moving
 into the emitter later.
 
-- **`tcp_read` with 2 arguments becomes `tcp_read2`.** an overload picked by
-  argument count, resolved in the consumer.
 - **`__list_get` / `__index` on a string register becomes `char_at`.** the
   consumer inspects whether the indexed register holds a string and rewrites the
   call. the emitter knows the receiver's type at emission time.

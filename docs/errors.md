@@ -511,9 +511,10 @@ error[E247]: cannot find module 'fs'
 
 ### E248 — collection shared into a spawned task
 
-a spawned task runs on its own os thread. reference counts are atomic, but
-a list, map, or set is an unsynchronized buffer behind a handle, so passing
-one the current scope still holds lets both threads mutate the same buffer.
+a spawned task runs concurrently with the scope that spawned it, on a pool of
+os threads. reference counts are atomic, but a list, map, or set is an
+unsynchronized buffer behind a handle, so passing one the current scope still
+holds lets both mutate the same buffer.
 pass data through a channel, hand the task a copy, or use an atomic cell for
 a shared scalar. a fresh collection — a literal, a copy, a call result — is
 not shared and is allowed.

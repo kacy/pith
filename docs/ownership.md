@@ -67,9 +67,9 @@ call arguments:
   literal or a wrapper whose ownership the result and optional
   extraction paths settle instead — `ir_emit_struct_positional_init`
   excludes tuple from its field retain for the same reason. a tuple
-  literal written into an argument therefore still leaks its box;
-  binding it to a local first does not, because scope cleanup releases
-  it
+  written *syntactically* as a literal in an argument is still released,
+  because the emitter can see the literal; it is a tuple-typed register
+  of unknown origin that keeps the bounded leak
 - exception: an argument stored directly into a container is skipped
   by that release (`skip_pos` in `ir_release_owned_method_args`),
   because ownership transfers into the container there rather than
@@ -111,7 +111,7 @@ call arguments:
   is load-bearing — retain first, because on the miss branch the release
   drops the very register the retain just counted.
   `ir_method_result_retains_over_args` names the callees this applies to,
-  and `ir_string_expr_is_borrowed` classifies their result as owned to
+  and `ir_expr_is_borrowed` classifies their result as owned to
   match. `unwrap_or` is the same shape and never reaches this code: both
   spellings have their own emitter and build the fallback inside the arm
   that returns it
@@ -278,7 +278,7 @@ keys are strings, and `map.values()` when the values are heap values.
 - the variable rules: statement lowering in
   `self-host/ir_emitter_core.pith` (binds, assigns, returns)
 - the argument rules: `ir_release_owned_method_args`,
-  `ir_release_owned_string_args` and the call paths near them. the
+  `ir_release_owned_args` and the call paths near them. the
   kinds they release are `ir_owned_arg_kind_releases`; the position
   they must not release is the container store's, and the callees that
   take a count on their own result instead are
@@ -403,8 +403,9 @@ gaps, all bounded leaks rather than dangling pointers:
   its live payload and shell through the cascade helper right after the
   call returns. a callee that extracts an rc-payload optional, or one
   the walk cannot read (imported, builtin, method, closure), keeps the
-  argument on the leak side as before. results in argument position and
-  real tuple literals still strand their box.
+  argument on the leak side as before. results in argument position, and
+  tuple-typed registers the emitter cannot tie back to a literal, still
+  strand their box.
 - **a collection literal the checker cannot type builds an untagged
   container.** `[]` and `{}` have no type of their own and take one from
   context. an annotated bind, a `return`, a struct constructor, an
@@ -571,9 +572,10 @@ end of the scope it was bound in.
 
 ## threads and tasks
 
-`spawn` runs a closure on a real os thread. reference counts are
-atomic, so retaining and releasing the same value from two threads is
-safe. the container *contents* are not synchronized, though: a list or
+`spawn` runs a closure on a green task, which linux schedules across a
+pool of os threads (see [concurrency.md](concurrency.md)). reference
+counts are atomic, so retaining and releasing the same value from two
+of those threads is safe. the container *contents* are not synchronized, though: a list or
 map is a plain buffer behind a handle, so two tasks mutating the same
 collection race on that buffer.
 

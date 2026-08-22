@@ -111,8 +111,8 @@ dev := Config(host: "localhost")
 prod := Config(host: "example.com", port: 443, tls: true)
 ```
 
-Named fields aren't available on generic structs yet — those still take
-positional arguments.
+Named fields work on generic structs too, whether the type argument is
+written out (`Box[Int](value: 5)`) or inferred (`Box(value: 5, label: "hi")`).
 
 ## errors and tests
 
@@ -175,7 +175,7 @@ Pith has two distinct shapes for "no value here". Pick by intent, not by mood:
 - **`T!` (Result)** — for *unexpected* failure the caller usually wants to
   propagate. I/O, parsing, network, anything with an external cause.
   Construct with `fail`; consume with `!`, `catch`, `unwrap_or`, `or_else`.
-  Examples: `fs.read`, `parse_port`, `tls.connect`.
+  Examples: `fs.read`, `parse_port`, `tls.dial`.
 
 Rule of thumb: if the caller would write `if x == none: ...` more often than
 `!`, use `T?`. If they'd write `let v = x!` more often than `match`, use `T!`.
@@ -192,9 +192,11 @@ fields you invariantly initialized — a miss is a real bug and should
 crash loudly, not flow through as a zero.
 
 Inside a `T!` function, `map[k]` and `list[i]` instead propagate the
-miss as `fail "index out of bounds"`, which the caller can `catch` or
-`unwrap_or`. So the same syntax means "assert" outside a Result context
-and "propagate" inside — no special operator required:
+miss as an error, which the caller can `catch` or `unwrap_or`. So the
+same syntax means "assert" outside a Result context and "propagate"
+inside — no special operator required. (The propagated error currently
+arrives with an empty `.err` string; branch on `.is_err`, and supply
+your own message with an explicit `fail` when the caller needs one.)
 
 ```pith
 fn config_value(cfg: Map[String, Int], key: String) -> Int!:

@@ -1110,6 +1110,26 @@ fn send_fatal_alert(stream: TcpStream, description: Int) -> Int!:
 # alert there would read as an injection to the peer. best-effort by contract,
 # like send_fatal_alert: callers discard a failed write with `catch 0` and let
 # the refusal already in flight stay the surfaced error.
+# Send a fatal alert, best-effort, and hand back the failure message: the
+# standard one-line refusal, `fail refuse_with(stream, alert, "why")`, usable
+# equally as the last statement of a catch block.
+fn refuse_with(stream: TcpStream, alert: Int, message: String) -> String:
+    send_fatal_alert(stream, alert) catch 0
+    return message
+
+# The sealed counterpart for the encrypted 1.3 handshake, where the alert must
+# ride the sender's handshake keys (sequence 0 — a refusal is always the
+# first and last record of its epoch).
+fn refuse_sealed_with(stream: TcpStream, cipher: Int, key: Bytes, iv: Bytes, alert: Int, message: String) -> String:
+    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, key, iv, 0, alert) catch 0
+    return message
+
+# The established-connection counterpart, sealed with the connection's write
+# keys.
+fn conn_refuse_with(cs: NativeConnState, alert: Int, message: String) -> String:
+    send_conn_fatal_alert(cs, alert) catch 0
+    return message
+
 fn send_fatal_alert_sealed(stream: TcpStream, version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, description: Int) -> Int!:
     payload := bytes.buffer_with_capacity(2)
     defer payload.free()
@@ -1155,18 +1175,15 @@ fn read_plaintext_handshake_record(stream: TcpStream) -> tls13.Record!:
     # records 0x0303. a value outside 0x03xx is not a tls record at all.
     record_version := checked_read(binary.read_u16_be_at(header, 1))!
     if record_version < 768 or record_version > 1023:
-        send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
-        fail "unexpected tls record version"
+        fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "unexpected tls record version")
     length := checked_read(binary.read_u16_be_at(header, 3))!
     if length > tls13.MAX_CIPHERTEXT_RECORD:
-        send_fatal_alert(stream, ALERT_RECORD_OVERFLOW) catch 0
-        fail "tls record overflow"
+        fail refuse_with(stream, ALERT_RECORD_OVERFLOW, "tls record overflow")
     payload := stream.read_exact_bytes(length)!
     if payload.len() != length:
         fail "truncated tls record payload"
     record := tls13.decode_record(header.concat(payload)) catch:
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls record"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls record")
     return record
 
 fn native_fail_alert(record: tls13.Record) -> Bool!:
@@ -1363,8 +1380,7 @@ fn scan_tls12_server_flight(stream: TcpStream, flight: Bytes) -> Bool!:
         if t == tls12.TLS12_SERVER_HELLO_DONE:
             have_done = true
         elif t != tls12.TLS12_CERTIFICATE and t != tls12.TLS12_SERVER_KEY_EXCHANGE and t != tls12.TLS12_CERTIFICATE_REQUEST:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "unexpected tls 1.2 handshake message"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls 1.2 handshake message")
     return have_done
 
 fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
@@ -1377,29 +1393,24 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         # duplicates first: a block with two of a type is malformed whatever
         # the types are, and earns decode_error over unsupported_extension.
         if seen_tls12_extensions.contains(ext_type):
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "server duplicated a tls 1.2 extension"
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "server duplicated a tls 1.2 extension")
         seen_tls12_extensions.push(ext_type)
     for ext_type in tls12_extension_types:
         if not client_offered_tls12_extension(ext_type, server_name != "", config_alpn_protocols(config).len() > 0):
-            send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
-            fail "server sent an unoffered tls 1.2 extension"
+            fail refuse_with(stream, ALERT_UNSUPPORTED_EXTENSION, "server sent an unoffered tls 1.2 extension")
     parsed_hello := tls12.parse_server_hello(server_hello_message.body)
     if parsed_hello.is_err:
         # selecting a compression method we never offered is a negotiation
         # violation with its own alert; anything else is a parse failure.
         if parsed_hello.err == "tls 1.2 server selected a compression method":
-            send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-            fail "tls 1.2 server selected a compression method"
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls 1.2 server hello"
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls 1.2 server selected a compression method")
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 server hello")
     hello := parsed_hello.ok
     # a 1.2 server echoing the session id we offered claims to resume a
     # session that does not exist — this stack never offers 1.2 resumption,
     # and the id it sends is the 1.3 compatibility placeholder.
     if session_id.len() > 0 and bytes.eq(hello.session_id, session_id):
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "tls 1.2 server echoed the compatibility session id"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls 1.2 server echoed the compatibility session id")
     # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
     # not mark its random. the sentinel means a 1.3-capable server fell back to
     # 1.2 — our 1.3 offer was stripped by an active attacker.
@@ -1407,19 +1418,15 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # downgrade sentinel (our 1.3 offer was stripped). a client that offered only
     # 1.2 never expected 1.3, so a marked random is legitimate there.
     if offered_tls13 and tls12.has_downgrade_sentinel(hello.random):
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2")
     if not tls12.is_supported_suite(hello.cipher_suite):
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "server selected an unsupported tls 1.2 cipher suite"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unsupported tls 1.2 cipher suite")
     # extended master secret is required (rfc 7627): it binds the master secret
     # to the full transcript and closes the triple-handshake class.
     if not hello.extended_master_secret:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "server did not negotiate extended master secret"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "server did not negotiate extended master secret")
     if hello.renegotiation_info.len() > 1 or (hello.renegotiation_info.len() == 1 and hello.renegotiation_info[0] != 0):
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "server sent a non-empty renegotiation info"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server sent a non-empty renegotiation info")
     cipher := hello.cipher_suite
     server_random := hello.random
     transcript_append(transcript, server_hello_message)!
@@ -1442,15 +1449,13 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
         if record.content_type != TLS_CONTENT_HANDSHAKE:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected a tls 1.2 handshake record"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected a tls 1.2 handshake record")
         flight.write(record.payload)!
         # a legitimate server flight (certificate chain and key exchange) is far
         # under this; the cap stops a malicious server from growing the buffer
         # without ever sending ServerHelloDone.
         if flight.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls 1.2 server handshake flight is too large"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 server handshake flight is too large")
         have_done = scan_tls12_server_flight(stream, flight.bytes())!
     server_flight := flight.bytes()
     transcript.write(server_flight)!
@@ -1463,50 +1468,39 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     for message in messages:
         if message.message_type == tls12.TLS12_CERTIFICATE:
             ders := tls12.parse_certificate_message(message.body) catch:
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls 1.2 certificate message"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 certificate message")
             for der in ders:
                 cert := x509.parse_der(der) catch:
-                    send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls 1.2 server certificate"
+                    fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 server certificate")
                 certs.push(cert)
         elif message.message_type == tls12.TLS12_SERVER_KEY_EXCHANGE:
             if certs.len() == 0:
-                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "tls 1.2 server key exchange arrived before the certificate"
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 server key exchange arrived before the certificate")
             ske := tls12.parse_server_key_exchange(message.body) catch:
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls 1.2 server key exchange"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 server key exchange")
             # a keyUsage extension that withholds digitalSignature bars this
             # certificate from signing the key exchange, whatever chain
             # verification would say — checked here so the rule also holds for
             # configs that skip verification (rfc 5280 §4.2.1.3).
             if certs[0].has_key_usage and not certs[0].digital_signature:
-                send_fatal_alert(stream, ALERT_BAD_CERTIFICATE) catch 0
-                fail "server certificate key usage does not permit signing"
+                fail refuse_with(stream, ALERT_BAD_CERTIFICATE, "server certificate key usage does not permit signing")
             signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, ske.signed_params)
             if not scheme_matches_certificate_key(ske.signature_scheme, certs[0].public_key_algorithm):
-                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-                fail "tls signature scheme does not match the certificate key type"
+                fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls signature scheme does not match the certificate key type")
             if not tls13.verify_certificate_signature(certs[0].subject_public_key, ske.signature_scheme, signed_data, ske.signature)!:
-                send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
-                fail "tls 1.2 server key exchange signature is invalid"
+                fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 server key exchange signature is invalid")
             ske_curve = ske.named_curve
             ske_point = ske.public_point
             have_ske = true
         elif message.message_type == tls12.TLS12_CERTIFICATE_REQUEST:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls 1.2 client certificate authentication is not supported"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client certificate authentication is not supported")
         elif message.message_type == tls12.TLS12_SERVER_HELLO_DONE:
             if message.body.len() != 0:
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "tls 1.2 server hello done must be empty"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "tls 1.2 server hello done must be empty")
         else:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "unexpected tls 1.2 handshake message"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls 1.2 handshake message")
     if certs.len() == 0 or not have_ske:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "incomplete tls 1.2 server flight"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "incomplete tls 1.2 server flight")
 
     if not verify_certificate_chain(certs, config, server_name, stream.fd)!:
         fail "tls 1.2 server certificate verification failed"
@@ -1584,49 +1578,38 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             if first_record.content_type == TLS_CONTENT_ALERT:
                 native_fail_alert(first_record)!
             if first_record.content_type != TLS_CONTENT_HANDSHAKE:
-                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "expected tls server hello"
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls server hello")
             if first_record.payload.len() == 0:
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "empty tls handshake record"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "empty tls handshake record")
             hello_buf.write(first_record.payload)!
             if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-                send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-                fail "tls server hello is too large"
+                fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls server hello is too large")
             server_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
         if server_messages[0].message_type != TLS_HANDSHAKE_SERVER_HELLO:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected tls server hello"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls server hello")
         if not tls13.is_hello_retry_request(server_messages[0].body):
             flight_ready = true
         else:
             # --- HelloRetryRequest (rfc 8446 §4.1.4) ---
             if hrr_suite != 0:
-                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "second tls hello retry request"
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "second tls hello retry request")
             parsed_hrr := tls13.parse_hello_retry_request(server_messages[0].body)
             if parsed_hrr.is_err:
                 if parsed_hrr.err == "unknown tls hello retry request extension":
-                    send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
-                    fail "unknown tls hello retry request extension"
+                    fail refuse_with(stream, ALERT_UNSUPPORTED_EXTENSION, "unknown tls hello retry request extension")
                 if parsed_hrr.err == "duplicate tls hello retry request extension" or parsed_hrr.err == "tls hello retry request selected a compression method":
-                    send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-                    fail "invalid tls hello retry request"
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls hello retry request"
+                    fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "invalid tls hello retry request")
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls hello retry request")
             hrr := parsed_hrr.ok
             if hrr.cipher_suite != TLS_CIPHER_AES_128_GCM_SHA256 and hrr.cipher_suite != TLS_CIPHER_AES_256_GCM_SHA384 and hrr.cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256:
-                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-                fail "tls hello retry request selected an unoffered cipher suite"
+                fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request selected an unoffered cipher suite")
             if hrr.selected_group != 0:
                 # this hello carried a share for every group it offered, so any
                 # group a retry names is either already served or never
                 # offered — both are aborts (rfc 8446 §4.1.4).
-                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-                fail "tls hello retry request named a group already offered"
+                fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request named a group already offered")
             if not hrr.has_cookie:
-                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-                fail "tls hello retry request changes nothing"
+                fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request changes nothing")
             # the second hello: the first one again with the cookie echoed. a
             # psk offer is not repeated — its binder covered the first hello
             # alone — so that hello is rebuilt bare before the cookie goes on.
@@ -1652,12 +1635,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     negotiated := tls13.negotiated_server_version(server_messages[0].body)!
     if hrr_suite != 0 and negotiated != TLS_VERSION_13:
         # the retry request already committed the server to 1.3.
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "tls server changed versions after a hello retry request"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls server changed versions after a hello retry request")
     if negotiated == TLS_VERSION_12:
         if not config_offers_tls12(config):
-            send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
-            fail "server negotiated tls 1.2 but this config requires tls 1.3"
+            fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "server negotiated tls 1.2 but this config requires tls 1.3")
         hello_bytes := hello_buf.bytes()
         server_hello_encoded_len := 4 + server_messages[0].body.len()
         mut server_flight_prefix := bytes.empty()
@@ -1665,37 +1646,30 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             server_flight_prefix = hello_bytes.slice(server_hello_encoded_len, hello_bytes.len())
         return native_client_handshake_tls12(stream, server_name, config, client_random, session_id, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
     if negotiated != TLS_VERSION_13:
-        send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
-        fail "server negotiated an unsupported tls version"
+        fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "server negotiated an unsupported tls version")
     if hello_buf.len() != 4 + server_messages[0].body.len():
         # a 1.3 server's flight after the ServerHello is encrypted; plaintext
         # handshake bytes past the hello have no legitimate reading.
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "trailing plaintext bytes after tls server hello"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "trailing plaintext bytes after tls server hello")
     sh_extension_types := tls13.server_hello_extension_types(server_messages[0].body) catch []
     mut seen_sh_extensions: List[Int] := []
     for sh_ext_type in sh_extension_types:
         if seen_sh_extensions.contains(sh_ext_type):
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "server duplicated a tls server hello extension"
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "server duplicated a tls server hello extension")
         seen_sh_extensions.push(sh_ext_type)
     for sh_ext_type in sh_extension_types:
         if not client_offered_server_hello_extension(sh_ext_type, server_name != ""):
-            send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
-            fail "server sent an unoffered tls server hello extension"
+            fail refuse_with(stream, ALERT_UNSUPPORTED_EXTENSION, "server sent an unoffered tls server hello extension")
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls server hello"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls server hello")
     if hrr_suite != 0 and server_hello.cipher_suite != hrr_suite:
         # rfc 8446 §4.1.4: the suite must not change between the retry request
         # and the hello that follows it.
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "tls server changed cipher suites after a hello retry request"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls server changed cipher suites after a hello retry request")
     # rfc 8446 §4.1.3: legacy_session_id_echo must equal what we offered; a
     # mismatch means the hello answers someone else's offer.
     if not bytes.eq(server_hello.session_id, session_id):
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "tls server hello echoed a different session id"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls server hello echoed a different session id")
     transcript_append(transcript_buf, server_messages[0])!
 
     # the server picked one of our offered groups; derive with that keypair.
@@ -1705,15 +1679,13 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     elif server_hello.key_share_group == TLS_GROUP_X25519:
         shared_secret = keypair.shared_secret(server_hello.key_share)!
     else:
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "server selected an unsupported tls key share group"
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unsupported tls key share group")
     keypair.close()
     p256pair.close()
     mut did_resume := false
     if server_hello.selected_psk_identity >= 0:
         if not offering_psk or server_hello.selected_psk_identity != 0:
-            send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-            fail "server selected an unexpected tls psk identity"
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unexpected tls psk identity")
         did_resume = true
     handshake_secret := handshake_secret_for_resumption(server_hello.cipher_suite, did_resume, cached_session.psk, shared_secret)!
     server_hs_secret := tls13.server_handshake_traffic_secret_for_cipher(server_hello.cipher_suite, handshake_secret, transcript_buf.bytes())!
@@ -1752,12 +1724,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
             if not is_valid_change_cipher_spec(record):
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls change cipher spec"
+                fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls change cipher spec")
             client_ccs_count = client_ccs_count + 1
             if client_ccs_count > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "too many tls change cipher spec records"
+                fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "too many tls change cipher spec records")
             continue
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
@@ -1765,31 +1735,25 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             # a plaintext handshake record where ciphertext is due is, to the
             # record layer, data that fails to authenticate — bad_record_mac,
             # the same verdict a garbled ciphertext earns.
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
-            fail "expected encrypted tls handshake record"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_BAD_RECORD_MAC, "expected encrypted tls handshake record")
         inner := open_record_for_cipher(server_hello.cipher_suite, server_hs_keys.key, server_hs_keys.iv, server_hs_seq, record_bytes(record)!) catch:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
-            fail "tls server record failed to open"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_BAD_RECORD_MAC, "tls server record failed to open")
         server_hs_seq = server_hs_seq + 1
         if inner.content_type != TLS_CONTENT_HANDSHAKE:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected tls handshake payload"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "expected tls handshake payload")
         if inner.payload.len() == 0:
             # rfc 8446 §5.1: zero-length handshake fragments must not be sent.
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-            fail "empty tls handshake record"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "empty tls handshake record")
         combined := bytes.concat(server_flight_pending, inner.payload)
         if combined.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls server flight is too large"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_HANDSHAKE_FAILURE, "tls server flight is too large")
         messages := tls13.decode_handshakes_prefix(combined)
         server_flight_pending = combined.slice(tls13.handshakes_encoded_len(messages), combined.len())
         mut message_index := 0
         for message in messages:
             message_index = message_index + 1
             if server_finished:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "excess data after tls server finished"
+                fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls server finished")
             if message.message_type == TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS:
                 mut ee_unsupported := false
                 mut ee_duplicated := false
@@ -1802,55 +1766,44 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                         ee_unsupported = true
                 if ee_duplicated:
                     # rfc 8446 §4.2: at most one extension of a type per block.
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "server duplicated an encrypted extension"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "server duplicated an encrypted extension")
                 if ee_unsupported:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNSUPPORTED_EXTENSION) catch 0
-                    fail "server sent an unoffered encrypted extension"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNSUPPORTED_EXTENSION, "server sent an unoffered encrypted extension")
                 encrypted_extensions := tls13.parse_encrypted_extensions(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls encrypted extensions"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls encrypted extensions")
                 if encrypted_extensions.alpn_protocol != "":
                     if not alpn_protocols.contains(encrypted_extensions.alpn_protocol):
-                        send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_ILLEGAL_PARAMETER) catch 0
-                        fail "server negotiated an unexpected alpn protocol"
+                        fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_ILLEGAL_PARAMETER, "server negotiated an unexpected alpn protocol")
                 negotiated_alpn = encrypted_extensions.alpn_protocol
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_REQUEST:
                 client_cert_requested = true
                 request := tls13.parse_certificate_request(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls certificate request"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate request")
                 client_cert_request_schemes = request.signature_schemes
                 if request.signature_schemes.len() > 0 and config_has_client_certificate(config):
                     client_cert_usable = select_server_signature_scheme(client_key_is_ecdsa(config) catch false, true, request.signature_schemes) != 0
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE:
                 if did_resume:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "unexpected certificate during resumed tls handshake"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected certificate during resumed tls handshake")
                 server_cert_msg := tls13.parse_certificate_message(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls server certificate message"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls server certificate message")
                 certs = certificates_from_message(server_cert_msg) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls server certificate"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls server certificate")
                 # this client requests no certificate-entry extensions
                 # (status_request, sct), so any that appear are unsolicited
                 # (rfc 8446 §4.4.2).
                 for entry in server_cert_msg.certificates:
                     if entry.extensions.len() != 0:
-                        send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNSUPPORTED_EXTENSION) catch 0
-                        fail "server sent an unoffered certificate extension"
+                        fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNSUPPORTED_EXTENSION, "server sent an unoffered certificate extension")
                 # the same keyUsage rule as the 1.2 path: CertificateVerify is
                 # signed with this leaf key, so digitalSignature is required
                 # even when chain verification is skipped.
                 if certs.len() > 0 and certs[0].has_key_usage and not certs[0].digital_signature:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_CERTIFICATE) catch 0
-                    fail "server certificate key usage does not permit signing"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_BAD_CERTIFICATE, "server certificate key usage does not permit signing")
                 chain_ok := verify_certificate_chain(certs, config, server_name, 0 - 1) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_CERTIFICATE) catch 0
-                    fail "tls server certificate verification failed"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_BAD_CERTIFICATE, "tls server certificate verification failed")
                 if not chain_ok:
                     fail "tls server certificate verification failed"
                 peer = peer_identity_from_certificates(certs)
@@ -1858,40 +1811,30 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_VERIFY:
                 if did_resume:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "unexpected certificate verify during resumed tls handshake"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected certificate verify during resumed tls handshake")
                 if certs.len() == 0:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "certificate verify arrived before certificate"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "certificate verify arrived before certificate")
                 cv := tls13.parse_certificate_verify(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls certificate verify"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate verify")
                 if not scheme_matches_certificate_key(cv.signature_scheme, certs[0].public_key_algorithm):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_ILLEGAL_PARAMETER) catch 0
-                    fail "tls signature scheme does not match the certificate key type"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls signature scheme does not match the certificate key type")
                 if not (tls13.verify_server_certificate_for_cipher(server_hello.cipher_suite, certs[0].subject_public_key, cv.signature_scheme, transcript_buf.bytes(), cv.signature) catch false):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
-                    fail "certificate verify failed"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECRYPT_ERROR, "certificate verify failed")
                 cert_verify_seen = true
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
                 if not did_resume and (not cert_verified or not cert_verify_seen):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "server finished before certificate verification"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "server finished before certificate verification")
                 verify_data := tls13.parse_finished(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls server finished"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls server finished")
                 if not (tls13.verify_finished_for_cipher(server_hello.cipher_suite, server_hs_secret, transcript_buf.bytes(), verify_data) catch false):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
-                    fail "server finished verification failed"
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECRYPT_ERROR, "server finished verification failed")
                 transcript_append(transcript_buf, message)!
                 server_finished = true
             else:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "unexpected tls handshake message"
+                fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls handshake message")
         if server_finished and server_flight_pending.len() != 0:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "excess data after tls server finished"
+            fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls server finished")
 
     application_transcript := transcript_buf.bytes()
     master_secret := tls13.master_secret_for_cipher(server_hello.cipher_suite, handshake_secret)!
@@ -2030,25 +1973,20 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     # it is refused cleanly here rather than after the handshake at Finished, and
     # the ServerHello never advertises an EMS extension the client did not send.
     if not lenient.extended_master_secret:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "tls 1.2 client did not offer extended master secret"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client did not offer extended master secret")
     # select the certificate/config by server name first: the cert's key type
     # decides which suite family (ECDHE-RSA vs ECDHE-ECDSA) we can serve.
     handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols) catch:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "no server configuration for this client hello"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no server configuration for this client hello")
     is_ecdsa := server_key_is_ecdsa(handshake_config)!
     cipher := select_tls12_suite(lenient.cipher_suites, is_ecdsa)
     if cipher == 0:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "no supported tls 1.2 cipher suite offered"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 cipher suite offered")
     curve := select_tls12_curve(lenient.supported_groups)
     if curve == 0:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "no supported tls 1.2 curve offered"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 curve offered")
     selected_alpn := select_alpn_protocol(handshake_config, lenient.alpn_protocols) catch:
-        send_fatal_alert(stream, ALERT_NO_APPLICATION_PROTOCOL) catch 0
-        fail "no common alpn protocol"
+        fail refuse_with(stream, ALERT_NO_APPLICATION_PROTOCOL, "no common alpn protocol")
     # rfc 5746 §3.6: echo renegotiation_info only when the client signalled secure
     # renegotiation, via the extension or the SCSV cipher value.
     mut secure_renegotiation := lenient.secure_renegotiation
@@ -2081,8 +2019,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     # extension) takes our top choice.
     ske_scheme := select_server_signature_scheme(is_ecdsa, false, lenient.signature_schemes)
     if ske_scheme == 0:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "client does not accept this server's signature algorithm"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client does not accept this server's signature algorithm")
     ske_sig := sign_with_scheme(handshake_config, ske_scheme, signed_data)!
     server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, ske_sig.scheme, ske_sig.signature)!)!
     server_done := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO_DONE, bytes.empty())!
@@ -2113,25 +2050,19 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
         if cke_record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(cke_record)!
         if cke_record.content_type != TLS_CONTENT_HANDSHAKE:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected tls 1.2 client key exchange"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls 1.2 client key exchange")
         if cke_record.payload.len() == 0:
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "empty tls handshake record"
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "empty tls handshake record")
         cke_buf.write(cke_record.payload)!
         if cke_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls 1.2 client key exchange is too large"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client key exchange is too large")
         cke_messages = tls13.decode_handshakes_prefix(cke_buf.bytes())
     if tls13.handshakes_encoded_len(cke_messages) != cke_buf.len():
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls 1.2 client key exchange record"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client key exchange record")
     if cke_messages[0].message_type != tls12.TLS12_CLIENT_KEY_EXCHANGE:
-        send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-        fail "expected tls 1.2 client key exchange"
+        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls 1.2 client key exchange")
     client_point := tls12.parse_client_key_exchange(cke_messages[0].body) catch:
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls 1.2 client key exchange"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client key exchange")
     transcript.write(tls13.encode_handshake(cke_messages[0].message_type, cke_messages[0].body)!)!
 
     pre_master := keypair.shared_secret(client_point)!
@@ -2145,8 +2076,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     if not subtle.equal(tls12_finished_bytes(master, "client finished", transcript)!, client_finished.verify_data):
         # the server has not sent its own ChangeCipherSpec yet, so its write
         # epoch is still plaintext and the plaintext alert is the correct one.
-        send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
-        fail "tls 1.2 client finished verification failed"
+        fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 client finished verification failed")
     transcript.write(tls13.encode_handshake(tls12.TLS12_FINISHED, client_finished.verify_data)!)!
 
     # send our ChangeCipherSpec and encrypted Finished.
@@ -2173,32 +2103,26 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         if first_record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(first_record)!
         if first_record.content_type != TLS_CONTENT_HANDSHAKE:
-            send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected tls client hello"
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls client hello")
         if first_record.payload.len() == 0:
             # rfc 8446 §5.1: zero-length handshake fragments must not be sent.
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "empty tls handshake record"
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "empty tls handshake record")
         hello_buf.write(first_record.payload)!
         if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls client hello is too large"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls client hello is too large")
         client_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
     if tls13.handshakes_encoded_len(client_messages) != hello_buf.len():
         # bytes after the ClientHello inside the same flight would desync the
         # transcript; the hello must arrive alone.
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls handshake record"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls handshake record")
     if client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
-        send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-        fail "expected tls client hello"
+        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls client hello")
     # a client that did not offer 1.3 takes the 1.2 fallback if this config
     # allows it and it offered a suite we can serve. a 1.3-capable client (our
     # own included) always has 772 in supported_versions and stays on the 1.3
     # path, whose parser is stricter.
     mut lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
-        send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls client hello"
+        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls client hello")
     # rfc 7507: a client that fell back from a higher version marks the retry
     # with TLS_FALLBACK_SCSV in its cipher list. when the fallback landed
     # below the best version this server speaks, the original attempt was cut
@@ -2211,15 +2135,13 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             if offered_version > client_best:
                 client_best = offered_version
     if lenient_hello.cipher_suites.contains(TLS_FALLBACK_SCSV) and client_best < TLS_VERSION_13:
-        send_fatal_alert(stream, ALERT_INAPPROPRIATE_FALLBACK) catch 0
-        fail "tls client signalled an inappropriate fallback"
+        fail refuse_with(stream, ALERT_INAPPROPRIATE_FALLBACK, "tls client signalled an inappropriate fallback")
     # rfc 8446 §4.1.2 froze the client hello's legacy_version at 0x0303, and
     # §4.2.1 makes supported_versions authoritative when present — the legacy
     # field is only meaningful without the extension, where a lower value is a
     # pre-1.2 client this stack does not speak.
     if lenient_hello.supported_versions.len() == 0 and lenient_hello.legacy_version < TLS_VERSION_12:
-        send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
-        fail "tls client hello legacy version below 1.2"
+        fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "tls client hello legacy version below 1.2")
     if not lenient_hello.supported_versions.contains(TLS_VERSION_13):
         # the fallback serves only a client that actually offered tls 1.2:
         # through supported_versions when the extension is present, or through
@@ -2231,8 +2153,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         if lenient_hello.supported_versions.len() > 0:
             offered_tls12 = lenient_hello.supported_versions.contains(TLS_VERSION_12)
         if not offered_tls12 or not config_offers_tls12(config):
-            send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
-            fail "client did not offer a tls version this server speaks"
+            fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "client did not offer a tls version this server speaks")
         # the 1.2 fallback does not implement client-certificate authentication,
         # so a config that requests or requires it must never drop to a path
         # that ignores it — that would authenticate nobody. such a client is
@@ -2240,24 +2161,20 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         # no-common-suite refusal below are handshake failures, not version ones.
         wants_client_auth := config_requires_client_certificate(config) or config_requests_client_certificate(config)
         if wants_client_auth:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls 1.2 fallback is unavailable with client authentication"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 fallback is unavailable with client authentication")
         if select_tls12_suite(lenient_hello.cipher_suites, server_key_is_ecdsa(config) catch false) == 0:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "no supported tls 1.2 cipher suite offered"
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 cipher suite offered")
         return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
     # rfc 8446 §9.2: a 1.3 client hello must carry supported_groups; one
     # without it gets the missing_extension alert rather than a parameter
     # complaint.
     if lenient_hello.supported_groups.len() == 0:
-        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
-        fail "tls client hello is missing supported groups"
+        fail refuse_with(stream, ALERT_MISSING_EXTENSION, "tls client hello is missing supported groups")
     # rfc 8446 §9.2 also demands a key_share (this stack serves no psk-only
     # mode); absence has its own alert, and the lenient walk saw every
     # extension regardless of ordering quirks the strict parser rejects.
     if not lenient_hello.key_share_present:
-        send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
-        fail "tls client hello is missing a key share"
+        fail refuse_with(stream, ALERT_MISSING_EXTENSION, "tls client hello is missing a key share")
     # --- HelloRetryRequest (rfc 8446 §4.1.4, server side) ---
     # the client's key_share may hold no share this stack serves while its
     # supported_groups still names one it could produce; ask for that group
@@ -2275,8 +2192,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         if retry_group != 0:
             retry_cipher := select_cipher_from_list(lenient_hello.cipher_suites)
             if retry_cipher == 0:
-                send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-                fail "client did not offer a supported tls cipher suite"
+                fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client did not offer a supported tls cipher suite")
             hrr_message := tls13.encode_hello_retry_request(lenient_hello.session_id, retry_cipher, retry_group)!
             native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, hrr_message)!)!
             send_change_cipher_spec(stream)!
@@ -2290,31 +2206,24 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 if second_record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
                     second_hello_ccs = second_hello_ccs + 1
                     if second_hello_ccs > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC or not is_valid_change_cipher_spec(second_record):
-                        send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                        fail "invalid tls change cipher spec"
+                        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "invalid tls change cipher spec")
                     continue
                 if second_record.content_type == TLS_CONTENT_ALERT:
                     native_fail_alert(second_record)!
                 if second_record.content_type != TLS_CONTENT_HANDSHAKE:
-                    send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "expected a second tls client hello"
+                    fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected a second tls client hello")
                 if second_record.payload.len() == 0:
-                    send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                    fail "empty tls handshake record"
+                    fail refuse_with(stream, ALERT_DECODE_ERROR, "empty tls handshake record")
                 hello_buf.write(second_record.payload)!
                 if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-                    send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-                    fail "tls client hello is too large"
+                    fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls client hello is too large")
                 client_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
             if tls13.handshakes_encoded_len(client_messages) != hello_buf.len():
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls handshake record"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls handshake record")
             if client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
-                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "expected a second tls client hello"
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected a second tls client hello")
             lenient_hello = tls13.parse_client_hello_lenient(client_messages[0].body) catch:
-                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls client hello"
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls client hello")
     parsed_client_hello := tls13.parse_client_hello(client_messages[0].body)
     if parsed_client_hello.is_err:
         # the lenient parse and version checks above already passed. a psk
@@ -2323,29 +2232,21 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         # share in a group this stack does not serve, a malformed psk offer,
         # a non-null compression.
         if parsed_client_hello.err == "tls psk offered without key exchange modes":
-            send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
-            fail "tls psk offered without key exchange modes"
+            fail refuse_with(stream, ALERT_MISSING_EXTENSION, "tls psk offered without key exchange modes")
         if parsed_client_hello.err == "tls psk offer has no binders":
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "tls psk offer has no binders"
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "tls psk offer has no binders")
         if parsed_client_hello.err == "tls psk binder has an invalid length":
-            send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
-            fail "tls psk binder failed verification"
-        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
-        fail "unsupported tls client hello"
+            fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls psk binder failed verification")
+        fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "unsupported tls client hello")
     client_hello := parsed_client_hello.ok
     handshake_config := select_server_config(config, client_hello) catch:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "no server configuration for this client hello"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no server configuration for this client hello")
     fallback_cipher := select_cipher(client_hello) catch:
-        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-        fail "no supported tls cipher suite offered"
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls cipher suite offered")
     selected_alpn := select_alpn_protocol(handshake_config, client_hello.alpn_protocols) catch:
-        send_fatal_alert(stream, ALERT_NO_APPLICATION_PROTOCOL) catch 0
-        fail "no common alpn protocol"
+        fail refuse_with(stream, ALERT_NO_APPLICATION_PROTOCOL, "no common alpn protocol")
     resumption := select_server_resumption(handshake_config, hrr_prefix, client_hello, selected_alpn, fallback_cipher) catch:
-        send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
-        fail "invalid tls session resumption offer"
+        fail refuse_with(stream, ALERT_DECRYPT_ERROR, "invalid tls session resumption offer")
     cipher := resumption.cipher
     did_resume := resumption.did_resume
 
@@ -2443,52 +2344,41 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
             if not is_valid_change_cipher_spec(record):
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls change cipher spec"
+                fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls change cipher spec")
             server_ccs_count = server_ccs_count + 1
             if server_ccs_count > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "too many tls change cipher spec records"
+                fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "too many tls change cipher spec records")
             continue
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected encrypted tls client finished"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "expected encrypted tls client finished")
         inner := open_record_for_cipher(cipher, client_hs_keys.key, client_hs_keys.iv, client_hs_seq, record_bytes(record)!) catch:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
-            fail "tls client record failed to open"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_BAD_RECORD_MAC, "tls client record failed to open")
         client_hs_seq = client_hs_seq + 1
         if inner.content_type != TLS_CONTENT_HANDSHAKE:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "expected tls client finished"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "expected tls client finished")
         if inner.payload.len() == 0:
             # rfc 8446 §5.1: zero-length handshake fragments must not be sent.
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-            fail "empty tls handshake record"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "empty tls handshake record")
         combined := bytes.concat(client_flight_pending, inner.payload)
         if combined.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls client flight is too large"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_HANDSHAKE_FAILURE, "tls client flight is too large")
         messages := tls13.decode_handshakes_prefix(combined)
         client_flight_pending = combined.slice(tls13.handshakes_encoded_len(messages), combined.len())
         mut message_index := 0
         for message in messages:
             message_index = message_index + 1
             if client_finished_seen:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "excess data after tls client finished"
+                fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls client finished")
             if message.message_type == TLS_HANDSHAKE_CERTIFICATE:
                 client_cert_msg := tls13.parse_certificate_message(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls client certificate message"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate message")
                 client_certs = certificates_from_message(client_cert_msg) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls client certificate"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate")
                 if client_certs.len() > 0:
                     verified := verify_client_certificate_chain(client_certs, handshake_config) catch:
-                        send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_BAD_CERTIFICATE) catch 0
-                        fail "tls client certificate verification failed"
+                        fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_BAD_CERTIFICATE, "tls client certificate verification failed")
                     if not verified:
                         fail "tls client certificate verification failed"
                     peer = peer_identity_from_certificates(client_certs)
@@ -2496,31 +2386,25 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 transcript_append(transcript, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_VERIFY:
                 if client_certs.len() == 0:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "client certificate verify arrived before certificate"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client certificate verify arrived before certificate")
                 cv := tls13.parse_certificate_verify(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls client certificate verify"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate verify")
                 if not (tls13.verify_client_certificate_for_cipher(cipher, client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
-                    fail "client certificate verify failed"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECRYPT_ERROR, "client certificate verify failed")
                 client_cert_verify_seen = true
                 transcript_append(transcript, message)!
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
                 if client_cert_required and (client_certs.len() == 0 or not client_cert_verify_seen):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "client finished arrived before client certificate verification"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client finished arrived before client certificate verification")
                 # a certificate is public, so presenting one proves nothing on
                 # its own — only CertificateVerify proves the client holds the
                 # matching private key (RFC 8446 4.4.2). without this, optional
                 # mTLS would record a peer identity from a victim's certificate
                 # that the client never proved it owns.
                 if client_certs.len() > 0 and not client_cert_verify_seen:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "client presented a certificate without a certificate verify"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client presented a certificate without a certificate verify")
                 verify_data := tls13.parse_finished(message.body) catch:
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
-                    fail "malformed tls client finished"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client finished")
                 # verify the client Finished over the LIVE transcript, which by
                 # now includes the client Certificate and CertificateVerify
                 # appended above (RFC 8446 4.4.4). application_transcript is the
@@ -2530,16 +2414,13 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 # genuine mTLS client, since the client computes its Finished
                 # over the full transcript.
                 if not (tls13.verify_finished_for_cipher(cipher, client_hs_secret, transcript.bytes(), verify_data) catch false):
-                    send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_DECRYPT_ERROR) catch 0
-                    fail "client finished verification failed"
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECRYPT_ERROR, "client finished verification failed")
                 transcript_append(transcript, message)!
                 client_finished_seen = true
             else:
-                send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-                fail "unexpected tls client handshake message"
+                fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls client handshake message")
         if client_finished_seen and client_flight_pending.len() != 0:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, cipher, server_app_keys.key, server_app_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "excess data after tls client finished"
+            fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls client finished")
 
     # rfc 8446 §4.6.1: a ticket is only useful to a client that offered the
     # psk_dhe_ke mode; one that did not gets none.
@@ -2604,14 +2485,12 @@ fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream) -> tls13.Re
         fail "truncated tls record header"
     length := checked_read(binary.read_u16_be_at(header, 3))!
     if length > tls13.MAX_CIPHERTEXT_RECORD:
-        send_conn_fatal_alert(cs, ALERT_RECORD_OVERFLOW) catch 0
-        fail "tls record overflow"
+        fail conn_refuse_with(cs, ALERT_RECORD_OVERFLOW, "tls record overflow")
     payload := stream.read_exact_bytes(length)!
     if payload.len() != length:
         fail "truncated tls record payload"
     record := tls13.decode_record(header.concat(payload)) catch:
-        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-        fail "malformed tls record"
+        fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "malformed tls record")
     return record
 
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
@@ -2658,18 +2537,15 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # rfc 8446 §5: change_cipher_spec is only tolerated during the
             # handshake. one arriving on an established connection is an
             # injected plaintext record, not a compatibility artifact.
-            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "change cipher spec after tls handshake"
+            fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "change cipher spec after tls handshake")
         # tls 1.3 wraps every post-handshake record as application_data, so any
         # other outer type is plaintext injection. tls 1.2 keeps the real
         # content type on the (encrypted) record, so alert and handshake outer
         # types are legitimate there and only decrypt below.
         if cs.version == TLS_VERSION_13 and record.content_type != TLS_CONTENT_APPLICATION_DATA:
-            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "unencrypted tls record after handshake"
+            fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "unencrypted tls record after handshake")
         if cs.version == TLS_VERSION_12 and record.content_type != TLS_CONTENT_APPLICATION_DATA and record.content_type != TLS_CONTENT_ALERT and record.content_type != TLS_CONTENT_HANDSHAKE:
-            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
-            fail "unexpected tls record after handshake"
+            fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "unexpected tls record after handshake")
         seq := cs.read_seq
         cs.read_seq = seq + 1
         opened := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)
@@ -2677,20 +2553,16 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # an oversized plaintext is a protocol violation with its own
             # alert; everything else that fails to open is a bad tag.
             if opened.err == "tls record overflow":
-                send_conn_fatal_alert(cs, ALERT_RECORD_OVERFLOW) catch 0
-                fail "tls plaintext record overflow"
-            send_conn_fatal_alert(cs, ALERT_BAD_RECORD_MAC) catch 0
-            fail "tls record failed to open"
+                fail conn_refuse_with(cs, ALERT_RECORD_OVERFLOW, "tls plaintext record overflow")
+            fail conn_refuse_with(cs, ALERT_BAD_RECORD_MAC, "tls record failed to open")
         inner := opened.ok
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
             alert := tls13.parse_alert(inner.payload) catch:
-                send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                fail "malformed tls alert"
+                fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "malformed tls alert")
             if alert.level != 1 and alert.level != 2:
-                send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
-                fail "unknown tls alert level"
+                fail conn_refuse_with(cs, ALERT_ILLEGAL_PARAMETER, "unknown tls alert level")
             if alert.description == tls13.ALERT_CLOSE_NOTIFY:
                 return bytes.empty()
             if alert.level == 1:
@@ -2699,24 +2571,20 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                 # and skipped, but only a few times — a stream of them burns a
                 # decrypt each while yielding nothing.
                 if cs.version == TLS_VERSION_13:
-                    send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                    fail "unexpected tls warning alert"
+                    fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "unexpected tls warning alert")
                 warning_alerts = warning_alerts + 1
                 if warning_alerts > 4:
-                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "too many tls warning alerts"
+                    fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "too many tls warning alerts")
                 continue
             fail "tls alert " + tls13.alert_description_name(alert.description)
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             if inner.payload.len() == 0:
-                send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                fail "empty tls handshake record"
+                fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "empty tls handshake record")
             # post-handshake messages may span records (a peer fragmenting its
             # session tickets, say); keep the incomplete tail for the next read.
             combined := bytes.concat(config_get(native_conn_handshake_pending, handle, bytes.empty()), inner.payload)
             if combined.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-                send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                fail "tls post-handshake message is too large"
+                fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "tls post-handshake message is too large")
             messages := tls13.decode_handshakes_prefix(combined)
             config_put(native_conn_handshake_pending, handle, combined.slice(tls13.handshakes_encoded_len(messages), combined.len()))
             for message in messages:
@@ -2725,12 +2593,10 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                 # stack refuses renegotiation (rfc 5746 makes the refusal
                 # explicit with the no_renegotiation alert).
                 if cs.version == TLS_VERSION_12 and (message.message_type == tls12.TLS12_HELLO_REQUEST or message.message_type == tls12.TLS12_CLIENT_HELLO):
-                    send_conn_fatal_alert(cs, ALERT_NO_RENEGOTIATION) catch 0
-                    fail "tls renegotiation refused"
+                    fail conn_refuse_with(cs, ALERT_NO_RENEGOTIATION, "tls renegotiation refused")
                 if message.message_type == tls13.HANDSHAKE_KEY_UPDATE:
                     apply_peer_key_update(cs, cipher, message) catch:
-                        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                        fail "malformed tls key update"
+                        fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "malformed tls key update")
                 else:
                     remembered := remember_client_ticket_from_message(handle, cipher, message)
                     if remembered.is_err:
@@ -2738,10 +2604,8 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                         # whose flags are duplicated or padded is a bad
                         # parameter.
                         if remembered.err == "tls ticket flags are not minimally encoded" or remembered.err == "duplicate tls new session ticket extension":
-                            send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
-                            fail "invalid tls session ticket"
-                        send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
-                        fail "malformed tls session ticket"
+                            fail conn_refuse_with(cs, ALERT_ILLEGAL_PARAMETER, "invalid tls session ticket")
+                        fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "malformed tls session ticket")
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
@@ -2752,8 +2616,7 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             if payload.len() == 0:
                 empty_records = empty_records + 1
                 if empty_records > 32:
-                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
-                    fail "too many empty tls records"
+                    fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "too many empty tls records")
                 continue
             if payload.len() > size:
                 cs.pending = payload.slice(size, payload.len())

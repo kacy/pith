@@ -60,6 +60,11 @@ CIPHER_TLS_AES_256_GCM_SHA384 := 4866
 CIPHER_TLS_CHACHA20_POLY1305_SHA256 := 4867
 GROUP_X25519 := 29
 GROUP_SECP256R1 := 23
+GROUP_SECP384R1 := 24
+
+# The strict client-hello parser's no-usable-share failure, named so the
+# server's HelloRetryRequest probe can match it without string drift.
+pub ERR_CLIENT_HELLO_KEY_SHARE := "client hello key share must be x25519, secp256r1, or secp384r1"
 PSK_MODE_DHE_KE := 1
 SIG_RSA_PKCS1_SHA256 := 1025
 SIG_ECDSA_SECP256R1_SHA256 := 1027
@@ -419,6 +424,9 @@ fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_p
     mut groups := [GROUP_X25519]
     if p256_public_key.len() > 0:
         groups.push(GROUP_SECP256R1)
+    # secp384r1 is advertised without a share: a server that insists on it
+    # answers with a HelloRetryRequest and the client supplies the share then.
+    groups.push(GROUP_SECP384R1)
     write_bytes_if_any(out, server_name_extension(server_name)!)!
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
     write_bytes_if_any(out, supported_versions_client_extension()!)!
@@ -768,6 +776,9 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
     mut groups := [GROUP_X25519]
     if p256_public_key.len() > 0:
         groups.push(GROUP_SECP256R1)
+    # secp384r1 is advertised without a share: a server that insists on it
+    # answers with a HelloRetryRequest and the client supplies the share then.
+    groups.push(GROUP_SECP384R1)
     mut versions := [TLS13_VERSION, TLS_LEGACY_VERSION]
     if not offer_tls13:
         versions = [TLS_LEGACY_VERSION]
@@ -1079,8 +1090,8 @@ pub fn parse_client_hello(body: Bytes) -> ClientHello!:
         fail "client did not offer tls 1.3"
     ks_group := parsed.key_share.group
     ks_len := parsed.key_share.key_share.len()
-    if not ((ks_group == GROUP_X25519 and ks_len == 32) or (ks_group == GROUP_SECP256R1 and ks_len == 65)):
-        fail "client hello key share must be x25519 or secp256r1"
+    if not ((ks_group == GROUP_X25519 and ks_len == 32) or (ks_group == GROUP_SECP256R1 and ks_len == 65) or (ks_group == GROUP_SECP384R1 and ks_len == 97)):
+        fail ERR_CLIENT_HELLO_KEY_SHARE
     return ClientHello(legacy_version, random, session_id, parsed.server_name, cipher_suites, parsed.supported_versions, parsed.key_share.group, parsed.key_share.key_share, parsed.signature_schemes, parsed.alpn_protocols, parsed.psk_mode_dhe, parsed.psk.identity, parsed.psk.binder, parsed.psk.obfuscated_ticket_age, parsed.psk.binder_input)
 
 # encode a tls 1.3 server hello.
@@ -1249,6 +1260,61 @@ pub fn client_hello_with_cookie(client_hello: Bytes, cookie: Bytes) -> Bytes!:
     write_u16_be(out, ext_len + cookie_ext.len())!
     write_bytes_if_any(out, body.slice(ext_len_offset + 2, body.len()))!
     write_bytes_if_any(out, cookie_ext)!
+    return encode_handshake(HANDSHAKE_CLIENT_HELLO, out.bytes())
+
+# Rebuild an encoded ClientHello with its key_share extension replaced by a
+# single share for `group` (rfc 8446 §4.1.2: after a retry the client sends
+# the share the server asked for). Every other extension is kept in place.
+pub fn client_hello_with_key_share(client_hello: Bytes, group: Int, public_key: Bytes) -> Bytes!:
+    if client_hello.len() < 4:
+        fail "malformed tls client hello"
+    body := client_hello.slice(4, client_hello.len())
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    sid_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, sid_len))!
+    suites_len := checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, suites_len))!
+    comp_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, comp_len))!
+    prefix_len := 2 + 32 + 1 + sid_len + 2 + suites_len + 1 + comp_len
+    ext_len := checked_read(binary.read_u16_be(r))!
+    extensions := checked_bytes(binary.read_bytes(r, ext_len))!
+    if binary.remaining(r) != 0:
+        fail "malformed tls client hello extensions"
+    share := bytes.buffer()
+    defer share.free()
+    write_u16_be(share, group)!
+    write_u16_be(share, public_key.len())!
+    write_bytes_if_any(share, public_key)!
+    shares := bytes.buffer()
+    defer shares.free()
+    write_u16_be(shares, share.len())!
+    write_bytes_if_any(shares, share.bytes())!
+    new_key_share := extension_record(EXT_KEY_SHARE, shares.bytes())!
+    out_extensions := bytes.buffer()
+    defer out_extensions.free()
+    er := binary.reader(extensions)
+    mut replaced := false
+    while binary.remaining(er) > 0:
+        extension_type := checked_read(binary.read_u16_be(er))!
+        data_len := checked_read(binary.read_u16_be(er))!
+        data := checked_bytes(binary.read_bytes(er, data_len))!
+        if extension_type == EXT_KEY_SHARE:
+            write_bytes_if_any(out_extensions, new_key_share)!
+            replaced = true
+        else:
+            write_u16_be(out_extensions, extension_type)!
+            write_u16_be(out_extensions, data.len())!
+            write_bytes_if_any(out_extensions, data)!
+    if not replaced:
+        fail "tls client hello has no key share to replace"
+    out := bytes.buffer()
+    defer out.free()
+    write_bytes_if_any(out, body.slice(0, prefix_len))!
+    write_u16_be(out, out_extensions.len())!
+    write_bytes_if_any(out, out_extensions.bytes())!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, out.bytes())
 
 # The transcript prefix that replaces ClientHello1 after a HelloRetryRequest

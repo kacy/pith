@@ -210,6 +210,7 @@ fn scheme_matches_certificate_key(scheme: Int, key_algorithm: String) -> Bool:
     return key_algorithm == OID_RSA_ENCRYPTION
 TLS_GROUP_X25519 := 29
 TLS_GROUP_SECP256R1 := 23
+TLS_GROUP_SECP384R1 := 24
 TLS_MAX_PLAINTEXT_RECORD := 16384
 TLS_MAX_HANDSHAKE_FLIGHT := 65536
 TLS_SESSION_TICKET_LIFETIME := 86400
@@ -1229,6 +1230,10 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     p256pair := ecdh.p256_keypair()!
     errdefer p256pair.close()
     client_random := random.bytes(32)!
+    # a p-384 pair exists only if a HelloRetryRequest asks for that group;
+    # until then this placeholder holds an invalid handle and close() on it is
+    # a no-op.
+    mut p384pair := ecdh.X25519KeyPair(0 - 1, bytes.empty())
     # the 32-byte legacy_session_id is 1.3 middlebox-compatibility theater
     # (rfc 8446 D.4); a hello capped at 1.2 sends none, like a real 1.2 client.
     mut session_id := bytes.empty()
@@ -1248,7 +1253,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
             transcript.write(client_hello)!
-            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, true, cache_key, transcript)
+            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, p384pair, cached_session, true, cache_key, transcript)
     # a non-resumption hello offers the TLS 1.2 fallback unless the config is
     # locked to 1.3. resumption is a 1.3-only path (a 1.2 ticket is never
     # cached), so its hello above stays 1.3-only.
@@ -1264,7 +1269,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
     transcript := bytes.buffer()
     transcript.write(client_hello)!
-    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
+    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, p384pair, cached_session, offering_psk, cache_key, transcript)
 
 # send a plaintext ChangeCipherSpec record (the single 0x01 byte) — the marker
 # that the sender's next record is under the newly negotiated 1.2 keys.
@@ -1529,6 +1534,10 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     elif ske_curve == tls12.NAMED_CURVE_SECP256R1:
         pre_master = p256pair.shared_secret(ske_point)!
         client_point = p256pair.public_key
+    elif ske_curve == tls12.NAMED_CURVE_SECP384R1:
+        p384 := ecdh.p384_keypair()!
+        pre_master = p384.shared_secret(ske_point)!
+        client_point = p384.public_key
     else:
         fail "server selected an unsupported tls 1.2 curve"
     keypair.close()
@@ -1571,7 +1580,7 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # application record in each direction is sequence 1.
     return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, server_finished.records_read, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
 
-fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
+fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, mut p384pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
     mut transcript_buf := transcript
     alpn_protocols := config_alpn_protocols(config)
     mut peer := empty_peer_identity()
@@ -1609,30 +1618,42 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             # --- HelloRetryRequest (rfc 8446 §4.1.4) ---
             if hrr_suite != 0:
                 fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "second tls hello retry request")
+            if tls13.handshakes_encoded_len(server_messages) != hello_buf.len() or server_messages.len() > 1:
+                # the retry request ends the server's flight — the client
+                # speaks next, so anything coalesced after it can never
+                # complete.
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls handshake data after hello retry request")
             parsed_hrr := tls13.parse_hello_retry_request(server_messages[0].body)
             if parsed_hrr.is_err:
                 if parsed_hrr.err == "unknown tls hello retry request extension":
                     fail refuse_with(stream, ALERT_UNSUPPORTED_EXTENSION, "unknown tls hello retry request extension")
-                if parsed_hrr.err == "duplicate tls hello retry request extension" or parsed_hrr.err == "tls hello retry request selected a compression method":
+                if parsed_hrr.err == "duplicate tls hello retry request extension":
                     fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "invalid tls hello retry request")
                 fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls hello retry request")
             hrr := parsed_hrr.ok
             if hrr.cipher_suite != TLS_CIPHER_AES_128_GCM_SHA256 and hrr.cipher_suite != TLS_CIPHER_AES_256_GCM_SHA384 and hrr.cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256:
                 fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request selected an unoffered cipher suite")
-            if hrr.selected_group != 0:
-                # this hello carried a share for every group it offered, so any
-                # group a retry names is either already served or never
-                # offered — both are aborts (rfc 8446 §4.1.4).
+            if hrr.selected_group != 0 and hrr.selected_group != TLS_GROUP_SECP384R1:
+                # shares for x25519 and p-256 were already in the first hello,
+                # so naming either — or a group never offered — is an abort
+                # (rfc 8446 §4.1.4). secp384r1 is the one group advertised
+                # without a share, the retry this client honors.
                 fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request named a group already offered")
-            if not hrr.has_cookie:
+            if hrr.selected_group == 0 and not hrr.has_cookie:
                 fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls hello retry request changes nothing")
-            # the second hello: the first one again with the cookie echoed. a
-            # psk offer is not repeated — its binder covered the first hello
-            # alone — so that hello is rebuilt bare before the cookie goes on.
+            # the second hello: the first one again with the requested changes
+            # applied — the p-384 share the server asked for, the cookie
+            # echoed. a psk offer is not repeated — its binder covered the
+            # first hello alone — so that hello is rebuilt bare first.
             mut hello1 := transcript_buf.bytes()
             if offering_psk:
                 hello1 = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
-            client_hello2 := tls13.client_hello_with_cookie(hello1, hrr.cookie)!
+            mut client_hello2 := hello1
+            if hrr.selected_group == TLS_GROUP_SECP384R1:
+                p384pair = ecdh.p384_keypair()!
+                client_hello2 = tls13.client_hello_with_key_share(client_hello2, TLS_GROUP_SECP384R1, p384pair.public_key)!
+            if hrr.has_cookie:
+                client_hello2 = tls13.client_hello_with_cookie(client_hello2, hrr.cookie)!
             # the retry transcript replaces ClientHello1 with a synthetic
             # message_hash of it (rfc 8446 §4.4.1).
             retry_prefix := tls13.hrr_transcript_prefix_for_cipher(hrr.cipher_suite, transcript_buf.bytes())!
@@ -1698,6 +1719,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         shared_secret = p256pair.shared_secret(server_hello.key_share)!
     elif server_hello.key_share_group == TLS_GROUP_X25519:
         shared_secret = keypair.shared_secret(server_hello.key_share)!
+    elif server_hello.key_share_group == TLS_GROUP_SECP384R1 and p384pair.handle >= 0:
+        # only legitimate after a retry asked for this group — that is the
+        # sole way a p-384 pair exists.
+        shared_secret = p384pair.shared_secret(server_hello.key_share)!
     else:
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unsupported tls key share group")
     keypair.close()
@@ -1987,6 +2012,8 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
         return tls12.NAMED_CURVE_X25519
     if groups.contains(tls12.NAMED_CURVE_SECP256R1):
         return tls12.NAMED_CURVE_SECP256R1
+    if groups.contains(tls12.NAMED_CURVE_SECP384R1):
+        return tls12.NAMED_CURVE_SECP384R1
     return 0
 
 # The TLS 1.2 server handshake, reached when a client did not offer 1.3 but
@@ -2010,6 +2037,10 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     curve := select_tls12_curve(lenient.supported_groups)
     if curve == 0:
         fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 curve offered")
+    if is_ecdsa and not lenient.supported_groups.contains(tls12.NAMED_CURVE_SECP256R1):
+        # rfc 4492: the ecdsa certificate's own curve must be one the client
+        # supports — this server's ec certificates are p-256.
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client does not support this server's certificate curve")
     selected_alpn := select_alpn_protocol(handshake_config, lenient.alpn_protocols) catch:
         fail refuse_with(stream, ALERT_NO_APPLICATION_PROTOCOL, "no common alpn protocol")
     # rfc 5746 §3.6: echo renegotiation_info only when the client signalled secure
@@ -2026,6 +2057,9 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     if curve == tls12.NAMED_CURVE_SECP256R1:
         keypair.close()
         keypair = ecdh.p256_keypair()!
+    elif curve == tls12.NAMED_CURVE_SECP384R1:
+        keypair.close()
+        keypair = ecdh.p384_keypair()!
     errdefer keypair.close()
 
     # a 1.2 ServerHello's session_id is a resumption signal, not an echo: a
@@ -2211,12 +2245,14 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # (rfc 8446 §4.4.1) and stays empty on the direct path.
     mut hrr_prefix := bytes.empty()
     share_probe := tls13.parse_client_hello(client_messages[0].body)
-    if share_probe.is_err and share_probe.err == "client hello key share must be x25519 or secp256r1":
+    if share_probe.is_err and share_probe.err == tls13.ERR_CLIENT_HELLO_KEY_SHARE:
         mut retry_group := 0
         if lenient_hello.supported_groups.contains(TLS_GROUP_X25519):
             retry_group = TLS_GROUP_X25519
         elif lenient_hello.supported_groups.contains(TLS_GROUP_SECP256R1):
             retry_group = TLS_GROUP_SECP256R1
+        elif lenient_hello.supported_groups.contains(TLS_GROUP_SECP384R1):
+            retry_group = TLS_GROUP_SECP384R1
         if retry_group != 0:
             retry_cipher := select_cipher_from_list(lenient_hello.cipher_suites)
             if retry_cipher == 0:
@@ -2286,6 +2322,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     if client_hello.key_share_group == TLS_GROUP_SECP256R1:
         keypair.close()
         keypair = ecdh.p256_keypair()!
+    elif client_hello.key_share_group == TLS_GROUP_SECP384R1:
+        keypair.close()
+        keypair = ecdh.p384_keypair()!
     errdefer keypair.close()
     server_random := random.bytes(32)!
     server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!

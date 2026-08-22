@@ -60,7 +60,7 @@ fn vectors(path: String) -> List[List[String]]!:
 
 # tcId|result|key|iv|aad|msg|ct_and_tag — seal must reproduce ct||tag for valid
 # vectors and open must round-trip; invalid vectors must fail to open.
-fn run_aead(suite: String, path: String, use_chacha: Bool) -> Bool!:
+fn run_aead(suite: String, path: String, kind: String) -> Bool!:
     t := tally()
     for parts in vectors(path)!:
         key := field_bytes(parts[2])!
@@ -73,9 +73,12 @@ fn run_aead(suite: String, path: String, use_chacha: Bool) -> Bool!:
         if result == "valid":
             mut resealed := bytes.empty()
             mut opened := bytes.empty()
-            if use_chacha:
+            if kind == "chacha":
                 resealed = aead.chacha20_poly1305_seal(key, iv, aad, msg) catch bytes.empty()
                 opened = aead.chacha20_poly1305_open(key, iv, aad, sealed) catch bytes.from_string_utf8("!open-failed")
+            elif kind == "aes256":
+                resealed = aead.aes_256_gcm_seal(key, iv, aad, msg) catch bytes.empty()
+                opened = aead.aes_256_gcm_open(key, iv, aad, sealed) catch bytes.from_string_utf8("!open-failed")
             else:
                 resealed = aead.aes_128_gcm_seal(key, iv, aad, msg) catch bytes.empty()
                 opened = aead.aes_128_gcm_open(key, iv, aad, sealed) catch bytes.from_string_utf8("!open-failed")
@@ -84,8 +87,12 @@ fn run_aead(suite: String, path: String, use_chacha: Bool) -> Bool!:
             # only open is meaningful: sealing the message would just produce
             # the correct ciphertext again. reaching the line after the catch
             # means open ACCEPTED the invalid input, which record() flags.
-            if use_chacha:
+            if kind == "chacha":
                 aead.chacha20_poly1305_open(key, iv, aad, sealed) catch:
+                    record(t, suite, parts[0], result, false)
+                    continue
+            elif kind == "aes256":
+                aead.aes_256_gcm_open(key, iv, aad, sealed) catch:
                     record(t, suite, parts[0], result, false)
                     continue
             else:
@@ -151,8 +158,9 @@ fn run_hmac(suite: String, path: String) -> Bool!:
 
 fn main() -> Int!:
     mut all_ok := true
-    all_ok = run_aead("aes-128-gcm", "tests/wycheproof/aes_gcm_128.txt", false)! and all_ok
-    all_ok = run_aead("chacha20-poly1305", "tests/wycheproof/chacha20_poly1305.txt", true)! and all_ok
+    all_ok = run_aead("aes-128-gcm", "tests/wycheproof/aes_gcm_128.txt", "aes128")! and all_ok
+    all_ok = run_aead("aes-256-gcm", "tests/wycheproof/aes_gcm_256.txt", "aes256")! and all_ok
+    all_ok = run_aead("chacha20-poly1305", "tests/wycheproof/chacha20_poly1305.txt", "chacha")! and all_ok
     all_ok = run_verify("ecdsa-p256-sha256", "tests/wycheproof/ecdsa_p256_sha256.txt", "ecdsa")! and all_ok
     all_ok = run_verify("rsa-pkcs1-2048-sha256", "tests/wycheproof/rsa_pkcs1_2048_sha256.txt", "pkcs1")! and all_ok
     all_ok = run_verify("rsa-pss-2048-sha256", "tests/wycheproof/rsa_pss_2048_sha256.txt", "pss")! and all_ok

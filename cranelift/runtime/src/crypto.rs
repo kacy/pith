@@ -174,6 +174,50 @@ pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pith_crypto_aes_256_gcm_seal(
+    key: i64,
+    nonce: i64,
+    aad: i64,
+    plaintext: i64,
+) -> i64 {
+    let Some(key) = bytes_slice(key) else {
+        return 0;
+    };
+    let Some(nonce) = bytes_slice(nonce) else {
+        return 0;
+    };
+    let Some(aad) = bytes_slice(aad) else {
+        return 0;
+    };
+    let Some(plaintext) = bytes_slice(plaintext) else {
+        return 0;
+    };
+    seal_with(&aead::AES_256_GCM, key, nonce, aad, plaintext)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_aes_256_gcm_open(
+    key: i64,
+    nonce: i64,
+    aad: i64,
+    ciphertext: i64,
+) -> i64 {
+    let Some(key) = bytes_slice(key) else {
+        return 0;
+    };
+    let Some(nonce) = bytes_slice(nonce) else {
+        return 0;
+    };
+    let Some(aad) = bytes_slice(aad) else {
+        return 0;
+    };
+    let Some(ciphertext) = bytes_slice(ciphertext) else {
+        return 0;
+    };
+    open_with(&aead::AES_256_GCM, key, nonce, aad, ciphertext)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pith_crypto_aes_128_gcm_seal(
     key: i64,
     nonce: i64,

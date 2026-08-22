@@ -135,6 +135,12 @@ pub extern "C" fn pith_crypto_p256_keygen() -> i64 {
     ecdh_keygen(&agreement::ECDH_P256)
 }
 
+/// Generate a P-384 (secp384r1) ephemeral key pair for ECDH.
+#[no_mangle]
+pub extern "C" fn pith_crypto_p384_keygen() -> i64 {
+    ecdh_keygen(&agreement::ECDH_P384)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_x25519_public_key(handle: i64) -> i64 {
     let Some(key) = x25519_key_ref(handle) else {

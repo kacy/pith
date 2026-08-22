@@ -23,13 +23,20 @@ pub fn p256_keypair() -> X25519KeyPair!:
     public_key := crypto_x25519_public_key(handle)!
     return X25519KeyPair(handle, public_key)
 
+# generate a fresh p-384 (secp384r1) ephemeral key pair. its public key is the
+# 97-byte uncompressed point; the shared secret it derives is 48 bytes.
+pub fn p384_keypair() -> X25519KeyPair!:
+    handle := crypto_p384_keygen()!
+    public_key := crypto_x25519_public_key(handle)!
+    return X25519KeyPair(handle, public_key)
+
 # derive a shared secret with a peer public key. this consumes the private key.
-# an x25519 peer key is 32 bytes; a p-256 peer key is a 65-byte uncompressed
-# point. the runtime rejects a peer key that does not match the private key's
-# curve.
+# an x25519 peer key is 32 bytes; a p-256 peer key a 65-byte and a p-384 peer
+# key a 97-byte uncompressed point. the runtime rejects a peer key that does
+# not match the private key's curve.
 pub fn x25519_shared_secret(key: X25519KeyPair, peer_public_key: Bytes) -> Bytes!:
-    if peer_public_key.len() != 32 and peer_public_key.len() != 65:
-        fail "ecdh peer public key must be 32 or 65 bytes"
+    if peer_public_key.len() != 32 and peer_public_key.len() != 65 and peer_public_key.len() != 97:
+        fail "ecdh peer public key must be 32, 65, or 97 bytes"
     return crypto_x25519_shared_secret(key.handle, peer_public_key)!
 
 impl X25519KeyPair:
@@ -38,6 +45,17 @@ impl X25519KeyPair:
 
     fn close():
         crypto_x25519_close(self.handle)
+
+test "p-384 key agreement derives the same 48-byte secret on both ends":
+    alice := p384_keypair()!
+    bob := p384_keypair()!
+    alice_secret := alice.shared_secret(bob.public_key)!
+    bob_secret := bob.shared_secret(alice.public_key)!
+
+    assert_eq(alice.public_key.len(), 97)
+    assert_eq(alice.public_key[0], 4)
+    assert_eq(alice_secret.len(), 48)
+    assert(bytes.eq(alice_secret, bob_secret))
 
 test "x25519 derives matching shared secrets":
     alice := x25519_keypair()!

@@ -1381,13 +1381,20 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
 # rather than after ServerHelloDone — a server that substitutes a foreign
 # message would otherwise deadlock both peers, each waiting for the other.
 fn scan_tls12_server_flight(stream: TcpStream, flight: Bytes) -> Bool!:
+    messages := tls13.decode_handshakes_prefix(flight)
     mut have_done := false
-    for message in tls13.decode_handshakes(flight) catch []:
+    for message in messages:
         t := message.message_type
+        if have_done:
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 handshake message after server hello done")
         if t == tls12.TLS12_SERVER_HELLO_DONE:
             have_done = true
         elif t != tls12.TLS12_CERTIFICATE and t != tls12.TLS12_SERVER_KEY_EXCHANGE and t != tls12.TLS12_CERTIFICATE_REQUEST:
             fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls 1.2 handshake message")
+    if have_done and tls13.handshakes_encoded_len(messages) != flight.len():
+        # ServerHelloDone ends the flight; a partial message coalesced after
+        # it can never complete — the client speaks next.
+        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "trailing tls handshake data after server hello done")
     return have_done
 
 fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
@@ -2133,8 +2140,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         client_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
     if tls13.handshakes_encoded_len(client_messages) != hello_buf.len():
         # bytes after the ClientHello inside the same flight would desync the
-        # transcript; the hello must arrive alone.
-        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls handshake record")
+        # transcript; the hello must arrive alone. what trails a complete
+        # hello is the start of a message the peer may not send yet.
+        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls handshake data after client hello")
     if client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
         fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls client hello")
     # a client that did not offer 1.3 takes the 1.2 fallback if this config
@@ -2240,7 +2248,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                     fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls client hello is too large")
                 client_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
             if tls13.handshakes_encoded_len(client_messages) != hello_buf.len():
-                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls handshake record")
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls handshake data after client hello")
             if client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
                 fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected a second tls client hello")
             lenient_hello = tls13.parse_client_hello_lenient(client_messages[0].body) catch:

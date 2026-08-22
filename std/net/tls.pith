@@ -1178,7 +1178,11 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     p256pair := ecdh.p256_keypair()!
     errdefer p256pair.close()
     client_random := random.bytes(32)!
-    session_id := random.bytes(32)!
+    # the 32-byte legacy_session_id is 1.3 middlebox-compatibility theater
+    # (rfc 8446 D.4); a hello capped at 1.2 sends none, like a real 1.2 client.
+    mut session_id := bytes.empty()
+    if not config_max_is_tls12(config):
+        session_id = random.bytes(32)!
     alpn_protocols := config_alpn_protocols(config)
     mut cache_key := ""
     mut cached_session := empty_cached_session()
@@ -1193,7 +1197,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
             transcript.write(client_hello)!
-            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, true, cache_key, transcript)
+            return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, true, cache_key, transcript)
     # a non-resumption hello offers the TLS 1.2 fallback unless the config is
     # locked to 1.3. resumption is a 1.3-only path (a 1.2 ticket is never
     # cached), so its hello above stays 1.3-only.
@@ -1209,7 +1213,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
     transcript := bytes.buffer()
     transcript.write(client_hello)!
-    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
+    return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, cached_session, offering_psk, cache_key, transcript)
 
 # send a plaintext ChangeCipherSpec record (the single 0x01 byte) — the marker
 # that the sender's next record is under the newly negotiated 1.2 keys.
@@ -1334,7 +1338,7 @@ fn scan_tls12_server_flight(stream: TcpStream, flight: Bytes) -> Bool!:
             fail "unexpected tls 1.2 handshake message"
     return have_done
 
-fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
+fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
     # the whole 1.2 server flight is plaintext, so every rejection below can
     # answer with a plaintext fatal alert before the socket closes, mirroring
     # what the server side does for a hello it refuses.
@@ -1342,9 +1346,22 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
         if not client_offered_tls12_extension(ext_type, server_name != "", config_alpn_protocols(config).len() > 0):
             send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
             fail "server sent an unoffered tls 1.2 extension"
-    hello := tls12.parse_server_hello(server_hello_message.body) catch:
+    parsed_hello := tls12.parse_server_hello(server_hello_message.body)
+    if parsed_hello.is_err:
+        # selecting a compression method we never offered is a negotiation
+        # violation with its own alert; anything else is a parse failure.
+        if parsed_hello.err == "tls 1.2 server selected a compression method":
+            send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+            fail "tls 1.2 server selected a compression method"
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls 1.2 server hello"
+    hello := parsed_hello.ok
+    # a 1.2 server echoing the session id we offered claims to resume a
+    # session that does not exist — this stack never offers 1.2 resumption,
+    # and the id it sends is the 1.3 compatibility placeholder.
+    if session_id.len() > 0 and bytes.eq(hello.session_id, session_id):
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls 1.2 server echoed the compatibility session id"
     # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
     # not mark its random. the sentinel means a 1.3-capable server fell back to
     # 1.2 — our 1.3 offer was stripped by an active attacker.
@@ -1504,7 +1521,7 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # application record in each direction is sequence 1.
     return allocate_native_conn(stream, TLS_VERSION_12, cipher, server_keys, client_keys, server_finished.records_read, 1, "", bytes.empty(), state, bytes.empty(), bytes.empty())
 
-fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
+fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, cached_session: CachedSession, offering_psk: Bool, cache_key: String, transcript: ByteBuffer) -> Conn!:
     mut transcript_buf := transcript
     alpn_protocols := config_alpn_protocols(config)
     mut peer := empty_peer_identity()
@@ -1548,7 +1565,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         mut server_flight_prefix := bytes.empty()
         if hello_bytes.len() > server_hello_encoded_len:
             server_flight_prefix = hello_bytes.slice(server_hello_encoded_len, hello_bytes.len())
-        return native_client_handshake_tls12(stream, server_name, config, client_random, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
+        return native_client_handshake_tls12(stream, server_name, config, client_random, session_id, keypair, p256pair, server_messages[0], transcript_buf, server_flight_prefix, not config_max_is_tls12(config))
     if negotiated != TLS_VERSION_13:
         send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
         fail "server negotiated an unsupported tls version"
@@ -1564,6 +1581,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls server hello"
+    # rfc 8446 §4.1.3: legacy_session_id_echo must equal what we offered; a
+    # mismatch means the hello answers someone else's offer.
+    if not bytes.eq(server_hello.session_id, session_id):
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls server hello echoed a different session id"
     transcript_append(transcript_buf, server_messages[0])!
 
     # the server picked one of our offered groups; derive with that keypair.

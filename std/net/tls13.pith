@@ -58,6 +58,11 @@ PSK_MODE_DHE_KE := 1
 SIG_RSA_PKCS1_SHA256 := 1025
 SIG_ECDSA_SECP256R1_SHA256 := 1027
 SIG_RSA_PSS_RSAE_SHA256 := 2052
+SIG_RSA_PSS_RSAE_SHA384 := 2053
+SIG_RSA_PSS_RSAE_SHA512 := 2054
+SIG_RSA_PKCS1_SHA384 := 1281
+SIG_RSA_PKCS1_SHA512 := 1537
+SIG_ECDSA_SECP384R1_SHA384 := 1283
 SIG_ED25519 := 2055
 SERVER_CERT_VERIFY_CONTEXT := "TLS 1.3, server CertificateVerify"
 CLIENT_CERT_VERIFY_CONTEXT := "TLS 1.3, client CertificateVerify"
@@ -373,7 +378,7 @@ fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_p
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
     write_bytes_if_any(out, supported_versions_client_extension()!)!
     write_bytes_if_any(out, supported_groups_extension(groups)!)!
-    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
+    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
     write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return true
 
@@ -510,6 +515,16 @@ pub fn verify_certificate_signature(public_key: Bytes, scheme: Int, message: Byt
         return signature.verify_ecdsa_p256_sha256_asn1(public_key, message, signed)
     if scheme == SIG_RSA_PSS_RSAE_SHA256:
         return signature.verify_rsa_pss_sha256(public_key, message, signed)
+    if scheme == SIG_RSA_PSS_RSAE_SHA384:
+        return signature.verify_rsa_pss_sha384(public_key, message, signed)
+    if scheme == SIG_RSA_PSS_RSAE_SHA512:
+        return signature.verify_rsa_pss_sha512(public_key, message, signed)
+    if scheme == SIG_RSA_PKCS1_SHA384:
+        return signature.verify_rsa_pkcs1_sha384(public_key, message, signed)
+    if scheme == SIG_RSA_PKCS1_SHA512:
+        return signature.verify_rsa_pkcs1_sha512(public_key, message, signed)
+    if scheme == SIG_ECDSA_SECP384R1_SHA384:
+        return signature.verify_ecdsa_p384_sha384_asn1(public_key, message, signed)
     if scheme == SIG_ED25519:
         return signature.verify_ed25519(public_key, message, signed)
     return false
@@ -696,7 +711,7 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
     write_bytes_if_any(out, supported_versions_client_extension_list(versions)!)!
     write_bytes_if_any(out, supported_groups_extension(groups)!)!
-    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
+    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
     write_bytes_if_any(out, extended_master_secret_extension()!)!
     write_bytes_if_any(out, renegotiation_info_extension()!)!
     write_bytes_if_any(out, ec_point_formats_extension()!)!

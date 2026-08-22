@@ -182,7 +182,11 @@ TLS_VERSION_12 := 771
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
 TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
+TLS_SIG_RSA_PSS_RSAE_SHA384 := 2053
+TLS_SIG_RSA_PSS_RSAE_SHA512 := 2054
 TLS_SIG_RSA_PKCS1_SHA256 := 1025
+TLS_SIG_RSA_PKCS1_SHA384 := 1281
+TLS_SIG_RSA_PKCS1_SHA512 := 1537
 TLS_SIG_ECDSA_SECP256R1_SHA256 := 1027
 OID_EC_PUBLIC_KEY := "1.2.840.10045.2.1"
 TLS_GROUP_X25519 := 29
@@ -877,22 +881,18 @@ fn client_key_is_ecdsa(config: Config) -> Bool!:
 # scheme this client's key can produce. a client that cannot satisfy the
 # request declines with an empty Certificate (rfc 8446 §4.4.2) — it must not
 # abort, and it must never fall back to signing with an unadvertised scheme.
-fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer, cert_usable: Bool) -> Bool!:
+fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer, cert_usable: Bool, request_schemes: List[Int]) -> Bool!:
     if config_has_client_certificate(config) and cert_usable:
         client_certs := native_config_client_cert_chain(config)!
         client_certificate := tls13.encode_certificate_message(client_certs)!
         transcript.write(client_certificate)!
         client_cert_input := tls13.client_certificate_verify_input_sha256(transcript.bytes())!
-        # sign with whatever key the certificate carries: ecdsa p-256 for an ec
-        # certificate, rsa-pss otherwise — the same split the server side makes.
+        # sign the CertificateVerify with a scheme the server's request
+        # advertised, keyed on this certificate's key type — the same
+        # selection the server side makes for its own signature.
         leaf := x509.parse_der(client_certs[0])!
-        mut client_scheme := TLS_SIG_RSA_PSS_RSAE_SHA256
-        mut client_sig := bytes.empty()
-        if leaf.public_key_algorithm == OID_EC_PUBLIC_KEY:
-            client_scheme = TLS_SIG_ECDSA_SECP256R1_SHA256
-            client_sig = signature.sign_ecdsa_p256_sha256_asn1_pkcs8(native_client_private_key(config)!, client_cert_input)!
-        else:
-            client_sig = signature.sign_rsa_pss_sha256_pkcs8(native_client_private_key(config)!, client_cert_input)!
+        client_scheme := select_server_signature_scheme(leaf.public_key_algorithm == OID_EC_PUBLIC_KEY, true, request_schemes)
+        client_sig := sign_with_client_scheme(config, client_scheme, client_cert_input)!
         client_certificate_verify := tls13.encode_certificate_verify(client_scheme, client_sig)!
         transcript.write(client_certificate_verify)!
         flight.write(client_certificate)!
@@ -1568,6 +1568,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     mut cert_verify_seen := false
     mut client_cert_requested := false
     mut client_cert_usable := true
+    mut client_cert_request_schemes: List[Int] := []
     mut negotiated_alpn := ""
     # the client has sent nothing in the handshake epoch yet, so a rejection
     # while reading the server's encrypted flight seals its alert with the
@@ -1640,11 +1641,9 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 request := tls13.parse_certificate_request(message.body) catch:
                     send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_DECODE_ERROR) catch 0
                     fail "malformed tls certificate request"
+                client_cert_request_schemes = request.signature_schemes
                 if request.signature_schemes.len() > 0 and config_has_client_certificate(config):
-                    mut our_scheme := TLS_SIG_RSA_PSS_RSAE_SHA256
-                    if client_key_is_ecdsa(config) catch false:
-                        our_scheme = TLS_SIG_ECDSA_SECP256R1_SHA256
-                    client_cert_usable = request.signature_schemes.contains(our_scheme)
+                    client_cert_usable = select_server_signature_scheme(client_key_is_ecdsa(config) catch false, true, request.signature_schemes) != 0
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE:
                 if did_resume:
@@ -1720,7 +1719,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
 
     client_flight := bytes.buffer()
     if client_cert_requested:
-        append_client_certificate_flight(config, transcript_buf, client_flight, client_cert_usable)!
+        append_client_certificate_flight(config, transcript_buf, client_flight, client_cert_usable, client_cert_request_schemes)!
     client_verify := tls13.finished_verify_data_sha256(client_hs_secret, transcript_buf.bytes())!
     client_finished := tls13.encode_finished(client_verify)!
     transcript_buf.write(client_finished)!
@@ -1755,13 +1754,67 @@ struct ServerSignature:
     scheme: Int
     signature: Bytes
 
-fn sign_server_handshake(config: Config, is_ecdsa: Bool, rsa_pss: Bool, message: Bytes) -> ServerSignature!:
-    key := native_server_private_key(config)!
+# the server's signature-scheme menu, in preference order, for a certificate
+# key type. an rsa key can produce any of the rsa schemes; a p-256 key only
+# ecdsa-p256-sha256. pss is preferred over pkcs1, stronger hash last only as a
+# tie-break the client's ordering doesn't already decide.
+fn server_signature_menu(is_ecdsa: Bool, tls13: Bool) -> List[Int]:
     if is_ecdsa:
-        return ServerSignature(TLS_SIG_ECDSA_SECP256R1_SHA256, signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!)
-    if rsa_pss:
-        return ServerSignature(TLS_SIG_RSA_PSS_RSAE_SHA256, signature.sign_rsa_pss_sha256_pkcs8(key, message)!)
-    return ServerSignature(TLS_SIG_RSA_PKCS1_SHA256, signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!)
+        return [TLS_SIG_ECDSA_SECP256R1_SHA256]
+    # rfc 8446 §4.2.3: the rsa_pkcs1_* codes name certificate signatures only,
+    # never a 1.3 handshake signature, so tls 1.3 signs with pss alone. tls 1.2
+    # accepts either family.
+    if tls13:
+        return [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512]
+    return [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512]
+
+# choose the first scheme from our menu the client also advertised. an empty
+# offered list means the client sent no signature_algorithms (a 1.2 client may
+# omit it); fall back to our top choice. returns 0 when nothing overlaps.
+fn select_server_signature_scheme(is_ecdsa: Bool, tls13: Bool, offered: List[Int]) -> Int:
+    menu := server_signature_menu(is_ecdsa, tls13)
+    if offered.len() == 0:
+        return menu[0]
+    for scheme in menu:
+        if offered.contains(scheme):
+            return scheme
+    return 0
+
+fn sign_with_client_scheme(config: Config, scheme: Int, message: Bytes) -> Bytes!:
+    key := native_client_private_key(config)!
+    if scheme == TLS_SIG_ECDSA_SECP256R1_SHA256:
+        return signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA256:
+        return signature.sign_rsa_pss_sha256_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA384:
+        return signature.sign_rsa_pss_sha384_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA512:
+        return signature.sign_rsa_pss_sha512_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PKCS1_SHA256:
+        return signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PKCS1_SHA384:
+        return signature.sign_rsa_pkcs1_sha384_pkcs8(key, message)!
+    if scheme == TLS_SIG_RSA_PKCS1_SHA512:
+        return signature.sign_rsa_pkcs1_sha512_pkcs8(key, message)!
+    fail "unsupported client signature scheme"
+
+fn sign_with_scheme(config: Config, scheme: Int, message: Bytes) -> ServerSignature!:
+    key := native_server_private_key(config)!
+    if scheme == TLS_SIG_ECDSA_SECP256R1_SHA256:
+        return ServerSignature(scheme, signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA256:
+        return ServerSignature(scheme, signature.sign_rsa_pss_sha256_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA384:
+        return ServerSignature(scheme, signature.sign_rsa_pss_sha384_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA512:
+        return ServerSignature(scheme, signature.sign_rsa_pss_sha512_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PKCS1_SHA256:
+        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PKCS1_SHA384:
+        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha384_pkcs8(key, message)!)
+    if scheme == TLS_SIG_RSA_PKCS1_SHA512:
+        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha512_pkcs8(key, message)!)
+    fail "unsupported server signature scheme"
 
 # pick a TLS 1.2 suite from what the client offered, in server preference order.
 # the eligible family follows the server certificate's key type: ECDHE-ECDSA
@@ -1839,24 +1892,15 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     params := tls12.server_key_exchange_params(curve, keypair.public_key)!
     signed_data := tls12.server_key_exchange_signed_data(client_random, server_random, params)
     # the ServerKeyExchange signature must use a scheme the client advertised
-    # (rfc 5246 §7.4.1.4.1). rsa-pss is preferred when offered — rfc 8446 §4.2.3
-    # applies the pss schemes to 1.2 signatures too — with pkcs1-sha256 as the
-    # fallback. a client that advertised neither (nor our one ecdsa scheme for
-    # an ec certificate) is refused; one that sent no extension at all gets the
-    # sha256 default rather than the rfc 5246 sha1 implied set, which this
-    # stack does not sign.
-    mut use_rsa_pss := false
-    if lenient.signature_schemes.len() > 0:
-        if is_ecdsa:
-            if not lenient.signature_schemes.contains(TLS_SIG_ECDSA_SECP256R1_SHA256):
-                send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-                fail "client does not accept this server's signature algorithm"
-        elif lenient.signature_schemes.contains(TLS_SIG_RSA_PSS_RSAE_SHA256):
-            use_rsa_pss = true
-        elif not lenient.signature_schemes.contains(TLS_SIG_RSA_PKCS1_SHA256):
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "client does not accept this server's signature algorithm"
-    ske_sig := sign_server_handshake(handshake_config, is_ecdsa, use_rsa_pss, signed_data)!
+    # (rfc 5246 §7.4.1.4.1); rfc 8446 §4.2.3 applies the pss schemes to 1.2
+    # signatures too. select from what the client offered, keyed on the
+    # certificate's key type. an empty offer (a 1.2 client omitting the
+    # extension) takes our top choice.
+    ske_scheme := select_server_signature_scheme(is_ecdsa, false, lenient.signature_schemes)
+    if ske_scheme == 0:
+        send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
+        fail "client does not accept this server's signature algorithm"
+    ske_sig := sign_with_scheme(handshake_config, ske_scheme, signed_data)!
     server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, ske_sig.scheme, ske_sig.signature)!)!
     server_done := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO_DONE, bytes.empty())!
 
@@ -2062,14 +2106,17 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     client_cert_requested := config_requests_client_certificate(handshake_config)
     client_cert_required := config_requires_client_certificate(handshake_config)
     if client_cert_requested and not did_resume:
-        certificate_request := tls13.encode_certificate_request([TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_ECDSA_SECP256R1_SHA256])!
+        certificate_request := tls13.encode_certificate_request([TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512])!
         transcript.write(certificate_request)!
         server_flight.write(certificate_request)!
     if not did_resume:
         certificate := tls13.encode_certificate_message(native_server_certificate_chain(handshake_config)!)!
         transcript.write(certificate)!
         cert_verify_input := tls13.server_certificate_verify_input_sha256(transcript.bytes())!
-        cert_verify_sig := sign_server_handshake(handshake_config, server_key_is_ecdsa(handshake_config)!, true, cert_verify_input)!
+        cert_verify_scheme := select_server_signature_scheme(server_key_is_ecdsa(handshake_config)!, true, client_hello.signature_schemes)
+        if cert_verify_scheme == 0:
+            fail "client does not accept this server's signature algorithm"
+        cert_verify_sig := sign_with_scheme(handshake_config, cert_verify_scheme, cert_verify_input)!
         certificate_verify := tls13.encode_certificate_verify(cert_verify_sig.scheme, cert_verify_sig.signature)!
         transcript.write(certificate_verify)!
         server_flight.write(certificate)!
@@ -3138,6 +3185,19 @@ test "tls cache helpers evict oldest and expire entries":
     assert_eq(native_server_session_ticket_order.len(), TLS_MAX_SERVER_SESSION_TICKETS)
     assert(not native_server_session_tickets.contains_key("server-2"))
     assert(native_server_session_tickets.contains_key("server-1"))
+
+test "server signature scheme selection honours the client's offer and version":
+    # rsa: 1.2 accepts pkcs1; 1.3 restricts to pss.
+    assert_eq(select_server_signature_scheme(false, false, [TLS_SIG_RSA_PKCS1_SHA384]), TLS_SIG_RSA_PKCS1_SHA384)
+    assert_eq(select_server_signature_scheme(false, true, [TLS_SIG_RSA_PKCS1_SHA384]), 0)
+    assert_eq(select_server_signature_scheme(false, true, [TLS_SIG_RSA_PSS_RSAE_SHA512]), TLS_SIG_RSA_PSS_RSAE_SHA512)
+    # preference order: pss before pkcs1 when both offered.
+    assert_eq(select_server_signature_scheme(false, false, [TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256]), TLS_SIG_RSA_PSS_RSAE_SHA256)
+    # an ecdsa key produces only its one scheme.
+    assert_eq(select_server_signature_scheme(true, true, [TLS_SIG_ECDSA_SECP256R1_SHA256]), TLS_SIG_ECDSA_SECP256R1_SHA256)
+    assert_eq(select_server_signature_scheme(true, true, [TLS_SIG_RSA_PSS_RSAE_SHA256]), 0)
+    # an empty offer (a 1.2 client omitting the extension) takes the top choice.
+    assert_eq(select_server_signature_scheme(false, false, []), TLS_SIG_RSA_PSS_RSAE_SHA256)
 
 test "tls resumable session lookup drops expired entries and refreshes lru":
     native_client_session_cache = {}

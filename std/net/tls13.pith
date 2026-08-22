@@ -1366,6 +1366,18 @@ pub fn negotiated_server_version(body: Bytes) -> Int!:
             return checked_read(binary.read_u16_be(dr))!
     return legacy_version
 
+# Walk an extensions block and list its type ids in order, without
+# interpreting any values. Duplicates are preserved for the caller to judge.
+fn extension_types_in(extensions: Bytes) -> List[Int]!:
+    out: List[Int] := []
+    er := binary.reader(extensions)
+    while binary.remaining(er) > 0:
+        extension_type := checked_read(binary.read_u16_be(er))!
+        data_len := checked_read(binary.read_u16_be(er))!
+        checked_bytes(binary.read_bytes(er, data_len))!
+        out.push(extension_type)
+    return out
+
 # list the extension type ids in a ServerHello body, without interpreting any
 # of them. lets the client reject an extension it never offered with the exact
 # unsupported_extension alert before the full parse runs (rfc 8446 §4.1.3).
@@ -1377,32 +1389,19 @@ pub fn server_hello_extension_types(body: Bytes) -> List[Int]!:
     checked_bytes(binary.read_bytes(r, session_len))!
     checked_read(binary.read_u16_be(r))!
     checked_read(binary.read_u8(r))!
-    out: List[Int] := []
     if binary.remaining(r) == 0:
+        out: List[Int] := []
         return out
     extension_len := checked_read(binary.read_u16_be(r))!
     extensions := checked_bytes(binary.read_bytes(r, extension_len))!
-    er := binary.reader(extensions)
-    while binary.remaining(er) > 0:
-        extension_type := checked_read(binary.read_u16_be(er))!
-        data_len := checked_read(binary.read_u16_be(er))!
-        checked_bytes(binary.read_bytes(er, data_len))!
-        out.push(extension_type)
-    return out
+    return extension_types_in(extensions)
 
 # list the extension type ids in an EncryptedExtensions body.
 pub fn encrypted_extensions_types(body: Bytes) -> List[Int]!:
     r := binary.reader(body)
     extension_len := checked_read(binary.read_u16_be(r))!
     extensions := checked_bytes(binary.read_bytes(r, extension_len))!
-    out: List[Int] := []
-    er := binary.reader(extensions)
-    while binary.remaining(er) > 0:
-        extension_type := checked_read(binary.read_u16_be(er))!
-        data_len := checked_read(binary.read_u16_be(er))!
-        checked_bytes(binary.read_bytes(er, data_len))!
-        out.push(extension_type)
-    return out
+    return extension_types_in(extensions)
 
 # Parse a TLS 1.3 ServerHello body into the fields the key schedule needs. Fails
 # unless the server negotiated 1.3 with a key share; use negotiated_server_version

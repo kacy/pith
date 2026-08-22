@@ -1,0 +1,51 @@
+# the boringssl (bogo) conformance gate. runs the full runner suite against
+# the tls stack and fails on any failure not in the checked-in baseline
+# (tests/interop/bogo/known_failures.txt). scheduled rather than per-pr: the
+# suite plus the pinned checkout is heavy, and the per-pr pipeline already
+# carries the interop and live-tls gates.
+name: bogo
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 4 * * *"
+
+env:
+  BORINGSSL_PIN: aebe361280f2c4afd7426815002e354ff02a4ce1
+
+jobs:
+  bogo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: cache boringssl
+        id: cache-boringssl
+        uses: actions/cache@v4
+        with:
+          path: boringssl
+          key: boringssl-${{ env.BORINGSSL_PIN }}
+      - name: fetch boringssl
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        run: |
+          git init boringssl
+          cd boringssl
+          git remote add origin https://boringssl.googlesource.com/boringssl
+          git fetch --depth 1 origin "$BORINGSSL_PIN"
+          git checkout FETCH_HEAD
+      - name: build
+        run: cargo build --release
+      - name: bogo gate
+        run: make tls-bogo-gate BOGO="$PWD/boringssl"
+      - name: keep the log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bogo-gate-log
+          path: |
+            bogo-gate.log
+            bogo-gate-new.txt
+            bogo-gate-retry.log
+            bogo-gate-confirmed.txt

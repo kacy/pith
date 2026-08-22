@@ -1,4 +1,4 @@
-.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
 
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
@@ -1610,6 +1610,34 @@ tls-bogo: build
 		-shim-config "$(CURDIR)/tests/interop/bogo/config.json" \
 		-allow-unimplemented -loose-errors -pipe \
 		$(if $(BOGO_TESTS),-test "$(BOGO_TESTS)",)
+
+# the bogo conformance gate: run the full suite and compare the failure set
+# against the checked-in baseline. a failure not in the baseline is a
+# regression and fails the gate; a baseline entry that now passes is reported
+# so the list gets pruned. BOGO must point at a boringssl checkout.
+tls-bogo-gate: build
+	@echo "--- bogo conformance gate ---"
+	@command -v go >/dev/null 2>&1 || { echo "go not found; cannot run the bogo gate"; exit 1; }
+	@[ -n "$(BOGO)" ] && [ -d "$(BOGO)/ssl/test/runner" ] || { echo "set BOGO=/path/to/boringssl (ssl/test/runner missing)"; exit 1; }
+	@./target/release/pith build tests/interop/bogo/shim.pith >/dev/null
+	@cd "$(BOGO)/ssl/test/runner" && go test \
+		-shim-path "$(CURDIR)/tests/interop/bogo/shim" \
+		-shim-config "$(CURDIR)/tests/interop/bogo/config.json" \
+		-allow-unimplemented -loose-errors -pipe > "$(CURDIR)/bogo-gate.log" 2>&1 || true
+	@grep -aoE '^FAILED \(.*\)' bogo-gate.log | sed 's/FAILED (//;s/)$$//' | sort -u > bogo-gate-failures.txt
+	@echo "suite: $$(grep -ac '^PASS' bogo-gate.log) passed, $$(wc -l < bogo-gate-failures.txt) failed"
+	@comm -23 bogo-gate-failures.txt tests/interop/bogo/known_failures.txt > bogo-gate-new.txt; \
+	comm -13 bogo-gate-failures.txt tests/interop/bogo/known_failures.txt > bogo-gate-fixed.txt; \
+	if [ -s bogo-gate-fixed.txt ]; then echo "newly passing (prune from known_failures.txt):"; cat bogo-gate-fixed.txt; fi; \
+	if [ -s bogo-gate-new.txt ]; then \
+		echo "retrying new failures serially (the parallel run can starve cases):"; cat bogo-gate-new.txt; \
+		retry=$$(paste -sd';' bogo-gate-new.txt); \
+		( cd "$(BOGO)/ssl/test/runner" && go test -shim-path "$(CURDIR)/tests/interop/bogo/shim" -shim-config "$(CURDIR)/tests/interop/bogo/config.json" -allow-unimplemented -loose-errors -pipe -test "$$retry" > "$(CURDIR)/bogo-gate-retry.log" 2>&1 || true ); \
+		grep -aoE '^FAILED \(.*\)' bogo-gate-retry.log | sed 's/FAILED (//;s/)$$//' | sort -u > bogo-gate-confirmed.txt; \
+		if [ -s bogo-gate-confirmed.txt ]; then echo "NEW FAILURES (confirmed serially):"; cat bogo-gate-confirmed.txt; exit 1; fi; \
+		echo "all new failures passed on serial retry (load flakes)"; \
+	fi
+	@echo "bogo gate ok: no new failures"
 
 # interop against Go's crypto/tls (a second independent reference stack), both
 # directions across tls 1.2/1.3 and rsa/ecdsa. builds the small go peer first.

@@ -656,6 +656,10 @@ pub fn cipher_suite_name(cipher: Int) -> String:
         return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
     if cipher == tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256:
         return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    if cipher == tls12.TLS12_ECDHE_RSA_AES256_GCM_SHA384:
+        return "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+    if cipher == tls12.TLS12_ECDHE_ECDSA_AES256_GCM_SHA384:
+        return "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
     if cipher == tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256:
         return "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
     if cipher == tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256:
@@ -708,6 +712,9 @@ fn open_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: 
         if tls12.suite_uses_chacha(cipher):
             chacha := tls12.open_chacha20_poly1305(key, iv, sequence, record)!
             opened = tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
+        elif tls12.suite_uses_sha384(cipher):
+            gcm256 := tls12.open_aes_256_gcm(key, iv, sequence, record)!
+            opened = tls13.Record(gcm256.content_type, TLS_VERSION_12, gcm256.payload)
         else:
             gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
             opened = tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
@@ -722,6 +729,8 @@ fn seal_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: 
     if version == TLS_VERSION_12:
         if tls12.suite_uses_chacha(cipher):
             return tls12.seal_chacha20_poly1305(key, iv, sequence, content_type, plaintext)
+        if tls12.suite_uses_sha384(cipher):
+            return tls12.seal_aes_256_gcm(key, iv, sequence, content_type, plaintext)
         return tls12.seal_aes_128_gcm(key, iv, sequence, content_type, plaintext)
     return seal_record_for_cipher(cipher, key, iv, sequence, content_type, plaintext)
 
@@ -1286,8 +1295,8 @@ fn send_change_cipher_spec(stream: TcpStream) -> Bool!:
 
 # the TLS 1.2 Finished verify_data for `label` over the handshake transcript so
 # far ("client finished" or "server finished").
-fn tls12_finished_bytes(master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
-    return tls12.finished_verify_data(master, label, tls12.handshake_hash_sha256(transcript.bytes()))!
+fn tls12_finished_bytes(cipher: Int, master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
+    return tls12.finished_verify_data_for_suite(cipher, master, label, tls12.handshake_hash_for_suite(cipher, transcript.bytes()))!
 
 # read the peer's ChangeCipherSpec — skipping a plaintext NewSessionTicket it
 # may send first — and then its encrypted Finished, returning the verify_data
@@ -1553,24 +1562,24 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     cke_message := tls13.encode_handshake(tls12.TLS12_CLIENT_KEY_EXCHANGE, tls12.encode_client_key_exchange(client_point)!)!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, cke_message)!)!
     transcript.write(cke_message)!
-    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
+    session_hash := tls12.handshake_hash_for_suite(cipher, transcript.bytes())
     mut master := bytes.empty()
     if hello.extended_master_secret:
-        master = tls12.extended_master_secret(pre_master, session_hash)!
+        master = tls12.extended_master_secret_for_suite(cipher, pre_master, session_hash)!
     else:
-        master = tls12.classic_master_secret(pre_master, client_random, server_random)!
-    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+        master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
+    keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
 
     # ChangeCipherSpec, then the encrypted client Finished over the transcript
     # through ClientKeyExchange.
     send_change_cipher_spec(stream)!
-    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "client finished", transcript)!)!
+    client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "client finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, TLS_CONTENT_HANDSHAKE, client_finished)!)!
     transcript.write(client_finished)!
 
     # the server answers with ChangeCipherSpec and its encrypted Finished.
     server_finished := read_tls12_peer_finished(stream, cipher, keys.server_write_key, keys.server_write_iv, keys.client_write_key, keys.client_write_iv, 1)!
-    if not subtle.equal(tls12_finished_bytes(master, "server finished", transcript)!, server_finished.verify_data):
+    if not subtle.equal(tls12_finished_bytes(cipher, master, "server finished", transcript)!, server_finished.verify_data):
         # the client's Finished went out sealed at sequence 0, so its alert
         # rides the same epoch at sequence 1.
         send_fatal_alert_sealed(stream, TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 1, ALERT_DECRYPT_ERROR) catch 0
@@ -2017,9 +2026,9 @@ fn sign_with_scheme(config: Config, scheme: Int, message: Bytes) -> ServerSignat
 # the eligible family follows the server certificate's key type: ECDHE-ECDSA
 # AEAD suites for an EC certificate, ECDHE-RSA for an RSA one.
 fn select_tls12_suite(offered: List[Int], is_ecdsa: Bool) -> Int:
-    mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
+    mut preference := [tls12.TLS12_ECDHE_RSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_RSA_AES256_GCM_SHA384, tls12.TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
     if is_ecdsa:
-        preference = [tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
+        preference = [tls12.TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, tls12.TLS12_ECDHE_ECDSA_AES256_GCM_SHA384, tls12.TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
     for candidate in preference:
         if offered.contains(candidate):
             return candidate
@@ -2153,17 +2162,17 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
 
     pre_master := keypair.shared_secret(client_point)!
     keypair.close()
-    session_hash := tls12.handshake_hash_sha256(transcript.bytes())
+    session_hash := tls12.handshake_hash_for_suite(cipher, transcript.bytes())
     mut master := bytes.empty()
     if lenient.extended_master_secret:
-        master = tls12.extended_master_secret(pre_master, session_hash)!
+        master = tls12.extended_master_secret_for_suite(cipher, pre_master, session_hash)!
     else:
-        master = tls12.classic_master_secret(pre_master, client_random, server_random)!
-    keys := tls12.key_block(master, server_random, client_random, tls12.suite_key_len(cipher), tls12.suite_iv_len(cipher))!
+        master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
+    keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
 
     # read the client's ChangeCipherSpec and encrypted Finished, then verify it.
     client_finished := read_tls12_peer_finished(stream, cipher, keys.client_write_key, keys.client_write_iv, bytes.empty(), bytes.empty(), 0)!
-    if not subtle.equal(tls12_finished_bytes(master, "client finished", transcript)!, client_finished.verify_data):
+    if not subtle.equal(tls12_finished_bytes(cipher, master, "client finished", transcript)!, client_finished.verify_data):
         # the server has not sent its own ChangeCipherSpec yet, so its write
         # epoch is still plaintext and the plaintext alert is the correct one.
         fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 client finished verification failed")
@@ -2171,7 +2180,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
 
     # send our ChangeCipherSpec and encrypted Finished.
     send_change_cipher_spec(stream)!
-    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(master, "server finished", transcript)!)!
+    server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "server finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, TLS_CONTENT_HANDSHAKE, server_finished)!)!
 
     peer := empty_peer_identity()

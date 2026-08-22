@@ -13,6 +13,7 @@ import std.net.tcp as tcp
 import std.io as io
 import std.bytes as bytes
 import std.bits as bits
+import std.strings as strings
 
 fn unimplemented(flag: String):
     print_err("unimplemented: " + flag)
@@ -55,7 +56,13 @@ fn exchange(conn: tls.Conn, writes_first: Bool, shuts_down: Bool) -> Int:
     while not done:
         read := conn.read_bytes(512)
         if read.is_err:
-            done = true
+            # a transport close (clean or not) and a fatal alert from the
+            # peer are how a test ends; anything else is this stack refusing
+            # a record — a protocol judgement the runner wants surfaced.
+            if read.err == "tcp_read_bytes failed" or strings.starts_with_any(read.err, ["tls alert "]) or read.err == "tls connection is unusable after an earlier record error":
+                done = true
+            else:
+                fail_test("connection failed: " + read.err)
         elif read.ok.len() == 0:
             done = true
         else:

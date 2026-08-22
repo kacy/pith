@@ -2302,11 +2302,18 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             retry_cipher := select_cipher_from_list(lenient_hello.cipher_suites)
             if retry_cipher == 0:
                 fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client did not offer a supported tls cipher suite")
-            hrr_message := tls13.encode_hello_retry_request(lenient_hello.session_id, retry_cipher, retry_group)!
+            mut hrr_message := tls13.encode_hello_retry_request_with_ech(lenient_hello.session_id, retry_cipher, retry_group, lenient_hello.ech_inner_present)!
+            hello1_encoded := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
+            message_hash_prefix := tls13.hrr_transcript_prefix_for_cipher(retry_cipher, hello1_encoded)!
+            if lenient_hello.ech_inner_present:
+                # the retry carries its confirmation in a trailing ech
+                # extension (eight zero bytes until patched), derived over the
+                # message_hash transcript plus this zero-padded retry.
+                hrr_ech := tls13.ech_accept_confirmation_for_cipher(retry_cipher, lenient_hello.random, "hrr ech accept confirmation", message_hash_prefix.concat(hrr_message))!
+                hrr_message = tls13.patch_bytes(hrr_message, hrr_message.len() - 8, hrr_ech)!
             native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, hrr_message)!)!
             send_change_cipher_spec(stream)!
-            hello1_encoded := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
-            hrr_prefix = tls13.hrr_transcript_prefix_for_cipher(retry_cipher, hello1_encoded)!.concat(hrr_message)
+            hrr_prefix = message_hash_prefix.concat(hrr_message)
             hello_buf.clear()
             client_messages = []
             mut second_hello_ccs := 0
@@ -2371,8 +2378,24 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         keypair.close()
         keypair = ecdh.p384_keypair()!
     errdefer keypair.close()
-    server_random := random.bytes(32)!
-    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
+    mut server_random := random.bytes(32)!
+    if lenient_hello.ech_inner_present:
+        # the last eight bytes carry the ech acceptance confirmation
+        # (draft-ietf-tls-esni §7.2): encoded as zeros first, then patched
+        # with a mac derived over this zero-padded hello.
+        zero_tail := bytes.buffer_with_capacity(8)
+        defer zero_tail.free()
+        mut zt := 0
+        while zt < 8:
+            zero_tail.write_byte(0)
+            zt = zt + 1
+        server_random = server_random.slice(0, 24).concat(zero_tail.bytes())
+    mut server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
+    if lenient_hello.ech_inner_present:
+        hello_now := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
+        ech_context := hrr_prefix.concat(hello_now).concat(server_hello)
+        ech_confirmation := tls13.ech_accept_confirmation_for_cipher(cipher, lenient_hello.random, "ech accept confirmation", ech_context)!
+        server_hello = tls13.patch_bytes(server_hello, 4 + 2 + 24, ech_confirmation)!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
     # a middlebox-compatibility change_cipher_spec follows the ServerHello
     # (rfc 8446 appendix d.4): a bare plaintext record, outside the transcript,
@@ -2766,6 +2789,9 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                 cs.pending = payload.slice(size, payload.len())
                 return payload.slice(0, size)
             return payload
+        # no branch claimed the record: an encrypted change_cipher_spec, or
+        # any other inner content type, has no post-handshake meaning.
+        fail conn_refuse_with(cs, ALERT_UNEXPECTED_MESSAGE, "unexpected tls record content")
 
 fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     if data.len() == 0:

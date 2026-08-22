@@ -1,0 +1,47 @@
+# tls 1.2 aes-256-gcm interop against openssl s_server pinned to
+# ECDHE-RSA-AES256-GCM-SHA384. a completed handshake and echoed body prove the
+# sha-384 prf key schedule and the aes-256 record layer match a real 1.2 peer
+# bit-for-bit.
+import std.net.tls as tls
+import std.os.process as process
+import std.time as time
+
+PORT := 44475
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+
+fn dial(cfg: tls.Config) -> String:
+    r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
+    if r.is_err:
+        return "dial-error"
+    conn := r.ok
+    wrote := conn.write_all("GET / HTTP/1.0\r\n\r\n")
+    mut body := ""
+    if wrote.is_ok:
+        body = conn.read(16) catch ""
+    conn.close()
+    if body.len() == 0:
+        return "no-body"
+    return "handshake ok"
+
+fn main() -> Int!:
+    server := process.command("openssl").arg("s_server").arg("-accept").arg(PORT.to_string()).arg("-cert").arg(CERT).arg("-key").arg(KEY).arg("-tls1_2").arg("-cipher").arg("ECDHE-RSA-AES256-GCM-SHA384").arg("-www").arg("-quiet").start()
+    if server.is_err:
+        print("result: openssl-unavailable")
+        return 0
+    proc := server.ok
+    cfg := tls.client_config_with_ca_file(CA)!
+    mut result := "no-connection"
+    mut attempt := 0
+    while attempt < 25 and result == "no-connection":
+        outcome := dial(cfg)
+        if outcome != "dial-error":
+            result = outcome
+        attempt = attempt + 1
+        time.delay(40)
+    print("result: " + result)
+    cfg.close()
+    proc.kill()
+    proc.wait()
+    return 0

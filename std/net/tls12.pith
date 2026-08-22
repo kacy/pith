@@ -48,6 +48,8 @@ pub TLS12_NEW_SESSION_TICKET := 4
 # values are the IANA registry ids, quoted in hex beside each one.
 pub TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 := 49195
 pub TLS12_ECDHE_RSA_AES128_GCM_SHA256 := 49199
+pub TLS12_ECDHE_RSA_AES256_GCM_SHA384 := 49200
+pub TLS12_ECDHE_ECDSA_AES256_GCM_SHA384 := 49196
 pub TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 := 52392
 pub TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 := 52393
 # 0xC02B (ECDHE-ECDSA-AES128-GCM), 0xC02F (ECDHE-RSA-AES128-GCM),
@@ -91,6 +93,28 @@ fn p_hash_sha256(secret: Bytes, seed: Bytes, length: Int) -> Bytes!:
 # The TLS 1.2 PRF: PRF(secret, label, seed) = P_SHA256(secret, label ++ seed).
 pub fn prf_sha256(secret: Bytes, label: String, seed: Bytes, length: Int) -> Bytes!:
     return p_hash_sha256(secret, bytes.concat(bytes.from_string_utf8(label), seed), length)
+
+fn p_hash_sha384(secret: Bytes, seed: Bytes, length: Int) -> Bytes!:
+    out := bytes.buffer()
+    defer out.free()
+    mut a := seed
+    while out.len() < length:
+        a = hmac.sha384(secret, a)
+        out.write(hmac.sha384(secret, bytes.concat(a, seed)))!
+    return bytes.slice(out.bytes(), 0, length)
+
+# The SHA-384 PRF the aes-256-gcm suites use (rfc 5289 §2).
+pub fn prf_sha384(secret: Bytes, label: String, seed: Bytes, length: Int) -> Bytes!:
+    return p_hash_sha384(secret, bytes.concat(bytes.from_string_utf8(label), seed), length)
+
+# True for the rfc 5289 suites whose PRF and handshake hash are sha-384.
+pub fn suite_uses_sha384(suite: Int) -> Bool:
+    return suite == TLS12_ECDHE_RSA_AES256_GCM_SHA384 or suite == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384
+
+fn prf_for_suite(suite: Int, secret: Bytes, label: String, seed: Bytes, length: Int) -> Bytes!:
+    if suite_uses_sha384(suite):
+        return prf_sha384(secret, label, seed, length)
+    return prf_sha256(secret, label, seed, length)
 
 # ---------------------------------------------------------------
 # key schedule
@@ -146,6 +170,39 @@ pub fn finished_verify_data(master: Bytes, label: String, handshake_hash: Bytes)
 pub fn handshake_hash_sha256(transcript: Bytes) -> Bytes:
     return hash.sha256_bytes(transcript)
 
+# The suite's handshake hash: sha-384 for the rfc 5289 aes-256 suites,
+# sha-256 for the rest.
+pub fn handshake_hash_for_suite(suite: Int, transcript: Bytes) -> Bytes:
+    if suite_uses_sha384(suite):
+        return hash.sha384_bytes(transcript)
+    return hash.sha256_bytes(transcript)
+
+# Suite-aware master-secret and key derivations: the PRF hash follows the
+# negotiated suite (rfc 5289 §2), everything else is unchanged.
+pub fn extended_master_secret_for_suite(suite: Int, pre_master: Bytes, session_hash: Bytes) -> Bytes!:
+    return prf_for_suite(suite, pre_master, "extended master secret", session_hash, 48)
+
+pub fn classic_master_secret_for_suite(suite: Int, pre_master: Bytes, client_random: Bytes, server_random: Bytes) -> Bytes!:
+    return prf_for_suite(suite, pre_master, "master secret", client_random.concat(server_random), 48)
+
+pub fn key_block_for_suite(suite: Int, master: Bytes, server_random: Bytes, client_random: Bytes) -> KeyBlock!:
+    seed := bytes.concat(server_random, client_random)
+    key_len := suite_key_len(suite)
+    iv_len := suite_iv_len(suite)
+    material := prf_for_suite(suite, master, "key expansion", seed, 2 * key_len + 2 * iv_len)!
+    mut pos := 0
+    client_key := bytes.slice(material, pos, pos + key_len)
+    pos = pos + key_len
+    server_key := bytes.slice(material, pos, pos + key_len)
+    pos = pos + key_len
+    client_iv := bytes.slice(material, pos, pos + iv_len)
+    pos = pos + iv_len
+    server_iv := bytes.slice(material, pos, pos + iv_len)
+    return KeyBlock(client_key, server_key, client_iv, server_iv)
+
+pub fn finished_verify_data_for_suite(suite: Int, master: Bytes, label: String, handshake_hash: Bytes) -> Bytes!:
+    return prf_for_suite(suite, master, label, handshake_hash, 12)
+
 # ---------------------------------------------------------------
 # cipher-suite policy
 # ---------------------------------------------------------------
@@ -153,14 +210,14 @@ pub fn handshake_hash_sha256(transcript: Bytes) -> Bytes:
 # The suites this fallback offers, in preference order (AES-GCM before ChaCha to
 # match the 1.3 stack and common server preference).
 pub fn offered_suites() -> List[Int]:
-    return [TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
+    return [TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_AES128_GCM_SHA256, TLS12_ECDHE_ECDSA_AES256_GCM_SHA384, TLS12_ECDHE_RSA_AES256_GCM_SHA384, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
 
 # True only for the four ECDHE+AEAD suites above. Everything else — static RSA,
 # every CBC suite, RC4, 3DES, DHE, PSK, anon — is refused, which is what keeps
 # the fallback free of the padding-oracle and forward-secrecy failures that make
 # a naive 1.2 fallback dangerous.
 pub fn is_supported_suite(suite: Int) -> Bool:
-    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 or suite_uses_sha384(suite)
 
 # True when the suite uses ChaCha20-Poly1305 (RFC 7905 nonce), false for AES-GCM.
 pub fn suite_uses_chacha(suite: Int) -> Bool:
@@ -168,11 +225,11 @@ pub fn suite_uses_chacha(suite: Int) -> Bool:
 
 # True when the suite authenticates with an ECDSA certificate rather than RSA.
 pub fn suite_is_ecdsa(suite: Int) -> Bool:
-    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+    return suite == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 or suite == TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 or suite == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384
 
 # The AEAD key length for the suite (16 for AES-128-GCM, 32 for ChaCha20).
 pub fn suite_key_len(suite: Int) -> Int:
-    if suite_uses_chacha(suite):
+    if suite_uses_chacha(suite) or suite_uses_sha384(suite):
         return 32
     return 16
 
@@ -313,6 +370,32 @@ pub fn open_aes_128_gcm(key: Bytes, salt: Bytes, sequence: Int, record: Bytes) -
     plaintext_len := ciphertext.len() - 16
     aad := record_aad(sequence, outer.content_type, plaintext_len)!
     plaintext := aead.aes_128_gcm_open(key, nonce, aad, ciphertext)!
+    return Tls12Record(outer.content_type, plaintext)
+
+# The aes-256-gcm siblings: identical framing, a 32-byte key.
+pub fn seal_aes_256_gcm(key: Bytes, salt: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
+    if salt.len() != 4:
+        fail "tls 1.2 gcm salt must be 4 bytes"
+    nonce_explicit := explicit_nonce(sequence)!
+    nonce := bytes.concat(salt, nonce_explicit)
+    aad := record_aad(sequence, content_type, plaintext.len())!
+    ciphertext := aead.aes_256_gcm_seal(key, nonce, aad, plaintext)!
+    payload := bytes.concat(nonce_explicit, ciphertext)
+    return bytes.concat(record_header(content_type, payload.len())!, payload)
+
+# Open an AES-256-GCM record produced by seal_aes_256_gcm.
+pub fn open_aes_256_gcm(key: Bytes, salt: Bytes, sequence: Int, record: Bytes) -> Tls12Record!:
+    if salt.len() != 4:
+        fail "tls 1.2 gcm salt must be 4 bytes"
+    outer := decode_record(record)!
+    if outer.payload.len() < 8 + 16:
+        fail "tls 1.2 gcm record too short"
+    nonce_explicit := bytes.slice(outer.payload, 0, 8)
+    ciphertext := bytes.slice(outer.payload, 8, outer.payload.len())
+    nonce := bytes.concat(salt, nonce_explicit)
+    plaintext_len := ciphertext.len() - 16
+    aad := record_aad(sequence, outer.content_type, plaintext_len)!
+    plaintext := aead.aes_256_gcm_open(key, nonce, aad, ciphertext)!
     return Tls12Record(outer.content_type, plaintext)
 
 # Seal a ChaCha20-Poly1305 record (RFC 7905): no explicit nonce on the wire, the

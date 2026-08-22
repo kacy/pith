@@ -538,11 +538,18 @@ fn wildcard_matches(pattern: String, host: String) -> Bool:
     if not pattern.starts_with("*."):
         return false
     suffix := pattern.substring(1, pattern.len())
+    # the wildcard must sit left of at least two labels: `*.example.com` is
+    # legitimate, `*.com` is a public-suffix-wide certificate no ca should
+    # issue and no client should honor (rfc 9525 §6.3).
+    if suffix.split(".").len() < 2:
+        return false
     if not host.ends_with(suffix):
         return false
     prefix_len := host.len() - suffix.len()
     if prefix_len <= 0:
         return false
+    # the wildcard replaces exactly one left-most label, so what it stands in
+    # for must be a single label with no embedded dot.
     return not host.substring(0, prefix_len).contains(".")
 
 # match a hostname or ip address against the certificate's san list. legacy
@@ -996,6 +1003,24 @@ test "x509 hostname matching uses san names":
     assert(cert.matches_hostname("localhost"))
     assert(cert.matches_hostname("127.0.0.1"))
     assert(not cert.matches_hostname("example.com"))
+
+test "x509 wildcard hostname matching is single-label and not public-suffix-wide":
+    # *.example.com covers one left-most label only.
+    assert(wildcard_matches("*.example.com", "www.example.com"))
+    assert(wildcard_matches("*.example.com", "api.example.com"))
+    # not two labels, not the bare domain, not a different domain.
+    assert(not wildcard_matches("*.example.com", "a.b.example.com"))
+    assert(not wildcard_matches("*.example.com", "example.com"))
+    assert(not wildcard_matches("*.example.com", "www.example.org"))
+    # a single-label (top-level-domain) wildcard is refused outright. a
+    # multi-label public suffix like co.uk needs the public suffix list to
+    # reject fully, which is out of scope here — the label-count rule catches
+    # the most dangerous and most common case.
+    assert(not wildcard_matches("*.com", "victim.com"))
+    assert(not wildcard_matches("*.org", "victim.org"))
+    # a bare or malformed wildcard matches nothing.
+    assert(not wildcard_matches("*", "anything"))
+    assert(not wildcard_matches("www.example.com", "www.example.com"))
 
 test "x509 parses pem certificate chains":
     chain := read_file("tests/live/fixtures/localhost.crt")! + read_file("tests/live/fixtures/localhost-ca.crt")!

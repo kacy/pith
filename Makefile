@@ -763,6 +763,9 @@ fuzz-check: build
 	@echo "--- fuzz check (generated + mutated corpus, deterministic) ---"
 	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
 	@./tools/fuzz/fuzz --count 120 --build-every 8
+	@echo "--- tls/x509 parser fuzz (mutated real inputs, deterministic) ---"
+	@./target/release/pith build tools/fuzz-tls/fuzz_tls.pith > /dev/null
+	@./tools/fuzz-tls/fuzz_tls --count 400 --seed 1
 
 # open-ended fuzzing: generated + corpus mutation. pass --count / --seed
 # to explore. known findings live in the bulletproof plan; use this to

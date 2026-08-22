@@ -165,6 +165,7 @@ ALERT_DECODE_ERROR := 50
 ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
+ALERT_NO_RENEGOTIATION := 100
 ALERT_UNSUPPORTED_EXTENSION := 110
 
 # the compatibility change_cipher_spec carries exactly one byte of value 1
@@ -2386,9 +2387,16 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # injected plaintext record, not a compatibility artifact.
             send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "change cipher spec after tls handshake"
-        if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+        # tls 1.3 wraps every post-handshake record as application_data, so any
+        # other outer type is plaintext injection. tls 1.2 keeps the real
+        # content type on the (encrypted) record, so alert and handshake outer
+        # types are legitimate there and only decrypt below.
+        if cs.version == TLS_VERSION_13 and record.content_type != TLS_CONTENT_APPLICATION_DATA:
             send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "unencrypted tls record after handshake"
+        if cs.version == TLS_VERSION_12 and record.content_type != TLS_CONTENT_APPLICATION_DATA and record.content_type != TLS_CONTENT_ALERT and record.content_type != TLS_CONTENT_HANDSHAKE:
+            send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+            fail "unexpected tls record after handshake"
         seq := cs.read_seq
         cs.read_seq = seq + 1
         inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!) catch:
@@ -2416,6 +2424,13 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             messages := tls13.decode_handshakes_prefix(combined)
             config_put(native_conn_handshake_pending, handle, combined.slice(tls13.handshakes_encoded_len(messages), combined.len()))
             for message in messages:
+                # a HelloRequest to a client or ClientHello to a server on an
+                # established 1.2 connection is a renegotiation attempt; this
+                # stack refuses renegotiation (rfc 5746 makes the refusal
+                # explicit with the no_renegotiation alert).
+                if cs.version == TLS_VERSION_12 and (message.message_type == tls12.TLS12_HELLO_REQUEST or message.message_type == tls12.TLS12_CLIENT_HELLO):
+                    send_conn_fatal_alert(cs, ALERT_NO_RENEGOTIATION) catch 0
+                    fail "tls renegotiation refused"
                 if message.message_type == tls13.HANDSHAKE_KEY_UPDATE:
                     apply_peer_key_update(cs, cipher, message) catch:
                         send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0

@@ -111,7 +111,10 @@ print("got " + signal.name(sig))                  # "got SIGTERM"
   trigger its own drain.
 - `pid()` is this process's id.
 
-signals queue, so none is lost between two waits.
+signals queue, so one is not lost between two waits in the ordinary case. the
+handler writes a byte to a non-blocking pipe and ignores the result, which is
+what keeps it async-signal-safe, so a signal arriving after that pipe has
+filled is dropped rather than buffered.
 
 ## std.shutdown
 

@@ -50,14 +50,17 @@ stream in one ByteBuffer — the shape the go version always used with
 `strings.Builder`, idiom for idiom — took `gen` from 299 to 120 ms, even
 with go's 122. see bench/README.md for the full phase table.
 
-the http row is the one not to read as a regression. both servers dropped by
-about the same 45% against july, because `wrk` itself competes for the two
-cores; the ratio between them barely moved, and the number worth keeping is
-the memory column, where pith is now exactly flat over a sustained run while
-the go server grows ~6 mb — a shape that reproduces run to run.
+the http row moved further than go's did and is not yet explained: against the
+july figures pith fell 16,800 to 4,648 req/s (-72%) where go fell 31,600 to
+15,444 (-51%), so the ratio went from 0.53 to 0.30 rather than holding. some of
+the absolute drop on both sides is `wrk` competing for the two cores, but that
+does not account for the gap widening, and this row wants a re-measurement on
+an idle box before anything is concluded from it. the number worth keeping
+meanwhile is the memory column, where pith is exactly flat over a sustained run
+while the go server grows ~6 mb — a shape that reproduces run to run.
 
-reading the rest honestly: on channel coordination green matches rust and beats
-zig, runs ~1.9x behind go at the default worker count (placement is still
+reading the rest honestly: on channel coordination green beats zig comfortably
+but runs ~1.9x behind both go and rust at the default worker count (placement is still
 decided by first-resume luck, hence the bimodal spread), and beats go pinned to
 one worker. raw spawn/await is still go's, though by ~3.4x now rather than ~7x;
 what the green backend buys over pith's own os-thread backend there is ~34x the
@@ -169,8 +172,8 @@ in a single pass, filled straight into the struct.
 `bench/chan_fanout`, the coordination benchmark, was the one pith lost
 outright — ~580ms against go's ~69 for a million messages between eight
 tasks. the green wake-path work on 2026-07-26 (details below) brought
-the green backend to ~133ms on the 2026-07-29 rerun — level with rust,
-ahead of zig, ~1.8x go — with ~46ms, faster than go on this box, when the
+the green backend to ~133ms on the 2026-07-29 rerun — ahead of zig, ~1.8x
+behind both go and rust — with ~46ms, faster than go on this box, when the
 pipeline is pinned to one worker. the batch benchmarks measure compute and pith is competitive
 there; coordination is now a genuine strength of the green backend
 rather than the standing embarrassment it was.

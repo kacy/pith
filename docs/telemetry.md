@@ -234,6 +234,7 @@ follow the opentelemetry sdk names:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | collector base url; unset means off | — |
 | `OTEL_SERVICE_NAME` | `service.name` on exported data | `pith-service` |
 | `OTEL_SERVICE_VERSION` | `service.version` | — |
+| `OTEL_SERVICE_INSTANCE_ID` | `service.instance.id` | generated per process |
 | `OTEL_RESOURCE_ATTRIBUTES` | extra resource attrs, `k1=v1,k2=v2` | — |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` | `http/protobuf` |
 | `OTEL_EXPORTER_OTLP_HEADERS` | auth/tenant headers, `k1=v1,k2=v2` | — |

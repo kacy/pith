@@ -399,11 +399,13 @@ worker tasks trade a request back and forth per call. on that last shape the
 green backend cut internal context switches from about five per grpc call to
 well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
-trading a million messages through one bounded channel — it runs 2.6x faster
-than the os-thread backend and ahead of rust and zig, at 2.3x go (~46ms
-against go's ~75 when pinned to one worker; see `bench/README.md`). it does
-the least for tasks that are already cpu-bound and rarely wait — those never
-hit the handoffs green makes cheap.
+trading a million messages through one bounded channel — it runs well ahead of
+the os-thread backend and of zig, but behind go and rust at the default worker
+count (~133 ms against their ~71 and ~73). pinned to one worker it turns that
+around against go, at ~46 ms to ~71: the benchmark is pure handoff, which one
+worker does without crossing a core. see the coordination table in
+`docs/performance.md`. it does the least for tasks that are already
+cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 
 the machinery behind that: coroutine stacks are pooled and reused rather
 than mapped and unmapped per task, so a fan-out of short tasks costs

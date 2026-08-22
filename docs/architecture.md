@@ -16,6 +16,25 @@ the active pipeline is:
 5. lower text IR to Cranelift IR
 6. emit an object file and link it with the Rust runtime using `gcc`
 
+end to end, that is:
+
+```
+pith source (.pith)
+  -> self-hosted frontend: lex, parse, check
+  -> self-hosted ir emitter (ir_emitter_core.pith and satellites) -> text ir
+  -> ir_consumer.rs (text ir -> cranelift ir)
+  -> cranelift native code generation
+  -> object file (.o)
+  -> system linker (gcc)
+  -> native executable
+```
+
+steps 1 through 4 are pith compiling pith: the frontend builds itself.
+`make bootstrap` rebuilds the compiler with the cranelift-compiled version of
+itself, and `make bootstrap-ir-checks` verifies the ir contract, its
+invariants, and that the emitted ir reaches a fixed point on the deterministic
+corpus.
+
 the older Zig bootstrap and C transpiler are historical implementation paths.
 they are useful context when reading old notes, but they are not tracked as the
 current build/run path.

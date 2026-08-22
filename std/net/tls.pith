@@ -1095,6 +1095,14 @@ fn read_plaintext_handshake_record(stream: TcpStream) -> tls13.Record!:
     header := stream.read_exact_bytes(5)!
     if header.len() != 5:
         fail "truncated tls record header"
+    # the record-layer version is a legacy field, but every plaintext
+    # handshake record still carries a real tls version (0x03xx): the initial
+    # ClientHello sends 0x0301 or 0x0303 (rfc 8446 §5.1), later plaintext 1.2
+    # records 0x0303. a value outside 0x03xx is not a tls record at all.
+    record_version := checked_read(binary.read_u16_be_at(header, 1))!
+    if record_version < 768 or record_version > 1023:
+        send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
+        fail "unexpected tls record version"
     length := checked_read(binary.read_u16_be_at(header, 3))!
     if length > tls13.MAX_CIPHERTEXT_RECORD:
         send_fatal_alert(stream, ALERT_RECORD_OVERFLOW) catch 0

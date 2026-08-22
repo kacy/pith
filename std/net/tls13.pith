@@ -975,6 +975,9 @@ pub fn parse_client_hello(body: Bytes) -> ClientHello!:
     legacy_version := checked_read(binary.read_u16_be(r))!
     random := checked_bytes(binary.read_bytes(r, 32))!
     session_len := checked_read(binary.read_u8(r))!
+    # rfc 8446 §4.1.2 caps a session id at 32 bytes.
+    if session_len > 32:
+        fail "tls session id too long"
     session_id := checked_bytes(binary.read_bytes(r, session_len))!
     cipher_len := checked_read(binary.read_u16_be(r))!
     cipher_bytes := checked_bytes(binary.read_bytes(r, cipher_len))!
@@ -1065,6 +1068,9 @@ pub fn parse_client_hello_lenient(body: Bytes) -> LenientClientHello!:
     legacy_version := checked_read(binary.read_u16_be(r))!
     random := checked_bytes(binary.read_bytes(r, 32))!
     session_len := checked_read(binary.read_u8(r))!
+    # rfc 8446 §4.1.2 caps a session id at 32 bytes.
+    if session_len > 32:
+        fail "tls session id too long"
     session_id := checked_bytes(binary.read_bytes(r, session_len))!
     cipher_len := checked_read(binary.read_u16_be(r))!
     cipher_suites := parse_u16_sequence(checked_bytes(binary.read_bytes(r, cipher_len))!)!
@@ -1181,6 +1187,9 @@ pub fn parse_server_hello(body: Bytes) -> ServerHello!:
     legacy_version := checked_read(binary.read_u16_be(r))!
     random := checked_bytes(binary.read_bytes(r, 32))!
     session_len := checked_read(binary.read_u8(r))!
+    # rfc 8446 §4.1.2 caps a session id at 32 bytes.
+    if session_len > 32:
+        fail "tls session id too long"
     session_id := checked_bytes(binary.read_bytes(r, session_len))!
     cipher_suite := checked_read(binary.read_u16_be(r))!
     compression := checked_read(binary.read_u8(r))!

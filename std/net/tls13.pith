@@ -478,9 +478,6 @@ fn default_client_extensions_with_options(server_name: String, x25519_public_key
         write_bytes_if_any(out, pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
     return out.bytes()
 
-fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> Bytes!:
-    return default_client_extensions_with_options(server_name, x25519_public_key, bytes.empty(), [], bytes.empty(), bytes.empty(), 0)
-
 fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
     defer out.free()
@@ -582,13 +579,7 @@ fn open_record_with_chacha(key: Bytes, static_iv: Bytes, sequence: Int, record: 
     return open_inner_plaintext(inner)
 
 fn zero_secret_sha256() -> Bytes:
-    out := bytes.buffer_with_capacity(32)
-    defer out.free()
-    mut i := 0
-    while i < 32:
-        out.write_byte(0)
-        i = i + 1
-    return out.bytes()
+    return bytes.zeros(32)
 
 fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!:
     # the transcript hash is the negotiated suite's: 32 bytes for sha-256, 48
@@ -756,9 +747,6 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
 
 # The supported_versions extension offering both TLS 1.3 and 1.2, highest first,
 # for a combined ClientHello. The server picks the highest it supports.
-fn supported_versions_client_extension_both() -> Bytes!:
-    return supported_versions_client_extension_list([TLS13_VERSION, TLS_LEGACY_VERSION])!
-
 # a supported_versions client extension listing exactly `versions`, highest
 # first. Used to offer {1.3, 1.2} for the fallback or {1.2} for a max-version cap.
 fn supported_versions_client_extension_list(versions: List[Int]) -> Bytes!:
@@ -1261,13 +1249,7 @@ pub fn encode_hello_retry_request_with_ech(session_id: Bytes, cipher_suite: Int,
     write_u16_be(ks, group)!
     mut extensions := supported_versions_server_extension(TLS13_VERSION)!.concat(extension_record(EXT_KEY_SHARE, ks.bytes())!)
     if ech_confirmation:
-        zeros := bytes.buffer_with_capacity(8)
-        defer zeros.free()
-        mut zi := 0
-        while zi < 8:
-            zeros.write_byte(0)
-            zi = zi + 1
-        extensions = extensions.concat(extension_record(EXT_ENCRYPTED_CLIENT_HELLO, zeros.bytes())!)
+        extensions = extensions.concat(extension_record(EXT_ENCRYPTED_CLIENT_HELLO, bytes.zeros(8))!)
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
@@ -2108,13 +2090,7 @@ pub fn traffic_keys_chacha20_poly1305_sha256(secret: Bytes) -> TrafficKeys!:
 # suite's hash, so only the hash and its output length change.
 
 fn zero_secret_sha384() -> Bytes:
-    out := bytes.buffer_with_capacity(48)
-    defer out.free()
-    mut i := 0
-    while i < 48:
-        out.write_byte(0)
-        i = i + 1
-    return out.bytes()
+    return bytes.zeros(48)
 
 # hkdf-expand-label (rfc 8446 §7.1) over sha-384.
 pub fn hkdf_expand_label_sha384(secret: Bytes, label: String, context: Bytes, length: Int) -> Bytes!:

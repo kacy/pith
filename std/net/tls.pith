@@ -743,9 +743,6 @@ fn certificates_from_message(cert_msg: tls13.CertificateMessage) -> List[x509.Ce
         chain.push(x509.parse_der(entry.der)!)
     return chain
 
-fn parse_certificate_chain(message: tls13.HandshakeMessage) -> List[x509.Certificate]!:
-    return certificates_from_message(tls13.parse_certificate_message(message.body)!)
-
 # alert_fd names the plaintext-phase socket a bad_certificate alert may be
 # written to before the failure propagates; pass a negative fd when the
 # connection has switched to encrypted records (a plaintext alert there would
@@ -791,10 +788,6 @@ fn resume_cache_key(config: Config, server_name: String) -> String:
 
 fn server_ticket_key(ticket: Bytes) -> String:
     return encoding.to_hex(ticket)
-
-fn cache_resumed_session(cache_key: String, ticket: Bytes, entry: SessionTicketEntry):
-    expires_at_ms := entry.issued_at_ms + entry.lifetime_ms
-    remember_client_cached_session(cache_key, cached_session_from_peer(ticket, entry.psk, entry.cipher, entry.alpn_protocol, empty_peer_identity(), expires_at_ms))
 
 fn copy_string_list(items: List[String]) -> List[String]:
     out: List[String] := []
@@ -2383,13 +2376,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         # the last eight bytes carry the ech acceptance confirmation
         # (draft-ietf-tls-esni §7.2): encoded as zeros first, then patched
         # with a mac derived over this zero-padded hello.
-        zero_tail := bytes.buffer_with_capacity(8)
-        defer zero_tail.free()
-        mut zt := 0
-        while zt < 8:
-            zero_tail.write_byte(0)
-            zt = zt + 1
-        server_random = server_random.slice(0, 24).concat(zero_tail.bytes())
+        server_random = server_random.slice(0, 24).concat(bytes.zeros(8))
     mut server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, client_hello.key_share_group, selected_psk_identity(did_resume))!
     if lenient_hello.ech_inner_present:
         hello_now := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!

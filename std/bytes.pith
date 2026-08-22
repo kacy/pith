@@ -30,6 +30,16 @@ pub fn empty() -> Bytes:
 pub fn from_string_utf8(text: String) -> Bytes:
     return bytes_from_string_utf8(text)
 
+# a run of `count` zero bytes.
+pub fn zeros(count: Int) -> Bytes:
+    out := buffer_with_capacity(count)
+    defer out.free()
+    mut i := 0
+    while i < count:
+        out.write_byte(0) catch 0
+        i = i + 1
+    return out.bytes()
+
 # return the number of bytes.
 pub fn len(data: Bytes) -> Int:
     return bytes_len(data)
@@ -235,6 +245,15 @@ impl ByteArray:
 
     fn clear():
         byte_buffer_clear(self.handle)
+
+test "zeros produces a run of zero bytes":
+    assert_eq(zeros(0).len(), 0)
+    z := zeros(5)
+    assert_eq(z.len(), 5)
+    mut i := 0
+    while i < 5:
+        assert_eq(z[i], 0)
+        i = i + 1
 
 test "bytes helpers wrap raw byte operations":
     data := from_string_utf8("pith")

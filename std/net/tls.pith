@@ -671,11 +671,18 @@ fn seal_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, con
 # paths call the version-specific functions directly.
 fn open_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
     if version == TLS_VERSION_12:
+        mut opened := tls13.Record(0, TLS_VERSION_12, bytes.empty())
         if tls12.suite_uses_chacha(cipher):
             chacha := tls12.open_chacha20_poly1305(key, iv, sequence, record)!
-            return tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
-        gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
-        return tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
+            opened = tls13.Record(chacha.content_type, TLS_VERSION_12, chacha.payload)
+        else:
+            gcm := tls12.open_aes_128_gcm(key, iv, sequence, record)!
+            opened = tls13.Record(gcm.content_type, TLS_VERSION_12, gcm.payload)
+        # rfc 5246 §6.2.1: a 1.2 plaintext fragment is capped at 2^14 bytes;
+        # the ciphertext bound admits more, so check after decryption.
+        if opened.payload.len() > tls13.MAX_PLAINTEXT_RECORD:
+            fail "tls record overflow"
+        return opened
     return open_record_for_cipher(cipher, key, iv, sequence, record)
 
 fn seal_conn_record(version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
@@ -2371,6 +2378,11 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
 
     stream := TcpStream(cs.fd)
     cipher := cs.cipher
+    # per-read DoS guards: a peer streaming empty records or warning alerts
+    # costs a decrypt each without ever yielding data, so both are capped
+    # within one read call (mirroring the limits BoringSSL enforces).
+    mut empty_records := 0
+    mut warning_alerts := 0
     while true:
         record := read_conn_record_alerting(cs, stream)!
         # after the handshake every legitimate record is application_data (it
@@ -2399,17 +2411,40 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             fail "unexpected tls record after handshake"
         seq := cs.read_seq
         cs.read_seq = seq + 1
-        inner := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!) catch:
+        opened := open_conn_record(cs.version, cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)
+        if opened.is_err:
+            # an oversized plaintext is a protocol violation with its own
+            # alert; everything else that fails to open is a bad tag.
+            if opened.err == "tls record overflow":
+                send_conn_fatal_alert(cs, ALERT_RECORD_OVERFLOW) catch 0
+                fail "tls plaintext record overflow"
             send_conn_fatal_alert(cs, ALERT_BAD_RECORD_MAC) catch 0
             fail "tls record failed to open"
+        inner := opened.ok
         if inner.content_type == TLS_CONTENT_ALERT:
             # close_notify is the clean end of the stream; every other alert
             # is a failure the caller must see rather than read as a quiet EOF.
             alert := tls13.parse_alert(inner.payload) catch:
                 send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
                 fail "malformed tls alert"
+            if alert.level != 1 and alert.level != 2:
+                send_conn_fatal_alert(cs, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "unknown tls alert level"
             if alert.description == tls13.ALERT_CLOSE_NOTIFY:
                 return bytes.empty()
+            if alert.level == 1:
+                # tls 1.3 has no warning alerts besides close_notify (rfc 8446
+                # §6); one is a peer error. tls 1.2 warning alerts are advisory
+                # and skipped, but only a few times — a stream of them burns a
+                # decrypt each while yielding nothing.
+                if cs.version == TLS_VERSION_13:
+                    send_conn_fatal_alert(cs, ALERT_DECODE_ERROR) catch 0
+                    fail "unexpected tls warning alert"
+                warning_alerts = warning_alerts + 1
+                if warning_alerts > 4:
+                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+                    fail "too many tls warning alerts"
+                continue
             fail "tls alert " + tls13.alert_description_name(alert.description)
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             if inner.payload.len() == 0:
@@ -2446,6 +2481,10 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # shaping); skip it rather than returning empty, which the caller
             # reads as a clean close_notify end-of-stream.
             if payload.len() == 0:
+                empty_records = empty_records + 1
+                if empty_records > 32:
+                    send_conn_fatal_alert(cs, ALERT_UNEXPECTED_MESSAGE) catch 0
+                    fail "too many empty tls records"
                 continue
             if payload.len() > size:
                 cs.pending = payload.slice(size, payload.len())

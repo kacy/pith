@@ -446,6 +446,11 @@ fn inner_plaintext(content_type: Int, plaintext: Bytes) -> Bytes!:
 fn open_inner_plaintext(data: Bytes) -> Record!:
     if data.len() == 0:
         fail "empty tls inner plaintext"
+    # rfc 8446 §5.4: TLSInnerPlaintext (content + type + padding) is capped at
+    # 2^14 + 1 bytes. the ciphertext bound alone admits ~255 bytes more, so an
+    # oversized plaintext only becomes visible after decryption.
+    if data.len() > MAX_PLAINTEXT_RECORD + 1:
+        fail "tls record overflow"
     mut pos := data.len() - 1
     while pos > 0 and data[pos] == 0:
         pos = pos - 1

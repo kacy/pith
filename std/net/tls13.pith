@@ -31,6 +31,7 @@ HANDSHAKE_CLIENT_HELLO := 1
 HANDSHAKE_SERVER_HELLO := 2
 HANDSHAKE_NEW_SESSION_TICKET := 4
 HANDSHAKE_KEY_UPDATE := 24
+HANDSHAKE_MESSAGE_HASH := 254
 HANDSHAKE_ENCRYPTED_EXTENSIONS := 8
 HANDSHAKE_CERTIFICATE := 11
 HANDSHAKE_CERTIFICATE_REQUEST := 13
@@ -43,6 +44,7 @@ EXT_PSK_KEY_EXCHANGE_MODES := 45
 EXT_TLS_FLAGS := 62
 pub EXT_SUPPORTED_GROUPS := 10
 EXT_SIGNATURE_ALGORITHMS := 13
+pub EXT_COOKIE := 44
 pub EXT_SUPPORTED_VERSIONS := 43
 # extensions a combined 1.2+1.3 ClientHello adds for the 1.2 fallback: extended
 # master secret (rfc 7627) and renegotiation_info (rfc 5746). a 1.3 server
@@ -1064,6 +1066,165 @@ pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher
     write_u16_be(body, extensions.len())!
     write_bytes_if_any(body, extensions)!
     return encode_handshake(HANDSHAKE_SERVER_HELLO, body.bytes())
+
+# ---------------------------------------------------------------
+# HelloRetryRequest (rfc 8446 §4.1.4)
+# ---------------------------------------------------------------
+
+# The fixed ServerHello random that marks a HelloRetryRequest: the sha-256 of
+# "HelloRetryRequest". A ServerHello carrying it is a retry request, not a
+# hello.
+pub fn hello_retry_request_random() -> Bytes:
+    return encoding.from_hex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c") catch bytes.empty()
+
+# Whether a ServerHello body carries the HelloRetryRequest random.
+pub fn is_hello_retry_request(body: Bytes) -> Bool:
+    if body.len() < 34:
+        return false
+    return bytes.eq(body.slice(2, 34), hello_retry_request_random())
+
+# The fields of a HelloRetryRequest a client acts on. selected_group is 0 when
+# the key_share extension was absent; has_cookie marks a cookie to echo.
+pub struct HelloRetryRequest:
+    pub session_id: Bytes
+    pub cipher_suite: Int
+    pub selected_group: Int
+    pub has_cookie: Bool
+    pub cookie: Bytes
+
+# Parse a HelloRetryRequest (a ServerHello whose random is the retry marker).
+# rfc 8446 §4.1.4 admits exactly supported_versions, key_share (a bare group),
+# and cookie; a duplicated extension fails, an unknown one carries its own
+# message so the caller can send unsupported_extension, and non-null
+# compression is refused.
+pub fn parse_hello_retry_request(body: Bytes) -> HelloRetryRequest!:
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    session_len := checked_read(binary.read_u8(r))!
+    if session_len > 32:
+        fail "tls session id too long"
+    session_id := checked_bytes(binary.read_bytes(r, session_len))!
+    cipher_suite := checked_read(binary.read_u16_be(r))!
+    compression := checked_read(binary.read_u8(r))!
+    if compression != 0:
+        fail "tls hello retry request selected a compression method"
+    mut selected_group := 0
+    mut has_cookie := false
+    mut cookie := bytes.empty()
+    mut supported_versions_seen := false
+    mut seen: List[Int] := []
+    if binary.remaining(r) > 0:
+        extensions_len := checked_read(binary.read_u16_be(r))!
+        extensions := checked_bytes(binary.read_bytes(r, extensions_len))!
+        er := binary.reader(extensions)
+        while binary.remaining(er) > 0:
+            extension_type := checked_read(binary.read_u16_be(er))!
+            data_len := checked_read(binary.read_u16_be(er))!
+            data := checked_bytes(binary.read_bytes(er, data_len))!
+            if seen.contains(extension_type):
+                fail "duplicate tls hello retry request extension"
+            seen.push(extension_type)
+            if extension_type == EXT_SUPPORTED_VERSIONS:
+                dr := binary.reader(data)
+                if checked_read(binary.read_u16_be(dr))! != TLS13_VERSION or binary.remaining(dr) != 0:
+                    fail "tls hello retry request selected an unsupported version"
+                supported_versions_seen = true
+            elif extension_type == EXT_KEY_SHARE:
+                dr := binary.reader(data)
+                selected_group = checked_read(binary.read_u16_be(dr))!
+                if binary.remaining(dr) != 0:
+                    fail "malformed tls hello retry request key share"
+            elif extension_type == EXT_COOKIE:
+                dr := binary.reader(data)
+                cookie_len := checked_read(binary.read_u16_be(dr))!
+                cookie = checked_bytes(binary.read_bytes(dr, cookie_len))!
+                if cookie.len() == 0 or binary.remaining(dr) != 0:
+                    fail "malformed tls hello retry request cookie"
+                has_cookie = true
+            else:
+                fail "unknown tls hello retry request extension"
+    if binary.remaining(r) != 0:
+        fail "trailing tls hello retry request bytes"
+    if not supported_versions_seen:
+        fail "tls hello retry request is missing supported versions"
+    return HelloRetryRequest(session_id, cipher_suite, selected_group, has_cookie, cookie)
+
+# Encode a HelloRetryRequest asking the client to send a key share for
+# `group`.
+pub fn encode_hello_retry_request(session_id: Bytes, cipher_suite: Int, group: Int) -> Bytes!:
+    if session_id.len() > 32:
+        fail "tls session id too long"
+    ks := bytes.buffer()
+    defer ks.free()
+    write_u16_be(ks, group)!
+    mut extensions := supported_versions_server_extension(TLS13_VERSION)!.concat(extension_record(EXT_KEY_SHARE, ks.bytes())!)
+    body := bytes.buffer()
+    defer body.free()
+    write_u16_be(body, TLS_LEGACY_VERSION)!
+    write_bytes_if_any(body, hello_retry_request_random())!
+    write_u8(body, session_id.len())!
+    write_bytes_if_any(body, session_id)!
+    write_u16_be(body, cipher_suite)!
+    write_u8(body, 0)!
+    write_u16_be(body, extensions.len())!
+    write_bytes_if_any(body, extensions)!
+    return encode_handshake(HANDSHAKE_SERVER_HELLO, body.bytes())
+
+# Rebuild an encoded ClientHello handshake message with a cookie extension
+# appended (rfc 8446 §4.2.2: the client echoes a HelloRetryRequest cookie in
+# its second hello). The input is the full handshake message (header + body)
+# of a hello without a psk offer, so appending at the end keeps any
+# pre_shared_key-last rule intact.
+pub fn client_hello_with_cookie(client_hello: Bytes, cookie: Bytes) -> Bytes!:
+    if cookie.len() == 0:
+        fail "tls cookie cannot be empty"
+    if client_hello.len() < 4:
+        fail "malformed tls client hello"
+    body := client_hello.slice(4, client_hello.len())
+    # walk to the extensions-length field: version, random, session id,
+    # cipher suites, compression.
+    r := binary.reader(body)
+    checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, 32))!
+    sid_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, sid_len))!
+    suites_len := checked_read(binary.read_u16_be(r))!
+    checked_bytes(binary.read_bytes(r, suites_len))!
+    comp_len := checked_read(binary.read_u8(r))!
+    checked_bytes(binary.read_bytes(r, comp_len))!
+    ext_len_offset := 2 + 32 + 1 + sid_len + 2 + suites_len + 1 + comp_len
+    ext_len := checked_read(binary.read_u16_be(r))!
+    if ext_len_offset + 2 + ext_len != body.len():
+        fail "malformed tls client hello extensions"
+    cookie_data := bytes.buffer()
+    defer cookie_data.free()
+    write_u16_be(cookie_data, cookie.len())!
+    write_bytes_if_any(cookie_data, cookie)!
+    cookie_ext := extension_record(EXT_COOKIE, cookie_data.bytes())!
+    out := bytes.buffer()
+    defer out.free()
+    write_bytes_if_any(out, body.slice(0, ext_len_offset))!
+    write_u16_be(out, ext_len + cookie_ext.len())!
+    write_bytes_if_any(out, body.slice(ext_len_offset + 2, body.len()))!
+    write_bytes_if_any(out, cookie_ext)!
+    return encode_handshake(HANDSHAKE_CLIENT_HELLO, out.bytes())
+
+# The transcript prefix that replaces ClientHello1 after a HelloRetryRequest
+# (rfc 8446 §4.4.1): a synthetic message_hash handshake message holding the
+# suite hash of the first hello.
+pub fn hrr_transcript_prefix_for_cipher(cipher: Int, client_hello1: Bytes) -> Bytes!:
+    mut hello_hash := transcript_hash_sha256(client_hello1)
+    if suite_uses_sha384(cipher):
+        hello_hash = transcript_hash_sha384(client_hello1)
+    out := bytes.buffer()
+    defer out.free()
+    write_u8(out, HANDSHAKE_MESSAGE_HASH)!
+    write_u8(out, 0)!
+    write_u8(out, 0)!
+    write_u8(out, hello_hash.len())!
+    write_bytes_if_any(out, hello_hash)!
+    return out.bytes()
 
 # A ClientHello parsed without assuming TLS 1.3: enough for a server to decide
 # which version to negotiate and, on the 1.2 fallback path, to pick a suite and

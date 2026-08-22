@@ -647,6 +647,15 @@ pub fn cipher_suite_name(cipher: Int) -> String:
         return "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
     return "unknown"
 
+fn select_cipher_from_list(offered: List[Int]) -> Int:
+    if offered.contains(TLS_CIPHER_AES_128_GCM_SHA256):
+        return TLS_CIPHER_AES_128_GCM_SHA256
+    if offered.contains(TLS_CIPHER_AES_256_GCM_SHA384):
+        return TLS_CIPHER_AES_256_GCM_SHA384
+    if offered.contains(TLS_CIPHER_CHACHA20_POLY1305_SHA256):
+        return TLS_CIPHER_CHACHA20_POLY1305_SHA256
+    return 0
+
 fn select_cipher(client: tls13.ClientHello) -> Int!:
     if client.cipher_suites.contains(TLS_CIPHER_AES_128_GCM_SHA256):
         return TLS_CIPHER_AES_128_GCM_SHA256
@@ -864,7 +873,7 @@ fn handshake_secret_for_resumption(cipher: Int, did_resume: Bool, psk: Bytes, sh
         return tls13.handshake_secret_from_early_secret_for_cipher(cipher, tls13.early_secret_from_psk_for_cipher(cipher, psk), shared_secret)
     return tls13.handshake_secret_for_cipher(cipher, shared_secret)
 
-fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, selected_alpn: String, fallback_cipher: Int) -> ServerResumptionDecision!:
+fn select_server_resumption(config: Config, hrr_prefix: Bytes, client_hello: tls13.ClientHello, selected_alpn: String, fallback_cipher: Int) -> ServerResumptionDecision!:
     if not config_resumption_enabled(config) or config_requires_client_certificate(config):
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     if not client_hello.psk_mode_dhe or client_hello.psk_identity.len() == 0:
@@ -887,7 +896,10 @@ fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, sel
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
     if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
         return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
-    expected_binder := tls13.resumption_binder_verify_data_for_cipher(entry.cipher, entry.psk, client_hello.psk_binder_input)!
+    # after a HelloRetryRequest the binder covers the retry transcript:
+    # message_hash(ClientHello1) ‖ HelloRetryRequest ‖ truncated ClientHello2
+    # (rfc 8446 §4.2.11.2). hrr_prefix is empty on the direct path.
+    expected_binder := tls13.resumption_binder_verify_data_for_cipher(entry.cipher, entry.psk, hrr_prefix.concat(client_hello.psk_binder_input))!
     # the binder is a MAC that proves the client holds the PSK; compare it in
     # constant time. an ordinary byte-equality short-circuits on the first
     # differing byte, which leaks the correct binder one byte at a time and lets
@@ -1536,29 +1548,86 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     hello_buf := bytes.buffer()
     defer hello_buf.free()
     mut server_messages: List[tls13.HandshakeMessage] := []
-    while server_messages.len() == 0:
-        first_record := native_read_record(stream)!
-        if first_record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
-            continue
-        if first_record.content_type == TLS_CONTENT_ALERT:
-            native_fail_alert(first_record)!
-        if first_record.content_type != TLS_CONTENT_HANDSHAKE:
+    mut hrr_suite := 0
+    mut flight_ready := false
+    while not flight_ready:
+        while server_messages.len() == 0:
+            first_record := native_read_record(stream)!
+            if first_record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+                continue
+            if first_record.content_type == TLS_CONTENT_ALERT:
+                native_fail_alert(first_record)!
+            if first_record.content_type != TLS_CONTENT_HANDSHAKE:
+                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "expected tls server hello"
+            if first_record.payload.len() == 0:
+                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+                fail "empty tls handshake record"
+            hello_buf.write(first_record.payload)!
+            if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
+                send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
+                fail "tls server hello is too large"
+            server_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
+        if server_messages[0].message_type != TLS_HANDSHAKE_SERVER_HELLO:
             send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
             fail "expected tls server hello"
-        if first_record.payload.len() == 0:
-            send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
-            fail "empty tls handshake record"
-        hello_buf.write(first_record.payload)!
-        if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
-            send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
-            fail "tls server hello is too large"
-        server_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
-    if server_messages[0].message_type != TLS_HANDSHAKE_SERVER_HELLO:
-        send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
-        fail "expected tls server hello"
+        if not tls13.is_hello_retry_request(server_messages[0].body):
+            flight_ready = true
+        else:
+            # --- HelloRetryRequest (rfc 8446 §4.1.4) ---
+            if hrr_suite != 0:
+                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "second tls hello retry request"
+            parsed_hrr := tls13.parse_hello_retry_request(server_messages[0].body)
+            if parsed_hrr.is_err:
+                if parsed_hrr.err == "unknown tls hello retry request extension":
+                    send_fatal_alert(stream, ALERT_UNSUPPORTED_EXTENSION) catch 0
+                    fail "unknown tls hello retry request extension"
+                if parsed_hrr.err == "duplicate tls hello retry request extension" or parsed_hrr.err == "tls hello retry request selected a compression method":
+                    send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+                    fail "invalid tls hello retry request"
+                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls hello retry request"
+            hrr := parsed_hrr.ok
+            if hrr.cipher_suite != TLS_CIPHER_AES_128_GCM_SHA256 and hrr.cipher_suite != TLS_CIPHER_AES_256_GCM_SHA384 and hrr.cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256:
+                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "tls hello retry request selected an unoffered cipher suite"
+            if hrr.selected_group != 0:
+                # this hello carried a share for every group it offered, so any
+                # group a retry names is either already served or never
+                # offered — both are aborts (rfc 8446 §4.1.4).
+                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "tls hello retry request named a group already offered"
+            if not hrr.has_cookie:
+                send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+                fail "tls hello retry request changes nothing"
+            # the second hello: the first one again with the cookie echoed. a
+            # psk offer is not repeated — its binder covered the first hello
+            # alone — so that hello is rebuilt bare before the cookie goes on.
+            mut hello1 := transcript_buf.bytes()
+            if offering_psk:
+                hello1 = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
+            client_hello2 := tls13.client_hello_with_cookie(hello1, hrr.cookie)!
+            # the retry transcript replaces ClientHello1 with a synthetic
+            # message_hash of it (rfc 8446 §4.4.1).
+            retry_prefix := tls13.hrr_transcript_prefix_for_cipher(hrr.cipher_suite, transcript_buf.bytes())!
+            hrr_encoded := tls13.encode_handshake(TLS_HANDSHAKE_SERVER_HELLO, server_messages[0].body)!
+            transcript_buf.clear()
+            transcript_buf.write(retry_prefix)!
+            transcript_buf.write(hrr_encoded)!
+            transcript_buf.write(client_hello2)!
+            send_change_cipher_spec(stream)!
+            native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, client_hello2)!)!
+            hrr_suite = hrr.cipher_suite
+            hello_buf.clear()
+            server_messages = []
     # branch on the version the server negotiated. a 1.2 ServerHello would fail
     # the 1.3 parser (no supported_versions, no key share), so decide here.
     negotiated := tls13.negotiated_server_version(server_messages[0].body)!
+    if hrr_suite != 0 and negotiated != TLS_VERSION_13:
+        # the retry request already committed the server to 1.3.
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls server changed versions after a hello retry request"
     if negotiated == TLS_VERSION_12:
         if not config_offers_tls12(config):
             send_fatal_alert(stream, ALERT_PROTOCOL_VERSION) catch 0
@@ -1584,6 +1653,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls server hello"
+    if hrr_suite != 0 and server_hello.cipher_suite != hrr_suite:
+        # rfc 8446 §4.1.4: the suite must not change between the retry request
+        # and the hello that follows it.
+        send_fatal_alert(stream, ALERT_ILLEGAL_PARAMETER) catch 0
+        fail "tls server changed cipher suites after a hello retry request"
     # rfc 8446 §4.1.3: legacy_session_id_echo must equal what we offered; a
     # mismatch means the hello answers someone else's offer.
     if not bytes.eq(server_hello.session_id, session_id):
@@ -1617,8 +1691,11 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     # record of the client's handshake epoch (rfc 8446 appendix d.4) — that
     # covers both the normal sealed Finished and a sealed alert sent while
     # rejecting the server's flight; a compat-mode peer refuses an encrypted
-    # record from the client until it has seen the dummy record.
-    native_write_all(stream, tls13.encode_change_cipher_spec()!)!
+    # record from the client until it has seen the dummy record. after a
+    # HelloRetryRequest the dummy already went out before the second hello,
+    # and the client sends it at most once.
+    if hrr_suite == 0:
+        native_write_all(stream, tls13.encode_change_cipher_spec()!)!
 
     mut server_hs_seq := 0
     mut certs: List[x509.Certificate] := []
@@ -2074,7 +2151,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # allows it and it offered a suite we can serve. a 1.3-capable client (our
     # own included) always has 772 in supported_versions and stays on the 1.3
     # path, whose parser is stricter.
-    lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
+    mut lenient_hello := tls13.parse_client_hello_lenient(client_messages[0].body) catch:
         send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
         fail "malformed tls client hello"
     # rfc 7507: a client that fell back from a higher version marks the retry
@@ -2136,6 +2213,63 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     if not lenient_hello.key_share_present:
         send_fatal_alert(stream, ALERT_MISSING_EXTENSION) catch 0
         fail "tls client hello is missing a key share"
+    # --- HelloRetryRequest (rfc 8446 §4.1.4, server side) ---
+    # the client's key_share may hold no share this stack serves while its
+    # supported_groups still names one it could produce; ask for that group
+    # with a HelloRetryRequest and read the second hello. hrr_prefix carries
+    # message_hash(ClientHello1) ‖ HelloRetryRequest for the retry transcript
+    # (rfc 8446 §4.4.1) and stays empty on the direct path.
+    mut hrr_prefix := bytes.empty()
+    share_probe := tls13.parse_client_hello(client_messages[0].body)
+    if share_probe.is_err and share_probe.err == "client hello key share must be x25519 or secp256r1":
+        mut retry_group := 0
+        if lenient_hello.supported_groups.contains(TLS_GROUP_X25519):
+            retry_group = TLS_GROUP_X25519
+        elif lenient_hello.supported_groups.contains(TLS_GROUP_SECP256R1):
+            retry_group = TLS_GROUP_SECP256R1
+        if retry_group != 0:
+            retry_cipher := select_cipher_from_list(lenient_hello.cipher_suites)
+            if retry_cipher == 0:
+                send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
+                fail "client did not offer a supported tls cipher suite"
+            hrr_message := tls13.encode_hello_retry_request(lenient_hello.session_id, retry_cipher, retry_group)!
+            native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, hrr_message)!)!
+            send_change_cipher_spec(stream)!
+            hello1_encoded := tls13.encode_handshake(TLS_HANDSHAKE_CLIENT_HELLO, client_messages[0].body)!
+            hrr_prefix = tls13.hrr_transcript_prefix_for_cipher(retry_cipher, hello1_encoded)!.concat(hrr_message)
+            hello_buf.clear()
+            client_messages = []
+            mut second_hello_ccs := 0
+            while client_messages.len() == 0:
+                second_record := read_plaintext_handshake_record(stream)!
+                if second_record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+                    second_hello_ccs = second_hello_ccs + 1
+                    if second_hello_ccs > MAX_HANDSHAKE_CHANGE_CIPHER_SPEC or not is_valid_change_cipher_spec(second_record):
+                        send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
+                        fail "invalid tls change cipher spec"
+                    continue
+                if second_record.content_type == TLS_CONTENT_ALERT:
+                    native_fail_alert(second_record)!
+                if second_record.content_type != TLS_CONTENT_HANDSHAKE:
+                    send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
+                    fail "expected a second tls client hello"
+                if second_record.payload.len() == 0:
+                    send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+                    fail "empty tls handshake record"
+                hello_buf.write(second_record.payload)!
+                if hello_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
+                    send_fatal_alert(stream, ALERT_HANDSHAKE_FAILURE) catch 0
+                    fail "tls client hello is too large"
+                client_messages = tls13.decode_handshakes_prefix(hello_buf.bytes())
+            if tls13.handshakes_encoded_len(client_messages) != hello_buf.len():
+                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls handshake record"
+            if client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
+                send_fatal_alert(stream, ALERT_UNEXPECTED_MESSAGE) catch 0
+                fail "expected a second tls client hello"
+            lenient_hello = tls13.parse_client_hello_lenient(client_messages[0].body) catch:
+                send_fatal_alert(stream, ALERT_DECODE_ERROR) catch 0
+                fail "malformed tls client hello"
     parsed_client_hello := tls13.parse_client_hello(client_messages[0].body)
     if parsed_client_hello.is_err:
         # the lenient parse and version checks above already passed. a psk
@@ -2164,7 +2298,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     selected_alpn := select_alpn_protocol(handshake_config, client_hello.alpn_protocols) catch:
         send_fatal_alert(stream, ALERT_NO_APPLICATION_PROTOCOL) catch 0
         fail "no common alpn protocol"
-    resumption := select_server_resumption(handshake_config, client_hello, selected_alpn, fallback_cipher) catch:
+    resumption := select_server_resumption(handshake_config, hrr_prefix, client_hello, selected_alpn, fallback_cipher) catch:
         send_fatal_alert(stream, ALERT_DECRYPT_ERROR) catch 0
         fail "invalid tls session resumption offer"
     cipher := resumption.cipher
@@ -2184,9 +2318,14 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     # a middlebox-compatibility change_cipher_spec follows the ServerHello
     # (rfc 8446 appendix d.4): a bare plaintext record, outside the transcript,
     # so networks that expect a 1.2-shaped exchange let the 1.3 flight through.
-    send_change_cipher_spec(stream)!
+    # after a HelloRetryRequest it already followed the retry, and it goes out
+    # at most once.
+    if hrr_prefix.len() == 0:
+        send_change_cipher_spec(stream)!
 
     transcript := bytes.buffer()
+    if hrr_prefix.len() > 0:
+        transcript.write(hrr_prefix)!
     transcript_append(transcript, client_messages[0])!
     server_messages := tls13.decode_handshakes(server_hello)!
     transcript_append(transcript, server_messages[0])!

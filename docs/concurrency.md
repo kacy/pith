@@ -401,9 +401,11 @@ well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
 trading a million messages through one bounded channel — it runs well ahead of
 the os-thread backend and of zig, but behind go and rust at the default worker
-count (~133 ms against their ~71 and ~73). pinned to one worker it turns that
-around against go, at ~46 ms to ~71: the benchmark is pure handoff, which one
-worker does without crossing a core. see the coordination table in
+count (~95 ms median against their ~71 and ~69 on the 2026-08-22 rerun — and
+bimodal: 2 of 15 launches land at 59-66 ms, faster than either, when the task
+placement race goes well). pinned to one worker it turns the go comparison
+around at ~46 ms to ~71: the benchmark is pure handoff, which one worker does
+without crossing a core. see the coordination table in
 `docs/performance.md`. it does the least for tasks that are already
 cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 

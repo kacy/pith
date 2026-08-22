@@ -9,120 +9,21 @@ and fix suggestion (if available).
 
 ---
 
-## lexer errors (E0xx)
+## lexing and parsing errors (E24x)
 
-### E001 — unexpected character
+the lexer and parser do not have their own numeric ranges. every diagnostic
+they produce lands in the E24x block alongside the checker's, and the four
+codes below are the whole set:
 
-the lexer encountered a character it doesn't recognize.
+| code | phase | what it covers |
+|------|-------|----------------|
+| `E240` | parser | an expected token was missing |
+| `E241` | parser | the file ended in the middle of a construct |
+| `E242` | parser | the tokens do not form a valid construct here |
+| `E243` | lexer | an invalid token: a stray character, an unterminated string, or a bad indentation change |
 
-```
-error[E001]: unexpected character: @
-  1 | x := @bad
-          ^
-```
-
-### E002 — unterminated string
-
-a string literal was opened but never closed.
-
-```
-error[E002]: unterminated string literal
-  1 | x := "hello
-            ^^^^^^
-```
-
-### E003 — invalid escape sequence
-
-a backslash in a string is followed by an unrecognized escape character.
-
-```
-error[E003]: invalid escape sequence: \q
-  1 | x := "hello\q"
-                  ^^
-```
-
-### E004 — invalid number literal
-
-a numeric literal has invalid syntax (e.g. multiple dots, letters in the middle).
-
-### E005 — indentation error
-
-the indentation level is inconsistent or uses mixed tabs/spaces.
-
-```
-error[E005]: inconsistent indentation
-  3 |     x := 1
-       ^^^^
-  fix: use consistent 4-space indentation
-```
-
-### E006 — string interpolation error
-
-a `{` inside a string interpolation is malformed or unmatched.
-
----
-
-## parser errors (E1xx)
-
-### E100 — unexpected token
-
-the parser encountered a token it didn't expect in the current context.
-
-```
-error[E100]: unexpected token: ')'
-  5 | fn add(x: Int, ) -> Int:
-                      ^
-```
-
-### E101 — expected expression
-
-the parser expected an expression but found something else.
-
-```
-error[E101]: expected expression
-  3 | x :=
-          ^
-```
-
-### E102 — expected type annotation
-
-a type annotation was expected (e.g. after `:` in a parameter or field).
-
-```
-error[E102]: expected type annotation
-  1 | fn foo(x: ) -> Int:
-                ^
-```
-
-### E103 — expected identifier
-
-an identifier was expected but not found (e.g. after `fn` or in a binding).
-
-### E104 — expected block
-
-a colon-terminated statement expected an indented block to follow.
-
-```
-error[E104]: expected indented block
-  1 | fn foo():
-  2 | bar()
-      ^^^^^
-```
-
-### E105 — expression nesting too deep
-
-an expression exceeds the maximum nesting depth (prevents stack overflow
-on malicious or generated input).
-
-### E106 — invalid lambda syntax
-
-a lambda expression has invalid syntax (e.g. missing `=>` or body).
-
-### E107 — expected pattern
-
-a pattern was expected in a match arm but something else was found.
-
----
+each is documented in full below. codes in the E0xx and E1xx ranges have never
+been emitted and are not reserved for these phases.
 
 ## checker errors (E2xx)
 
@@ -196,6 +97,8 @@ error[E203]: duplicate definition of 'x'
       ^
 ```
 
+**not currently emitted.** rebinding a name in the same scope is accepted; there is no duplicate-definition check.
+
 ### E204 — non-exhaustive match
 
 a match expression doesn't cover all possible values. includes a fix
@@ -212,9 +115,13 @@ error[E204]: non-exhaustive match: missing variant 'Circle'
 
 a match arm can never be reached because earlier arms already cover it.
 
+**not currently emitted.** a repeated match arm is rejected by the parser as `E240` instead.
+
 ### E206 — missing return type
 
 a function needs a return type annotation but doesn't have one.
+
+**not currently emitted.** a function with no return type annotation is treated as returning nothing.
 
 ### E207 — wrong number of arguments
 
@@ -247,6 +154,8 @@ a field access or struct constructor was used on a non-struct type.
 ### E211 — not an enum type
 
 an enum variant pattern was used on a non-enum type.
+
+**not currently emitted.** matching an enum pattern against a non-enum is rejected by the parser as `E240` instead.
 
 ### E212 — unknown variant
 
@@ -318,6 +227,8 @@ a few argument positions do not widen yet; see `docs/limitations.md`.
 
 the right side of a pipe operator (`|`) is not a valid function.
 
+**not currently emitted.** a bad right-hand side to `|` reports `E208` instead.
+
 ### E221 — generic type argument count mismatch
 
 a generic type was used with the wrong number of type arguments.
@@ -362,6 +273,8 @@ a type doesn't satisfy the interface bounds required by a generic parameter.
 ### E227 — method not found
 
 a method call references a method that doesn't exist on the type.
+
+**not currently emitted.** a missing method reports `E209` instead, which covers both fields and methods.
 
 ### E228 — pattern type mismatch
 
@@ -425,6 +338,8 @@ error[E236]: name 'subtract' not found in the imported module
                        ^^^^^^^^
 ```
 
+**not currently emitted.** importing a name a module does not declare reports `E246` instead.
+
 ### E237 — imported name is not public
 
 a `from ... import` refers to a name that exists but isn't marked `pub`.
@@ -434,6 +349,8 @@ error[E237]: 'secret' is not public in the imported module
   1 | from math import secret
                        ^^^^^^
 ```
+
+**not currently emitted**, and there is no check behind it: `from mod import name` currently succeeds whether or not `name` is `pub`. only the `mod.name(...)` call form is gated, by `E251`.
 
 ### E238 — invalid unwrap context
 
@@ -558,9 +475,10 @@ error[E250]: 'Channel' is a builtin type name and cannot be used as a struct nam
 
 ## lint errors (E3xx)
 
-reported by `pith lint`. naming violations are errors; style issues are warnings.
+reported by `pith lint`. all of them are warnings: `pith lint` reports them
+without failing a build.
 
-### E300 — snake_case required (error)
+### E300 — snake_case required (warning)
 
 function names, variable names, and method names must use `snake_case`.
 
@@ -570,7 +488,7 @@ error[E300]: function name 'GetUser' should be snake_case
        ^^^^^^^
 ```
 
-### E301 — PascalCase required (error)
+### E301 — PascalCase required (warning)
 
 type names (structs, enums, interfaces, type aliases) must use `PascalCase`.
 
@@ -580,20 +498,11 @@ error[E301]: struct name 'my_point' should be PascalCase
             ^^^^^^^^
 ```
 
-### E302 — unused variable (warning)
-
-a local variable is bound but never referenced in its scope.
-
-```
-warning[E302]: unused variable 'x' in 'main'
-  3 |     x := 42
-        ^
-```
-
 ### E304 — missing doc comment (warning)
 
-a public function or method has no doc comment. every `pub fn` should have
-a `///` doc comment explaining its purpose.
+a public function or method has no doc comment. every `pub fn` should have a
+`#` comment on the line directly above it explaining its purpose. there is no
+`///` form — that is a parse error.
 
 ```
 warning[E304]: public function 'serve' is missing a doc comment
@@ -652,6 +561,35 @@ end the block with `return`, `fail`, `continue` or `break`.
 error[E253]: a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression
 ```
 
+
+### E260 — invalid defer or errdefer
+
+`defer` and `errdefer` appear outside a function, or the deferred statement is
+not a plain side effect. a deferred statement may not return, `fail`, `break`,
+`continue`, use `!` or `?`, bind a name, or nest another defer — move the
+control flow into a helper and defer the call to it. `errdefer` additionally
+requires a function that returns a result (`T!`), since there is no error case
+for it to run on otherwise.
+
+```
+error[E260]: errdefer is only meaningful in a function returning a result (`T!`)
+  fix: use `defer` for cleanup that must always run, or give the function a `T!` return type
+```
+
+see [defer.md](defer.md) for the full ordering rules.
+
+### E261 — invalid weak binding
+
+a `weak` binding broke one of its restrictions. a weak binding cannot be `mut`,
+cannot carry a type annotation (it takes its type from its value), must hold a
+struct value, cannot be declared inside a closure, and cannot reuse a name
+already bound in the same function.
+
+```
+error[E261]: a weak binding cannot be 'mut'
+```
+
+see [ownership.md](ownership.md) for why each restriction exists.
 
 ### E262 — generic enum instance cannot be inferred
 

@@ -294,8 +294,10 @@ when a client advertises a group it can serve but offers no usable key share,
 and verifies a resumption binder in the second hello over the retry
 transcript.
 
-ecdhe key exchange uses x25519 or nist p-256 (secp256r1) on both 1.3 and the
-1.2 fallback. the client offers both and prefers x25519; the server keys with
+ecdhe key exchange uses x25519, nist p-256 (secp256r1), or nist p-384
+(secp384r1) on both 1.3 and the 1.2 fallback. the client sends shares for
+x25519 and p-256 and prefers x25519; secp384r1 is advertised without a share,
+and a server that insists on it asks via HelloRetryRequest. the server keys with
 whichever group the client sent a share for, so a client restricted to p-256
 (as some fips deployments are) still negotiates.
 

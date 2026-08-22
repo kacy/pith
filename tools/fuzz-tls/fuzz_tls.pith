@@ -1,0 +1,254 @@
+# fuzz_tls.pith — feed the tls and x.509 parsers bytes they never asked for.
+#
+# every attacker-reachable parser in the stack is called on mutated versions
+# of real inputs. the oracles are cheap:
+#
+#   1. no call crashes the process or hangs: ok and err are both answers,
+#      a signal or a timeout is a bug.
+#   2. a parser that accepted a mutation must hand back a value the
+#      accessors can walk without dying.
+#
+# deterministic by default (fixed seed) so ci runs are reproducible; pass
+# --seed to explore and --count to run longer.
+#
+#   pith run tools/fuzz-tls/fuzz_tls.pith -- --count 500 --seed 42
+
+import std.bytes as bytes
+import std.crypto.x509 as x509
+import std.encoding as encoding
+import std.io as io
+import std.net.tls12 as tls12
+import std.net.tls13 as tls13
+import std.rand as rand
+
+# ---------------------------------------------------------------
+# mutation
+# ---------------------------------------------------------------
+
+# one mutated copy of `input`: bit flips, truncations, extensions, zero and
+# 0xff fills, and length-field-shaped corruptions (16-bit big-endian values
+# rewritten in place), all driven by the shared prng.
+fn mutate(input: Bytes) -> Bytes!:
+    if input.len() == 0:
+        return input
+    choice := rand.int(0, 6)
+    out := bytes.buffer()
+    defer out.free()
+    if choice == 0:
+        # flip one bit
+        at := rand.int(0, input.len() - 1)
+        bit := rand.int(0, 7)
+        out.write(input.slice(0, at))!
+        out.write_byte(bits_xor(input[at], shl_int(1, bit)))
+        out.write(input.slice(at + 1, input.len()))!
+        return out.bytes()
+    if choice == 1:
+        # truncate
+        keep := rand.int(0, input.len())
+        return input.slice(0, keep)
+    if choice == 2:
+        # append junk
+        extra := rand.int(1, 32)
+        out.write(input)!
+        mut i := 0
+        while i < extra:
+            out.write_byte(rand.int(0, 255))
+            i = i + 1
+        return out.bytes()
+    if choice == 3:
+        # overwrite a run with zeros or 0xff
+        at := rand.int(0, input.len() - 1)
+        run := rand.int(1, 16)
+        mut fill := 0
+        if rand.int(0, 1) == 1:
+            fill = 255
+        out.write(input.slice(0, at))!
+        mut i := 0
+        while i < run and at + i < input.len():
+            out.write_byte(fill)
+            i = i + 1
+        out.write(input.slice(at + i, input.len()))!
+        return out.bytes()
+    if choice == 4 and input.len() >= 2:
+        # corrupt a 16-bit length-shaped field
+        at := rand.int(0, input.len() - 2)
+        value := rand.int(0, 65535)
+        out.write(input.slice(0, at))!
+        out.write_byte(value / 256)
+        out.write_byte(value % 256)
+        out.write(input.slice(at + 2, input.len()))!
+        return out.bytes()
+    # swap two slices
+    if input.len() < 4:
+        return input
+    a := rand.int(0, input.len() / 2)
+    b := rand.int(input.len() / 2, input.len() - 1)
+    out.write(input.slice(0, a))!
+    out.write_byte(input[b])
+    out.write(input.slice(a + 1, b))!
+    out.write_byte(input[a])
+    out.write(input.slice(b + 1, input.len()))!
+    return out.bytes()
+
+fn bits_xor(a: Int, b: Int) -> Int:
+    mut out := 0
+    mut bit := 1
+    mut x := a
+    mut y := b
+    mut i := 0
+    while i < 8:
+        if (x % 2) != (y % 2):
+            out = out + bit
+        x = x / 2
+        y = y / 2
+        bit = bit * 2
+        i = i + 1
+    return out
+
+fn shl_int(v: Int, count: Int) -> Int:
+    mut out := v
+    mut i := 0
+    while i < count:
+        out = out * 2
+        i = i + 1
+    return out
+
+# ---------------------------------------------------------------
+# targets
+# ---------------------------------------------------------------
+
+# walk everything a successful certificate parse exposes, so a mutation the
+# parser accepted still has to produce a walkable value.
+fn exercise_certificate(cert: x509.Certificate) -> Int:
+    mut total := cert.version + cert.serial_hex.len() + cert.signature_algorithm.len()
+    total = total + cert.subject_common_name.len() + cert.issuer_common_name.len()
+    for name in cert.dns_names:
+        total = total + name.len()
+    for ip in cert.ip_addresses:
+        total = total + ip.len()
+    for oid in cert.eku_oids:
+        total = total + oid.len()
+    return total
+
+fn fuzz_x509(input: Bytes) -> Int:
+    cert := x509.parse_der(input) catch:
+        return 0
+    return exercise_certificate(cert)
+
+fn fuzz_pem(text: String) -> Int:
+    cert := x509.parse_pem(text) catch:
+        return 0
+    return exercise_certificate(cert)
+
+fn fuzz_tls13(input: Bytes) -> Int:
+    mut total := 0
+    total = total + (tls13.decode_records(input) catch []).len()
+    messages := tls13.decode_handshakes_prefix(input)
+    total = total + messages.len()
+    hello := tls13.parse_client_hello(input) catch:
+        total = total + 0
+        return finish_tls13(input, total)
+    total = total + hello.cipher_suites.len() + hello.key_share.len()
+    return finish_tls13(input, total)
+
+fn finish_tls13(input: Bytes, base: Int) -> Int:
+    mut total := base
+    lenient := tls13.parse_client_hello_lenient(input) catch:
+        return total
+    total = total + lenient.supported_groups.len() + lenient.signature_schemes.len()
+    # each parser is called for its crash-resistance, not its result: is_err
+    # forces evaluation and swallows the error either way.
+    if tls13.parse_server_hello(input).is_err:
+        total = total + 0
+    if tls13.parse_hello_retry_request(input).is_err:
+        total = total + 0
+    if tls13.negotiated_server_version(input).is_err:
+        total = total + 0
+    total = total + (tls13.server_hello_extension_types(input) catch []).len()
+    total = total + (tls13.encrypted_extensions_types(input) catch []).len()
+    if tls13.parse_new_session_ticket(input).is_err:
+        total = total + 0
+    if tls13.parse_certificate_request(input).is_err:
+        total = total + 0
+    if tls13.parse_alert(input).is_err:
+        total = total + 0
+    return total
+
+fn fuzz_tls12(input: Bytes) -> Int:
+    mut total := 0
+    if tls12.parse_server_hello(input).is_err:
+        total = total + 0
+    total = total + (tls12.server_hello_extension_types(input) catch []).len()
+    if tls12.validate_new_session_ticket(input).is_err:
+        total = total + 0
+    return total
+
+fn fuzz_arg_int(flag: String, fallback: Int) -> Int:
+    argv := args()
+    mut i := 0
+    while i < argv.len():
+        if argv[i] == flag and i + 1 < argv.len():
+            return parse_int(argv[i + 1]) catch fallback
+        i = i + 1
+    return fallback
+
+# ---------------------------------------------------------------
+# main loop
+# ---------------------------------------------------------------
+
+fn load_corpus() -> List[Bytes]!:
+    out: List[Bytes] := []
+    for path in ["tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost-ecdsa.crt", "tests/live/fixtures/keyusage-root.crt", "tests/live/fixtures/p384-leaf.crt"]:
+        text := io.read_file_text(path) catch:
+            continue
+        cert := x509.parse_pem(text) catch:
+            continue
+        out.push(cert.der)
+    # wire-shaped tls inputs from our own encoders
+    random := bytes.buffer_with_capacity(32)
+    defer random.free()
+    mut i := 0
+    while i < 32:
+        random.write_byte(i)
+        i = i + 1
+    session := random.bytes()
+    keypairish := bytes.buffer_with_capacity(32)
+    defer keypairish.free()
+    i = 0
+    while i < 32:
+        keypairish.write_byte(255 - i)
+        i = i + 1
+    hello := tls13.encode_client_hello("fuzz.example", random.bytes(), session, keypairish.bytes()) catch bytes.empty()
+    if hello.len() > 4:
+        out.push(hello.slice(4, hello.len()))
+    record := tls13.encode_record(22, hello) catch bytes.empty()
+    out.push(record)
+    ticket := tls13.encode_new_session_ticket(3600, 7, keypairish.bytes().slice(0, 8), session) catch bytes.empty()
+    if ticket.len() > 4:
+        out.push(ticket.slice(4, ticket.len()))
+    return out
+
+fn main() -> Int!:
+    count := fuzz_arg_int("--count", 300)
+    seed := fuzz_arg_int("--seed", 42)
+    rand.seed(seed)
+    corpus := load_corpus()!
+    if corpus.len() == 0:
+        print("fuzz-tls: no corpus inputs loaded")
+        return 1
+    pem_text := io.read_file_text("tests/live/fixtures/localhost.crt") catch ""
+    mut sink := 0
+    mut round := 0
+    while round < count:
+        for entry in corpus:
+            mutated := mutate(entry)!
+            sink = sink + fuzz_x509(mutated)
+            sink = sink + fuzz_tls13(mutated)
+            sink = sink + fuzz_tls12(mutated)
+        if pem_text != "" and round % 10 == 0:
+            # mutate the pem text as bytes and re-string it
+            mutated_pem := mutate(bytes.from_string_utf8(pem_text))!
+            sink = sink + fuzz_pem(mutated_pem.to_string_utf8() catch "")
+        round = round + 1
+    print("fuzz-tls: " + (count * corpus.len()).to_string() + " mutations survived (sink " + (sink % 1000).to_string() + ")")
+    return 0

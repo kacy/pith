@@ -36,8 +36,9 @@ pith runtime error: substring(0, 1) would split the character 'Ä' at byte 1 (it
 ```
 
 this follows the strict accessors already in the runtime —
-`pith_list_get_value_strict`, `bytes_get_strict`, `map_get_strict` — which all
-abort with a diagnostic rather than return a quietly wrong value. `substring`
+`pith_list_get_value_strict`, `pith_bytes_get_strict`, and the strict map
+accessors — which all abort with a diagnostic rather than return a quietly
+wrong value. `substring`
 keeps its `String` return type; there is no new error to thread through the
 391-odd call sites, and code that was already cutting on boundaries is
 unaffected.

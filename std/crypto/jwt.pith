@@ -487,14 +487,14 @@ pub fn verify_ps256(token: String, public_key: Bytes, options: Options) -> Verif
     return finish(parts, options)!
 
 # verify an RS256 token issued elsewhere. `public_key` is the pkcs#1
-# rsapublickey der. pith cannot issue RS256: the runtime has no pkcs#1 signer.
+# rsapublickey der. to issue an RS256 token, use `sign_rs256` with a pkcs#8 key.
 pub fn verify_rs256(token: String, public_key: Bytes, options: Options) -> Verified!:
     parts := open_token(token, RS256)!
     require_signature(signature.verify_rsa_pkcs1_sha256(public_key, parts.signing_input, parts.signature))!
     return finish(parts, options)!
 
 # verify an EdDSA (ed25519) token issued elsewhere. `public_key` is the raw 32
-# byte key. pith cannot issue EdDSA: the runtime has no ed25519 signer.
+# byte key. to issue an EdDSA token, use `sign_eddsa` with a pkcs#8 key.
 pub fn verify_eddsa(token: String, public_key: Bytes, options: Options) -> Verified!:
     parts := open_token(token, EDDSA)!
     require_signature(signature.verify_ed25519(public_key, parts.signing_input, parts.signature))!
@@ -541,8 +541,8 @@ fn ecdsa_der_signature(raw: Bytes, half: Int) -> Bytes!:
     return out.bytes()
 
 # verify an ES256 token issued elsewhere. `public_key` is the uncompressed
-# p-256 point: 0x04 followed by x and y. pith cannot issue ES256: the runtime
-# has no ecdsa signer.
+# p-256 point: 0x04 followed by x and y. to issue an ES256 token, use
+# `sign_es256` with a pkcs#8 key.
 pub fn verify_es256(token: String, public_key: Bytes, options: Options) -> Verified!:
     parts := open_token(token, ES256)!
     der := ecdsa_der_signature(parts.signature, P256_COORDINATE_LEN)!

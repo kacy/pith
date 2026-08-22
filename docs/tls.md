@@ -1,6 +1,6 @@
 # tls
 
-pith's native tls stack lives in `std.net.tls` and `std.net.tls13`.
+pith's native tls stack lives in `std.net.tls`, `std.net.tls13`, and `std.net.tls12`.
 
 the current shape is:
 - tls 1.3, with a tls 1.2 fallback (ecdhe + aead only)
@@ -388,6 +388,10 @@ equivalent of a minimum version of 1.3:
 ```pith
 cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.require_tls13()
 ```
+
+`require_tls12()` is the inverse: it caps a config at tls 1.2, so the client
+offers only the fallback and never negotiates 1.3. the two are mutually
+exclusive; if both are set on one config, `require_tls12()` wins.
 
 what the 1.2 fallback does not do (v1): session resumption, renegotiation
 (refused), or client-certificate auth (the server refuses a 1.2

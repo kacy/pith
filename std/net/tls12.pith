@@ -98,10 +98,17 @@ pub fn prf_sha256(secret: Bytes, label: String, seed: Bytes, length: Int) -> Byt
 
 # The Extended Master Secret (RFC 7627): PRF over the ECDHE pre-master secret
 # and the handshake session hash. This binds the master secret to the full
-# handshake transcript, defeating the triple-handshake class; this fallback
-# requires it and offers no non-extended master-secret derivation.
+# handshake transcript, defeating the triple-handshake class; it is always
+# offered and always taken when the peer agrees.
 pub fn extended_master_secret(pre_master: Bytes, session_hash: Bytes) -> Bytes!:
     return prf_sha256(pre_master, "extended master secret", session_hash, 48)
+
+# The rfc 5246 §8.1 master secret, for a peer that does not speak rfc 7627.
+# Safe to accept here because the attacks the extended form closes need
+# session resumption or renegotiation to exploit, and this stack refuses both
+# on 1.2.
+pub fn classic_master_secret(pre_master: Bytes, client_random: Bytes, server_random: Bytes) -> Bytes!:
+    return prf_sha256(pre_master, "master secret", client_random.concat(server_random), 48)
 
 # The record-protection key material for one direction pair, expanded from the
 # master secret. For an AEAD suite there are no MAC keys: a GCM suite has a
@@ -546,11 +553,14 @@ pub fn apply_downgrade_sentinel(random: Bytes) -> Bytes!:
 # suite, null compression, and extensions — extended master secret always, an
 # empty renegotiation_info when the client advertised secure renegotiation, and
 # ALPN when a protocol was selected.
-pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, alpn_protocol: String, secure_renegotiation: Bool) -> Bytes!:
+pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, alpn_protocol: String, secure_renegotiation: Bool, extended_master_secret: Bool) -> Bytes!:
     ext := bytes.buffer()
     defer ext.free()
-    checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
-    checked_write(binary.write_u16_be(ext, 0))!
+    # extended master secret is acked only when the client offered it
+    # (rfc 7627 §5.1); unsolicited it would be an unoffered extension.
+    if extended_master_secret:
+        checked_write(binary.write_u16_be(ext, EXT_EXTENDED_MASTER_SECRET))!
+        checked_write(binary.write_u16_be(ext, 0))!
     # renegotiation_info echoes back only when the client advertised secure
     # renegotiation (rfc 5746 §3.6); sending it unsolicited is an unadvertised
     # extension the client never asked for.
@@ -574,8 +584,11 @@ pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, 
     out.write(session_id)!
     checked_write(binary.write_u16_be(out, cipher_suite))!
     checked_write(binary.write_u8(out, 0))!
-    checked_write(binary.write_u16_be(out, extensions.len()))!
-    out.write(extensions)!
+    # a hello with nothing to say omits the extensions block entirely — the
+    # legacy encoding a client that sent none expects back.
+    if extensions.len() > 0:
+        checked_write(binary.write_u16_be(out, extensions.len()))!
+        out.write(extensions)!
     return out.bytes()
 
 # validate a 1.2 NewSessionTicket body (rfc 5077 §3.3): a u32 lifetime hint
@@ -784,7 +797,7 @@ test "the server hello encodes the sentinel and round-trips its flags":
     random := apply_downgrade_sentinel(bytes.concat(base, encoding.from_hex("aabbccddeeff0011")!))!
     assert_eq(random.len(), 32)
     assert(has_downgrade_sentinel(random))
-    body := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", true)!
+    body := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", true, true)!
     hello := parse_server_hello(body)!
     assert_eq(hello.cipher_suite, TLS12_ECDHE_RSA_AES128_GCM_SHA256)
     assert(hello.extended_master_secret)
@@ -792,5 +805,5 @@ test "the server hello encodes the sentinel and round-trips its flags":
     assert_eq(hello.alpn_protocol, "h2")
     assert(has_downgrade_sentinel(hello.random))
     # a client that did not advertise secure renegotiation gets no such extension
-    quiet := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", false)!
+    quiet := encode_server_hello(random, encoding.from_hex("abcd")!, TLS12_ECDHE_RSA_AES128_GCM_SHA256, "h2", false, true)!
     assert_eq(parse_server_hello(quiet)!.renegotiation_info.len(), 0)

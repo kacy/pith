@@ -1652,7 +1652,10 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         if record.content_type == TLS_CONTENT_ALERT:
             native_fail_alert(record)!
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
-            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_UNEXPECTED_MESSAGE) catch 0
+            # a plaintext handshake record where ciphertext is due is, to the
+            # record layer, data that fails to authenticate — bad_record_mac,
+            # the same verdict a garbled ciphertext earns.
+            send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0
             fail "expected encrypted tls handshake record"
         inner := open_record_for_cipher(server_hello.cipher_suite, server_hs_keys.key, server_hs_keys.iv, server_hs_seq, record_bytes(record)!) catch:
             send_fatal_alert_sealed(stream, TLS_VERSION_13, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, 0, ALERT_BAD_RECORD_MAC) catch 0

@@ -314,6 +314,12 @@ struct NativeConnState:
     # no KeyUpdate.
     mut read_secret: Bytes
     mut write_secret: Bytes
+    # KeyUpdates received since the last application-data record — a flood
+    # guard — and whether we already answered an update_requested since our
+    # last write (rfc 8446 §4.6.3 lets a receiver coalesce several requests
+    # into one response, and strict peers refuse extra responses).
+    mut key_updates_received: Int
+    mut key_update_responded: Bool
 
 mut native_conn_mu := Mutex()
 mut native_conn_states: Map[Int, NativeConnState] := {}
@@ -1049,7 +1055,7 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
     return session
 
 fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret)
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret, key_updates_received: 0, key_update_responded: false)
     return Conn(native_conn_register(cs))
 
 # write a plaintext fatal alert before tearing a handshake down, so the peer
@@ -2480,6 +2486,7 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             # a zero-length application record is legal (padding / traffic
             # shaping); skip it rather than returning empty, which the caller
             # reads as a clean close_notify end-of-stream.
+            cs.key_updates_received = 0
             if payload.len() == 0:
                 empty_records = empty_records + 1
                 if empty_records > 32:
@@ -2516,6 +2523,9 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     cs.write_seq = seq + 1
     record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
     native_write_all(stream, record)!
+    # an application write opens a new coalescing window: the next
+    # update_requested from the peer earns a fresh KeyUpdate response.
+    cs.key_update_responded = false
     return count
 
 # send a close_notify alert, best-effort, before the socket closes. this is
@@ -2576,6 +2586,11 @@ fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool)
 fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
     if cs.version != TLS_VERSION_13 or cs.read_secret.len() == 0:
         fail "unexpected key update on a non-1.3 connection"
+    # a peer streaming KeyUpdates costs a full key derivation each while
+    # yielding no data; bound how many arrive between application records.
+    cs.key_updates_received = cs.key_updates_received + 1
+    if cs.key_updates_received > 32:
+        fail "too many tls key updates"
     request_peer_update := tls13.parse_key_update(message.body)!
     next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.read_secret)!
     keys := traffic_keys_for_cipher(cipher, next_secret)!
@@ -2583,8 +2598,12 @@ fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.Handsh
     cs.read_iv = keys.iv
     cs.read_seq = 0
     cs.read_secret = next_secret
-    if request_peer_update:
+    if request_peer_update and not cs.key_update_responded:
+        # several requests may arrive before we next write; answer the batch
+        # with one KeyUpdate (rfc 8446 §4.6.3) — a strict peer treats a second
+        # response as unsolicited.
         rotate_send_keys(cs, cipher, false)!
+        cs.key_update_responded = true
     return true
 
 # send a KeyUpdate that asks the peer to rekey too, and rotate our send keys.

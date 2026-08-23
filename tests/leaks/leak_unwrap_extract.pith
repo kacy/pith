@@ -1,0 +1,80 @@
+# unwrap_or on an optional used to hand out the count its subject's shell
+# still claimed: the extracted payload carried no count of its own, so a
+# consumer's release stripped the shell's count and a second extraction (or
+# a bound-then-returned one, once the subject's cleanup learned to cascade)
+# read freed memory. the Some arm now retains the payload it extracts, the
+# result is owned everywhere — a bind transfers, an argument position is
+# released after the call, an owned receiver is released after the member
+# read — and the subject's cascade stays the sole owner of the count its
+# shell keeps. every extraction shape churns here so an unbalanced retain
+# or release in any one of them moves the peak.
+import leakprobe as probe
+
+struct Ev:
+    pub tag: String
+
+fn mk(i: Int) -> Ev?:
+    if i < 0:
+        return none
+    return Ev("event-" + i.to_string())
+
+fn name_of(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "name-" + i.to_string()
+
+fn consume(e: Ev) -> Int:
+    return e.tag.len()
+
+# the escape shape: bind the extraction, return it
+fn take(i: Int) -> Ev:
+    opt := mk(i)
+    ev := opt.unwrap_or(Ev("fallback"))
+    return ev
+
+# unwrap_or in argument position: the owned result is released after the call
+fn as_argument(i: Int) -> Int:
+    opt := mk(i)
+    return consume(opt.unwrap_or(Ev("arg-fb")))
+
+# unwrap_or as a receiver: the owned result is released after the member read
+fn as_receiver(i: Int) -> Int:
+    s := "recv-fb-" + i.to_string()
+    o := name_of(i)
+    return o.unwrap_or(s).len()
+
+# none path with a fresh fallback: the fallback's own count transfers out
+fn none_fresh(i: Int) -> Int:
+    p: Ev? := none
+    e := p.unwrap_or(Ev("fresh-" + i.to_string()))
+    return e.tag.len()
+
+# none path with a borrowed fallback: the result takes its own count and
+# the local keeps the one it had
+fn none_borrowed(i: Int) -> Int:
+    fb := Ev("borrowed-" + i.to_string())
+    p: Ev? := none
+    e := p.unwrap_or(fb)
+    return e.tag.len() + fb.tag.len()
+
+# double extraction of the same local: each extraction carries its own count
+fn double_extract(i: Int) -> Int:
+    opt := mk(i)
+    a := opt.unwrap_or(Ev("a-fb"))
+    b := opt.unwrap_or(Ev("b-fb"))
+    return consume(a) + consume(b)
+
+fn churn_round(i: Int):
+    t := take(i).tag.len()
+    total := t + as_argument(i) + as_receiver(i) + none_fresh(i) + none_borrowed(i) + double_extract(i)
+    if total < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

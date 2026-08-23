@@ -116,6 +116,12 @@ mut ir_rc_local_kinds: List[String] := []
 # can never double-free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
+# tuple LOCALS the cascade scan rejected: their cleanup releases the shell
+# only, so an extraction must keep handing the shell's payload count out
+# rather than retaining a fresh one nothing would ever release. params,
+# fields, elements and fresh shells are deliberately not in this list —
+# their payload count stays with its owner, so extraction retains.
+mut ir_tuple_shell_only_names: List[String] := []
 # the module root emit_ir is currently lowering: the cascade walk reads a
 # same-module callee's declaration through it to judge an argument borrow
 # (ir_tuple_call_arg_is_borrow). and the (callee, param) pairs that walk is
@@ -882,6 +888,21 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         if ir_rc_kind(ir_infer_type(idx)).len() > 0:
             if ir_method_result_retains_over_args(ir_method_emit_name(mname, recv_type)):
                 return false
+        # the optional unwrap_or hands out an owned count for every heap
+        # payload kind: either the freshly retained one its Some arm takes,
+        # or (for a shell-only subject) the count the shell's cleanup never
+        # releases. the struct/list/... kinds already answered owned through
+        # the rc-kind check above; this covers the string payload, which
+        # would otherwise fall to the builtin fresh-name list below and
+        # classify borrowed — making the escape site retain a second count
+        # on top of the one the extraction carries. the RESULT unwrap_or is
+        # untouched: its receiver's kind is "result", and its string payload
+        # keeps the retain-at-escape convention.
+        if mname == "unwrap_or" and node.children.len() > 0:
+            unwrap_recv_tid := ir_emission_tid(node.children[0])
+            if unwrap_recv_tid >= 0 and get_type_info(unwrap_recv_tid).kind == "optional":
+                if ir_rc_kind(ir_type_from_tid(get_type_info(unwrap_recv_tid).inner)).len() > 0:
+                    return false
         return not ir_string_method_returns_fresh(mname)
     # a payload-free variant written bare — `Holder.Empty`, or the alias-
     # qualified `mod.Holder.Empty` — parses as a field access but mints a
@@ -1063,16 +1084,20 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # cleanup path is still the payload's sole owner, exactly like a `.ok` read.
 # without these entries an extraction disqualified the local from the cascade
 # and the count the shell holds was never released — one heap payload leaked
-# per extraction. `is_result` gates them because the OPTIONAL unwrap_or moves
-# a borrowed subject's count out to the extracted value instead of retaining
-# a new one; cascading such a local would release a count it no longer holds.
+# per extraction.
+#
+# the unwrap_or entry is open for an OPTIONAL local too: its extraction
+# retains the payload it hands out for a cascade-eligible subject (see the
+# Some arm in ir_emit_typed_receiver_method), so the shell keeps the count
+# it was built with and the cascade is its sole releaser — the same
+# contract as the result forms. `catch` and `!` stay result-only.
 #
 # one whitelisted position lives in the walk instead of here: an argument of a
 # same-module call whose body provably only reads the parameter
 # (ir_tuple_call_uses_safe) — the parser wraps arguments in `arg` nodes, so
 # this per-parent check never sees the call they belong to.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
-    if is_result and parent.kind == "method_call" and parent.children.len() > 0:
+    if parent.kind == "method_call" and parent.children.len() > 0:
         recv := get_node(parent.children[0])
         if recv.kind == "ident" and recv.value == name and ir_plain_method_name(parent.value) == "unwrap_or":
             # only the receiver position is safe; the name appearing inside
@@ -1184,12 +1209,13 @@ fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
 # and a recursive chain already being walked. erring that way keeps the leak
 # the cascade has always tolerated and can never free a live payload.
 #
-# the callee's own extractions are safe on a borrowed parameter for a RESULT:
-# `!`, `catch` and `unwrap_or` classify a named operand as borrowed and retain
-# the payload they hand out (see ir_emit_result_unwrap_or). the OPTIONAL
-# unwrap_or instead TRANSFERS the borrowed shell's payload count out, so an
-# optional parameter that is extracted must disqualify the argument — which
-# the walk's `is_result` gate on those clauses already does.
+# the callee's own extractions are safe on a borrowed parameter: `!`,
+# `catch` and `unwrap_or` classify a named operand as borrowed and retain
+# the payload they hand out (see ir_emit_result_unwrap_or for results and
+# the Some arm in ir_emit_typed_receiver_method for optionals — a parameter
+# subject always retains), so the caller stays the shell's sole owner. the
+# walk's `is_result` gate keeps `catch` and `!` result-only; unwrap_or is
+# open for both.
 fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
     callee := ir_resolve_static_callee(node.children[0])
     if callee.imported or callee.name.len() == 0:
@@ -1351,6 +1377,7 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
 # the body provably safe. anything unknown stays shell-only (leak, never UAF).
 fn ir_tuple_cascade_scan(body_idx: Int):
     ir_tuple_cascade_names = []
+    ir_tuple_shell_only_names = []
     if body_idx < 0:
         return
     mut i := 0
@@ -1362,12 +1389,17 @@ fn ir_tuple_cascade_scan(body_idx: Int):
         # a param is a borrow: the caller owns the payload and the prologue only
         # retains the shell, so cascading one would over-release. skip anything
         # already in ir_var_regs, which at this point holds exactly the params.
-        if kind == "tuple" and ir_tuple_local_tid.contains_key(name) and not ir_var_regs.contains_key(name):
-            tid := ir_tuple_local_tid[name]
-            if tid >= 0 and ir_tuple_local_has_rc_payload(tid):
-                is_result := get_type_info(tid).kind == "result"
-                if ir_tuple_uses_all_safe(body_idx, name, is_result):
-                    ir_tuple_cascade_names.push(name)
+        if kind == "tuple" and not ir_var_regs.contains_key(name):
+            mut cascades := false
+            if ir_tuple_local_tid.contains_key(name):
+                tid := ir_tuple_local_tid[name]
+                if tid >= 0 and ir_tuple_local_has_rc_payload(tid):
+                    is_result := get_type_info(tid).kind == "result"
+                    if ir_tuple_uses_all_safe(body_idx, name, is_result):
+                        ir_tuple_cascade_names.push(name)
+                        cascades = true
+            if not cascades:
+                ir_tuple_shell_only_names.push(name)
         i = i + 1
 
 # true when a result/optional type holds an rc payload worth cascading: either
@@ -3085,13 +3117,15 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # the call returns; anything the walk cannot prove keeps the leak, which
 # can never free a live value.
 #
-# extractions inside the callee are the one wrinkle: the optional
-# unwrap_or transfers the borrowed shell's payload count out, so a callee
-# that extracts disqualifies an rc-payload optional — but a payload with
-# no rc kind has no count to move, so extraction is harmless there and
-# the walk runs with its extraction clauses open. results stay excluded
-# entirely for now: they ride a different return abi in places, and the
-# measured leak is the optional shape.
+# extractions inside the callee used to be the one wrinkle: the optional
+# unwrap_or once transferred the borrowed shell's payload count out, so a
+# callee that extracted had to disqualify an rc-payload optional. it now
+# retains what it hands out on a parameter subject, so the unwrap_or
+# clause of the walk is open for every payload kind; the `is_result` flag
+# below still opens the result-only clauses (`catch`, `!`) for payloads
+# with no count to move. results stay excluded entirely for now: they
+# ride a different return abi in places, and the measured leak is the
+# optional shape.
 # a fresh optional shell in argument position dies with the call it fed,
 # once the callee's body proves the caller stayed its sole owner. three
 # shapes produce one: a call returning an optional (`take(mk(i))`), a bare
@@ -3142,8 +3176,9 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
         sig = ir_tuple_cascade_signature(tid)
     else:
         return
-    # a payload the shell's destructor owns must not be extracted by the
-    # callee either: an unwrap transfers the count out of the shell.
+    # `open_extraction` opens the result-only extraction clauses of the
+    # walk; the optional unwrap_or clause is always open, since it retains
+    # what it hands out on a parameter subject.
     open_extraction := sig == "00" and not dtor_owned
     mut borrow := false
     if is_method:
@@ -5700,15 +5735,25 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
                 ir_emit_label(some_l)
                 inner_r := ir_optional_value_field(obj_r, recv_tid)
-                # a borrowed subject moves its inner out without a retain: the
-                # subject's own cleanup is shell-only, so the single count the
-                # shell holds transfers to the extracted value and is released
-                # once, at that value's scope. only an owned (fresh) subject,
-                # whose shell is freed just below, needs a retain first so the
-                # inner survives the free. (extracting the same borrowed local
-                # twice is a separate, rarer bug tracked on its own — a retain
-                # here to cover it leaked the far more common single case.)
-                if inner_kind.len() > 0 and owns_subject:
+                # the extracted payload takes its own count, so a consumer
+                # (which treats a heap-kind unwrap_or value as owned) never
+                # strips the count the subject still claims. a fresh
+                # subject's shell is freed just below, so the inner must
+                # outlive it; a parameter, field or element subject keeps
+                # its count with its owner (the caller, the shell's
+                # destructor, the container); a cascade-eligible local's
+                # count is released by its cascade. the one subject that
+                # still transfers is a shell-only local — one the cascade
+                # walk rejected — whose cleanup releases the shell alone: a
+                # retained count there would have no release, so it keeps
+                # the old transfer (and the old double-extraction
+                # unsoundness) rather than trading it for a leak.
+                mut retains := inner_kind.len() > 0
+                if retains and not owns_subject:
+                    subj := get_node(node.children[0])
+                    if subj.kind == "ident" and ir_tuple_shell_only_names.contains(subj.value):
+                        retains = false
+                if retains:
                     ir_rc_retain_reg(inner_r, inner_kind)
                 ir_emit("store " + tmp + " " + inner_r.to_string())
                 ir_emit("jmp " + end_l)
@@ -5719,9 +5764,10 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 # release it, so a default that arrives borrowed (a named
                 # local, a field) needs its own count here — without one that
                 # release strips the owner's count and the owner's next use
-                # reads freed memory. strings stay on the borrowed
-                # classification (the escape site retains), so they are
-                # excluded. mirrors the result unwrap_or's fallback arm.
+                # reads freed memory. a fresh default already owns its single
+                # count and is stored as-is. string payloads classify owned
+                # like every other heap kind (see ir_expr_is_borrowed), so
+                # the same gate covers them.
                 if inner_kind.len() > 0 and not ir_expr_is_borrowed(idx) and ir_expr_is_borrowed(default_idx):
                     ir_rc_retain_reg(default_r, inner_kind)
                 ir_emit("store " + tmp + " " + default_r.to_string())
@@ -6115,6 +6161,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_rc_kinds := ir_rc_local_kinds
     saved_tuple_tids := ir_tuple_local_tid
     saved_tuple_cascade := ir_tuple_cascade_names
+    saved_tuple_shell_only := ir_tuple_shell_only_names
     # the lambda body is its own function frame; open loops in the enclosing
     # function must not have their iterables released by a return inside it.
     saved_loop_iter_vars := ir_loop_iter_vars
@@ -6125,6 +6172,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
+    ir_tuple_shell_only_names = []
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
     ir_weak_capture_names = lambda_weak_caps
@@ -6145,6 +6193,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
     ir_tuple_cascade_names = saved_tuple_cascade
+    ir_tuple_shell_only_names = saved_tuple_shell_only
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
     ir_loop_var_slots = saved_loop_var_slots
@@ -8890,6 +8939,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_untracked_rc_binds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
+    ir_tuple_shell_only_names = []
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
     ir_defer_is_err = []

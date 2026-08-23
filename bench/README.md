@@ -119,6 +119,18 @@ per-request latency with a core idle, and the pith-vs-go comparison measured a
 serial server against a concurrent one. any pith throughput recorded before
 that date carries the flaw.
 
+`bench/http_seq_latency.py` is the other half of the http story, and on a
+small shared box the more trustworthy half: one keepalive connection, one
+request at a time, p50/p90/p99 per round trip. wrk throughput on such a box is
+launch-cadence noise — repeated runs read progressively lower as the host's
+cpu burst decays — while this probe is deterministic to a few microseconds.
+when a throughput number looks like a regression, run this first: if p50 did
+not move, the code did not slow down.
+
+```
+bench/http_seq_latency.py 8080 3000
+```
+
 `bench/http_bench.sh` drives a server with `wrk` and samples RSS across the
 run, so it doubles as a memory-growth check:
 

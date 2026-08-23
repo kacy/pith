@@ -220,7 +220,9 @@ correctness story:
   local holds a struct weakly with `weak name := expr`, and a closure that
   captures a weak binding holds its target weakly too, so a callback stored
   on the object it reads from reclaims with the object (see
-  docs/ownership.md). an unmarked strong cycle still leaks by default,
+  docs/ownership.md). `pith lint` reports a strong cycle between a module's
+  structs as E306, at the field that can break it. an unmarked strong cycle
+  still leaks by default,
   bounded by design — the discipline never produces a dangling pointer in
   exchange. for cycles nobody marked there is now an experimental
   trial-deletion collector behind `PITH_CYCLE_GC=1` (off by default; see

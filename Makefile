@@ -1379,6 +1379,14 @@ cli-regressions-only:
 	lint_out=$$(./target/release/pith lint --json "$$tmpdir/lint_pos.pith" 2>/dev/null); \
 	set -e; \
 	case "$$lint_out" in *'"code":"E300"'*'"line":0'*) echo "FAIL lint --json positions"; fail=$$((fail+1));; *'"code":"E300"'*'"line":'*) pass=$$((pass+1)); echo "ok   lint --json positions";; *) echo "FAIL lint --json positions"; fail=$$((fail+1));; esac; \
+	printf 'struct Node:\n    next: Node?\n\nfn main():\n    return\n' > "$$tmpdir/lint_cycle.pith"; \
+	printf 'struct Node:\n    weak next: Node?\n\nfn main():\n    return\n' > "$$tmpdir/lint_weak.pith"; \
+	set +e; \
+	cyc_out=$$(./target/release/pith lint --json "$$tmpdir/lint_cycle.pith" 2>/dev/null); \
+	weak_out=$$(./target/release/pith lint --json "$$tmpdir/lint_weak.pith" 2>/dev/null); \
+	set -e; \
+	case "$$cyc_out" in *'"code":"E306"'*) pass=$$((pass+1)); echo "ok   lint strong cycle";; *) echo "FAIL lint strong cycle"; fail=$$((fail+1));; esac; \
+	case "$$weak_out" in *'"code":"E306"'*) echo "FAIL lint weak edge exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint weak edge exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

@@ -521,6 +521,22 @@ warning[E305]: indentation depth 5 exceeds maximum of 4
                             ^^
 ```
 
+### E306 — strong reference cycle (warning)
+
+a struct holds a strong reference back to itself, directly (`next: Node?`) or
+through a chain of fields across other structs in the same module. a cycle of
+strong references keeps its own count above zero, so it is never reclaimed;
+mark the back edge `weak` (see [ownership.md](ownership.md)). a `weak` field
+is not an edge, and neither is a function-typed field. a cycle that runs
+through another module's structs is not visible to the linter and passes.
+
+```
+warning[E306]: struct 'Node' holds a strong reference to itself through field 'next'; a cycle of strong references is never reclaimed
+  3 |     next: Node?
+          ^
+  fix: mark the back edge with `weak` (`weak next: ...`), see docs/ownership.md
+```
+
 ### E251 — function is not public in that module
 
 a module function declared with a bare `fn` belongs to the module that declared

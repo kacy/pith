@@ -321,6 +321,8 @@ gaps, all bounded leaks rather than dangling pointers:
   the first-class fix is the `weak` keyword (below): mark the back edge
   `weak` — a field, a local binding, or a binding a closure captures —
   and the ring reclaims deterministically.
+  `pith lint` flags a strong cycle between a module's structs (E306) at
+  a field that can break it, so the edge is named before the leak is.
 
   for cycles nobody marked there is an experimental trial-deletion
   collector, off by default and enabled by running the process with

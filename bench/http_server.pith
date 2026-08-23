@@ -51,6 +51,15 @@ fn route(req: HttpRequestBytes) -> HttpResponse:
         return http.json(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125))
     return http.not_found_response()
 
+# serve one connection's keepalive lifetime; spawned per accept, the same
+# model as the go arm's ListenAndServe, so the two servers measure the same
+# thing. serving inline instead serialized the whole benchmark on one
+# connection — throughput collapsed to 1/request-latency with a core idle,
+# and the pith-vs-go rows compared a serial server to a concurrent one.
+fn serve_client(client: Int) -> Int:
+    tcp_set_timeout(client, 5000)
+    return http.serve_connection_fd(client, route) catch 0
+
 fn main() -> Int!:
     mut port := 8080
     argv := args()
@@ -60,6 +69,5 @@ fn main() -> Int!:
     fd := tcp_listen("0.0.0.0", port)!
     while true:
         client := tcp_accept(fd)!
-        tcp_set_timeout(client, 5000)
-        http.serve_connection_fd(client, route) catch 0
+        spawn serve_client(client)
     return 0

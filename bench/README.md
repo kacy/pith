@@ -110,8 +110,14 @@ and GC, while Pith statically links a smaller Rust runtime.
 
 `bench/http_server.pith` serves a small JSON API with allocation-churny
 request handling — query parsing, catalog lookups, and per-request string
-assembly. `bench/http_server_mt.pith` is the threaded variant, and
-`bench/http_server.go` is the Go counterpart.
+assembly. it spawns a task per accepted connection, the same serving model as
+the Go counterpart, `bench/http_server.go`; `bench/http_server_mt.pith` is the
+explicitly threaded variant. it did not always: until 2026-08-23
+the accept loop served each connection inline, which serialized the whole
+benchmark on one connection — throughput collapsed to the reciprocal of
+per-request latency with a core idle, and the pith-vs-go comparison measured a
+serial server against a concurrent one. any pith throughput recorded before
+that date carries the flaw.
 
 `bench/http_bench.sh` drives a server with `wrk` and samples RSS across the
 run, so it doubles as a memory-growth check:

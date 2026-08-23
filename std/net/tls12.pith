@@ -44,8 +44,9 @@ pub TLS12_CLIENT_KEY_EXCHANGE := 16
 pub TLS12_FINISHED := 20
 pub TLS12_NEW_SESSION_TICKET := 4
 
-# The four cipher suites this fallback offers, all ECDHE + AEAD. The decimal
-# values are the IANA registry ids, quoted in hex beside each one.
+# The six cipher suites this fallback offers, all ECDHE + AEAD (aes-128-gcm,
+# aes-256-gcm, and chacha20-poly1305, each with an rsa and an ecdsa variant).
+# The decimal values are the IANA registry ids, quoted in hex beside each one.
 pub TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 := 49195
 pub TLS12_ECDHE_RSA_AES128_GCM_SHA256 := 49199
 pub TLS12_ECDHE_RSA_AES256_GCM_SHA384 := 49200
@@ -222,7 +223,7 @@ pub fn finished_verify_data_for_suite(suite: Int, master: Bytes, label: String, 
 pub fn offered_suites() -> List[Int]:
     return [TLS12_ECDHE_ECDSA_AES128_GCM_SHA256, TLS12_ECDHE_RSA_AES128_GCM_SHA256, TLS12_ECDHE_ECDSA_AES256_GCM_SHA384, TLS12_ECDHE_RSA_AES256_GCM_SHA384, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]
 
-# True only for the four ECDHE+AEAD suites above. Everything else — static RSA,
+# True only for the six ECDHE+AEAD suites above. Everything else — static RSA,
 # every CBC suite, RC4, 3DES, DHE, PSK, anon — is refused, which is what keeps
 # the fallback free of the padding-oracle and forward-secrecy failures that make
 # a naive 1.2 fallback dangerous.

@@ -1,8 +1,8 @@
 # std.compress.gzip — gzip helpers
 #
-# the current implementation writes portable gzip streams with stored
-# deflate blocks. that means the output is valid gzip, but this first
-# slice favors compatibility over smaller files.
+# writes portable gzip streams with real deflate compression — greedy lz77
+# over fixed huffman blocks, with a stored-block fallback for data that does
+# not compress. dynamic huffman on the write side is the remaining refinement.
 
 import std.bytes as bytes
 import std.compress.inflate as inflate

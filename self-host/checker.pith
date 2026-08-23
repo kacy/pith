@@ -4408,8 +4408,15 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             # type the aliased module declares. resolve the type the same way the
             # same-module ident path does and build it, instead of falling through
             # to the function-binding lookup (which reports "not callable").
-            ctor_type_name := resolve_imported_type_name(recv_name + "." + method_name)
-            ctor_tid := lookup_type_id(ctor_type_name)
+            # resolve the aliased module's own declaration first: two modules
+            # can each declare a struct with this name, and the bare-name
+            # lookup below answers with whichever module registered the name
+            # into the shared table last.
+            mut ctor_tid := resolve_type_name_module_scoped(recv_name + "." + method_name)
+            mut ctor_type_name := method_name
+            if ctor_tid < 0:
+                ctor_type_name = resolve_imported_type_name(recv_name + "." + method_name)
+                ctor_tid = lookup_type_id(ctor_type_name)
             if ctor_tid >= 0:
                 ctor_info := get_type_info(ctor_tid)
                 if ctor_info.kind == "struct":

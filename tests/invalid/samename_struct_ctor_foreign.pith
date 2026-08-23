@@ -1,0 +1,12 @@
+# two modules each declare struct Widget and only module a's has only_a().
+# calling only_a() on module b's Widget — built directly with the
+# module-qualified constructor — must be E209 on b's declaration, not answered
+# by a's same-named method.
+import support.samename_widget_a as a
+import support.samename_widget_b as b
+
+fn main():
+    ok := a.Widget(1)
+    print(ok.only_a())
+    bad := b.Widget(2)
+    print(bad.only_a())

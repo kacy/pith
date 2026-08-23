@@ -1,0 +1,16 @@
+# two modules each declare `struct Widget`, both stay imported, and each value
+# is built directly with the module-qualified constructor. `a.Widget(...)` must
+# construct and dispatch against module a's own declaration: the constructor
+# used to resolve the bare name in the shared table, so the last-imported
+# module's Widget answered for both — a.tag() ran b's body, and a method only
+# module a declares was refused with a spurious E209.
+import clash_widget_a as a
+import clash_widget_b as b
+
+fn main():
+    va := a.Widget(5)
+    vb := b.Widget("lbl", 5)
+    print(va.tag().to_string())
+    print(vb.tag().to_string())
+    print(va.only_a())
+    print(vb.only_b())

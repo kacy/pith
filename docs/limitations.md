@@ -83,13 +83,15 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **duplicate method names across impl blocks are rejected** — a struct's
   methods can be declared in more than one impl block, including a block in
   a different module than the struct, and every method resolves from any
-  call site that can see the value. method dispatch within one struct is
-  per-declaration. but two *different* modules that each declare a struct
-  with the same name is a known clash (issue #911): the declarations
-  collapse, and a method call dispatches to whichever module was imported
-  last rather than to the receiver's own — the wrong body runs with no
-  diagnostic, and a method present on only one of them mis-resolves. give
-  same-purpose structs distinct names across modules until this is fixed.
+  call site that can see the value. method dispatch is per-declaration:
+  two modules can each declare a plain struct with the same name, a
+  module-qualified constructor binds to that module's own declaration,
+  shared method names dispatch to the receiver's own body, and a method
+  the receiver's struct does not declare is E209 even when the other
+  struct has it — in either import order. the one remaining clash is
+  same-named *generic* structs across modules (issue #912): their method
+  tables are keyed by the bare base name, so the last import's bodies win
+  silently. give same-named generic structs distinct names until then.
   a second impl block giving the *same* declaration
   the *same* method name used to overwrite the first silently, with the
   winning body decided by module order — that is now E263. one deliberate

@@ -35,6 +35,7 @@ cases=(
   tests/leaks/leak_struct_store
   tests/leaks/leak_loop_var_slot
   tests/leaks/leak_list_transform
+  tests/leaks/leak_module_call_string
   tests/leaks/leak_container_arg
   tests/leaks/leak_handed_back_arg
   tests/leaks/leak_empty_literal_arg

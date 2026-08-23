@@ -834,6 +834,17 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple":
             return false
     if node.kind == "method_call":
+        # a module-qualified call (`mod.helper(...)`) parses as a method call
+        # but is a user function call, and its result routes through the same
+        # return convention as any call: the callee retains a returned borrow
+        # and transfers a fresh value, so the result arrives owned. without
+        # this check the string case fell through to the builtin fresh-name
+        # list below, classified the result as borrowed, and the call site
+        # retained a count nobody released — one leaked string per
+        # `mod.fn(...) -> String` call, which url.decode turned into ~64
+        # bytes per http request once #839 put it on the request path.
+        if ir_resolve_module_alias_method_call_name(idx).len() > 0:
+            return false
         # a user-defined method already settled its result's ownership on the
         # way out: it retains a returned borrow and transfers a fresh value, so
         # the result arrives owned — the caller must not retain it again (that

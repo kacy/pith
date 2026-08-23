@@ -10,11 +10,12 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 the short version, all on the same 2-core machine, rerun 2026-08-08,
-reconfirmed 2026-08-11, and rerun again 2026-08-22 (comparators reproducing
-their published figures each time — on 2026-08-08 the one mover was a weak-
-reference leak, found and fixed on the rerun, in cyclic_graph below; the
-2026-08-22 rerun moved catalog and chan_fanout in pith's favor and corrected
-the http row, below). the
+reconfirmed 2026-08-11, rerun 2026-08-22, and reconfirmed 2026-08-23 after the
+module-call leak fix (#901) and the concurrent http server (#902) landed —
+every row within run-to-run noise of the day before, comparators reproducing
+their figures (on 2026-08-08 the one mover was a weak-reference leak, found
+and fixed on the rerun, in cyclic_graph below; 2026-08-22 moved catalog and
+chan_fanout in pith's favor and corrected the http row, below). the
 concurrency rows are the green backend, which is the default on linux; rows
 marked `PITH_GREEN=0` are the os-thread opt-out, kept for contrast. the go,
 rust and zig columns double as canaries — they are the same programs as in the
@@ -23,7 +24,7 @@ the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **~95 ms** (bimodal: 13/15 runs 96-100, 2/15 runs 59-66) | ~71 ms | ~69 ms | ~203 ms |
+| chan_fanout, 1m msgs | **90-95 ms** (bimodal: 13/15 runs 96-100, 2/15 runs 59-66) | ~71 ms | 66-69 ms | 203-245 ms |
 | chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
 | 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
 | 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
@@ -33,9 +34,10 @@ the language:
 | catalog workload, 200k requests | **~92 ms** | ~376 ms | ~68 ms | — |
 | grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
 | grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
-| http server under wrk, 60 s | 14.2k req/s, rss flat (~2.7 b/req) | 21.4k req/s | — | — |
-| event_ledger, 200k events | **339 ms (0.83x go)** | 406 ms | 105 ms | 127 ms |
-| std_pipeline, 50k records | 439 ms (1.76x go) | 249 ms | 134 ms | — |
+| http server under wrk, 60 s | 14.2-14.4k req/s, rss flat (~3 b/req) | 21-32k req/s (regime-dependent, see below) | — | — |
+| http sequential latency, 1 connection, p50 | 135-162µs | 93µs | — | — |
+| event_ledger, 200k events | **339-344 ms (0.85x go)** | 404-406 ms | 105 ms | 127-131 ms |
+| std_pipeline, 50k records | 439-448 ms (1.78x go) | 249 ms | 134 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
 to ~27 ms at flat memory — the argument-ownership fixes took a per-call
@@ -65,9 +67,15 @@ connection like the go arm, and reads 14.2k req/s to go's 21.4k on the same
 
 second, pith leaked ~64 bytes per request — a compiler bug in the ownership of
 module-qualified call results, not an http bug — fixed in #901; rss is flat
-again. third, the go figure swings 15.6k-31.5k with box state on this shared
-box, so single go readings are not comparable across days; the 21.4k above is
-the same-session spaced pair with the pith number.
+again. third, the go figure swings between regimes with box state on this
+shared host — 21.4k on 2026-08-22 and 31.7k on 2026-08-23 on the identical
+60-second spaced protocol, with pith at 14.2k and 14.4k on the same two days
+— so the pith/go ratio is whatever regime go is in (0.45x-0.66x) and pith is
+the stable arm. the sequential-latency row is the number that does not move
+with that: `bench/http_seq_latency.py` reads one keepalive connection at a
+time and is deterministic to a few microseconds; its day-to-day band
+(135-162µs) is the host's latency regime, since the cpu-bound rows above did
+not move between the same two days.
 
 the july figures reconcile too: 16.8k was `http_server_mt`, the variant that
 already spawned per connection, under `PITH_GREEN=0` — reproduced 2026-08-23

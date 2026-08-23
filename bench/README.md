@@ -143,17 +143,21 @@ bench/http_bench.sh ./bench/http_server_go 8081 120
 ```
 
 It prints a per-10s RSS table and a summary line (requests, throughput, and
-RSS start / end / peak). The Pith server holds flat RSS across the run: on
-the 2026-08-08 30-second run it served 4648 req/s with **zero** RSS growth,
-against the Go server's 15444 req/s with 5.9 mb of growth. Go is ~3.3x
-faster here; the flat line is the part this benchmark exists to watch.
+RSS start / end / peak). On 60-second spaced runs (2026-08-22 and 23) the
+Pith server holds 14.2-14.4k req/s with ~3 bytes/request of RSS growth — flat
+— while the Go server reads 21k one day and 32k the next on the identical
+protocol, with ~6 mb of growth that reproduces. The earlier figures this
+section carried (4648 req/s, "zero growth") were both wrong: the server was
+serial, and it was leaking ~64 bytes/request until #901, which a 30-second
+window could not see.
 
 Take the throughput figures as same-run comparisons only, never across runs.
-`wrk` competes with the server for the same two cores, so the absolute rate
-tracks whatever else the machine is doing — both servers fell about 45% from
-the 2026-07-29 run (8079 and 28453) while the ratio between them barely moved.
-The memory column does not have that problem and is the one to trust: Pith
-went from +4 kb to +0 kb, and Go's ~6 mb of growth reproduces run to run.
+`wrk` competes with the server for the same two cores, and the Go arm in
+particular swings between regimes with the host's state, so the Pith/Go
+ratio is whatever regime Go is in that day (0.45x-0.66x across the two runs
+above); Pith is the stable arm. For a number that does not move with the
+host, use `bench/http_seq_latency.py`. The memory column is trustworthy only
+over a long window: run at least 60 seconds before calling an RSS line flat.
 
 ## catalog service benchmark
 

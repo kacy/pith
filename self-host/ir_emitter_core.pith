@@ -1067,7 +1067,15 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # (ir_tuple_call_uses_safe) — the parser wraps arguments in `arg` nodes, so
 # this per-parent check never sees the call they belong to.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
-    if is_result and parent.kind == "method_call" and parent.children.len() > 0:
+    # `unwrap_or` on the tracked shell reads the payload in place for results
+    # and optionals alike: the emitted code is a field read, taking no count,
+    # and every downstream use (a bind, a return, a store) retains under the
+    # ordinary borrow rules. this clause used to be result-only on the belief
+    # that an optional's unwrap_or moved the payload count out of the shell;
+    # it does not, and the gate kept a `String?` or `Pt?` local handed to any
+    # callee that unwrapped it on the shell-only cleanup — the payload leaked
+    # per call.
+    if parent.kind == "method_call" and parent.children.len() > 0:
         recv := get_node(parent.children[0])
         if recv.kind == "ident" and recv.value == name and ir_plain_method_name(parent.value) == "unwrap_or":
             # only the receiver position is safe; the name appearing inside

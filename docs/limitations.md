@@ -356,12 +356,16 @@ one caveat on the numbers themselves: every comparison in docs/performance.md
 and bench/README.md was measured on the same 2-core box. "green wins everywhere"
 is true there and unverified on wider hardware.
 
-two related ownership gaps, both bounded leaks rather than unsafety, are also
-outstanding: passing a bare `T!` or `T?` local as a call argument leaks its
-payload (the caller-side cascade does not yet treat a call argument as the
-borrow it now provably is), and extracting the same optional local twice is a
-rare use-after-free that needs a second-extraction check rather than the blanket
-retain that was tried and reverted for regressing the common single case.
+two related ownership notes. a `T!` or `T?` local passed as a call argument
+is reclaimed when the callee's body shows it only reads the value — a
+`v.unwrap_or(x)`, a `== none` test, a field read — and stays on the bounded
+shell-only cleanup when the callee stores, returns or extracts it, or lives in
+another module. and a fresh struct built as the fallback inside `unwrap_or`
+(`p.unwrap_or(Pt(0, "z"))`) is not released on the none path; bind the
+fallback to a module-level value or a local first. extracting the same optional
+local twice was once recorded as a rare use-after-free; it has not been
+reproduced since the match and extraction ownership work, and the entry stays
+until a generated-program search under memcheck either finds it or retires it.
 
 sweeping std's shared globals for the same class of bug turned up three things
 that are questions of design rather than repairs, so they are recorded here

@@ -1,0 +1,47 @@
+# a `T?` local handed to a callee that unwraps it. the callee's walk used to
+# refuse `unwrap_or` on an optional parameter — the clause was result-only, on
+# the belief that an optional's unwrap_or moved the payload count out of the
+# shell — so the local stayed on the shell-only cleanup and its payload leaked
+# per call: ~12 bytes for a string, ~40 for a struct and the string it holds.
+# the emitted unwrap_or is a field read that takes no count, so the cascade
+# is safe. the fallback is a module-level value on purpose: a fresh struct
+# built inside unwrap_or is a separate, still-open leak, and this case pins
+# only the walk.
+import leakprobe as probe
+
+struct Pt:
+    pub x: Int
+    pub name: String
+
+FALLBACK := Pt(0, "z")
+
+fn len_of(v: String?) -> Int:
+    return v.unwrap_or("").len()
+
+fn x_of(p: Pt?) -> Int:
+    return p.unwrap_or(FALLBACK).x
+
+fn maybe_str(i: Int) -> String?:
+    if i % 2 == 0:
+        return "value-" + i.to_string()
+    return none
+
+fn maybe_pt(i: Int) -> Pt?:
+    if i % 2 == 0:
+        return Pt(i, "n-" + i.to_string())
+    return none
+
+fn churn_round(i: Int):
+    s := maybe_str(i)
+    len_of(s)
+    p := maybe_pt(i)
+    x_of(p)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

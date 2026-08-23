@@ -33,7 +33,7 @@ the language:
 | catalog workload, 200k requests | **~92 ms** | ~376 ms | ~68 ms | — |
 | grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
 | grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
-| http server under wrk, 20 s | 7.7-7.9k req/s, rss grows ~30 mb/min | 28-31.5k req/s, plateaus ~13.7 mb | — | — |
+| http server under wrk, 60 s | 14.2k req/s, rss flat (~2.7 b/req) | 21.4k req/s | — | — |
 | event_ledger, 200k events | **339 ms (0.83x go)** | 406 ms | 105 ms | 127 ms |
 | std_pipeline, 50k records | 439 ms (1.76x go) | 249 ms | 134 ms | — |
 
@@ -52,24 +52,35 @@ stream in one ByteBuffer — the shape the go version always used with
 `strings.Builder`, idiom for idiom — took `gen` from 299 to 120 ms, even
 with go's 122. see bench/README.md for the full phase table.
 
-the http row resolved on the 2026-08-22 rerun, in two parts, neither of them
-the story the earlier tables told. first, the shifting go figure was the box,
-not the language: the same go binary read anywhere from 15.6k to 31.5k req/s
-depending on what had run before it, while pith read 7.7-7.9k regardless of
-position, duration, or a 90-second cooldown — pith is the position-stable arm,
-and the july-vs-august "ratio moved" was two measurements of go taken under
-different box states. `wrk` sharing the two cores caps both arms, so read the
-row as a ratio under contention, not as a capacity.
+the http row was wrong for three separate reasons, untangled across
+2026-08-22/23, and the row above is the first honest one.
 
-second, the memory column in the previous table was backwards. pith's rss is
-not flat: under steady load it grows linearly with no plateau — 5.4 to 57 mb
-over a 120-second run, ~63 bytes per request across 825,900 requests — while
-go plateaus at ~13.7 mb after its first warm-up interval. monotonic linear
-growth under a steady workload is a leak signature, and it is filed as #899;
-the "+0 kb" the old row reported can only have been a short-window read taken
-before the growth was visible. until it is fixed, the http server's memory
-behavior is a reason not to leave it under sustained load, and this paragraph
-is the honest version of the row above.
+first, the pith benchmark server was serial by construction: the accept loop
+served each connection inline, so the whole benchmark ran on one connection at
+a time — throughput equal to the reciprocal of per-request latency, one core
+idle — while the go arm served concurrently. every earlier pith figure in this
+row measured that flaw, not the stack. the server now spawns a task per
+connection like the go arm, and reads 14.2k req/s to go's 21.4k on the same
+60-second spaced runs.
+
+second, pith leaked ~64 bytes per request — a compiler bug in the ownership of
+module-qualified call results, not an http bug — fixed in #901; rss is flat
+again. third, the go figure swings 15.6k-31.5k with box state on this shared
+box, so single go readings are not comparable across days; the 21.4k above is
+the same-session spaced pair with the pith number.
+
+the july figures reconcile too: 16.8k was `http_server_mt`, the variant that
+already spawned per connection, under `PITH_GREEN=0` — reproduced 2026-08-23
+at 16.1k, within 4%. the "throughput halved since july" scare was the mt
+server's number compared against the serial server's. per-request latency,
+measured with a sequential single-connection probe, has been ~126-136µs from
+july through today: no cpu regression, only the serial loop and the leak.
+
+a launch-history note for anyone re-measuring: repeated short wrk runs read
+progressively lower on this box for either language's server, so use one long
+spaced run per arm. the mt-threaded server currently outruns the green
+spawning one on this workload (16.1k vs 14.2k) — a real gap worth its own
+measured look, not a regression.
 
 reading the rest honestly: on channel coordination green beats zig comfortably
 but runs ~1.9x behind both go and rust at the default worker count (placement is still

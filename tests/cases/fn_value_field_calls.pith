@@ -1,0 +1,34 @@
+# regression: a function value stored in a struct field is callable through
+# the field — `instance.field(args)` — for a plain function, a closure, a field
+# on a generic struct, and a struct built in another module. this was once
+# listed as unsupported (rejected as a method call, E209); it works, and this
+# pins each shape so it stays that way.
+import fn_field_call_helper as helper
+
+struct Ops:
+    add: fn(Int, Int) -> Int
+    name: String
+
+struct Box[T]:
+    get: fn(T) -> T
+    tag: String
+
+fn plus(a: Int, b: Int) -> Int:
+    return a + b
+
+fn twice(x: Int) -> Int:
+    return x * 2
+
+fn main():
+    o := Ops(plus, "plain")
+    print("{o.name}: {o.add(2, 40)}")
+
+    offset := 40
+    c := Ops(fn(a: Int, b: Int) => a + b + offset, "closure")
+    print("{c.name}: {c.add(1, 1)}")
+
+    b := Box[Int](twice, "generic")
+    print("{b.tag}: {b.get(21)}")
+
+    x := helper.make()
+    print("cross-module: {x.add(2, 40)}")

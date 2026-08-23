@@ -3,13 +3,40 @@
 [![ci](https://github.com/kacy/pith/actions/workflows/ci.yml/badge.svg)](https://github.com/kacy/pith/actions/workflows/ci.yml)
 [![license: mit](https://img.shields.io/badge/license-mit-blue.svg)](LICENSE)
 
-a small language that compiles to native code and is written in
-itself. python-shaped syntax, result types instead of exceptions,
-reference counting instead of a garbage collector. the compiler is
-about 26,000 lines of pith; the standard library is another 39,000,
-and it goes deeper than you'd guess — the TLS 1.2 and 1.3 stack, the native
-http/2 client, the regex engine, the postgres and mysql wire protocols,
-and gzip compression are all pith source you can read.
+a small language for writing servers. python-shaped syntax, native
+binaries, result types instead of exceptions, reference counting
+instead of a garbage collector. the compiler is written in pith, and
+so is the standard library, all the way down: the tls 1.2 and 1.3
+stack, the http/2 client and server, the postgres and mysql wire
+protocols, the regex engine, gzip. when something goes wrong in the
+stack, you can read the code that did it.
+
+```pith
+import std.web as web
+import std.net.http as http
+
+fn greet(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "hello, " + req.param("name"))
+
+fn main() -> Int!:
+    mut app := web.new()
+    app = app.get("/", fn(req: web.Request) => http.text(200, "welcome"))
+    app = app.get("/hello/:name", greet)
+    return app.listen("0.0.0.0", 8080)!
+```
+
+that is a complete http server, and it comes with more than it shows.
+every route is already wrapped in a trace span and red metrics; an
+inbound `traceparent` joins the caller's trace, `GET /metrics` serves
+prometheus text, and one `obs.init()` call ships spans and metrics to
+an opentelemetry collector. `listen_tls` negotiates http/2 or http/1.1
+over tls 1.2 and 1.3, a sigterm drains in-flight requests before the
+process exits, and rate limiting, circuit breaking, sessions, csrf and
+cors are middleware you add one line at a time. no dependencies, one
+static binary, and all of it is standard library you can read
+([docs/web.md](docs/web.md), [docs/telemetry.md](docs/telemetry.md)).
+
+## the language in one file
 
 ```pith
 enum Shape:
@@ -42,161 +69,158 @@ fn main() -> Int!:
     return 0
 ```
 
-that's most of the flavor in one file: enums carry payloads and match
-destructures them, errors are values that propagate with `!` and get
-absorbed with `catch`, and interpolation takes format specs
-(`{total:.2}`). no null, no exceptions, no panics in safe code.
+enums carry payloads and `match` takes them apart. errors are values:
+`T!` is a result, `fail` makes one, `!` passes it up, `catch` supplies
+a fallback. a function that cannot fail cannot pretend otherwise.
+interpolation takes format specs. there is no null, there are no
+exceptions, and safe code does not panic.
 
-## why it exists
+## why you might want it
 
-mostly to answer a question: how much of a real toolchain can one
-small language carry on its own back? the answer so far:
+**the whole stack is readable.** 126 standard library modules, 39,000
+lines, no c and no bindings: the tls implementation, http/1.1 and
+http/2, websockets, grpc, the database wire protocols, json, toml,
+yaml, compression, hashing, a linear-time regex engine. when the
+language could not express something well, that became a language
+feature to build rather than a foreign library to hide behind.
 
-- **it compiles itself.** the lexer, parser, type checker, formatter,
-  linter, and ir emitter are pith. the build reaches a fixed point —
-  the compiler compiles a compiler that compiles an identical
-  compiler — and ci verifies that on every merge.
-- **errors are values.** `T!` is a result, `T?` is an optional,
-  `fail` produces an error, `!` propagates it, `catch` gives a
-  fallback. functions that can't fail can't lie about it.
-- **memory is reference-counted by the compiler.** retain/release
-  pairs are emitted at compile time following a borrowed-by-default
-  discipline (docs/ownership.md). no gc pauses. there is no cycle
-  collector, but a struct graph can break its own cycles with a `weak`
-  field — mark the back edge `weak` and a parent/child ring reclaims.
-- **the stdlib doesn't shell out.** TLS 1.2 and 1.3, http/1.1 and http/2, websockets, json,
-  toml, yaml, csv, tar, zip, gzip (interops with system gzip in both
-  directions), sha-256, a linear-time regex engine — written in pith.
-  when the language couldn't express something well, that became a
-  language feature to build rather than a binding to hide behind.
-- **tooling is machine-readable.** check, lint, and doc all take
-  `--json`; every diagnostic has a stable code (docs/errors.md);
-  `fmt` has one canonical style. scripts and editors get the same
-  interface people do.
-- **builds are quick.** the benchmark app compiles in about 2 seconds,
-  the entire self-hosted compiler in under 7.
+**it compiles itself, and ci proves it.** the lexer, parser, checker,
+formatter, linter, language server and ir emitter are pith. the build
+reaches a fixed point: the compiler compiles a compiler that compiles
+an identical compiler, verified on every merge.
 
-## what it doesn't do
+**errors are data.** `T!E` carries a typed payload when callers need
+to inspect a failure, and `defer` / `errdefer` run cleanup on every
+exit or only the failing one. see [docs/errors.md](docs/errors.md) and
+[docs/defer.md](docs/defer.md).
 
-the honest list lives in [docs/limitations.md](docs/limitations.md)
-and stays current. highlights you should know before diving in:
-strong reference cycles leak unless broken with a `weak` field, closure
-environments that capture back to themselves leak (no weak captures yet),
-removed container elements aren't reclaimed until the container dies,
-tls negotiates 1.3 with a 1.2 fallback (ecdhe+aead only, `require_tls13()` to
-opt out), and
-performance sits between go and rust on service-shaped work but
-behind go on heavy string churn — measured numbers, not vibes, in
-[docs/performance.md](docs/performance.md).
+**memory is managed at compile time.** the compiler emits retain and
+release pairs under a borrowed-by-default discipline
+([docs/ownership.md](docs/ownership.md)), so there are no gc pauses and
+no runtime to tune. a struct graph breaks its own cycles with a `weak`
+field.
+
+**concurrency is structured, and green by default.** `spawn` and
+`await` with `Task[T]`, channels, `select`, mutexes, wait groups,
+contexts and timers, on an m:n green runtime with an epoll reactor
+([docs/concurrency.md](docs/concurrency.md)). the os-thread backend is
+one environment variable away.
+
+**the tooling talks json.** `check`, `lint` and `doc` all take
+`--json`, every diagnostic has a stable code, `fmt` has one canonical
+style, and `pith lsp` speaks the language server protocol to neovim or
+vs code ([docs/editors.md](docs/editors.md)).
+
+**builds are fast.** hello world compiles in a tenth of a second, the
+http benchmark server in about three, and the entire self-hosted
+compiler in about five.
+
+## the numbers
+
+measured on one two-core machine, 2026-08-23, comparators reproducing
+their published figures. the full tables, the methodology and the
+caveats are in [docs/performance.md](docs/performance.md); these four
+rows are the shape of it.
+
+| workload | pith | go | rust |
+|---|---:|---:|---:|
+| catalog service, 200k requests | **92 ms** | 368 ms | 67 ms |
+| json ingest + hmac, 200k events | **344 ms** | 404 ms | 106 ms |
+| csv/url/gzip pipeline, 50k records | 448 ms | 250 ms | 134 ms |
+| http server under load, req/s | 14.4k | 21k–32k | — |
+
+ahead of go on service-shaped work, behind it on heavy string
+pipelines and raw http throughput, behind rust everywhere. the http
+comparison swings with the host's state; the per-request latency that
+does not swing is 135–162µs against go's 93.
+
+## what it does not do
+
+the current list lives in [docs/limitations.md](docs/limitations.md)
+and is kept up to date. the ones to know before you start:
+
+- a strong reference cycle with no `weak` edge leaks. an opt-in
+  trial-deletion collector exists behind `PITH_CYCLE_GC`, off by default.
+- tls 1.2 is a fallback: ecdhe with aead suites only, no resumption, no
+  client certificates. 1.3 is the full implementation, and
+  `require_tls13()` refuses the fallback.
+- no package registry. dependencies are local paths in `pith.toml`,
+  with `lock` and `install` but nothing that fetches.
+- no debugger, and the language server re-checks the whole module
+  closure rather than incrementally.
+- gzip compresses with fixed huffman only, and the regex engine skips
+  counted repeats, lazy quantifiers and lookaround on purpose.
 
 ## quick start
 
-you need [rust/cargo](https://rustup.rs/) for the native backend.
+you need [rust and cargo](https://rustup.rs/) for the native backend.
 
 ```
 cargo build --release
 ./target/release/pith run examples/hello.pith
+./target/release/pith new myapp
+```
+
+`pith new` scaffolds a package with a `pith.toml`, a `Makefile` and a
+`Dockerfile`. to build the compiler with itself:
+
+```
 make self-host
 ./self-host/pith_main check examples/hello.pith
 ```
 
-the first build compiles the ir driver from the tracked seed at
-`self-host/bootstrap/ir_driver.ir` — the compiler is written in pith,
-so the seed breaks the circular dependency. after that everything
-rebuilds from source.
+the first build compiles the ir driver from a tracked seed at
+`self-host/bootstrap/ir_driver.ir`, which is what breaks the circular
+dependency of a compiler written in its own language. after that
+everything rebuilds from source.
 
-## errors as data
+## the standard library
 
-string errors are fine until callers need to inspect the failure.
-`T!E` carries a typed payload:
+126 modules, all pith. the areas, with the doc that goes deepest:
 
-```pith
-struct ParseError:
-    message: String
+| area | modules | read |
+|---|---|---|
+| networking | tcp, dns, url, http, http2, websocket, tls, sse, grpc | [tls](docs/tls.md), [grpc](docs/grpc.md), [web](docs/web.md) |
+| databases | sql, postgres, mysql, redis, and `db` on top | [db](docs/db.md) |
+| web apps | web: routing, middleware, sessions, csrf, cors | [http apps](docs/http_apps.md) |
+| data | json, toml, yaml, csv, config, table | [yaml](docs/yaml.md) |
+| exact numbers | bigint, decimal | [numbers](docs/numbers.md) |
+| bytes and crypto | hash, checksum, encoding, crypto, bits, binary | [auth](docs/auth.md) |
+| compression | gzip, zlib, zstd, tar, zip | |
+| text | regex, scanner, fmt, html, template, text, strings | [unicode](docs/unicode.md), [html](docs/html.md) |
+| i18n | locales, message catalogs, cldr plural rules | [i18n](docs/i18n.md) |
+| app plumbing | log, metrics, cli, env, testing, time, datetime, rand, uuid, math | [logging](docs/logging.md) |
+| resilience | retry, rate limiting, circuit breaking | [resilience](docs/resilience.md) |
+| observability | trace, prometheus, otlp, obs | [telemetry](docs/telemetry.md) |
+| terminals | term: raw mode, input, styling, widgets, an elm-style runtime | [tui](docs/tui.md) |
+| concurrency | concurrent: contexts, groups, timers; iter for lazy pipelines | [concurrency](docs/concurrency.md) |
 
-fn parse_port(text: String) -> Int!ParseError:
-    if text == "":
-        fail ParseError{"empty"}
-    return 8080
+the stdlib reference site is generated from the source comments, so
+what you read there is what the compiler read.
 
-fn main() -> Int!:
-    print((parse_port("8080") catch 9000).to_string())
-    print((parse_port("") catch 9000).to_string())
-    return 0
-```
-
-## the language, briefly
-
-structs (heap references with generated destructors), enums with
-payloads, interfaces with generic bounds, impl blocks with
-per-instantiation specialization, closures with capture, tuples,
-type aliases. `mut` is required for reassignment. `for` drives
-collections, strings, ranges (`0..n`, `0..=n`), and anything with a
-`fn next() -> T?` method. match checks exhaustiveness. generics
-monomorphize. `defer` runs cleanup on every exit from a scope and
-`errdefer` runs it only on the error exit (docs/defer.md). concurrency
-is structured: spawn/await with `Task[T]`, channels, select, mutexes,
-wait groups, contexts, timers.
-
-the full grammar is [docs/grammar.ebnf](docs/grammar.ebnf); the tour
-with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
-
-## the standard library, briefly
-
-126 modules, ~39,000 lines, all pith. the areas: io and filesystems
-(fs, glob, path, process), networking (tcp, dns, url, http, http2,
-websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
-wire protocols with tls, prepared statements, and pooling — plus db, a
-pooled high-level layer over a connection url, see [docs/db.md](docs/db.md)),
-exact numbers (bigint, decimal — arbitrary precision and fixed-point, so a
-NUMERIC column round-trips without rounding through a float, see
-[docs/numbers.md](docs/numbers.md)),
-data (json,
-toml, yaml, csv, config, table, see [docs/yaml.md](docs/yaml.md) for the
-yaml subset), bytes and crypto (hash, checksum, encoding,
-crypto, bits, binary — including argon2id password hashing and json web
-tokens, see [docs/auth.md](docs/auth.md)),
-compression and archives (gzip/zlib in pure pith, zstd on the reference codec, tar, zip),
-text (regex, scanner, fmt, html, template — escaping untrusted values into a
-page, and templates that escape by default, see
-[docs/html.md](docs/html.md), plus std.text for character-aware utf-8 work,
-see [docs/unicode.md](docs/unicode.md)), internationalization (locales,
-message catalogs and cldr plural rules, see [docs/i18n.md](docs/i18n.md)),
-app plumbing (log, metrics, cli, env, testing,
-diagnostic, time, datetime, rand, uuid, math), resilience (retry with
-backoff, rate limiting, circuit breaking — shared by the web middleware and
-the protocol clients, see [docs/resilience.md](docs/resilience.md)),
-observability (trace,
-prometheus, otlp, obs — opentelemetry traces and metrics, see
-[docs/telemetry.md](docs/telemetry.md)), terminal uis (std.term — raw
-mode, input events, styling, widgets, and an elm-style application
-runtime, see [docs/tui.md](docs/tui.md)), and lazy iterators (std.iter).
-
-## proof it's usable
+## proof it is usable
 
 real programs live in `tools/` and run against golden output in ci: a
-static site generator (toml config, markdown subset, layouts, feeds), a
-web log analyzer (combined format, gzip input, csv export), a json api
-client that talks to a pith http server — both ends of the conversation
-in pith — a worker pool running a jobs file through spawn and channels,
-the protobuf code generator, and the documentation site generator that
-builds the stdlib reference. they are the honest answer to "what does
+static site generator, a web log analyzer, a json api client talking
+to a pith http server, a worker pool over spawn and channels, the
+protobuf code generator, and the documentation site generator that
+builds the stdlib reference. they are the answer to "what does
 non-trivial pith look like."
 
 ## cli
 
-```
-pith run <file>          compile and run
-pith build <file>        compile to a native binary
-pith test <file>         run test declarations (--filter <substr> to select)
-pith check <file>        type check (--json for machine output)
-pith fmt <file>          format (--check to verify)
-pith lint <file>         conventions (--json available)
-pith doc <file>          docs (--check verifies pub items documented)
-pith lsp                 language server over stdio (docs/editors.md wires it into neovim or vs code)
-pith lex / parse         token stream / ast, for the curious
-pith package <cmd>       check/test/lint/doc/deps/lock/install/inspect
-```
+| command | what it does |
+|---|---|
+| `pith run <file>` | compile and run |
+| `pith build <file>` | compile to a native binary |
+| `pith test <file>` | run `test` blocks; `--filter <substr>` selects |
+| `pith check <file>` | type check; `--json` for machine output |
+| `pith fmt <file>` | format; `--check` to verify |
+| `pith lint <file>` | conventions; `--json` available |
+| `pith doc <file>` | docs; `--check` requires every pub item documented |
+| `pith lsp` | language server over stdio |
+| `pith new <dir>` | scaffold a package |
+| `pith package <cmd>` | check, test, lint, doc, deps, lock, install, inspect |
 
 local packages resolve through `pith.toml`:
 
@@ -222,24 +246,22 @@ make status-audit     # current corpus and size numbers
 ## project layout
 
 ```
-self-host/     the compiler, in pith (~26,000 lines): lexer, parser,
-               checker, formatter, linter, docgen, ir emitter
-cranelift/     the native backend, in rust (~13,500 lines): ir
-               consumer, codegen, runtime (arc, collections, net)
-std/           the standard library (126 modules)
+self-host/     the compiler, in pith: lexer, parser, checker,
+               formatter, linter, docgen, language server, ir emitter
+cranelift/     the native backend, in rust: ir consumer, codegen,
+               runtime (arc, collections, net)
+std/           the standard library
 examples/      139 runnable programs, 132 with expected output
-tests/         regression, invalid-program, and golden fixtures
+tests/         regression, invalid-program, leak, and golden fixtures
 tools/         real programs in pith: codegen, generators, fuzzers,
                log and parquet readers
 docs/          architecture, ownership, errors, grammar, limitations
 ```
 
-line counts here are code: comments and blank lines are excluded.
-`make status-audit` prints the current corpus numbers.
-
-start with [docs/architecture.md](docs/architecture.md) if you want
-to change the compiler, [docs/contributing.md](docs/contributing.md)
-for the development loop, and [docs/testing.md](docs/testing.md) for how
+`make status-audit` prints line counts, with comments and blank lines
+excluded. start with [docs/architecture.md](docs/architecture.md) to
+change the compiler, [docs/contributing.md](docs/contributing.md) for
+the development loop, and [docs/testing.md](docs/testing.md) for how
 tests are written and run.
 
 ## syntax highlighting on github

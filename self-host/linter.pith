@@ -9,6 +9,7 @@
 #   E302 — unused variable
 #   E304 — public function missing doc comment
 #   E305 — indentation depth exceeds 4 levels
+#   E306 — a strong reference cycle between structs
 
 from ast import Node, get_node
 from errors import Diagnostic
@@ -20,6 +21,11 @@ from std.strings import lines_keep_empty
 
 mut l_diagnostics: List[Diagnostic] := []
 mut l_file := ""
+
+# the module's struct declarations and the cycles already reported, for
+# the strong-cycle pass at the end of lint_module (E306, below).
+mut l_struct_decls: Map[String, Int] := {}
+mut l_reported_cycles: List[String] := []
 
 fn report_linter_warning(code: String, message: String, line: Int, col: Int):
     l_diagnostics.push(Diagnostic("warning", code, message, l_file, line, col, ""))
@@ -64,9 +70,12 @@ pub fn source_is_generated(source: String) -> Bool:
 pub fn lint_module(root_idx: Int, source: String, file: String) -> List[Diagnostic]:
     l_diagnostics = []
     l_file = file
+    l_struct_decls = {}
+    l_reported_cycles = []
     root := get_node(root_idx)
     for child in root.children:
         lint_top_level(child, source)
+    lint_strong_cycles()
     return l_diagnostics
 
 fn lint_top_level(node_idx: Int, source: String):
@@ -85,6 +94,7 @@ fn lint_top_level(node_idx: Int, source: String):
         lint_fn_decl(inner, inner_idx, is_pub, source)
     elif inner.kind == "struct_decl":
         check_pascal_case(inner.value, "struct", inner.line, inner.col)
+        l_struct_decls.insert(inner.value, inner_idx)
     elif inner.kind == "enum_decl":
         check_pascal_case(inner.value, "enum", inner.line, inner.col)
     elif inner.kind == "interface_decl":
@@ -341,3 +351,93 @@ fn is_digit_char(c: Int) -> Bool:
 
 fn is_alphanumeric_char(c: Int) -> Bool:
     return is_lowercase_char(c) or is_uppercase_char(c) or is_digit_char(c)
+
+# ---------------------------------------------------------------
+# E306: a strong reference cycle between structs
+# ---------------------------------------------------------------
+#
+# a struct graph that closes a loop of strong references keeps its own count
+# above zero, so reference counting alone never reclaims it (the model is in
+# docs/ownership.md). the first-class fix is marking the back edge `weak`,
+# and a new user rarely knows that until a leak is measured. so the linter
+# names the cycle at a field that could break it: a field whose type names
+# the struct itself, or one that starts a chain through other structs in the
+# same module that leads back. a `weak` field is not an edge, and neither is
+# a function type — a closure value may capture a cycle, but a field's fn
+# type holds nothing by itself. a cycle through another module's structs is
+# not visible here and passes.
+
+
+fn l_field_name(value: String) -> String:
+    return value.split(" ")[0]
+
+# append the module-local structs a type mentions, skipping function types.
+fn l_type_struct_refs(type_idx: Int, out: List[String]):
+    node := get_node(type_idx)
+    if node.kind == "fn_type":
+        return
+    if node.kind == "type" or node.kind == "generic_type":
+        if l_struct_decls.contains_key(node.value) and not out.contains(node.value):
+            out.push(node.value)
+    for child in node.children:
+        l_type_struct_refs(child, out)
+
+# the strong edges out of a struct, one "field:target" entry per reference.
+fn l_strong_edges(sname: String) -> List[String]:
+    mut edges: List[String] := []
+    decl := get_node(l_struct_decls[sname])
+    for child in decl.children:
+        field := get_node(child)
+        if field.kind != "field" or field.value.contains(" weak") or field.children.len() == 0:
+            continue
+        mut refs: List[String] := []
+        l_type_struct_refs(field.children[0], refs)
+        for target in refs:
+            edges.push(l_field_name(field.value) + ":" + target)
+    return edges
+
+# true when a strong path from `cur` reaches `origin`. `seen` holds every
+# struct already visited, so a loop that never passes through origin ends.
+fn l_reaches(cur: String, origin: String, seen: List[String]) -> Bool:
+    for edge in l_strong_edges(cur):
+        target := edge.split(":")[1]
+        if target == origin:
+            return true
+        if not seen.contains(target):
+            seen.push(target)
+            if l_reaches(target, origin, seen):
+                return true
+    return false
+
+fn lint_strong_cycles():
+    for sname in l_struct_decls.keys():
+        for edge in l_strong_edges(sname):
+            parts := edge.split(":")
+            fname := parts[0]
+            target := parts[1]
+            mut seen: List[String] := [sname, target]
+            mut closes := target == sname
+            if not closes:
+                closes = l_reaches(target, sname, seen)
+            if not closes:
+                continue
+            # a mutual pair closes from both sides; report it once
+            key := sname + "|" + target
+            if l_reported_cycles.contains(key):
+                continue
+            l_reported_cycles.push(key)
+            l_reported_cycles.push(target + "|" + sname)
+            decl := get_node(l_struct_decls[sname])
+            mut line := decl.line
+            mut col := decl.col
+            for child in decl.children:
+                field := get_node(child)
+                if field.kind == "field" and l_field_name(field.value) == fname:
+                    line = field.line
+                    col = field.col
+            mut message := ""
+            if target == sname:
+                message = "struct '" + sname + "' holds a strong reference to itself through field '" + fname + "'; a cycle of strong references is never reclaimed"
+            else:
+                message = "struct '" + sname + "' reaches itself through a strong reference cycle starting at field '" + fname + "' (" + target + "); a cycle of strong references is never reclaimed"
+            l_diagnostics.push(Diagnostic("warning", "E306", message, l_file, line, col, "mark the back edge with `weak` (`weak " + fname + ": ...`), see docs/ownership.md"))

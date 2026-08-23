@@ -1,0 +1,46 @@
+# a payload-free variant written bare — `Holder.Empty` — parses as a field
+# access, and a field read is a borrow. the ownership classifier took that
+# literally, so every return, bind and argument of a bare variant retained a
+# count the freshly built box already held: `return Holder.Empty` leaked one
+# box per call, on every boxed enum in the language. a generic instance
+# takes the same path, so both are churned here.
+import leakprobe as probe
+
+enum Holder:
+    Some(Int)
+    Empty
+
+enum Slot[T]:
+    Full(T)
+    Vacant
+
+fn make(i: Int) -> Holder:
+    if i % 2 == 0:
+        return Holder.Some(i)
+    return Holder.Empty
+
+fn make_slot(i: Int) -> Slot[Int]:
+    if i % 2 == 0:
+        return Slot.Full(i)
+    return Slot.Vacant
+
+fn count(h: Holder) -> Int:
+    match h:
+        Holder.Some(v) => 1
+        Holder.Empty => 0
+
+fn churn_round(i: Int):
+    h := make(i)
+    bound := Holder.Empty
+    count(h)
+    count(Holder.Empty)
+    s := make_slot(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -1,0 +1,40 @@
+# a generic enum's declaration records its type parameter names as payload
+# kinds, so the shared destructor saw no rc payload and was never generated:
+# `Holder[String].Some(s)` freed its box and stranded the string, every time.
+# the construction site now resolves the instance's concrete kinds and attaches
+# a per-instance destructor, and the match prepass resolves the same kinds so
+# a payload binding retained by the match is also released at scope exit.
+import leakprobe as probe
+
+enum Holder[T]:
+    Some(T)
+    Empty
+
+fn make(i: Int) -> Holder[String]:
+    if i % 2 == 0:
+        return Holder.Some("payload-" + i.to_string())
+    return Holder.Empty
+
+fn make_list(i: Int) -> Holder[List[Int]]:
+    return Holder.Some([i, i + 1])
+
+fn size(h: Holder[String]) -> Int:
+    match h:
+        Holder.Some(s) => s.len()
+        Holder.Empty => 0
+
+fn churn_round(i: Int):
+    dropped := make(i)
+    size(make(i))
+    h := make(i)
+    size(h)
+    l := make_list(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

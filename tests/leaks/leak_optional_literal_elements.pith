@@ -1,0 +1,32 @@
+# a collection literal whose element type is an optional. the element renders
+# as a tuple shell, and no list constructor, store-kind or element tag knew
+# that kind, so `[1, none, 3]` typed List[Int?] built an untagged list that
+# owned none of the three shells it had just wrapped — ~176 bytes stranded per
+# literal, and the same for a map literal's optional values. pushing bound
+# optionals one at a time was always fine, and is churned here too so the
+# push path stays pinned beside the literal it now matches. the string
+# elements are literals on purpose: a fresh heap string held by an optional
+# inside a container is a separate, still-open leak (the shell carries no
+# destructor for a string payload), and this case pins only the shells.
+import leakprobe as probe
+
+fn churn_round(i: Int):
+    ints: List[Int?] := [i, none, i + 1]
+    strs: List[String?] := ["a", none, "c"]
+    m: Map[String, Int?] := {"a": i, "b": none}
+    mut pushed: List[Int?] := []
+    a: Int? := i
+    b: Int? := none
+    pushed.push(a)
+    pushed.push(b)
+    if ints.len() + strs.len() + m.len() + pushed.len() == 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

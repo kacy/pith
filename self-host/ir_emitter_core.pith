@@ -892,6 +892,11 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # every boxed enum in the language.
     if node.kind == "field_access" and ir_field_access_is_bare_variant(idx):
         return false
+    # a field read off an owned temporary receiver hands back a retained value
+    # (ir_release_owned_field_receiver), so it is owned — but only when the
+    # field has a kind to retain; a plain-value field is not rc either way.
+    if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
+        return false
     return true
 
 # true when a field-access node is really a payload-free variant
@@ -4811,15 +4816,72 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
         checked_r := ir_try_checked_field_read(obj_r, recv_idx, fname)
         if checked_r >= 0:
             return checked_r
-    ir_emit_named_field_access(r, obj_r, lk, fname, ir_checked_struct_field_type(recv_idx, fname))
+    field_type := ir_checked_struct_field_type(recv_idx, fname)
+    ir_emit_named_field_access(r, obj_r, lk, fname, field_type)
     # a weak field's slot holds the bare target pointer; synthesize the optional
     # the rest of the pipeline expects, resolving liveness so a reclaimed target
     # reads back as none.
     if lk.len() > fname.len() + 1:
         weak_struct := lk.substring(0, lk.len() - fname.len() - 1)
         if ir_struct_field_is_weak(weak_struct, fname):
-            return ir_emit_weak_read(r)
+            weak_r := ir_emit_weak_read(r)
+            ir_release_owned_field_receiver(recv_idx, obj_r, weak_r, "tuple")
+            return weak_r
+    ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(field_type))
     return r
+
+# a field read off an owned temporary — `make_pt(i).x`, `p.unwrap_or(Pt(0, "z")).x`
+# — used to strand the temporary: the method-call path releases an owned
+# receiver once the call returns, but the field path never did, and every
+# struct built only to have one field read leaked whole. now the field value
+# takes its own count first when it has a kind (so it outlives the receiver),
+# then the receiver's count is dropped. ir_expr_is_borrowed classifies such a
+# read as owned to match, so a bind transfers the count, an argument position
+# releases it after the call, and a comparison drops it. a field whose kind
+# the emitter cannot name on an rc-bearing receiver keeps the old leak rather
+# than risk freeing what the field still points at.
+fn ir_release_owned_field_receiver(recv_idx: Int, obj_r: Int, field_r: Int, field_kind: String):
+    if not ir_field_receiver_is_owned_temp(recv_idx):
+        return
+    recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
+    if field_kind.len() > 0:
+        ir_rc_retain_reg(field_r, field_kind)
+    ir_rc_release_reg(obj_r, recv_kind)
+
+# true when a field access's receiver is a fresh value nothing else names: a
+# call or method result, a struct construction, or an unwrap that built its
+# answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
+# kind, outside generic bodies where the types cannot be trusted.
+# `.value()` on an optional hands the payload back as an uncounted view — the
+# shell (or the field that fed it) keeps the only count, and a weak field's
+# read holds no count at all. the owned-receiver release above would drop a
+# count the read never took: releasing the referent of `n.parent.value()`
+# freed the parent while its owner still held it (test_weak_read_loop went
+# 7000 -> 7). refuse the release for that shape; an unprovable receiver type
+# also refuses, which can only leak, never dangle.
+fn ir_method_call_is_value_extraction(recv_idx: Int) -> Bool:
+    recv := get_node(recv_idx)
+    if recv.kind != "method_call" or recv.children.len() == 0:
+        return false
+    if ir_plain_method_name(recv.value) != "value":
+        return false
+    recv_tid := c_get_expr_type(recv.children[0])
+    if recv_tid < 0:
+        return true
+    return get_type_info(recv_tid).kind == "optional"
+
+fn ir_field_receiver_is_owned_temp(recv_idx: Int) -> Bool:
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
+    recv := get_node(recv_idx)
+    if recv.kind != "call" and recv.kind != "method_call" and recv.kind != "struct_init":
+        return false
+    if ir_method_call_is_value_extraction(recv_idx):
+        return false
+    if ir_expr_is_borrowed(recv_idx):
+        return false
+    recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
+    return recv_kind == "struct" or recv_kind == "tuple"
 
 fn ir_emit_result_tuple(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     count_r := ir_reg()

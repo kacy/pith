@@ -1194,13 +1194,50 @@ fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_re
     decl_idx := ir_tuple_walk_fn_decl(callee.name)
     if decl_idx < 0:
         return false
+    return ir_tuple_decl_arg_is_borrow(decl_idx, callee.name, arg_pos, arg_name, is_result)
+
+# the method-call front end of the same walk: the receiver's static type
+# names the impl block, the method name the declaration inside it. a generic
+# receiver has no single body to read and stays excluded, as does a method
+# the module being emitted cannot see.
+fn ir_tuple_method_arg_is_borrow(node: Node, arg_pos: Int, is_result: Bool) -> Bool:
+    if node.children.len() == 0:
+        return false
+    mname := ir_plain_method_name(node.value)
+    recv_type := ir_method_receiver_type(node)
+    if recv_type.len() == 0 or recv_type.contains("["):
+        return false
+    decl_idx := ir_tuple_walk_method_decl(recv_type, mname)
+    if decl_idx < 0:
+        return false
+    return ir_tuple_decl_arg_is_borrow(decl_idx, recv_type + "." + mname, arg_pos, "", is_result)
+
+# the declaration of `mname` inside an impl block for `impl_type` in the
+# module being emitted, or -1. a method's params exclude the receiver, so a
+# method argument's position lines up with the param nodes directly.
+fn ir_tuple_walk_method_decl(impl_type: String, mname: String) -> Int:
+    if ir_tuple_walk_root < 0:
+        return 0 - 1
+    for item_idx in ir_root_items(ir_tuple_walk_root):
+        item := get_node(item_idx)
+        if item.kind != "impl_decl" or ir_impl_target_type(item) != impl_type:
+            continue
+        for child in item.children:
+            method_idx := ir_unwrap_pub_child(child)
+            method_node := get_node(method_idx)
+            if ir_is_fn_decl_kind(method_node.kind) and method_node.value == mname:
+                return method_idx
+    return 0 - 1
+
+# the declaration-keyed core of the walk, shared by both front ends.
+fn ir_tuple_decl_arg_is_borrow(decl_idx: Int, walk_name: String, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
     param := ir_tuple_walk_param_name(decl_idx, arg_pos, arg_name)
     if param.len() == 0:
         return false
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0:
         return false
-    walk_key := callee.name + "/" + param
+    walk_key := walk_name + "/" + param
     if ir_tuple_borrow_walk_active.contains(walk_key):
         return false
     ir_tuple_borrow_walk_active.push(walk_key)
@@ -1756,9 +1793,12 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
         expr_idx := ir_method_call_arg_expr(node, i)
         if expr_idx < 0:
             continue
-        if ir_arg_release_is_skipped(expr_idx):
-            continue
-        ir_release_owned_operand(expr_idx, reg, ir_infer_type(expr_idx))
+        if not ir_arg_release_is_skipped(expr_idx):
+            ir_release_owned_operand(expr_idx, reg, ir_infer_type(expr_idx))
+        # a fresh optional shell handed to a method dies with the call the
+        # same way it does for a plain function; the walk runs over the impl
+        # method's body. `obj.take(maybe(i))` leaked its shell per call.
+        ir_release_fresh_optional_arg(node, i, "", expr_idx, reg, true)
 
 # true for a builtin whose result may BE one of its arguments rather than a
 # value the receiver keeps a count for. `get_default` is the only one: it
@@ -1805,8 +1845,11 @@ fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
             expr_idx = cn.children[0]
         if ir_arg_release_is_skipped(expr_idx) == false:
             ir_release_owned_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
-            if arg_name.len() > 0 or not has_named:
-                ir_release_fresh_optional_arg(node, reg_i, arg_name, expr_idx, arg_regs[reg_i])
+        # a widened argument's register is a wrapper the operand release must
+        # not touch (above), but the wrapper itself is a fresh shell this
+        # caller built, and the fresh-optional release knows how to drop it.
+        if arg_name.len() > 0 or not has_named:
+            ir_release_fresh_optional_arg(node, reg_i, arg_name, expr_idx, arg_regs[reg_i], false)
         reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
@@ -3044,22 +3087,65 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # the walk runs with its extraction clauses open. results stay excluded
 # entirely for now: they ride a different return abi in places, and the
 # measured leak is the optional shape.
-fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int):
+# a fresh optional shell in argument position dies with the call it fed,
+# once the callee's body proves the caller stayed its sole owner. three
+# shapes produce one: a call returning an optional (`take(mk(i))`), a bare
+# `none`, and a plain value the checker widened into a `T?` parameter
+# (`take(3)`, `take(point)`). the last two are built by this caller itself
+# in ir_emit_call_arg, so the caller is trivially the shell's only owner and
+# the walk only has to show the callee did not keep it; they leaked a shell
+# per call before this, `f(none)` alone at 45 call sites in std.
+#
+# what is released follows what the shell holds. a string payload arrives as
+# a transferred count the shell has no destructor for, so the cascade helper
+# drops it before the shell. a struct, list, map, set, bytes or closure
+# payload is owned through the wrapper's destructor (ir_emit_optional_owned_some),
+# so only the shell is released and its destructor does the rest — releasing
+# the payload here too would drop it twice. a plain value or a none has
+# nothing but the shell. `is_method` picks the walk: the callee's own body for
+# a plain call, the impl method's for a method call.
+fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int, is_method: Bool):
     en := get_node(expr_idx)
-    if en.kind != "call" and en.kind != "method_call":
-        return
     # inside generic or specialized bodies the checked types are suppressed
     # and a wrong answer here frees a register that is not a shell
     if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
         return
-    tid := c_get_expr_type(expr_idx)
-    if tid < 0:
+    mut sig := ""
+    mut dtor_owned := false
+    if en.kind == "none_lit":
+        sig = "00"
+    elif c_argument_widens_to_optional(expr_idx):
+        payload_kind := ir_rc_kind(ir_infer_type(expr_idx))
+        if payload_kind == "string":
+            sig = "s0"
+        elif payload_kind.len() > 0:
+            sig = "00"
+            dtor_owned = true
+        else:
+            sig = "00"
+    elif en.kind == "call" or en.kind == "method_call":
+        tid := c_get_expr_type(expr_idx)
+        if tid < 0:
+            return
+        info := get_type_info(tid)
+        if info.kind != "optional":
+            return
+        # the signature says what the cascade must drop: a runtime-built
+        # optional (`xs.get(i)`) carries its payload count with no destructor,
+        # so the payload is released explicitly, exactly as before this
+        # function learned the two shapes above.
+        sig = ir_tuple_cascade_signature(tid)
+    else:
         return
-    info := get_type_info(tid)
-    if info.kind != "optional":
-        return
-    sig := ir_tuple_cascade_signature(tid)
-    if not ir_tuple_call_arg_is_borrow(node, arg_pos, arg_name, sig == "00"):
+    # a payload the shell's destructor owns must not be extracted by the
+    # callee either: an unwrap transfers the count out of the shell.
+    open_extraction := sig == "00" and not dtor_owned
+    mut borrow := false
+    if is_method:
+        borrow = ir_tuple_method_arg_is_borrow(node, arg_pos, open_extraction)
+    else:
+        borrow = ir_tuple_call_arg_is_borrow(node, arg_pos, arg_name, open_extraction)
+    if not borrow:
         return
     if not ir_tuple_cascade_sigs.contains(sig):
         ir_tuple_cascade_sigs.push(sig)

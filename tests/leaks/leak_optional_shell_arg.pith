@@ -1,0 +1,61 @@
+# three more ways a fresh optional shell lands in argument position, each of
+# which leaked the shell per call: a bare `none`, a plain value the checker
+# widened into a `T?` parameter (built by the caller in ir_emit_call_arg), and
+# a call-produced optional handed to a *method* rather than a function. the
+# fresh-optional release now covers all three through the same callee walk,
+# and a struct payload widened into a parameter releases through its shell's
+# destructor rather than twice.
+import leakprobe as probe
+
+struct Pt:
+    pub x: Int
+
+struct Taker:
+    n: Int
+
+impl Taker:
+    fn take(v: Int?) -> Int:
+        return v.unwrap_or(0) + self.n
+
+    fn peek(p: Pt?) -> Int:
+        if p == none:
+            return 0
+        return 1
+
+fn take_int(v: Int?) -> Int:
+    return v.unwrap_or(0)
+
+fn peek_str(v: String?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+fn peek_pt(p: Pt?) -> Int:
+    if p == none:
+        return 0
+    return 1
+
+fn maybe(i: Int) -> Int?:
+    if i % 7 == 0:
+        return none
+    return i
+
+fn churn_round(i: Int):
+    t := Taker(1)
+    take_int(none)
+    take_int(i)
+    peek_str("value-" + i.to_string())
+    peek_pt(Pt(i))
+    t.take(maybe(i))
+    t.take(none)
+    t.take(i)
+    t.peek(Pt(i))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

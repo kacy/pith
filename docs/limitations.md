@@ -225,17 +225,16 @@ correctness story:
   container, returning early on an error path, and indexed reads of
   `List[Struct]` were all listed here once; each was fixed and each is now
   pinned flat by the leak-growth gate, measured at two round counts.)
-- a fresh optional written straight into an argument is released when it came
-  from a call — `f(maybe(i))` reclaims, because the emitter can prove through
-  the callee's body that the caller stayed the shell's sole owner (see
-  docs/ownership.md). the shapes still on the leak side, about 64 bytes per
-  call each: a bare `none` (`f(none)`), a plain value widened into an optional
-  parameter (`f(3)`), a call-produced optional handed to a *method*
-  (`obj.take(maybe(i))`), and a callee the walk cannot read or that extracts
-  an rc payload. the widened form also holds the count on its payload, so a
-  heap payload passed that way (`f(Point(1))`, `f(some_list)`) is held by the
-  optional that leaks. binding it first (`v: Int? := 3` then `f(v)`) is
-  reclaimed normally, so the local is the workaround on a hot path.
+- a fresh optional written straight into an argument is released once the
+  emitter proves through the callee's body that the caller stayed the shell's
+  sole owner (see docs/ownership.md). that covers a call-produced optional
+  (`f(maybe(i))`), a bare `none` (`f(none)`), a plain value widened into an
+  optional parameter (`f(3)`, `f(Point(1))`), and all three handed to a
+  method (`obj.take(maybe(i))`). what stays on the leak side, about 64 bytes
+  per call: a callee the walk cannot read — one in another module, or a
+  method on a generic receiver — and a callee that extracts a heap payload
+  out of the optional rather than reading it in place. binding the value
+  first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) does not release the optionals it holds — about 128 bytes
   per literal. building the container and pushing into it does not leak; only

@@ -55,7 +55,7 @@ stream in one ByteBuffer — the shape the go version always used with
 with go's 122. see bench/README.md for the full phase table.
 
 the http row was wrong for three separate reasons, untangled across
-2026-08-22/23, and the row above is the first honest one.
+2026-08-22/23, and the row above is the first correct one.
 
 first, the pith benchmark server was serial by construction: the accept loop
 served each connection inline, so the whole benchmark ran on one connection at
@@ -90,7 +90,7 @@ spaced run per arm. the mt-threaded server currently outruns the green
 spawning one on this workload (16.1k vs 14.2k) — a real gap worth its own
 measured look, not a regression.
 
-reading the rest honestly: on channel coordination green beats zig comfortably
+reading the rest plainly: on channel coordination green beats zig comfortably
 but runs ~1.9x behind both go and rust at the default worker count (placement is still
 decided by first-resume luck, hence the bimodal spread), and beats go pinned to
 one worker. raw spawn/await is still go's, though by ~3.4x now rather than ~7x;

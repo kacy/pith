@@ -80,7 +80,7 @@ when you want it back at scale 2, and say how it should round.
 ### there is no conversion from Float
 
 on purpose. java's `new BigDecimal(0.1)` gives
-`0.1000000000000000055511151231257827021181583404541015625`, which is the honest
+`0.1000000000000000055511151231257827021181583404541015625`, which is the exact
 answer and almost never the wanted one. the alternative — taking the decimal a
 Float was *printed* as and treating it as exact — hides the error rather than
 removing it. neither belongs behind a function that looks safe.

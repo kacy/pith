@@ -17,7 +17,7 @@ Since then the compiler reached a self-hosting fixed point (enforced by
 `make bootstrap-verify`), and the lazy iterator milestone shipped — the
 `Iterator[T]` protocol, range-for, list `.map`/`.filter`/`.reduce`, and the
 fusing `std.iter` adapters. That closes several of the ergonomics gaps noted
-further down; see `docs/limitations.md` for the current honest gap list.
+further down; see `docs/limitations.md` for the current gap list.
 
 Source totals are not written down here, because a copied number is wrong
 within a month and nothing catches it. Run `make status-audit` for the live

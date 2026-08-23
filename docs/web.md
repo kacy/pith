@@ -464,7 +464,7 @@ splitting a ten megabyte body on `&` to find one field is work an attacker
 can ask for repeatedly. a form that big should send the token in the header,
 which costs nothing to read.
 
-`examples/web_csrf.pith` runs both halves: the honest post with the token in
+`examples/web_csrf.pith` runs both halves: the legitimate post with the token in
 a header and in a form field, and then the cross-site version — session
 cookie attached, no token — plus a token borrowed from another session and a
 near miss.
@@ -539,7 +539,7 @@ existed those requests fell straight through to a 404 with no middleware in
 sight. `std.web` now answers an `OPTIONS` request to any path some route
 claims with `204` and an `Allow` header listing that path's methods, and runs
 it through the middleware chain like any other request. cors middleware
-intercepts the preflight ones; the rest get the honest `Allow` answer. an
+intercepts the preflight ones; the rest get the ordinary `Allow` answer. an
 `OPTIONS` to a path no route claims is still a 404.
 
 ## observability
@@ -755,7 +755,7 @@ routes, spawns the server, makes a few requests against itself, and prints the
 replies. `examples/web_cors.pith` puts a cors policy in front of an api and drives it
 from two origins, one allowed and one not. `examples/web_session.pith` runs the whole
 life of one session: an anonymous visit, a sign-in that rotates the id, a forged
-cookie, and a sign-out. `examples/web_csrf.pith` posts a form the honest way and then
+cookie, and a sign-out. `examples/web_csrf.pith` posts a form the legitimate way and then
 the way another site would. `examples/web_login.pith` puts the whole stack together —
 argon2id, a session, a csrf token and a guard — and drives a login, a protected page
 and a sign-out through it. `examples/web_observability.pith` does the

@@ -167,7 +167,7 @@ global's init kind:
 | `void` | no meaningful result |
 | `unknown` | the emitter did not commit to a kind |
 
-`unknown` is an honest admission, not a wildcard: it means the consumer will not
+`unknown` is an explicit admission, not a wildcard: it means the consumer will not
 track the register's kind and later kind-specific handling (string release, float
 math, struct field access) will not fire for it. an `unknown` where a concrete
 kind was knowable is a missed optimization or a latent bug, not a convenience.

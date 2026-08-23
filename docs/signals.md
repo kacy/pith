@@ -107,7 +107,7 @@ print("got " + signal.name(sig))                  # "got SIGTERM"
 - `wait(timeout_ms)` returns the next signal number, `0` on timeout, or `-1` when
   nothing is armed. `wait_forever()` is the same with no deadline.
 - `raise_self(sig)` sends a signal to this process, exactly as an orchestrator
-  would. it is how a signal path is tested honestly, and how a program can
+  would. it is how a signal path is tested for real, and how a program can
   trigger its own drain.
 - `pid()` is this process's id.
 

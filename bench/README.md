@@ -41,7 +41,7 @@ work or decoded a field differently, the digest would diverge.
 
 **Batteries:** Pith, Go, and Zig write this with only their standard
 libraries. Rust's std has neither JSON nor crypto, so its version pulls
-`serde_json`, `sha2`, and `hmac` — the honest cost of a deliberately
+`serde_json`, `sha2`, and `hmac` — the real cost of a deliberately
 small standard library. (Four independent crypto implementations landing
 on the same HMAC digest is also decent evidence the digest is real.)
 
@@ -75,7 +75,7 @@ interleaved trials (2026-08-16; the 2026-08-08 pith total was 570, the
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
 
-Read this honestly. Rust and Zig are fastest; Pith now leads Go on the
+Read this plainly. Rust and Zig are fastest; Pith now leads Go on the
 total, and the two changes that got it there are both instructive. The
 2026-08-16 `gen` drop (299 → 120, now even with Go) came from writing
 the stream into one ByteBuffer instead of concatenating fresh strings

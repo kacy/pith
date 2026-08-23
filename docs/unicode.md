@@ -98,7 +98,7 @@ a "character" here is a unicode scalar value — the unit Go's `for range` and
 Rust's `chars()` yield. it is not always one mark on screen: `e` followed by a
 combining acute accent is two scalar values but one thing a reader sees, and
 a family emoji is several. when you are truncating a display name or a chat
-message, graphemes are the honest unit.
+message, graphemes are the right unit.
 
 there is a fourth unit pith never uses for its own strings but has to speak at
 protocol boundaries: the utf-16 code unit, which the language server protocol

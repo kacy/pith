@@ -1,7 +1,7 @@
 # limitations
 
 pith is self-hosting and runs real programs, but it is not finished. this page
-is the honest list of what does not work yet, so you can plan around it instead
+is a plain list of what does not work yet, so you can plan around it instead
 of discovering it the hard way. it is kept current with the compiler; if you hit
 something here that now works, the page is stale and a fix to it is welcome.
 
@@ -83,10 +83,14 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **duplicate method names across impl blocks are rejected** — a struct's
   methods can be declared in more than one impl block, including a block in
   a different module than the struct, and every method resolves from any
-  call site that can see the value. method dispatch is per-declaration: two
-  modules can each declare a struct with the same name and a call binds
-  only to the receiver's own methods (E209 otherwise, even when the other
-  struct has the method). a second impl block giving the *same* declaration
+  call site that can see the value. method dispatch within one struct is
+  per-declaration. but two *different* modules that each declare a struct
+  with the same name is a known clash (issue #911): the declarations
+  collapse, and a method call dispatches to whichever module was imported
+  last rather than to the receiver's own — the wrong body runs with no
+  diagnostic, and a method present on only one of them mis-resolves. give
+  same-purpose structs distinct names across modules until this is fixed.
+  a second impl block giving the *same* declaration
   the *same* method name used to overwrite the first silently, with the
   winning body decided by module order — that is now E263. one deliberate
   exception: an interface impl may re-declare a method the inherent impl
@@ -113,10 +117,10 @@ something here that now works, the page is stale and a fix to it is welcome.
   Display + Hash, U: Ord:`) — a clause naming something that is not a
   declared type parameter is E264, reported at the offending name. `where`
   is a contextual keyword, so it stays usable as an ordinary name
-  everywhere else. clauses attach to functions and impl methods, and an
-  interface member signature parses one too — though generic interface
-  members themselves are not supported yet (the member's type parameter is
-  unknown in its body, E202), with either bound spelling. struct,
+  everywhere else. clauses attach to free functions. a generic method inside
+  an impl block is not supported — its type parameter is unknown in the body
+  (E202) — so a clause cannot attach to a working impl method, and a generic
+  interface member is unsupported the same way, with either bound spelling. struct,
   interface, and impl headers still take inline bounds only, and a
   method's clause may name only the method's own type parameters, not the
   owner's.
@@ -142,12 +146,12 @@ something here that now works, the page is stale and a fix to it is welcome.
 ## standard library
 
 - **tls 1.2** — the client and server speak tls 1.3 and, as a fallback, tls
-  1.2 (ecdhe + aead only; the four ecdhe-rsa/ecdhe-ecdsa aes-128-gcm and
-  chacha20-poly1305 suites), negotiating the highest a peer supports and
-  refusing anything below 1.2 — the same posture as go's crypto/tls and rustls.
-  `require_tls13()` locks a config to 1.3. the 1.2 fallback does not yet do
-  session resumption, renegotiation, or client-certificate auth, supports rsa (≥2048-bit) and ecdsa (p-256) server certificates, and has no
-  aes-256 suites.
+  1.2 (ecdhe + aead only; six suites — ecdhe-rsa/ecdhe-ecdsa in aes-128-gcm,
+  aes-256-gcm and chacha20-poly1305), negotiating the highest a peer supports
+  and refusing anything below 1.2 — the same posture as go's crypto/tls and
+  rustls. `require_tls13()` locks a config to 1.3. the 1.2 fallback supports
+  rsa (≥2048-bit) and ecdsa (p-256) server certificates; it does not yet do
+  session resumption, renegotiation, or client-certificate auth.
 - **testing** — `test` blocks are discovered and run by `pith test` (with
   `--filter`), and `std/testing` adds assertions and a `with_temp_dir` fixture
   helper. parameterized cases have no support: a table-driven test is a loop you
@@ -273,9 +277,10 @@ correctness story:
 as of 2026-07-27 the green backend is what a spawned task runs on when you
 build for linux; `PITH_GREEN=0` switches back to one os thread per task, and on
 macos and the bsds os threads are still the default with `PITH_GREEN=1` as the
-opt-in. green wins every shape this repo measures: spawn is ~30x the os-thread
-backend at a seventeenth of the memory, and the channel fan-out benchmark runs
-2.6x faster than os threads and ahead of rust and zig. the whole regression
+opt-in. green beats the os-thread backend on every shape this repo measures: spawn by
+~30x at comparable memory, and the channel fan-out benchmark by several times.
+on fan-out it beats zig and trails go and rust at the default worker count; the
+current numbers and their caveats are in docs/performance.md. the whole regression
 corpus, 380 cases at both worker counts, produces byte-identical output to the
 recorded goldens (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
@@ -332,7 +337,8 @@ placement is left to luck. a task pins to the first worker that runs it, so
 whether two tasks that talk to each other land together is chance, and the
 fan-out benchmark is bimodal because of it: ~46 ms pinned to one worker with
 `PITH_GREEN_WORKERS=1`, ~60 ms when the pipeline happens to share a worker
-anyway, ~130-170 ms when it splits. cross-worker wakes are the whole remaining
+anyway, ~96-100 ms on the runs that split, which are the common case.
+cross-worker wakes are the whole remaining
 gap to go on coordination-heavy work.
 
 the obvious fix is to move a parked task to whichever worker keeps waking it,
@@ -355,20 +361,26 @@ one caveat on the numbers themselves: every comparison in docs/performance.md
 and bench/README.md was measured on the same 2-core box. "green wins everywhere"
 is true there and unverified on wider hardware.
 
-two related ownership gaps, both bounded leaks rather than unsafety, are also
-outstanding: passing a bare `T!` or `T?` local as a call argument leaks its
-payload (the caller-side cascade does not yet treat a call argument as the
-borrow it now provably is), and extracting the same optional local twice is a
-rare use-after-free that needs a second-extraction check rather than the blanket
-retain that was tried and reverted for regressing the common single case.
+two related ownership issues are outstanding, and they are not the same
+severity. passing a bare `T!` or `T?` local as a call argument leaks its
+payload — a bounded leak, where the caller-side cascade does not yet treat the
+argument as the borrow it now provably is. extracting the same optional local
+twice, where a consumer releases what it is handed (an argument, a method
+receiver), is a use-after-free rather than a leak: `unwrap_or` on a borrowed
+subject hands the payload out with no count of its own, so the first consumer's
+release frees it and the second read lands on freed memory. retaining on
+extraction closes it but interacts with the release of an owned temporary a
+field is read off, so it is being fixed on its own rather than as a one-line
+guard.
 
 sweeping std's shared globals for the same class of bug turned up three things
 that are questions of design rather than repairs, so they are recorded here
 instead of decided.
 
 `std.metrics` is correct under concurrency and does not scale. one mutex covers
-all thirteen registries, so every counter increment, gauge set and histogram
-observation in the process serializes on it, and a metric written once per
+all twelve registries (the module's thirteenth `mut` global is the mutex
+itself), so every counter increment, gauge set and histogram observation in the
+process serializes on it, and a metric written once per
 request is the normal case. measured on the 2-core box, one task manages 7.4M
 increments a second; two manage 3.7M between them, four 3.0M, eight 2.4M — the
 aggregate falls as tasks are added, which is what a single lock looks like. the

@@ -257,6 +257,20 @@ mut ir_current_impl_subst_args: List[String] := []
 # type name) so the destructor body can substitute them into each field type.
 mut ir_generic_dtor_base: Map[String, String] := {}
 mut ir_generic_dtor_args: Map[String, String] := {}
+# the same idea for generic enums. a generic enum's declaration records its
+# type parameter names as payload kinds, so the shared `__dtor_<enum>` sees
+# no rc payload and is never generated — `Holder[String].Some(s)` freed its
+# box and stranded the string. a construction site knows its instance from
+# the checked type, resolves every variant's concrete kinds, and registers a
+# destructor keyed by that kind signature, so instances with the same rc
+# shape share one. `kinds` packs the per-variant kind lists, variants joined
+# by ";" and a variant's kinds by ",".
+mut ir_generic_enum_dtor_base: Map[String, String] := {}
+mut ir_generic_enum_dtor_kinds: Map[String, String] := {}
+# the tids of the match subjects enclosing the rc prepass walk, innermost
+# last, so a nested variant pattern can resolve a generic enum's payload
+# kinds against the instance being matched.
+mut ir_prepass_subject_tids: List[Int] := []
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 # every module in the build, not just the emitted module's direct imports.
@@ -869,7 +883,39 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             if ir_method_result_retains_over_args(ir_method_emit_name(mname, recv_type)):
                 return false
         return not ir_string_method_returns_fresh(mname)
+    # a payload-free variant written bare — `Holder.Empty`, or the alias-
+    # qualified `mod.Holder.Empty` — parses as a field access but mints a
+    # fresh box (the field-access emitters route it to ir_emit_variant_alloc).
+    # a field read is a borrow; this is not, and classifying it as one made
+    # every return, bind and argument of a bare variant retain a count the
+    # box already held. `return Holder.Empty` leaked one box per call, on
+    # every boxed enum in the language.
+    if node.kind == "field_access" and ir_field_access_is_bare_variant(idx):
+        return false
     return true
+
+# true when a field-access node is really a payload-free variant
+# construction: the receiver names a boxed enum (directly, or through a
+# module alias) and the member is one of its variants. mirrors the two
+# dispatch paths in ir_emit_field_access_expr and ir_emit_field_access.
+fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "field_access" or node.children.len() == 0:
+        return false
+    recv := get_node(node.children[0])
+    mut ename := ""
+    if recv.kind == "ident":
+        ename = recv.value
+    elif recv.kind == "field_access" and recv.children.len() > 0:
+        base := get_node(recv.children[0])
+        if base.kind == "ident" and ir_module_aliases.contains_key(base.value):
+            ename = recv.value
+    if ename.len() == 0 or not ir_boxed_enums.contains_key(ename):
+        return false
+    key := ename + "." + node.value
+    if not ir_struct_field_index_lookup.contains_key(key):
+        return false
+    return ir_struct_field_lookup.contains_key(key) and ir_struct_field_lookup[key] == ename
 
 fn ir_string_method_returns_fresh(mname: String) -> Bool:
     if mname == "to_string" or mname == "trim" or mname == "substring":
@@ -1535,6 +1581,14 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
         mut variant_kinds: List[String] := []
         if ir_enum_payload_kinds.contains_key(node.value):
             variant_kinds = ir_enum_payload_kinds[node.value].split(",")
+            # a generic enum's declaration records parameter names here; the
+            # enclosing match's subject names the instance whose concrete kinds
+            # decide whether a binding is tracked. ir_emit_match_bindings
+            # retains by those resolved kinds, so tracking by the declared ones
+            # left every generic rc payload binding retained and never
+            # released.
+            if ir_prepass_subject_tids.len() > 0:
+                variant_kinds = ir_resolved_variant_kinds_for_tid(ir_prepass_subject_tids[ir_prepass_subject_tids.len() - 1], node.value, variant_kinds)
         for sub_idx, pi in node.children:
             sub := get_node(sub_idx)
             if sub.kind == "pat_binding":
@@ -1546,6 +1600,14 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                 # Beta(Int, _) sharing x0), and releasing the rc kind at exit
                 # would dereference whatever integer the last-run arm stored.
                 ir_prepass_track_or_poison(sub.value, payload_kind, names, poisoned)
+    # remember the subject under a match so nested variant patterns can
+    # resolve a generic enum's payload kinds against the instance (above)
+    if node.kind == "match_expr" and node.children.len() > 1:
+        ir_prepass_subject_tids.push(ir_emission_tid(node.children[0]))
+        for child in node.children:
+            ir_collect_rc_bind_names(child, names, poisoned)
+        ir_prepass_subject_tids.remove(ir_prepass_subject_tids.len() - 1)
+        return
     for child in node.children:
         ir_collect_rc_bind_names(child, names, poisoned)
 
@@ -4537,7 +4599,7 @@ fn ir_enum_max_payload_count(enum_name: String) -> Int:
                     max_count = count
     return max_count
 
-fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: Int) -> Int:
+fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: Int, tid: Int) -> Int:
     mut slots := ir_enum_max_payload_count(enum_name)
     if payload_count > slots:
         slots = payload_count
@@ -4549,9 +4611,59 @@ fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: 
     ir_emit("iconst " + tag_r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
     ir_emit("sstore " + r.to_string() + " 0 " + tag_r.to_string())
     # attach the tag-aware destructor so the box releases its rc payloads when
-    # it dies (self-guards: a no-op for enums with no releasable payloads).
-    ir_emit_attach_dtor(r, enum_name)
+    # it dies. a generic instance whose concrete payloads are rc gets its own
+    # (the declaration's shared one sees only type parameter names); every
+    # other enum attaches the shared one, which self-guards to a no-op when
+    # nothing is releasable.
+    inst := ir_generic_enum_instance_dtor(enum_name, tid)
+    if inst.len() > 0:
+        fr := ir_reg()
+        ir_emit("funcref " + fr.to_string() + " __dtor_" + inst)
+        ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + r.to_string() + " " + fr.to_string())
+    else:
+        ir_emit_attach_dtor(r, enum_name)
     return r
+
+# the per-instance destructor symbol for a generic enum construction, or ""
+# when the shared destructor is right: a non-generic enum, an instance whose
+# resolved payloads hold nothing reference counted, or a site whose checked
+# type does not name an instance. registers the symbol for emission at the
+# end of the module. keyed by the resolved kind signature rather than the
+# type arguments, since the destructor depends on nothing else.
+fn ir_generic_enum_instance_dtor(ename: String, tid: Int) -> String:
+    if tid < 0 or not ir_enum_variant_lists.contains_key(ename):
+        return ""
+    mut any_rc := false
+    mut resolved_any := false
+    mut parts: List[String] := []
+    for v in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + v
+        mut kinds: List[String] := []
+        if ir_enum_payload_kinds.contains_key(vkey):
+            declared := ir_enum_payload_kinds[vkey].split(",")
+            kinds = ir_resolved_variant_kinds_for_tid(tid, vkey, declared)
+            if kinds.join(",") != declared.join(","):
+                resolved_any = true
+        for k in kinds:
+            if ir_rc_field_kind(k).len() > 0:
+                any_rc = true
+        parts.push(kinds.join(","))
+    if not resolved_any or not any_rc:
+        return ""
+    sig := parts.join(";")
+    # the symbol carries the same signature with separators a linker accepts:
+    # variants joined by "__", a variant's kinds by "_", empty variants
+    # spelled out so two signatures never collapse into one name.
+    mut sym_parts: List[String] := []
+    for part in parts:
+        if part.len() == 0:
+            sym_parts.push("void")
+        else:
+            sym_parts.push(part.replace(",", "_"))
+    sym := ir_sanitize_symbol(ename + "__" + sym_parts.join("__"))
+    ir_generic_enum_dtor_base.insert(sym, ename)
+    ir_generic_enum_dtor_kinds.insert(sym, sig)
+    return sym
 
 # Shape.Circle(2.5): build the boxed value and store each payload argument.
 fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant_key: String) -> Int:
@@ -4561,7 +4673,7 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
         # kinds; the construction expression's checked type names the
         # instance whose concrete types decide whether a payload is retained.
         kinds = ir_resolved_variant_kinds_for_tid(ir_emission_tid(idx), variant_key, ir_enum_payload_kinds[variant_key].split(","))
-    r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len())
+    r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len(), ir_emission_tid(idx))
     mut i := 0
     while i < kinds.len():
         arg_idx := ir_method_call_arg_expr(node, i)
@@ -4594,7 +4706,7 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
             if ir_struct_field_lookup.contains_key(lookup_key):
                 if ir_struct_field_lookup[lookup_key] == recv_node.value:
                     if ir_boxed_enums.contains_key(recv_node.value):
-                        return ir_emit_variant_alloc(recv_node.value, lookup_key, 0)
+                        return ir_emit_variant_alloc(recv_node.value, lookup_key, 0, ir_emission_tid(idx))
                     r := ir_reg()
                     ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[lookup_key])
                     return r
@@ -6673,10 +6785,15 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
                 if ir_struct_field_index_lookup.contains_key(variant_key):
                     if ir_struct_field_lookup.contains_key(variant_key) and ir_struct_field_lookup[variant_key] == ename:
                         if ir_boxed_enums.contains_key(ename):
-                            return ir_emit_variant_alloc(ename, variant_key, 0)
+                            return ir_emit_variant_alloc(ename, variant_key, 0, ir_emission_tid(idx))
                         r := ir_reg()
                         ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
                         return r
+        # a bare payload-free variant — `Holder.Empty` — names a type on the
+        # left, not a value; evaluating it loaded a variable that does not
+        # exist. hand it straight to the construction path instead.
+        if ir_field_access_is_bare_variant(idx):
+            return ir_emit_field_access(idx, node, 0 - 1)
         obj_r := ir_expr(node.children[0])
         # result fields are special: `.ok` and status checks read the tagged value,
         # not a struct field.
@@ -9095,47 +9212,71 @@ fn ir_emit_enum_dtors():
             continue
         if not ir_enum_variant_lists.contains_key(ename):
             continue
-        ir_emit_func_header("__dtor_" + ename, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        tag_r := ir_reg()
-        ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
-        variants := ir_enum_variant_lists[ename].split(",")
-        mut vi := 0
-        while vi < variants.len():
-            vkey := ename + "." + variants[vi]
-            if ir_enum_payload_kinds.contains_key(vkey):
-                kinds := ir_enum_payload_kinds[vkey].split(",")
-                mut has_rc := false
-                mut c := 0
-                while c < kinds.len():
-                    if ir_rc_field_kind(kinds[c]).len() > 0:
-                        has_rc = true
-                    c = c + 1
-                if has_rc:
-                    vtag := ir_reg()
-                    ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
-                    is_v := ir_reg()
-                    ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
-                    hit_l := ir_label()
-                    skip_l := ir_label()
-                    ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
-                    ir_emit_label(hit_l)
-                    mut s := 0
-                    while s < kinds.len():
-                        rk := ir_rc_field_kind(kinds[s])
-                        if rk.len() > 0:
-                            slot_r := ir_reg()
-                            ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((s + 1) * 8).to_string() + " unknown __p" + s.to_string())
-                            ir_rc_release_reg(slot_r, rk)
-                        s = s + 1
-                    ir_emit_label(skip_l)
-            vi = vi + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_enum_dtor_body("__dtor_" + ename, ir_declared_variant_kinds(ename))
+
+# the generic instances registered at construction sites. emitted in the late
+# pass beside the generic struct instance destructors: the declared-enum pass
+# above runs before any body, when the registry is still empty.
+fn ir_emit_generic_enum_instance_dtors():
+    for sym in ir_generic_enum_dtor_base.keys():
+        ir_emit_enum_dtor_body("__dtor_" + sym, ir_generic_enum_dtor_kinds[sym].split(";"))
+
+# the per-variant payload kinds a declared enum's destructor and tracer walk:
+# one entry per variant in declaration order, each that variant's kinds
+# joined by "," (empty for a payload-free variant).
+fn ir_declared_variant_kinds(ename: String) -> List[String]:
+    mut out: List[String] := []
+    for v in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + v
+        if ir_enum_payload_kinds.contains_key(vkey):
+            out.push(ir_enum_payload_kinds[vkey])
+        else:
+            out.push("")
+    return out
+
+# one tag-aware destructor: switch on the variant tag, release each rc
+# payload slot of the variant that matched. shared by the declared enums and
+# the generic instances, which differ only in the kinds they are handed.
+fn ir_emit_enum_dtor_body(symbol: String, variant_kinds: List[String]):
+    ir_emit_func_header(symbol, 1, "void")
+    ir_emit("param p")
+    pr := ir_reg()
+    ir_emit("load " + pr.to_string() + " p")
+    tag_r := ir_reg()
+    ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
+    mut vi := 0
+    while vi < variant_kinds.len():
+        if variant_kinds[vi].len() > 0:
+            kinds := variant_kinds[vi].split(",")
+            mut has_rc := false
+            mut c := 0
+            while c < kinds.len():
+                if ir_rc_field_kind(kinds[c]).len() > 0:
+                    has_rc = true
+                c = c + 1
+            if has_rc:
+                vtag := ir_reg()
+                ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
+                is_v := ir_reg()
+                ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
+                hit_l := ir_label()
+                skip_l := ir_label()
+                ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
+                ir_emit_label(hit_l)
+                mut si := 0
+                while si < kinds.len():
+                    rk := ir_rc_field_kind(kinds[si])
+                    if rk.len() > 0:
+                        slot_r := ir_reg()
+                        ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((si + 1) * 8).to_string() + " unknown __p" + si.to_string())
+                        ir_rc_release_reg(slot_r, rk)
+                    si = si + 1
+                ir_emit_label(skip_l)
+        vi = vi + 1
+    zr := ir_reg()
+    ir_emit("iconst " + zr.to_string() + " 0")
+    ir_emit("ret " + zr.to_string())
+    ir_emit("endfunc")
 
 # --- cycle tracer twins ----------------------------------------------------
 #
@@ -9207,47 +9348,66 @@ fn ir_emit_enum_tracers():
             continue
         if not ir_enum_variant_lists.contains_key(ename):
             continue
-        ir_emit_func_header("__cc_trace_" + ename, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        tag_r := ir_reg()
-        ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
-        variants := ir_enum_variant_lists[ename].split(",")
-        mut vi := 0
-        while vi < variants.len():
-            vkey := ename + "." + variants[vi]
-            if ir_enum_payload_kinds.contains_key(vkey):
-                kinds := ir_enum_payload_kinds[vkey].split(",")
-                mut has_trace := false
-                mut c := 0
-                while c < kinds.len():
-                    if ir_trace_kind_enabled(ir_rc_field_kind(kinds[c])):
-                        has_trace = true
-                    c = c + 1
-                if has_trace:
-                    vtag := ir_reg()
-                    ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
-                    is_v := ir_reg()
-                    ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
-                    hit_l := ir_label()
-                    skip_l := ir_label()
-                    ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
-                    ir_emit_label(hit_l)
-                    mut s := 0
-                    while s < kinds.len():
-                        rk := ir_rc_field_kind(kinds[s])
-                        if ir_trace_kind_enabled(rk):
-                            slot_r := ir_reg()
-                            ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((s + 1) * 8).to_string() + " unknown __p" + s.to_string())
-                            ir_rc_visit_reg(slot_r, rk)
-                        s = s + 1
-                    ir_emit_label(skip_l)
-            vi = vi + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_enum_tracer_body("__cc_trace_" + ename, ir_declared_variant_kinds(ename))
+
+# tracer twins for the generic enum instances, same late pass as their dtors.
+fn ir_emit_generic_enum_instance_tracers():
+    for sym in ir_generic_enum_dtor_base.keys():
+        if ir_variant_kinds_have_trace(ir_generic_enum_dtor_kinds[sym].split(";")):
+            ir_emit_enum_tracer_body("__cc_trace_" + sym, ir_generic_enum_dtor_kinds[sym].split(";"))
+
+# true when any variant's resolved kinds include a traceable child, the
+# per-instance answer to ir_enum_needs_tracer.
+fn ir_variant_kinds_have_trace(variant_kinds: List[String]) -> Bool:
+    for vk in variant_kinds:
+        if vk.len() > 0:
+            for k in vk.split(","):
+                if ir_trace_kind_enabled(ir_rc_field_kind(k)):
+                    return true
+    return false
+
+# the tracer twin of ir_emit_enum_dtor_body: the same tag switch and slot
+# walk, each traceable child visited instead of released.
+fn ir_emit_enum_tracer_body(symbol: String, variant_kinds: List[String]):
+    ir_emit_func_header(symbol, 1, "void")
+    ir_emit("param p")
+    pr := ir_reg()
+    ir_emit("load " + pr.to_string() + " p")
+    tag_r := ir_reg()
+    ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
+    mut vi := 0
+    while vi < variant_kinds.len():
+        if variant_kinds[vi].len() > 0:
+            kinds := variant_kinds[vi].split(",")
+            mut has_trace := false
+            mut c := 0
+            while c < kinds.len():
+                if ir_trace_kind_enabled(ir_rc_field_kind(kinds[c])):
+                    has_trace = true
+                c = c + 1
+            if has_trace:
+                vtag := ir_reg()
+                ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
+                is_v := ir_reg()
+                ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
+                hit_l := ir_label()
+                skip_l := ir_label()
+                ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
+                ir_emit_label(hit_l)
+                mut si := 0
+                while si < kinds.len():
+                    rk := ir_rc_field_kind(kinds[si])
+                    if ir_trace_kind_enabled(rk):
+                        slot_r := ir_reg()
+                        ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((si + 1) * 8).to_string() + " unknown __p" + si.to_string())
+                        ir_rc_visit_reg(slot_r, rk)
+                    si = si + 1
+                ir_emit_label(skip_l)
+        vi = vi + 1
+    zr := ir_reg()
+    ir_emit("iconst " + zr.to_string() + " 0")
+    ir_emit("ret " + zr.to_string())
+    ir_emit("endfunc")
 
 # one destructor per rc-bearing tuple signature seen in this module.
 # emitted after the bodies, since tuple shapes are only discovered at
@@ -9604,6 +9764,9 @@ fn ir_emit_cc_register_tracers():
         if not ir_enum_variant_lists.contains_key(ename):
             continue
         ir_emit_cc_register_pair("__dtor_" + ename, "__cc_trace_" + ename)
+    for sym in ir_generic_enum_dtor_base.keys():
+        if ir_variant_kinds_have_trace(ir_generic_enum_dtor_kinds[sym].split(";")):
+            ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     for sig in ir_tuple_dtor_sigs:
         if not ir_tuple_sig_has_trace(sig):
             continue
@@ -9620,6 +9783,8 @@ fn ir_emit_cc_register_tracers():
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_base = {}
     ir_generic_dtor_args = {}
+    ir_generic_enum_dtor_base = {}
+    ir_generic_enum_dtor_kinds = {}
     ir_emit_global_bindings(root)
     ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)
@@ -9646,6 +9811,8 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # are where such constructions (and their attaches) are recorded.
     ir_emit_generic_instance_dtors()
     ir_emit_generic_instance_tracers()
+    ir_emit_generic_enum_instance_dtors()
+    ir_emit_generic_enum_instance_tracers()
     ir_append_lambda_bodies()
     # tuple cascade helpers last of all: every body (top level, specializations,
     # generic instance dtors and lambdas) has registered its signatures by now.

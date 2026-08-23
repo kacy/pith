@@ -133,10 +133,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   argument. self-referential generic types themselves work —
   `struct Node[T]: next: Node[T]?`, `Link(T, Chain[T]?)`, and mutually
   recursive pairs all instantiate (the instance registers before its fields
-  resolve, so the reference finds a floor). one ownership caveat: a generic
-  enum erases to a single IR struct whose destructor is built from the
-  declaration, so a heap payload (`Opt[String]`) is not released when the
-  enum box itself dies — the same erasure gap generic struct fields have.
+  resolve, so the reference finds a floor). a generic enum erases to a
+  single IR struct, but ownership follows the instance: a construction site
+  attaches a destructor built from the instance's concrete payload kinds,
+  so an `Opt[String]` releases its string when the box dies, the same way a
+  generic struct instance releases its fields.
 
 ## standard library
 

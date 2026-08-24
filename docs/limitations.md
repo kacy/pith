@@ -291,11 +291,18 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## tooling
 
-- **no incremental analysis** — `pith lsp` re-checks the whole import closure
-  on every change, so diagnostics on a large file trail the last keystroke by
-  the closure's check time. queries answer instantly from the last snapshot
-  throughout. see [docs/lsp.md](lsp.md) for the feature list and the measured
-  numbers.
+- **analysis is incremental only for syntax** — `pith lsp` parses the changed
+  document on its own and publishes its parse errors within a few milliseconds,
+  but everything else re-reads, re-lexes, re-parses and re-checks the whole
+  import closure on every change, so type errors on a large file still trail
+  the last keystroke by the closure's check time. the fast lane takes itself
+  out of the way on a file too large to parse inside the debounce window.
+  editing a module does not re-report its dependents, and the server grows by
+  tens of megabytes per analysis without giving it back, so a long session on
+  a large closure ends in the oom killer. queries answer instantly from the
+  last snapshot throughout. see [docs/lsp.md](lsp.md) for the feature list, the
+  measured phase split, the memory figures, and what per-module caching would
+  take.
 - **no package registry** — dependencies are local path entries in `pith.toml`.
   `pith package lock` writes a `pith.lock` and `pith package install` copies
   those paths into `.pith/packages`, but nothing fetches over the network and

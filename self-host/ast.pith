@@ -71,6 +71,30 @@ pub fn node_child(idx: Int, pos: Int) -> Int:
     kids := n.children
     return kids[pos]
 
-# clear the arena for reuse
+# clear the arena for reuse.
+#
+# emptying the list in place rather than rebinding it to a fresh one:
+# `nodes = []` strands every node it drops, strings and child lists
+# included, so a long-lived tool that runs the front end per keystroke
+# grew by a whole closure's worth of nodes each time — tens of
+# megabytes an edit, which walks a language server into the oom killer
+# inside a couple of minutes of typing. `clear()` releases what it
+# removes. the rebinding form is the one with the defect, and it is a
+# defect in the emitter rather than here; this call site is only the
+# one that hurt.
 pub fn reset_arena():
-    nodes = []
+    nodes.clear()
+
+# drop every node added since the arena held `count` of them, leaving
+# the earlier nodes — and every index into them — exactly as they were.
+# parses append contiguously, so a count taken before a parse and handed
+# back here undoes precisely that parse. that is what lets a throwaway
+# parse share the arena with an analysis the editor is still reading
+# from: without it, parsing one file to find its syntax errors would
+# leave the type cache and definition map pointing at nodes that are no
+# longer the ones they described.
+pub fn truncate_arena(count: Int):
+    if count < 0:
+        return
+    while nodes.len() > count:
+        nodes.remove(nodes.len() - 1)

@@ -9,7 +9,7 @@
 # describe only the most recent run_check_pipeline call — so every
 # feature goes through ensure_analyzed first.
 
-from check_pipeline import run_check_pipeline, last_timing_line
+from check_pipeline import run_check_pipeline, run_parse_only, last_timing_line, last_module_timing_lines, last_parse_only_ms
 from driver import file_for_node, dr_read_source
 from checker import c_get_expr_type, get_definition_of
 from types import get_type_name, TID_ERR
@@ -22,6 +22,7 @@ from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, open_doc
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 import std.json as json
 import std.lsp.protocol as protocol
+import std.time as time
 
 # at most this many diagnostics publish per file; an unparsable file can
 # produce hundreds and the first few are the actionable ones.
@@ -33,6 +34,24 @@ MAX_WORKSPACE_SYMBOLS := 200
 # the fix text check_assignment attaches to E216; the one fix shape a
 # code action can apply mechanically.
 MUT_FIX_PREFIX := "declare with 'mut': mut "
+
+## how long the server lets the typing settle before running the full
+## analysis. the syntax fast lane exists to answer inside this window,
+## so the window is also the budget it has to stay under.
+pub DEBOUNCE_MS := 300
+
+# what parsing each document on its own last cost, in milliseconds.
+# the fast lane pays for itself only while that stays under the
+# debounce window it is racing. below the window a syntax error reaches
+# the editor sooner for a parse nobody notices; above it the parse is
+# duplicated work sitting in front of a full run that will parse the
+# same text again, which pushes the real diagnostics out by however
+# long the file takes to parse. both sides of that line are real files
+# in this repository: a 300-line module parses in a few milliseconds
+# and a 10,000-line one in a few hundred. the cost is measured rather
+# than guessed from the file's size, so the first change to a document
+# runs the lane and remembers what it cost.
+mut parse_only_cost_ms: Map[String, Int] := {}
 
 # which document the compiler state currently describes, and whether the
 # checker ran for it (a parse or import failure stops before checking,
@@ -134,6 +153,21 @@ fn publish_body(uri: String, diags: List[Diagnostic], mode: String) -> String:
     json.object_set(params, "diagnostics", arr)
     return protocol.notification_body("textDocument/publishDiagnostics", params)
 
+# where one analysis spent its time, on stderr so the protocol channel
+# on fd 1 never sees it. PITH_LSP_TIMING=1 logs the phase split plus the
+# cost of turning the outcome into publishDiagnostics bodies;
+# PITH_LSP_TIMING=2 adds one line per module of the closure, which is
+# how a slow closure names the module responsible.
+fn log_analysis_timing(path: String, publish_ms: Int):
+    level := env("PITH_LSP_TIMING")
+    if level != "1" and level != "2":
+        return
+    log.info("analysis " + path + " " + last_timing_line() + " publish={publish_ms}ms")
+    if level != "2":
+        return
+    for line in last_module_timing_lines():
+        log.info("  " + line)
+
 ## run the front end for one document and build the publishDiagnostics
 ## notifications that fall out: always one for the analyzed document,
 ## and one per other open document that has findings now or had some at
@@ -144,10 +178,7 @@ pub fn run_analysis(uri: String) -> List[String]:
     mut bodies: List[String] := []
     outcome := run_check_pipeline(path) catch:
         return bodies
-    # PITH_LSP_TIMING=1 logs where each analysis spent its time, on
-    # stderr where the protocol channel never sees it
-    if env("PITH_LSP_TIMING") == "1":
-        log.info("analysis " + path + " " + last_timing_line())
+    pipeline_done := time.mono_millis()
     clear_dirty_if(uri)
     analyzed_uri = uri
     analyzed_root = outcome.root
@@ -178,7 +209,48 @@ pub fn run_analysis(uri: String) -> List[String]:
             bodies.push(publish_body(open_uri, file_diags, mode))
             last_published_counts.insert(open_path, file_diags.len())
     last_diags_by_path = by_path
+    log_analysis_timing(path, time.mono_millis() - pipeline_done)
     return bodies
+
+## the fast lane: lex and parse just this document and build the
+## publishDiagnostics bodies for what the parser found, leaving the
+## import closure alone. it costs what one file costs to parse, so a
+## syntax error surfaces while the full analysis is still ahead of it.
+##
+## a document that parses cleanly produces no bodies at all. publishing
+## an empty list for it would wipe the last analysis's findings off the
+## screen and put them back when the closure check lands, which reads
+## as a flicker; a parse error is different, because it makes those
+## findings stale by definition, so it publishes and replaces them.
+##
+## nothing here touches the analyzed-document state: the full run still
+## has to happen, and this neither satisfies nor cancels it.
+pub fn syntax_diagnostics(uri: String) -> List[String]:
+    path := uri_to_path(uri)
+    mut bodies: List[String] := []
+    if parse_only_cost_ms.contains_key(path) and parse_only_cost_ms[path] >= DEBOUNCE_MS:
+        return bodies
+    diags := run_parse_only(path) catch:
+        return bodies
+    cost := last_parse_only_ms()
+    parse_only_cost_ms.insert(path, cost)
+    level := env("PITH_LSP_TIMING")
+    if level == "1" or level == "2":
+        found := diags.len()
+        log.info("syntax " + path + " parse={cost}ms diags={found}")
+    if diags.len() == 0:
+        return bodies
+    bodies.push(publish_body(uri, diags, get_position_encoding()))
+    # remember the publish so a later analysis that finds nothing still
+    # sends the clearing notification for this document
+    last_published_counts.insert(path, diags.len())
+    return bodies
+
+## forget what the fast lane learned about a document, so a later
+## didOpen measures it again instead of trusting a figure taken before
+## the file was edited elsewhere.
+pub fn forget_syntax_cost(uri: String):
+    parse_only_cost_ms.remove(uri_to_path(uri))
 
 ## whether the last analysis ran the checker to completion, so the
 ## type cache and definition map describe the current node arena.

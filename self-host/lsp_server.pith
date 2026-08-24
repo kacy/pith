@@ -4,9 +4,11 @@
 # stdio. one loop reads frames from fd 0, handles each message
 # synchronously, and writes every response frame straight to fd 1 —
 # no spawned tasks, so nothing can interleave with the protocol
-# stream. analysis is debounced: a document change marks the world
-# dirty, and the loop runs the front end when 300ms pass without
-# input. PITH_LSP_NO_DEBOUNCE=1 analyzes immediately after every
+# stream. a document change is answered in two lanes: once the batch
+# of input is drained the fast lane parses the changed document alone
+# and publishes its parse errors, and the full front end runs over the
+# whole import closure when 300ms pass without input.
+# PITH_LSP_NO_DEBOUNCE=1 runs both lanes inline after every
 # didOpen/didChange/didSave instead, which is what the transcript
 # tests run under.
 #
@@ -14,7 +16,7 @@
 # newline corrupts the frame stream.
 
 from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
-from lsp_features import run_analysis, ensure_analyzed, hover_result, document_symbols, workspace_symbols, code_actions, formatting_edits
+from lsp_features import run_analysis, syntax_diagnostics, forget_syntax_cost, DEBOUNCE_MS, ensure_analyzed, hover_result, document_symbols, workspace_symbols, code_actions, formatting_edits
 from lsp_navigation import definition_location, references_locations, completion_items, prepare_rename_range, rename_workspace_edit
 from lsp_tokens import semantic_token_legend, semantic_tokens_full, signature_help, inlay_hints
 from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
@@ -342,6 +344,34 @@ fn handle_request(m: Message):
 fn analyze_now(uri: String):
     write_bodies(run_analysis(uri))
 
+# the document whose syntax the fast lane still owes an answer for, or
+# "" when it is caught up.
+mut syntax_pending := ""
+
+# a document changed. the fast lane parses it alone and publishes any
+# parse errors long before the closure check that follows can answer,
+# but it fires once per batch of input rather than once per frame: with
+# full-document sync only the newest text matters, so a burst of
+# keystrokes parses once and the latest one wins. under
+# PITH_LSP_NO_DEBOUNCE both lanes run inline, in order, so the
+# transcript tests see the same sequence a client would.
+fn note_changed(uri: String):
+    if no_debounce:
+        write_bodies(syntax_diagnostics(uri))
+        analyze_now(uri)
+        return
+    syntax_pending = uri
+
+# answer the fast lane's debt, if the document is still open.
+fn publish_pending_syntax():
+    uri := syntax_pending
+    syntax_pending = ""
+    if uri == "" or not document_is_open(uri):
+        return
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    write_bodies(syntax_diagnostics(uri))
+
 fn handle_did_open(params: Int):
     if params < 0:
         return
@@ -354,8 +384,7 @@ fn handle_did_open(params: Int):
     text := json.object_get_string_or(doc, "text", "")
     version := json.object_get_int_or(doc, "version", 0)
     lsp_open_document(uri, text, version)
-    if no_debounce:
-        analyze_now(uri)
+    note_changed(uri)
 
 fn handle_did_change(params: Int):
     uri := params_uri(params)
@@ -372,8 +401,7 @@ fn handle_did_change(params: Int):
     if doc >= 0:
         version = json.object_get_int_or(doc, "version", 0)
     lsp_change_document(uri, text, version)
-    if no_debounce:
-        analyze_now(uri)
+    note_changed(uri)
 
 fn handle_did_save(params: Int):
     uri := params_uri(params)
@@ -385,8 +413,7 @@ fn handle_did_save(params: Int):
         text = json.object_get_string_or(params, "text", "")
         has_text = true
     lsp_save_document(uri, text, has_text)
-    if no_debounce:
-        analyze_now(uri)
+    note_changed(uri)
 
 fn handle_notification(m: Message):
     if m.method == "exit":
@@ -413,7 +440,9 @@ fn handle_notification(m: Message):
         handle_did_save(m.params)
         return
     if m.method == "textDocument/didClose":
-        lsp_close_document(params_uri(m.params))
+        closed := params_uri(m.params)
+        forget_syntax_cost(closed)
+        lsp_close_document(closed)
         return
     # unknown notifications are ignored by design
 
@@ -461,7 +490,7 @@ pub fn run_lsp_server() -> Int:
         # an idle server just keeps listening
         mut wait_ms := 1000
         if has_dirty():
-            wait_ms = 300
+            wait_ms = DEBOUNCE_MS
         chunk := tty.read(65536, wait_ms) catch:
             # stdin closed: the client is gone
             if shutdown_seen:
@@ -484,4 +513,10 @@ pub fn run_lsp_server() -> Int:
         if reader.error() != "":
             # framing is unrecoverable once the header stream is corrupt
             return 1
+        # the whole batch is handled; answer the fast lane before going
+        # back to waiting, so a syntax error lands in the time one file
+        # takes to parse rather than after the debounce and a closure
+        # check. a batch ending in exit writes nothing more.
+        if not exit_requested:
+            publish_pending_syntax()
     return exit_code

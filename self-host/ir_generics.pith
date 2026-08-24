@@ -193,6 +193,11 @@ pub mut ir_generic_emitted_specializations: Map[String, Int] := {}
 ## concrete Optional tid inside a specialization body (concrete_types
 ## flattens Optional to "tuple").
 pub mut ir_generic_specialization_arg_tids: Map[String, String] := {}
+## The impl target of every generic declaration that is a method rather than a
+## free function, keyed by the same symbol name ir_generic_decl_indices uses.
+## A method's specialization takes a leading self parameter and emits inside
+## its impl's context; nothing else about it differs from a free function's.
+pub mut ir_generic_method_owners: Map[String, String] := {}
 
 ## file a generic declaration under its module-qualified name.
 pub fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
@@ -205,6 +210,16 @@ pub fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: S
 ## true when the name is a recorded generic declaration.
 pub fn ir_is_generic_function_name(name: String) -> Bool:
     return ir_generic_decl_indices.contains_key(name)
+
+## file a generic impl method under the symbol dispatch resolves it to.
+pub fn ir_record_generic_method_decl(method_idx: Int, full_name: String, impl_type: String, module_path: String):
+    ir_generic_decl_indices.insert(full_name, method_idx)
+    ir_generic_decl_module_paths.insert(full_name, module_path)
+    ir_generic_method_owners.insert(full_name, impl_type)
+
+## true when the name is a recorded generic impl method.
+pub fn ir_is_generic_method_name(name: String) -> Bool:
+    return ir_generic_method_owners.contains_key(name)
 
 ## prefer a name that names a generic declaration.
 pub fn ir_generic_preferred_name(preferred: String, fallback: String) -> String:

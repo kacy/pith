@@ -1,0 +1,124 @@
+# a method may carry type parameters of its own, separate from any the type
+# has. each call site fixes them from the argument types and gets its own
+# specialization, exactly the way a call to a free generic function does.
+import generic_impl_method_helper as helper
+
+interface Label:
+    fn label() -> String
+
+# an interface member may carry its own type parameters too, in both the
+# abstract and the default spelling.
+interface Render:
+    fn render[T](value: T) -> String
+    fn shout[T](value: T) -> String:
+        return "!" + value.to_string() + "!"
+
+struct Coin:
+    pub face: String
+
+impl Label for Coin:
+    fn label() -> String:
+        return "coin:" + self.face
+
+struct Card:
+    pub rank: Int
+
+impl Label for Card:
+    fn label() -> String:
+        return "card:" + self.rank.to_string()
+
+struct Holder:
+    pub tag: String
+
+impl Holder:
+    # inferred from the argument, returned as the same type
+    fn echo[T](value: T) -> T:
+        return value
+
+    # two type parameters of its own, alongside the owner's own field
+    fn pair[A, B](a: A, b: B) -> String:
+        return self.tag + "/" + a.to_string() + "/" + b.to_string()
+
+    # a type parameter under a container, in both directions
+    fn count[T](items: List[T]) -> Int:
+        return items.len()
+
+    fn wrap[T](value: T) -> List[T]:
+        mut out: List[T] := []
+        out.push(value)
+        return out
+
+    # an optional and a Result built from the method's type parameter
+    fn maybe[T](value: T) -> T?:
+        return value
+
+    fn parse[T](value: T) -> Int!:
+        return parse_int(value.to_string())
+
+    # an inline bound on the method's own type parameter
+    fn show[T: Label](item: T) -> String:
+        return self.tag + " " + item.label()
+
+    # the same bound written as a where clause on the method
+    fn twice[T](item: T) -> String where T: Label:
+        return item.label() + "|" + item.label()
+
+    # one generic method calling another on self, from inside a specialization
+    fn doubled[T](value: T) -> String:
+        return self.pair(value, value)
+
+# a second type with a same-named generic method. dispatch has to pick the
+# receiver's own body rather than whichever registered last.
+struct Marker:
+    pub tag: String
+
+impl Marker:
+    fn pair[A, B](a: A, b: B) -> String:
+        return "M" + self.tag + "/" + b.to_string() + "/" + a.to_string()
+
+# a generic method called from inside a free generic function's body: the
+# inner call specializes under the outer specialization's substitution.
+fn relay[U](h: Holder, v: U) -> String:
+    return h.pair(v, v)
+
+struct Plain:
+    pub prefix: String
+
+impl Render for Plain:
+    fn render[T](value: T) -> String:
+        return self.prefix + value.to_string()
+
+fn main():
+    h := Holder(tag: "h")
+    print(h.echo(41).to_string())
+    print(h.echo("text"))
+    print(h.pair(1, "two"))
+    print(h.count([1, 2, 3]).to_string())
+    print(h.count(["a", "b"]).to_string())
+    ws := h.wrap("only")
+    print(ws.len().to_string() + ":" + ws[0])
+    wi := h.wrap(9)
+    print(wi[0].to_string())
+    m := h.maybe(4)
+    if m != none:
+        print(m.value().to_string())
+    ms := h.maybe("m")
+    if ms != none:
+        print(ms.value())
+    print((h.parse(31) catch 0 - 1).to_string())
+    print((h.parse("no") catch 0 - 1).to_string())
+    print(h.show(Coin(face: "heads")))
+    print(h.show(Card(rank: 7)))
+    print(h.twice(Coin(face: "tails")))
+    print(h.doubled(3))
+    print(h.doubled("d"))
+    print(Marker(tag: "k").pair(1, "two"))
+    print(relay(h, 8))
+    print(relay(h, "r"))
+    p := Plain(prefix: "> ")
+    print(p.render(5))
+    print(p.render("x"))
+    print(p.shout(2))
+    t := helper.Tagger(tag: "n")
+    print(t.render(4))
+    print(t.render("s"))

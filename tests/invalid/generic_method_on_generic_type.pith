@@ -1,0 +1,15 @@
+# a method may declare its own type parameters only on a NON-generic type.
+# on a generic owner the two substitutions would have to compose — the owner's
+# is fixed per instantiation, the method's per call site — and nothing lowers
+# that pair, so the shape is refused at the declaration (E265) rather than
+# lowered against one substitution or the other.
+struct Box[T]:
+    pub item: T
+
+impl Box:
+    pub fn describe[U](other: U) -> String:
+        return other.to_string()
+
+fn main():
+    b := Box[Int](item: 3)
+    print(b.describe(7))

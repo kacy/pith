@@ -119,6 +119,14 @@ fn main():
     # bounds per parameter.
     print(wingspan(Wing(feathers: 9)))
 
+    # a method may declare type parameters of its own, separate from any the
+    # type has. each call site infers them from its arguments and gets its own
+    # specialization, the same as a call to a free generic function.
+    ledger := Ledger(name: "log")
+    print(ledger.note(12))
+    print(ledger.note("open"))
+    print(ledger.measure(Wing(feathers: 4)))
+
 struct Wing:
     pub feathers: Int
 
@@ -131,3 +139,15 @@ impl Sized for Wing:
 
 fn wingspan[T](v: T) -> String where T: Sized:
     return "spans {v.size()}"
+
+struct Ledger:
+    pub name: String
+
+impl Ledger:
+    # T is fixed by the argument at each call site
+    fn note[T](value: T) -> String:
+        return self.name + ": " + value.to_string()
+
+    # a bound on the method's own type parameter, in the clause spelling
+    fn measure[T](v: T) -> String where T: Sized:
+        return self.name + " spans " + v.size().to_string()

@@ -45,7 +45,7 @@ from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
-from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
+from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
@@ -376,6 +376,7 @@ fn ir_reset_type_state():
     ir_current_func_returns_result = false
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
+    ir_generic_method_owners = {}
     ir_generic_specialization_keys = []
     ir_generic_specialization_names = {}
     ir_generic_specialization_type_lists = {}
@@ -501,8 +502,12 @@ fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
         return ir_expr_legacy_result_kind(idx)
     obj_type := ir_method_receiver_type(node)
     method_name := ir_plain_method_name(node.value)
-    impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
+    mut impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
     if impl_name.len() > 0:
+        # a generic method's declared return kind lives on the specialization,
+        # not on the base name — the base's may still be a type parameter
+        if ir_is_generic_method_name(impl_name):
+            impl_name = ir_queue_generic_method_call(idx, node, impl_name)
         declared_kind := ir_declared_callable_ir_retkind(impl_name)
         if declared_kind.len() > 0:
             return declared_kind
@@ -576,6 +581,13 @@ fn ir_result_ok_kind_for_expr(idx: Int) -> String:
         obj_type := ir_method_receiver_type(node)
         method_name := ir_plain_method_name(node.value)
         impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
+        if impl_name.len() > 0 and ir_is_generic_method_name(impl_name):
+            # the ok payload of a `T!` return is only concrete under this call's
+            # substitution, so read it off the declaration with the inferred
+            # types rather than from a registry keyed on the base name
+            generic_ok_kind := ir_generic_result_ok_kind(impl_name, ir_infer_generic_concrete_types(impl_name, node))
+            if generic_ok_kind.len() > 0:
+                return generic_ok_kind
         if impl_name.len() > 0 and ir_func_result_ok_kinds.contains_key(impl_name):
             return ir_retkind(ir_func_result_ok_kinds[impl_name])
         emit_name := ir_method_emit_name(method_name, obj_type)
@@ -2059,11 +2071,12 @@ fn ir_emit_impl_methods(node: Node, impl_type: String):
         # unwrap the method silently never emits and calls return zero
         method_idx := ir_unwrap_pub_child(child)
         child_node := get_node(method_idx)
-        if child_node.kind == "fn_decl":
+        if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
             ir_impl_func(method_idx, impl_type)
     # emit a per-type copy of each interface default this impl didn't override
     for default_idx in ir_inherited_default_indices(node):
-        ir_impl_func(default_idx, impl_type)
+        if not ir_has_generic_params(get_node(default_idx)):
+            ir_impl_func(default_idx, impl_type)
 
 fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
     if not has_generic_declaration(impl_type):
@@ -2086,7 +2099,7 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
         for child in impl_node.children:
             method_idx := ir_unwrap_pub_child(child)
             child_node := get_node(method_idx)
-            if child_node.kind == "fn_decl":
+            if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
                 ir_impl_func_specialized(method_idx, impl_type, instance_type_name, struct_params, arg_names)
 
 fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, params: List[String], arg_names: List[String]):
@@ -6021,6 +6034,8 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     impl_dispatch := impl_name.len() > 0
     if impl_dispatch:
         emit_name = impl_name
+        if ir_is_generic_method_name(impl_name):
+            emit_name = ir_queue_generic_method_call(idx, node, impl_name)
 
     call_regs := ir_collect_method_call_regs(node)
     obj_r := call_regs[0]
@@ -8592,6 +8607,21 @@ fn ir_infer_generic_concrete_types(name: String, node: Node) -> List[String]:
     inferred := ir_infer_generic_concrete_types_with_state(name, node, ir_generic_decl_indices)
     return ir_fill_unknown_concretes_from_caller(name, node, inferred)
 
+# the symbol one call to a generic impl method lowers to. the method's own type
+# parameters are fixed by the argument types here and the specialization is
+# queued under the resolved symbol, exactly as a call to a free generic
+# function is. the inference walks the same node shape either way: a method
+# call's receiver sits at children[0] where a plain call's callee sits, and
+# self is never one of a method's declared parameters, so argument positions
+# line up with the declaration's parameter list without an offset.
+fn ir_queue_generic_method_call(idx: Int, node: Node, base_name: String) -> String:
+    mut ret_type := ir_checked_type(idx)
+    if ret_type.len() == 0:
+        ret_type = ir_infer_type(idx)
+    concrete_types := ir_infer_generic_concrete_types(base_name, node)
+    ir_record_generic_spec_arg_tids(base_name, concrete_types, ir_generic_arg_tids(node))
+    return ir_queue_generic_specialization(base_name, concrete_types, ret_type)
+
 # the type node a named parameter of a function declaration was written
 # with, or -1 when the name is not one of its parameters.
 fn ir_decl_param_type_node(decl_idx: Int, param_name: String) -> Int:
@@ -8795,6 +8825,14 @@ fn ir_emit_generic_specialization(key: String):
     for pt in param_types:
         resolved_param_types.push(ir_resolve_assoc_in_generic(pt, generic_params, concrete_types))
     param_types = resolved_param_types
+    # a generic impl method carries an implicit self ahead of its declared
+    # parameters and emits inside its impl's context, so `self.field` resolves
+    # against the owner's layout. everything else about its specialization is
+    # a free generic function's.
+    mut owner_type := ""
+    if ir_generic_method_owners.contains_key(base_name):
+        owner_type = ir_generic_method_owners[base_name]
+    saved_impl_type := ir_current_impl_type
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
@@ -8811,7 +8849,12 @@ fn ir_emit_generic_specialization(key: String):
     ir_prepare_func_emission(ret_type)
     ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
-    ir_emit_func_header(spec_name, param_count, ret_type)
+    if owner_type.len() > 0:
+        ir_current_impl_type = owner_type
+        ir_emit_func_header(spec_name, param_count + 1, ret_type)
+        ir_emit_named_param("self", owner_type)
+    else:
+        ir_emit_func_header(spec_name, param_count, ret_type)
     ir_emit_fn_params_with_types(decl_idx, param_types)
     ir_func_returns.insert(spec_name, ret_type)
     if concrete_types.len() == 1 and ir_is_config_decode_specialization(base_name, false, ir_active_generic_module_path, decl_idx):
@@ -8861,6 +8904,7 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_module_path = saved_module_path
     ir_active_param_optional_tids = saved_param_optional_tids
     ir_active_generic_decl_idx = saved_decl_idx
+    ir_current_impl_type = saved_impl_type
 
 # the tid a declared type name denotes, or -1 when it names nothing the type
 # table knows. a source-level name (`Int`, a struct) resolves directly; a name
@@ -9042,6 +9086,13 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
     ir_register_impl_method_entry(impl_type, method_name, full_name, module_path)
     ir_func_returns.insert(key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
+    # a method with type parameters of its own has no single body: it is
+    # specialized per call site the way a free generic function is. file the
+    # declaration under the symbol dispatch already resolves to, so a call site
+    # that reaches this name can queue the specialization instead of emitting a
+    # call to a body that was never written out.
+    if ir_has_generic_params(method_node):
+        ir_record_generic_method_decl(method_idx, full_name, impl_type, module_path)
 
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
@@ -9978,6 +10029,7 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
     ir_type_aliases = {}
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
+    ir_generic_method_owners = {}
 
     for root, preload_i in ir_preloaded_import_roots:
         mut module_path := ""

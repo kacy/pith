@@ -1,0 +1,24 @@
+# a bound on a method's own type parameter is checked at the call site, in
+# both spellings: the inline bracket form and the where clause. an argument
+# whose type does not implement the bound is E226, the same answer a free
+# generic function gives.
+interface Label:
+    fn label() -> String
+
+struct Plain:
+    pub n: Int
+
+struct Printer:
+    pub prefix: String
+
+impl Printer:
+    pub fn show[T: Label](item: T) -> String:
+        return self.prefix + item.label()
+
+    pub fn twice[T](item: T) -> String where T: Label:
+        return item.label() + item.label()
+
+fn main():
+    p := Printer(prefix: "> ")
+    print(p.show(Plain(n: 1)))
+    print(p.twice(Plain(n: 2)))

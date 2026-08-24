@@ -4588,6 +4588,13 @@ fn ir_container_store_takes_count(store_kind: String) -> Bool:
         return true
     if store_kind == "struct":
         return true
+    # an optional shell is a struct-header allocation and transfers like one.
+    # a list has no kind-carrying store for an owned value, so without this an
+    # owned shell — `xs.push(maybe(i))`, and now every widened `xs.push(3)` —
+    # reached the plain store, which took a count of its own while the caller
+    # skipped its release: ~62 bytes stranded per push.
+    if store_kind == "tuple":
+        return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
 # the variant of a container store that takes the caller's count instead of
@@ -4913,11 +4920,18 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
     while i < kinds.len():
         arg_idx := ir_method_call_arg_expr(node, i)
         if arg_idx >= 0:
-            arg_r := ir_expr(arg_idx)
+            # a plain value the checker widened into an optional payload goes
+            # through the same target-shaped emitter every other widening
+            # position uses, so `Probe.Alpha(3)` stores the Some(3) a match
+            # binding on that payload reads back.
+            arg_r := ir_emit_call_arg(arg_idx)
             # the enum value owns a count on rc payloads, same as any
-            # other struct-shaped store
+            # other struct-shaped store. a widened payload's register is the
+            # shell this construction just built rather than the value the
+            # expression names, so it is already owned however the value
+            # arrived — retaining it there would strand the shell.
             payload_kind := ir_rc_kind(kinds[i])
-            if payload_kind.len() > 0 and ir_expr_is_borrowed(arg_idx):
+            if payload_kind.len() > 0 and ir_expr_is_borrowed(arg_idx) and not c_argument_widens_to_optional(arg_idx):
                 ir_rc_retain_reg(arg_r, payload_kind)
             ir_emit("sstore " + r.to_string() + " " + (i + 1).to_string() + " " + arg_r.to_string())
         i = i + 1
@@ -6040,8 +6054,15 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         if store_value_pos >= 0 and store_value_pos < arg_regs.len():
             value_expr := ir_method_call_arg_expr(node, store_value_pos)
             if value_expr >= 0:
-                store_kind := ir_rc_kind(ir_infer_type(value_expr))
-                borrowed := ir_expr_is_borrowed(value_expr)
+                mut store_kind := ir_rc_kind(ir_infer_type(value_expr))
+                mut borrowed := ir_expr_is_borrowed(value_expr)
+                # a widened store argument's register is the optional shell
+                # ir_emit_call_arg just built, not the plain value the
+                # expression names: the container learns the tuple kind and
+                # takes this caller's count, whatever the value was.
+                if c_argument_widens_to_optional(value_expr):
+                    store_kind = "tuple"
+                    borrowed = false
                 mut kind_store := ir_map_kind_store_name(emit_name, not borrowed)
                 if kind_store.len() == 0 and borrowed:
                     kind_store = ir_list_kind_store_name(emit_name)

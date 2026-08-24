@@ -23,27 +23,40 @@ something here that now works, the page is stale and a fix to it is welcome.
   and tuple elements, and `==` / `!=`. an unannotated `x := none` is the one
   place with no target to check against; it binds a type nothing else accepts,
   so the first use of `x` reports instead. write `x: T? := none`.
-- **a plain value widens into an optional in most positions, not all** — `3`
-  is accepted where an `Int?` is expected, and the callee reads the `Some(3)`
-  it expects. that covers bindings, assignments, returns, struct fields
-  (positional, named and defaulted), collection literal elements, map index
-  assignment, and the argument of a plain function, a method, a lambda and a
-  function value. a collection literal in argument position takes the
-  parameter's declared element type too, so `f([1, 2])` against a
-  `List[Int?]` parameter widens element by element. two argument positions
-  still need the value bound to a `T?` local first:
-  - a builtin container store or query — `xs.push(3)` into a `List[Int?]`,
-    `m.insert(k, 3)` into a `Map[K, Int?]`, `s.add(3)` into a `Set[Int?]`.
-    the element type also feeds `contains`, `index_of` and `remove`, which
-    compare rather than store, so widening there would answer against a
-    freshly built optional and always miss.
-  - an enum variant payload — `Probe.Alpha(3)` against an `Int?` payload
-    still needs the value bound to an `Int?` local first. destructuring is
-    fine: a match binding on an optional payload has the payload's declared
-    type, so `Probe.Alpha(b0) => b0.unwrap_or(0)` reads it like any other
-    optional local.
+- **a plain value widens into an optional where the value is kept, not where
+  one is looked up** — `3` is accepted where an `Int?` is expected, and
+  whatever reads it back gets the `Some(3)` it expects. that covers bindings,
+  assignments, returns, struct fields (positional, named and defaulted),
+  collection literal elements, map index assignment, the argument of a plain
+  function, a method, a lambda and a function value, a builtin container's
+  store (`xs.push(3)` into a `List[Int?]`, `xs.insert(0, 3)`, `m.insert(k, 3)`
+  into a `Map[K, Int?]`) and an enum variant payload (`Probe.Alpha(3)` against
+  an `Int?` payload). destructuring is unchanged: a match binding on an
+  optional payload has the payload's declared type, so `Probe.Alpha(b0) =>
+  b0.unwrap_or(0)` reads it like any other optional local. a collection
+  literal takes the declared element type too, so `f([1, 2])` against a
+  `List[Int?]` parameter widens element by element, an optional element that
+  is itself a container takes the literal through the container and wraps what
+  it built (`{"a": [1, 2]}` against a `Map[String, List[Int]?]`), and a
+  `List[Int?]?` target widens the elements and the container at once.
 
-  a parameter of a *generic function* now widens like any other argument —
+  the query positions report instead, and still need the value bound to a `T?`
+  local first: `contains`, `index_of` and a set's `remove` compare against
+  what the container already holds rather than store into it, and so does
+  every map key — `m.insert(k, v)` widens `v` and not `k`. a list compares
+  optional elements by identity, so a `Some(3)` built at the call would answer
+  "not present" for a 3 that is; widening only where a value is kept is what
+  stops a rejection turning into a wrong answer.
+
+  a `Set[T?]` is the one store that also reports. a set has exactly two
+  element flavors, int and string, and an optional is neither, so `Set[Int?]`
+  builds the string set and hands its add a tuple pointer to read as a
+  c-string — two distinct optionals already collapse into one entry and
+  `contains` answers true for anything. widening `s.add(3)` would only add a
+  shorter spelling for that; use a `List[T?]` or a `Map[T, Bool]` until the
+  element type itself is fixed.
+
+  a parameter of a *generic function* widens like any other argument —
   `pick(x, 3)` against `fn pick[T](a: T, b: Int?)` builds `Some(3)`, in both
   the inferred and the explicit `pick[String](x, 3)` forms. (this had been
   deliberately held back until a specialization took a parameter's
@@ -56,14 +69,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   compares by content. ordering operators (`<`, `>`, `<=`, `>=`) do not
   widen — unwrap first, because there is no sensible order between `none`
   and a value.
-- **a collection literal does not widen into an optional element that is
-  itself a container** — `{"a": [1, 2]}` against a `Map[String, List[Int]?]`
-  reports, because the literal walk recurses into a container target and an
-  optional is not one. this predates the widening above and applies equally to
-  a binding, a struct field and an argument. bind the inner container to a
-  `List[Int]?` local first. the same nesting stops one argument case: a
-  literal against a `List[Int?]?` parameter has to widen its elements and its
-  container at once, and reports.
+- **`unwrap_or` on an optional holding a container hands back a freed
+  handle** — `lst.unwrap_or([])` where `lst` is a `List[Int]?` reads the right
+  answer and then leaves the payload dangling: the extraction takes no count
+  and the shell's release frees the list underneath it. `Int?`, `String?` and
+  a struct payload are all fine; only a `List`, `Map` or `Set` payload is
+  affected. read a container payload through `match` (`match lst: got =>
+  got.len()`) until this is fixed.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

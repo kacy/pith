@@ -1,0 +1,74 @@
+# the positions a plain value now widens into an optional at: a builtin
+# container store, an enum variant payload, and a collection literal whose
+# element or container is an optional. every one of them builds a fresh Some
+# shell the caller never names, so nothing in the source says who drops it —
+# each round churns the int, string, struct and container payload kinds
+# through all of them.
+#
+# the list store is the shape this case was written for. a list has no
+# kind-carrying store for an owned value, so an owned shell reached the plain
+# store, which took a count of its own while the caller skipped its release:
+# ~62 bytes per push, 75 mb over 600k extra rounds. the string payloads are
+# literals on purpose — a fresh heap string held by an optional inside a
+# container is a separate, still-open leak.
+import leakprobe as probe
+
+struct Point:
+    pub x: Int
+    pub y: Int
+
+struct Holder:
+    pub rows: Map[String, List[Int]?]
+    pub opt: List[Int?]?
+
+enum Probe:
+    Alpha(Int?)
+    Held(Point?)
+    Beta
+
+fn take_list(xs: List[Int?]?) -> Int:
+    match xs:
+        some => some.len()
+        none => 0 - 1
+
+fn churn_round(i: Int):
+    mut ints: List[Int?] := []
+    ints.push(i)
+    ints.insert(0, i + 1)
+    mut strs: List[String?] := []
+    strs.push("kept")
+    mut pts: List[Point?] := []
+    pts.push(Point(i, i + 1))
+    mut m: Map[String, Int?] := {}
+    m.insert("a", i)
+    mut pm: Map[String, Point?] := {}
+    pm.insert("p", Point(i, i))
+    a := Probe.Alpha(i)
+    h := Probe.Held(Point(i, i))
+    nested: Map[String, List[Int]?] := {"a": [i, i + 1]}
+    widened := take_list([i, i + 1])
+    holder := Holder({"a": [i]}, [i, i + 1])
+    mut assigned: List[Int?]? := none
+    assigned = [i, i + 1, i + 2]
+    from_assigned := take_list(assigned)
+    from_alpha := match a:
+        Probe.Alpha(v) => v.unwrap_or(0)
+        Probe.Held(p) => 1
+        Probe.Beta => 2
+    from_held := match h:
+        Probe.Alpha(v) => v.unwrap_or(0)
+        Probe.Held(p) => 1
+        Probe.Beta => 2
+    held := from_alpha + from_held
+    total := ints.len() + strs.len() + pts.len() + m.len() + pm.len() + nested.len() + widened + held + holder.rows.len() + from_assigned
+    if total == 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

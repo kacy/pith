@@ -64,6 +64,8 @@ cases=(
   tests/leaks/leak_optional_plain_compare
   tests/leaks/leak_optional_match_payload
   tests/leaks/leak_argument_literal
+  tests/leaks/leak_optional_literal_elements
+  tests/leaks/leak_widened_store
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood

@@ -1763,6 +1763,18 @@ fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int
 pub fn c_argument_widens_to_optional(expr_idx: Int) -> Bool:
     return optional_widened_arguments.contains_key(expr_idx)
 
+# accept a value into an optional target and record what the emitter has to
+# build for it. the two answers differ: `none` and a value that is already the
+# optional arrive in the right shape and are recorded as nothing, while a
+# plain inner value needs the Some shell, which is what the recording asks
+# for. positions that have both cases in one check — a container store, an
+# enum variant payload — ask through here rather than repeating the pairing.
+fn optional_target_accepts_value(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
+    if value_matches_optional_target(value_idx, actual_tid, expected_tid) == false:
+        return false
+    argument_widens_to_optional(value_idx, actual_tid, expected_tid)
+    return true
+
 fn struct_field_has_default(struct_name: String, field_name: String) -> Bool:
     return struct_field_default_nodes.contains_key(struct_name + "." + field_name)
 
@@ -1915,6 +1927,22 @@ fn collection_literal_coerces(value_idx: Int, target_tid: Int, scope_id: Int) ->
         return false
     node := get_node(value_idx)
     target_info := get_type_info(target_tid)
+    # an optional whose inner type is a container takes the literal through
+    # the container and wraps what it built. the walk below recurses on the
+    # three container kinds and an optional is not one of them, so
+    # `{"a": [1, 2]}` against a Map[String, List[Int]?] used to report even
+    # though every element was fine — and a List[Int?]? parameter, which has
+    # to widen its elements and its container at once, reported too.
+    if target_info.kind == "optional" and target_info.inner >= 0:
+        inner_info := get_type_info(target_info.inner)
+        if inner_info.kind != "list" and inner_info.kind != "map" and inner_info.kind != "set":
+            return false
+        if collection_literal_coerces(value_idx, target_info.inner, scope_id) == false:
+            return false
+        # the literal now carries the inner container's type; the Some shell
+        # around it is the emitter's to build, which is what this records.
+        optional_widened_arguments.insert(value_idx, true)
+        return true
     if node.kind == "list" and target_info.kind == "list":
         for child in node.children:
             if literal_element_coerces(child, target_info.inner, scope_id) == false:
@@ -4492,7 +4520,7 @@ fn check_generic_enum_variant_construction(decl_idx: Int, variant_name: String, 
                             # widening, the same rule a binding applies — a
                             # recursive variant's tail (Chain[T]?) is handed
                             # a plain Chain[Int] all over the tree.
-                            if value_matches_optional_target(arg_exprs[pi], at, payload_types[pi]) == false:
+                            if optional_target_accepts_value(arg_exprs[pi], at, payload_types[pi]) == false:
                                 if types_structurally_equal(at, payload_types[pi]) == false:
                                     report_error("E219", "argument type mismatch: expected " + get_type_name(payload_types[pi]) + ", got " + get_type_name(at))
                     pi = pi + 1
@@ -4701,7 +4729,13 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                     if is_error_type(pa_type) == false and pi < payload_types.len():
                         if pa_type != payload_types[pi]:
                             if types_structurally_equal(pa_type, payload_types[pi]) == false:
-                                report_error("E219", "argument type mismatch: expected " + get_type_name(payload_types[pi]) + ", got " + get_type_name(pa_type))
+                                # a plain value widens into an optional
+                                # payload, the rule the generic enum path
+                                # above already applies. destructuring is
+                                # untouched: a match binding on an optional
+                                # payload reads the payload's declared type.
+                                if optional_target_accepts_value(pa_expr, pa_type, payload_types[pi]) == false:
+                                    report_error("E219", "argument type mismatch: expected " + get_type_name(payload_types[pi]) + ", got " + get_type_name(pa_type))
                     pi = pi + 1
                 return receiver_type
             vi = vi + 1
@@ -4977,7 +5011,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
     tid_bool := lookup_type_id("Bool")
     tid_void := lookup_type_id("Void")
     if method == "push":
-        expect_one_typed_argument(method, args, elem, scope_id)
+        expect_one_stored_argument(method, args, elem, scope_id)
         return tid_void
     if method == "len":
         expect_no_arguments(method, args)
@@ -4999,7 +5033,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
             report_error("E207", "insert expects 2 arguments (index, value), got " + args.len().to_string())
             return tid_void
         check_argument_type(args[0], tid_int, scope_id)
-        check_argument_type(args[1], elem, scope_id)
+        check_stored_argument_type(args[1], elem, scope_id)
         return tid_void
     if method == "contains":
         expect_one_typed_argument(method, args, elem, scope_id)
@@ -5052,9 +5086,11 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         if args.len() != 2:
             report_error("E207", "insert expects 2 arguments, got " + args.len().to_string())
             return tid_void
-        # check key type
+        # the key is a query position as much as a store one — the map looks
+        # it up to decide whether this replaces an entry — so only the value
+        # takes the store widening.
         check_argument_type(args[0], key_t, scope_id)
-        check_argument_type(args[1], val_t, scope_id)
+        check_stored_argument_type(args[1], val_t, scope_id)
         return tid_void
     if method == "len":
         expect_no_arguments(method, args)
@@ -5106,6 +5142,14 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         report_error_with_fix("E209", "Set has no method 'insert'", "use add(value)")
         return TID_ERR
     if method == "add":
+        # `add` stores, so it would take the store widening a list's push and
+        # a map's insert now take — except that a set has exactly two element
+        # flavors, int and string, and an optional is neither. a Set[Int?]
+        # builds the string set and hands pith_set_add_cstr a tuple pointer to
+        # read as a c-string, so two distinct optionals already collapse into
+        # one entry and `contains` answers true for anything. widening here
+        # would only add a shorter spelling for that; the element type is what
+        # needs fixing first.
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
     if method == "len":
@@ -5271,6 +5315,41 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:
                 report_error_at(expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
+
+# the argument check for a position that STORES its value into a container.
+# a store takes the container's declared element type, so a plain value
+# widens into an optional element there the same way a binding, a struct
+# field and a plain function's parameter already do: `xs.push(3)` into a
+# List[Int?] keeps the Some(3) the list is declared to hold.
+#
+# the query positions deliberately keep the rejection and stay on
+# check_argument_type. contains, index_of, remove and every map key COMPARE
+# against what the container already holds rather than store into it, and a
+# list compares optional elements by identity, so a freshly built Some(3)
+# would answer "not present" for a 3 that is. widening where a value is kept
+# and reporting where one is looked up is the rule that cannot turn a
+# rejection into a wrong answer.
+fn check_stored_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
+    expr_idx := argument_expression_index(arg_idx)
+    actual := c_check_expr(expr_idx, scope_id)
+    propagate_empty_argument_collection_type(arg_idx, expected, actual, scope_id)
+    if is_error_type(actual):
+        return
+    if actual == expected:
+        return
+    if types_structurally_equal(actual, expected):
+        return
+    if optional_target_accepts_value(expr_idx, actual, expected):
+        return
+    if collection_literal_matches_target(expr_idx, expected, scope_id):
+        return
+    report_error_at(expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
+
+fn expect_one_stored_argument(method: String, args: List[Int], expected: Int, scope_id: Int):
+    if args.len() != 1:
+        report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
+        return
+    check_stored_argument_type(args[0], expected, scope_id)
 
 # ---------------------------------------------------------------
 # field access

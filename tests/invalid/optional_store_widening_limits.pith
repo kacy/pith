@@ -1,0 +1,42 @@
+# a plain value widens into a container's optional element where the value is
+# STORED. the positions below either look a value up rather than store it, or
+# store into a container that cannot hold an optional at all, and every one of
+# them stays a compile error.
+
+fn main():
+    mut xs: List[Int?] := []
+    # contains and index_of COMPARE against what the list already holds. a
+    # list compares optional elements by identity, so a Some(3) built here
+    # would answer "not present" for a 3 that is; the rejection is what keeps
+    # that from becoming a wrong answer.
+    print("{xs.contains(3)}")
+    print("{xs.index_of(3).unwrap_or(0 - 1)}")
+
+    # a map key is looked up, not stored: it decides which entry the call
+    # lands on.
+    mut byint: Map[Int?, String] := {}
+    print("{byint.contains_key(3)}")
+    print("{byint.get_default(3, "x")}")
+    byint.remove(3)
+
+    # get_default's fallback is handed straight back out when the key is
+    # missing, so it is neither a store nor a query and takes no widening:
+    # the result may BE this argument, and the count handshake that makes
+    # that safe is written against a value the caller still owns.
+    mut byname: Map[String, Int?] := {}
+    print("{byname.get_default("a", 3).unwrap_or(0)}")
+
+    # a set has exactly two element flavors, int and string, and an optional
+    # is neither — so its store does not widen either.
+    mut s: Set[Int?] := {}
+    s.add(3)
+    print("{s.contains(3)}")
+    s.remove(3)
+
+    # widening still runs in one direction only, and only when the inner type
+    # matches: an optional does not narrow into a plain element, and a String
+    # is not the inner type of Int?.
+    mut plain: List[Int] := []
+    o: Int? := 3
+    plain.push(o)
+    xs.push("three")

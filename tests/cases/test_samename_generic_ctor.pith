@@ -1,0 +1,27 @@
+# two modules each declare `struct Box[T]`, both stay imported, and each value
+# is built with the module-qualified constructor. `a.Box(...)` must construct
+# and dispatch against module a's own declaration. a generic base has no type
+# id to key by, so its declaration, its methods and its instances were all
+# filed under the bare name "Box": both modules' Box[Int] shared one type id,
+# and every tag() ran whichever module's body registered last — 1005 and 2005
+# came out as two 2005s, or two 1005s with the imports the other way round.
+import clash_gbox_a as a
+import clash_gbox_b as b
+
+fn main():
+    ai := a.Box(5, 7)
+    bi := b.Box("lbl", 5, 7)
+    print(ai.tag().to_string())
+    print(bi.tag().to_string())
+    print(ai.only_a())
+    print(bi.only_b())
+    print(ai.get().to_string())
+    print(bi.get().to_string())
+    # the same two bases at a second type argument: each module's Box[String]
+    # is its own type too, with its own field order and its own method bodies
+    astr := a.Box(6, "seven")
+    bstr := b.Box("tag", 6, "eight")
+    print(astr.tag().to_string())
+    print(bstr.tag().to_string())
+    print(astr.get())
+    print(bstr.get())

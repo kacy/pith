@@ -1,0 +1,39 @@
+# clash_gbox_a — one of two modules that each declare same-named GENERIC
+# structs. the module-qualified constructor (`a.Box(...)`) must bind to this
+# module's own declaration and dispatch to these bodies, never to whichever
+# module registered the bare base name into the generic tables last.
+from clash_gnamed import Named
+
+pub struct Box[T]:
+    pub n: Int
+    pub v: T
+
+impl Box:
+    fn tag() -> Int:
+        return self.n + 1000
+    fn get() -> T:
+        return self.v
+    fn only_a() -> String:
+        return "a-only"
+
+# Cell is laid out identically to module b's Cell on purpose. a wrong binding
+# between the two reads the right fields and returns the wrong body's answer
+# with nothing to show for it — the silent half of this defect, which only an
+# output golden catches.
+pub struct Cell[T]:
+    pub n: Int
+    pub v: T
+
+impl Cell:
+    fn mark() -> Int:
+        return self.n + 10
+
+# the same clash reached through an interface impl rather than an inherent
+# one. the impl set was keyed by the bare base name too, so `impl Named for
+# Holder` in either module answered for both.
+pub struct Holder[T]:
+    pub v: T
+
+impl Named for Holder:
+    fn name() -> String:
+        return "a-holder"

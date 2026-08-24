@@ -1,0 +1,21 @@
+# the silent half of the same-named-generic clash: two modules declare
+# `struct Cell[T]` with identical layouts and different method bodies. nothing
+# about a wrong binding is visible in the field values — a.Cell(1, 0).mark()
+# simply returned 21 instead of 11, because both declarations were filed under
+# the bare base name "Cell" and the last module to register it answered for
+# both. only comparing the printed answers catches it, in either import order.
+import clash_gbox_a as a
+import clash_gbox_b as b
+
+fn main():
+    ca := a.Cell(1, 0)
+    cb := b.Cell(1, 0)
+    print(ca.mark().to_string())
+    print(cb.mark().to_string())
+    # the same silence one level up: each module implements the same interface
+    # on its own same-named generic, and the impl set was keyed by the bare
+    # base name — so both name() calls answered "b-holder".
+    ha := a.Holder(0)
+    hb := b.Holder(0)
+    print(ha.name())
+    print(hb.name())

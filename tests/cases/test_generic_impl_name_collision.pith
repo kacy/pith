@@ -2,10 +2,12 @@
 # in the duplicate-method check: generic bases dedup by (module, name),
 # because bare generic names are not globally unique. std.iter declares
 # MapIter with next(); so does this file — both register in one compile,
-# which the first cut of E263 (keyed by bare name) rejected. std's own
-# MapIter is deliberately not driven here: a same-named generic instance
-# still misbinds across modules at runtime (the E209/#163 family), which
-# is a separate, pre-existing defect.
+# which the first cut of E263 (keyed by bare name) rejected. a value of each
+# module's MapIter now carries its own type and dispatches to its own body —
+# see test_samename_generic_ctor for that guarantee. what std's MapIter is
+# still not driven through here is a generic function of std's whose return
+# type names it (iter.map_iter): a generic signature resolves in the caller's
+# module, so this file's MapIter answers for std's in that one path.
 import std.iter as iter
 
 pub struct MapIter[I, U]:

@@ -1,0 +1,37 @@
+# clash_gbox_b — the other module, declaring the same three generic bases.
+# Box carries a different field layout on purpose: `label` sits first, so a
+# constructor or method bound across the two modules would read the wrong
+# offsets and the golden output would show it.
+from clash_gnamed import Named
+
+pub struct Box[T]:
+    pub label: String
+    pub n: Int
+    pub v: T
+
+impl Box:
+    fn tag() -> Int:
+        return self.n + 2000
+    fn get() -> T:
+        return self.v
+    fn only_b() -> String:
+        return "b-only:" + self.label
+
+# the same layout as module a's Cell, and a different mark() body: the two
+# tell each other apart only by which body runs.
+pub struct Cell[T]:
+    pub n: Int
+    pub v: T
+
+impl Cell:
+    fn mark() -> Int:
+        return self.n + 20
+
+# the other `impl Named for Holder`, identical in shape to module a's and
+# different only in what name() returns.
+pub struct Holder[T]:
+    pub v: T
+
+impl Named for Holder:
+    fn name() -> String:
+        return "b-holder"

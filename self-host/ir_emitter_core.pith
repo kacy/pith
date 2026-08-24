@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import generic_base_identity, generic_identity_bare_name, c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -1251,7 +1251,7 @@ fn ir_tuple_walk_method_decl(impl_type: String, mname: String) -> Int:
         return 0 - 1
     for item_idx in ir_root_items(ir_tuple_walk_root):
         item := get_node(item_idx)
-        if item.kind != "impl_decl" or ir_impl_target_type(item) != impl_type:
+        if item.kind != "impl_decl" or ir_impl_target_type(item) != generic_identity_bare_name(impl_type):
             continue
         for child in item.children:
             method_idx := ir_unwrap_pub_child(child)
@@ -1923,6 +1923,34 @@ fn ir_impl_target_type(node: Node) -> String:
             impl_type = child_node.value
     return impl_type
 
+# the impl target's identity name — ir_impl_target_type, with a generic base
+# whose bare name a second module also declares replaced by its declaring
+# module's key. every table the emitter keys by an impl target goes through
+# this, so two modules' `impl Box:` never write over each other's methods,
+# specializations or associated types. an unambiguous name comes back
+# unchanged, which is every name in a program with no such clash.
+fn ir_impl_identity_type(node: Node, module_path: String) -> String:
+    impl_type := ir_impl_target_type(node)
+    if impl_type.len() == 0:
+        return impl_type
+    return generic_base_identity(module_path, impl_type)
+
+# the identity of a generic base named through a module alias, for a
+# `mod.Box(...)` call node. the alias says which module's declaration the call
+# means, which is exactly what the bare written name cannot. an alias that
+# names no module, or a name no second module declares generically, gives the
+# name back unchanged.
+fn ir_alias_generic_base_identity(idx: Int, name: String) -> String:
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return name
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return name
+    if not ir_module_aliases.contains_key(recv.value):
+        return name
+    return generic_base_identity(ir_module_aliases[recv.value], name)
+
 # for `impl Iface for Concrete`, the interface's base name; "" for a plain
 # `impl T:` block. the first type child is the interface, a for_type follows.
 fn ir_impl_interface_base(node: Node) -> String:
@@ -1966,14 +1994,14 @@ fn ir_inherited_default_indices(node: Node) -> List[Int]:
 
 # collect each impl's associated-type bindings so a method's `-> Item` header
 # resolves to the bound type (and, for heap types, gets the right return kind).
-fn ir_collect_assoc_bindings_in_root(root_idx: Int):
+fn ir_collect_assoc_bindings_in_root(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         mut actual := node
         if node.kind == "pub":
             actual = get_node(node.children[0])
         if actual.kind == "impl_decl":
-            impl_type := ir_impl_target_type(actual)
+            impl_type := ir_impl_identity_type(actual, module_path)
             if impl_type.len() > 0:
                 mut names: List[String] := []
                 for child in actual.children:
@@ -2114,8 +2142,14 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
     ir_struct_field_index_lookup.insert(struct_name + "." + field_name, field_index.to_string())
     return updated_fields
 
-fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool):
-    sname := ir_declared_struct_name(node)
+fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool, module_path: String):
+    bare := ir_declared_struct_name(node)
+    # a generic base whose bare name a second module also declares is filed
+    # under its declaring module's key as well, so an instance built from that
+    # identity finds its own module's layout. the bare entry stays for the call
+    # sites that only have a written name to go on; it is the only entry when
+    # the name is unambiguous, which is every program without such a clash.
+    sname := generic_base_identity(module_path, bare)
     ir_struct_decl_nodes.insert(sname, node_idx)
     mut field_names: List[String] := []
     for child in node.children:
@@ -2123,13 +2157,23 @@ fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool):
         if field_node.kind == "field":
             field_names = ir_record_struct_field(sname, field_names, field_node)
     ir_struct_names.insert(sname, field_names.len())
+    if sname != bare:
+        ir_struct_decl_nodes.insert(bare, node_idx)
+        mut bare_fields: List[String] := []
+        for child in node.children:
+            field_node := ir_unwrap_pub_node(child)
+            if field_node.kind == "field":
+                bare_fields = ir_record_struct_field(bare, bare_fields, field_node)
+        ir_struct_names.insert(bare, bare_fields.len())
     if emit_decl:
         if not ir_local_struct_names.contains(sname):
             ir_local_struct_names.push(sname)
         ir_emit("struct " + sname + " " + field_names.join(" "))
 
-fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
-    sname := node.value
+fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
+    # a generic enum base takes the same identity a generic struct base does,
+    # so two modules declaring the same enum name keep their variants apart.
+    sname := generic_base_identity(module_path, node.value)
     mut variant_names: List[String] := []
     for child in node.children:
         variant_node := ir_unwrap_pub_node(child)
@@ -2152,13 +2196,13 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
     if emit_decl:
         ir_emit("struct " + sname + " " + variant_names.join(" "))
 
-fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
+fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool, module_path: String):
     for item_idx in ir_root_items(root_idx):
         cn := get_node(item_idx)
         if cn.kind == "struct_decl" or cn.kind == "struct":
-            ir_collect_struct_decl(item_idx, cn, emit_decl)
+            ir_collect_struct_decl(item_idx, cn, emit_decl, module_path)
         elif cn.kind == "enum_decl" or cn.kind == "enum":
-            ir_collect_enum_decl(cn, emit_decl)
+            ir_collect_enum_decl(cn, emit_decl, module_path)
 
 fn ir_seed_global_types():
     for name in ir_global_int_names:
@@ -5821,6 +5865,11 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         mut call_name := alias_fname
+        # `mod.Box(...)` where Box is a generic struct comes back as the bare
+        # written name. when a second module declares a generic with that name
+        # too, the aliased module's declaration is the one this call means, and
+        # its identity is what the struct decl and its methods are keyed by.
+        call_name = ir_alias_generic_base_identity(idx, call_name)
         # a module-qualified struct construction (`mod.Struct(...)`) resolves the
         # alias member to the struct name. emit it through the same inline path as
         # a same-module construction so each field takes ownership and the struct
@@ -8877,7 +8926,7 @@ fn ir_emit_generic_specializations():
         i = i + 1
 
 fn ir_collect_impl_method_signatures(node: Node, module_path: String):
-    impl_type := ir_impl_target_type(node)
+    impl_type := ir_impl_identity_type(node, module_path)
     if impl_type.len() == 0:
         return
     for child in node.children:
@@ -9834,7 +9883,7 @@ fn ir_emit_top_level_items(root_idx: Int, root: Node):
                 ir_emit_test_func(item_idx, test_ord)
                 test_ord = test_ord + 1
         elif actual_node.kind == "impl_decl":
-            impl_type := ir_impl_target_type(actual_node)
+            impl_type := ir_impl_identity_type(actual_node, ir_current_module_path)
             ir_emit_impl_methods(actual_node, impl_type)
     if ir_emit_tests:
         ir_emit_test_main(root_idx)
@@ -9917,14 +9966,14 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     mut iface_i := 0
     while iface_i < method_roots.len():
         ir_index_interfaces_in_root(method_roots[iface_i])
-        ir_collect_assoc_bindings_in_root(method_roots[iface_i])
+        ir_collect_assoc_bindings_in_root(method_roots[iface_i], method_paths[iface_i])
         iface_i = iface_i + 1
     ir_index_interfaces_in_root(root_idx)
-    ir_collect_assoc_bindings_in_root(root_idx)
+    ir_collect_assoc_bindings_in_root(root_idx, ir_current_module_path)
 
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
-        ir_collect_struct_decls(ir_preloaded_import_roots[preload_i], false)
+        ir_collect_struct_decls(ir_preloaded_import_roots[preload_i], false, ir_preloaded_import_paths[preload_i])
         preload_i = preload_i + 1
 
     mut impl_i := 0
@@ -9935,9 +9984,9 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if node.kind == "struct_decl" or node.kind == "struct":
-            ir_collect_struct_decl(item_idx, node, true)
+            ir_collect_struct_decl(item_idx, node, true, ir_current_module_path)
         elif node.kind == "enum_decl" or node.kind == "enum":
-            ir_collect_enum_decl(node, true)
+            ir_collect_enum_decl(node, true, ir_current_module_path)
         elif node.kind == "impl_decl":
             ir_collect_impl_method_signatures(node, "")
 
@@ -10054,7 +10103,7 @@ fn ir_preregister_all_impl_specializations(root_idx: Int, root: Node):
         if node.kind == "pub":
             actual_node = get_node(node.children[0])
         if actual_node.kind == "impl_decl":
-            impl_type := ir_impl_target_type(actual_node)
+            impl_type := ir_impl_identity_type(actual_node, ir_current_module_path)
             if impl_type.len() > 0:
                 ir_register_impl_method_specialization_names(actual_node, impl_type)
 

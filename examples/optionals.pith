@@ -54,3 +54,15 @@ fn main():
     # a list literal mixing none with values is a list of optionals
     ranks: List[Int?] := [1, none, 3]
     print("ranks: {ranks.len()}, second empty: {ranks[1] == none}")
+
+    # a container's store positions widen too, so a plain value goes straight
+    # in — no `T?` local first. the query positions do not: they compare
+    # against what the list already holds, and `ranks.contains(3)` reports.
+    mut more: List[Int?] := []
+    more.push(4)
+    more.push(none)
+    print("more: {more.len()}, first: {more[0].unwrap_or(0)}")
+
+    mut by_name: Map[String, Int?] := {}
+    by_name.insert("dana", 77)
+    print("dana: {by_name.get_default("dana", none).unwrap_or(0)}")

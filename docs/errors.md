@@ -221,7 +221,10 @@ the reverse is fine: a plain value passed to an optional parameter widens to
 `Some(v)`, so `f(3)` against `fn f(x: Int?)` is accepted. it does not run
 backwards — an `Int?` argument to an `Int` parameter still reports here, and
 so does an inner type that does not match (`f("three")` against `Int?`).
-a few argument positions do not widen yet; see `docs/limitations.md`.
+a builtin container position that looks a value up rather than stores it —
+`xs.contains(3)`, `m.contains_key(3)`, a map key — reports here too, because
+a freshly built `Some(3)` would not compare equal to the one the container
+holds; see `docs/limitations.md`.
 
 ### E220 — pipe operator error
 

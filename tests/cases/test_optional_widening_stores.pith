@@ -1,0 +1,158 @@
+# a plain value written into a position that STORES it widens to Some(v):
+# a builtin container's store, an enum variant's payload, and a collection
+# literal whose element or container is an optional. accepting the spelling is
+# only half of it — every probe reads the value back out of the container or
+# the variant it was stored into, and the heap payloads are read again after
+# the frame that built them is gone, so a shell that lost its payload shows up
+# as a wrong answer rather than as nothing at all.
+
+struct Point:
+    pub n: Int
+
+struct Holder:
+    pub rows: Map[String, List[Int]?]
+    pub opt: List[Int?]?
+
+enum Probe:
+    Alpha(Int?)
+    Held(Point?)
+    Beta
+
+enum Box[T]:
+    Held(T?)
+    Empty
+
+fn show(x: Int?) -> String:
+    return "{x == none}/{x.unwrap_or(0 - 1)}"
+
+fn build_ints() -> List[Int?]:
+    mut xs: List[Int?] := []
+    xs.push(3)
+    xs.push(none)
+    bound: Int? := 5
+    xs.push(bound)
+    xs.insert(0, 9)
+    return xs
+
+fn build_points() -> List[Point?]:
+    mut ps: List[Point?] := []
+    ps.push(Point(7))
+    ps.push(none)
+    return ps
+
+fn build_map() -> Map[String, Int?]:
+    mut m: Map[String, Int?] := {}
+    m.insert("a", 3)
+    m.insert("b", none)
+    return m
+
+fn build_point_map() -> Map[String, Point?]:
+    mut m: Map[String, Point?] := {}
+    m.insert("p", Point(11))
+    return m
+
+fn build_nested_lists() -> List[List[Int]?]:
+    mut xs: List[List[Int]?] := []
+    xs.push([1, 2])
+    xs.push(none)
+    return xs
+
+fn alpha_of(n: Int) -> Probe:
+    return Probe.Alpha(n)
+
+fn held_of(n: Int) -> Probe:
+    return Probe.Held(Point(n))
+
+fn probe_label(p: Probe) -> String:
+    return match p:
+        Probe.Alpha(v) => "alpha:{show(v)}"
+        Probe.Held(q) => "held:{q.unwrap_or(Point(0 - 1)).n}"
+        Probe.Beta => "beta"
+
+fn box_label(b: Box[Int]) -> String:
+    return match b:
+        Box.Held(v) => "box:{show(v)}"
+        Box.Empty => "box:empty"
+
+fn count_optional_list(xs: List[Int?]?) -> Int:
+    return match xs:
+        some => some.len()
+        none => 0 - 1
+
+# a container payload is read through a match binding rather than unwrap_or:
+# `some_list_optional.unwrap_or([])` hands the payload back without a count
+# and the shell then frees it, which is its own open defect and not this
+# case's subject.
+fn count_nested(m: Map[String, List[Int]?], key: String) -> Int:
+    return match m.get_default(key, none):
+        got => got.len()
+        none => 0 - 1
+
+fn count_rows(rows: List[List[Int]?], at: Int) -> Int:
+    return match rows[at]:
+        got => got.len()
+        none => 0 - 1
+
+fn main():
+    # a builtin container's store positions
+    ints := build_ints()
+    print("push:{show(ints[0])} {show(ints[1])} {show(ints[2])} {show(ints[3])}")
+    pts := build_points()
+    print("push_struct:{pts[0].unwrap_or(Point(0 - 1)).n} {pts[1] == none}")
+    m := build_map()
+    print("insert:{show(m.get_default("a", none))} {show(m.get_default("b", none))}")
+    pm := build_point_map()
+    print("insert_struct:{pm.get_default("p", none).unwrap_or(Point(0 - 1)).n}")
+
+    mut strs: List[String?] := []
+    strs.push("kept")
+    fresh := "fr" + "esh"
+    strs.push(fresh)
+    print("push_string:{strs[0].unwrap_or("MISS")} {strs[1].unwrap_or("MISS")} {fresh}")
+
+    # a literal stored into a container of optional containers widens its
+    # elements and its container in the same store
+    nested := build_nested_lists()
+    print("push_literal:{count_rows(nested, 0)} {nested[1] == none}")
+
+    # an enum variant payload
+    print("variant:{probe_label(alpha_of(4))}")
+    print("variant_none:{probe_label(Probe.Alpha(none))}")
+    print("variant_struct:{probe_label(held_of(6))}")
+    print("variant_generic:{box_label(Box.Held(8))}")
+    print("variant_generic_none:{box_label(Box.Empty)}")
+
+    # a collection literal against a container-typed optional element
+    by_name: Map[String, List[Int]?] := {"a": [1, 2], "b": none}
+    print("map_literal:{count_nested(by_name, "a")} {count_nested(by_name, "b")}")
+    rows: List[List[Int]?] := [[1, 2, 3], none]
+    print("list_literal:{count_rows(rows, 0)} {rows[1] == none}")
+
+    # a literal that has to widen its elements and its container at once
+    print("both:{count_optional_list([1, 2])}")
+    print("both_none:{count_optional_list(none)}")
+
+    # the same two shapes in the other positions a declared type reaches:
+    # a struct field, positional and named, and an assignment
+    h := Holder({"a": [1, 2]}, [3, 4, 5])
+    print("field:{count_nested(h.rows, "a")} {count_optional_list(h.opt)}")
+    hn := Holder(rows: {"b": [1]}, opt: [9])
+    print("field_named:{count_nested(hn.rows, "b")} {count_optional_list(hn.opt)}")
+    mut assigned: Map[String, List[Int]?] := {}
+    assigned = {"c": [1, 2, 3]}
+    mut both: List[Int?]? := none
+    both = [7, 8]
+    print("assign:{count_nested(assigned, "c")} {count_optional_list(both)}")
+
+    # the payloads outlive the frames that stored them, and repeating the
+    # store keeps answering the same way
+    mut kept: List[Point?] := []
+    mut i := 0
+    while i < 200:
+        kept.push(Point(i * 3))
+        i = i + 1
+    mut total := 0
+    for k in kept:
+        total = total + k.unwrap_or(Point(0)).n
+    print("kept_total:{total}")
+    print("kept_last:{kept[199].unwrap_or(Point(0 - 1)).n}")

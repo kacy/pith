@@ -83,15 +83,22 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **duplicate method names across impl blocks are rejected** — a struct's
   methods can be declared in more than one impl block, including a block in
   a different module than the struct, and every method resolves from any
-  call site that can see the value. method dispatch is per-declaration:
-  two modules can each declare a plain struct with the same name, a
-  module-qualified constructor binds to that module's own declaration,
-  shared method names dispatch to the receiver's own body, and a method
-  the receiver's struct does not declare is E209 even when the other
-  struct has it — in either import order. the one remaining clash is
-  same-named *generic* structs across modules (issue #912): their method
-  tables are keyed by the bare base name, so the last import's bodies win
-  silently. give same-named generic structs distinct names until then.
+  call site that can see the value. method dispatch is per-declaration.
+  two modules can each declare a struct with the same name, plain or
+  generic: a module-qualified constructor binds to that module's own
+  declaration, shared method names dispatch to the receiver's own body,
+  and a method the receiver's struct does not declare is E209 even when
+  the other struct has it. import order changes none of that, and an
+  interface impl on each module's own same-named generic dispatches per
+  module too. three narrower clashes are still keyed by the bare name,
+  and all three fail at compile time rather than quietly running the
+  wrong body. a generic function whose signature names a generic its own
+  module declares resolves that name in the calling module, so
+  `iter.map_iter(...)` yields the caller's `MapIter` when the caller
+  declares one too. two modules that each declare the same generic enum
+  do not compile. a generic struct sharing its name with a plain struct
+  in another module resolves to the plain one. give those three shapes
+  distinct names.
   a second impl block giving the *same* declaration
   the *same* method name used to overwrite the first silently, with the
   winning body decided by module order — that is now E263. one deliberate

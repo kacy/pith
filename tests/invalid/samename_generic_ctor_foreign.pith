@@ -1,0 +1,12 @@
+# two modules each declare a generic `struct Box[T]` and only module a's has
+# only_a(). calling only_a() on module b's Box — built with the
+# module-qualified constructor — must be E209 on b's declaration, not answered
+# by a's same-named method on a base name the two used to share.
+import support.samename_gbox_a as a
+import support.samename_gbox_b as b
+
+fn main():
+    ok := a.Box(1)
+    print(ok.only_a())
+    bad := b.Box(2)
+    print(bad.only_a())

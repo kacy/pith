@@ -71,6 +71,19 @@ mut struct_field_default_nodes: Map[String, Int] := {}
 # legacy map kept for probes; generic declaration lookup uses flat lists
 pub mut generic_declaration_map: Map[String, Int] := {}
 mut generic_declaration_names: List[String] := []
+# the first module seen to declare a generic under each bare base name, and
+# the bare base names more than one module declares. a generic base has no
+# type id to key by, so every table that describes one keys by its name —
+# and a bare name shared by two modules would merge the two declarations.
+# see generic_base_identity for how the ambiguous ones are told apart.
+mut generic_base_first_module: Map[String, String] := {}
+mut ambiguous_generic_bases: Map[String, Bool] := {}
+# each qualified generic key back to the bare name it was built from, for the
+# few places that hold an identity and have to match it against a written name.
+mut generic_identity_bare_names: Map[String, String] := {}
+# the module each generic declaration was registered from, keyed by its AST
+# node index, so an instantiation can name the declaration it came from.
+mut generic_declaration_modules: Map[Int, String] := {}
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
@@ -147,6 +160,10 @@ pub fn initialize_checker(file_path: String):
     struct_field_default_nodes = {}
     generic_declaration_map = {}
     generic_declaration_names = []
+    generic_base_first_module = {}
+    ambiguous_generic_bases = {}
+    generic_identity_bare_names = {}
+    generic_declaration_modules = {}
     checker_interfaces_reset()
     implementation_set = {}
     impl_interface_args = {}
@@ -831,6 +848,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
     first_type_node := get_node(node.children[0])
     mut concrete_name := ""
     mut interface_name := ""
+    mut iface_base := ""
     mut method_start := 1
 
     # check if there's a for_type node
@@ -842,15 +860,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             for_inner := get_node(second_node.children[0])
             concrete_name = get_type_node_name(for_inner)
             method_start = 2
-            # record in impl set, keyed on base names so generic instances
-            # (FilterIter[Range, Int]) find the impl registered for FilterIter
-            iface_base := iface_type_base_name(first_type_node)
-            key := concrete_name + chr(9) + iface_base
-            implementation_set.insert(key, 1)
-            # also record the impl's interface-arg encoding (per-arg "tid:N" or
-            # "param:N" — see encode_impl_iface_args) so bound-based inference
-            # can recover the args and substitute the receiver's instance args
-            impl_interface_args.insert(key, encode_impl_iface_args(concrete_name, first_type_node))
+            iface_base = iface_type_base_name(first_type_node)
         else:
             concrete_name = get_type_node_name(first_type_node)
     else:
@@ -858,6 +868,28 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
 
     if concrete_name == "":
         return
+
+    # when the impl targets a generic base, file every entry below under the
+    # declaring module's key as well as the bare one. an instance of a generic
+    # whose bare name two modules share is named from that key, so this is what
+    # its dispatch, interface and associated-type lookups find; the bare entry
+    # stays for every program where the name is unambiguous. see
+    # generic_base_alias_key for why the choice cannot be made here.
+    generic_alias := generic_base_alias_key(concrete_name)
+
+    if iface_base != "":
+        # record in impl set, keyed on base names so generic instances
+        # (FilterIter[Range, Int]) find the impl registered for FilterIter
+        key := concrete_name + chr(9) + iface_base
+        implementation_set.insert(key, 1)
+        # also record the impl's interface-arg encoding (per-arg "tid:N" or
+        # "param:N" — see encode_impl_iface_args) so bound-based inference
+        # can recover the args and substitute the receiver's instance args
+        impl_interface_args.insert(key, encode_impl_iface_args(concrete_name, first_type_node))
+        if generic_alias != "":
+            alias_key := generic_alias + chr(9) + iface_base
+            implementation_set.insert(alias_key, 1)
+            impl_interface_args.insert(alias_key, impl_interface_args[key])
 
     # if this impl is for a generic struct, suppress `unknown type` errors for
     # the struct's type parameters while registering its methods so signatures
@@ -880,9 +912,14 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             active_assoc_bindings.insert(cn.value, bound_tid)
             assoc_type_binding.insert(concrete_name + "." + cn.value, bound_tid)
             assoc_type_binding_node.insert(concrete_name + "." + cn.value, cn.children[0])
+            if generic_alias != "":
+                assoc_type_binding.insert(generic_alias + "." + cn.value, bound_tid)
+                assoc_type_binding_node.insert(generic_alias + "." + cn.value, cn.children[0])
             assoc_names_for_type.push(cn.value)
     if assoc_names_for_type.len() > 0:
         type_assoc_names.insert(concrete_name, assoc_names_for_type.join(","))
+        if generic_alias != "":
+            type_assoc_names.insert(generic_alias, assoc_names_for_type.join(","))
 
     # register each method (skip first method_start children)
     mut skip := method_start
@@ -898,7 +935,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             method_node_idx = cn.children[0]
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
-            register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub, interface_name != "")
+            register_method_declaration_aliased(concrete_name, generic_alias, method_node_idx, cn, method_is_pub, interface_name != "")
     active_assoc_bindings = {}
 
     # clear the suppression for the next impl block
@@ -921,6 +958,14 @@ fn method_owner_type_id(type_name: String) -> Int:
     return lookup_type_id(resolve_imported_type_name(type_name))
 
 fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool, from_interface: Bool):
+    register_method_declaration_aliased(type_name, "", node_idx, node, is_pub, from_interface)
+
+# register one impl method. `alias_name` is the declaring module's key for a
+# generic base (see generic_base_alias_key) or "": when it is set, the method
+# is filed under that key too, so a receiver whose generic base name is shared
+# with another module's finds the body its own module declared. pass "" for a
+# concrete type — those are told apart by the owner tid instead.
+fn register_method_declaration_aliased(type_name: String, alias_name: String, node_idx: Int, node: Node, is_pub: Bool, from_interface: Bool):
     mut method_name := node.value
     fn_tid := resolve_function_signature(node)
     key := type_name + "." + method_name
@@ -972,6 +1017,12 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
         register_method_owner(key, owner)
     else:
         clear_method_owner(key)
+    if alias_name != "":
+        alias_key := alias_name + "." + method_name
+        method_type_map.insert(alias_key, fn_tid)
+        method_visibility_map.insert(alias_key, is_pub)
+        register_method_signature(alias_key, node_idx)
+        clear_method_owner(alias_key)
 
 # after all interfaces and impls are registered, an `impl Iface for T`
 # inherits every default method (a fn_decl member of the interface) that
@@ -1002,6 +1053,7 @@ fn fill_impl_defaults(node: Node):
     if interface_decl_index.contains_key(iface_base) == false:
         return
     iface_node := get_node(interface_decl_index[iface_base])
+    generic_alias := generic_base_alias_key(concrete_name)
     for member in iface_node.children:
         mn := get_node(member)
         # a fn_decl member carries a body: it is a default. an abstract
@@ -1017,7 +1069,7 @@ fn fill_impl_defaults(node: Node):
             if owner >= 0:
                 provides_own = has_method_declaration(method_tid_key(owner, mn.value))
             if provides_own == false:
-                register_method_declaration(concrete_name, member, mn, true, true)
+                register_method_declaration_aliased(concrete_name, generic_alias, member, mn, true, true)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
     # match on base names so a generic instance like FilterIter[Range, Int]
@@ -1090,9 +1142,73 @@ fn register_generic_declaration(name: String, node_idx: Int):
     if generic_declaration_map.contains_key(key) == false:
         generic_declaration_names.push(key)
     generic_declaration_map.insert(key, node_idx)
+    generic_declaration_modules.insert(node_idx, current_checker_module_path)
+    if key != name:
+        generic_identity_bare_names.insert(key, name)
+    # a second module declaring a generic under this bare base name makes the
+    # bare name ambiguous from here on. modules are checked one at a time, so
+    # this is only settled once every module has registered — which is why the
+    # identity below is consulted at use time, never at registration time.
+    if generic_base_first_module.contains_key(name):
+        if generic_base_first_module[name] != current_checker_module_path:
+            ambiguous_generic_bases.insert(name, true)
+    else:
+        generic_base_first_module.insert(name, current_checker_module_path)
     if current_checker_module_path.len() > 0 and generic_declaration_map.contains_key(name) == false:
         generic_declaration_names.push(name)
         generic_declaration_map.insert(name, node_idx)
+
+# the name every table keys a generic base by. a generic declaration has no
+# type id to key on — only its instances get one — so a struct's methods, its
+# interface impls, its associated-type bindings and its instance names are all
+# filed under the base name. that name is unique in almost every program, and
+# stays bare when it is; when two modules each declare a generic with the same
+# bare name it is not, and the declaration's own module joins the key so the
+# two never merge. deciding this per name rather than always qualifying keeps
+# every program that has no such clash keyed exactly as before, down to the
+# emitted symbols.
+pub fn generic_base_identity(module_path: String, name: String) -> String:
+    if ambiguous_generic_bases.contains_key(name) == false:
+        return name
+    key := module_generic_target_name(module_path, name)
+    if generic_declaration_map.contains_key(key):
+        return key
+    return name
+
+# the bare name a generic identity was built from, or the name unchanged when
+# it is already bare. for the callers that hold an identity and have to match
+# it against a name written in source, which never carries the module.
+pub fn generic_identity_bare_name(identity: String) -> String:
+    if generic_identity_bare_names.contains_key(identity):
+        return generic_identity_bare_names[identity]
+    return identity
+
+# the identity of the generic declaration at this AST node index, resolved
+# from the module it was registered in. instantiation names an instance from
+# this, so two modules' `Box[Int]` become two differently named types with
+# two type ids instead of merging into one.
+pub fn generic_declaration_identity(decl_idx: Int) -> String:
+    decl := get_node(decl_idx)
+    if generic_declaration_modules.contains_key(decl_idx):
+        return generic_base_identity(generic_declaration_modules[decl_idx], decl.value)
+    return decl.value
+
+# the declaring module's key for the generic base `name`, or "" when `name`
+# names no module-declared generic. registration runs one module at a time,
+# long before the last module has had its chance to make a bare base name
+# ambiguous, so a registration site cannot ask generic_base_identity what the
+# key will be — it files its entry under this key as well as the bare one and
+# lets the use site pick. the extra entry is inert in a program with no clash.
+fn generic_base_alias_key(name: String) -> String:
+    decl_idx := get_generic_declaration_index(name)
+    if decl_idx < 0:
+        return ""
+    if generic_declaration_modules.contains_key(decl_idx) == false:
+        return ""
+    qualified := module_generic_target_name(generic_declaration_modules[decl_idx], name)
+    if qualified == name:
+        return ""
+    return qualified
 
 fn resolve_generic_declaration_key(name: String) -> String:
     if current_checker_module_path.len() > 0:
@@ -3098,7 +3214,7 @@ fn check_generic_struct_call_explicit(name: String, index_node: Node, arg_indice
             subst_map.insert(gp, type_args[gp_i])
     if check_type_parameter_bounds(decl_idx, subst_map) == false:
         return TID_ERR
-    struct_tid := instantiate_generic_struct_type(decl_node, type_args)
+    struct_tid := instantiate_generic_struct_type(decl_idx, type_args)
     if struct_tid < 0:
         return TID_ERR
     return check_struct_constructor(get_type_name(struct_tid), struct_tid, get_type_info(struct_tid), arg_indices, scope_id)
@@ -3550,7 +3666,7 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
         else:
             type_args.push(TID_ERR)
     # instantiate the struct and reuse the concrete constructor checks
-    struct_tid := instantiate_generic_struct_type(decl_node, type_args)
+    struct_tid := instantiate_generic_struct_type(decl_idx, type_args)
     if struct_tid < 0:
         return TID_ERR
     return check_struct_constructor(get_type_name(struct_tid), struct_tid, get_type_info(struct_tid), arg_indices, scope_id)
@@ -6148,14 +6264,20 @@ fn check_await_expression(node: Node, scope_id: Int) -> Int:
 fn instantiate_generic_type(decl_idx: Int, type_args: List[Int]) -> Int:
     decl := get_node(decl_idx)
     if decl.kind == "struct_decl":
-        return instantiate_generic_struct_type(decl, type_args)
+        return instantiate_generic_struct_type(decl_idx, type_args)
     if decl.kind == "enum_decl":
-        return instantiate_generic_enum_type(decl, type_args)
+        return instantiate_generic_enum_type(decl_idx, type_args)
     return TID_ERR
 
-fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
-    name := decl.value
-    base_name := name
+fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
+    decl := get_node(decl_idx)
+    # the instance is named from the declaration's identity, not from its bare
+    # name: with two modules each declaring `Box[T]`, one shared name would
+    # hand the second module's instantiation the first module's type id, and
+    # one type would answer for both — wrong fields, wrong method bodies. the
+    # identity is the bare name in every program without such a clash, so the
+    # instance names and the symbols built from them do not move.
+    base_name := generic_declaration_identity(decl_idx)
     inst_name := build_instantiated_type_name(base_name, type_args)
     existing := lookup_type_id(inst_name)
     if existing != -1:
@@ -6197,9 +6319,11 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
     set_type_info(tid, ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
     return tid
 
-fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
-    name := decl.value
-    base_name := name
+fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
+    decl := get_node(decl_idx)
+    # named from the declaration's identity for the same reason as the struct
+    # path above: two modules' same-named generic enums must not share a tid.
+    base_name := generic_declaration_identity(decl_idx)
     inst_name := build_instantiated_type_name(base_name, type_args)
     existing := lookup_type_id(inst_name)
     if existing != -1:

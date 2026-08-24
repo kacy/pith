@@ -36,6 +36,8 @@ cases=(
   tests/leaks/leak_loop_var_slot
   tests/leaks/leak_list_transform
   tests/leaks/leak_module_call_string
+  tests/leaks/leak_optional_string_payload
+  tests/leaks/leak_optional_literal_elements
   tests/leaks/leak_unwrap_extract
   tests/leaks/leak_owned_temp_field_read
   tests/leaks/leak_enum_bare_variant

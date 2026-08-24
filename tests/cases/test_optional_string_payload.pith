@@ -1,0 +1,62 @@
+# an optional owns the string it carries. these cases print the payload back
+# out of every shape that can build one, because the failure this pins is not
+# a leak but its opposite: a shell that releases a string somebody else still
+# owns hands back recycled bytes, and only the printed value shows it. the
+# loops repeat each shape so a freed buffer has to be reused before it is read.
+
+struct Holder:
+    pub label: String?
+
+fn wrap(i: Int) -> String?:
+    return "wrapped-{i}"
+
+fn probe(v: String?) -> String:
+    return v.unwrap_or("none")
+
+fn main():
+    lit: List[String?] := ["lit-{1}", none, "lit-{2}"]
+    print("{lit[0].value()} {lit[1] == none} {lit[2].value()}")
+
+    entries: Map[String, String?] := {"a": "map-{1}", "b": none}
+    print("{entries["a"].value()} {entries["b"] == none}")
+
+    mut indexed: Map[String, String?] := {}
+    indexed["k"] = "indexed-{1}"
+    print("{indexed["k"].value()}")
+
+    mut pushed: List[String?] := []
+    fresh: String? := "pushed-{1}"
+    pushed.push(fresh)
+    print("{pushed[0].value()} {fresh.value()}")
+
+    # a borrowed payload: the local keeps its own count, so both must read back
+    owner := "owner-{1}"
+    borrowed: String? := owner
+    held: List[String?] := [owner]
+    print("{held[0].value()} {borrowed.value()} {owner}")
+
+    h := Holder(label: "field-{1}")
+    print("{h.label.value()}")
+
+    print("{probe(wrap(7))} {probe(none)} {probe("widened-{1}")}")
+
+    # repetition: an over-release shows up as a recycled buffer carrying
+    # someone else's bytes, so the same shapes run again and are compared
+    mut bad := 0
+    mut i := 0
+    while i < 500:
+        round: List[String?] := ["r-{i}", none]
+        m: Map[String, String?] := {"k": "m-{i}"}
+        v: String? := "v-{i}"
+        mut into: List[String?] := []
+        into.push(v)
+        if round[0].value() != "r-{i}":
+            bad = bad + 1
+        if m["k"].value() != "m-{i}":
+            bad = bad + 1
+        if into[0].value() != "v-{i}":
+            bad = bad + 1
+        if probe(wrap(i)) != "wrapped-{i}":
+            bad = bad + 1
+        i = i + 1
+    print("mismatches {bad}")

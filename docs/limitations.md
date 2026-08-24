@@ -253,11 +253,16 @@ correctness story:
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) owns the optionals it holds, the same as a container
   built by pushing into it: the literal's wrapped elements are tagged like
-  any other heap element and released with the container. one gap remains
-  for both forms: an optional holding a fresh heap *string* (`List[String?]`
-  of built strings, whether pushed or written in a literal) releases its
-  shell but not the string, about 30 bytes per element — a string payload's
-  shell carries no destructor, and inside a container nothing else cascades.
+  any other heap element and released with the container. an optional over a
+  string owns that string as well, wherever the `Some` is built — a list or
+  map literal, an index assignment, a binding, a struct field, a widened
+  argument — so a `List[String?]` of built strings reclaims them with the
+  container, and a payload the wrap borrowed keeps its owner's count intact.
+  what still leaks is a bare `none` written straight into a container store
+  (`xs.push(none)`, `m[k] = none`), about 62 bytes a store: the shell the
+  caller builds keeps a count the store never takes and the caller never
+  drops. binding it first (`v: String? := none` then `xs.push(v)`) is
+  reclaimed normally.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

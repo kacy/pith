@@ -1,0 +1,40 @@
+# an optional whose payload is a freshly built heap string. the shell used to
+# borrow a string payload, which is right for one some local keeps a count for
+# and wrong for one built into the Some on the spot: the container released the
+# shell and nothing released the string, ~32 bytes per element. every shape
+# that can put a fresh string inside a container optional runs here — the list
+# literal, the map literal, an index assignment, and a bound optional pushed in
+# — beside a borrowed payload, which must stay on its owner's count and not be
+# released twice.
+#
+# `xs.push(none)` is deliberately absent: a bare none handed to a container
+# store keeps a shell count the caller never drops, ~62 bytes a round, and it
+# leaks that way with or without the destructor this case exists for. the none
+# shells the literals below build are covered and are flat.
+import leakprobe as probe
+
+fn churn_round(i: Int):
+    lit: List[String?] := ["a-{i}", none, "b-{i}"]
+    entries: Map[String, String?] := {"k": "c-{i}", "n": none}
+    mut indexed: Map[String, String?] := {}
+    indexed["k"] = "d-{i}"
+    mut pushed: List[String?] := []
+    fresh: String? := "e-{i}"
+    pushed.push(fresh)
+    owner := "f-{i}"
+    borrowed: String? := owner
+    mut held: List[String?] := [owner]
+    held.push(borrowed)
+    if lit.len() + entries.len() + indexed.len() + pushed.len() + held.len() == 0:
+        print("impossible")
+    if owner.len() == 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

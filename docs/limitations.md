@@ -493,12 +493,18 @@ a `std.net.tls` config that the caller builds is the caller's to close, and
 nothing in the language notices when one is not. the rule is now uniform inside
 std — whoever builds a config closes it, and `client_config()` shares one cached
 root bundle rather than handing out a copy — so an https request no longer leaks
-a config per request. what is left is that the compiler cannot help: a program
-that builds its own config for `dial_with_config` and forgets `close()` holds a
-registry slot until it exits, with no diagnostic. the slot is small now, which
-makes it a slow leak rather than a fast one, which is arguably worse. what would
-actually fix it is a destructor that runs when the last reference to a `Config`
-goes away, which is the same missing feature behind several entries here.
+a config per request. what is left is that the language still does not close one
+for you: a program that builds its own config for `dial_with_config` and forgets
+`close()` holds a registry slot until it exits. the slot is small now, which
+makes it a slow leak rather than a fast one, which is arguably worse. `pith
+lint` now names the narrow case — a config built locally, used in place and
+never closed reports E307 — but a warning on one pattern is not the destructor
+that would run when the last reference to a `Config` goes away, which is the
+same missing feature behind several entries here.
+[docs/destructors_roadmap.md](destructors_roadmap.md) surveys every std type in
+the same position, measures how close the emitter's destructor machinery
+actually is, and says why the recommendation is the diagnostic rather than the
+destructor.
 
 the root bundle cache that made per-request configs cheap is capped at eight
 distinct bundles and never evicts. a process that trusts more than eight

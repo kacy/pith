@@ -379,7 +379,11 @@ gaps, all bounded leaks rather than dangling pointers:
   locals, so the cleanup still sees them. for cleanup that should happen
   only when something went wrong — roll back a half-finished transaction,
   delete a partial file — use `errdefer`, which runs on the error exits
-  and stays quiet on a normal return.
+  and stays quiet on a normal return. `pith lint` reports the narrow case
+  where a resource is built locally, used in place and never closed
+  (E307). the full survey of what needs a manual close, and the plan for
+  whether a destructor hook should ever replace the convention, is in
+  [destructors_roadmap.md](destructors_roadmap.md).
 - **a result consumed with `catch` or `unwrap_or` can leak its ok
   value** when that value was freshly built (a returned tuple, a
   concatenated string). the consumer has no way to tell a fresh ok

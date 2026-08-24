@@ -10,6 +10,7 @@
 #   E304 — public function missing doc comment
 #   E305 — indentation depth exceeds 4 levels
 #   E306 — a strong reference cycle between structs
+#   E307 — a resource built locally and never closed
 
 from ast import Node, get_node
 from errors import Diagnostic
@@ -26,6 +27,13 @@ mut l_file := ""
 # the strong-cycle pass at the end of lint_module (E306, below).
 mut l_struct_decls: Map[String, Int] := {}
 mut l_reported_cycles: List[String] := []
+
+# the module's import aliases (alias -> dotted module path) and the two
+# answers the use scan produces, for the unclosed-resource pass (E307,
+# below). the scan writes its answers here because it recurses.
+mut l_import_aliases: Map[String, String] := {}
+mut l_resource_escaped := false
+mut l_resource_closed := false
 
 fn report_linter_warning(code: String, message: String, line: Int, col: Int):
     l_diagnostics.push(Diagnostic("warning", code, message, l_file, line, col, ""))
@@ -72,7 +80,13 @@ pub fn lint_module(root_idx: Int, source: String, file: String) -> List[Diagnost
     l_file = file
     l_struct_decls = {}
     l_reported_cycles = []
+    l_import_aliases = {}
     root := get_node(root_idx)
+    # imports are read first: the unclosed-resource rule resolves a call's
+    # module from the alias it was imported under, and a rule that ran in
+    # declaration order would miss an import written below a function.
+    for child in root.children:
+        l_record_import_alias(child)
     for child in root.children:
         lint_top_level(child, source)
     lint_strong_cycles()
@@ -133,6 +147,7 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
         cn := get_node(child)
         if cn.kind == "body":
             lint_block_depth(cn, 1)
+            lint_unclosed_resources(child)
 
 fn lint_impl_decl(node: Node, source: String):
     # iterate methods
@@ -161,6 +176,7 @@ fn lint_impl_decl(node: Node, source: String):
                 cn := get_node(child)
                 if cn.kind == "body":
                     lint_block_depth(cn, 1)
+                    lint_unclosed_resources(child)
 
 # ---------------------------------------------------------------
 # E300: snake_case for functions and variables
@@ -440,3 +456,130 @@ fn lint_strong_cycles():
             else:
                 message = "struct '" + sname + "' reaches itself through a strong reference cycle starting at field '" + fname + "' (" + target + "); a cycle of strong references is never reclaimed"
             l_diagnostics.push(Diagnostic("warning", "E306", message, l_file, line, col, "mark the back edge with `weak` (`weak " + fname + ": ...`), see docs/ownership.md"))
+
+# ---------------------------------------------------------------
+# E307: a resource built locally and never closed
+# ---------------------------------------------------------------
+#
+# reference counting reclaims a value's memory; it does not give back the
+# registry slot, socket or fd behind a handle. std's rule is that whoever
+# builds a resource closes it, and until this rule nothing said so when a
+# caller forgot (docs/destructors_roadmap.md has the survey and the plan).
+#
+# the rule is deliberately narrow, because a false positive on a resource
+# that is closed somewhere the linter cannot see is worse than no rule at
+# all. it reports only when BOTH hold:
+#
+#   - the binding's initializer is a call to a constructor on the short
+#     list below, reached through `!`/`?` and any chain of builder methods
+#   - every later mention of the name is the receiver of a method that is
+#     not a closer
+#
+# any other use silences it: passed as an argument, returned, assigned,
+# stored, read as a field, captured by a lambda. each of those can hand
+# the resource to something that closes it, and none of them is visible
+# from one module.
+#
+# the constructor list stays short on purpose. an entry has to be a call
+# whose result the caller owns, on a type with no method that consumes the
+# receiver instead of closing it. `bytes.ByteBuffer` is the counterexample
+# that sets the bar: `take_bytes()` frees the buffer as it takes its
+# contents, so a buffer that never sees `free()` can still be correct, and
+# listing it would report working code.
+
+# the label to name in the diagnostic, or "" when this call does not build
+# a resource the caller has to close.
+fn l_resource_ctor_label(module_path: String, fn_name: String) -> String:
+    if module_path != "std.net.tls":
+        return ""
+    if fn_name != "client_config" and fn_name != "client_config_with_ca_file" and fn_name != "server_config":
+        return ""
+    return "tls." + fn_name + "()"
+
+# the closers std spells. a receiver use of any of these is enough to
+# silence the rule for that binding, whatever the module.
+fn l_is_closing_method(name: String) -> Bool:
+    if name == "close" or name == "free" or name == "release":
+        return true
+    return name == "shutdown" or name == "stop" or name == "destroy" or name == "cancel"
+
+# record `import a.b.c as alias` so a call's module can be resolved from
+# the name it was written under. an import with no alias is referred to by
+# the last segment of its path.
+fn l_record_import_alias(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind != "import":
+        return
+    parts := node.value.split(" ")
+    if parts.len() == 0:
+        return
+    path := parts[0]
+    segments := path.split(".")
+    mut alias := segments[segments.len() - 1]
+    if parts.len() >= 3 and parts[1] == "as":
+        alias = parts[2]
+    l_import_aliases.insert(alias, path)
+
+# the resource constructor a binding's initializer ultimately calls, seen
+# through `!`, `?` and a chain of builder methods — `tls.client_config()!`
+# and `tls.client_config()!.with_alpn(["h2"])` name the same constructor.
+fn l_init_resource_label(idx: Int) -> String:
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return ""
+    if node.kind == "try" or node.kind == "unwrap":
+        return l_init_resource_label(node.children[0])
+    if node.kind != "method_call":
+        return ""
+    receiver := get_node(node.children[0])
+    if receiver.kind != "ident":
+        return l_init_resource_label(node.children[0])
+    if not l_import_aliases.contains_key(receiver.value):
+        return ""
+    return l_resource_ctor_label(l_import_aliases[receiver.value], node.value)
+
+# walk a function body recording how `name` is used. a bare mention is an
+# escape — the value reached somewhere this rule cannot follow — and only a
+# method call whose receiver is the name itself is read as a use in place.
+fn l_scan_resource_uses(node_idx: Int, name: String):
+    node := get_node(node_idx)
+    if node.kind == "ident":
+        if node.value == name:
+            l_resource_escaped = true
+        return
+    if node.kind == "method_call" and node.children.len() > 0:
+        receiver := get_node(node.children[0])
+        if receiver.kind == "ident" and receiver.value == name:
+            if l_is_closing_method(node.value):
+                l_resource_closed = true
+            # the receiver is accounted for; the arguments are not
+            for child, i in node.children:
+                if i > 0:
+                    l_scan_resource_uses(child, name)
+            return
+    for child in node.children:
+        l_scan_resource_uses(child, name)
+
+fn l_check_resource_binding(name: String, label: String, line: Int, col: Int, body_idx: Int):
+    if name.len() == 0 or name == "_":
+        return
+    l_resource_escaped = false
+    l_resource_closed = false
+    l_scan_resource_uses(body_idx, name)
+    if l_resource_escaped or l_resource_closed:
+        return
+    message := "'" + name + "' is built by " + label + " and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope"
+    fix := "close it on every exit -- `defer " + name + ".close()` next to the build; see docs/destructors_roadmap.md"
+    l_diagnostics.push(Diagnostic("warning", "E307", message, l_file, line, col, fix))
+
+fn l_collect_resource_bindings(node_idx: Int, body_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "binding" and node.children.len() > 0:
+        label := l_init_resource_label(node.children[node.children.len() - 1])
+        if label.len() > 0:
+            l_check_resource_binding(l_extract_binding_name(node.value), label, node.line, node.col, body_idx)
+    for child in node.children:
+        l_collect_resource_bindings(child, body_idx)
+
+fn lint_unclosed_resources(body_idx: Int):
+    l_collect_resource_bindings(body_idx, body_idx)

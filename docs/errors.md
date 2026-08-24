@@ -537,6 +537,37 @@ warning[E306]: struct 'Node' holds a strong reference to itself through field 'n
   fix: mark the back edge with `weak` (`weak next: ...`), see docs/ownership.md
 ```
 
+### E307 — resource never closed (warning)
+
+a local binding holds a resource its caller owns — today that means a
+`std.net.tls` config — and nothing in the function closes it. reference counting
+reclaims the handle's memory but not the registry slot behind it, so the slot is
+held until the process exits with no other diagnostic. pair the build with a
+`defer` close (see [defer.md](defer.md)), or close it explicitly.
+
+the rule is deliberately narrow, because a false positive on a resource that is
+closed elsewhere is worse than no rule. it reports only when every later mention
+of the name is the receiver of a method that is not a closer. passing the value
+as an argument, returning it, assigning it, storing it, reading a field off it,
+or capturing it in a lambda all silence the rule — each of those can hand the
+resource to something the linter cannot see. it also follows `!` and a chain of
+builder methods back to the constructor, so
+`tls.client_config()!.with_alpn(["h2"])` is recognized.
+
+the constructor list is short on purpose. an entry has to be a call whose result
+the caller owns, on a type with no method that consumes the receiver instead of
+closing it — `bytes.ByteBuffer` is excluded for exactly that reason, since
+`take_bytes()` frees the buffer as it takes its contents. the survey behind the
+list, and the plan for what would replace the rule, are in
+[destructors_roadmap.md](destructors_roadmap.md).
+
+```
+warning[E307]: 'config' is built by tls.client_config() and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope
+  7 |     config := tls.client_config()!
+                                       ^
+  fix: close it on every exit -- `defer config.close()` next to the build; see docs/destructors_roadmap.md
+```
+
 ### E251 — function is not public in that module
 
 a module function declared with a bare `fn` belongs to the module that declared

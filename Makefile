@@ -1387,6 +1387,17 @@ cli-regressions-only:
 	set -e; \
 	case "$$cyc_out" in *'"code":"E306"'*) pass=$$((pass+1)); echo "ok   lint strong cycle";; *) echo "FAIL lint strong cycle"; fail=$$((fail+1));; esac; \
 	case "$$weak_out" in *'"code":"E306"'*) echo "FAIL lint weak edge exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint weak edge exempt";; esac; \
+	printf 'import std.net.tls as tls\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_open.pith"; \
+	printf 'import std.net.tls as tls\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    defer config.close()\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_closed.pith"; \
+	printf 'import std.net.tls as tls\n\nfn keep(c: tls.Config):\n    return\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    keep(config)\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_handoff.pith"; \
+	set +e; \
+	open_out=$$(./target/release/pith lint --json "$$tmpdir/lint_open.pith" 2>/dev/null); \
+	closed_out=$$(./target/release/pith lint --json "$$tmpdir/lint_closed.pith" 2>/dev/null); \
+	handoff_out=$$(./target/release/pith lint --json "$$tmpdir/lint_handoff.pith" 2>/dev/null); \
+	set -e; \
+	case "$$open_out" in *'"code":"E307"'*) pass=$$((pass+1)); echo "ok   lint unclosed resource";; *) echo "FAIL lint unclosed resource"; fail=$$((fail+1));; esac; \
+	case "$$closed_out" in *'"code":"E307"'*) echo "FAIL lint deferred close exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint deferred close exempt";; esac; \
+	case "$$handoff_out" in *'"code":"E307"'*) echo "FAIL lint handed-off resource exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint handed-off resource exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

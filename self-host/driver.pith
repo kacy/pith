@@ -8,6 +8,7 @@ from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, node_count, reset_arena
 from checker import initialize_checker, c_run_module
 from errors import Diagnostic
+import std.time as time
 # note: codegen removed — compilation handled by Cranelift native backend
 
 # extract directory from a file path.
@@ -135,6 +136,44 @@ fn dr_source_exists(path: String) -> Bool:
 mut module_range_starts: List[Int] := []
 mut module_range_ends: List[Int] := []
 mut module_range_files: List[String] := []
+
+# where the import walk's time went, in microseconds, split by what it
+# was doing rather than by module: locating each import's file on disk,
+# reading it, lexing it, and parsing it. a per-module list runs alongside
+# so a slow closure can name the module that costs the most. the clock
+# reads are a handful per module against work measured in milliseconds,
+# so this is collected unconditionally and read only when asked for.
+mut import_resolve_us := 0
+mut import_read_us := 0
+mut import_lex_us := 0
+mut import_parse_us := 0
+mut import_timed_files: List[String] := []
+mut import_timed_us: List[Int] := []
+
+fn reset_import_timings():
+    import_resolve_us = 0
+    import_read_us = 0
+    import_lex_us = 0
+    import_parse_us = 0
+    import_timed_files = []
+    import_timed_us = []
+
+## the import walk's phase split from the last resolve_imports call,
+## rendered for a log line with microsecond figures.
+pub fn import_timing_line() -> String:
+    return "resolve={import_resolve_us}us read={import_read_us}us lex={import_lex_us}us parse={import_parse_us}us"
+
+## one "<file> <n>us" entry per module the last import walk read, in
+## the order the walk reached them, covering the whole of locating,
+## reading, lexing and parsing that module. an already-visited module
+## contributes nothing, so each file appears at most once.
+pub fn import_module_timings() -> List[String]:
+    mut lines: List[String] := []
+    mut i := 0
+    while i < import_timed_files.len():
+        lines.push(import_timed_files[i] + " " + import_timed_us[i].to_string() + "us")
+        i = i + 1
+    return lines
 
 fn record_module_node_range(start: Int, end: Int, file: String):
     if end <= start:
@@ -419,7 +458,9 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         return roots
     imports := find_imports(root_idx)
     for mod_path in imports:
+        resolve_started := time.mono_nanos()
         file_path := dr_resolve_module_file(mod_path, source_path)
+        import_resolve_us = import_resolve_us + (time.mono_nanos() - resolve_started) / 1000
         # an unresolvable import used to fail silently: read_file below
         # would return an error result that vanished on the way out, so
         # `import fs` (should be `std.fs`) checked clean and emitted
@@ -445,10 +486,19 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
             read_file("__import_cycle_error__")!
         files_being_checked.insert(file_path, true)
         visited_files.insert(file_path, true)
+        read_started := time.mono_nanos()
         content := dr_read_source(file_path)!
+        lex_started := time.mono_nanos()
         tokens := lex_all(content)
         range_start := node_count()
+        parse_started := time.mono_nanos()
         mod_root := parse_with_file(tokens, file_path)
+        parse_ended := time.mono_nanos()
+        import_read_us = import_read_us + (lex_started - read_started) / 1000
+        import_lex_us = import_lex_us + (parse_started - lex_started) / 1000
+        import_parse_us = import_parse_us + (parse_ended - parse_started) / 1000
+        import_timed_files.push(file_path)
+        import_timed_us.push((parse_ended - read_started) / 1000)
         if parser_has_errors():
             driver_parse_diagnostics = parser_diagnostics()
             return roots
@@ -482,6 +532,7 @@ pub fn init_driver(source_path: String):
     resolved_module_files = {}
     package_dependency_loaded = {}
     package_dependency_roots = {}
+    reset_import_timings()
     # every caller parses the entry file before calling init_driver, so
     # the arena's current contents are exactly the root module's nodes
     module_range_starts = []

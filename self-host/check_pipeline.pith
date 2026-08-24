@@ -7,8 +7,8 @@
 
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
-from ast import reset_arena, get_node
-from driver import init_driver, resolve_imports, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node
+from ast import reset_arena, get_node, node_count, truncate_arena
+from driver import init_driver, resolve_imports, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of
 from errors import Diagnostic
 import std.time as time
@@ -22,6 +22,13 @@ mut timing_parse_ms := 0
 mut timing_imports_ms := 0
 mut timing_check_ms := 0
 mut timing_module_count := 0
+mut timing_parse_only_ms := 0
+
+# how long the checker spent on each module of the last run, in
+# microseconds, in the order it checked them — imports first, entry
+# file last.
+mut timing_check_files: List[String] := []
+mut timing_check_us: List[Int] := []
 
 ## the last pipeline run's phase split, rendered for a log line:
 ## reading and lexing the entry file, parsing it, resolving (which
@@ -29,6 +36,23 @@ mut timing_module_count := 0
 pub fn last_timing_line() -> String:
     total := timing_lex_ms + timing_parse_ms + timing_imports_ms + timing_check_ms
     return "total={total}ms lex={timing_lex_ms}ms parse={timing_parse_ms}ms imports={timing_imports_ms}ms check={timing_check_ms}ms modules={timing_module_count}"
+
+## the last run broken down one line per module: an "import" line per
+## file the walk read (locating, reading, lexing, and parsing it) and a
+## "check" line per module the checker ran over, both in microseconds.
+## the leading line splits the import phase by activity, so a closure
+## that spends its time probing the filesystem is told apart from one
+## that spends it parsing.
+pub fn last_module_timing_lines() -> List[String]:
+    mut lines: List[String] := []
+    lines.push("imports " + import_timing_line())
+    for entry in import_module_timings():
+        lines.push("import " + entry)
+    mut i := 0
+    while i < timing_check_files.len():
+        lines.push("check " + timing_check_files[i] + " " + timing_check_us[i].to_string() + "us")
+        i = i + 1
+    return lines
 
 ## one front-end run's result. a parse failure carries the parser's
 ## diagnostics with parse_ok false; an unresolvable or unparsable
@@ -41,6 +65,34 @@ pub struct CheckOutcome:
     pub diags: List[Diagnostic]
     pub root: Int
     pub import_roots: List[Int]
+
+## how long the last run_parse_only call took, in milliseconds.
+pub fn last_parse_only_ms() -> Int:
+    return timing_parse_only_ms
+
+## lex and parse one file and hand back only what the parser found.
+## no imports are resolved and the checker never runs, so this costs
+## what one file costs to parse rather than what its whole closure
+## costs to check — the difference between tens of milliseconds and
+## seconds on a large closure.
+##
+## the node arena is restored to exactly what it held on entry, so this
+## can run against an arena a completed analysis is still being read
+## from: the type cache, the definition map and the module ranges all
+## still describe the same nodes afterwards. sources are read through
+## the driver's overlays like every other entry point.
+pub fn run_parse_only(path: String) -> List[Diagnostic]!:
+    started := time.mono_millis()
+    source := dr_read_source(path)!
+    mark := node_count()
+    tokens := lex_all(source)
+    _root := parse_with_file(tokens, path)
+    mut diags: List[Diagnostic] := []
+    if parser_has_errors():
+        diags = parser_diagnostics()
+    truncate_arena(mark)
+    timing_parse_only_ms = time.mono_millis() - started
+    return diags
 
 ## run the whole front end for one entry file. sources are read through
 ## the driver's overlays, so a caller can check unsaved buffers.
@@ -57,6 +109,8 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
     timing_imports_ms = 0
     timing_check_ms = 0
     timing_module_count = 1
+    timing_check_files = []
+    timing_check_us = []
 
     if parser_has_errors():
         mut no_imports: List[Int] := []
@@ -72,12 +126,19 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
 
     initialize_checker(path)
     for imp_root in import_roots:
+        module_file := get_resolved_module_file(imp_root)
         set_checker_module_path(get_resolved_module_path(imp_root))
-        set_checker_file_path(get_resolved_module_file(imp_root))
+        set_checker_file_path(module_file)
+        module_started := time.mono_nanos()
         c_run_module(imp_root)
+        timing_check_files.push(module_file)
+        timing_check_us.push((time.mono_nanos() - module_started) / 1000)
     set_checker_module_path("")
     set_checker_file_path(path)
+    entry_started := time.mono_nanos()
     diags := c_run_module(root)
+    timing_check_files.push(path)
+    timing_check_us.push((time.mono_nanos() - entry_started) / 1000)
     timing_check_ms = time.mono_millis() - resolved
     return CheckOutcome(true, true, diags, root, import_roots)
 
@@ -107,6 +168,27 @@ test "pipeline reports checker diagnostics from an overlay":
     assert(outcome.parse_ok)
     assert(outcome.import_ok)
     assert(outcome.diags.len() > 0)
+    clear_source_overlays()
+
+test "parse-only reports the parser's findings and leaves the arena alone":
+    set_source_overlay("__overlay_syntax_bad.pith", "fn main(:\n")
+    set_source_overlay("__overlay_syntax_ok.pith", "fn main():\n    print(\"hi\")\n")
+    # a completed analysis the editor would still be reading from
+    outcome := run_check_pipeline("__overlay_syntax_ok.pith")!
+    assert(outcome.parse_ok)
+    before := node_count()
+    root_kind := get_node(outcome.root).kind
+
+    bad := run_parse_only("__overlay_syntax_bad.pith")!
+    assert(bad.len() > 0)
+    # the throwaway parse left no nodes of its own behind, so every
+    # index the analysis handed out still points at the same node
+    assert_eq(node_count(), before)
+    assert_eq(get_node(outcome.root).kind, root_kind)
+
+    good := run_parse_only("__overlay_syntax_ok.pith")!
+    assert_eq(good.len(), 0)
+    assert_eq(node_count(), before)
     clear_source_overlays()
 
 test "pipeline reports parse failures without checking":

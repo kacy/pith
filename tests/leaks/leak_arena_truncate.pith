@@ -1,0 +1,81 @@
+# a growing arena of structs wound back to a mark, over and over.
+#
+# this is the shape the language server's syntax fast lane runs on every
+# keystroke: `run_parse_only` notes the node count, parses a file into the
+# same arena a completed analysis is still being read from, and then drops
+# every node it added by removing from the end until the count is back where
+# it started. the nodes it removes each carry two heap strings and a list of
+# child indices, so a removal that dropped the element without releasing what
+# it holds would strand a whole file's worth of strings per keystroke — the
+# server would grow for as long as the editor stayed open, and nothing else
+# in this corpus exercises repeated removal from the end of a struct list.
+#
+# the arena that survives the wind-back is here on purpose. the point is not
+# only that the removed nodes are freed; it is that the ones below the mark
+# are still intact afterwards, so the fixture keeps a base region alive and
+# reads it back each round.
+import leakprobe as probe
+
+struct Node:
+    kind: String
+    value: String
+    children: List[Int]
+
+mut arena: List[Node] := []
+
+fn add(kind: String, value: String, kids: List[Int]) -> Int:
+    arena.push(Node(kind, value, kids))
+    return arena.len() - 1
+
+# drop every node added since the arena held `count` of them
+fn truncate(count: Int):
+    while arena.len() > count:
+        arena.remove(arena.len() - 1)
+
+fn round(i: Int) -> Int:
+    mark := arena.len()
+
+    # a throwaway parse: nodes carrying fresh strings and a child list
+    mut kids: List[Int] := []
+    mut n := 0
+    while n < 8:
+        kids.push(add("ident", "name-{i}-{n}", []))
+        n = n + 1
+    root := add("module", "file-{i}.pith", kids)
+    depth := arena.len() - mark
+
+    # a borrowed local pushed in as well, so the removal has to drop a count
+    # it did not create
+    borrowed := "shared-{i}"
+    _b := add("string_lit", borrowed, kids)
+
+    truncate(mark)
+
+    # everything below the mark survived, indices and contents both
+    mut acc := depth + root
+    if arena.len() != mark:
+        acc = acc - 1000000
+    if mark > 0:
+        acc = acc + arena[0].children.len() + arena[mark - 1].kind.len()
+    return acc
+
+fn main():
+    # a base region the wind-back must never touch
+    mut base: List[Int] := []
+    base.push(0)
+    base.push(1)
+    mut k := 0
+    while k < 16:
+        _r := add("base", "base-{k}", base)
+        k = k + 1
+
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

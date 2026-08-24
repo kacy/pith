@@ -1047,15 +1047,28 @@ fn ir_defer_emit_for_loop_jump():
 # record the producing result/optional type id for a tuple local. a rebind to a
 # tuple of a different type (tid) can't pick one payload shape, so it is marked
 # conflicting (-1) and never becomes cascade-eligible — a safe under-fix.
+#
+# a BORROWED producer is marked the same way. `v := xs[0]`, `v := s.field` and
+# `v := other` hand over a shell somebody else still owns: the bind retains the
+# shell and nothing at all takes a count on the payload behind it, so cascading
+# that payload frees a value the container or the struct is still holding. that
+# was a use-after-free wherever the container outlived the borrow — a callee
+# that binds `xs[0]` and returns left its caller's list pointing at a freed
+# string — and it becomes a double free the moment the shell owns its payload
+# through a destructor. only a producer that transfers (a call, an await, a
+# match) leaves this local the payload's sole owner.
 fn ir_tuple_record_tid(name: String, val_idx: Int):
     tid := c_get_expr_type(val_idx)
     if tid < 0:
         return
+    mut recorded := tid
+    if ir_expr_is_borrowed(val_idx):
+        recorded = 0 - 1
     if ir_tuple_local_tid.contains_key(name):
-        if ir_tuple_local_tid[name] != tid:
+        if ir_tuple_local_tid[name] != recorded:
             ir_tuple_local_tid.insert(name, 0 - 1)
         return
-    ir_tuple_local_tid.insert(name, tid)
+    ir_tuple_local_tid.insert(name, recorded)
 
 # true when `parent` uses its child ident `name` in a way that leaves the tuple
 # holding the count it was built with, so the cleanup path is the only thing
@@ -1459,6 +1472,13 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
 # otherwise — and then frees the shell. a null shell short-circuits to a no-op,
 # which is what an unassigned local (early return before its bind) or the first
 # loop iteration's zero-stored previous value hands in.
+#
+# the slot is zeroed after its release, because the shell's own destructor may
+# release the same slot: a function that wraps a fresh payload and returns the
+# shell hands its caller something the wrap made an owner, while the caller's
+# cascade signature is read off the type and says the payload is a transfer.
+# both are describing one count, so exactly one of them may drop it — the
+# explicit release here does, and the null leaves the destructor a no-op.
 fn ir_emit_tuple_cascade_helpers():
     for sig in ir_tuple_cascade_sigs:
         ok_kind := ir_tuple_dtor_code_kind(sig[0])
@@ -1486,12 +1506,14 @@ fn ir_emit_tuple_cascade_helpers():
             ok_r := ir_reg()
             ir_emit("field " + ok_r.to_string() + " " + pr.to_string() + " 8 unknown ok")
             ir_rc_release_reg(ok_r, ok_kind)
+            ir_emit("sstore " + pr.to_string() + " 1 " + zero_r.to_string())
         ir_emit("jmp " + rel_l)
         ir_emit_label(err_l)
         if err_kind.len() > 0:
             err_r := ir_reg()
             ir_emit("field " + err_r.to_string() + " " + pr.to_string() + " 16 unknown err")
             ir_rc_release_reg(err_r, err_kind)
+            ir_emit("sstore " + pr.to_string() + " 2 " + zero_r.to_string())
         ir_emit("jmp " + rel_l)
         ir_emit_label(rel_l)
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
@@ -2586,13 +2608,20 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
         # than wrap-it-as-Some.
         if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
             return value_r
-        # an optional wrapping an rc payload (a struct, list, map, set, bytes, or
-        # closure) OWNS it: take a count when the value arrives borrowed, and
-        # attach a destructor so the payload is released when the optional dies.
-        # this keeps a `Node?` field's target alive instead of dangling. strings
-        # stay borrowed (copy-on-derive already keeps them safe).
+        # an optional wrapping an rc payload (a struct, list, map, set, bytes,
+        # closure or string) OWNS it: take a count when the value arrives
+        # borrowed, and attach a destructor so the payload is released when the
+        # optional dies. this keeps a `Node?` field's target alive instead of
+        # dangling. a string payload was left out of this for a long time, on
+        # the grounds that an optional over a string only ever borrowed one —
+        # but a wrap builds a Some over a *fresh* string too (`["a-{i}", none]`,
+        # `v: String? := "a-{i}"`), and the borrowed convention left that string
+        # with a count nobody would ever drop once the shell went into a
+        # container or a field. owning it here settles both shapes: a borrowed
+        # payload gets the retain that pairs with the destructor's release, and
+        # a fresh one hands its count to the shell.
         payload_kind := ir_rc_kind(ir_infer_type(val_idx))
-        if payload_kind == "struct" or payload_kind == "list" or payload_kind == "map" or payload_kind == "set" or payload_kind == "bytes" or payload_kind == "closure":
+        if payload_kind == "struct" or payload_kind == "list" or payload_kind == "map" or payload_kind == "set" or payload_kind == "bytes" or payload_kind == "closure" or payload_kind == "string":
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, payload_kind)
             return ir_emit_optional_owned_some(value_r, payload_kind)
@@ -3179,14 +3208,14 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # the walk only has to show the callee did not keep it; they leaked a shell
 # per call before this, `f(none)` alone at 45 call sites in std.
 #
-# what is released follows what the shell holds. a string payload arrives as
-# a transferred count the shell has no destructor for, so the cascade helper
-# drops it before the shell. a struct, list, map, set, bytes or closure
-# payload is owned through the wrapper's destructor (ir_emit_optional_owned_some),
-# so only the shell is released and its destructor does the rest — releasing
-# the payload here too would drop it twice. a plain value or a none has
-# nothing but the shell. `is_method` picks the walk: the callee's own body for
-# a plain call, the impl method's for a method call.
+# what is released follows what the shell holds. a shell this caller wrapped
+# owns its payload through its destructor (ir_emit_optional_owned_some), so
+# only the shell is released and the destructor does the rest — releasing the
+# payload here too would drop it twice. a shell a callee built and returned
+# carries a transferred payload count and no destructor, so the cascade helper
+# drops the payload before the shell. a plain value or a none has nothing but
+# the shell. `is_method` picks the walk: the callee's own body for a plain
+# call, the impl method's for a method call.
 fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int, is_method: Bool):
     en := get_node(expr_idx)
     # inside generic or specialized bodies the checked types are suppressed
@@ -3198,14 +3227,16 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
     if en.kind == "none_lit":
         sig = "00"
     elif c_argument_widens_to_optional(expr_idx):
+        # a widened argument's shell comes from ir_emit_value_for_target, which
+        # owns every rc payload kind through the shell's destructor — a string
+        # included, since the wrap started retaining a borrowed one and taking
+        # over a fresh one. so the cascade releases the shell alone and lets the
+        # destructor drop the payload; dropping it here as well would free it
+        # twice.
         payload_kind := ir_rc_kind(ir_infer_type(expr_idx))
-        if payload_kind == "string":
-            sig = "s0"
-        elif payload_kind.len() > 0:
-            sig = "00"
+        sig = "00"
+        if payload_kind.len() > 0:
             dtor_owned = true
-        else:
-            sig = "00"
     elif en.kind == "call" or en.kind == "method_call":
         tid := c_get_expr_type(expr_idx)
         if tid < 0:
@@ -3242,6 +3273,16 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     if node.kind != "call" and node.kind != "method_call":
         return false
     if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
+    # `.value()` on an optional spells like a call and is a field read: it
+    # hands back an uncounted view of the shell's payload (see
+    # ir_method_call_is_value_extraction). counting it as a transfer released
+    # a string the shell still owns — `xs[0].value() == "a"` freed the
+    # element's string mid-comparison. it went unnoticed while a string
+    # payload was borrowed and its count belonged to nobody, so the stray
+    # release balanced the leak; with the shell owning the payload it is a
+    # plain over-release.
+    if ir_method_call_is_value_extraction(idx):
         return false
     mut expr_type := ir_checked_type(idx)
     if expr_type.len() == 0:
@@ -9413,12 +9454,19 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
     ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
 
 # one destructor per rc payload kind for owned optionals. an optional that owns
-# a struct/list/map/set/bytes/closure payload attaches the matching dtor, which
-# releases the payload (slot 1) when the optional tuple dies. release on a null
-# payload is a no-op, so no is_some guard is needed — none tuples never carry a
-# dtor anyway.
+# a struct/list/map/set/bytes/closure/string payload attaches the matching dtor,
+# which releases the payload (slot 1) when the optional tuple dies. release on a
+# null payload is a no-op, so no is_some guard is needed — none tuples never
+# carry a dtor anyway.
+#
+# string joined the list late. an optional over a string used to borrow, which
+# is safe for a payload some local keeps a count for and wrong for a fresh one:
+# nothing released the string a `List[String?]` element or a `String?` field
+# held, ~32 bytes per element. it is an rc kind like any other here — a release
+# on a literal or a null is a no-op in the runtime, so the destructor is safe
+# on every shape a Some can hold.
 fn ir_emit_optional_dtors():
-    kinds := ["struct", "list", "map", "set", "bytes", "closure"]
+    kinds := ["struct", "list", "map", "set", "bytes", "closure", "string"]
     for k in kinds:
         ir_emit_func_header("__opt_dtor_" + k, 1, "void")
         ir_emit("param p")

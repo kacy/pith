@@ -5,9 +5,9 @@
 # literal, and the same for a map literal's optional values. pushing bound
 # optionals one at a time was always fine, and is churned here too so the
 # push path stays pinned beside the literal it now matches. the string
-# elements are literals on purpose: a fresh heap string held by an optional
-# inside a container is a separate, still-open leak (the shell carries no
-# destructor for a string payload), and this case pins only the shells.
+# elements are literals, so this case pins the shells alone; the fresh heap
+# string an optional carries inside a container is pinned next door, in
+# leak_optional_string_payload.
 import leakprobe as probe
 
 fn churn_round(i: Int):

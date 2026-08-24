@@ -138,13 +138,37 @@ something here that now works, the page is stale and a fix to it is welcome.
   Display + Hash, U: Ord:`) — a clause naming something that is not a
   declared type parameter is E264, reported at the offending name. `where`
   is a contextual keyword, so it stays usable as an ordinary name
-  everywhere else. clauses attach to free functions. a generic method inside
-  an impl block is not supported — its type parameter is unknown in the body
-  (E202) — so a clause cannot attach to a working impl method, and a generic
-  interface member is unsupported the same way, with either bound spelling. struct,
-  interface, and impl headers still take inline bounds only, and a
-  method's clause may name only the method's own type parameters, not the
-  owner's.
+  everywhere else. clauses attach to free functions and to methods —
+  inherent, interface-impl, and interface members in both the abstract and
+  the default spelling. struct, interface, and impl headers still take
+  inline bounds only, and a method's clause may name only the method's own
+  type parameters, not the owner's.
+- **a method may carry type parameters of its own** — `fn describe[T](v: T)
+  -> T` inside an impl block behaves like a free generic function: the
+  argument types at a call site fix the parameters, and each distinct set
+  gets its own specialization. inference reaches through a container
+  parameter (`List[T]`), the return type may be the parameter or a shape
+  built from it (`T`, `List[T]`, `T?`), a Result return carries through, a
+  method may declare more than one parameter, and bounds work in both
+  spellings (`[T: Label]` and a `where` clause). interface members take
+  type parameters too, in the abstract and the default form, and a call
+  across a module boundary specializes the same way. two things do not
+  work. type arguments cannot be written at the call site —
+  `x.describe[Int](v)` parses as an index into a field rather than a call
+  carrying type arguments — so a parameter that appears in no argument has
+  nothing to fix it and the call is E222. the other is a generic owner:
+  `impl Box[T]: fn map[U](...)` is E265. past those two a generic method
+  behaves exactly as a free generic function does, rough edges included.
+  returning an already-optional value out of a `-> T?` signature wraps it a
+  second time: `fn f[T](v: T?) -> T?: return v` hands back the inner shell's
+  address rather than the value it holds. the checker types that call
+  correctly — it is the specialization's return that re-wraps — and every
+  neighbouring shape is fine, including a `-> T?` built from a plain
+  parameter (`fn f[T](v: T) -> T?`), a `-> T!` return, and the same
+  signature written without type parameters. and a specialization publishes
+  its owned locals untracked, so a body that binds a heap value to a local
+  leaks it per call while one that hands its argument or a fresh value
+  straight back does not.
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the

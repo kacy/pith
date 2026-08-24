@@ -1,0 +1,20 @@
+# a where clause on an interface member with its own type parameter is
+# enforced at the call site: Point never implements Tag, so the bound the
+# clause states fails (E226). E240 here instead would mean the clause stopped
+# parsing; a bare E202 would mean the member's type parameter stopped
+# resolving in its body.
+interface Sized:
+    fn tagged_by[U](u: U) -> Int where U: Tag
+
+interface Tag:
+    fn tag() -> Int
+
+struct Point:
+    pub x: Int
+
+impl Sized for Point:
+    fn tagged_by[U](u: U) -> Int where U: Tag:
+        return u.tag() + self.x
+
+fn main():
+    print(Point(x: 1).tagged_by(Point(x: 2)))

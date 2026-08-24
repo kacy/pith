@@ -1,0 +1,14 @@
+# a method's own type parameter is fixed by the argument types at the call
+# site. one that appears in no parameter has nothing to fix it, and there is no
+# explicit spelling to supply it with, so the call is refused (E222) instead of
+# specializing at whatever the emitter happened to guess.
+struct Sink:
+    pub name: String
+
+impl Sink:
+    pub fn blank[T]() -> Int:
+        return 0
+
+fn main():
+    s := Sink(name: "s")
+    print(s.blank().to_string())

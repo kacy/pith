@@ -935,12 +935,54 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             method_node_idx = cn.children[0]
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
+            method_params := suppress_method_type_params(concrete_name, method_node_idx, cn)
             register_method_declaration_aliased(concrete_name, generic_alias, method_node_idx, cn, method_is_pub, interface_name != "")
+            release_method_type_params(method_params)
     active_assoc_bindings = {}
 
     # clear the suppression for the next impl block
     for sp in suppressed_params:
         suppress_unknown_type_for.remove(sp)
+
+# a method may carry type parameters of its own (`fn run[T](v: T) -> T`).
+# they are not real types while the signature registers — the call site fixes
+# them — so suppress them exactly the way an impl on a generic struct
+# suppresses the struct's parameters. only names this call introduced are
+# returned, so lifting the suppression afterwards cannot drop a name the
+# enclosing impl block owns.
+#
+# a method type parameter on a generic owner is refused here rather than
+# registered: the owner's parameters are substituted per instantiation and the
+# method's per call site, and nothing downstream composes the two, so accepting
+# the shape would lower one substitution against the other's body.
+fn suppress_method_type_params(owner_name: String, method_idx: Int, method_node: Node) -> List[String]:
+    mut added: List[String] := []
+    if declaration_has_generic_params(method_node) == false:
+        return added
+    if has_generic_declaration(owner_name):
+        report_error_at(first_generic_param_index(method_node), "E265", "generic method '" + method_node.value + "' on generic type '" + owner_name + "': a method may declare its own type parameters only on a non-generic type")
+    # suppress either way: with the shape refused the signature still has to
+    # resolve quietly, or every mention of the parameter stacks an E202 under
+    # the one error that explains the problem.
+    for name in collect_generic_parameter_names(method_node):
+        if suppress_unknown_type_for.contains_key(name) == false:
+            suppress_unknown_type_for.insert(name, 1)
+            added.push(name)
+    return added
+
+# the declaration's first type-parameter node, which carries the position of
+# the bracket list — the fn_decl node itself is built after its body and points
+# past it. answers the declaration when it has no type parameters.
+fn first_generic_param_index(node: Node) -> Int:
+    for child in node.children:
+        if get_node(child).kind == "generic_param":
+            return child
+    return 0 - 1
+
+# lift the suppression suppress_method_type_params put in place.
+fn release_method_type_params(names: List[String]):
+    for name in names:
+        suppress_unknown_type_for.remove(name)
 
 # the concrete declaration an impl target names, resolved in the registering
 # module's own scope. a generic base ("Iter") has no single tid, and a target
@@ -1069,7 +1111,9 @@ fn fill_impl_defaults(node: Node):
             if owner >= 0:
                 provides_own = has_method_declaration(method_tid_key(owner, mn.value))
             if provides_own == false:
+                default_params := suppress_method_type_params(concrete_name, member, mn)
                 register_method_declaration_aliased(concrete_name, generic_alias, member, mn, true, true)
+                release_method_type_params(default_params)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
     # match on base names so a generic instance like FilterIter[Range, Int]
@@ -1530,6 +1574,11 @@ fn is_impl_own_method(node: Node, method_start: Int, method_name: String) -> Boo
     return false
 
 fn check_method_body(type_name: String, type_tid: Int, node_idx: Int, node: Node):
+    # a method with its own type parameters has no concrete signature until a
+    # call fixes them, so its body is not checked here — the same treatment
+    # check_function_declaration gives a free generic function.
+    if declaration_has_generic_params(node):
+        return
     param_types := collect_function_param_types(node)
     ret_type := collect_function_return_type(node)
     method_scope := create_function_scope(current_scope, ret_type)
@@ -4316,6 +4365,45 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
 # method call
 # ---------------------------------------------------------------
 
+# fix a generic method's own type parameters from the argument types at one
+# call site, in declaration order. this is check_generic_function_call's
+# inference step applied to a method: unify each written parameter type against
+# the checked argument type, fill anything still free from the interface bounds
+# on the declaration, then verify those bounds hold. answers [] when a
+# parameter stays unbound or a bound fails, having reported; a method with type
+# parameters always has at least one, so an empty answer is unambiguous.
+fn infer_method_type_arguments(method_node: Node, decl_idx: Int, method_name: String, method_params: List[String], arg_types: List[Int]) -> List[Int]:
+    mut empty: List[Int] := []
+    mut param_type_nodes: List[Int] := []
+    for child in method_node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_type_nodes.push(cn.children[0])
+            else:
+                param_type_nodes.push(0 - 1)
+    if arg_types.len() != param_type_nodes.len():
+        report_error("E207", method_name + " expects " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
+        return empty
+    generic_inference_subst = {}
+    mut pidx := 0
+    for ptn in param_type_nodes:
+        if ptn >= 0 and pidx < arg_types.len():
+            if infer_generic_subst_from_type_node(ptn, arg_types[pidx], method_params) == false:
+                return empty
+        pidx = pidx + 1
+    infer_subst_from_bounds(method_node, method_params)
+    mut subst_args: List[Int] := []
+    for gp in method_params:
+        if generic_inference_subst.contains_key(gp):
+            subst_args.push(generic_inference_subst[gp])
+        else:
+            report_error("E222", "cannot infer type parameter " + gp)
+            return empty
+    if check_type_parameter_bounds(decl_idx, generic_inference_subst) == false:
+        return empty
+    return subst_args
+
 # Variants of collect_function_param_types / collect_function_return_type that
 # substitute generic type parameters with concrete type arguments. Used to
 # resolve method signatures on a generic struct instance like `Iter[Int]`.
@@ -4782,6 +4870,25 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 if assoc_type_binding.contains_key(bkey):
                     struct_params.push(an)
                     struct_args.push(assoc_type_binding[bkey])
+        # a method's own type parameters (`fn run[T](v: T) -> T`) are fixed by
+        # this call's arguments, so those have to be checked before the
+        # signature resolves. the types land in the expression cache and the
+        # validation loop below reads them back rather than checking a second
+        # time, which would report anything wrong inside an argument twice.
+        mut method_args_prechecked := false
+        if declaration_has_generic_params(method_node):
+            method_params := collect_generic_parameter_names(method_node)
+            mut method_arg_types: List[Int] := []
+            for ai in arg_indices:
+                method_arg_types.push(c_check_expr(argument_expression_index(ai), scope_id))
+            method_args_prechecked = true
+            method_type_args := infer_method_type_arguments(method_node, get_method_declaration_index(key), method_name, method_params, method_arg_types)
+            if method_type_args.len() == 0:
+                return TID_ERR
+            for mp in method_params:
+                struct_params.push(mp)
+            for ma in method_type_args:
+                struct_args.push(ma)
         param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
         ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
         # check arg count
@@ -4796,7 +4903,11 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             if arg_node.kind == "arg":
                 if arg_node.children.len() > 0:
                     arg_expr = arg_node.children[0]
-            atype := c_check_expr(arg_expr, scope_id)
+            mut atype := TID_ERR
+            if method_args_prechecked:
+                atype = c_get_expr_type(arg_expr)
+            else:
+                atype = c_check_expr(arg_expr, scope_id)
             if aidx < param_types.len():
                 propagate_empty_argument_collection_type(arg_expr, param_types[aidx], atype, scope_id)
             if is_error_type(atype) == false:
@@ -5469,11 +5580,52 @@ fn parse_integer_string(s: String) -> Int:
 # index expression
 # ---------------------------------------------------------------
 
+# true, having reported, when this index expression brackets a generic
+# method: `x.describe[Int]`. answers false for every other shape, including
+# an index into a field that happens to share a method's name, so the
+# ordinary index checking below is untouched.
+fn indexes_a_generic_method(node: Node, scope_id: Int) -> Bool:
+    base := get_node(node.children[0])
+    if base.kind != "field_access" or base.children.len() == 0:
+        return false
+    # only a bracket holding a bare type name can be a type-argument list. an
+    # ordinary index holds a literal, a key expression or a binding, so this
+    # returns before checking anything on every real index expression.
+    arg := get_node(node.children[1])
+    if arg.kind != "ident":
+        return false
+    if lookup_binding(scope_id, arg.value) >= 0:
+        return false
+    if lookup_type_id(arg.value) < 0:
+        return false
+    recv_type := c_check_expr(base.children[0], scope_id)
+    if is_error_type(recv_type):
+        return false
+    recv_info := get_type_info(recv_type)
+    if recv_info.fields.contains(base.value):
+        return false
+    mut key := method_tid_key(recv_type, base.value)
+    if has_method_declaration(key) == false:
+        key = get_type_name(recv_type) + "." + base.value
+        if has_method_declaration(key) == false:
+            return false
+    if declaration_has_generic_params(get_node(get_method_declaration_index(key))) == false:
+        return false
+    report_error("E209", get_type_name(recv_type) + "." + base.value + " is a generic method: its type arguments are inferred from the call's arguments and cannot be written at the call site")
+    return true
+
 fn check_index_expression(node: Node, scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_bytes := lookup_type_id("Bytes")
     tid_int := lookup_type_id("Int")
     if node.children.len() < 2:
+        return TID_ERR
+    # `x.describe[Int](v)` parses as an index into `x.describe`, not as a call
+    # carrying type arguments: a method's own type parameters have no explicit
+    # spelling and are fixed by the argument types. name that here — checking
+    # the parts would report a missing field and an undefined variable, and
+    # neither reads as the real problem.
+    if indexes_a_generic_method(node, scope_id):
         return TID_ERR
     mut obj_type := c_check_expr(node.children[0], scope_id)
     idx_type := c_check_expr(node.children[1], scope_id)

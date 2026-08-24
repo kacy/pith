@@ -679,3 +679,16 @@ or fix the spelling.
 ```
 error[E264]: where clause names 'U', which is not a type parameter of 'f'
 ```
+
+### E265 — generic method on a generic type
+
+a method declared type parameters of its own on a type that already has
+some. the two substitutions would have to compose — the type's are fixed
+once per instantiation, the method's once per call site — and the
+specializer carries one at a time. move the method to a non-generic type,
+or drop its bracket list and let the type's parameters carry the varying
+part.
+
+```
+error[E265]: generic method 'describe' on generic type 'Box': a method may declare its own type parameters only on a non-generic type
+```

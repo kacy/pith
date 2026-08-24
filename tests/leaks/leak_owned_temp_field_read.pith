@@ -1,0 +1,43 @@
+# a field read off an owned temporary — `make_pt(i).x`, a string field bound
+# or compared off a fresh struct, a field read off the fresh fallback
+# `unwrap_or` builds on its none path — used to strand the temporary: the
+# method-call path releases an owned receiver once the call returns, but the
+# field path never did, so a struct built only to have one field read leaked
+# whole, ~90 bytes a time. the field value takes its own count first, then the
+# receiver is dropped.
+#
+# every line here is a field read off a value nothing else names. a fresh
+# optional handed to an extracting callee is a separate open shape (see
+# limitations.md) and is deliberately kept out.
+import leakprobe as probe
+
+struct Pt:
+    pub x: Int
+    pub name: String
+
+fn make_pt(i: Int) -> Pt:
+    return Pt(i, "n-" + i.to_string())
+
+fn x_of_fresh_fallback(i: Int) -> Int:
+    p: Pt? := none
+    return p.unwrap_or(Pt(i, "fb-" + i.to_string())).x
+
+fn churn_round(i: Int):
+    a := make_pt(i).x
+    b := make_pt(i).name.len()
+    nm := make_pt(i).name
+    mut c := 0
+    if make_pt(i).name == "n-5":
+        c = 1
+    d := x_of_fresh_fallback(i)
+    if a + b + nm.len() + c + d < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

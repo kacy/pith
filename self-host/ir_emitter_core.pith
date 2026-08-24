@@ -4319,7 +4319,11 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
     mut entry_kind := ir_rc_kind(val_target)
     if val_target.len() == 0:
         entry_kind = ir_rc_kind(ir_infer_type(entry.children[1]))
-    entry_owned := not ir_expr_is_borrowed(entry.children[1])
+    mut entry_owned := not ir_expr_is_borrowed(entry.children[1])
+    # an optional value's register is a wrapper this literal owns (see the
+    # list literal), so the owned store transfers it whatever the child was
+    if entry_kind == "tuple":
+        entry_owned = true
     kind_store := ir_map_kind_store_name(store_name, entry_owned)
     if kind_store.len() > 0 and ir_store_learns_kind(entry_kind):
         tag_r := ir_emit_element_tag_const(entry_kind)
@@ -4408,6 +4412,10 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 3
     if kind == "struct":
         return 4
+    # a tuple shell releases through the struct header, so it carries the
+    # struct tag
+    if kind == "tuple":
+        return 4
     if kind == "bytes":
         return 5
     if kind == "closure":
@@ -4441,6 +4449,10 @@ fn ir_element_tag_code(kind: String) -> Int:
 # every string insert in the tree for no change in ownership.
 fn ir_store_learns_kind(store_kind: String) -> Bool:
     if store_kind == "list" or store_kind == "map" or store_kind == "set":
+        return true
+    # a tuple shell (an optional or result value) is owned through the
+    # struct tag, see ir_list_ctor_for_elem_kind
+    if store_kind == "tuple":
         return true
     return store_kind == "struct" or store_kind == "bytes" or store_kind == "closure"
 
@@ -4541,6 +4553,14 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     # fn value transfers its count at the call.
     if elem_kind == "closure":
         return "__list_new_closure"
+    # an optional element is a tuple shell: a struct-header allocation that
+    # retains and releases through pith_struct_*, which is exactly what the
+    # struct tag does. built untagged, `[1, none, 3]` typed List[Int?] owned
+    # none of the three shells it had just built and stranded ~176 bytes per
+    # literal; pushing bound optionals one by one was fine, so the literal
+    # was the one shape that leaked.
+    if elem_kind == "tuple":
+        return "__list_new_struct"
     # a set is a shared handle like a list or a map, and the only collection
     # kind the runtime's element tag was missing. untagged, a List[Set] owned
     # nothing: `xs.push({1, 2})` stranded its element for the life of the
@@ -4583,7 +4603,11 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     for child in node.children:
         elem_r := ir_emit_value_for_target(child, elem_target)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
-        if retaining and not ir_expr_is_borrowed(child):
+        # an optional element's register is the wrapper ir_emit_value_for_target
+        # built (or retained, for a passed-through optional), owned by this
+        # literal whatever the child expression was — so it is always dropped
+        # once the list holds its own count.
+        if retaining and (elem_kind == "tuple" or not ir_expr_is_borrowed(child)):
             ir_rc_release_reg(elem_r, elem_kind)
     return list_r
 

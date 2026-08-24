@@ -244,9 +244,13 @@ correctness story:
   out of the optional rather than reading it in place. binding the value
   first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
 - a collection literal whose element type is an optional (`List[Int?]`,
-  `Map[String, Int?]`) does not release the optionals it holds — about 128 bytes
-  per literal. building the container and pushing into it does not leak; only
-  the literal form does.
+  `Map[String, Int?]`) owns the optionals it holds, the same as a container
+  built by pushing into it: the literal's wrapped elements are tagged like
+  any other heap element and released with the container. one gap remains
+  for both forms: an optional holding a fresh heap *string* (`List[String?]`
+  of built strings, whether pushed or written in a literal) releases its
+  shell but not the string, about 30 bytes per element — a string payload's
+  shell carries no destructor, and inside a container nothing else cascades.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

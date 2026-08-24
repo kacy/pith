@@ -1404,6 +1404,12 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && echo "$$out" | grep -q "a first ... ok" && ! echo "$$out" | grep -q "c after failure" && echo "$$out" | grep -q "1 passed, 0 failed, 2 filtered out"; then pass=$$((pass+1)); echo "ok   test --filter runs only matching tests"; else echo "FAIL test --filter"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'from std.testing import case, each\n\ntest "rows":\n    each([\n        case("alpha", 1),\n        case("beta", 2),\n], fn(n: Int) => n > 0)\n' > "$$tmpdir/rows.pith"; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/rows.pith" --filter "rows / beta" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "\[2\] beta" && ! echo "$$out" | grep -q "alpha" && echo "$$out" | grep -q "rows ... ok"; then pass=$$((pass+1)); echo "ok   test --filter selects one table row"; else echo "FAIL test --filter table row"; echo "$$out"; fail=$$((fail+1)); fi; \
 	printf 'test "runs":\n    assert(true)\ntest "skips":\n    skip_test("not today")\n    assert(false)\n' > "$$tmpdir/skip.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/skip.pith" 2>&1); \

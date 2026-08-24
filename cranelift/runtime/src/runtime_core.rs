@@ -1377,9 +1377,30 @@ pub unsafe extern "C" fn pith_test_skip(reason: *const i8) -> i64 {
     std::process::exit(TEST_SKIP_CODE);
 }
 
+/// The name of the test running in this child, or the empty string outside one.
+/// `std.testing` builds a table row's identity on top of it, which is what lets
+/// a row name itself in the output and be reachable by `--filter`.
+#[no_mangle]
+pub extern "C" fn pith_test_current_name() -> *const i8 {
+    let name = CURRENT_TEST.lock().map(|n| n.clone()).unwrap_or_default();
+    pith_strdup_string(&name)
+}
+
+/// The separator between a test's name and the label of one case inside it.
+/// A filter naming a case begins with the test's name and this, which is how
+/// the parent knows to run a test whose own name does not match.
+pub const TEST_CASE_SEPARATOR: &str = " / ";
+
 /// Whether a test should run under the current `PITH_TEST_FILTER`. With no
 /// filter every test runs; otherwise only names containing the substring do,
 /// and the rest are tallied as filtered out.
+///
+/// A filter can also name one case inside a table-driven test — `"the test
+/// name / a case label"`. The test's own name does not contain that, so
+/// matching on the substring alone would filter the test out and the case
+/// would never get the chance to select itself. A filter that starts with this
+/// test's name and the case separator is aimed inside it, so the test runs and
+/// `std.testing`'s `each` applies the same filter to each row's identity.
 ///
 /// # Safety
 /// `name` must point to a valid NUL-terminated string for this call.
@@ -1389,7 +1410,10 @@ pub unsafe extern "C" fn pith_test_should_run(name: *const i8) -> i64 {
         Ok(f) if !f.is_empty() => f,
         _ => return 1,
     };
-    if cstr_to_display(name).contains(&filter) {
+    let name = cstr_to_display(name);
+    let aimed_inside =
+        !name.is_empty() && filter.starts_with(&format!("{}{}", name, TEST_CASE_SEPARATOR));
+    if name.contains(&filter) || aimed_inside {
         1
     } else {
         TEST_FILTERED.fetch_add(1, Ordering::Relaxed);

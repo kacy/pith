@@ -26,6 +26,7 @@
 import std.bytes as bytes
 import std.net.http as http
 import std.web as web
+from std.testing import case, each
 
 # the header names, spelled once.
 ORIGIN := "Origin"
@@ -332,6 +333,16 @@ test "vary is merged rather than overwritten":
 test "an origin is matched whole, not by prefix or suffix":
     guard := middleware(origins([APP_ORIGIN]))
 
-    for spoofed in ["https://app.example.com.evil.test", "https://evil.test/https://app.example.com", "http://app.example.com", "https://app.example.com:8443", "https://sub.app.example.com"]:
-        resp := guard(ok_handler, cross_origin("GET", spoofed))
-        assert_eq(resp.header_value(ALLOW_ORIGIN), "")
+    # written as a loop this stopped at the first near-miss that got through and
+    # reported an assertion comparing two empty-looking strings, which said
+    # nothing about which shape of spoof had worked. every row is named here,
+    # and the rows after a failure still run: for a list of lookalikes, one that
+    # gets through usually means its neighbours do too, and that is the thing
+    # worth seeing in one go.
+    each([
+        case("a suffix past the boundary", "https://app.example.com.evil.test"),
+        case("the origin buried in a path", "https://evil.test/https://app.example.com"),
+        case("plain http", "http://app.example.com"),
+        case("another port", "https://app.example.com:8443"),
+        case("a subdomain", "https://sub.app.example.com"),
+], fn(spoofed: String) => guard(ok_handler, cross_origin("GET", spoofed)).header_value(ALLOW_ORIGIN) == "")

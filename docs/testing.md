@@ -59,31 +59,146 @@ carries on with the rest.
 ### assertions in helpers
 
 the assertions are ordinary calls, not a `test` block dialect, so they work in
-any function. that is what makes a table of cases worth writing: the check goes
-in a helper and the test body feeds it rows.
+any function. a check that takes a few lines to set up belongs in a helper, and
+the test body calls it once per input:
 
 ```pith
-struct Case:
-    input: String
-    want: Int
-
-fn assert_parses(c: Case):
-    assert_eq(parse(c.input), c.want)
+fn assert_parses(input: String, want: Int):
+    parsed := parse(input)
+    assert(parsed.is_ok)
+    assert_eq(parsed.ok, want)
 
 test "the parser handles every documented form":
-    for c in cases():
-        assert_parses(c)
-```
-
-a loop that stopped iterating passes as loudly as one that checked everything,
-so assert the row count too:
-
-```pith
-    assert_eq(checked, 7)
+    assert_parses("1", 1)
+    assert_parses("0x10", 16)
 ```
 
 if a module defines or imports its own function called `assert_eq`, that one
-wins; the built-in only fills a name nothing else has claimed.
+wins; the built-in only fills a name nothing else has claimed. that is the
+switch behind the table-driven form below: `std.testing`'s assertions record a
+failure and carry on where the built-ins end the process.
+
+## table-driven cases
+
+a list of inputs checked by one body is a common shape, and written as a loop it
+loses what the runner is for: the first row that fails ends the whole block, the
+failure names the assertion rather than the row that provoked it, and there is
+no way to ask for one row back.
+
+`each` runs a body once per labeled row and reports every row as a result of its
+own:
+
+```pith
+from std.testing import case, each
+
+test "an origin is matched whole, not by prefix or suffix":
+    guard := middleware(origins(["https://app.example.com"]))
+
+    each([
+        case("a suffix past the boundary", "https://app.example.com.evil.test"),
+        case("the origin buried in a path", "https://evil.test/https://app.example.com"),
+        case("plain http", "http://app.example.com"),
+        case("another port", "https://app.example.com:8443"),
+        case("a subdomain", "https://sub.app.example.com"),
+], fn(spoofed: String) => guard(ok_handler, cross_origin("GET", spoofed)).header_value(ALLOW_ORIGIN) == "")
+```
+
+a row passes when the body answers true and nothing inside it recorded a failed
+check. one that does not is named where it sits, and the rows after it still
+run:
+
+```
+  ok   [1] a suffix past the boundary
+  ok   [2] the origin buried in a path
+  FAIL [3] plain http -- the case did not hold
+  ok   [4] another port
+  ok   [5] a subdomain
+  an origin is matched whole, not by prefix or suffix ... FAILED
+```
+
+for a list of lookalikes that matters, because one that gets through is rarely
+the only one.
+
+a row carries whatever the body needs, so the input-and-expected table is a
+table of pairs:
+
+```pith
+    each([
+        case("empty", ("", 0)),
+        case("one character", ("a", 1)),
+        case("several", ("abcd", 4)),
+], fn(c: (String, Int)) => c.0.len() == c.1)
+```
+
+### reporting both sides
+
+a body that answers yes or no reports its label and nothing else. when the two
+values are worth seeing, check them with `std.testing`'s assertions inside the
+body and return `true`: the check prints both sides and `each` names the row it
+belonged to underneath. a multi-line body is bound to a name first, because a
+`fn(x):` block does not fit inside an argument list:
+
+```pith
+from std.testing import case, each, check
+
+test "doubling":
+    doubled := fn(n: Int):
+        check(n + n, n * 2, "doubled")
+        return true
+
+    each([case("one", 1), case("two", 2)], doubled)
+```
+
+reach for `std.testing`'s assertions rather than the built-ins inside a case
+body. the built-ins end the process where they fail, which under `each` takes
+every row after the failing one with it, and the row that failed is never named:
+
+```
+  ok   [1] first
+assertion failed
+  a builtin assertion reaches a case body through a helper ... FAILED
+```
+
+`std.testing`'s record the failure instead, so the table finishes and `each`
+says which row it was. (a closure body cannot call the built-ins at all today —
+`assert` inside a `fn(x):` block fails to compile; they reach a case body only
+through a helper the body calls.)
+
+`pith fmt` closes a multi-line list at column zero, which is why the `]` above
+sits where it does — the same shape the tables in `std/crypto/password.pith` and
+`std/hash.pith` already have.
+
+### selecting one row
+
+a row's identity is the test's name, ` / `, and the row's label, and `--filter`
+matches on that:
+
+```
+$ pith test std/web/cors.pith --filter "an origin is matched whole, not by prefix or suffix / another port"
+  ok   [4] another port
+  an origin is matched whole, not by prefix or suffix ... ok
+
+1 passed, 0 failed, 10 filtered out
+```
+
+the number in brackets is the row's position in the table, not in the run, so a
+filtered run names the same row the full run did. a filter that matches the
+test's name alone runs the whole table, the way it always has.
+
+a filter that names a row which is not there runs the test with no rows
+selected, and a test that checked nothing reports as passing:
+
+```
+$ pith test rows.pith --filter "rows / gamma"
+  rows ... ok
+
+1 passed, 0 failed, 1 filtered out
+```
+
+there is no result line above it, which is the tell — a table that ran prints
+one line per row. the test cannot skip itself instead, because a test is free
+to hold more than one table and the first of them cannot know whether a later
+one matches.
 
 ## skipping a test
 
@@ -119,7 +234,9 @@ $ pith test std/mysql.pith --filter scramble
 ```
 
 the filter also reads from the `PITH_TEST_FILTER` environment variable, which is
-handy when you drive the tests through a wrapper script.
+handy when you drive the tests through a wrapper script. one row of a
+table-driven test is reachable the same way — see [selecting one
+row](#selecting-one-row).
 
 ## std.testing
 
@@ -144,8 +261,8 @@ of the comparison.
 
 what `std.testing` adds beyond the built-ins is the utilities they do not cover:
 `assert_contains(text, part)`, `assert_file_exists(path)`,
-`assert_dir_exists(path)`, and `with_temp_dir(prefix, run)` for a scoped
-filesystem sandbox.
+`assert_dir_exists(path)`, `with_temp_dir(prefix, run)` for a scoped filesystem
+sandbox, and `case`/`each` for the table-driven form above.
 
 ## the other test suites
 

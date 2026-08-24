@@ -1,0 +1,37 @@
+from std.testing import case, each, check, done
+
+# a table-driven test written as a bare loop reports the assertion that failed
+# and stops there. `each` reports the row instead, by label and by position, and
+# keeps going. the deliberate failures below are the point of this case: they
+# are what proves a bad row neither hides its detail nor takes its siblings
+# with it, and the golden output is where that gets checked.
+
+fn main():
+    each([
+        case("empty", ""),
+        case("short", "ab"),
+        case("too long", "abcdefghij"),
+        case("still short", "cd"),
+], fn(s: String) => s.len() < 5)
+
+    # an input/expected table reads as a table: one row per pair.
+    each([
+        case("empty", ("", 0)),
+        case("one character", ("a", 1)),
+        case("wrong want", ("ab", 9)),
+], fn(c: (String, Int)) => c.0.len() == c.1)
+
+    # a row is free to check values rather than answer yes or no. the check
+    # prints both sides and counts itself, and the row that held it is named
+    # underneath so the detail has an owner.
+    doubling := fn(n: Int):
+        check(n + n, n * 2, "doubled")
+        check(n, 1, "is one")
+        return true
+
+    each([
+        case("one", 1),
+        case("two", 2),
+], doubling)
+
+    done()

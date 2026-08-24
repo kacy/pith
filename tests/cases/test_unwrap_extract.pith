@@ -1,0 +1,60 @@
+# golden coverage for the values unwrap_or extracts, through every ownership
+# shape the retain-on-extraction change touches: bound then returned, argument
+# position, receiver position, both none-path fallbacks, and double extraction
+# of the same local. the leak gate proves the counting balances; this proves
+# the extracted VALUES are right, which a leak gate cannot see.
+struct Ev:
+    pub tag: String
+
+fn mk(i: Int) -> Ev?:
+    if i < 0:
+        return none
+    return Ev("event-" + i.to_string())
+
+fn name_of(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "name-" + i.to_string()
+
+fn consume(e: Ev) -> Int:
+    return e.tag.len()
+
+fn take(i: Int) -> Ev:
+    opt := mk(i)
+    ev := opt.unwrap_or(Ev("fallback"))
+    return ev
+
+fn main():
+    # escape shape: bind + return, some and none paths
+    e := take(7)
+    print(e.tag)
+    miss := take(0 - 1)
+    print(miss.tag)
+    # argument position
+    opt := mk(12)
+    arg_n := consume(opt.unwrap_or(Ev("arg-fb")))
+    print("{arg_n}")
+    # receiver position, some and none paths
+    s := "recv-fb"
+    o := name_of(3)
+    print("{o.unwrap_or(s).len()}")
+    o2 := name_of(0 - 1)
+    print(o2.unwrap_or(s))
+    print(s)
+    # none path, fresh fallback
+    p: Ev? := none
+    fresh := p.unwrap_or(Ev("fresh-fb"))
+    print(fresh.tag)
+    # none path, borrowed fallback: the owner's value survives the extraction
+    fb := Ev("borrowed-fb")
+    q: Ev? := none
+    got := q.unwrap_or(fb)
+    print(got.tag)
+    print(fb.tag)
+    # double extraction of the same local
+    d := mk(5)
+    a := d.unwrap_or(Ev("a-fb"))
+    b := d.unwrap_or(Ev("b-fb"))
+    print(a.tag)
+    print(b.tag)
+    print("{consume(a) + consume(b)}")

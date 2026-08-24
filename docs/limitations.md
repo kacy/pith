@@ -365,17 +365,18 @@ one caveat on the numbers themselves: every comparison in docs/performance.md
 and bench/README.md was measured on the same 2-core box. "green wins everywhere"
 is true there and unverified on wider hardware.
 
-two related ownership issues are outstanding, and they are not the same
-severity. passing a bare `T!` or `T?` local as a call argument leaks its
-payload — a bounded leak, where the caller-side cascade does not yet treat the
-argument as the borrow it now provably is. extracting the same optional local
-twice, where a consumer releases what it is handed (an argument, a method
-receiver), is a use-after-free rather than a leak: `unwrap_or` on a borrowed
-subject hands the payload out with no count of its own, so the first consumer's
-release frees it and the second read lands on freed memory. retaining on
-extraction closes it but interacts with the release of an owned temporary a
-field is read off, so it is being fixed on its own rather than as a one-line
-guard.
+of the two related ownership issues that were outstanding here, one remains.
+passing a bare `T!` or `T?` local as a call argument still leaks its payload —
+a bounded leak, where the caller-side cascade does not yet treat the argument
+as the borrow it now provably is. the double-extraction use-after-free is
+fixed: `unwrap_or` retains the payload it extracts, so the result carries its
+own count — a bind transfers it, an argument position releases it after the
+call, an owned receiver is released after the member read — and the subject's
+cleanup cascade stays the sole owner of the count its shell keeps. the retain
+covers a parameter, field, element or fresh subject, and any local whose uses
+the cascade walk can prove safe. a local the walk rejects (one also sent to a
+channel, captured by a closure, or handed to a callee the walk cannot read)
+keeps the old transfer, so extracting that local twice is still unsound.
 
 sweeping std's shared globals for the same class of bug turned up three things
 that are questions of design rather than repairs, so they are recorded here

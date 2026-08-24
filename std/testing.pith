@@ -46,7 +46,11 @@ fn reset_counts():
     counts_mu.unlock()
     set_test_failed(false)
 
-fn silence_output():
+## stop printing a line per check and per case. the tally still counts, and a
+## failure still fails the run — this only quietens the output, for a caller
+## that runs a table many thousands of times and wants its own line at the end
+## rather than one per row.
+pub fn silence_output():
     counts_mu.lock()
     silent = true
     counts_mu.unlock()
@@ -238,6 +242,103 @@ pub fn with_temp_dir(prefix: String, run: fn(String) -> Bool) -> Bool:
         record_fail("with_temp_dir", "callback returned false")
     return ok
 
+# --- table-driven cases -----------------------------------------------------
+#
+# a table of rows checked by one body is a loop you write by hand, and a loop
+# has no per-row identity: the first row that fails ends the whole block, the
+# failure names the assertion rather than the row that provoked it, and there is
+# no way to ask for one row back. `each` gives every row a result line of its
+# own and a name `--filter` can select.
+
+# between a test's name and a case label, in a case identity and in a filter.
+# the runner knows this separator too: a filter that begins with a test's name
+# and this is aimed at a case inside that test, so the test runs rather than
+# being filtered out on its own name, and `each` sorts the rows out from there.
+CASE_SEPARATOR := " / "
+
+## one row of a table-driven test: the label that names it in the result line
+## and in `--filter`, and the value the body is run against.
+pub struct Case[T]:
+    pub label: String
+    pub value: T
+
+## build one labeled row for `each`.
+##
+##   case("trailing junk", "12x")
+pub fn case[T](label: String, value: T) -> Case[T]:
+    return Case(label: label, value: value)
+
+# a row's full name: the test it sits in, the separator, and its label. outside
+# a test — a std.testing `main()` — there is no enclosing name, so the label is
+# the whole identity.
+fn case_identity(prefix: String, label: String) -> String:
+    if prefix == "":
+        return label
+    return prefix + CASE_SEPARATOR + label
+
+## run `body` once per row, reporting every row under its own name.
+##
+##   from std.testing import case, each
+##
+##   test "parse_int rejects what is not a number":
+##       each([
+##           case("empty", ""),
+##           case("letters", "abc"),
+##           case("trailing junk", "12x"),
+##       ], fn(text: String) => parse_int(text).is_err)
+##
+## a row passes when the body returns true and no check inside it recorded a
+## failure. a row that fails is named — by label and by position — and every row
+## after it still runs, which is the point: a hand-written loop stops at the
+## first failure and reports the assertion instead of the row.
+##
+## the built-in `assert`, `assert_eq` and `assert_ne` end the process where they
+## fail, so a case body that reaches for one takes its siblings down with it.
+## import this module's assertions instead — `from std.testing import assert_eq`
+## makes the recording version win for the whole file — and a failing row prints
+## both sides before `each` names it.
+##
+## a row runs under `--filter` when its identity contains the filter, so
+## `--filter "parse_int rejects what is not a number / letters"` runs one row
+## and `--filter "parse_int rejects"` runs the table.
+pub fn each[T](rows: List[Case[T]], body: fn(T) -> Bool):
+    filter := env("PITH_TEST_FILTER")
+    prefix := test_name()
+    for row, i in rows:
+        if filter != "" and not case_identity(prefix, row.label).contains(filter):
+            continue
+        name := "[" + (i + 1).to_string() + "] " + row.label
+        before := failure_count()
+        ok := body(row.value)
+        failed_checks := failure_count() - before
+        if failed_checks > 0:
+            # the checks inside the row have already printed their detail and
+            # counted themselves. naming the row is the part they cannot do.
+            mut detail := "a check above failed"
+            if failed_checks > 1:
+                detail = failed_checks.to_string() + " checks above failed"
+            name_case_failure(name, detail)
+        elif ok:
+            record_pass(name)
+        else:
+            record_fail(name, "the case did not hold")
+
+fn failure_count() -> Int:
+    counts_mu.lock()
+    n := fail_count
+    counts_mu.unlock()
+    return n
+
+# say which row a failure belongs to without counting it a second time: the
+# check inside it already moved the tally and set the verdict.
+fn name_case_failure(name: String, detail: String):
+    counts_mu.lock()
+    quiet := silent
+    counts_mu.unlock()
+    if quiet:
+        return
+    print("  FAIL " + name + " -- " + detail)
+
 # print summary
 pub fn done():
     counts_mu.lock()
@@ -366,3 +467,66 @@ test "match payload bindings work directly in a test body":
 
     assert(pass_count == 2)
     assert(fail_count == 0)
+
+test "a table reports every row, and one bad row does not end the table":
+    reset_counts()
+    silence_output()
+
+    each([
+        case("empty", ""),
+        case("short", "ab"),
+        case("too long", "abcdefghij"),
+        case("still short", "cd"),
+], fn(s: String) => s.len() < 5)
+
+    # three rows passed and the fourth still ran after the third failed, which
+    # is the whole difference from a hand-written loop.
+    assert(pass_count == 3)
+    assert(fail_count == 1)
+
+    reset_counts()
+
+test "a row that fails a check is named once, not counted twice":
+    reset_counts()
+    silence_output()
+
+    body := fn(n: Int):
+        check(n, 1, "is one")
+        return true
+
+    each([case("one", 1), case("two", 2)], body)
+
+    # the passing row counts as a result of its own, the way with_temp_dir
+    # does, so the tally reads two passes: the check and the row it held. the
+    # failing check counted itself, and naming the row it belongs to does not
+    # count it a second time.
+    assert(pass_count == 2)
+    assert(fail_count == 1)
+
+    reset_counts()
+
+test "a case identity is the test name and the label":
+    reset_counts()
+    silence_output()
+
+    assert_eq(test_name(), "a case identity is the test name and the label")
+    assert_eq(case_identity(test_name(), "a row"), test_name() + " / a row")
+    # outside a test there is no enclosing name, so the label stands alone.
+    assert_eq(case_identity("", "a row"), "a row")
+
+    reset_counts()
+
+test "a table of input and expected pairs reads as a table":
+    reset_counts()
+    silence_output()
+
+    each([
+        case("empty", ("", 0)),
+        case("one character", ("a", 1)),
+        case("several", ("abcd", 4)),
+], fn(c: (String, Int)) => c.0.len() == c.1)
+
+    assert(pass_count == 3)
+    assert(fail_count == 0)
+
+    reset_counts()

@@ -1,43 +1,33 @@
-# a table of cases checked by a shared helper.
+# a table of cases, every row named and reported on its own.
 #
-# the built-in assertions are ordinary calls, not something only a `test` block
-# can say, so the check for one row lives in a function and the caller feeds it
-# rows. spelling every case out inline is what a table exists to avoid, and it
-# is why exhaustive coverage so often does not get written at all.
+# `each` runs one body over every labeled row. a row that fails is named where
+# it sits, and the rows after it still run — which a loop over the same table
+# cannot do: the first failure ends it, and what gets reported is the assertion
+# rather than the row that provoked it. the label is also how `pith test` picks
+# one row back out, with `--filter "the test name / no separator present"`.
 import std.strings as strings
+from std.testing import case, each, done
 
+# one row: what to split, and what the pieces should come out as. the wanted
+# pieces are written joined because a list compares by identity rather than by
+# content, and what a row wants to compare is what it produced.
 struct SplitCase:
-    name: String
     input: String
     sep: String
     limit: Int
-    want: List[String]
+    want: String
 
-fn cases() -> List[SplitCase]:
-    return [
-        SplitCase("plain", "a,b,c", ",", 8, ["a", "b", "c"]),
-        SplitCase("no separator present", "abc", ",", 8, ["abc"]),
-        SplitCase("empty fields are kept", "a,,c", ",", 8, ["a", "", "c"]),
-        SplitCase("leading and trailing", ",a,", ",", 8, ["", "a", ""]),
-        SplitCase("multi-character separator", "a::b", "::", 8, ["a", "b"]),
-        SplitCase("the limit counts splits, not fields", "a,b,c,d", ",", 2, ["a", "b", "c,d"]),
-    ]
-
-# one row, checked. assert_eq compares lists by content, so a row that differs
-# reports both lists rather than two heap addresses.
-fn assert_splits(c: SplitCase):
-    got := strings.split_n(c.input, c.sep, c.limit)
-    assert_eq(got, c.want)
-    assert_eq(got.len(), c.want.len())
-    assert_ne(c.name, "")
+fn split_matches(c: SplitCase) -> Bool:
+    return strings.split_n(c.input, c.sep, c.limit).join("|") == c.want
 
 fn main():
-    mut checked := 0
-    for c in cases():
-        assert_splits(c)
-        checked = checked + 1
+    each([
+        case("plain", SplitCase("a,b,c", ",", 8, "a|b|c")),
+        case("no separator present", SplitCase("abc", ",", 8, "abc")),
+        case("empty fields are kept", SplitCase("a,,c", ",", 8, "a||c")),
+        case("leading and trailing", SplitCase(",a,", ",", 8, "|a|")),
+        case("multi-character separator", SplitCase("a::b", "::", 8, "a|b")),
+        case("the limit counts splits, not fields", SplitCase("a,b,c,d", ",", 2, "a|b|c,d")),
+], split_matches)
 
-    # a loop that quietly stopped iterating passes just as loudly as one that
-    # checked every row, so the row count is an assertion too.
-    assert_eq(checked, 6)
-    print("{checked} split cases checked")
+    done()

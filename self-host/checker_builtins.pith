@@ -103,6 +103,11 @@ pub fn register_builtin_types(scope_id: Int):
     define_builtin_function("print_err", str_to_void)
     define_builtin_function("skip_test", str_to_void)
 
+    # the name of the test currently running, or "" outside one. std.testing
+    # builds a table row's identity on top of it, so a row can name itself in
+    # the output and be reachable by --filter.
+    define_builtin_function("test_name", create_function_type([], TID_STRING))
+
     str_to_int := create_function_type([TID_STRING], TID_INT)
     define_builtin_function("exec", str_to_int)
     define_builtin_function("ord", str_to_int)
@@ -307,6 +312,7 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("print", [tid_string], tid_void)
     fix_builtin_binding("print_err", [tid_string], tid_void)
     fix_builtin_binding("skip_test", [tid_string], tid_void)
+    fix_builtin_binding("test_name", [], tid_string)
     fix_builtin_binding("exec", [tid_string], tid_int)
     fix_builtin_binding("ord", [tid_string], tid_int)
     fix_builtin_binding("file_exists", [tid_string], tid_bool)

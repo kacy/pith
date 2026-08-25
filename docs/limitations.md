@@ -335,20 +335,15 @@ correctness story:
   map literal, an index assignment, a binding, a struct field, a widened
   argument — so a `List[String?]` of built strings reclaims them with the
   container, and a payload the wrap borrowed keeps its owner's count intact.
-  what still leaks is a bare `none` written straight into a container store
-  (`xs.push(none)`, `m[k] = none`), about 62 bytes a store: the shell the
-  caller builds keeps a count the store never takes and the caller never
-  drops. binding it first (`v: String? := none` then `xs.push(v)`) is
-  reclaimed normally.
+  a bare `none` written straight into a container store (`xs.push(none)`,
+  `m[k] = none`) is a shell the caller built, so the store takes that count
+  instead of adding one of its own, the same as a widened plain value.
 - a set or map literal never releases a freshly built element, about 24 bytes
   each, and both halves of a map literal pay it independently. the same set
   built with `add`, the same map filled by index assignment, and a list literal
   over the same strings are all flat (issue #942).
-- two optional shapes still strand a shell. `xs.index_of(v) != none` leaks the
-  optional the search returns, on any list and any element type, about 48 bytes
-  a call — calling `unwrap_or` on the same result is flat (issue #933). and a
-  discarded call result of type `List[X]?` leaks its payload, on the generic and
-  non-generic spellings alike, which places it in the discarded-result path
+- a discarded call result of type `List[X]?` leaks its payload, on the generic
+  and non-generic spellings alike, which places it in the discarded-result path
   rather than the return path (issue #935).
 - a heap payload behind a *fresh* optional shell that carries no destructor
   leaks, about one count per extraction. a user function returning `T?` builds

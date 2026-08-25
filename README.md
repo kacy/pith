@@ -136,8 +136,9 @@ does not swing is 135–162µs against go's 93.
 
 ## what it does not do
 
-the current list lives in [docs/limitations.md](docs/limitations.md)
-and is kept up to date. the ones to know before you start:
+the current list lives in [docs/limitations.md](docs/limitations.md),
+kept current with the compiler and carrying issue numbers for the
+open defects. the ones to know before you start:
 
 - a strong reference cycle with no `weak` edge leaks. an opt-in
   trial-deletion collector exists behind `PITH_CYCLE_GC`, off by default.
@@ -146,8 +147,9 @@ and is kept up to date. the ones to know before you start:
   `require_tls13()` refuses the fallback.
 - no package registry. dependencies are local paths in `pith.toml`,
   with `lock` and `install` but nothing that fetches.
-- no debugger, and the language server re-checks the whole module
-  closure rather than incrementally.
+- no debugger. the language server answers a syntax error from the
+  edited file alone, but a full check still walks the whole import
+  closure.
 - gzip compresses with fixed huffman only, and the regex engine skips
   counted repeats, lazy quantifiers and lookaround on purpose.
 

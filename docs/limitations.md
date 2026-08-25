@@ -181,6 +181,22 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
+- **`.value()` on an optional holding a struct frees it** — where the optional
+  came from an annotated binding, `o: Plain? := Plain(...)`, extracting with
+  `.value()` releases the payload while the extracted value is still live. the
+  program prints the right answer and exits 0; under `PITH_STRUCT_FREELIST=0`
+  valgrind reports the read landing on a freed block. `match` and `unwrap_or`
+  on the same optional are clean, and a call-produced optional is clean, so the
+  shape is specific: a struct payload, an annotated-binding shell, extracted by
+  `.value()`. this is what a recursive walk over a `next: Node?` chain does at
+  every step. read the payload through `match` until it is fixed (issue #940).
+- **two generic instances whose type arguments differ only in element type
+  collide** — an instance is keyed by its type argument's bare name, so
+  `Holder[List[Int]]` and `Holder[List[String]]` are one key and the second
+  reports `field 'item' type mismatch: expected List, got List`. the same area
+  miscompiles an explicit parameterized type argument: `Holder[List[Int]]([1, 2])`
+  compiles and then faults when the field is indexed, while the inferred,
+  annotated-binding and parameter-annotation spellings all work (issue #941).
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is
@@ -340,6 +356,30 @@ correctness story:
   caller builds keeps a count the store never takes and the caller never
   drops. binding it first (`v: String? := none` then `xs.push(v)`) is
   reclaimed normally.
+- a set or map literal never releases a freshly built element, about 24 bytes
+  each, and both halves of a map literal pay it independently. the same set
+  built with `add`, the same map filled by index assignment, and a list literal
+  over the same strings are all flat (issue #942).
+- three optional shapes still strand a shell. `xs.index_of(v) != none` leaks the
+  optional the search returns, on any list and any element type, about 48 bytes
+  a call — calling `unwrap_or` on the same result is flat (issue #933). a
+  discarded call result of type `List[X]?` leaks its payload, on the generic and
+  non-generic spellings alike, which places it in the discarded-result path
+  rather than the return path (issue #935). and `if let` on an awaited optional
+  leaks its shell, because `await` is not counted as a producer of an owned
+  optional the way a call and a method call are — binding the result and
+  reading it with `unwrap_or` is flat (issue #936).
+- a `Set` with an optional element type, and a `Map` with an optional key type,
+  are really the string-backed containers reading a shell pointer as a
+  c-string, so distinct optionals collapse into one entry. the store and query
+  positions reject an optional element rather than offering a shorter spelling
+  for a container that loses entries (issue #920).
+- several std types must be closed by hand and nothing enforces it. the survey,
+  the assessment of what a destructor hook would take, and the staged plan are
+  in docs/destructors_roadmap.md; three registry leaks it found — buffered text
+  readers and writers, websocket, and gRPC streams, which expose no close at
+  all — are issue #925. the E307 lint flags a locally built resource that is
+  never closed and never handed off.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

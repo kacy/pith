@@ -1,0 +1,51 @@
+# an awaited task's optional result is a fresh shell the awaiter owns, the same
+# as a call result: the task built it with a count of one and pith_await hands
+# that count over. so every consumer that frees a call-result shell has to free
+# an awaited one too — `if let` at its merge, `.value()` and `unwrap_or` right
+# after the extract. an extraction off an await has to be parenthesized, so the
+# paren node has to be transparent to the same classification.
+#
+# run under valgrind this catches both halves: a missing release leaks, and a
+# release the shell was not entitled to shows up as an invalid read on the map
+# payloads below, which another owner is still holding. the printed sum catches
+# a behavior regression.
+
+fn maybe_name(i: Int) -> String?:
+    if i % 3 == 0:
+        return none
+    return "name-" + i.to_string()
+
+fn maybe_len(i: Int) -> Int?:
+    if i % 4 == 0:
+        return none
+    return i % 17
+
+fn main() -> Int!:
+    mut sum := 0
+    fallback := "fallback-string"
+    mut m: Map[String, String] := {}
+    m.insert("k", "value-string")
+    mut i := 0
+    while i < 300:
+        # if-let on an awaited optional: the shell is the awaiter's to free,
+        # and the binding only borrows the payload out of it
+        t := spawn maybe_name(i)
+        if let v = await t:
+            sum = sum + v.len()
+        # a scalar payload, so nothing but the shell is at stake
+        u := spawn maybe_len(i)
+        sum = sum + (await u).unwrap_or(0 - 1)
+        # a borrowed fallback needs its own count before the shell dies
+        w := spawn maybe_name(i + 1)
+        got := (await w).unwrap_or(fallback)
+        sum = sum + got.len()
+        # a parenthesized borrowing getter: the shell is fresh and must be
+        # freed, but the map still owns the payload behind it
+        held := (m.get("k")).value()
+        sum = sum + held.len()
+        sum = sum + (m.get("absent")).unwrap_or(fallback).len()
+        i = i + 1
+    # the map's payload must have survived every one of those extractions
+    sum = sum + m.get("k").unwrap_or("").len()
+    print("sum=" + sum.to_string())
+    return 0

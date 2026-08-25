@@ -344,15 +344,23 @@ correctness story:
   each, and both halves of a map literal pay it independently. the same set
   built with `add`, the same map filled by index assignment, and a list literal
   over the same strings are all flat (issue #942).
-- three optional shapes still strand a shell. `xs.index_of(v) != none` leaks the
+- two optional shapes still strand a shell. `xs.index_of(v) != none` leaks the
   optional the search returns, on any list and any element type, about 48 bytes
-  a call — calling `unwrap_or` on the same result is flat (issue #933). a
+  a call — calling `unwrap_or` on the same result is flat (issue #933). and a
   discarded call result of type `List[X]?` leaks its payload, on the generic and
   non-generic spellings alike, which places it in the discarded-result path
-  rather than the return path (issue #935). and `if let` on an awaited optional
-  leaks its shell, because `await` is not counted as a producer of an owned
-  optional the way a call and a method call are — binding the result and
-  reading it with `unwrap_or` is flat (issue #936).
+  rather than the return path (issue #935).
+- a heap payload behind a *fresh* optional shell that carries no destructor
+  leaks, about one count per extraction. a user function returning `T?` builds
+  its `Some` with a plain allocation and no `__opt_dtor_<kind>`, so the shell
+  holds the only count on the payload and freeing the shell does not drop it;
+  the extraction still takes the retain it would need against a shell that did
+  own the payload. `if let s = maybe():` and `maybe().unwrap_or(d)` both pay it,
+  on a call subject and an awaited one alike, while binding the shell first
+  (`o := maybe()` then `o.unwrap_or(d)`) is flat. narrowing the retain is not
+  the fix on its own: a call that returns a *widened* local shell does carry
+  the destructor, and dropping the retain there would hand out a payload the
+  shell is about to free.
 - a `Set` with an optional element type, and a `Map` with an optional key type,
   are really the string-backed containers reading a shell pointer as a
   c-string, so distinct optionals collapse into one entry. the store and query

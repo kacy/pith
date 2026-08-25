@@ -37,6 +37,12 @@ cases=(
   tests/leaks/leak_list_transform
   tests/leaks/leak_module_call_string
   tests/leaks/leak_list_search_widened_arg
+  tests/leaks/leak_generic_instance_dtor
+  tests/leaks/leak_generic_optional_return
+  tests/leaks/leak_generic_variant_slots
+  tests/leaks/leak_generic_field_kinds
+  tests/leaks/leak_generic_call_shapes
+  tests/leaks/leak_generic_boundary
   tests/leaks/leak_container_rebind
   tests/leaks/leak_optional_string_payload
   tests/leaks/leak_optional_literal_elements
@@ -66,13 +72,41 @@ cases=(
   tests/leaks/leak_optional_plain_compare
   tests/leaks/leak_optional_match_payload
   tests/leaks/leak_argument_literal
-  tests/leaks/leak_optional_literal_elements
   tests/leaks/leak_widened_store
+  tests/leaks/leak_arena_truncate
+  tests/leaks/leak_json_decode_struct
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_http_string_head_flood
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
 )
+
+# a case file that never made it into the list above measures nothing and says
+# so to nobody: two generic cases sat in tests/leaks/ unregistered for a day
+# each, written alongside a fix and then never run again. so the list is
+# checked against the directory rather than trusted. a reproducer that is
+# expected to fail belongs in tests/pending/, which nothing globs.
+unregistered=""
+for file in tests/leaks/leak_*.pith; do
+  base="${file%.pith}"
+  found=""
+  for entry in "${cases[@]}"; do
+    read -r entry_base _ <<<"$entry"
+    if [ "$entry_base" = "$base" ]; then
+      found=1
+      break
+    fi
+  done
+  [ -n "$found" ] || unregistered="$unregistered $base"
+done
+if [ -n "$unregistered" ]; then
+  echo "leak case(s) present but not registered in tooling/leak_check.sh:"
+  for base in $unregistered; do
+    echo "  $base"
+  done
+  echo "add them to the cases list, or move a known-failing one to tests/pending/"
+  exit 1
+fi
 
 echo "--- leak growth (${low_rounds} vs ${high_rounds} rounds, limit ${limit_kb}kb) ---"
 

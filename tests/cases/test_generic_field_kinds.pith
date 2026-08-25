@@ -1,0 +1,105 @@
+# a generic struct's field type is whatever the type argument put there, and
+# every rc kind the language has can land behind one parameter. a destructor
+# built from the wrong kind either strands the value or frees it as the wrong
+# thing, and only reading the value back out can tell the second case from a
+# program that happens to survive.
+#
+# so each kind is built, read back and printed: string, list, map, set, bytes,
+# struct and closure. beside them are the shapes where the field is not the
+# only thing to get right — a nested instance, a two-parameter instance whose
+# first slot releases nothing, the same declaration at two different type
+# arguments in one program, a borrowed payload that outlives its instance and
+# a self-referential `Node[T]` chain.
+#
+# maps and sets print only their size and a keyed lookup: their iteration
+# order is not part of what this pins down.
+import std.bytes as bytes
+
+struct Leaf:
+    pub name: String
+
+struct Holder[T]:
+    pub item: T
+
+# a second declaration rather than a second `Holder[List[...]]`: two inferred
+# instantiations of one generic at the same container and different element
+# types collide today, so the nested shapes get their own name.
+struct Nest[T]:
+    pub item: T
+
+struct Tagged[K, V]:
+    pub key: K
+    pub value: V
+
+struct Node[T]:
+    pub value: T
+    pub next: Node[T]?
+
+fn chain(tag: String) -> Node[String]:
+    tail := Node("tail-" + tag, none)
+    middle := Node("middle-" + tag, tail)
+    return Node("head-" + tag, middle)
+
+# the tail is reached with a match rather than `.value()`: `.value()` on an
+# optional holding a struct over-releases what it extracts (see
+# tests/pending/), which valgrind sees as a read of a freed block and which
+# has nothing to do with the generic chain this walks.
+fn walk(n: Node[String]) -> String:
+    match n.next:
+        none => n.value
+        tail => n.value + ">" + walk(tail)
+
+fn main():
+    mut round := 0
+    while round < 2:
+        tag := round.to_string()
+
+        hs := Holder("string-" + tag)
+        print(hs.item)
+
+        hl := Holder([round, round + 1, round + 2])
+        print("list {hl.item.len()} {hl.item[0]} {hl.item[2]}")
+
+        mut m: Map[String, String] := {}
+        m["a"] = "map-" + tag
+        hm := Holder(m)
+        print("map {hm.item.len()} {hm.item["a"]}")
+
+        mut s: Set[String] := {}
+        s.add("set-" + tag)
+        s.add("other-" + tag)
+        hset := Holder(s)
+        print("set {hset.item.len()} {hset.item.contains("set-" + tag)}")
+
+        hb := Holder(bytes.from_string_utf8("bytes-" + tag))
+        print("bytes {hb.item.len()} {hb.item.to_string_utf8()}")
+
+        hstruct := Holder(Leaf("leaf-" + tag))
+        print(hstruct.item.name)
+
+        hclosure := Holder(fn(x: Int) => x + round)
+        f := hclosure.item
+        print("closure {f(10)}")
+
+        # a borrowed payload: the local keeps its own count and the instance
+        # takes one of its own, so neither release can be the last one twice
+        borrowed := "borrowed-" + tag
+        hborrow := Holder(borrowed)
+        print(hborrow.item + "/" + borrowed)
+
+        # the same declaration at a second type argument, and one whose first
+        # slot is an Int and releases nothing at all
+        hint := Holder(round)
+        print("int {hint.item}")
+        t := Tagged(round, "tag-" + tag)
+        print("{t.key}={t.value}")
+        t2 := Tagged("key-" + tag, [round, round + 1])
+        print("{t2.key}={t2.value.len()}")
+
+        nested := Nest(["n-" + tag, "m-" + tag])
+        print("nested {nested.item.len()} {nested.item[1]}")
+        deep := Nest(Holder("deep-" + tag))
+        print(deep.item.item)
+
+        print(walk(chain(tag)))
+        round = round + 1

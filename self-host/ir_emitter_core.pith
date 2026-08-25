@@ -931,20 +931,21 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         if ir_rc_kind(ir_infer_type(idx)).len() > 0:
             if ir_method_result_retains_over_args(ir_method_emit_name(mname, recv_type)):
                 return false
-        # the optional unwrap_or hands out an owned count for every heap
-        # payload kind: either the freshly retained one its Some arm takes,
-        # or (for a shell-only subject) the count the shell's cleanup never
-        # releases. the struct/list/... kinds already answered owned through
-        # the rc-kind check above; this covers the string payload, which
-        # would otherwise fall to the builtin fresh-name list below and
-        # classify borrowed — making the escape site retain a second count
-        # on top of the one the extraction carries. the RESULT unwrap_or is
-        # untouched: its receiver's kind is "result", and its string payload
-        # keeps the retain-at-escape convention.
-        if mname == "unwrap_or" and node.children.len() > 0:
-            unwrap_recv_tid := ir_emission_tid(node.children[0])
-            if unwrap_recv_tid >= 0 and get_type_info(unwrap_recv_tid).kind == "optional":
-                if ir_rc_kind(ir_type_from_tid(get_type_info(unwrap_recv_tid).inner)).len() > 0:
+        # the optional extractions — `unwrap_or` and `.value()` — hand out an
+        # owned count for every heap payload kind: either the freshly
+        # retained one ir_extraction_retains asks for, or (for a shell-only
+        # subject) the count the shell's cleanup never releases. the
+        # struct/list/... kinds already answered owned through the rc-kind
+        # check above; this covers the string payload, which would otherwise
+        # fall to the builtin fresh-name list below and classify borrowed —
+        # making the escape site retain a second count on top of the one the
+        # extraction carries. the RESULT unwrap_or is untouched: its
+        # receiver's kind is "result", and its string payload keeps the
+        # retain-at-escape convention.
+        if (mname == "unwrap_or" or mname == "value") and node.children.len() > 0:
+            extract_recv_tid := ir_emission_tid(node.children[0])
+            if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
+                if ir_rc_kind(ir_type_from_tid(get_type_info(extract_recv_tid).inner)).len() > 0:
                     return false
         return not ir_string_method_returns_fresh(mname)
     # a payload-free variant written bare — `Holder.Empty`, or the alias-
@@ -1099,13 +1100,17 @@ fn ir_defer_emit_for_loop_jump():
 # that binds `xs[0]` and returns left its caller's list pointing at a freed
 # string — and it becomes a double free the moment the shell owns its payload
 # through a destructor. only a producer that transfers (a call, an await, a
-# match) leaves this local the payload's sole owner.
+# match) leaves this local the payload's sole owner — and a borrowing runtime
+# getter (`v := m.get(k)`, `v := xs.first()`) does not, even though the shell
+# it hands back is fresh enough that nothing else about the bind looks
+# borrowed. cascading one of those releases the container's own count on an
+# element it is still holding.
 fn ir_tuple_record_tid(name: String, val_idx: Int):
     tid := c_get_expr_type(val_idx)
     if tid < 0:
         return
     mut recorded := tid
-    if ir_expr_is_borrowed(val_idx):
+    if ir_expr_is_borrowed(val_idx) or not ir_shell_producer_transfers(val_idx):
         recorded = 0 - 1
     if ir_tuple_local_tid.contains_key(name):
         if ir_tuple_local_tid[name] != recorded:
@@ -1113,9 +1118,52 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
         return
     ir_tuple_local_tid.insert(name, recorded)
 
+# the runtime getters that build an optional shell around a payload they do
+# NOT own a count on: the map's stored value, the list's element. the shell is
+# fresh and the caller frees it, but the payload's count stays with the
+# container, so a local bound to one is never the payload's last owner. the
+# other optional-returning builtins are the opposite — `env_opt` and
+# `char_at` mint a fresh string, a channel receive hands the sent value's
+# count over — and those shells do transfer.
+fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
+    if emit_name == "map_get_opt" or emit_name == "map_get_ikey_opt":
+        return true
+    if emit_name == "pith_list_get_opt":
+        return true
+    return emit_name == "pith_list_first_opt" or emit_name == "pith_list_last_opt"
+
+# true when the expression that produced a result/optional shell handed its
+# own count on the payload over with it. a user-declared callable does: its
+# return path transfers a fresh value and retains a borrowed one, so the
+# shell arrives holding the only count. so do `await`, `catch` and a match,
+# which normalize to a transfer the same way.
+#
+# two producers do not. a borrowing runtime getter (above) leaves the count
+# with the container. and an extraction out of a doubly-wrapped optional
+# (`inner := outer.value()`, `inner := outer.unwrap_or(none)`, where the
+# payload is itself a `T?`) hands back a RETAINED count on a shell its owner
+# still holds — that shell keeps its own count on what it wraps, and releases
+# it through the `__opt_dtor_<kind>` it carries. so the local is one owner of
+# the shell and never the last owner of what is inside it.
+fn ir_shell_producer_transfers(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return true
+    mname := ir_plain_method_name(node.value)
+    if mname == "value" or mname == "unwrap_or":
+        extract_recv_tid := ir_emission_tid(node.children[0])
+        if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
+            return false
+    if ir_resolve_module_alias_method_call_name(idx).len() > 0:
+        return true
+    recv_type := ir_method_receiver_type(node)
+    if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
+        return true
+    return not ir_runtime_getter_borrows_payload(ir_method_emit_name(mname, recv_type))
+
 # record whether this bind leaves the local holding a shell that is the
-# payload's LAST owner. it is not, in two shapes, and both have to be known
-# before an extraction decides whether to retain:
+# payload's LAST owner. it is not, in three shapes, and all of them have to be
+# known before an extraction decides whether to retain:
 #
 #   - a plain rc value widened into the shell (`o: List[Int]? := [1, 2]`,
 #     and the same wrap inside a literal or a field). ir_emit_value_for_target
@@ -1127,6 +1175,9 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 #     SHELL and takes nothing on the payload, so the container or struct
 #     behind it goes on releasing that payload; handing its count out would
 #     over-release once the extracted value was dropped.
+#   - a shell a borrowing runtime getter built (`e := m.get(k)`,
+#     `e := xs.first()`). the shell itself is fresh, so nothing above catches
+#     it, but the count on what it points at never left the container.
 #
 # recorded per name and never unrecorded: one non-transferring bind is enough
 # to disqualify the name, since the scan cannot tell which bind reached an
@@ -1142,6 +1193,8 @@ fn ir_tuple_record_shell_ownership(name: String, val_idx: Int):
         return
     info := get_type_info(tid)
     if info.kind == "optional" or info.kind == "result" or info.kind == "tuple":
+        if not ir_shell_producer_transfers(val_idx):
+            ir_tuple_shell_owns_payload_names.push(name)
         return
     # a plain value with no rc payload has no count to argue about
     if ir_rc_kind(ir_infer_type(val_idx)).len() > 0:
@@ -1176,11 +1229,19 @@ fn ir_tuple_record_shell_ownership(name: String, val_idx: Int):
 # and the count the shell holds was never released — one heap payload leaked
 # per extraction.
 #
-# the unwrap_or entry is open for an OPTIONAL local too: its extraction
-# retains the payload it hands out for a cascade-eligible subject (see the
-# Some arm in ir_emit_typed_receiver_method), so the shell keeps the count
-# it was built with and the cascade is its sole releaser — the same
-# contract as the result forms. `catch` and `!` stay result-only.
+# the extraction entries are open for an OPTIONAL local too, for both
+# spellings: `name.unwrap_or(d)` and `name.value()` each retain the payload
+# they hand out for a cascade-eligible subject (ir_extraction_retains), so the
+# shell keeps the count it was built with and the cascade is its sole releaser
+# — the same contract as the result forms. `catch` and `!` stay result-only.
+#
+# `.value()` has to be on this list, not merely counted at the extraction
+# site. without it a local that only ever extracts falls off the cascade and
+# onto the shell-only path, where the extraction transfers the shell's single
+# count instead of taking its own — and a second extraction of the same local
+# then hands the same count out twice. `std.trace` reads four fields off one
+# parsed `SpanContext?` that way, and the first consumer's release freed what
+# the other three read.
 #
 # one whitelisted position lives in the walk instead of here: an argument of a
 # same-module call whose body provably only reads the parameter
@@ -1189,7 +1250,8 @@ fn ir_tuple_record_shell_ownership(name: String, val_idx: Int):
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
     if parent.kind == "method_call" and parent.children.len() > 0:
         recv := get_node(parent.children[0])
-        if recv.kind == "ident" and recv.value == name and ir_plain_method_name(parent.value) == "unwrap_or":
+        mname := ir_plain_method_name(parent.value)
+        if recv.kind == "ident" and recv.value == name and (mname == "unwrap_or" or (mname == "value" and not is_result)):
             # only the receiver position is safe; the name appearing inside
             # the fallback argument is a use the walk must judge on its own
             mut ai := 1
@@ -3381,15 +3443,13 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
         return false
     if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
         return false
-    # `.value()` on an optional spells like a call and is a field read: it
-    # hands back an uncounted view of the shell's payload (see
-    # ir_method_call_is_value_extraction). counting it as a transfer released
-    # a string the shell still owns — `xs[0].value() == "a"` freed the
-    # element's string mid-comparison. it went unnoticed while a string
-    # payload was borrowed and its count belonged to nobody, so the stray
-    # release balanced the leak; with the shell owning the payload it is a
-    # plain over-release.
-    if ir_method_call_is_value_extraction(idx):
+    # a `.value()` the emitter could not count spells like a call and is a
+    # field read: it hands back an uncounted view of the shell's payload (see
+    # ir_value_extraction_is_uncounted). counting it as a transfer released a
+    # string the shell still owns — `xs[0].value() == "a"` freed the element's
+    # string mid-comparison. a counted extraction is a transfer like any
+    # other, and reaches the borrowed-classification branch above this one.
+    if ir_value_extraction_is_uncounted(idx):
         return false
     mut expr_type := ir_checked_type(idx)
     if expr_type.len() == 0:
@@ -5155,35 +5215,35 @@ fn ir_release_owned_field_receiver(recv_idx: Int, obj_r: Int, field_r: Int, fiel
         ir_rc_retain_reg(field_r, field_kind)
     ir_rc_release_reg(obj_r, recv_kind)
 
-# true when a field access's receiver is a fresh value nothing else names: a
-# call or method result, a struct construction, or an unwrap that built its
-# answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
-# kind, outside generic bodies where the types cannot be trusted.
-# `.value()` on an optional hands the payload back as an uncounted view — the
-# shell (or the field that fed it) keeps the only count, and a weak field's
-# read holds no count at all. the owned-receiver release above would drop a
-# count the read never took: releasing the referent of `n.parent.value()`
-# freed the parent while its owner still held it (test_weak_read_loop went
-# 7000 -> 7). refuse the release for that shape; an unprovable receiver type
-# also refuses, which can only leak, never dangle.
-fn ir_method_call_is_value_extraction(recv_idx: Int) -> Bool:
+# true for a `.value()` whose extraction the emitter could not count. a
+# provable optional receiver routes through the value arm of
+# ir_emit_typed_receiver_method, which hands the payload out with a count of
+# its own (ir_extraction_retains) — so those are ordinary owned temporaries and
+# an owned-receiver release balances the count the extract took. where the
+# receiver's type is unprovable that arm never fires, no retain is emitted, and
+# the value is still the uncounted view it always was: releasing it would drop
+# a count the read never took, which is what dropped a weak referent's count
+# and took test_weak_read_loop from 7000 to 7. refuse there — a refusal can
+# only leak, never dangle.
+fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
     recv := get_node(recv_idx)
     if recv.kind != "method_call" or recv.children.len() == 0:
         return false
     if ir_plain_method_name(recv.value) != "value":
         return false
-    recv_tid := c_get_expr_type(recv.children[0])
-    if recv_tid < 0:
-        return true
-    return get_type_info(recv_tid).kind == "optional"
+    return ir_emission_tid(recv.children[0]) < 0
 
+# true when a field access's receiver is a fresh value nothing else names: a
+# call or method result, a struct construction, or an unwrap that built its
+# answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
+# kind, outside generic bodies where the types cannot be trusted.
 fn ir_field_receiver_is_owned_temp(recv_idx: Int) -> Bool:
     if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
         return false
     recv := get_node(recv_idx)
     if recv.kind != "call" and recv.kind != "method_call" and recv.kind != "struct_init":
         return false
-    if ir_method_call_is_value_extraction(recv_idx):
+    if ir_value_extraction_is_uncounted(recv_idx):
         return false
     if ir_expr_is_borrowed(recv_idx):
         return false
@@ -5986,11 +6046,23 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                     return ir_emit_result_to_string(node)
             if recv_info.kind == "optional" and mname == "value":
                 # unchecked extraction of the inner value (caller has verified
-                # the optional is Some); used by iterator adapters in std.iter
+                # the optional is Some); used by iterator adapters in std.iter.
+                # counted on exactly the terms the unwrap_or arm below uses:
+                # the payload leaves with a count of its own, so a bind, an
+                # argument position or an owned receiver may release it
+                # without touching the count its owner still needs.
                 obj_r := ir_expr(node.children[0])
                 val_r := ir_optional_value_field(obj_r, recv_tid)
+                inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
+                owns_subject := ir_optional_subject_is_owned(node.children[0])
+                if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
+                    ir_rc_retain_reg(val_r, inner_kind)
                 # free a fresh weak-read shell once its value is extracted
                 ir_release_weak_shell(node.children[0], obj_r)
+                # a fresh shell (a call or method result) is this expression's
+                # to free; the retain above kept its payload alive past it.
+                if owns_subject:
+                    ir_emit_call1(ir_reg(), "pith_struct_release", "void", obj_r)
                 return val_r
             if recv_info.kind == "optional" and mname == "unwrap_or":
                 # some(v) -> v, none -> the default argument
@@ -6007,25 +6079,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
                 ir_emit_label(some_l)
                 inner_r := ir_optional_value_field(obj_r, recv_tid)
-                # the extracted payload takes its own count, so a consumer
-                # (which treats a heap-kind unwrap_or value as owned) never
-                # strips the count the subject still claims. a fresh
-                # subject's shell is freed just below, so the inner must
-                # outlive it; a parameter, field or element subject keeps
-                # its count with its owner (the caller, the shell's
-                # destructor, the container); a cascade-eligible local's
-                # count is released by its cascade. the one subject that
-                # still transfers is a shell-only local — one the cascade
-                # walk rejected — whose cleanup releases the shell alone: a
-                # retained count there would have no release, so it keeps
-                # the old transfer (and the old double-extraction
-                # unsoundness) rather than trading it for a leak.
-                mut retains := inner_kind.len() > 0
-                if retains and not owns_subject:
-                    subj := get_node(node.children[0])
-                    if subj.kind == "ident" and ir_tuple_shell_only_names.contains(subj.value):
-                        retains = false
-                if retains:
+                if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
                     ir_rc_retain_reg(inner_r, inner_kind)
                 ir_emit("store " + tmp + " " + inner_r.to_string())
                 ir_emit("jmp " + end_l)
@@ -8211,6 +8265,30 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
         return false
     kind := node_kind(idx)
     return kind == "call" or kind == "method_call"
+
+# whether an extraction out of the optional `subject_idx` must take its own
+# count on the payload it hands out. both extraction spellings — `.value()`
+# and `unwrap_or` — answer through here, so a consumer that treats a
+# heap-kind extraction as owned never strips a count the subject still
+# claims. a fresh subject's shell is freed right after the extract, so the
+# payload must outlive it; a parameter, field or element subject keeps its
+# count with its owner (the caller, the shell's destructor, the container);
+# a widened shell releases the payload through its `__opt_dtor_<kind>`; and a
+# cascade-eligible local's count is released by its cascade.
+#
+# the one subject that still transfers is a shell-only local — one the
+# cascade walk rejected — whose cleanup releases the shell alone: a retained
+# count there would have no release, so it keeps the old transfer (and the
+# old double-extraction unsoundness) rather than trading it for a leak.
+fn ir_extraction_retains(subject_idx: Int, inner_kind: String, owns_subject: Bool) -> Bool:
+    if inner_kind.len() == 0:
+        return false
+    if owns_subject:
+        return true
+    subj := get_node(subject_idx)
+    if subj.kind == "ident" and ir_tuple_shell_only_names.contains(subj.value):
+        return false
+    return true
 
 fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() < 3:

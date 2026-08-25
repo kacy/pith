@@ -41,6 +41,7 @@ cases=(
   tests/leaks/leak_optional_string_payload
   tests/leaks/leak_optional_literal_elements
   tests/leaks/leak_unwrap_extract
+  tests/leaks/leak_unwrap_container
   tests/leaks/leak_owned_temp_field_read
   tests/leaks/leak_enum_bare_variant
   tests/leaks/leak_generic_enum_payload

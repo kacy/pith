@@ -79,10 +79,9 @@ fn count_optional_list(xs: List[Int?]?) -> Int:
         some => some.len()
         none => 0 - 1
 
-# a container payload is read through a match binding rather than unwrap_or:
-# `some_list_optional.unwrap_or([])` hands the payload back without a count
-# and the shell then frees it, which is its own open defect and not this
-# case's subject.
+# a container payload read through a match binding. the unwrap_or spelling
+# works too and is covered by test_unwrap_container; these stay on match so
+# the widening this case is about is the only thing they exercise.
 fn count_nested(m: Map[String, List[Int]?], key: String) -> Int:
     return match m.get_default(key, none):
         got => got.len()

@@ -1,0 +1,78 @@
+# golden coverage for unwrap_or on an optional holding a container. the Some
+# arm's retain was suppressed for every local the cascade scan rejected, which
+# swept in two subjects whose cleanup does release the payload: a shell built
+# by widening a plain value (it carries a destructor) and a borrowed shell (an
+# element, a field). those extractions handed back a handle the shell then
+# freed, so the values below were read out of freed memory — right by luck at
+# first, and a "list indexing on invalid list handle" trap once the handle was
+# recycled. the leak gate proves the counting balances; this proves the values.
+struct Holder:
+    pub lst: List[Int]?
+
+fn fill(i: Int) -> List[Int]:
+    mut l: List[Int] := []
+    l.push(i)
+    l.push(i + 1)
+    return l
+
+fn consume(l: List[Int]) -> Int:
+    return l.len() + l[0]
+
+# the escape shape: the extraction outlives the shell that held it
+fn escape(i: Int) -> List[Int]:
+    mut o: List[Int]? := fill(i)
+    return o.unwrap_or([])
+
+fn main():
+    # a widened bind, read back through every position
+    mut o: List[Int]? := fill(5)
+    v := o.unwrap_or([])
+    print("bind:{v.len()}/{v[0]}/{v[1]}")
+    print("recv:{o.unwrap_or([]).len()}")
+    print("arg:{consume(o.unwrap_or([]))}")
+    a := o.unwrap_or([])
+    b := o.unwrap_or([])
+    print("double:{a[0]}/{b[1]}/{a.len() + b.len()}")
+
+    # bind + return, some and none paths
+    e := escape(9)
+    print("escape:{e.len()}/{e[0]}/{e[1]}")
+    filler := fill(100)
+    print("escape_alive:{e[0]}/{filler[0]}")
+
+    # a borrowed element subject: the list still holds its payload afterwards
+    rows: List[List[Int]?] := [fill(2), none]
+    row := rows[0]
+    rv := row.unwrap_or([])
+    print("element:{rv.len()}/{rv[0]}")
+    miss := rows[1]
+    print("element_none:{miss.unwrap_or([]).len()}")
+    print("element_again:{rows[0].unwrap_or([]).len()}/{rows[0].unwrap_or([])[0]}")
+
+    # a borrowed field subject: the struct still holds its payload afterwards
+    h := Holder(fill(7))
+    f := h.lst
+    fv := f.unwrap_or([])
+    print("field:{fv.len()}/{fv[0]}")
+    print("field_again:{h.lst.unwrap_or([])[1]}")
+
+    # map and set payloads take the same path
+    mut m: Map[String, Int]? := {"k": 3}
+    mv := m.unwrap_or({})
+    print("map:{mv.len()}/{mv["k"]}")
+    mut s: Set[Int]? := {4, 5, 6}
+    sv := s.unwrap_or({})
+    print("set:{sv.len()}/{sv.contains(5)}")
+
+    # the none paths, fresh and borrowed fallbacks
+    p: List[Int]? := none
+    fresh := p.unwrap_or(fill(11))
+    print("none_fresh:{fresh.len()}/{fresh[0]}")
+    fb := fill(13)
+    q: List[Int]? := none
+    borrowed := q.unwrap_or(fb)
+    print("none_borrowed:{borrowed[0]}/{fb[0]}/{fb.len()}")
+
+    # a shell a callee built and returned keeps working
+    built := escape(21)
+    print("built:{built[0]}/{built[1]}")

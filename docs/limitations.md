@@ -264,11 +264,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   the last keystroke by the closure's check time. the fast lane takes itself
   out of the way on a file too large to parse inside the debounce window.
   editing a module does not re-report its dependents, and the server grows by
-  tens of megabytes per analysis without giving it back, so a long session on
-  a large closure ends in the oom killer. queries answer instantly from the
-  last snapshot throughout. see [docs/lsp.md](lsp.md) for the feature list, the
-  measured phase split, the memory figures, and what per-module caching would
-  take.
+  about 12 mb per analysis without giving it back, so a long enough session on
+  a large closure still ends in the oom killer. it was about 31 mb an analysis
+  until an assignment over a global started releasing the table it replaces.
+  queries answer instantly from the last snapshot throughout. see
+  [docs/lsp.md](lsp.md) for the feature list, the measured phase split, the
+  memory figures, and what per-module caching would take.
 - **no package registry** — dependencies are local path entries in `pith.toml`.
   `pith package lock` writes a `pith.lock` and `pith package install` copies
   those paths into `.pith/packages`, but nothing fetches over the network and

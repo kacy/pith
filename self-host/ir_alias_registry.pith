@@ -34,6 +34,33 @@ pub mut ir_global_map_value_types: Map[String, String] := {}
 pub mut ir_global_set_names: List[String] := []
 pub mut ir_global_set_int_names: List[String] := []
 pub mut ir_global_bool_names: List[String] := []
+## every module-level global this module declares, threadlocal or not, and
+## whatever its type. the kind-specific lists above only hold the globals
+## whose type the emitter recognises by name, so none of them can answer
+## "does this bare name write a global slot?" — a struct-typed global is in
+## none of them. an assignment needs that answer to know whether it owns the
+## value it is overwriting.
+pub mut ir_global_slot_names: List[String] := []
+## file a global under its name, regardless of type, so an assignment to it
+## can tell a global slot from a local of the same spelling.
+pub fn ir_record_global_slot(name: String):
+    ir_global_slot_names = ir_push_string(ir_global_slot_names, name)
+
+## every name any module emitted so far binds as a local, a parameter, an
+## `if let` or `match` payload, or a loop variable. deliberately NOT cleared
+## between modules: the ir consumer resolves a bare name to a global's data
+## slot whenever one exists, and the root module's globals are the ones
+## emitted unprefixed, so a local anywhere in the program can land in one of
+## their slots. imports are emitted before the root, so by the time the root
+## decides which of its globals are safe to release this holds every binding
+## name in the program.
+pub mut ir_shadowing_binding_names: Set[String] := {}
+## record a name some function binds, so a global spelled the same is left
+## out of the assignment release.
+pub fn ir_record_shadowing_binding_name(name: String):
+    if name.len() > 0:
+        ir_shadowing_binding_names.add(name)
+
 ## file a global under its emission kind for per-function seeding.
 pub fn ir_record_global_type(name: String, global_type: String):
     if global_type == "int":

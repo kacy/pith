@@ -571,6 +571,34 @@ warning[E307]: 'config' is built by tls.client_config() and never closed; the re
   fix: close it on every exit -- `defer config.close()` next to the build; see docs/destructors_roadmap.md
 ```
 
+### E266 — module global read before a local of the same name
+
+a function's storage is flat: one slot per name for the whole body. a local, a
+parameter or a `match` / `if let` payload therefore takes its name for the
+entire function, and the module global of that name is unreachable from inside
+it. that is legal on its own. what has no answer is a
+body that wants both — reads the global somewhere above and binds a local of the
+same name below.
+
+rename the binding, or move the reads of the global into a function that does
+not bind the name.
+
+a `for` variable is exempt. it is the one binding whose storage is scoped to a
+block rather than the function, so the global is still reachable on either side
+of the loop and nothing is ambiguous.
+
+before globals were given a storage namespace of their own, this compiled and
+miscompiled: the binding wrote the GLOBAL's slot, so the local and the global
+were one value and the global's next reader anywhere in the program saw
+whatever the local had left there.
+
+```
+error[E266]: 'items' names a module global that is read earlier in this function, and this binding takes the name for the whole function
+ 10 |     mut items: List[Int] := [7]
+          ^
+  fix: rename the binding, or move the reads of the global into a function that does not bind the name
+```
+
 ### E251 — function is not public in that module
 
 a module function declared with a bare `fn` belongs to the module that declared

@@ -1,7 +1,7 @@
 # ir_callees.pith - static callee resolution helpers
 
 from ast import get_node
-from ir_names import ir_import_target_name
+from ir_names import ir_import_target_name, ir_global_storage_symbol
 
 # what a written call name turned into, and whether the answer came
 # from an import. `imported` is not decoration: when it is true, `name`
@@ -45,7 +45,8 @@ pub fn ir_module_alias_member_name_with_state(alias: String, member: String, mod
     if ir_import_declares_function_with_state(module_path, member, import_declared_functions):
         return ir_import_target_name(module_path, member)
     if ir_import_declares_global_with_state(module_path, member, import_declared_globals):
-        return ir_import_target_name(module_path, member)
+        # a global is named by its storage symbol, not its written name
+        return ir_import_target_name(module_path, ir_global_storage_symbol(member))
     return member
 
 # a method name with any leading "." stripped, so every reader of a

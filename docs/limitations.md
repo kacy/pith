@@ -66,6 +66,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   compares by content. ordering operators (`<`, `>`, `<=`, `>=`) do not
   widen — unwrap first, because there is no sensible order between `none`
   and a value.
+- **a binding that shadows a module global takes the name for the whole
+  function** — a local, a parameter or a `match` / `if let` payload spelled
+  like one of the module's globals reads its own storage, and the global is
+  unreachable from inside that function. a `for` variable is the exception:
+  its storage lasts the loop, so the global is still reachable on either side
+  of it. reading the global and then binding a local of the same name in one
+  function asks for both and is E266 rather than a guess.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

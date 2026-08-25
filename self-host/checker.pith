@@ -1405,9 +1405,74 @@ fn binding_is_mutable(value: String) -> Bool:
 # concrete types until something instantiates it — so a mistake inside
 # one is not reported by this pass.
 pub fn c_check_all(root_idx: Int):
+    collect_module_global_names(root_idx)
     root := get_node(root_idx)
     for child in root.children:
         check_top_level_declarations(child)
+
+# every module-level binding this file declares, by name. collected before
+# any body is checked, so a global written below the function that shadows it
+# still counts. E266 is the only reader.
+mut c_module_global_names: List[String] := []
+# names the shadow walk has already seen mentioned in the body it is walking.
+mut c_shadow_seen_names: List[String] := []
+
+fn collect_module_global_names(root_idx: Int):
+    c_module_global_names = []
+    root := get_node(root_idx)
+    for child in root.children:
+        mut inner := get_node(child)
+        if inner.kind == "pub" and inner.children.len() > 0:
+            inner = get_node(inner.children[0])
+        if inner.kind == "threadlocal" and inner.children.len() > 0:
+            inner = get_node(inner.children[0])
+        if inner.kind == "binding" or inner.kind == "bind":
+            name := extract_binding_name(inner.value)
+            if name.len() > 0 and not c_module_global_names.contains(name):
+                c_module_global_names.push(name)
+
+# E266: a module global read in a function that later binds the same name.
+#
+# a function's storage is flat — one slot per name for the whole body — so a
+# local, a parameter or a pattern binding takes its name for the entire
+# function and the module global of that name is unreachable from it. that is
+# fine on its own, and legal. what has no answer is a body that wants BOTH:
+# reads the global somewhere above and binds a local of the same name below.
+# one of the two has to be wrong, and neither is a wrong the emitter can see,
+# so it is refused here instead.
+#
+# a `for` variable is exempt. it is the one binding with storage scoped to a
+# block rather than the function, so the global is still reachable on either
+# side of the loop and nothing is ambiguous.
+fn report_shadow_after_read(name: String, node_idx: Int):
+    if name.len() == 0:
+        return
+    if not c_module_global_names.contains(name):
+        return
+    if not c_shadow_seen_names.contains(name):
+        return
+    report_error_with_fix_at(node_idx, "E266", "'" + name + "' names a module global that is read earlier in this function, and this binding takes the name for the whole function", "rename the binding, or move the reads of the global into a function that does not bind the name")
+
+fn check_global_shadow_reads(idx: Int):
+    node := get_node(idx)
+    if node.kind == "ident":
+        if not c_shadow_seen_names.contains(node.value):
+            c_shadow_seen_names.push(node.value)
+        return
+    # an `assign` carries its target in the node's value rather than as an
+    # ident child, so it needs its own mention.
+    if node.kind == "assign":
+        if not c_shadow_seen_names.contains(node.value):
+            c_shadow_seen_names.push(node.value)
+    # children first: a binding's own initializer is a child of it, and
+    # `mut g := g + 1` reads the global on the right of a binding that would
+    # then claim the name.
+    for child in node.children:
+        check_global_shadow_reads(child)
+    if node.kind == "binding" or node.kind == "bind":
+        report_shadow_after_read(extract_binding_name(node.value), idx)
+    elif node.kind == "pat_binding":
+        report_shadow_after_read(node.value, idx)
 
 fn check_top_level_declarations(node_idx: Int):
     node := get_node(node_idx)
@@ -1466,6 +1531,9 @@ fn check_function_declaration(node: Node):
             check_function_body(child, fn_scope)
 
 fn check_function_body(node_idx: Int, scope_id: Int):
+    if c_module_global_names.len() > 0:
+        c_shadow_seen_names = []
+        check_global_shadow_reads(node_idx)
     node := get_node(node_idx)
     if node.children.len() > 0:
         block := get_node(node.children[0])

@@ -1,0 +1,18 @@
+# a function's storage is flat: a local takes its name for the whole body, so
+# the module global of that name is unreachable from the function. binding one
+# AFTER reading the global asks for both, and there is no answer that gives
+# each read what it wants.
+mut items: List[Int] := [1, 2, 3]
+mut counter: Int := 5
+
+fn read_then_bind() -> Int:
+    seen := items.len()
+    mut items: List[Int] := [7]
+    return seen + items.len()
+
+fn bind_from_itself() -> Int:
+    mut counter := counter + 1
+    return counter
+
+fn main():
+    print("{read_then_bind()} {bind_from_itself()}")

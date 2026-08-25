@@ -32,6 +32,19 @@ pub fn ir_import_symbol_prefix(module_path: String) -> String:
         i = i + 1
     return prefix + "_"
 
+# the storage symbol a module-level global is emitted under. the IR
+# namespace is flat and the consumer resolves a bare `load`/`store`
+# operand to a global's data slot whenever one exists, so a global
+# emitted under its written name shares that namespace with every
+# local, parameter and pattern binding in the build — a binding
+# spelled the same wrote the global's storage instead of its own. the
+# prefix keeps the two apart; a written name reaches the IR unchanged,
+# so only a source identifier literally spelled `__g_<global>` could
+# meet one, the same reservation the emitter's other generated names
+# (`__closure`, `__for_`, `__init_globals`) already rely on.
+pub fn ir_global_storage_symbol(name: String) -> String:
+    return "__g_" + name
+
 # the flat IR symbol a name declared in module_path is emitted as. the
 # IR namespace is flat, so this is what keeps two modules that both
 # declare `parse` from colliding; call it wherever a written name is

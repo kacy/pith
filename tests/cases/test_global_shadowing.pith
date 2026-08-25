@@ -1,0 +1,94 @@
+# a local, a parameter or a pattern binding spelled like a module global used
+# to write the GLOBAL's data slot instead of its own storage. the ir namespace
+# is flat and the consumer resolves a bare load/store operand to a global's
+# data slot whenever one exists, so the two shared one namespace: the entry
+# module's globals are emitted unprefixed, and an imported module's own
+# globals are reached by the same bare name inside that module. every binding
+# below reads back its own value and leaves the global it is spelled like
+# untouched.
+import global_shadow_helper as helper
+
+mut items: List[Int] := []
+mut label: String := "global-label"
+mut counter: Int := 10
+mut lookup: Map[String, Int] := {}
+mut flags: Set[Int] := {}
+
+fn local_shadow() -> Int:
+    mut items: List[Int] := [7, 8, 9]
+    items.push(10)
+    return items.len()
+
+fn param_shadow(items: List[Int]) -> Int:
+    return items.len()
+
+fn iflet_shadow(src: Int?) -> Int:
+    if let counter = src:
+        return counter * 2
+    return 0 - 1
+
+fn match_shadow(src: String?) -> String:
+    return match src:
+        label => "bound:" + label
+        none => "none"
+
+fn loop_shadow() -> Int:
+    mut total := 0
+    for counter in [1, 2, 3]:
+        total = total + counter
+    return total
+
+fn string_shadow() -> String:
+    mut label := "local-label"
+    label = label + "!"
+    return label
+
+fn map_shadow() -> Int:
+    mut lookup: Map[String, Int] := {"a": 1, "b": 2}
+    lookup.insert("c", 3)
+    return lookup.len()
+
+fn set_shadow() -> Int:
+    mut flags: Set[Int] := {4, 5}
+    flags.add(6)
+    return flags.len()
+
+fn closure_shadow() -> Int:
+    mut counter := 100
+    bump := fn(n: Int) => counter + n
+    return bump(5)
+
+fn main() -> Int:
+    items.push(1)
+    items.push(2)
+    lookup.insert("g", 9)
+    flags.add(1)
+    print("local={local_shadow()} items={items.len()}")
+    print("param={param_shadow([4, 5, 6])} items={items.len()}")
+    print("iflet={iflet_shadow(21)} counter={counter}")
+    print("match={match_shadow("payload")} label={label}")
+    print("loop={loop_shadow()} counter={counter}")
+    print("string={string_shadow()} label={label}")
+    print("map={map_shadow()} lookup={lookup.len()}")
+    print("set={set_shadow()} flags={flags.len()}")
+    print("closure={closure_shadow()} counter={counter}")
+    # an imported module's own global, shadowed by its own local
+    helper.add(1)
+    helper.add(2)
+    print("helper_own={helper.own_shadow()} helper_count={helper.count()}")
+    print("helper_param={helper.own_param_shadow("in")} helper_label={helper.own_label()}")
+    # a local in an imported module spelled like an entry-module global
+    print("entry_name={helper.entry_name_shadow()} counter={counter}")
+    # reassigning a global after every shadow still works, and the old value
+    # is released rather than stranded
+    mut round := 0
+    while round < 3:
+        items = [1, 2, 3, 4]
+        label = "reassigned-" + round.to_string()
+        counter = 99
+        lookup = {"x": 1, "y": 2}
+        flags = {7, 8, 9}
+        round = round + 1
+    print("after items={items.len()} label={label} counter={counter}")
+    print("after lookup={lookup.len()} flags={flags.len()}")
+    return 0

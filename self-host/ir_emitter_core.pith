@@ -273,6 +273,17 @@ mut ir_generic_dtor_args: Map[String, String] := {}
 # by ";" and a variant's kinds by ",".
 mut ir_generic_enum_dtor_base: Map[String, String] := {}
 mut ir_generic_enum_dtor_kinds: Map[String, String] := {}
+# and the same idea again for generic structs built through the struct literal
+# path (`Holder("v")` typed as `Holder[String]`). the declaration records a
+# type parameter field as its bare parameter name, which no rc kind matches, so
+# the shared `__dtor_<struct>` is never generated and whatever the instance
+# holds behind the parameter is stranded when the box frees. the construction's
+# checked type names the instance, so its concrete field kinds are resolvable
+# there and get a destructor keyed by that kind signature. `kinds` holds one
+# entry per field in declaration order, joined by ";": the field's rc kind,
+# "weak" for a weak field, "-" for a field that releases nothing.
+mut ir_generic_struct_dtor_base: Map[String, String] := {}
+mut ir_generic_struct_dtor_kinds: Map[String, String] := {}
 # the tids of the match subjects enclosing the rc prepass walk, innermost
 # last, so a nested variant pattern can resolve a generic enum's payload
 # kinds against the instance being matched.
@@ -4902,7 +4913,17 @@ fn ir_generic_enum_instance_dtor(ename: String, tid: Int) -> String:
         for k in kinds:
             if ir_rc_field_kind(k).len() > 0:
                 any_rc = true
-        parts.push(kinds.join(","))
+        # a payload-free variant is spelled "-" rather than left blank: the
+        # signature is stored as one string and read back with split, which
+        # drops empty parts. a dropped part shifts every later variant's kinds
+        # down one tag, so a destructor for `Nothing, Some(T)` released slot 1
+        # under tag 0 — the payload variant's own tag never matched and its
+        # string was stranded. the tag a variant releases under is its position
+        # in this list, so the list has to keep every position.
+        if kinds.len() == 0:
+            parts.push("-")
+        else:
+            parts.push(kinds.join(","))
     if not resolved_any or not any_rc:
         return ""
     sig := parts.join(";")
@@ -4911,7 +4932,7 @@ fn ir_generic_enum_instance_dtor(ename: String, tid: Int) -> String:
     # spelled out so two signatures never collapse into one name.
     mut sym_parts: List[String] := []
     for part in parts:
-        if part.len() == 0:
+        if part == "-":
             sym_parts.push("void")
         else:
             sym_parts.push(part.replace(",", "_"))
@@ -6599,7 +6620,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
     ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
-    ir_emit_attach_dtor(r, sname)
+    ir_emit_attach_instance_dtor(r, sname, tid)
     return r
 
 fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int) -> Int:
@@ -6644,7 +6665,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
     ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
-    ir_emit_attach_dtor(r, sname)
+    ir_emit_attach_instance_dtor(r, sname, tid)
     return r
 
 fn ir_emit_struct_init(idx: Int, node: Node) -> Int:
@@ -9515,6 +9536,83 @@ fn ir_emit_global_bindings(root: Node):
         elif ir_is_binding_kind(cn.kind):
             ir_emit_global_binding(cn, false)
 
+# attach a freshly built struct's destructor, preferring the per-instance one
+# when the construction's checked type names a generic instance whose resolved
+# fields hold something releasable. every other construction attaches the
+# declaration's shared destructor, which is what the type parameter-free case
+# has always used.
+fn ir_emit_attach_instance_dtor(struct_r: Int, raw_name: String, tid: Int):
+    inst := ir_generic_struct_instance_dtor(raw_name, tid)
+    if inst.len() == 0:
+        ir_emit_attach_dtor(struct_r, raw_name)
+        return
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __dtor_" + inst)
+    ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
+
+# the per-instance destructor symbol for a generic struct construction, or ""
+# when the shared destructor is right: a non-generic struct, an instance whose
+# type arguments resolve to nothing releasable, or a site the checker never
+# typed. a field whose declared type already names an rc kind keeps that kind,
+# so only the parameter fields differ from what the shared destructor does.
+# registers the symbol for emission at the end of the module, keyed by the
+# resolved kind signature rather than the type arguments, since the destructor
+# depends on nothing else.
+fn ir_generic_struct_instance_dtor(sname: String, tid: Int) -> String:
+    base := ir_struct_base_name(sname)
+    if tid < 0 or not ir_struct_names.contains_key(base):
+        return ""
+    # only a declaration with type parameters can have a field the shared
+    # destructor cannot classify. everything else keeps the destructor it has
+    # always had, which also keeps this off the hot path of ordinary
+    # construction sites.
+    if not has_generic_declaration(base):
+        return ""
+    # a boxed enum is a struct-shaped allocation but releases tagged payloads,
+    # not declared fields; ir_generic_enum_instance_dtor answers for those.
+    if ir_boxed_enums.contains_key(base):
+        return ""
+    count := ir_ctor_field_count(sname, tid)
+    # the destructor walks the layout the allocation was built from, so a tid
+    # whose field count disagrees with the registry is not one to trust.
+    if count != ir_struct_field_count(base):
+        return ""
+    mut resolved_any := false
+    mut parts: List[String] := []
+    mut i := 0
+    while i < count:
+        fname := ir_ctor_field_name_at(sname, tid, i)
+        if ir_struct_field_is_weak(base, fname):
+            parts.push("weak")
+        else:
+            declared := ir_rc_field_kind(ir_struct_field_type_name(base, fname))
+            if declared.len() > 0:
+                parts.push(declared)
+            else:
+                instance := ir_rc_field_kind(ir_ctor_field_type_name(sname, tid, fname))
+                if instance.len() > 0:
+                    parts.push(instance)
+                    resolved_any = true
+                else:
+                    parts.push("-")
+        i = i + 1
+    if not resolved_any:
+        return ""
+    # a field that releases nothing is spelled "-" rather than left blank, in
+    # the signature and in the symbol alike: reading the signature back splits
+    # it, and split drops empty parts, which would slide every later field onto
+    # a lower slot and release the wrong offset.
+    mut sym_parts: List[String] := []
+    for part in parts:
+        if part == "-":
+            sym_parts.push("void")
+        else:
+            sym_parts.push(part)
+    sym := ir_sanitize_symbol(base + "__" + sym_parts.join("__"))
+    ir_generic_struct_dtor_base.insert(sym, base)
+    ir_generic_struct_dtor_kinds.insert(sym, parts.join(";"))
+    return sym
+
 # attach the type's destructor to a freshly built struct so its rc
 # fields release when the struct dies
 fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
@@ -9610,7 +9708,93 @@ fn ir_emit_enum_dtors():
 # above runs before any body, when the registry is still empty.
 fn ir_emit_generic_enum_instance_dtors():
     for sym in ir_generic_enum_dtor_base.keys():
-        ir_emit_enum_dtor_body("__dtor_" + sym, ir_generic_enum_dtor_kinds[sym].split(";"))
+        ir_emit_enum_dtor_body("__dtor_" + sym, ir_generic_enum_variant_kinds(sym))
+
+# the generic struct instances registered at construction sites, emitted in the
+# same late pass: the declared-struct pass runs before any body, when the
+# registry is still empty, and a construction inside a specialization or a
+# lambda only registers itself as that body is emitted.
+fn ir_emit_generic_struct_instance_dtors():
+    for sym in ir_generic_struct_dtor_base.keys():
+        base := ir_generic_struct_dtor_base[sym]
+        kinds := ir_generic_struct_dtor_kinds[sym].split(";")
+        ir_emit_func_header("__dtor_" + sym, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        mut i := 0
+        while i < kinds.len():
+            if kinds[i] == "weak":
+                # a weak field holds a bare target pointer, so drop its weak
+                # reference rather than a strong one; weak_release(0) is a no-op.
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
+                rel_r := ir_reg()
+                ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + fr.to_string())
+            elif kinds[i] != "-":
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
+                ir_rc_release_reg(fr, kinds[i])
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# the field name an instance destructor labels a slot with, falling back to the
+# slot number when the registry has no name for it. the label is documentation
+# only — the offset is what the release reads.
+fn ir_generic_struct_field_label(base: String, index: Int) -> String:
+    fname := ir_struct_field_name_at(base, index)
+    if fname.len() > 0:
+        return fname
+    return "__f" + index.to_string()
+
+# true when a registered generic struct instance has a traceable field — the
+# per-instance answer to ir_struct_needs_tracer. weak fields are skipped like
+# everywhere else: they hold no strong count, so they are not ownership edges.
+fn ir_generic_struct_instance_needs_tracer(sym: String) -> Bool:
+    for k in ir_generic_struct_dtor_kinds[sym].split(";"):
+        if k != "weak" and ir_trace_kind_enabled(k):
+            return true
+    return false
+
+# tracer twin of a generic struct instance destructor: the same slot walk,
+# visiting each traceable child instead of releasing it.
+fn ir_emit_generic_struct_instance_tracers():
+    for sym in ir_generic_struct_dtor_base.keys():
+        if not ir_generic_struct_instance_needs_tracer(sym):
+            continue
+        base := ir_generic_struct_dtor_base[sym]
+        kinds := ir_generic_struct_dtor_kinds[sym].split(";")
+        ir_emit_func_header("__cc_trace_" + sym, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        mut i := 0
+        while i < kinds.len():
+            if kinds[i] != "weak" and ir_trace_kind_enabled(kinds[i]):
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
+                ir_rc_visit_reg(fr, kinds[i])
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# the per-variant kinds of a registered generic instance, one entry per
+# variant in declaration order — the instance twin of ir_declared_variant_kinds.
+# unpacks the "-" a payload-free variant is stored as, so the list index a
+# variant sits at is still the tag its payloads release under.
+fn ir_generic_enum_variant_kinds(sym: String) -> List[String]:
+    mut out: List[String] := []
+    for part in ir_generic_enum_dtor_kinds[sym].split(";"):
+        if part == "-":
+            out.push("")
+        else:
+            out.push(part)
+    return out
 
 # the per-variant payload kinds a declared enum's destructor and tracer walk:
 # one entry per variant in declaration order, each that variant's kinds
@@ -9744,8 +9928,8 @@ fn ir_emit_enum_tracers():
 # tracer twins for the generic enum instances, same late pass as their dtors.
 fn ir_emit_generic_enum_instance_tracers():
     for sym in ir_generic_enum_dtor_base.keys():
-        if ir_variant_kinds_have_trace(ir_generic_enum_dtor_kinds[sym].split(";")):
-            ir_emit_enum_tracer_body("__cc_trace_" + sym, ir_generic_enum_dtor_kinds[sym].split(";"))
+        if ir_variant_kinds_have_trace(ir_generic_enum_variant_kinds(sym)):
+            ir_emit_enum_tracer_body("__cc_trace_" + sym, ir_generic_enum_variant_kinds(sym))
 
 # true when any variant's resolved kinds include a traceable child, the
 # per-instance answer to ir_enum_needs_tracer.
@@ -10157,7 +10341,7 @@ fn ir_emit_cc_register_tracers():
             continue
         ir_emit_cc_register_pair("__dtor_" + ename, "__cc_trace_" + ename)
     for sym in ir_generic_enum_dtor_base.keys():
-        if ir_variant_kinds_have_trace(ir_generic_enum_dtor_kinds[sym].split(";")):
+        if ir_variant_kinds_have_trace(ir_generic_enum_variant_kinds(sym)):
             ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     for sig in ir_tuple_dtor_sigs:
         if not ir_tuple_sig_has_trace(sig):
@@ -10165,6 +10349,10 @@ fn ir_emit_cc_register_tracers():
         ir_emit_cc_register_pair(ir_tuple_dtor_name(sig), ir_tuple_tracer_name(sig))
     for sym in ir_generic_dtor_base.keys():
         if not ir_generic_instance_needs_tracer(sym):
+            continue
+        ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
+    for sym in ir_generic_struct_dtor_base.keys():
+        if not ir_generic_struct_instance_needs_tracer(sym):
             continue
         ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     zr := ir_reg()
@@ -10177,6 +10365,8 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_args = {}
     ir_generic_enum_dtor_base = {}
     ir_generic_enum_dtor_kinds = {}
+    ir_generic_struct_dtor_base = {}
+    ir_generic_struct_dtor_kinds = {}
     ir_emit_global_bindings(root)
     ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)
@@ -10206,6 +10396,12 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_generic_enum_instance_dtors()
     ir_emit_generic_enum_instance_tracers()
     ir_append_lambda_bodies()
+    # per-instance destructors for generic structs built through the struct
+    # literal path, after every body: a construction inside a specialization or
+    # a lambda registers its instance only as that body is emitted, and a
+    # destructor emitted before its registration is a reference to nothing.
+    ir_emit_generic_struct_instance_dtors()
+    ir_emit_generic_struct_instance_tracers()
     # tuple cascade helpers last of all: every body (top level, specializations,
     # generic instance dtors and lambdas) has registered its signatures by now.
     ir_emit_tuple_cascade_helpers()

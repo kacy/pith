@@ -1,0 +1,102 @@
+# what a generic instance holds is only visible through the instance. the
+# declaration writes down type parameter names, and no rc kind matches "T", so
+# the shared destructor walked past every payload and every field the type
+# argument made releasable.
+#
+# two halves of that, both here:
+#
+# the generic enum instance destructor existed but read its variant kinds back
+# out of a packed signature, and splitting that signature dropped the empty
+# entry a payload-free variant left behind. every later variant slid down one
+# tag, so a destructor for `Empty, Some(T)` released slot 1 under tag 0 and the
+# payload variant's own tag never matched. the ordering matters and both are
+# pinned below: payload declared second, and payload declared first.
+#
+# the generic struct instance had no destructor at all — the string, list or
+# struct a type argument put behind the field was stranded when the box freed.
+import leakprobe as probe
+
+# payload variant declared SECOND: the tag that carries the string is 1.
+enum Late[T]:
+    Empty
+    Full(T)
+
+# payload variant declared FIRST: the tag that carries the string is 0.
+enum Early[T]:
+    Full(T)
+    Empty
+
+struct Leaf:
+    pub name: String
+
+struct Holder[T]:
+    pub item: T
+
+# two type parameters, one of them non-releasable, so the destructor has to
+# skip a slot and still land on the right offset for the next one.
+struct Tagged[K, V]:
+    pub key: K
+    pub value: V
+
+fn late(i: Int) -> Late[String]:
+    if i % 2 == 0:
+        return Late.Full("late-" + i.to_string())
+    return Late.Empty
+
+fn early(i: Int) -> Early[String]:
+    if i % 2 == 0:
+        return Early.Full("early-" + i.to_string())
+    return Early.Empty
+
+fn late_len(v: Late[String]) -> Int:
+    match v:
+        Late.Full(s) => s.len()
+        Late.Empty => 0
+
+fn early_len(v: Early[String]) -> Int:
+    match v:
+        Early.Full(s) => s.len()
+        Early.Empty => 0
+
+fn hold_string(i: Int) -> Holder[String]:
+    return Holder("held-" + i.to_string())
+
+fn hold_list(i: Int) -> Holder[List[Int]]:
+    return Holder([i, i + 1, i + 2])
+
+fn hold_leaf(i: Int) -> Holder[Leaf]:
+    return Holder(Leaf("leaf-" + i.to_string()))
+
+fn hold_borrowed(name: String) -> Holder[String]:
+    return Holder(name)
+
+fn tagged(i: Int) -> Tagged[Int, String]:
+    return Tagged(i, "tag-" + i.to_string())
+
+fn churn_round(i: Int):
+    late_len(late(i))
+    l := late(i)
+    late_len(l)
+    early_len(early(i))
+    e := early(i)
+    early_len(e)
+    hs := hold_string(i)
+    n := hs.item.len()
+    hl := hold_list(i)
+    m := hl.item.len()
+    hf := hold_leaf(i)
+    k := hf.item.name.len()
+    borrowed := "borrowed-" + i.to_string()
+    hb := hold_borrowed(borrowed)
+    b := hb.item.len()
+    t := tagged(i)
+    v := t.value.len() + t.key
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

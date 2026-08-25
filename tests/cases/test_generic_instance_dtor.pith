@@ -1,0 +1,81 @@
+# a generic instance's destructor has to release whatever the type argument
+# put behind the parameter, under whichever tag or slot holds it.
+#
+# for a generic enum the destructor reads its variant kinds back out of a
+# packed signature; a payload-free variant used to leave an empty entry there
+# that splitting dropped, sliding every later variant onto a lower tag. so both
+# declaration orders are pinned here: the payload variant declared second and
+# declared first, each built, matched and printed.
+#
+# for a generic struct there was no destructor at all. the shapes below cover a
+# string field, a struct field, a list field, a borrowed payload, a payload that
+# escapes the instance, one instantiation at two different type arguments, and a
+# second parameter whose slot releases nothing.
+#
+# every value is printed back out: a destructor that fires one release too many
+# corrupts what the next round reads, which a leak gate cannot see.
+
+enum Late[T]:
+    Empty
+    Full(T)
+
+enum Early[T]:
+    Full(T)
+    Empty
+
+struct Leaf:
+    pub name: String
+
+struct Holder[T]:
+    pub item: T
+
+struct Tagged[K, V]:
+    pub key: K
+    pub value: V
+
+fn late_text(v: Late[String]) -> String:
+    match v:
+        Late.Full(s) => s
+        Late.Empty => "empty"
+
+fn early_text(v: Early[String]) -> String:
+    match v:
+        Early.Full(s) => s
+        Early.Empty => "empty"
+
+# the payload is bound and handed back out, so it outlives the instance that
+# carried it — the shape where a newly firing destructor would free it early.
+fn escaped(i: Int) -> String:
+    v := Late.Full("escaped-" + i.to_string())
+    return late_text(v)
+
+fn main():
+    mut lines: List[String] := []
+    mut i := 0
+    while i < 3:
+        lines.push(late_text(Late.Full("late-" + i.to_string())))
+        lines.push(late_text(Late.Empty))
+        lines.push(early_text(Early.Full("early-" + i.to_string())))
+        lines.push(early_text(Early.Empty))
+        lines.push(escaped(i))
+
+        hs := Holder("held-" + i.to_string())
+        lines.push(hs.item)
+
+        # a borrowed payload: the local keeps its own count and the instance
+        # takes one of its own, so neither release can be the last one twice.
+        borrowed := "borrowed-" + i.to_string()
+        hb := Holder(borrowed)
+        lines.push(hb.item + "/" + borrowed)
+
+        hf := Holder(Leaf("leaf-" + i.to_string()))
+        lines.push(hf.item.name)
+
+        hl := Holder([i, i + 1, i + 2])
+        lines.push("{hl.item.len()}:{hl.item[2]}")
+
+        t := Tagged(i, "tag-" + i.to_string())
+        lines.push("{t.key}={t.value}")
+        i = i + 1
+    for line in lines:
+        print(line)

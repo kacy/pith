@@ -183,54 +183,19 @@ something here that now works, the page is stale and a fix to it is welcome.
   `struct Node[T]: next: Node[T]?`, `Link(T, Chain[T]?)`, and mutually
   recursive pairs all instantiate (the instance registers before its fields
   resolve, so the reference finds a floor). a generic enum erases to a
-  single IR struct, and a construction site attaches a destructor built
-  from the instance's concrete payload kinds — see the ownership gaps below
-  for the ordering that destructor gets wrong, and for the generic struct and
-  generic function body that have no equivalent at all.
+  single IR struct, but ownership follows the instance: a construction site
+  attaches a destructor built from the instance's concrete payload kinds,
+  and that destructor releases each variant's payload under that variant's
+  own tag, so an `Opt[String]` releases its string when the box dies no
+  matter where the payload-carrying variant sits in the declaration. a
+  generic struct instance gets the same treatment from its concrete field
+  kinds, whichever field the type argument made releasable.
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is
   rejected by the backend with `unknown load source 'assert'`. put the
   assertion in a function the closure calls, or use `std.testing`'s recording
   assertions, which are ordinary calls.
-- **a generic struct never releases an rc field behind its type parameter** —
-  no destructor is emitted for a generic struct instance at all, so
-  `Holder[String]` frees its box and strands the string, about forty-eight
-  bytes an instance. it does not depend on how the instance is built: named
-  or positional construction, the instance inferred from the argument or
-  supplied by an annotated return, all leak, and no `__dtor_Holder…` function
-  appears in the emitted ir. the generic *enum* instance destructors added in
-  #906 have no struct counterpart. the equivalent non-generic struct is flat.
-
-  ```pith
-  struct Holder[T]:
-      value: T
-
-  fn churn(i: Int):                 # 47.9 bytes a round, 200k vs 800k
-      h := Holder(value: "payload-" + i.to_string())
-  ```
-
-- **a generic enum releases its payload only when the payload variant is
-  declared first** — the per-instance destructor #906 attaches is real and its
-  name carries the right per-variant kinds (`__dtor_Holder__void__string`),
-  but its body tests `__enum_tag == 0` whatever the signature says. that is
-  the payload variant's tag only when the payload variant comes first in the
-  declaration. swap the two and the destructor releases nothing on the variant
-  that has something to release:
-
-  ```pith
-  enum Holder[T]:                   # flat
-      Some(T)
-      Empty
-
-  enum Holder[T]:                   # 23.9 bytes a round on the same churn,
-      Empty                         # which builds the payload every other
-      Some(T)                       # round, so ~48 bytes an instance
-  ```
-
-  `tests/leaks/leak_generic_enum_payload` pins the first ordering, which is
-  why the gate stays green.
-
 - **a generic function body has no rc prologue** — an instantiation is emitted
   without the zero-store prologue a concrete body gets, and its call results
   come back typed `unknown` rather than `string`, so no heap local or
@@ -246,10 +211,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   the concrete twin emits `pith_cstring_release` for the temporary and for `s`
   on both return paths; the generic one emits neither.
 
-  none of the three shows up in `make leak-check`, whose cases are all either
-  non-generic or the one enum ordering that works. `std.testing`'s `each` and
-  `case` are generic and pay the first and third, on the order of a couple of
-  hundred bytes a row for the length of one test run.
+  it does not show up in `make leak-check`, whose generic cases now cover the
+  instance's own payload rather than the locals inside a generic body.
+  `std.testing`'s `each` and `case` are generic and pay it, on the order of a
+  couple of hundred bytes a row for the length of one test run. tracked as
+  issue #927.
 
 ## standard library
 
@@ -357,6 +323,18 @@ correctness story:
   method on a generic receiver — and a callee that extracts a heap payload
   out of the optional rather than reading it in place. binding the value
   first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
+- a heap local inside a *generic function body* is never released. a
+  specialized body is re-emitted per instantiation and cannot run the full
+  prologue, so every reference-counted binding in it is published as
+  untracked and its scope exit frees nothing: `fn f[T](v: T, i: Int)` that
+  builds a string or a list into a local drops about 90 bytes per call. the
+  suppression is deliberate. the alternative is releasing a local whose
+  escape into the caller's module the emitter cannot see, and a recycled
+  handle is worse than a leak, so lifting this means teaching the
+  specialization path the caller-side escape it is missing rather than
+  turning the releases back on. what a *generic instance* holds is
+  unaffected: its destructor is built from the instance's concrete kinds and
+  releases the enum payload or struct field either way.
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) owns the optionals it holds, the same as a container
   built by pushing into it: the literal's wrapped elements are tagged like

@@ -1,0 +1,102 @@
+# a generic function whose return type is `T?` must forward an optional the
+# body already holds, and still wrap a bare `T` the body hands back. the body
+# is checked before the substitution, so an `Optional[T]` parameter, field or
+# call reads back as the bare generic marker; the return path used to see no
+# optional there and build a second shell around the first, and the caller
+# then unwrapped one layer and read the inner shell's address as the value.
+#
+# every shape below is a row of that split: the ones that used to answer with
+# a heap address, the neighbouring ones that must keep wrapping, and the
+# non-generic control that always worked.
+
+struct Holder[T]:
+    pub slot: T?
+
+struct Wrap:
+    pub tag: String
+
+# --- the broken rows: an optional forwarded out of a `-> T?` ---
+
+fn forward[T](v: T?) -> T?:
+    return v
+
+fn forward_with_spare[T](v: T?, spare: T) -> T?:
+    return v
+
+fn forward_field[T](h: Holder[T]) -> T?:
+    return h.slot
+
+fn forward_nested[T](v: List[T]?) -> List[T]?:
+    return v
+
+fn forward_call[T](v: T?) -> T?:
+    return forward(v)
+
+impl Wrap:
+    fn forward_method[T](v: T?) -> T?:
+        return v
+
+# --- the rows that must keep wrapping: a bare `T` out of a `-> T?` ---
+
+fn wrap_other[T](v: T?, other: T) -> T?:
+    return other
+
+fn wrap_plain[T](v: T) -> T?:
+    return v
+
+fn wrap_match[T](v: T?) -> T?:
+    match v:
+        none => none
+        x => x
+
+# --- the rows that unwrap: `-> T` and `-> T!` out of a `T?` ---
+
+fn unwrap[T](v: T?) -> T:
+    return v.value()
+
+fn unwrap_result[T](v: T?) -> T!:
+    return v.value()
+
+fn unwrap_result_caller(v: Int?) -> Int!:
+    return unwrap_result(v)!
+
+# --- the non-generic control ---
+
+fn control(v: Int?) -> Int?:
+    return v
+
+fn main():
+    n: Int? := 3
+    s: String? := "hi"
+    empty: Int? := none
+
+    print("forward int: {forward(n).value()}")
+    print("forward string: {forward(s).value()}")
+    print("forward none: {forward(empty) == none}")
+    print("forward with spare: {forward_with_spare(n, 9).value()}")
+    print("forward call: {forward_call(n).value()}")
+
+    hi := Holder[Int](slot: 4)
+    hs := Holder[String](slot: "field")
+    print("forward field int: {forward_field[Int](hi).value()}")
+    print("forward field string: {forward_field[String](hs).value()}")
+
+    xs: List[Int]? := [1, 2, 3]
+    print("forward nested: {forward_nested(xs).value().len()}")
+
+    w := Wrap(tag: "w")
+    print("forward method: {w.forward_method(n).value()}")
+    print("forward method string: {w.forward_method(s).value()}")
+
+    print("wrap other: {wrap_other(n, 7).value()}")
+    print("wrap plain: {wrap_plain(5).value()}")
+    ps := wrap_plain("plain")
+    print("wrap plain string: {ps.value()}")
+    print("wrap match: {wrap_match(n).value()}")
+    print("wrap match none: {wrap_match(empty) == none}")
+
+    print("unwrap: {unwrap(n)}")
+    print("unwrap string: {unwrap(s)}")
+    print("unwrap result: {unwrap_result_caller(n) catch 0}")
+
+    print("control: {control(n).value()}")

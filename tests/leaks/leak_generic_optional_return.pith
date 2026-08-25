@@ -1,0 +1,69 @@
+# a `-> T?` generic that hands an optional straight back used to build a
+# second shell around the first. the outer shell borrows its payload, so the
+# caller's release freed two slots and dropped nothing: the retain the return
+# path put on the inner shell had no matching release and one struct header
+# leaked per call. forwarding the shell the body already holds balances that
+# retain against the caller's release.
+#
+# each round drives the shapes that took the second shell: a parameter, a
+# struct field, a list payload, a generic method, and a forward through
+# another generic.
+import leakprobe as probe
+
+struct Holder[T]:
+    pub slot: T?
+
+struct Wrap:
+    tag: Int
+
+impl Wrap:
+    fn forward[T](v: T?) -> T?:
+        return v
+
+fn forward[T](v: T?) -> T?:
+    return v
+
+fn forward_again[T](v: T?) -> T?:
+    return forward(v)
+
+fn forward_field[T](h: Holder[T]) -> T?:
+    return h.slot
+
+fn forward_list[T](v: List[T]?) -> List[T]?:
+    return v
+
+fn seen(v: Int?) -> Int:
+    return v.unwrap_or(0)
+
+fn seen_str(v: String?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+fn seen_list(v: List[Int]?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+fn churn_round(i: Int):
+    w := Wrap(1)
+    n: Int? := i
+    s: String? := "value-" + i.to_string()
+    seen(forward(n))
+    seen_str(forward(s))
+    seen(forward_again(n))
+    seen(forward_field[Int](Holder[Int](slot: i)))
+    seen_str(forward_field[String](Holder[String](slot: s.unwrap_or(""))))
+    xs: List[Int]? := [i, i + 1]
+    seen_list(forward_list(xs))
+    seen(w.forward(n))
+    seen_str(w.forward(s))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

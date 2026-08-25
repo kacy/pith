@@ -1401,6 +1401,14 @@ cli-regressions-only:
 	case "$$open_out" in *'"code":"E307"'*) pass=$$((pass+1)); echo "ok   lint unclosed resource";; *) echo "FAIL lint unclosed resource"; fail=$$((fail+1));; esac; \
 	case "$$closed_out" in *'"code":"E307"'*) echo "FAIL lint deferred close exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint deferred close exempt";; esac; \
 	case "$$handoff_out" in *'"code":"E307"'*) echo "FAIL lint handed-off resource exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint handed-off resource exempt";; esac; \
+	printf 'mut items: List[Int] := []\n\nfn helper() -> Int:\n    mut items: List[Int] := [7]\n    return items.len()\n\nfn main():\n    print("{helper()}")\n' > "$$tmpdir/lint_shadow.pith"; \
+	printf 'mut items: List[Int] := []\n\nfn helper() -> Int:\n    mut own: List[Int] := [7]\n    return own.len()\n\nfn main():\n    print("{helper()}")\n' > "$$tmpdir/lint_noshadow.pith"; \
+	set +e; \
+	shadow_out=$$(./target/release/pith lint --json "$$tmpdir/lint_shadow.pith" 2>/dev/null); \
+	noshadow_out=$$(./target/release/pith lint --json "$$tmpdir/lint_noshadow.pith" 2>/dev/null); \
+	set -e; \
+	case "$$shadow_out" in *'"code":"E308"'*) pass=$$((pass+1)); echo "ok   lint shadowed global";; *) echo "FAIL lint shadowed global"; fail=$$((fail+1));; esac; \
+	case "$$noshadow_out" in *'"code":"E308"'*) echo "FAIL lint distinct local exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint distinct local exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

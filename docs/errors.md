@@ -576,7 +576,8 @@ warning[E307]: 'config' is built by tls.client_config() and never closed; the re
 a function's storage is flat: one slot per name for the whole body. a local, a
 parameter or a `match` / `if let` payload therefore takes its name for the
 entire function, and the module global of that name is unreachable from inside
-it. that is legal on its own. what has no answer is a
+it. that is legal on its own (the linter mentions it as
+[E308](#e308--binding-shadows-a-module-global-warning)). what has no answer is a
 body that wants both — reads the global somewhere above and binds a local of the
 same name below.
 
@@ -597,6 +598,35 @@ error[E266]: 'items' names a module global that is read earlier in this function
  10 |     mut items: List[Int] := [7]
           ^
   fix: rename the binding, or move the reads of the global into a function that does not bind the name
+```
+
+### E308 — binding shadows a module global (warning)
+
+a local, a parameter or a `match` / `if let` payload is spelled like one of the
+module's globals. the binding reads its own storage, so the global is
+unreachable for the rest of that function — every mention of the name inside is
+the binding, whichever was declared first. a `for` variable is exempt: its
+storage lasts the loop and the global is still reachable on either side of it.
+
+that is legal and sometimes deliberate, which is why it is a warning. it is
+worth a look anyway: a reader cannot tell a function that means to read the
+global from one that means to hold its own value, and the two are one rename
+apart.
+
+it used to be a miscompile rather than a readability problem. the ir namespace
+is flat and the consumer resolved a bare `load`/`store` operand to a global's
+data slot whenever one existed, so the binding wrote the GLOBAL's storage: the
+global's own next read came back as whatever the binding had left there, and a
+container global reached `list indexing on invalid list handle` once the
+binding's cleanup freed what the slot still named. globals now carry a storage
+symbol of their own (`__g_<name>`) and a binding keeps its written name, so the
+two can no longer meet.
+
+```
+warning[E308]: binding 'items' shadows the module global declared on line 1; the global is unreachable for the rest of this function
+  4 |     mut items: List[Int] := [7, 8, 9]
+          ^
+  fix: rename the binding, or drop the global if the binding is what you meant
 ```
 
 ### E251 — function is not public in that module

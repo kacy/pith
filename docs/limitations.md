@@ -181,13 +181,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
-- **two generic instances whose type arguments differ only in element type
-  collide** — an instance is keyed by its type argument's bare name, so
-  `Holder[List[Int]]` and `Holder[List[String]]` are one key and the second
-  reports `field 'item' type mismatch: expected List, got List`. the same area
-  miscompiles an explicit parameterized type argument: `Holder[List[Int]]([1, 2])`
-  compiles and then faults when the field is indexed, while the inferred,
-  annotated-binding and parameter-annotation spellings all work (issue #941).
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is

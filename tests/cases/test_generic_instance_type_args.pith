@@ -1,0 +1,132 @@
+# a generic instance is keyed by a name built from its type arguments, and
+# that name used to spell each argument the way a diagnostic spells it: "List"
+# for every list, "Map" for every map, "optional" for every optional. none of
+# those carry an element type, so Holder[List[Int]] and Holder[List[String]]
+# were one instance — whichever was built first handed the other its field
+# types, and the second construction failed with the giveaway message
+# "expected List, got List".
+#
+# so every shape below is built at two or more different element types in one
+# program, and every value is read back out: an instance that took the wrong
+# field types either fails to compile or reads the wrong slot.
+#
+# the explicit spelling is here for its own reason. `Holder[List[Int]](…)` is
+# parsed as an expression, so its type argument arrives as an index node and
+# `Holder[Int?](…)` as an unwrap — neither of which the type-expression
+# resolver knew, so both resolved to the error type, which is a wildcard
+# everywhere it is compared. `.len()` on the field answered correctly and the
+# indexed read faulted.
+#
+# this is where the two reproducers that used to sit in tests/pending/ landed,
+# with the rest of the family beside them.
+
+struct Holder[T]:
+    pub item: T
+
+# an impl on the generic base gets one specialized body per instance, keyed by
+# the instance name. splitting one instance into several is what makes that
+# key split too, so a method is called on every list instance below.
+impl Holder:
+    fn size() -> Int:
+        return self.item.len()
+
+struct Pair[K, V]:
+    pub key: K
+    pub value: V
+
+struct Leaf:
+    pub name: String
+
+# a generic enum is named the same way, so it collided the same way
+enum Wrap[T]:
+    Empty
+    Full(T)
+
+fn ints(w: Wrap[List[Int]]) -> Int:
+    match w:
+        Wrap.Full(v) => v.len()
+        Wrap.Empty => 0
+
+fn words(w: Wrap[List[String]]) -> Int:
+    match w:
+        Wrap.Full(v) => v.len()
+        Wrap.Empty => 0
+
+fn main():
+    # lists differing only in element type, four of them at once
+    a := Holder([1, 2])
+    b := Holder(["x", "y", "z"])
+    c := Holder([1.5])
+    d := Holder([true, false])
+    print("{a.size()} {a.item[0]}")
+    print("{b.size()} {b.item[2]}")
+    print("{c.size()} {c.item[0]}")
+    print("{d.size()} {d.item[1]}")
+
+    # a list of a named type, which never collided, alongside the ones that did
+    e := Holder([Leaf("leaf")])
+    print("{e.item.len()} {e.item[0].name}")
+
+    # maps: same key type, different value types
+    f := Holder({"k": 1})
+    g := Holder({"k": "v"})
+    key := "k"
+    print("{f.item.len()} {f.item[key]}")
+    print("{g.item.len()} {g.item[key]}")
+
+    # sets
+    h := Holder({1, 2, 3})
+    i := Holder({"one", "two"})
+    two := "two"
+    print("{h.item.len()} {h.item.contains(2)}")
+    print("{i.item.len()} {i.item.contains(two)}")
+
+    # optionals behind the parameter, and a plain value beside them
+    j := Holder(maybe_int(true))
+    k := Holder(maybe_string(true))
+    absent := "absent"
+    print("{j.item.unwrap_or(0)} {k.item.unwrap_or(absent)}")
+
+    # nesting: the inner element type is what separates these two
+    l := Holder([[1, 2], [3]])
+    m := Holder([["a"], ["b", "c"]])
+    print("{l.item.len()} {l.item[0][1]}")
+    print("{m.item.len()} {m.item[1][1]}")
+
+    # two parameters, differing only in the second's element type
+    n := Pair("n", [1, 2, 3])
+    o := Pair("o", ["p", "q"])
+    print("{n.key} {n.value[2]}")
+    print("{o.key} {o.value[0]}")
+
+    # the same shapes written with an explicit type argument
+    p := Holder[List[Int]]([4, 5])
+    q := Holder[List[String]](["r", "s"])
+    print("{p.item.len()} {p.item[0]}")
+    print("{q.item.len()} {q.item[1]}")
+
+    r := Holder[Map[String, Int]]({"k": 7})
+    print("{r.item.len()} {r.item[key]}")
+
+    s := Holder[List[List[Int]]]([[6], [7, 8]])
+    print("{s.item.len()} {s.item[1][0]}")
+
+    t := Holder[Int?](9)
+    print("{t.item.unwrap_or(0)}")
+
+    u := Holder[Set[Int]]({4, 5})
+    print("{u.item.len()} {u.item.contains(5)}")
+
+    # the enum, at two element types and with the payload-free variant beside
+    print("{ints(Wrap.Full([1, 2, 3]))} {words(Wrap.Full(["w"]))}")
+    print("{ints(Wrap.Empty)} {words(Wrap.Empty)}")
+
+fn maybe_int(want: Bool) -> Int?:
+    if want:
+        return 11
+    return none
+
+fn maybe_string(want: Bool) -> String?:
+    if want:
+        return "some"
+    return none

@@ -295,13 +295,56 @@ pub fn process_import_aliases(root_idx: Int):
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
                             pi = pi + 1
 
+# one type argument, spelled so the spelling names the type. get_type_name
+# answers with the bare kind for every unnamed composite — "List" for every
+# list, "Map" for every map, "optional" for every optional — so an instance
+# named from it keyed Holder[List[Int]] and Holder[List[String]] alike, and
+# whichever was built first handed the other its field types. spelling the
+# element out separates them.
+#
+# a named leaf (a struct, an enum, a primitive) already names itself, so it
+# comes back exactly as before: an instance over named arguments only keeps
+# the name it has always had, and the symbols built from that name do not
+# move. the composite spellings use only letters, digits and the bracket and
+# comma that ir_sanitize_symbol already folds to underscores, which is why
+# `?`, `!` and the arrow do not appear here even where they would read better.
+fn instance_type_arg_name(tid: Int) -> String:
+    if tid < 0:
+        return get_type_name(tid)
+    info := get_type_info(tid)
+    if info.kind == "list":
+        return "List[" + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "set":
+        return "Set[" + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "task":
+        return "Task[" + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "channel":
+        return "Channel[" + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "map":
+        return "Map[" + instance_type_arg_name(info.key_type) + "," + instance_type_arg_name(info.value_type) + "]"
+    if info.kind == "optional":
+        return "optional[" + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "result":
+        return "result[" + instance_type_arg_name(info.value_type) + "," + instance_type_arg_name(info.inner) + "]"
+    if info.kind == "tuple":
+        mut elems: List[String] := []
+        for e in info.elements:
+            elems.push(instance_type_arg_name(e))
+        return "tuple[" + elems.join(",") + "]"
+    if info.kind == "function":
+        mut params: List[String] := []
+        for pt in info.param_types:
+            params.push(instance_type_arg_name(pt))
+        return "fn[" + params.join(",") + "][" + instance_type_arg_name(info.return_type) + "]"
+    return get_type_name(tid)
+
 # build an instantiation name like "Pair[Int,String]"
 fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
     mut result := base + "["
-    for i in type_args:
-        if result.len() > base.len() + 1:
+    for arg, i in type_args:
+        if i > 0:
             result = result + ","
-        result = result + get_type_name(i)
+        result = result + instance_type_arg_name(arg)
     result = result + "]"
     return result
 
@@ -3333,11 +3376,52 @@ fn check_explicit_generic_callee_name(index_node: Node) -> String:
             return module_generic_target_name(module_aliases[recv_node.value], base_node.value)
     return ""
 
+# an explicit type argument at a call site is parsed as an expression, not as
+# a type: `Holder[List[Int]]` is an index node whose argument is itself an
+# index node, and `Holder[Int?]` is an index node over an unwrap. neither kind
+# means anything to the type-expression resolver, so both used to come back as
+# the error type — which is a wildcard everywhere it is compared, so the
+# instance took `<error>` for its field and the field read guessed a layout and
+# faulted. resolve the two expression shapes here instead.
 fn resolve_explicit_type_arg(type_arg_idx: Int) -> Int:
     type_arg := get_node(type_arg_idx)
     if type_arg.kind == "ident":
         return resolve_named_type(type_arg.value)
+    if type_arg.kind == "index":
+        return resolve_explicit_generic_type_arg(type_arg)
+    if type_arg.kind == "unwrap":
+        if type_arg.children.len() == 0:
+            return TID_ERR
+        inner := resolve_explicit_type_arg(type_arg.children[0])
+        if is_error_type(inner):
+            return TID_ERR
+        return add_type_info(ti_optional(inner))
     return resolve_type_implementation(type_arg_idx)
+
+# `List[Int]` and `mod.Box[String]` in explicit-type-argument position. the
+# base names a generic type the same way the enclosing call's base does, so it
+# goes through check_explicit_generic_callee_name for the module-qualified
+# spelling and resolve_imported_type_name for the bare one.
+fn resolve_explicit_generic_type_arg(type_arg: Node) -> Int:
+    if type_arg.children.len() < 2:
+        return TID_ERR
+    base_node := get_node(type_arg.children[0])
+    mut base := ""
+    if base_node.kind == "ident":
+        base = resolve_imported_type_name(base_node.value)
+    else:
+        base = check_explicit_generic_callee_name(type_arg)
+    if base.len() == 0:
+        return TID_ERR
+    mut args: List[Int] := []
+    mut i := 1
+    while i < type_arg.children.len():
+        arg := resolve_explicit_type_arg(type_arg.children[i])
+        if is_error_type(arg):
+            return TID_ERR
+        args.push(arg)
+        i = i + 1
+    return resolve_generic_type(base, args)
 
 fn check_generic_struct_call_explicit(name: String, index_node: Node, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)

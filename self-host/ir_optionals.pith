@@ -89,6 +89,22 @@ pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, p
     val_eq := ir_emit_inner_value_eq(info.inner, value, plain_r)
     ir_emit_guarded_eq(result_reg, op, flag, val_eq)
 
+## the equality register for two values of type `tid`, decided the way `==`
+## decides it for that type: an optional structurally through the compare
+## above, a string or a Bytes by content, a boxed enum through its per-enum
+## helper, and everything else — ints, floats, bools, and a struct, which
+## `==` gives pointer identity — as i64 equality. this is what a container
+## searching for an element asks, so that `xs.contains(v)` and `xs[i] == v`
+## cannot disagree. `tid` must name a type; callers with none of their own
+## keep whatever fallback they had.
+pub fn ir_emit_value_eq_for_tid(tid: Int, a_r: Int, b_r: Int) -> Int:
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        out_r := ir_reg()
+        ir_emit_optional_optional_compare(out_r, "eq", a_r, b_r, tid)
+        return out_r
+    return ir_emit_inner_value_eq(tid, a_r, b_r)
+
 # the payload-equality register for one inner type, shared by both optional
 # compares above. the dispatch mirrors ir_emit_value_binary's for the bare
 # type's `==`: strings compare by content through __str_eq, bytes through

@@ -2,6 +2,7 @@
 
 from ir_builder import ir_emit, ir_reg, ir_label
 from ir_metadata import ir_runtime_call_name
+from ir_optionals import ir_emit_value_eq_for_tid
 
 fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
     mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
@@ -154,11 +155,22 @@ pub fn ir_emit_list_is_empty(list_r: Int) -> Int:
     ir_emit("eq " + out_r.to_string() + " " + len_r.to_string() + " " + zero_r.to_string())
     return out_r
 
-fn ir_emit_list_item_eq(out_r: Int, elem_kind: String, item_r: Int, target_r: Int):
+# the register holding "this element equals the search target". with the
+# element type in hand the comparison is the one `==` performs on that type,
+# so an optional element compares by tag and payload rather than by the
+# address of its shell — the shape that used to make `xs.contains(b)` answer
+# false for a b equal to an element the list holds. elem_tid is -1 only where
+# the checker left the list untyped, and there the old kind-driven pair is
+# all there is: a string by content, anything else by raw slot.
+fn ir_emit_list_item_eq(elem_kind: String, elem_tid: Int, item_r: Int, target_r: Int) -> Int:
+    if elem_tid >= 0:
+        return ir_emit_value_eq_for_tid(elem_tid, item_r, target_r)
+    out_r := ir_reg()
     if elem_kind == "string":
         ir_emit_call2_raw(out_r, "__str_eq", "bool", item_r, target_r)
-        return
+        return out_r
     ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
+    return out_r
 
 ## emit the -1 that the index-search family uses for "not found". it is both
 ## the search loop's starting value and the answer for a search call the
@@ -173,10 +185,11 @@ pub fn ir_emit_list_missing_index_result() -> Int:
 ## emit the linear scan behind `xs.index_of(v)`: returns a register holding
 ## the first matching index, or -1 when nothing matches. result_name and
 ## idx_name must be locals the caller reserved for this loop alone. how the
-## match is decided comes from elem_kind — a string element compares by
-## content, every other kind compares the raw slot value, so a struct or a
-## list element only ever matches the identical object.
-pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: String, result_name: String, idx_name: String) -> Int:
+## match is decided comes from elem_tid: an element compares the way `==`
+## compares its type, so a string or a Bytes by content, an optional by tag
+## and payload, a boxed enum through its structural helper, and a struct by
+## identity, which is the comparison `==` gives a struct too.
+pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: String, elem_tid: Int, result_name: String, idx_name: String) -> Int:
     missing_r := ir_emit_list_missing_index_result()
     ir_emit("store " + result_name + " " + missing_r.to_string())
     zero_r := ir_reg()
@@ -199,8 +212,7 @@ pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: Str
     ir_emit("label " + body_l)
     item_r := ir_reg()
     ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
-    eq_r := ir_reg()
-    ir_emit_list_item_eq(eq_r, elem_kind, item_r, target_r)
+    eq_r := ir_emit_list_item_eq(elem_kind, elem_tid, item_r, target_r)
     ir_emit("brif " + eq_r.to_string() + " " + match_l + " " + step_l)
     ir_emit("label " + match_l)
     ir_emit("store " + result_name + " " + i_r.to_string())

@@ -1189,6 +1189,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_protobuf_roundtrip tests/cases/test_module_ctor_heap_field \
 	tests/cases/test_catch_heap_no_leak tests/cases/test_list_struct_no_leak \
 	tests/cases/test_optional_temp_release \
+	tests/cases/test_list_optional_element_search \
 	tests/cases/test_loop_iter_early_return \
 	tests/cases/test_loop_var_slot_isolation \
 	tests/cases/test_spawn_in_loop_capture \

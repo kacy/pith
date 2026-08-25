@@ -1,0 +1,43 @@
+# a list's search positions widen a plain value into the optional element
+# they compare against, which means the search — not a store — builds a shell
+# it alone owns. nothing keeps it past the scan, so the shell and whatever
+# payload it wrapped have to go back at the end of the call rather than once
+# per round for the life of the process. a bare `none` target is the same
+# shape and is churned here too.
+#
+# the searches hand their result to unwrap_or rather than comparing it against
+# `none`: `xs.index_of(v) != none` strands the result shell on every list,
+# optional elements or not, and that is a separate hole in the optional
+# compare rather than anything this file is measuring.
+import leakprobe as probe
+
+fn churn_round(i: Int, ints: List[Int?], strs: List[String?]) -> Int:
+    mut hits := 0
+    if ints.contains(i % 4):
+        hits = hits + 1
+    if ints.contains(none):
+        hits = hits + 1
+    hits = hits + ints.index_of(3).unwrap_or(0)
+    if strs.contains("value-" + (i % 4).to_string()):
+        hits = hits + 1
+    hits = hits + strs.index_of("miss-" + i.to_string()).unwrap_or(0)
+    return hits
+
+fn main():
+    n := probe.rounds()
+    mut ints: List[Int?] := []
+    mut strs: List[String?] := []
+    mut k := 0
+    while k < 4:
+        ints.push(k)
+        strs.push("value-" + k.to_string())
+        k = k + 1
+    ints.push(none)
+
+    mut hits := 0
+    mut i := 0
+    while i < n:
+        hits = hits + churn_round(i, ints, strs)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -63,7 +63,7 @@ from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emi
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_list_element_tid, ir_function_return_kind
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_handle_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_handle_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_handle_decode_specialization, ir_is_handle_decode_path_specialization, ir_is_handle_decode_text_path_specialization, ir_is_handle_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_handle_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_declared_callable_return_type_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
@@ -3935,18 +3935,44 @@ fn ir_emit_list_is_empty_method(node: Node) -> Int:
     list_r := ir_expr(node.children[0])
     return ir_emit_list_is_empty(list_r)
 
+# true when the search target is an optional shell this frame built and
+# nothing else names: a bare `none`, or a plain value the checker widened
+# into the list's optional element type. the scan reads such a shell and
+# keeps nothing, so it goes back at the end of the search rather than being
+# stranded once per call. a shell some other expression produced —
+# `xs.contains(maybe(i))` — is left alone: showing that the caller is its
+# only owner is the general call path's callee walk, and this lowering has
+# no callee to walk.
+fn ir_search_target_is_fresh_shell(expr_idx: Int) -> Bool:
+    if expr_idx < 0:
+        return false
+    if c_argument_widens_to_optional(expr_idx):
+        return true
+    return get_node(expr_idx).kind == "none_lit"
+
+# emit the scan behind `xs.index_of(v)` and `xs.contains(v)`. the target goes
+# through the call-argument emitter, so a plain value the checker widened
+# against a `List[T?]` arrives as the `Some(v)` shell the elements are. the
+# element type id rides alongside the kind so the comparison inside the loop
+# is the one `==` performs on that type.
 fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
     if node.children.len() < 2:
         return ir_emit_list_missing_index_result()
     list_idx := node.children[0]
     target_idx := ir_method_call_arg_expr(node, 0)
     list_r := ir_expr(list_idx)
-    target_r := ir_expr(target_idx)
+    target_r := ir_emit_call_arg(target_idx)
     mut elem_kind := ir_list_element_kind(list_idx)
     if obj_type == "list_string":
         elem_kind = "string"
 
-    return ir_emit_list_index_search_loop(list_r, target_r, ir_retkind(elem_kind), ir_temp_name("__list_index_result"), ir_temp_name("__list_index_i"))
+    out_r := ir_emit_list_index_search_loop(list_r, target_r, ir_retkind(elem_kind), ir_list_element_tid(list_idx), ir_temp_name("__list_index_result"), ir_temp_name("__list_index_i"))
+    # a widened shell owns its payload through the destructor
+    # ir_emit_value_for_target attached, and a `none` holds nothing, so
+    # releasing the shell is the whole of it either way.
+    if ir_search_target_is_fresh_shell(target_idx):
+        ir_rc_release_reg(target_r, "tuple")
+    return out_r
 
 fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
     index_r := ir_emit_list_index_search(node, obj_type)

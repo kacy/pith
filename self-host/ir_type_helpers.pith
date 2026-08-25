@@ -212,6 +212,20 @@ pub fn ir_list_element_kind(expr_idx: Int) -> String:
                 return kind
     return "unknown"
 
+# the element type id of the list expression at expr_idx, or -1 when the
+# checker did not type it as a list — which is what happens inside a
+# generic body, where the checked types are suppressed. the emission kind
+# above answers what an element IS; this answers which type it is, which is
+# what an element comparison needs to compare it the way `==` would.
+pub fn ir_list_element_tid(expr_idx: Int) -> Int:
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return 0 - 1
+    info := get_type_info(tid)
+    if info.kind != "list":
+        return 0 - 1
+    return info.inner
+
 # the return kind of the function *value* at expr_idx — a lambda, a
 # closure variable, an element of a list of functions. use it for a
 # callee that is an expression rather than a name, where there is no

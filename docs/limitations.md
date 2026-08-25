@@ -181,15 +181,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
-- **`.value()` on an optional holding a struct frees it** — where the optional
-  came from an annotated binding, `o: Plain? := Plain(...)`, extracting with
-  `.value()` releases the payload while the extracted value is still live. the
-  program prints the right answer and exits 0; under `PITH_STRUCT_FREELIST=0`
-  valgrind reports the read landing on a freed block. `match` and `unwrap_or`
-  on the same optional are clean, and a call-produced optional is clean, so the
-  shape is specific: a struct payload, an annotated-binding shell, extracted by
-  `.value()`. this is what a recursive walk over a `next: Node?` chain does at
-  every step. read the payload through `match` until it is fixed (issue #940).
 - **two generic instances whose type arguments differ only in element type
   collide** — an instance is keyed by its type argument's bare name, so
   `Holder[List[Int]]` and `Holder[List[String]]` are one key and the second
@@ -502,28 +493,37 @@ of the two related ownership issues that were outstanding here, one remains.
 passing a bare `T!` or `T?` local as a call argument still leaks its payload —
 a bounded leak, where the caller-side cascade does not yet treat the argument
 as the borrow it now provably is. the double-extraction use-after-free is
-fixed: `unwrap_or` retains the payload it extracts, so the result carries its
-own count — a bind transfers it, an argument position releases it after the
-call, an owned receiver is released after the member read — and the subject's
-cleanup cascade stays the sole owner of the count its shell keeps. the retain
-covers a parameter, field, element or fresh subject, and any local whose uses
-the cascade walk can prove safe.
+fixed. `unwrap_or` and `.value()` both retain the payload they extract, so the
+result carries its own count — a bind transfers it, an argument position
+releases it after the call, an owned receiver is released after the member read
+— and the subject's cleanup cascade stays the sole owner of the count its shell
+keeps. the retain covers a parameter, field, element or fresh subject, and any
+local whose uses the cascade walk can prove safe.
 
 the exception to that retain is narrower than it was. it exists for a local
 whose cleanup releases nothing but the shell, where a retained count would
 have no release. it used to cover every local the cascade walk rejected, and
-that swept in two shells which do release their payload. a shell built by
-widening a plain value into an optional (`o: List[Int]? := [1, 2]`, and the
+that swept in four shells which are not the payload's last owner. a shell built
+by widening a plain value into an optional (`o: List[Int]? := [1, 2]`, and the
 same wrap inside a literal or a field) carries a destructor that drops the
 payload with it. a borrowed shell (`e := rows[0]`, `e := h.opt`) leaves the
-container or struct behind it doing the releasing. extracting from either
-handed back a handle its owner then freed, which showed up first on container
-payloads, where the freed handle came back from the registry as somebody
-else's list. both retain now. what still transfers is what the exception was
-written for: a local holding a dtor-less shell a callee built and returned,
-whose uses the walk cannot prove safe (one also sent to a channel, captured by
-a closure, or handed to a callee the walk cannot read). extracting such a
-local twice is still unsound.
+container or struct behind it doing the releasing. a shell a borrowing runtime
+getter built (`e := m.get(k)`, `e := xs.first()`) is the same story one step
+further out: the shell itself is fresh, so nothing about that bind looks
+borrowed, but the count on what it points at never left the container. and a
+shell an extraction handed out of a doubly-wrapped optional
+(`e := outer.value()`, where the payload is itself a `T?`) arrives as one
+retained count on a shell its owner still holds, which goes on releasing what
+it wraps through its own destructor. extracting from any of these handed back a
+handle its owner then freed, which showed up first on container payloads, where
+the freed handle came back from the registry as somebody else's list. all four
+retain now. what still transfers is what the exception was written for: a local
+holding a dtor-less shell a callee built and returned, whose uses the walk
+cannot prove safe (one also sent to a channel, captured by a closure, or handed
+to a callee the walk cannot read). extracting such a local twice is still
+unsound — which is why both extraction spellings are on the cascade walk's
+whitelist, so a local that only ever extracts keeps its cascade and takes a
+fresh count each time rather than handing the same one out twice.
 
 sweeping std's shared globals for the same class of bug turned up three things
 that are questions of design rather than repairs, so they are recorded here

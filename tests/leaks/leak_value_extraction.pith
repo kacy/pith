@@ -1,0 +1,173 @@
+# `.value()` on an optional with an rc payload. the extraction used to hand
+# back an uncounted view of the shell's payload while the ownership classifier
+# already called the result owned for every heap kind but string, so a bind, an
+# argument or a receiver released a count the extraction never took. it now
+# takes one on the same terms unwrap_or does — every subject but a shell-only
+# local, which still transfers the count its cleanup would otherwise strand.
+#
+# both halves of that have to balance here: an unpaired retain moves the peak,
+# and an unpaired release is a double free the valgrind run on the golden twin
+# (tests/cases/test_optional_value_extraction) catches.
+import leakprobe as probe
+
+struct Holder:
+    pub lst: List[Int]?
+    pub name: String?
+
+struct Plain:
+    pub value: String
+
+struct Chain:
+    pub tag: String
+    mut next: Chain?
+    weak up: Chain?
+
+fn fill(i: Int) -> List[Int]:
+    mut l: List[Int] := []
+    l.push(i)
+    l.push(i + 1)
+    return l
+
+fn consume(l: List[Int]) -> Int:
+    return l.len()
+
+fn label(p: Plain) -> String:
+    return p.value
+
+# a widened bind: the shell owns the payload through its destructor
+fn widened_list(i: Int) -> Int:
+    o: List[Int]? := fill(i)
+    v := o.value()
+    return v.len()
+
+fn widened_struct(i: Int) -> Int:
+    o: Plain? := Plain(value: "p" + i.to_string())
+    v := o.value()
+    return v.value.len()
+
+fn widened_string(i: Int) -> Int:
+    o: String? := "s" + i.to_string()
+    return o.value().len()
+
+fn widened_map_and_set(i: Int) -> Int:
+    m: Map[String, Int]? := {"k": i}
+    mv := m.value()
+    s: Set[Int]? := {i, i + 1}
+    sv := s.value()
+    b: Bytes? := bytes_from_string_utf8("b" + i.to_string())
+    bv := b.value()
+    return mv.len() + sv.len() + bv.len()
+
+# the escape shape: the extraction outlives the shell it came out of
+fn widened_escape(i: Int) -> List[Int]:
+    o: List[Int]? := fill(i)
+    return o.value()
+
+# argument position: the owned result is released after the call
+fn widened_argument(i: Int) -> Int:
+    o: List[Int]? := fill(i)
+    return consume(o.value())
+
+fn string_argument(i: Int) -> Int:
+    o: Plain? := Plain(value: "a" + i.to_string())
+    return label(o.value()).len()
+
+# receiver position: the owned result is released after the member read
+fn widened_receiver(i: Int) -> Int:
+    o: List[Int]? := fill(i)
+    return o.value().len()
+
+# comparison position: the owned string is dropped after the compare
+fn compared(i: Int) -> Int:
+    o: String? := "c" + i.to_string()
+    if o.value() == "c0":
+        return 1
+    return 0
+
+# double extraction off one widened local
+fn widened_double(i: Int) -> Int:
+    o: List[Int]? := fill(i)
+    a := o.value()
+    b := o.value()
+    return a.len() + b.len()
+
+# a borrowed element subject: the list keeps its own count on the payload
+fn element_subject(i: Int) -> Int:
+    rows: List[List[Int]?] := [fill(i), none]
+    e := rows[0]
+    v := e.value()
+    return v.len() + rows[0].value().len()
+
+# a borrowed field subject: the struct keeps its own count on the payload
+fn field_subject(i: Int) -> Int:
+    h := Holder(fill(i), "h" + i.to_string())
+    e := h.lst
+    v := e.value()
+    return v.len() + h.lst.value().len() + h.name.value().len()
+
+# a shell a callee built and returned still transfers when the cascade scan
+# rejects the local
+fn built_elsewhere(i: Int) -> List[Int]?:
+    if i < 0:
+        return none
+    return fill(i)
+
+fn from_call(i: Int) -> Int:
+    o := built_elsewhere(i)
+    v := o.value()
+    return v.len()
+
+# a call-produced local extracted more than once: each extraction takes its
+# own count and the local's cascade releases the one the shell was built with
+fn repeat_extract(i: Int) -> Int:
+    o := built_elsewhere(i)
+    a := o.value()
+    b := o.value()
+    return a.len() + b.len() + o.value().len()
+
+# a borrowing runtime getter's shell: the shell is fresh but the count on what
+# it points at never left the container
+fn getter_subject(i: Int) -> Int:
+    m: Map[String, List[Int]] := {"k": fill(i)}
+    e := m.get("k")
+    v := e.value()
+    return v.len() + m["k"].len()
+
+# a doubly-wrapped optional: the outer extraction retains the inner shell,
+# which goes on owning its payload through its destructor
+fn doubly_wrapped(i: Int) -> Int:
+    m: Map[String, Plain?] := {"k": Plain(value: "d" + i.to_string())}
+    outer := m.get("k")
+    inner := outer.value()
+    got := inner.value()
+    return got.value.len()
+
+# a weak field read: the shell borrows and the target's count belongs to its
+# owner, so the upgrade the extraction takes has to come back off again
+fn weak_read(c: Chain) -> Int:
+    if c.up != none:
+        return c.up.value().tag.len()
+    return 0
+
+fn weak_round(i: Int) -> Int:
+    root := Chain(tag: "r" + i.to_string(), next: none, up: none)
+    leaf := Chain(tag: "l" + i.to_string(), next: none, up: root)
+    return weak_read(leaf) + weak_read(root)
+
+fn churn_round(i: Int):
+    total := widened_list(i) + widened_struct(i) + widened_string(i)
+    more := widened_map_and_set(i) + widened_escape(i).len() + widened_argument(i)
+    rest := string_argument(i) + widened_receiver(i) + compared(i) + widened_double(i)
+    tail := element_subject(i) + field_subject(i) + from_call(i) + weak_round(i)
+    last := getter_subject(i) + doubly_wrapped(i) + repeat_extract(i)
+    if total + more + rest + tail + last < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

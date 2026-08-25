@@ -159,16 +159,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   nothing to fix it and the call is E222. the other is a generic owner:
   `impl Box[T]: fn map[U](...)` is E265. past those two a generic method
   behaves exactly as a free generic function does, rough edges included.
-  returning an already-optional value out of a `-> T?` signature wraps it a
-  second time: `fn f[T](v: T?) -> T?: return v` hands back the inner shell's
-  address rather than the value it holds. the checker types that call
-  correctly — it is the specialization's return that re-wraps — and every
-  neighbouring shape is fine, including a `-> T?` built from a plain
-  parameter (`fn f[T](v: T) -> T?`), a `-> T!` return, and the same
-  signature written without type parameters. and a specialization publishes
-  its owned locals untracked, so a body that binds a heap value to a local
-  leaks it per call while one that hands its argument or a fresh value
-  straight back does not.
+  a specialization publishes its owned locals untracked, so a body that
+  binds a heap value to a local leaks it per call while one that hands its
+  argument or a fresh value straight back does not.
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the

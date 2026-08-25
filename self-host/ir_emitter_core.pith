@@ -7537,7 +7537,19 @@ pub fn ir_emit_return_value(expr_child: Int):
         # signal as a tuple retkind — the guard against an Optional[Tuple]
         # inner still applies.
         ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
-        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
+        # the emitter's own inference is the third witness, and the one that
+        # answers inside a generic specialization. the body was checked before
+        # the substitution, so an `Optional[T]` parameter, an `Optional[T]`
+        # field of the receiver, and an `Optional[T]`-returning inner call all
+        # read back as the bare generic marker rather than an optional — the
+        # two witnesses above see nothing, the return wraps a shell that is
+        # already a shell, and the caller unwraps one layer and reads the
+        # inner shell's address as the value. ir_infer_type answers "tuple"
+        # for exactly the optional-shaped expressions, because that is the
+        # representation an optional lowers to; the same Optional[Tuple] guard
+        # keeps a genuinely tuple-valued inner out of it.
+        infer_tuple := ir_infer_type(expr_child) == "tuple"
+        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local or infer_tuple) and ir_current_func_optional_inner_kind != "tuple")
         if expr_node.kind == "none_lit":
             r = ir_emit_optional_none_value()
         elif already_optional == false:

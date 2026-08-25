@@ -1,0 +1,64 @@
+# an optional result dropped at statement position. the caller holds a count on
+# that shell however the callee produced it — a borrowed shell is retained on
+# the way out, a fresh one transfers — so the shell goes back at the statement,
+# the same as the result box beside it.
+#
+# run under valgrind this is mostly a test of what must NOT be freed: every
+# subject below is still live after its result is dropped. `xs` is the local the
+# callee handed straight back, `m` still owns the payload behind the shell
+# `get` builds, and the struct field outlives the method that returned it — so
+# each is read again after the loop, where an over-release would fault. the
+# printed sum catches a behavior regression.
+
+struct Holder:
+    mut slot: List[Int]?
+
+impl Holder:
+    fn peek() -> List[Int]?:
+        return self.slot
+
+fn hand_back(v: List[Int]?) -> List[Int]?:
+    return v
+
+fn hand_back_g[T](v: T?) -> T?:
+    return v
+
+fn make_opt(i: Int) -> Int?:
+    if i % 3 == 0:
+        return none
+    return i
+
+fn make_words(i: Int) -> List[String]?:
+    if i % 4 == 0:
+        return none
+    return ["w-" + i.to_string()]
+
+fn main() -> Int!:
+    mut sum := 0
+    mut m: Map[String, String] := {}
+    m.insert("k", "value-string")
+    h := Holder(slot: [7, 8, 9])
+    mut i := 0
+    while i < 400:
+        # the caller's own local, handed back and dropped
+        xs: List[Int]? := [i, i + 1]
+        hand_back(xs)
+        hand_back_g(xs)
+        # a fresh shell over a fresh payload
+        make_words(i)
+        # a scalar payload: the shell is all there is
+        make_opt(i)
+        # a borrowing runtime getter: the map still owns what the shell points at
+        m.get("k")
+        m.get("absent")
+        # a field the struct keeps, returned by a method and dropped
+        h.peek()
+        # the local must still be readable after its result was dropped
+        sum = sum + xs.unwrap_or([]).len()
+        i = i + 1
+    # every subject above is still live
+    sum = sum + m.get("k").unwrap_or("").len()
+    sum = sum + h.peek().unwrap_or([]).len()
+    sum = sum + h.slot.unwrap_or([]).len()
+    print("sum=" + sum.to_string())
+    return 0

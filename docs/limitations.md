@@ -342,9 +342,15 @@ correctness story:
   each, and both halves of a map literal pay it independently. the same set
   built with `add`, the same map filled by index assignment, and a list literal
   over the same strings are all flat (issue #942).
-- a discarded call result of type `List[X]?` leaks its payload, on the generic
-  and non-generic spellings alike, which places it in the discarded-result path
-  rather than the return path (issue #935).
+- a call result dropped at statement position is reclaimed when it is a result
+  box, an optional shell, or a string, and stranded when it is any other heap
+  kind. a discarded `List[X]` or `Map[K, V]` result leaks the whole container —
+  about 590 bytes a round for a two-element list and a one-entry map together,
+  which is the largest of the ownership leaks still open. the release itself is
+  the same one line the optional shell gets; what is not settled is the set of
+  runtime producers that hand back a borrowed container with no count of their
+  own, and a release aimed at one of those is a use-after-free rather than a
+  leak. bind the result and let the local's cleanup reclaim it.
 - a heap payload behind a *fresh* optional shell that carries no destructor
   leaks, about one count per extraction. a user function returning `T?` builds
   its `Some` with a plain allocation and no `__opt_dtor_<kind>`, so the shell

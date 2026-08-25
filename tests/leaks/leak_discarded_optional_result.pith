@@ -1,0 +1,41 @@
+# a call whose optional result is discarded at statement position leaves the
+# caller holding a count on the shell: the callee retained a borrowed shell on
+# the way out and transferred a fresh one, and nothing dropped either. with a
+# `List[X]?` handed straight back the caller's own local was left one count
+# above zero, so the shell and the list behind it both survived the round —
+# the generic and non-generic spellings alike, which is what placed the leak
+# in the discard path rather than in the return.
+import leakprobe as probe
+
+fn hand_back(v: List[Int]?) -> List[Int]?:
+    return v
+
+fn hand_back_g[T](v: T?) -> T?:
+    return v
+
+fn make_opt(i: Int) -> Int?:
+    if i % 3 == 0:
+        return none
+    return i
+
+fn round(i: Int) -> Int:
+    xs: List[Int]? := [i, i + 1, i + 2]
+    hand_back(xs)
+    hand_back_g(xs)
+    make_opt(i)
+    mut m: Map[String, Int] := {}
+    m.insert("k", i)
+    m.get("k")
+    return 1
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

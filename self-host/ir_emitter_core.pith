@@ -8291,6 +8291,18 @@ fn ir_stmt(idx: Int):
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
                 ir_emit_discard_result(r, stmt_tid)
                 return
+            # a discarded optional result is a shell nothing will ever name,
+            # and the caller holds a count on it either way: the callee
+            # retained a borrowed shell on the way out and transferred a fresh
+            # one. so the shell goes back here, and what it owns through its
+            # destructor goes with it — a `List[X]?` handed straight back and
+            # dropped left the caller's own local one count above zero, which
+            # stranded the shell and the list inside it. the payload of a
+            # destructor-less shell is the older leak docs/limitations.md
+            # records and is not this release's to drop.
+            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(idx):
+                ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
+                return
         # a discarded owned string result (a popped element, an unused
         # fresh string) is garbage as soon as the statement ends
         if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx):

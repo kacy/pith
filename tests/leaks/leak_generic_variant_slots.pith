@@ -1,0 +1,115 @@
+# a generic enum's destructor releases its payload under the variant's own
+# tag, and the tag is the variant's position in the declaration. that made the
+# declaration order load-bearing and invisible: an instance destructor that
+# tested tag 0 unconditionally released nothing at all unless the payload
+# variant happened to be declared first, and every probe written for the
+# earlier ownership work declared it first.
+#
+# so the ordering is churned here rather than assumed. `Head` carries its
+# payload in the first variant, `Waist` in the second with a payload-free
+# variant on either side, `Tail` in the last, and `Both` carries two payloads
+# with a payload-free variant wedged between them. each of the four is
+# instantiated at a different rc kind, so a tag that slides lands on a slot
+# holding a different sort of value rather than on a compatible one.
+import leakprobe as probe
+
+struct Leaf:
+    pub name: String
+
+enum Head[T]:
+    Full(T)
+    Empty
+    Missing
+
+enum Waist[T]:
+    Empty
+    Full(T)
+    Missing
+
+enum Tail[T]:
+    Empty
+    Missing
+    Full(T)
+
+enum Both[T]:
+    First(T)
+    Empty
+    Second(T)
+
+fn head_len(v: Head[String]) -> Int:
+    match v:
+        Head.Full(s) => s.len()
+        Head.Empty => 0
+        Head.Missing => 0
+
+fn waist_len(v: Waist[List[Int]]) -> Int:
+    match v:
+        Waist.Full(xs) => xs.len()
+        Waist.Empty => 0
+        Waist.Missing => 0
+
+fn tail_len(v: Tail[Map[String, Int]]) -> Int:
+    match v:
+        Tail.Full(m) => m.len()
+        Tail.Empty => 0
+        Tail.Missing => 0
+
+fn both_len(v: Both[Leaf]) -> Int:
+    match v:
+        Both.First(a) => a.name.len()
+        Both.Empty => 0
+        Both.Second(b) => b.name.len()
+
+fn make_head(i: Int) -> Head[String]:
+    if i % 3 == 0:
+        return Head.Full("head-" + i.to_string())
+    if i % 3 == 1:
+        return Head.Empty
+    return Head.Missing
+
+fn make_waist(i: Int) -> Waist[List[Int]]:
+    if i % 3 == 0:
+        return Waist.Full([i, i + 1])
+    if i % 3 == 1:
+        return Waist.Empty
+    return Waist.Missing
+
+fn make_tail(i: Int) -> Tail[Map[String, Int]]:
+    if i % 3 == 0:
+        return Tail.Full({"a": i, "b": i + 1})
+    if i % 3 == 1:
+        return Tail.Empty
+    return Tail.Missing
+
+fn make_both(i: Int) -> Both[Leaf]:
+    if i % 3 == 0:
+        return Both.First(Leaf("first-" + i.to_string()))
+    if i % 3 == 1:
+        return Both.Empty
+    return Both.Second(Leaf("second-" + i.to_string()))
+
+fn churn_round(i: Int):
+    head_len(make_head(i))
+    waist_len(make_waist(i))
+    tail_len(make_tail(i))
+    both_len(make_both(i))
+
+    # bound rather than consumed straight out of the call, so the binding's
+    # own scope exit is the release rather than the argument's
+    h := make_head(i)
+    w := make_waist(i)
+    t := make_tail(i)
+    b := make_both(i)
+    head_len(h)
+    waist_len(w)
+    tail_len(t)
+    both_len(b)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

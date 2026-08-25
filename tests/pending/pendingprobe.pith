@@ -1,0 +1,24 @@
+# the peak-resident-set reader the churn reproducers in this directory share.
+#
+# it is a copy of the two entry points tests/leaks/leakprobe.pith exposes,
+# because a pith import resolves inside one directory and a reproducer here
+# cannot reach that one. keeping it to those two keeps the copy small; a
+# reproducer that graduates into tests/leaks/ swaps this import for that one
+# and nothing else changes.
+import std.env as env
+import std.fs as fs
+
+# how many churn rounds this run should do.
+pub fn rounds() -> Int:
+    return env.int_or("PITH_LEAK_ROUNDS", 20000)
+
+# the process high-water resident set in kilobytes.
+pub fn peak_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0

@@ -1,0 +1,34 @@
+# PENDING — no issue yet. not registered anywhere; it compiles and crashes.
+#
+# an explicit type argument written at a generic construction —
+# `Holder[List[Int]]([1, 2])` — loses the element type on the way in. the
+# instance is built, `.len()` on the field answers correctly, and indexing it
+# reads out of a slot the compiler never typed:
+#
+#   $ pith build tests/pending/generic_explicit_container_type_arg.pith
+#   Compiled 20 functions
+#   $ ./tests/pending/generic_explicit_container_type_arg
+#   Segmentation fault
+#
+# the same program with the type argument inferred (`Holder([1, 2])`), with it
+# supplied by an annotated binding (`a: Holder[List[Int]] := Holder([1, 2])`)
+# or by a parameter annotation all run and print 1. an explicit *scalar*
+# argument (`Holder[String]("s")`) runs too, and an explicit optional argument
+# (`Holder[Int?](3)`) fails a third way, at run time, with "call to a function
+# the compiler could not resolve".
+#
+# so what is broken is specifically an explicit type argument that is itself
+# parameterized. this shares a root with generic_instance_name_collision.pith:
+# the instance name is built from `get_type_name`, which does not carry an
+# element type.
+#
+# there is no `#` marker on the crashing line because there is nothing to
+# mark: the crash is in the read, not in a diagnostic.
+
+struct Holder[T]:
+    pub item: T
+
+fn main():
+    a := Holder[List[Int]]([1, 2])
+    print("len {a.item.len()}")
+    print("first {a.item[0]}")

@@ -1,0 +1,104 @@
+# a generic function is emitted once per set of type arguments, and every
+# shape its signature can take is a separate lowering: returning the parameter
+# itself, wrapping it in an optional or a result, building a list or an
+# instance from it, reading one back out, and taking the same in. a generic
+# method with its own type parameter takes the same paths.
+#
+# each shape is exercised at a heap type argument and at `Int`, and the value
+# is printed back out: a return that hands back the wrong representation
+# answers with a heap address rather than the value, which no leak gate and no
+# crash oracle can see.
+#
+# the inference routes are pinned too — from a plain argument, through a
+# container parameter, and from an annotated binding — beside the one call
+# that has to spell its type argument out.
+
+struct Holder[T]:
+    pub item: T
+
+struct Sink:
+    pub tag: String
+
+fn ident[T](v: T) -> T:
+    return v
+
+fn wrapped[T](v: T) -> T?:
+    return v
+
+fn forwarded[T](v: T?) -> T?:
+    return v
+
+fn resulted[T](v: T) -> T!:
+    return v
+
+fn listed[T](v: T) -> List[T]:
+    return [v]
+
+fn held[T](v: T) -> Holder[T]:
+    return Holder(v)
+
+fn first[T](xs: List[T]) -> T:
+    return xs[0]
+
+fn unheld[T](h: Holder[T]) -> T:
+    return h.item
+
+fn left[T, U](a: T, b: U) -> T:
+    return a
+
+fn right[T, U](a: T, b: U) -> U:
+    return b
+
+impl Sink:
+    fn echo[T](v: T) -> T:
+        return v
+
+    fn maybe[T](v: T) -> T?:
+        return v
+
+    fn only[T](xs: List[T]) -> T:
+        return xs[0]
+
+    fn wrap[T](v: T) -> Holder[T]:
+        return Holder(v)
+
+fn main():
+    sink := Sink(tag: "sink")
+
+    print(ident("ident"))
+    print("{ident(7)}")
+
+    print(wrapped("wrapped").unwrap_or("fallback"))
+    print("{wrapped(8).unwrap_or(0)}")
+
+    o: String? := "forwarded"
+    print(forwarded(o).unwrap_or("fallback"))
+    empty: String? := none
+    print("{forwarded(empty) == none}")
+
+    print(resulted("resulted") catch "caught")
+    print("{resulted(9) catch 0}")
+
+    print(listed("listed")[0])
+    print("{listed(10).len()}")
+
+    print(held("held").item)
+    print("{held(11).item}")
+
+    # inference through a container parameter
+    print(first(["first", "second"]))
+    print("{first([12, 13])}")
+
+    # a generic instance as an argument: the type parameter has to be spelled
+    # out, since it is not inferred from an instance argument today
+    print(unheld[String](Holder("unheld")))
+
+    # two type parameters, and the same declaration at both orders
+    print(left("left", 14))
+    print("{right("kept", 15)}")
+
+    print(sink.echo("echo"))
+    print(sink.maybe("maybe").unwrap_or("fallback"))
+    print(sink.only(["only", "other"]))
+    print(sink.wrap("wrapped-method").item)
+    print("{sink.echo(16)}")

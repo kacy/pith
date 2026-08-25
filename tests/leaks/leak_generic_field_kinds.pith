@@ -1,0 +1,108 @@
+# a generic struct's declaration writes down the type parameter name, and no
+# rc kind matches "T", so what the instance actually put in the field is
+# whatever the type argument decided. every rc kind the language has can land
+# there, and each one is released by a different runtime call — a destructor
+# built from the wrong kind either strands the value or frees it as the wrong
+# thing.
+#
+# so this churns one `Holder[T]` at each rc kind in turn: string, list, map,
+# set, bytes, struct and closure. beside them are the shapes where the field
+# is not the only thing to get right — a nested instance (a list behind the
+# parameter, and an instance behind it), a two-parameter instance whose first
+# slot releases nothing, one declaration at two different type arguments,
+# and a self-referential `Node[T]` chain that has to unwind rather than stop at
+# the head.
+import leakprobe as probe
+import std.bytes as bytes
+
+struct Leaf:
+    pub name: String
+
+struct Holder[T]:
+    pub item: T
+
+# a second declaration rather than a second `Holder[List[...]]`: two inferred
+# instantiations of one generic at the same container and different element
+# types collide today (see tests/pending/), so the nested shapes get their own
+# name until that is fixed.
+struct Nest[T]:
+    pub item: T
+
+struct Tagged[K, V]:
+    pub key: K
+    pub value: V
+
+struct Node[T]:
+    pub value: T
+    pub next: Node[T]?
+
+# the chain is walked with a match rather than `.value()`: `.value()` on an
+# optional holding a struct over-releases what it extracts (see
+# tests/pending/), which is not what this case is about.
+fn walk(n: Node[String]) -> Int:
+    match n.next:
+        none => n.value.len()
+        tail => n.value.len() + walk(tail)
+
+fn chain(i: Int) -> Node[String]:
+    tail := Node("tail-" + i.to_string(), none)
+    middle := Node("middle-" + i.to_string(), tail)
+    return Node("head-" + i.to_string(), middle)
+
+# a set and a map are filled a member at a time rather than written as a
+# literal: a set or map literal built over a freshly allocated element does
+# not release that element (see tests/pending/), which would put an unrelated
+# leak inside a case about generic fields.
+fn fresh_set(suffix: String) -> Set[String]:
+    mut s: Set[String] := {}
+    s.add("set-" + suffix)
+    s.add("other-" + suffix)
+    return s
+
+fn fresh_map(suffix: String) -> Map[String, String]:
+    mut m: Map[String, String] := {}
+    m["a"] = "map-" + suffix
+    m["b"] = "other-" + suffix
+    return m
+
+fn churn_round(i: Int):
+    suffix := i.to_string()
+
+    hs := Holder("string-" + suffix)
+    hl := Holder([i, i + 1, i + 2])
+    hm := Holder(fresh_map(suffix))
+    hset := Holder(fresh_set(suffix))
+    hb := Holder(bytes.from_string_utf8("bytes-" + suffix))
+    hstruct := Holder(Leaf("leaf-" + suffix))
+    hclosure := Holder(fn(x: Int) => x + i)
+
+    # the same declaration at a second type argument in the same program, and
+    # one whose first slot is an Int and so releases nothing at all
+    hint := Holder(i)
+    tag := Tagged(i, "tag-" + suffix)
+    tagpair := Tagged("key-" + suffix, [i, i + 1])
+
+    # nested: a container behind the parameter, and an instance behind it
+    nested := Nest(["n-" + suffix, "m-" + suffix])
+    deep := Nest(Holder("deep-" + suffix))
+
+    linked := chain(i)
+
+    # read every one back, so a destructor that fires a release too early has
+    # something live to corrupt rather than a slot nobody looks at again
+    f := hclosure.item
+    total := hs.item.len() + hl.item.len() + hm.item.len() + hset.item.len()
+    total2 := hb.item.len() + hstruct.item.name.len() + f(1) + hint.item
+    total3 := tag.value.len() + tagpair.value.len() + nested.item.len()
+    total4 := deep.item.item.len() + walk(linked)
+    if total + total2 + total3 + total4 < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

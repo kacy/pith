@@ -1,0 +1,33 @@
+# PENDING — no issue yet. not registered anywhere; it does not compile.
+#
+# a generic instance is keyed by a name built from its type arguments, and
+# `build_instantiated_type_name` (self-host/checker.pith) spells each argument
+# with `get_type_name` (self-host/types.pith), which answers "List" for every
+# list, "Map" for every map, "Set" for every set, and "optional", "result",
+# "tuple", "fn", "Channel" and "Task" for the rest. none of those carry the
+# element type, so `Holder[List[Int]]` and `Holder[List[String]]` are both
+# keyed `Holder[List]`.
+#
+# whichever is instantiated first wins and the second is handed the first
+# one's field types. the diagnostic is the giveaway:
+#
+#   error[E219]: field 'item' type mismatch: expected List, got List
+#
+# scalars are unaffected — `Holder[Int]` and `Holder[String]` have distinct
+# names — and so is one instance per container, which is why the corpus only
+# tripped over this when a survey put two of them in one program.
+#
+# the sibling half is in generic_explicit_container_type_arg.pith.
+
+struct Holder[T]:
+    pub item: T
+
+fn main():
+    a := Holder([1, 2])
+    b := Holder(["x", "y"])
+    print("{a.item.len()} {b.item.len()}")
+
+    # the same collision one level down, at a map
+    c := Holder({"k": 1})
+    d := Holder({"k": "v"})
+    print("{c.item.len()} {d.item.len()}")

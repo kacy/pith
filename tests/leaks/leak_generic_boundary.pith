@@ -1,0 +1,88 @@
+# a generic instance is a value like any other, and every boundary a value
+# crosses has its own ownership rule: an argument is borrowed, a return is
+# handed over, a container element is adopted, a closure capture is retained
+# for the closure's life, a channel send gives the value away and a match
+# binding borrows out of the subject. the destructor a construction site
+# attaches has to survive all of them, and a construction inside a lambda
+# registers its destructor only as that lambda's body is emitted.
+#
+# so the same two instances — a generic struct and a generic enum, each over a
+# freshly allocated string — are pushed through every one of those boundaries
+# each round.
+import leakprobe as probe
+
+struct Holder[T]:
+    pub item: T
+
+enum Slot[T]:
+    Vacant
+    Full(T)
+
+# a channel's payload type has to be a bare type name, so a generic instance
+# travels inside a concrete carrier rather than as itself.
+struct Parcel:
+    pub held: Holder[String]
+    pub slot: Slot[String]
+
+fn borrowed(h: Holder[String]) -> Int:
+    return h.item.len()
+
+fn handed_back(i: Int) -> Holder[String]:
+    return Holder("returned-" + i.to_string())
+
+fn matched(s: Slot[String]) -> Int:
+    match s:
+        Slot.Full(v) => v.len()
+        Slot.Vacant => 0
+
+# the payload is bound out of the subject and handed back, so it outlives the
+# instance that carried it.
+fn extracted(s: Slot[String]) -> String:
+    match s:
+        Slot.Full(v) => v
+        Slot.Vacant => "vacant"
+
+fn churn_round(i: Int, ch: Channel[Parcel]):
+    suffix := i.to_string()
+
+    # argument, return
+    total := borrowed(Holder("arg-" + suffix)) + borrowed(handed_back(i))
+
+    # containers
+    mut shelf: List[Holder[String]] := []
+    shelf.push(Holder("listed-" + suffix))
+    mut byname: Map[String, Holder[String]] := {}
+    byname["k"] = Holder("mapped-" + suffix)
+
+    # closure capture, and a construction inside the lambda body
+    captured := Holder("captured-" + suffix)
+    read := fn() => captured.item.len()
+    built := fn() => Holder("built-" + suffix).item.len()
+
+    # match, and a payload that escapes the match
+    seen := matched(Slot.Full("matched-" + suffix))
+    escaped := extracted(Slot.Full("escaped-" + suffix))
+    vacant: Slot[String] := Slot.Vacant
+
+    # channel send and receive
+    ch.send(Parcel(held: Holder("sent-" + suffix), slot: Slot.Full("slotted-" + suffix)))
+    # the received optional is bound before it is unwrapped: `.value()` called
+    # straight on a call's optional temporary strands the shell (see
+    # tests/pending/), which has nothing to do with what the instance holds.
+    received := ch.recv()
+    parcel := received.value()
+
+    sum := total + shelf[0].item.len() + byname["k"].item.len() + read() + built()
+    sum2 := seen + escaped.len() + matched(vacant) + parcel.held.item.len() + matched(parcel.slot)
+    if sum + sum2 < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    ch := Channel[Parcel](4)
+    mut i := 0
+    while i < n:
+        churn_round(i, ch)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

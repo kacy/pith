@@ -1,0 +1,100 @@
+# a generic function is emitted once per set of type arguments, and the
+# ownership of what crosses its signature is decided per specialization: an
+# argument is borrowed, a return is handed over, and a value that goes in as a
+# `T` and comes back out as a `T?`, a `T!` or a `List[T]` has been retained or
+# wrapped somewhere on the way.
+#
+# so every signature shape is churned here at a heap type argument, both as a
+# free function and as a method with its own type parameter. an unbalanced
+# retain in any one of them moves the peak; the same call at `Int` is beside it
+# so a shape that releases what it should not shows up as well.
+#
+# two neighbours are deliberately absent, both in tests/pending/ rather than
+# here. a heap *local* inside a generic body is never released, because a
+# specialization publishes its locals untracked (issue #927) — which also
+# takes with it a generic struct built by bare name inside a generic body,
+# since that struct never dies. and `.value()` on the optional a call handed
+# back strands what it extracts, which is not about generics at all, so the
+# extractions below go through `unwrap_or`.
+import leakprobe as probe
+
+struct Holder[T]:
+    pub item: T
+
+struct Sink:
+    pub tag: String
+
+fn ident[T](v: T) -> T:
+    return v
+
+fn wrapped[T](v: T) -> T?:
+    return v
+
+fn forwarded[T](v: T?) -> T?:
+    return v
+
+fn resulted[T](v: T) -> T!:
+    return v
+
+fn listed[T](v: T) -> List[T]:
+    return [v]
+
+fn first[T](xs: List[T]) -> T:
+    return xs[0]
+
+fn unheld[T](h: Holder[T]) -> T:
+    return h.item
+
+fn pair[T, U](a: T, b: U) -> T:
+    return a
+
+impl Sink:
+    fn echo[T](v: T) -> T:
+        return v
+
+    fn maybe[T](v: T) -> T?:
+        return v
+
+    fn only[T](xs: List[T]) -> T:
+        return xs[0]
+
+fn churn_round(i: Int, sink: Sink):
+    text := "call-" + i.to_string()
+
+    a := ident(text)
+    b := wrapped(text)
+    o: String? := text
+    c := forwarded(o)
+    d := resulted(text)
+    e := listed(text)
+    f := first([text, "other"])
+    # a generic instance built at the call site and consumed by a generic
+    # parameter: the argument is borrowed and the field read hands its own
+    # count out
+    g := unheld[String](Holder(text))
+    h := pair(text, i)
+
+    m := sink.echo(text)
+    n := sink.maybe(text)
+    p := sink.only([text, "other"])
+
+    # the same specializations at a type argument that releases nothing
+    q := ident(i)
+    r := listed(i)
+    s := pair(i, text)
+
+    total := a.len() + b.unwrap_or("").len() + c.unwrap_or("").len()
+    total2 := (d catch "x").len() + e.len() + f.len() + g.len() + h.len()
+    total3 := m.len() + n.unwrap_or("").len() + p.len() + q + r.len() + s
+    if total + total2 + total3 < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    sink := Sink(tag: "sink")
+    mut i := 0
+    while i < n:
+        churn_round(i, sink)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

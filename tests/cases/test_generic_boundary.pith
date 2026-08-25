@@ -1,0 +1,74 @@
+# a generic instance is a value like any other, and every boundary a value
+# crosses has its own rule: an argument is borrowed, a return is handed over,
+# a container element is adopted, a closure capture is retained for the
+# closure's life, a channel send gives the value away and a match binding
+# borrows out of the subject. a construction inside a lambda registers its
+# destructor only as that lambda's body is emitted, which is a different path
+# again.
+#
+# so the same generic struct and generic enum are pushed through every one of
+# those boundaries and printed at the far end. a value that arrives as a heap
+# address rather than itself prints as an empty line or as something from the
+# round before; a released-too-early payload prints as whatever reused the
+# slot.
+
+struct Holder[T]:
+    pub item: T
+
+enum Slot[T]:
+    Vacant
+    Full(T)
+
+# a channel's payload type has to be a bare type name, so a generic instance
+# travels inside a concrete carrier rather than as itself.
+struct Parcel:
+    pub held: Holder[String]
+    pub slot: Slot[String]
+
+fn borrowed(h: Holder[String]) -> String:
+    return h.item
+
+fn handed_back(tag: String) -> Holder[String]:
+    return Holder("returned-" + tag)
+
+fn matched(s: Slot[String]) -> String:
+    match s:
+        Slot.Full(v) => v
+        Slot.Vacant => "vacant"
+
+fn main():
+    ch := Channel[Parcel](4)
+    mut round := 0
+    while round < 2:
+        tag := round.to_string()
+
+        print(borrowed(Holder("arg-" + tag)))
+        print(borrowed(handed_back(tag)))
+
+        mut shelf: List[Holder[String]] := []
+        shelf.push(Holder("listed-" + tag))
+        print(shelf[0].item)
+
+        mut byname: Map[String, Holder[String]] := {}
+        byname["k"] = Holder("mapped-" + tag)
+        print(byname["k"].item)
+
+        captured := Holder("captured-" + tag)
+        read := fn() => captured.item
+        print(read())
+
+        # a construction inside the lambda body rather than a capture of one
+        built := fn() => Holder("built-" + tag).item
+        print(built())
+
+        print(matched(Slot.Full("matched-" + tag)))
+        vacant: Slot[String] := Slot.Vacant
+        print(matched(vacant))
+
+        ch.send(Parcel(held: Holder("sent-" + tag), slot: Slot.Full("slotted-" + tag)))
+        received := ch.recv()
+        parcel := received.value()
+        print(parcel.held.item)
+        print(matched(parcel.slot))
+
+        round = round + 1

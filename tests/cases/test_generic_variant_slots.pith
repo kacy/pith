@@ -1,0 +1,100 @@
+# a generic enum's destructor releases its payload under the variant's own
+# tag, and the tag is the variant's position in the declaration. that made the
+# declaration order load-bearing and invisible: a destructor that tested tag 0
+# unconditionally released nothing at all unless the payload variant happened
+# to be declared first, and every probe written for the earlier ownership work
+# declared it first, so an exhaustive audit passed for the wrong reason.
+#
+# so the ordering is spelled out rather than assumed. `Head` carries its
+# payload in the first variant, `Waist` in the second with a payload-free
+# variant on either side, `Tail` in the last, and `Both` carries two payloads
+# with a payload-free variant wedged between them. each of the four is
+# instantiated at a different rc kind, so a tag that slides lands on a slot
+# holding a different sort of value rather than on a compatible one.
+#
+# every payload is printed back out: a destructor that fires one release too
+# many corrupts what the next round reads, and no leak gate can see that.
+
+struct Leaf:
+    pub name: String
+
+enum Head[T]:
+    Full(T)
+    Empty
+    Missing
+
+enum Waist[T]:
+    Empty
+    Full(T)
+    Missing
+
+enum Tail[T]:
+    Empty
+    Missing
+    Full(T)
+
+enum Both[T]:
+    First(T)
+    Empty
+    Second(T)
+
+fn head_text(v: Head[String]) -> String:
+    match v:
+        Head.Full(s) => s
+        Head.Empty => "empty"
+        Head.Missing => "missing"
+
+fn waist_text(v: Waist[List[String]]) -> String:
+    match v:
+        Waist.Full(xs) => xs[0] + "+" + xs[1]
+        Waist.Empty => "empty"
+        Waist.Missing => "missing"
+
+fn tail_text(v: Tail[Leaf]) -> String:
+    match v:
+        Tail.Full(leaf) => leaf.name
+        Tail.Empty => "empty"
+        Tail.Missing => "missing"
+
+fn both_text(v: Both[String]) -> String:
+    match v:
+        Both.First(a) => "first:" + a
+        Both.Empty => "empty"
+        Both.Second(b) => "second:" + b
+
+# the payload is bound and handed back out, so it outlives the instance that
+# carried it — the shape a newly firing destructor would free too early
+fn escaped(tag: String) -> String:
+    v := Tail.Full(Leaf("escaped-" + tag))
+    return tail_text(v)
+
+fn main():
+    mut round := 0
+    while round < 2:
+        tag := round.to_string()
+
+        print(head_text(Head.Full("head-" + tag)))
+        he: Head[String] := Head.Empty
+        print(head_text(he))
+        hm: Head[String] := Head.Missing
+        print(head_text(hm))
+
+        print(waist_text(Waist.Full(["w1-" + tag, "w2-" + tag])))
+        we: Waist[List[String]] := Waist.Empty
+        print(waist_text(we))
+        wm: Waist[List[String]] := Waist.Missing
+        print(waist_text(wm))
+
+        print(tail_text(Tail.Full(Leaf("tail-" + tag))))
+        te: Tail[Leaf] := Tail.Empty
+        print(tail_text(te))
+        tm: Tail[Leaf] := Tail.Missing
+        print(tail_text(tm))
+
+        print(both_text(Both.First("b1-" + tag)))
+        be: Both[String] := Both.Empty
+        print(both_text(be))
+        print(both_text(Both.Second("b2-" + tag)))
+
+        print(escaped(tag))
+        round = round + 1

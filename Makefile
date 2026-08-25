@@ -1180,6 +1180,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_generic_instance_dtor \
 	tests/cases/test_generic_optional_return \
 	tests/cases/test_generic_variant_slots tests/cases/test_generic_field_kinds \
+	tests/cases/test_generic_instance_type_args \
 	tests/cases/test_generic_call_shapes tests/cases/test_generic_boundary \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_lazy_adapter_pipeline tests/cases/test_named_local_adapter_chain \

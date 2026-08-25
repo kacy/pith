@@ -130,6 +130,36 @@ pub fn ir_resolve_type_node_with_subst_with_state(type_idx: Int, generic_params:
                     return "set_int"
             return "set"
         return ir_resolve_type_hint_with_state(tn.value, type_aliases, struct_names)
+    # an explicit type argument written at a call site is parsed as an
+    # expression, so `Holder[List[Int]]([1, 2])` hands its argument over as an
+    # ident, an index or an unwrap rather than as a type node. the rules are
+    # the ones above; only the shape differs. without these the argument
+    # resolved to "", the instance was built over a kind nothing matched, and
+    # the field read guessed.
+    if tn.kind == "ident":
+        return ir_resolve_type_hint_with_state(ir_specialize_type_name_with_state(tn.value, generic_params, concrete_types, type_aliases, struct_names), type_aliases, struct_names)
+    if tn.kind == "index" and tn.children.len() > 1:
+        base := get_node(tn.children[0])
+        if base.kind != "ident":
+            return ""
+        if base.value == "List":
+            inner := ir_resolve_type_node_with_subst_with_state(tn.children[1], generic_params, concrete_types, type_aliases, struct_names)
+            if inner == "string":
+                return "list_string"
+            return "list"
+        if base.value == "Map":
+            key_type := ir_resolve_type_node_with_subst_with_state(tn.children[1], generic_params, concrete_types, type_aliases, struct_names)
+            if key_type == "int":
+                return "map_int"
+            return "map"
+        if base.value == "Set":
+            elem_type := ir_resolve_type_node_with_subst_with_state(tn.children[1], generic_params, concrete_types, type_aliases, struct_names)
+            if elem_type == "int":
+                return "set_int"
+            return "set"
+        return ir_resolve_type_hint_with_state(base.value, type_aliases, struct_names)
+    if tn.kind == "unwrap":
+        return "tuple"
     if tn.kind == "result_type" and tn.children.len() > 0:
         inner_type := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
         return ir_resolve_result_type_kind(inner_type)

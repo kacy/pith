@@ -46,6 +46,27 @@ variables:
   which keeps it out of the slot a local of the same name uses — where
   the rebind's release-the-old, and the exit cleanup on an early
   return, would drop a count the loop never took
+- a module-level global's slot owns its value the same way a local
+  does, so assigning one releases what it held. nothing else would: a
+  global is not in any function's exit cleanup, and the store itself
+  only overwrites the slot. that release is what frees a container's
+  elements, since a container's last count cascades into everything it
+  owns — `xs = []` over a global used to strand every element the old
+  container held, which is how the compiler front end grew tens of
+  megabytes per analysis by resetting its tables the obvious way. a
+  `threadlocal` global is the same rule per thread.
+  `ir_assign_targets_global_slot` decides this, and it excludes two
+  spellings. a `for` variable reads its own storage, so releasing there
+  would drop a count the loop never took. an entry-module global whose
+  name any function in the build also binds is left out altogether:
+  entry globals are the ones emitted unprefixed, a local keeps its bare
+  name, and the ir consumer resolves a bare name to a global's slot
+  whenever one exists, so such a binding writes the global's slot and
+  drops the count at its own scope exit. releasing again at the next
+  assignment would be a double free, so those globals keep the old
+  leak. the aliasing behind that exclusion is a separate, older defect:
+  a local spelled like an entry global already reads and writes the
+  global's slot, and crashes on its own with no release involved
 
 call arguments:
 

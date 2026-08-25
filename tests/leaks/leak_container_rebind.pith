@@ -1,0 +1,62 @@
+# `xs = []` over a module-level global — the ordinary reset idiom — used to
+# strand everything the outgoing container held. a global's slot owns a count
+# on its value and nothing else ever drops it: the store overwrote the slot,
+# the function's exit cleanup only walks locals, and the assignment path only
+# released the outgoing value for a tracked local or a string global. every
+# other kind of global — list, map, set, struct, threadlocal — kept every
+# value it had ever held, so the compiler front end grew tens of megabytes per
+# analysis by resetting its tables the obvious way.
+import leakprobe as probe
+
+struct Node:
+    pub name: String
+
+struct Holder:
+    pub items: List[String]
+
+mut glist: List[Node] := []
+mut gliststr: List[String] := []
+mut gmap: Map[String, String] := {}
+mut gset: Set[String] := {}
+mut gstruct: Node := Node("seed")
+mut gholder: Holder := Holder([])
+threadlocal mut tlmap: Map[String, String] := {}
+
+fn fill(i: Int):
+    mut k := 0
+    while k < 4:
+        glist.push(Node("node-{i}-{k}"))
+        gliststr.push("str-{i}-{k}")
+        gmap["key-{k}"] = "val-{i}-{k}"
+        gset.add("set-{i}-{k}")
+        gholder.items.push("held-{i}-{k}")
+        tlmap["tl-{k}"] = "tlval-{i}-{k}"
+        k = k + 1
+
+fn churn_round(i: Int):
+    fill(i)
+    # every container kind, reset by rebinding: the empty literal and the
+    # non-empty one, which owns its elements just the same.
+    glist = []
+    gliststr = ["kept-{i}"]
+    gmap = {}
+    gset = {}
+    gstruct = Node("fresh-{i}")
+    gholder = Holder([])
+    tlmap = {}
+    # a struct field holding a container, and a local, for contrast: both
+    # already released the outgoing value, and both must keep doing it.
+    mut local: List[String] := ["seed-{i}"]
+    local.push("more-{i}")
+    local = []
+    mut holder := Holder(["seed-{i}"])
+    holder.items = []
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -1,0 +1,136 @@
+# rebinding a module-level global — `xs = []` and friends — drops the count
+# the global's slot held on the value it is overwriting. that release is what
+# frees the container's elements, since a container's last count cascades into
+# everything it owns.
+#
+# the danger runs both ways, which is why this case prints instead of just
+# measuring: the outgoing value may still be reachable from somewhere else —
+# a second binding onto the same container, an element read out before the
+# rebind, another global assigned from this one, the global on both sides of
+# its own assignment. every read below happens after the rebind that would
+# expose an over-release, so a count dropped one too many times shows up as
+# wrong output rather than as a quiet leak fix.
+import std.fs as fs
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+struct Node:
+    pub name: String
+
+struct Holder:
+    pub items: List[String]
+
+mut glist: List[Node] := []
+mut gliststr: List[String] := []
+mut gmap: Map[String, String] := {}
+mut gset: Set[String] := {}
+mut gstruct: Node := Node("seed")
+mut gholder: Holder := Holder([])
+mut gother: List[Node] := []
+threadlocal mut tlmap: Map[String, String] := {}
+
+# a global and a parameter of the same name: the parameter is the caller's
+# borrow, and reassigning it must not touch the global's count.
+mut shadowed: List[String] := ["outer-a", "outer-b"]
+
+fn rebind_param(mut shadowed: List[String]) -> Int:
+    shadowed = ["inner-a", "inner-b", "inner-c"]
+    return shadowed.len()
+
+fn fill():
+    mut k := 0
+    while k < 3:
+        glist.push(Node("node-{k}"))
+        gliststr.push("str-{k}")
+        gmap["key-{k}"] = "val-{k}"
+        gset.add("set-{k}")
+        gholder.items.push("held-{k}")
+        tlmap["tl-{k}"] = "tlval-{k}"
+        k = k + 1
+
+fn churn(rounds: Int):
+    mut r := 0
+    while r < rounds:
+        fill()
+        glist = []
+        gliststr = []
+        gmap = {}
+        gset = {}
+        gholder = Holder([])
+        tlmap = {}
+        r = r + 1
+
+fn main() -> Int:
+    fill()
+
+    # a second binding onto the same container outlives the rebind
+    kept := glist
+    glist = []
+    print("kept {kept.len()} {kept[0].name} {kept[2].name}")
+    print("glist {glist.len()}")
+
+    # an element read out of the container outlives the rebind too
+    elem := gliststr[1]
+    gliststr = ["fresh-a", "fresh-b"]
+    print("elem {elem} gliststr {gliststr.len()} {gliststr[0]} {gliststr[1]}")
+
+    # the map, the set and a struct field holding a container
+    print("gmap {gmap.len()} {gmap["key-1"]}")
+    gmap = {}
+    print("gmap {gmap.len()}")
+    print("gset {gset.len()} {gset.contains("set-2")}")
+    gset = {}
+    print("gset {gset.len()} {gset.contains("set-2")}")
+    print("gholder {gholder.items.len()} {gholder.items[0]}")
+    gholder = Holder(["reset"])
+    print("gholder {gholder.items.len()} {gholder.items[0]}")
+
+    # a plain struct global
+    print("gstruct {gstruct.name}")
+    gstruct = Node("replaced")
+    print("gstruct {gstruct.name}")
+
+    # a threadlocal global's per-thread slot owns its value the same way
+    print("tlmap {tlmap.len()} {tlmap["tl-0"]}")
+    tlmap = {}
+    print("tlmap {tlmap.len()}")
+
+    # the global on both sides of its own assignment
+    gother = kept
+    gother = gother
+    print("gother {gother.len()} {gother[1].name}")
+
+    # one global assigned from another, then the source reset
+    glist = gother
+    gother = []
+    print("glist {glist.len()} {glist[0].name} gother {gother.len()}")
+
+    # a `for` variable spelled like a global reads its own slot
+    for shadowed in ["loop-x", "loop-y"]:
+        print("loop {shadowed}")
+    print("shadowed {shadowed.len()} {shadowed[0]} {shadowed[1]}")
+
+    print("param {rebind_param(shadowed)}")
+
+    # rebinding in a loop, the shape the compiler front end resets its tables
+    # with. one warmup pass settles the working set, then a second identical
+    # pass has to leave the high-water mark where the first one put it: a
+    # global that keeps what it held moves the peak by megabytes here.
+    churn(3000)
+    settled := peak_rss_kb()
+    churn(3000)
+    grew := peak_rss_kb() - settled
+    if grew < 1024:
+        print("global rebind memory: flat")
+    else:
+        print("global rebind memory: grew {grew}kb")
+    print("after churn {glist.len()} {gmap.len()} {gset.len()} {tlmap.len()}")
+    return 0

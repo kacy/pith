@@ -1145,6 +1145,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_enum_payload_churn tests/cases/test_ownership_stress \
 	tests/cases/test_enum_scope_release \
 	tests/cases/test_field_reassign_release tests/cases/test_discarded_result \
+	tests/cases/test_global_rebind_ownership \
 	tests/cases/test_generic_method_return tests/cases/test_generic_fnvalue_return \
 	tests/cases/test_fnvalue_field_pool tests/cases/test_closure_capture_escape \
 	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \

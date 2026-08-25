@@ -250,23 +250,25 @@ described.
 ### memory over a session
 
 the server does not give an analysis's memory back. every run rebuilds
-the node arena and the checker's tables, and rebinding a container to a
-fresh empty one strands what the old one held rather than releasing it,
-so a long editing session grows without bound. twenty edits in the
-23-module closure take a server from 56 mb resident to 679 mb; before
+the node arena and the checker's tables, and for a long time it also
+stranded them: an assignment over a global released nothing, so `xs =
+{}` kept every entry the old table held. twenty edits in the 23-module
+closure took a server to 679 mb that way, and to 1017 mb before
 `reset_arena` was changed to empty the node list in place rather than
-rebind it, the same twenty took it to 1017 mb. that is 48 mb an edit
-down to 31, and the 31 that remain are the thirty tables
-`initialize_checker` rebinds and the twenty-one the driver rebinds, all
-in the same shape.
+rebind it.
 
-the underlying defect is in the emitter, not in any of those call
-sites: a program that pushes 64 struct nodes onto a global list and
-then rebinds it to `[]` grows to 390 mb over 20,000 rounds and 778 mb
-over 40,000, while the same program calling `clear()` sits flat at
-2.8 mb over both. until that is fixed, an editor session on a large
-closure will eventually be killed for memory, and the fix is worth more
-to this server than any of the latency work above.
+the assignment releases the outgoing value now. the same twenty edits
+peak at 284 mb, measured interleaved against a server built from the
+same tree without that release, which came back at 672 mb. one edit
+costs 57 mb rather than 87, so the slope across the remaining nineteen
+is 12 mb an edit rather than 31. the thirty tables `initialize_checker`
+rebinds and the twenty-one the driver rebinds all reclaim; what is left
+per edit is the arena and whatever else a run allocates and never
+names.
+
+12 mb an edit is still a session that ends in the oom killer, just a
+much longer one. per-module caching, below, is what would stop the work
+being redone at all.
 
 ### what per-module caching would take
 
@@ -355,9 +357,9 @@ are diagnostic latency only.
 - document sync is full-text only; incremental sync is not offered. on
   a large file the cost of shipping and decoding the whole buffer per
   keystroke exceeds the cost of parsing it.
-- the server grows by tens of megabytes per analysis and never gives it
-  back, so a long session on a large closure ends in the oom killer.
-  see "memory over a session" above.
+- the server grows by about 12 mb per analysis and never gives it back,
+  so a long enough session on a large closure still ends in the oom
+  killer. see "memory over a session" above.
 - one document is analyzed per debounce — the most recently changed
   one — though diagnostics for other open documents that fall out of
   that run are published too.

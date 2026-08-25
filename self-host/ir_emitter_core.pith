@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_shadowing_binding_names, ir_record_shadowing_binding_name, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -357,6 +357,7 @@ fn ir_reset_global_state():
     ir_global_set_names = []
     ir_global_set_int_names = []
     ir_global_bool_names = []
+    ir_global_slot_names = []
 
 fn ir_reset_type_state():
     ir_local_struct_names = []
@@ -1489,6 +1490,26 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
             ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", r)
             return
     ir_rc_release_reg(r, kind)
+
+# whether a bare-name assignment writes a module-level global's slot. that
+# slot owns a count on whatever it holds — nothing else releases it, not the
+# function's exit cleanup (globals are not locals) and not the store itself —
+# so the assignment has to drop the outgoing value the way a local rebind
+# does, or every value the global ever held is stranded along with everything
+# it owned. a threadlocal global counts: its per-thread slot owns its value
+# just the same, and nothing releases that either.
+#
+# two spellings do NOT write the global slot even when a global shares the
+# name, and both must stay out: a `for` variable, whose own slot holds a
+# borrowed element, and a local or parameter shadowing the global, whose
+# ownership the tracked-locals list already accounts for. releasing either
+# would be an over-release of a count this function never took.
+fn ir_assign_targets_global_slot(name: String) -> Bool:
+    if not ir_global_slot_names.contains(name):
+        return false
+    if ir_loop_var_slot(name).len() > 0:
+        return false
+    return not ir_var_regs.contains_key(name)
 
 # one helper per (ok, err) payload signature used this module. each releases the
 # live payload of a result/optional tuple — slot 8 when the flag is set, slot 16
@@ -7738,7 +7759,7 @@ fn ir_emit_assign_stmt(node: Node):
         tracked := ir_rc_local_kind(name).len() > 0
         mut old_r := 0 - 1
         if legacy_kind.len() > 0 and ir_rc_release_enabled(legacy_kind):
-            if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)):
+            if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)) or ir_assign_targets_global_slot(name):
                 old_r = ir_reg()
                 ir_emit_name_load(old_r, name)
         legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
@@ -7849,7 +7870,7 @@ fn ir_emit_compound_assignment(node: Node):
         tracked := ir_rc_local_kind(name).len() > 0
         mut old_r := 0 - 1
         if assign_kind.len() > 0 and ir_rc_release_enabled(assign_kind):
-            if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)):
+            if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)) or ir_assign_targets_global_slot(name):
                 old_r = ir_reg()
                 ir_emit_name_load(old_r, name)
         assign_target := ir_map_init_target(name, target_type)
@@ -9383,6 +9404,7 @@ fn ir_record_returns_clause(name: String, returns_node: Node):
 
 fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
     gname := ir_binding_name(node)
+    ir_record_global_slot(gname)
     mut init_val := "0"
     mut global_type := ""
     mut global_map_value_type := ""
@@ -9525,6 +9547,71 @@ fn ir_emit_local_slot_load(dest_r: Int, name: String):
         ir_emit_tls_load(dest_r, name)
     else:
         ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
+
+# collect every name a function body binds — a local, a parameter, an
+# `if let` or `match` payload, a `for` variable — so a global spelled the
+# same can be taken back out of the release set. the modifiers the parser
+# packs into a binding's value string are stripped two ways because a
+# binding may carry more than one, and an extra name here only costs a
+# global its release.
+fn ir_collect_shadowing_binding_names(idx: Int):
+    node := get_node(idx)
+    if node.kind == "param" or ir_is_binding_kind(node.kind):
+        ir_record_shadowing_binding_name(ir_binding_name(node))
+        space := node.value.index_of(" ")
+        if space > 0:
+            ir_record_shadowing_binding_name(node.value.substring(0, space))
+    elif node.kind == "pat_binding":
+        ir_record_shadowing_binding_name(node.value)
+    elif node.kind == "for" or node.kind == "for_stmt":
+        for_names := ir_for_binding_names(node)
+        ir_record_shadowing_binding_name(for_names.value_name)
+        ir_record_shadowing_binding_name(for_names.index_name)
+    for child in node.children:
+        ir_collect_shadowing_binding_names(child)
+
+# walk one module for the names its functions bind, skipping the top-level
+# global bindings themselves.
+fn ir_collect_module_binding_names(root: Node):
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if ir_is_binding_kind(cn.kind) or cn.kind == "threadlocal":
+            continue
+        ir_collect_shadowing_binding_names(child)
+
+# an entry module's global whose name some function also binds must keep its
+# outgoing value rather than release it. a shadowing binding gets no storage
+# of its own — it stores under its bare name, and the ir consumer resolves a
+# bare name to a global's data slot whenever one exists — so the binding's
+# value lands in the global's slot and its scope exit drops the count. the
+# slot is then naming a value the global never took a count on, and releasing
+# that at the next assignment would be a double free. taking the name out of
+# the release set leaves such a global exactly as it was: leaking, which is
+# what every global did before.
+#
+# only the entry module needs this. every other module's globals carry its
+# symbol prefix (`std_io_io_registry_mu`) while its locals stay bare, so
+# nothing can name their slots by accident; the entry module's globals are
+# the unprefixed ones, sharing one namespace with every local in the build.
+# that is also why the walk covers every module rather than this one: a local
+# in any import can land in an entry global's slot.
+#
+# the aliasing itself is an older defect and a wider one — a local spelled
+# like an entry global already reads and writes that global's slot, and
+# crashes on its own without any release — and fixing it means giving a
+# shadowing binding storage of its own, a change to how every name is stored
+# rather than to who releases.
+fn ir_drop_shadowed_global_slots(root: Node):
+    ir_collect_module_binding_names(root)
+    if ir_current_module_path.len() > 0:
+        return
+    for other_idx in ir_all_module_roots:
+        ir_collect_module_binding_names(get_node(other_idx))
+    mut kept: List[String] := []
+    for name in ir_global_slot_names:
+        if not ir_shadowing_binding_names.contains(name):
+            kept.push(name)
+    ir_global_slot_names = kept
 
 fn ir_emit_global_bindings(root: Node):
     for child in root.children:
@@ -10368,6 +10455,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_struct_dtor_base = {}
     ir_generic_struct_dtor_kinds = {}
     ir_emit_global_bindings(root)
+    ir_drop_shadowed_global_slots(root)
     ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)
     ir_emit_optional_dtors()

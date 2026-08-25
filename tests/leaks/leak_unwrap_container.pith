@@ -1,0 +1,110 @@
+# unwrap_or on an optional whose payload is a container. the retain the Some
+# arm takes was suppressed for any local the cascade scan rejected, on the
+# grounds that such a local's cleanup releases the shell alone — true for a
+# shell a callee built and returned, false for a shell built by widening a
+# plain value (it carries __opt_dtor_<kind>, which releases the payload) and
+# false for a borrowed shell (the container or struct behind it goes on
+# releasing the payload). both of those now retain, so every shape below has
+# to balance: an unpaired retain moves the peak, an unpaired release is a
+# double free the valgrind run on the golden twin catches.
+import leakprobe as probe
+
+struct Holder:
+    pub lst: List[Int]?
+
+fn fill(i: Int) -> List[Int]:
+    mut l: List[Int] := []
+    l.push(i)
+    l.push(i + 1)
+    return l
+
+fn consume(l: List[Int]) -> Int:
+    return l.len()
+
+# a widened bind: the shell owns the list through its destructor
+fn widened_bind(i: Int) -> Int:
+    mut o: List[Int]? := fill(i)
+    v := o.unwrap_or([])
+    return v.len()
+
+# the escape shape on a widened bind: the extraction outlives the shell
+fn widened_escape(i: Int) -> List[Int]:
+    mut o: List[Int]? := fill(i)
+    return o.unwrap_or([])
+
+# argument position: the owned result is released after the call
+fn widened_argument(i: Int) -> Int:
+    mut o: List[Int]? := fill(i)
+    return consume(o.unwrap_or([]))
+
+# receiver position: the owned result is released after the member read
+fn widened_receiver(i: Int) -> Int:
+    mut o: List[Int]? := fill(i)
+    return o.unwrap_or([]).len()
+
+# double extraction of one widened local
+fn widened_double(i: Int) -> Int:
+    mut o: List[Int]? := fill(i)
+    a := o.unwrap_or([])
+    b := o.unwrap_or([])
+    return a.len() + b.len()
+
+# a borrowed element subject: the list keeps its own count on the payload
+fn element_bind(i: Int) -> Int:
+    rows: List[List[Int]?] := [fill(i), none]
+    e := rows[0]
+    v := e.unwrap_or([])
+    miss := rows[1]
+    return v.len() + miss.unwrap_or([]).len()
+
+# a borrowed field subject: the struct keeps its own count on the payload
+fn field_bind(i: Int) -> Int:
+    h := Holder(fill(i))
+    e := h.lst
+    v := e.unwrap_or([])
+    return v.len() + h.lst.unwrap_or([]).len()
+
+# the none path, fresh and borrowed fallbacks
+fn none_paths(i: Int) -> Int:
+    p: List[Int]? := none
+    fresh := p.unwrap_or(fill(i))
+    fb := fill(i)
+    q: List[Int]? := none
+    borrowed := q.unwrap_or(fb)
+    return fresh.len() + borrowed.len() + fb.len()
+
+# a map payload and a set payload take the same path as a list
+fn map_and_set(i: Int) -> Int:
+    mut m: Map[String, Int]? := {"k": i}
+    mv := m.unwrap_or({})
+    mut s: Set[Int]? := {i, i + 1}
+    sv := s.unwrap_or({})
+    return mv.len() + sv.len()
+
+# a shell a callee built and returned still transfers when the cascade scan
+# rejects the local, so it churns here too
+fn built_elsewhere(i: Int) -> List[Int]?:
+    if i < 0:
+        return none
+    return fill(i)
+
+fn from_call(i: Int) -> Int:
+    o := built_elsewhere(i)
+    v := o.unwrap_or([])
+    return v.len()
+
+fn churn_round(i: Int):
+    total := widened_bind(i) + widened_escape(i).len() + widened_argument(i)
+    rest := widened_receiver(i) + widened_double(i) + element_bind(i)
+    more := field_bind(i) + none_paths(i) + map_and_set(i) + from_call(i)
+    if total + rest + more < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -21,6 +21,16 @@ mut gset: Set[String] := {}
 mut gstruct: Node := Node("seed")
 mut gholder: Holder := Holder([])
 threadlocal mut tlmap: Map[String, String] := {}
+# globals whose names other functions also bind as locals. the assignment
+# release used to skip these outright: locals kept their bare names, an entry
+# module's globals were emitted unprefixed, and the consumer resolved a bare
+# name to a global's slot whenever one existed, so the local wrote the
+# global's storage and dropped the count at its own scope exit — releasing
+# again at the next assignment would have been a double free. globals carry a
+# storage symbol of their own now, so nothing can reach their slots by
+# accident and the release applies to them like any other global.
+mut shadowed_list: List[String] := []
+mut shadowed_map: Map[String, String] := {}
 
 fn fill(i: Int):
     mut k := 0
@@ -33,8 +43,23 @@ fn fill(i: Int):
         tlmap["tl-{k}"] = "tlval-{i}-{k}"
         k = k + 1
 
+# binds both shadowed names as locals of its own, which is what took their
+# globals out of the release set
+fn shadow_locals(i: Int) -> Int:
+    mut shadowed_list: List[String] := ["local-{i}"]
+    shadowed_list.push("more-{i}")
+    mut shadowed_map: Map[String, String] := {}
+    shadowed_map["k"] = "local-{i}"
+    return shadowed_list.len() + shadowed_map.len()
+
 fn churn_round(i: Int):
     fill(i)
+    shadowed_list.push("shadowed-{i}")
+    shadowed_map["s-{i}"] = "sval-{i}"
+    if shadow_locals(i) < 0:
+        print("impossible")
+    shadowed_list = []
+    shadowed_map = {}
     # every container kind, reset by rebinding: the empty literal and the
     # non-empty one, which owns its elements just the same.
     glist = []

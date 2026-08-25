@@ -56,17 +56,22 @@ variables:
   megabytes per analysis by resetting its tables the obvious way. a
   `threadlocal` global is the same rule per thread.
   `ir_assign_targets_global_slot` decides this, and it excludes two
-  spellings. a `for` variable reads its own storage, so releasing there
-  would drop a count the loop never took. an entry-module global whose
-  name any function in the build also binds is left out altogether:
-  entry globals are the ones emitted unprefixed, a local keeps its bare
-  name, and the ir consumer resolves a bare name to a global's slot
-  whenever one exists, so such a binding writes the global's slot and
-  drops the count at its own scope exit. releasing again at the next
-  assignment would be a double free, so those globals keep the old
-  leak. the aliasing behind that exclusion is a separate, older defect:
-  a local spelled like an entry global already reads and writes the
-  global's slot, and crashes on its own with no release involved
+  spellings, both of which read storage of their own. a `for` variable
+  reads the loop's slot, so releasing there would drop a count the loop
+  never took. a local, a parameter or a pattern binding spelled like
+  the global reads the function's own storage: a global is emitted
+  under a reserved symbol (`__g_<name>`), a binding keeps its written
+  name, and the two no longer meet in the flat ir namespace. that split
+  is what lets the release be unconditional. before it, the consumer
+  resolved a bare name to a global's slot whenever one existed, so a
+  shadowing binding wrote the global's slot and dropped the count at
+  its own scope exit — releasing again at the next assignment would
+  have been a double free, and those globals kept an old leak instead.
+  the aliasing was the wider defect of the two: the binding read and
+  wrote the global's slot with no release anywhere in sight, so the
+  global's own next read came back as whatever the binding had left
+  there, and a container global reached `list indexing on invalid list
+  handle` once the binding's cleanup freed what the slot still named
 
 call arguments:
 

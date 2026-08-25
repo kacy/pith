@@ -128,6 +128,15 @@ field REG OBJ INDEX               legacy short form: INDEX is a field index,
 sstore STRUCT_REG FIELD_IDX VALUE_REG   store VALUE into field FIELD_IDX of a struct.
 ```
 
+`VARNAME` is one flat namespace and the consumer resolves it against the
+module-level globals before the function's own variables, so a global and a
+local of the same spelling would name the same storage. the emitter keeps them
+apart by spelling: a local, a parameter and a pattern binding reach the ir under
+the name they were written with, while a global is declared and reached under
+`__g_<name>`. nothing written in a source file produces that spelling, so the
+two can no longer meet, and `ir_global_storage_symbol` is the single place the
+mapping is applied.
+
 **function values**
 
 ```

@@ -6,7 +6,7 @@
 # ir_decode_emit; nothing here writes output.
 
 from ast import get_node
-from ir_names import ir_import_target_name
+from ir_names import ir_import_target_name, ir_global_storage_symbol
 from ir_type_helpers import ir_resolve_type_hint_with_state
 from ir_generics import ir_param_name_at, ir_resolve_generic_module_call_name
 from types import get_type_info
@@ -262,7 +262,7 @@ fn ir_module_alias_member_name_with_state(alias: String, member: String, module_
     if import_declared_functions.contains_key(key):
         return ir_import_target_name(module_path, member)
     if import_declared_globals.contains_key(key):
-        return ir_import_target_name(module_path, member)
+        return ir_import_target_name(module_path, ir_global_storage_symbol(member))
     return member
 
 # the symbol to emit for `member_name` when a decode lowering needs a

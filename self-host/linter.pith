@@ -11,8 +11,10 @@
 #   E305 — indentation depth exceeds 4 levels
 #   E306 — a strong reference cycle between structs
 #   E307 — a resource built locally and never closed
+#   E308 — a binding shadows a module global
 
 from ast import Node, get_node
+from ir_ast_helpers import ir_is_binding_kind
 from errors import Diagnostic
 from std.strings import lines_keep_empty
 
@@ -34,6 +36,11 @@ mut l_reported_cycles: List[String] := []
 mut l_import_aliases: Map[String, String] := {}
 mut l_resource_escaped := false
 mut l_resource_closed := false
+
+# the module's own globals, name -> declaration line, for the shadowing
+# pass (E308, below). filled before any function is walked, so a global
+# written below the function that shadows it still counts.
+mut l_module_globals: Map[String, Int] := {}
 
 fn report_linter_warning(code: String, message: String, line: Int, col: Int):
     l_diagnostics.push(Diagnostic("warning", code, message, l_file, line, col, ""))
@@ -85,8 +92,10 @@ pub fn lint_module(root_idx: Int, source: String, file: String) -> List[Diagnost
     # imports are read first: the unclosed-resource rule resolves a call's
     # module from the alias it was imported under, and a rule that ran in
     # declaration order would miss an import written below a function.
+    l_module_globals = {}
     for child in root.children:
         l_record_import_alias(child)
+        l_record_module_global(child)
     for child in root.children:
         lint_top_level(child, source)
     lint_strong_cycles()
@@ -127,6 +136,7 @@ fn lint_top_level(node_idx: Int, source: String):
             check_snake_case(name, "constant", inner.line, inner.col)
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
+        lint_shadowed_globals(inner_idx)
 
 fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
     name := node.value
@@ -148,6 +158,7 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
         if cn.kind == "body":
             lint_block_depth(cn, 1)
             lint_unclosed_resources(child)
+    lint_shadowed_globals(node_idx)
 
 fn lint_impl_decl(node: Node, source: String):
     # iterate methods
@@ -177,6 +188,7 @@ fn lint_impl_decl(node: Node, source: String):
                 if cn.kind == "body":
                     lint_block_depth(cn, 1)
                     lint_unclosed_resources(child)
+            lint_shadowed_globals(actual_idx)
 
 # ---------------------------------------------------------------
 # E300: snake_case for functions and variables
@@ -456,6 +468,66 @@ fn lint_strong_cycles():
             else:
                 message = "struct '" + sname + "' reaches itself through a strong reference cycle starting at field '" + fname + "' (" + target + "); a cycle of strong references is never reclaimed"
             l_diagnostics.push(Diagnostic("warning", "E306", message, l_file, line, col, "mark the back edge with `weak` (`weak " + fname + ": ...`), see docs/ownership.md"))
+
+# ---------------------------------------------------------------
+# E308: a binding shadows a module global
+# ---------------------------------------------------------------
+#
+# a local, a parameter or a `match` / `if let` payload spelled like one of
+# this module's globals reads its own storage, and the global is then
+# unreachable for the rest of that function: every mention of the name inside
+# is the binding. a `for` variable is exempt — its storage lasts the loop and
+# the global is still reachable on either side of it. that is legal, and it is almost never what
+# the author meant — a function that means to read the global and a function
+# that means to hold its own value are spelled the same, and only the
+# declaration order tells them apart.
+#
+# it used to be worse than a readability problem. the ir namespace is flat
+# and the consumer resolved a bare name to a global's data slot whenever one
+# existed, so the binding wrote the GLOBAL's storage: `items.len()` on the
+# global came back as whatever the shadowing binding had left there. globals
+# now carry a storage symbol of their own and the two cannot meet, which is
+# what makes this a warning rather than a miscompile.
+
+# record a module-level binding under its name, so the shadowing pass can
+# point at the declaration it hides. threadlocal globals count: they have
+# per-thread storage rather than a data slot, but the name is the same.
+fn l_record_module_global(node_idx: Int):
+    node := get_node(node_idx)
+    mut inner := node
+    if node.kind == "pub" and node.children.len() > 0:
+        inner = get_node(node.children[0])
+    if inner.kind == "threadlocal" and inner.children.len() > 0:
+        inner = get_node(inner.children[0])
+    if not ir_is_binding_kind(inner.kind):
+        return
+    name := l_extract_binding_name(inner.value)
+    if name.len() > 0 and not l_module_globals.contains_key(name):
+        l_module_globals.insert(name, inner.line)
+
+fn l_report_shadowed_global(name: String, kind: String, line: Int, col: Int):
+    if name.len() == 0 or name == "_":
+        return
+    if not l_module_globals.contains_key(name):
+        return
+    declared := l_module_globals[name]
+    message := kind + " '" + name + "' shadows the module global declared on line " + declared.to_string() + "; the global is unreachable for the rest of this function"
+    l_diagnostics.push(Diagnostic("warning", "E308", message, l_file, line, col, "rename the binding, or drop the global if the binding is what you meant"))
+
+# walk one function declaration for names it binds function-wide that a
+# module global already claims. a `for` variable is left out: it has storage
+# of its own for the length of the loop and the global is still reachable on
+# either side of it, so it hides nothing.
+fn lint_shadowed_globals(idx: Int):
+    node := get_node(idx)
+    if node.kind == "param":
+        l_report_shadowed_global(l_extract_binding_name(node.value), "parameter", node.line, node.col)
+    elif ir_is_binding_kind(node.kind):
+        l_report_shadowed_global(l_extract_binding_name(node.value), "binding", node.line, node.col)
+    elif node.kind == "pat_binding":
+        l_report_shadowed_global(node.value, "pattern binding", node.line, node.col)
+    for child in node.children:
+        lint_shadowed_globals(child)
 
 # ---------------------------------------------------------------
 # E307: a resource built locally and never closed

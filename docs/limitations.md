@@ -66,13 +66,14 @@ something here that now works, the page is stale and a fix to it is welcome.
   compares by content. ordering operators (`<`, `>`, `<=`, `>=`) do not
   widen — unwrap first, because there is no sensible order between `none`
   and a value.
-- **`unwrap_or` on an optional holding a container hands back a freed
-  handle** — `lst.unwrap_or([])` where `lst` is a `List[Int]?` reads the right
-  answer and then leaves the payload dangling: the extraction takes no count
-  and the shell's release frees the list underneath it. `Int?`, `String?` and
-  a struct payload are all fine; only a `List`, `Map` or `Set` payload is
-  affected. read a container payload through `match` (`match lst: got =>
-  got.len()`) until this is fixed.
+- **a binding that shadows a module global takes the name for the whole
+  function** — a local, a parameter or a `match` / `if let` payload spelled
+  like one of the module's globals reads its own storage, and the global is
+  unreachable from inside that function. a `for` variable is the exception:
+  its storage lasts the loop, so the global is still reachable on either side
+  of it. reading the global and then binding a local of the same name in one
+  function asks for both and is E266 rather than a guess. `pith lint` mentions
+  the shadowing itself as E308.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.
@@ -466,9 +467,23 @@ own count — a bind transfers it, an argument position releases it after the
 call, an owned receiver is released after the member read — and the subject's
 cleanup cascade stays the sole owner of the count its shell keeps. the retain
 covers a parameter, field, element or fresh subject, and any local whose uses
-the cascade walk can prove safe. a local the walk rejects (one also sent to a
-channel, captured by a closure, or handed to a callee the walk cannot read)
-keeps the old transfer, so extracting that local twice is still unsound.
+the cascade walk can prove safe.
+
+the exception to that retain is narrower than it was. it exists for a local
+whose cleanup releases nothing but the shell, where a retained count would
+have no release. it used to cover every local the cascade walk rejected, and
+that swept in two shells which do release their payload. a shell built by
+widening a plain value into an optional (`o: List[Int]? := [1, 2]`, and the
+same wrap inside a literal or a field) carries a destructor that drops the
+payload with it. a borrowed shell (`e := rows[0]`, `e := h.opt`) leaves the
+container or struct behind it doing the releasing. extracting from either
+handed back a handle its owner then freed, which showed up first on container
+payloads, where the freed handle came back from the registry as somebody
+else's list. both retain now. what still transfers is what the exception was
+written for: a local holding a dtor-less shell a callee built and returned,
+whose uses the walk cannot prove safe (one also sent to a channel, captured by
+a closure, or handed to a callee the walk cannot read). extracting such a
+local twice is still unsound.
 
 sweeping std's shared globals for the same class of bug turned up three things
 that are questions of design rather than repairs, so they are recorded here

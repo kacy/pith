@@ -1,0 +1,31 @@
+# helper for test_global_shadowing: an imported module whose own global is
+# shadowed by its own locals, and whose locals are also spelled like the
+# entry module's globals. both used to land in a global's data slot — the
+# entry module's globals are emitted unprefixed, and the driver's rename
+# rewrites a bare name to this module's global whenever one is declared with
+# that spelling, locals included.
+pub mut items: List[Int] := []
+pub mut label: String := "helper-global"
+
+pub fn own_shadow() -> Int:
+    mut items: List[Int] := [1, 2, 3, 4, 5]
+    return items.len()
+
+pub fn own_param_shadow(label: String) -> String:
+    return "param:" + label
+
+pub fn add(n: Int):
+    items.push(n)
+
+pub fn count() -> Int:
+    return items.len()
+
+pub fn own_label() -> String:
+    return label
+
+# a local spelled like the ENTRY module's global (counter), which this module
+# never declares and cannot see
+pub fn entry_name_shadow() -> Int:
+    mut counter := 41
+    counter = counter + 1
+    return counter

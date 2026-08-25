@@ -19,6 +19,25 @@ pub fn ir_string_retain_reg(r: Int):
 pub fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
 
+# true when values of `kind` live behind a struct header: the allocation
+# pith_struct_alloc hands out, carrying its own count and destructor slot.
+#
+# "tuple" is what the emitter calls the shells it builds structurally — an
+# optional (flag, value), a result (flag, ok, err), a tuple literal. it is a
+# separate kind from "struct" because the type system keeps the two apart,
+# but at the allocation level they are one thing: the same header, the same
+# pith_struct_retain/release pair, the same element tag, the same destructor
+# hookup, the same collector visit code. so every question of the form "does
+# this kind live behind a struct header?" has to answer yes for both
+# spellings, and this is where that question is asked.
+#
+# four separate leak fixes each rediscovered it and each left its own
+# paragraph at its own site. forgetting the tuple half is what stranded ~176
+# bytes per `[1, none, 3]` literal typed List[Int?] and ~62 bytes per
+# `xs.push(maybe(i))`.
+pub fn ir_kind_is_struct_header(kind: String) -> Bool:
+    return kind == "struct" or kind == "tuple"
+
 # whether `kind` names something reference counted at all. ir_rc_kind
 # returns "" for a value that carries no count (an int, a bool, a
 # result shell), so the empty string is the "nothing to release"
@@ -47,7 +66,7 @@ pub fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
-    elif kind == "struct" or kind == "tuple":
+    elif ir_kind_is_struct_header(kind):
         ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
@@ -59,10 +78,9 @@ pub fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_struct_weak_retain", "void", r)
 
 # the runtime kind code pith_cc_visit expects for an rc child, mirroring
-# the closure env tag table (CLOSURE_TAG_* in runtime_core.rs). a tuple is
-# a struct-header allocation, so it reports as a struct and the collector
-# reaches its elements through the box's own destructor-keyed tracer. 0
-# means the kind is not a visitable child.
+# the closure env tag table (CLOSURE_TAG_* in runtime_core.rs). the
+# collector reaches a struct-header child's elements through the box's own
+# destructor-keyed tracer. 0 means the kind is not a visitable child.
 pub fn ir_cc_visit_code(kind: String) -> Int:
     if kind == "string":
         return 1
@@ -74,7 +92,7 @@ pub fn ir_cc_visit_code(kind: String) -> Int:
         return 4
     if kind == "bytes":
         return 5
-    if kind == "struct" or kind == "tuple":
+    if ir_kind_is_struct_header(kind):
         return 6
     if kind == "closure":
         return 7
@@ -109,7 +127,7 @@ pub fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
-    elif kind == "struct" or kind == "tuple":
+    elif ir_kind_is_struct_header(kind):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)

@@ -145,7 +145,12 @@ call arguments:
   exception does not cover it: a lookup reads the key and keeps nothing,
   a store copies the key bytes into the map's own storage, so an owned
   key in `m[a + ":" + b]` dies with the operation either way. the stored
-  *value* is still under the exception. the object being indexed is
+  *value* is still under the exception. a map *literal* is a store like
+  any other and follows both rules — `{k(): "v-" + tag}` releases the key
+  and transfers the value — which it did not until the two lines that say
+  so were written into `ir_emit_map_entry_insert`. a set element is a key
+  rather than a value: a set copies the element bytes too, so a set
+  literal releases a freshly built element and takes nothing on it. the object being indexed is
   deliberately left alone — container indexing borrows the element out
   of the container, so releasing a temporary container there would free
   the value just returned

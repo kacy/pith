@@ -4744,8 +4744,22 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
     if kind_store.len() > 0 and ir_store_learns_kind(entry_kind):
         tag_r := ir_emit_element_tag_const(entry_kind)
         ir_emit_call4(ir_reg(), kind_store, "void", map_r, k_r, v_r, tag_r)
+        ir_release_owned_index_key(entry.children[0], k_r)
         return
-    ir_emit_call3(ir_reg(), store_name, "void", map_r, k_r, v_r)
+    # both halves of a literal entry follow the rules `m[k] = v` already
+    # follows. the runtime copies the key bytes into the map's own storage, so
+    # a freshly built key dies at the store; and a value the store would take
+    # its own count for goes through the transferring variant, or the entry
+    # ends up with two counts and one release. neither was wired here, so a
+    # literal whose key or value was built on the spot stranded them both,
+    # while the same map filled by index assignment was flat.
+    mut plain_store := store_name
+    if entry_owned and ir_container_store_takes_count(entry_kind):
+        owned_store := ir_owned_container_store_name(store_name)
+        if owned_store.len() > 0:
+            plain_store = owned_store
+    ir_emit_call3(ir_reg(), plain_store, "void", map_r, k_r, v_r)
+    ir_release_owned_index_key(entry.children[0], k_r)
 
 fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     map_r := ir_reg()
@@ -4801,6 +4815,12 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
     for child in node.children:
         elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
+        # a set copies the element bytes into its own storage rather than
+        # keeping the caller's value, so a freshly built element dies right
+        # here. `s.add("s-" + tag)` gets that release from the general call
+        # path; the literal had no such path and stranded one element per
+        # entry, which is why the same set built by adding was flat.
+        ir_release_owned_operand(child, elem_r, ir_infer_type(child))
     return set_r
 
 # the list store that carries the element's kind with it, or "" when this is

@@ -1,0 +1,40 @@
+# what a set literal and a map literal owe the elements they are handed. a set
+# copies the element bytes into its own storage, and so does a map with its
+# key, so a freshly built one dies at the store; a map value the store takes a
+# count for goes through the transferring variant rather than being counted
+# twice. a borrowed key, value or element belongs to its binding and must come
+# through untouched.
+#
+# run under valgrind this catches the other direction: `held` and `key` are
+# read back inside the loop and again after it, so a release either literal was
+# not entitled to faults where it happens. the printed sum catches a behavior
+# regression.
+
+fn main() -> Int!:
+    mut sum := 0
+    held := "held-value"
+    key := "held-key"
+    mut i := 0
+    while i < 400:
+        tag := i.to_string()
+        # a fresh key and a fresh value: both die at the store
+        m := {"k-" + tag: "v-" + tag}
+        # borrowed on both halves: the bindings keep their counts
+        b := {key: held}
+        # a map whose value is a heap container, which travels with its kind
+        ml := {"lk-" + tag: [i, i + 1]}
+        # an int-keyed map with a fresh value
+        mi := {i: "v-" + tag}
+        # a set literal over a fresh element and a borrowed one
+        s := {"s-" + tag, held}
+        # a set with nothing to count either way
+        si := {1, 2, 3}
+        sum = sum + m.len() + b.len() + ml.len() + mi.len() + s.len() + si.len()
+        sum = sum + b[key].len() + m["k-" + tag].len()
+        if s.contains(held):
+            sum = sum + 1
+        i = i + 1
+    # both bindings must have survived every literal above
+    sum = sum + held.len() + key.len()
+    print("sum=" + sum.to_string())
+    return 0

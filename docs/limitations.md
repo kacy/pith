@@ -338,10 +338,6 @@ correctness story:
   a bare `none` written straight into a container store (`xs.push(none)`,
   `m[k] = none`) is a shell the caller built, so the store takes that count
   instead of adding one of its own, the same as a widened plain value.
-- a set or map literal never releases a freshly built element, about 24 bytes
-  each, and both halves of a map literal pay it independently. the same set
-  built with `add`, the same map filled by index assignment, and a list literal
-  over the same strings are all flat (issue #942).
 - a call result dropped at statement position is reclaimed when it is a result
   box, an optional shell, or a string, and stranded when it is any other heap
   kind. a discarded `List[X]` or `Map[K, V]` result leaks the whole container —

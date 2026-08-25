@@ -5122,7 +5122,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
     tid_bool := lookup_type_id("Bool")
     tid_void := lookup_type_id("Void")
     if method == "push":
-        expect_one_stored_argument(method, args, elem, scope_id)
+        expect_one_widened_argument(method, args, elem, scope_id)
         return tid_void
     if method == "len":
         expect_no_arguments(method, args)
@@ -5144,10 +5144,10 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
             report_error("E207", "insert expects 2 arguments (index, value), got " + args.len().to_string())
             return tid_void
         check_argument_type(args[0], tid_int, scope_id)
-        check_stored_argument_type(args[1], elem, scope_id)
+        check_widened_argument_type(args[1], elem, scope_id)
         return tid_void
     if method == "contains":
-        expect_one_typed_argument(method, args, elem, scope_id)
+        expect_one_widened_argument(method, args, elem, scope_id)
         return tid_bool
     if method == "join":
         expect_one_typed_argument(method, args, tid_string, scope_id)
@@ -5157,7 +5157,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
             report_error("E219", "join requires a list of String or Int elements, got List[" + get_type_name(elem) + "]; map elements to String first")
         return tid_string
     if method == "index_of":
-        expect_one_typed_argument(method, args, elem, scope_id)
+        expect_one_widened_argument(method, args, elem, scope_id)
         return add_type_info(ti_optional(tid_int))
     if method == "slice":
         expect_two_int_arguments(method, args, scope_id)
@@ -5201,7 +5201,7 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         # it up to decide whether this replaces an entry — so only the value
         # takes the store widening.
         check_argument_type(args[0], key_t, scope_id)
-        check_stored_argument_type(args[1], val_t, scope_id)
+        check_widened_argument_type(args[1], val_t, scope_id)
         return tid_void
     if method == "len":
         expect_no_arguments(method, args)
@@ -5427,20 +5427,21 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
             if types_structurally_equal(actual, expected) == false:
                 report_error_at(expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
 
-# the argument check for a position that STORES its value into a container.
-# a store takes the container's declared element type, so a plain value
-# widens into an optional element there the same way a binding, a struct
-# field and a plain function's parameter already do: `xs.push(3)` into a
-# List[Int?] keeps the Some(3) the list is declared to hold.
+# the argument check for a position that takes the container's declared
+# element type: a plain value widens into an optional element there the same
+# way a binding, a struct field and a plain function's parameter already do.
+# `xs.push(3)` into a List[Int?] keeps the Some(3) the list is declared to
+# hold, and `xs.contains(3)` builds one to search with.
 #
-# the query positions deliberately keep the rejection and stay on
-# check_argument_type. contains, index_of, remove and every map key COMPARE
-# against what the container already holds rather than store into it, and a
-# list compares optional elements by identity, so a freshly built Some(3)
-# would answer "not present" for a 3 that is. widening where a value is kept
-# and reporting where one is looked up is the rule that cannot turn a
-# rejection into a wrong answer.
-fn check_stored_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
+# a search position may only widen where the search compares structurally. a
+# list's does — an optional element compares by tag and payload, so the shell
+# built here finds the equal element it names. the positions that still hold
+# the rejection are the ones whose comparison is not structural: a map key and
+# a set element are hashed as a raw slot, and a Set[Int?] or a Map[Int?, V]
+# hands the string container a tuple pointer to read as a c-string, which
+# collapses every optional into one entry. widening there would turn a
+# rejection into a wrong answer, which is the whole reason the rule exists.
+fn check_widened_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)
     actual := c_check_expr(expr_idx, scope_id)
     propagate_empty_argument_collection_type(arg_idx, expected, actual, scope_id)
@@ -5456,11 +5457,11 @@ fn check_stored_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
         return
     report_error_at(expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
 
-fn expect_one_stored_argument(method: String, args: List[Int], expected: Int, scope_id: Int):
+fn expect_one_widened_argument(method: String, args: List[Int], expected: Int, scope_id: Int):
     if args.len() != 1:
         report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
         return
-    check_stored_argument_type(args[0], expected, scope_id)
+    check_widened_argument_type(args[0], expected, scope_id)
 
 # ---------------------------------------------------------------
 # field access

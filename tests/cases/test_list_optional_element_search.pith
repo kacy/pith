@@ -1,0 +1,123 @@
+# a list searches its elements the way `==` compares them. an optional
+# element compares by tag and then payload, so an equal-valued optional is
+# found rather than only the identical shell; a Bytes and a boxed enum
+# element compare by content too, and a struct element keeps the pointer
+# identity `==` gives a struct. because the search compares structurally, a
+# plain value widens into it: `xs.contains(3)` against a List[Int?] builds the
+# Some(3) it searches with, and drops it again once the scan has read it.
+
+import std.bytes
+
+struct Point:
+    pub n: Int
+
+enum Probe:
+    Alpha(Int)
+    Beta(String)
+
+fn found(hit: Int?) -> String:
+    return hit.unwrap_or(0 - 1).to_string()
+
+fn int_elements() -> List[Int?]:
+    a: Int? := 3
+    b: Int? := 7
+    mut xs: List[Int?] := []
+    xs.push(a)
+    xs.push(none)
+    xs.push(b)
+    return xs
+
+fn main() -> Int!:
+    xs := int_elements()
+
+    # the bug this pins: two distinct shells holding the same 3.
+    probe: Int? := 3
+    print("opt_contains:{xs.contains(probe)}")
+    print("opt_index:{found(xs.index_of(probe))}")
+
+    absent: Int? := 4
+    print("opt_absent:{xs.contains(absent)}")
+    print("opt_absent_index:{found(xs.index_of(absent))}")
+
+    # none is an element like any other: found where the list holds one,
+    # and never equal to a Some.
+    hole: Int? := none
+    print("none_contains:{xs.contains(hole)}")
+    print("none_index:{found(xs.index_of(hole))}")
+    mut filled: List[Int?] := []
+    filled.push(1)
+    print("none_absent:{filled.contains(hole)}")
+
+    # a widened plain value: the search builds the shell it compares with.
+    print("widened_contains:{xs.contains(3)}")
+    print("widened_index:{found(xs.index_of(7))}")
+    print("widened_absent:{xs.contains(4)}")
+    print("widened_none:{found(xs.index_of(none))}")
+
+    # a String payload compares by content, not by the address of a shell
+    # or of the string inside it.
+    sa: String? := "beta"
+    mut ss: List[String?] := []
+    ss.push(sa)
+    ss.push(none)
+    joined := "be" + "ta"
+    built: String? := joined
+    print("str_contains:{ss.contains(built)}")
+    print("str_index:{found(ss.index_of(built))}")
+    print("str_widened:{ss.contains("beta")}")
+    print("str_absent:{ss.contains("alpha")}")
+
+    # a plain List[String] was already searched by content and stays so.
+    plain: List[String] := ["a", "b"]
+    print("plain_str:{found(plain.index_of("b"))}")
+
+    # Bytes and a boxed enum compare by content, matching `==` on them. the
+    # probes are bound rather than written into the call: a fresh temporary in
+    # a search position is stranded there, which predates the comparison being
+    # structural and is not what this case is pinning.
+    mut bs: List[Bytes] := []
+    bs.push(bytes.from_string_utf8("ab"))
+    same_bytes := bytes.from_string_utf8("ab")
+    other_bytes := bytes.from_string_utf8("ac")
+    print("bytes_contains:{bs.contains(same_bytes)}")
+    print("bytes_absent:{bs.contains(other_bytes)}")
+
+    mut ps: List[Probe] := []
+    ps.push(Probe.Alpha(2))
+    ps.push(Probe.Beta("x"))
+    same_alpha := Probe.Alpha(2)
+    same_beta := Probe.Beta("x")
+    other_alpha := Probe.Alpha(9)
+    print("enum_contains:{ps.contains(same_alpha)}")
+    print("enum_payload:{found(ps.index_of(same_beta))}")
+    print("enum_absent:{ps.contains(other_alpha)}")
+
+    # a struct element keeps identity, which is what `==` gives a struct.
+    same := Point(1)
+    other := Point(1)
+    mut pts: List[Point] := []
+    pts.push(same)
+    print("struct_same:{pts.contains(same)}")
+    print("struct_equal:{pts.contains(other)}")
+    print("struct_eq_op:{same == other}")
+
+    # remove takes an index, not a value, so no comparison happens there.
+    mut drop: List[Int?] := []
+    drop.push(1)
+    drop.push(2)
+    drop.remove(0)
+    print("remove_len:{drop.len()}")
+    print("remove_head:{drop.contains(2)}")
+
+    # the widened shell is this frame's alone; a loop of searches must not
+    # strand one per call.
+    mut hits := 0
+    mut i := 0
+    while i < 200:
+        if xs.contains(3):
+            hits = hits + 1
+        if ss.contains("beta"):
+            hits = hits + 1
+        i = i + 1
+    print("loop_hits:{hits}")
+    return 0

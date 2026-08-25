@@ -51,7 +51,7 @@ from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_ma
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
-from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
+from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
@@ -275,6 +275,18 @@ mut ir_current_impl_type := ""
 # resolve to the right concrete type for dispatch (e.g., `Range` not `I`).
 mut ir_current_impl_subst_params: List[String] := []
 mut ir_current_impl_subst_args: List[String] := []
+
+# true while a generic function body or a specialized impl method body is
+# being emitted. the checker ran on the unspecialized declaration, so inside
+# one the checked types are suppressed and inference can name a type
+# parameter's stand-in instead of the concrete type. a predicate that decides
+# ownership by consulting a type therefore has nothing trustworthy to consult
+# here and must refuse to answer. every caller's refusal is the conservative
+# side of its own question: an untaken count leaks, where acting on a wrong
+# type releases a register that is not what it looked like.
+fn ir_in_generic_body() -> Bool:
+    return ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0
+
 # per-instance destructors needed for generic structs built via the backend
 # constructor call (`Name[params](...)` inside a generic function). keyed by the
 # sanitized instance symbol: one map holds the base struct name, the other the
@@ -727,7 +739,66 @@ fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
 # references. a string or bytes value is a leaf — it never points back —
 # and a weak field holds no strong count, so none of those are visited.
 fn ir_trace_kind_enabled(kind: String) -> Bool:
-    return kind == "struct" or kind == "list" or kind == "map" or kind == "set" or kind == "closure" or kind == "tuple"
+    return ir_kind_is_struct_header(kind) or kind == "list" or kind == "map" or kind == "set" or kind == "closure"
+
+# --- shared destructor and tracer walk plumbing ----------------------------
+#
+# every destructor that walks traceable children gets a tracer twin: the same
+# slot walk in the same order, but each child is reported to pith_cc_visit
+# instead of released. __cc_register_tracers_m<N> pairs each destructor with
+# its twin in the runtime's side table, so a future collector can enumerate a
+# dead candidate's edges through the destructor pointer the box already
+# carries — no per-instance cost, and destructors without a twin (only
+# string, bytes or weak slots) correctly read as leaves. inert until a
+# collector installs a visitor: an unhooked pith_cc_visit returns
+# immediately.
+#
+# each destructor/tracer pair is emitted by one function with a `trace` mode
+# rather than two near-identical ones. that is safe because these emitters
+# make no ownership decision: what the walk covers was settled when the type
+# was registered, and the walk only serializes it. what stays separate is the
+# memo tables — ir_dtor_memo and ir_tracer_memo — because a struct can need a
+# destructor and no tracer, a string or bytes slot being a leaf.
+
+# open a walk body: one pointer parameter, loaded into the register every
+# slot read hangs off.
+fn ir_emit_rc_walk_header(symbol: String) -> Int:
+    ir_emit_func_header(symbol, 1, "void")
+    ir_emit("param p")
+    pr := ir_reg()
+    ir_emit("load " + pr.to_string() + " p")
+    return pr
+
+# close a body whose return value nobody reads: the backend still wants a
+# register returned, so hand it a zero.
+fn ir_emit_zero_ret_endfunc():
+    end_r := ir_reg()
+    ir_emit("iconst " + end_r.to_string() + " 0")
+    ir_emit("ret " + end_r.to_string())
+    ir_emit("endfunc")
+
+# the symbol prefix a walk emits under. the runtime's side table pairs the
+# two names, so they have to stay in step.
+fn ir_rc_walk_prefix(trace: Bool) -> String:
+    if trace:
+        return "__cc_trace_"
+    return "__dtor_"
+
+# true when a slot of rc kind `kind` takes part in this walk: every counted
+# kind in destructor mode, and in tracer mode only the kinds that can hold
+# references back.
+fn ir_rc_walk_covers(kind: String, trace: Bool) -> Bool:
+    if trace:
+        return ir_trace_kind_enabled(kind)
+    return kind.len() > 0
+
+# what a walk does with one slot register: drop the count, or report the
+# child to the collector without touching it.
+fn ir_rc_walk_slot(r: Int, kind: String, trace: Bool):
+    if trace:
+        ir_rc_visit_reg(r, kind)
+    else:
+        ir_rc_release_reg(r, kind)
 
 # true when any variant of a boxed enum carries a traceable payload, so
 # the enum's destructor gets a tracer twin. mirrors ir_enum_needs_dtor.
@@ -820,18 +891,40 @@ fn ir_name_is_weak_read(name: String) -> Bool:
         return true
     return ir_weak_capture_names.contains(name)
 
-# true when the expression reads a value some other owner keeps a count
-# for: variables, collection elements, struct fields. anything else that
-# produces a string (concat, substring, to_string, ...) hands us a fresh
-# owned count.
+# the emitter's load-bearing ownership question, and the one the rest of the
+# rc machinery is built on: does this expression hand back a count some other
+# owner already holds, so the consumer has to take one of its own (borrowed,
+# true), or a count the expression minted or was handed, which the consumer
+# inherits and must not retain again (owned, false)?
+#
+# borrowed is the answer for a read of storage another owner keeps alive: a
+# variable, a container element, a struct field, `self`. owned is the answer
+# for everything that mints a fresh value or carries a count out of somewhere
+# — a fresh string (a literal, a concatenation, an interpolation, a builtin
+# known to build one), a call or method-call result of an rc kind, an await, a
+# catch, a lambda, a named function value, a list/map/set/tuple literal, a
+# struct init, a bare payload-free variant, and a field read off an owned
+# temporary receiver. that list grew one clause at a time, and most of the
+# clauses below name the shape they settle together with the leak that taught
+# us the shape and how much it cost.
+#
+# the two ways of being wrong are not symmetric. calling an owned value
+# borrowed makes the consumer take a second count nobody releases — a leak.
+# calling a borrowed value owned skips the retain and lets the consumer
+# release a count it never took — a dangling pointer. so wherever the answer
+# cannot be proved (inside a generic body, where the checked types are
+# suppressed, or on a receiver that will not resolve) the clause falls through
+# to borrowed on purpose.
+#
+# the sequence of early returns below is the classification. they are ordered
+# so a specific shape answers before the general rule it would otherwise fall
+# into — a bare variant ahead of the field-access rule, a module-qualified
+# call ahead of the builtin fresh-string list — and reordering them changes
+# what the emitter emits.
 fn ir_expr_is_borrowed(idx: Int) -> Bool:
     node := get_node(idx)
-    # only expressions that provably mint a fresh buffer are owned: string
-    # literals (retain is a no-op for them anyway), concatenation, string
-    # interpolation, and methods known to build new strings. everything
-    # else — variables, extractions, calls, match values — counts as
-    # borrowed. over-classifying as borrowed can only over-retain (a leak);
-    # the reverse dangles a pointer.
+    # a string literal is its own buffer, and the runtime makes retain on one
+    # a no-op anyway.
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         return false
     if node.kind == "index" and node.children.len() > 0:
@@ -1647,10 +1740,7 @@ fn ir_emit_tuple_cascade_helpers():
     for sig in ir_tuple_cascade_sigs:
         ok_kind := ir_tuple_dtor_code_kind(sig[0])
         err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
-        ir_emit_func_header(ir_tuple_cascade_helper_name(sig), 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        pr := ir_emit_rc_walk_header(ir_tuple_cascade_helper_name(sig))
         zero_r := ir_reg()
         ir_emit("iconst " + zero_r.to_string() + " 0")
         live_r := ir_reg()
@@ -1683,10 +1773,7 @@ fn ir_emit_tuple_cascade_helpers():
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
         ir_emit("jmp " + done_l)
         ir_emit_label(done_l)
-        ret_r := ir_reg()
-        ir_emit("iconst " + ret_r.to_string() + " 0")
-        ir_emit("ret " + ret_r.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 fn ir_emit_rc_cleanup(exclude: String):
     mut i := 0
@@ -3264,7 +3351,7 @@ fn ir_expr_is_fresh_string_index(idx: Int) -> Bool:
     # and inference can misname a map or list receiver as a string; a wrong
     # answer here frees a container's element, so freshness requires the
     # non-generic certainty path.
-    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+    if ir_in_generic_body():
         return false
     # replicate ir_emit_index_expr's dispatch exactly: checked type first,
     # inference as fallback.
@@ -3389,7 +3476,7 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
     en := get_node(expr_idx)
     # inside generic or specialized bodies the checked types are suppressed
     # and a wrong answer here frees a register that is not a shell
-    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+    if ir_in_generic_body():
         return
     mut sig := ""
     mut dtor_owned := false
@@ -3435,13 +3522,50 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
         ir_tuple_cascade_sigs.push(sig)
     ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", reg)
 
+# --- the four "is this a fresh temporary?" predicates -----------------------
+#
+# ir_expr_is_transferred_call_temp, ir_field_receiver_is_owned_temp,
+# ir_extraction_operand_class and ir_optional_subject_is_owned all ask some
+# version of "did this expression just produce the value, so whoever consumes
+# it here is its only owner?" — and they all answer it by looking at the node
+# kind. they are deliberately four functions, not one: each serves a different
+# consumer, and they differ on axes that are not accidental.
+#
+#   which node kinds count as a producer. a call and a method call count for
+#   all four. `await` counts for the extraction class (an awaited task hands
+#   its count to the single awaiter) and not for the optional subject — an
+#   omission, filed as its own bug, not a design choice. `struct_init` counts
+#   only for the field receiver, which is the one consumer that can be handed
+#   a construction directly.
+#
+#   whether a generic-body guard applies. three of them consult a type — an
+#   inferred string, an rc kind, a checked tid — so they must refuse inside a
+#   generic body (see ir_in_generic_body). ir_extraction_operand_class has no
+#   guard on purpose: it is purely syntactic, reads the node kind and nothing
+#   else, and so has nothing that specialization could have suppressed.
+#
+#   whether `.value()` is excluded. the two that can end up releasing their
+#   receiver exclude it, because `opt.value()` spells like a call and is a
+#   field read that hands back an uncounted view. the other two never release
+#   on that path and do not need the carve-out.
+#
+#   which rc kinds are in scope. the transferred-call test is strings only,
+#   the field receiver is struct-header kinds only, and the two shell
+#   classifiers are about the shell rather than its payload.
+#
+# so: read them together, keep them consistent where they agree, and do not
+# merge them. a single predicate would have to carry all four filter sets, and
+# every consumer would then be asking a question slightly wider or narrower
+# than the one it means.
+
 # true for call and method-call results whose checked or inferred type is
-# string, outside generic bodies where the types cannot be trusted.
+# string, outside generic bodies where the types cannot be trusted. one of the
+# four fresh-temporary predicates; see the block above.
 fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind != "call" and node.kind != "method_call":
         return false
-    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+    if ir_in_generic_body():
         return false
     # a `.value()` the emitter could not count spells like a call and is a
     # field read: it hands back an uncounted view of the shell's payload (see
@@ -4366,34 +4490,36 @@ fn ir_retain_generic_construction_fields(node: Node, base: String, params: List[
 # one destructor per generic struct instance that was constructed via a backend
 # constructor call, emitted after the body so every construction site recorded
 # its instance. resolves each field type with the instance's args before
-# deciding whether to release it.
-fn ir_emit_generic_instance_dtors():
+# deciding whether to release it. `trace` emits the tracer twin instead: the
+# same substituted field walk, visiting traceable children rather than
+# releasing them, and only for the instances that have one.
+fn ir_emit_generic_instance_walks(trace: Bool):
     for sym in ir_generic_dtor_base.keys():
+        if trace:
+            if not ir_generic_instance_needs_tracer(sym):
+                continue
         base := ir_generic_dtor_base[sym]
-        mut arg_names: List[String] := []
-        args_str := ir_generic_dtor_args[sym]
-        if args_str.len() > 0:
-            arg_names = args_str.split(chr(1))
+        arg_names := ir_generic_instance_arg_names(sym)
         params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
-        ir_emit_func_header("__dtor_" + sym, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        pr := ir_emit_rc_walk_header(ir_rc_walk_prefix(trace) + sym)
         count := ir_struct_field_count(base)
         mut i := 0
         while i < count:
             fname := ir_struct_field_name_at(base, i)
             base_ftype := ir_struct_field_type_name(base, fname)
             fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
-            if fkind.len() > 0:
+            mut walk_slot := ir_rc_walk_covers(fkind, trace)
+            # a weak field holds no strong count, so it is not an edge of the
+            # ownership graph the collector trial-deletes; the destructor
+            # still releases the slot.
+            if trace and ir_struct_field_is_weak(base, fname):
+                walk_slot = false
+            if walk_slot:
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                ir_rc_release_reg(fr, fkind)
+                ir_rc_walk_slot(fr, fkind, trace)
             i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 # the generic parameter names and substituted argument names for a recorded
 # generic instance destructor, packed as (params, arg_names) lookups shared
@@ -4422,35 +4548,6 @@ fn ir_generic_instance_needs_tracer(sym: String) -> Bool:
             return true
         i = i + 1
     return false
-
-# tracer twin of a generic instance destructor: the same substituted field
-# walk, visiting traceable children instead of releasing them.
-fn ir_emit_generic_instance_tracers():
-    for sym in ir_generic_dtor_base.keys():
-        if not ir_generic_instance_needs_tracer(sym):
-            continue
-        base := ir_generic_dtor_base[sym]
-        arg_names := ir_generic_instance_arg_names(sym)
-        params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
-        ir_emit_func_header("__cc_trace_" + sym, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        count := ir_struct_field_count(base)
-        mut i := 0
-        while i < count:
-            fname := ir_struct_field_name_at(base, i)
-            base_ftype := ir_struct_field_type_name(base, fname)
-            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
-            if not ir_struct_field_is_weak(base, fname) and ir_trace_kind_enabled(fkind):
-                fr := ir_reg()
-                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                ir_rc_visit_reg(fr, fkind)
-            i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
 
 fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
     if not ir_is_generic_function_name(callee.name):
@@ -4694,11 +4791,7 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 2
     if kind == "map":
         return 3
-    if kind == "struct":
-        return 4
-    # a tuple shell releases through the struct header, so it carries the
-    # struct tag
-    if kind == "tuple":
+    if ir_kind_is_struct_header(kind):
         return 4
     if kind == "bytes":
         return 5
@@ -4734,11 +4827,9 @@ fn ir_element_tag_code(kind: String) -> Int:
 fn ir_store_learns_kind(store_kind: String) -> Bool:
     if store_kind == "list" or store_kind == "map" or store_kind == "set":
         return true
-    # a tuple shell (an optional or result value) is owned through the
-    # struct tag, see ir_list_ctor_for_elem_kind
-    if store_kind == "tuple":
+    if ir_kind_is_struct_header(store_kind):
         return true
-    return store_kind == "struct" or store_kind == "bytes" or store_kind == "closure"
+    return store_kind == "bytes" or store_kind == "closure"
 
 # materialize an element-tag code into a register, for the store to carry.
 fn ir_emit_element_tag_const(kind: String) -> Int:
@@ -4785,14 +4876,7 @@ fn ir_channel_send_needs_retain(emit_name: String, store_kind: String) -> Bool:
 fn ir_container_store_takes_count(store_kind: String) -> Bool:
     if store_kind == "string" or store_kind == "bytes":
         return true
-    if store_kind == "struct":
-        return true
-    # an optional shell is a struct-header allocation and transfers like one.
-    # a list has no kind-carrying store for an owned value, so without this an
-    # owned shell — `xs.push(maybe(i))`, and now every widened `xs.push(3)` —
-    # reached the plain store, which took a count of its own while the caller
-    # skipped its release: ~62 bytes stranded per push.
-    if store_kind == "tuple":
+    if ir_kind_is_struct_header(store_kind):
         return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
@@ -4834,7 +4918,7 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_list"
     if elem_kind == "map":
         return "__list_new_map"
-    if elem_kind == "struct":
+    if ir_kind_is_struct_header(elem_kind):
         return "__list_new_struct"
     if elem_kind == "bytes":
         return "__list_new_bytes"
@@ -4844,14 +4928,6 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     # fn value transfers its count at the call.
     if elem_kind == "closure":
         return "__list_new_closure"
-    # an optional element is a tuple shell: a struct-header allocation that
-    # retains and releases through pith_struct_*, which is exactly what the
-    # struct tag does. built untagged, `[1, none, 3]` typed List[Int?] owned
-    # none of the three shells it had just built and stranded ~176 bytes per
-    # literal; pushing bound optionals one by one was fine, so the literal
-    # was the one shape that leaked.
-    if elem_kind == "tuple":
-        return "__list_new_struct"
     # a set is a shared handle like a list or a map, and the only collection
     # kind the runtime's element tag was missing. untagged, a List[Set] owned
     # nothing: `xs.push({1, 2})` stranded its element for the life of the
@@ -5238,7 +5314,7 @@ fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
 # answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
 # kind, outside generic bodies where the types cannot be trusted.
 fn ir_field_receiver_is_owned_temp(recv_idx: Int) -> Bool:
-    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+    if ir_in_generic_body():
         return false
     recv := get_node(recv_idx)
     if recv.kind != "call" and recv.kind != "method_call" and recv.kind != "struct_init":
@@ -5532,7 +5608,10 @@ fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
 #                on the historical owned-style treatment, which can leak a
 #                shell but predates this classification.
 # parens are transparent. mirrors ir_optional_subject_is_owned, which makes
-# the same call-vs-borrow split for optional subjects.
+# the same call-vs-borrow split for optional subjects. one of the four
+# fresh-temporary predicates; see the block above
+# ir_expr_is_transferred_call_temp — this is the one with no generic-body
+# guard, because it is purely syntactic and consults no types.
 fn ir_extraction_operand_class(idx: Int) -> String:
     node := get_node(idx)
     if node.kind == "grouped" and node.children.len() > 0:
@@ -6467,10 +6546,7 @@ fn ir_emit_lambda_body_value(body_idx: Int):
     ir_emit_lambda_expr_return(body_idx)
 
 fn ir_emit_lambda_default_return():
-    dr := ir_reg()
-    ir_emit("iconst " + dr.to_string() + " 0")
-    ir_emit("ret " + dr.to_string())
-    ir_emit("endfunc")
+    ir_emit_zero_ret_endfunc()
 
 fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[String, Int], saved_types: Map[String, String]):
     ir_append_deferred_lambda_body()
@@ -8259,9 +8335,10 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
 # borrowed subjects (a variable, field, element, self) are owned at their own
 # scope and released there, so releasing here would double-free. suppressed
 # inside generic/specialized bodies where the shape can't be trusted, mirroring
-# ir_expr_is_transferred_call_temp.
+# ir_expr_is_transferred_call_temp. one of the four fresh-temporary
+# predicates; see the block above ir_expr_is_transferred_call_temp.
 fn ir_optional_subject_is_owned(idx: Int) -> Bool:
-    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+    if ir_in_generic_body():
         return false
     kind := node_kind(idx)
     return kind == "call" or kind == "method_call"
@@ -9498,10 +9575,7 @@ fn ir_emit_test_main(root_idx: Int):
     summary_r := ir_reg()
     ir_emit_call0(summary_r, "pith_test_summary", "int")
     ir_emit_call1(ir_reg(), "exit", "unknown", summary_r)
-    zero_r := ir_reg()
-    ir_emit("iconst " + zero_r.to_string() + " 0")
-    ir_emit("ret " + zero_r.to_string())
-    ir_emit("endfunc")
+    ir_emit_zero_ret_endfunc()
 
 # --- emit function ---
 fn ir_func(idx: Int):
@@ -9917,39 +9991,42 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 # held, ~32 bytes per element. it is an rc kind like any other here — a release
 # on a literal or a null is a no-op in the runtime, so the destructor is safe
 # on every shape a Some can hold.
-fn ir_emit_optional_dtors():
-    kinds := ["struct", "list", "map", "set", "bytes", "closure", "string"]
+#
+# `trace` emits the twins instead, over the payload kinds that are traceable
+# children: a string or bytes payload is a leaf and gets none.
+fn ir_emit_optional_walks(trace: Bool):
+    mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string"]
+    mut prefix := "__opt_dtor_"
+    if trace:
+        kinds = ["struct", "list", "map", "set", "closure"]
+        prefix = "__opt_trace_"
     for k in kinds:
-        ir_emit_func_header("__opt_dtor_" + k, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        pr := ir_emit_rc_walk_header(prefix + k)
         vr := ir_reg()
         ir_emit("field " + vr.to_string() + " " + pr.to_string() + " 8 unknown value")
-        ir_rc_release_reg(vr, k)
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_rc_walk_slot(vr, k, trace)
+        ir_emit_zero_ret_endfunc()
 
 # one destructor per known struct with rc fields: releases each such
 # field, then the runtime frees the allocation. every module emits its
 # own copy (module prefixing keeps the names distinct), so construction
-# sites never need cross-module destructor references.
-fn ir_emit_struct_dtors():
+# sites never need cross-module destructor references. `trace` emits the
+# tracer twin: the same field walk, visiting each traceable field instead of
+# releasing it, and only for the structs that have one.
+fn ir_emit_struct_walks(trace: Bool):
     for sname in ir_struct_names.keys():
         if sname.index_of("[") >= 0:
             continue
         # boxed enums live in ir_struct_names too but their releasable slots
-        # are tagged payloads, not fields — ir_emit_enum_dtors handles them.
+        # are tagged payloads, not fields — the enum walk handles them.
         if ir_boxed_enums.contains_key(sname):
             continue
         if not ir_struct_needs_dtor(sname):
             continue
-        ir_emit_func_header("__dtor_" + sname, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        if trace:
+            if not ir_struct_needs_tracer(sname):
+                continue
+        pr := ir_emit_rc_walk_header(ir_rc_walk_prefix(trace) + sname)
         count := ir_struct_field_count(sname)
         mut i := 0
         while i < count:
@@ -9957,21 +10034,21 @@ fn ir_emit_struct_dtors():
             ftype := ir_struct_field_type_name(sname, fname)
             fkind := ir_rc_field_kind(ftype)
             if ir_struct_field_is_weak(sname, fname):
-                # a weak field holds a bare target pointer, so drop its weak
-                # reference rather than a strong one; weak_release(0) is a no-op.
+                # a weak field holds a bare target pointer, so the destructor
+                # drops its weak reference rather than a strong one
+                # (weak_release(0) is a no-op) and the tracer skips the field
+                # entirely: no strong count means no ownership edge.
+                if not trace:
+                    fr := ir_reg()
+                    ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                    rel_r := ir_reg()
+                    ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + fr.to_string())
+            elif ir_rc_walk_covers(fkind, trace):
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                rel_r := ir_reg()
-                ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + fr.to_string())
-            elif fkind.len() > 0:
-                fr := ir_reg()
-                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                ir_rc_release_reg(fr, fkind)
+                ir_rc_walk_slot(fr, fkind, trace)
             i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 # one tag-aware destructor per boxed enum with rc payloads: read the tag,
 # and for the matching variant release each releasable payload slot. the box
@@ -9983,14 +10060,14 @@ fn ir_emit_enum_dtors():
             continue
         if not ir_enum_variant_lists.contains_key(ename):
             continue
-        ir_emit_enum_dtor_body("__dtor_" + ename, ir_declared_variant_kinds(ename))
+        ir_emit_enum_walk_body("__dtor_" + ename, ir_declared_variant_kinds(ename), false)
 
 # the generic instances registered at construction sites. emitted in the late
 # pass beside the generic struct instance destructors: the declared-enum pass
 # above runs before any body, when the registry is still empty.
 fn ir_emit_generic_enum_instance_dtors():
     for sym in ir_generic_enum_dtor_base.keys():
-        ir_emit_enum_dtor_body("__dtor_" + sym, ir_generic_enum_variant_kinds(sym))
+        ir_emit_enum_walk_body("__dtor_" + sym, ir_generic_enum_variant_kinds(sym), false)
 
 # the generic struct instances registered at construction sites, emitted in the
 # same late pass: the declared-struct pass runs before any body, when the
@@ -10000,10 +10077,7 @@ fn ir_emit_generic_struct_instance_dtors():
     for sym in ir_generic_struct_dtor_base.keys():
         base := ir_generic_struct_dtor_base[sym]
         kinds := ir_generic_struct_dtor_kinds[sym].split(";")
-        ir_emit_func_header("__dtor_" + sym, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        pr := ir_emit_rc_walk_header("__dtor_" + sym)
         mut i := 0
         while i < kinds.len():
             if kinds[i] == "weak":
@@ -10018,10 +10092,7 @@ fn ir_emit_generic_struct_instance_dtors():
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
                 ir_rc_release_reg(fr, kinds[i])
             i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 # the field name an instance destructor labels a slot with, falling back to the
 # slot number when the registry has no name for it. the label is documentation
@@ -10049,10 +10120,7 @@ fn ir_emit_generic_struct_instance_tracers():
             continue
         base := ir_generic_struct_dtor_base[sym]
         kinds := ir_generic_struct_dtor_kinds[sym].split(";")
-        ir_emit_func_header("__cc_trace_" + sym, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        pr := ir_emit_rc_walk_header("__cc_trace_" + sym)
         mut i := 0
         while i < kinds.len():
             if kinds[i] != "weak" and ir_trace_kind_enabled(kinds[i]):
@@ -10060,10 +10128,7 @@ fn ir_emit_generic_struct_instance_tracers():
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
                 ir_rc_visit_reg(fr, kinds[i])
             i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 # the per-variant kinds of a registered generic instance, one entry per
 # variant in declaration order — the instance twin of ir_declared_variant_kinds.
@@ -10091,27 +10156,25 @@ fn ir_declared_variant_kinds(ename: String) -> List[String]:
             out.push("")
     return out
 
-# one tag-aware destructor: switch on the variant tag, release each rc
-# payload slot of the variant that matched. shared by the declared enums and
-# the generic instances, which differ only in the kinds they are handed.
-fn ir_emit_enum_dtor_body(symbol: String, variant_kinds: List[String]):
-    ir_emit_func_header(symbol, 1, "void")
-    ir_emit("param p")
-    pr := ir_reg()
-    ir_emit("load " + pr.to_string() + " p")
+# one tag-aware walk body: switch on the variant tag, and under the variant
+# that matched release each rc payload slot — or, with `trace`, visit each
+# traceable one. shared by the declared enums and the generic instances,
+# which differ only in the kinds they are handed.
+fn ir_emit_enum_walk_body(symbol: String, variant_kinds: List[String], trace: Bool):
+    pr := ir_emit_rc_walk_header(symbol)
     tag_r := ir_reg()
     ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
     mut vi := 0
     while vi < variant_kinds.len():
         if variant_kinds[vi].len() > 0:
             kinds := variant_kinds[vi].split(",")
-            mut has_rc := false
+            mut has_slot := false
             mut c := 0
             while c < kinds.len():
-                if ir_rc_field_kind(kinds[c]).len() > 0:
-                    has_rc = true
+                if ir_rc_walk_covers(ir_rc_field_kind(kinds[c]), trace):
+                    has_slot = true
                 c = c + 1
-            if has_rc:
+            if has_slot:
                 vtag := ir_reg()
                 ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
                 is_v := ir_reg()
@@ -10123,79 +10186,14 @@ fn ir_emit_enum_dtor_body(symbol: String, variant_kinds: List[String]):
                 mut si := 0
                 while si < kinds.len():
                     rk := ir_rc_field_kind(kinds[si])
-                    if rk.len() > 0:
+                    if ir_rc_walk_covers(rk, trace):
                         slot_r := ir_reg()
                         ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((si + 1) * 8).to_string() + " unknown __p" + si.to_string())
-                        ir_rc_release_reg(slot_r, rk)
+                        ir_rc_walk_slot(slot_r, rk, trace)
                     si = si + 1
                 ir_emit_label(skip_l)
         vi = vi + 1
-    zr := ir_reg()
-    ir_emit("iconst " + zr.to_string() + " 0")
-    ir_emit("ret " + zr.to_string())
-    ir_emit("endfunc")
-
-# --- cycle tracer twins ----------------------------------------------------
-#
-# every destructor that walks traceable children gets a tracer twin: the
-# same field walk, but each child is reported to pith_cc_visit instead of
-# released. __cc_register_tracers_m<N> pairs each destructor with its twin
-# in the runtime's side table, so a future collector can enumerate a dead
-# candidate's edges through the destructor pointer the box already carries
-# — no per-instance cost, and destructors without a twin (only string,
-# bytes or weak slots) correctly read as leaves. inert until a collector
-# installs a visitor: an unhooked pith_cc_visit returns immediately.
-
-# tracer twin of __opt_dtor_<kind>, for the payload kinds that are
-# traceable children — bytes payloads are leaves and get no twin.
-fn ir_emit_optional_tracers():
-    kinds := ["struct", "list", "map", "set", "closure"]
-    for k in kinds:
-        ir_emit_func_header("__opt_trace_" + k, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        vr := ir_reg()
-        ir_emit("field " + vr.to_string() + " " + pr.to_string() + " 8 unknown value")
-        ir_rc_visit_reg(vr, k)
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
-
-# tracer twin of __dtor_<sname>: visit each traceable field. weak fields
-# are skipped entirely — they hold no strong count, so they are not edges
-# of the ownership graph the collector trial-deletes.
-fn ir_emit_struct_tracers():
-    for sname in ir_struct_names.keys():
-        if sname.index_of("[") >= 0:
-            continue
-        # boxed enums get their tag-aware twin from ir_emit_enum_tracers.
-        if ir_boxed_enums.contains_key(sname):
-            continue
-        if not ir_struct_needs_dtor(sname):
-            continue
-        if not ir_struct_needs_tracer(sname):
-            continue
-        ir_emit_func_header("__cc_trace_" + sname, 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        count := ir_struct_field_count(sname)
-        mut i := 0
-        while i < count:
-            fname := ir_struct_field_name_at(sname, i)
-            ftype := ir_struct_field_type_name(sname, fname)
-            fkind := ir_rc_field_kind(ftype)
-            if not ir_struct_field_is_weak(sname, fname) and ir_trace_kind_enabled(fkind):
-                fr := ir_reg()
-                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                ir_rc_visit_reg(fr, fkind)
-            i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+    ir_emit_zero_ret_endfunc()
 
 # tracer twin of a boxed enum's __dtor_<ename>: the same tag dispatch,
 # visiting the matching variant's traceable payload slots.
@@ -10205,13 +10203,13 @@ fn ir_emit_enum_tracers():
             continue
         if not ir_enum_variant_lists.contains_key(ename):
             continue
-        ir_emit_enum_tracer_body("__cc_trace_" + ename, ir_declared_variant_kinds(ename))
+        ir_emit_enum_walk_body("__cc_trace_" + ename, ir_declared_variant_kinds(ename), true)
 
 # tracer twins for the generic enum instances, same late pass as their dtors.
 fn ir_emit_generic_enum_instance_tracers():
     for sym in ir_generic_enum_dtor_base.keys():
         if ir_variant_kinds_have_trace(ir_generic_enum_variant_kinds(sym)):
-            ir_emit_enum_tracer_body("__cc_trace_" + sym, ir_generic_enum_variant_kinds(sym))
+            ir_emit_enum_walk_body("__cc_trace_" + sym, ir_generic_enum_variant_kinds(sym), true)
 
 # true when any variant's resolved kinds include a traceable child, the
 # per-instance answer to ir_enum_needs_tracer.
@@ -10223,95 +10221,29 @@ fn ir_variant_kinds_have_trace(variant_kinds: List[String]) -> Bool:
                     return true
     return false
 
-# the tracer twin of ir_emit_enum_dtor_body: the same tag switch and slot
-# walk, each traceable child visited instead of released.
-fn ir_emit_enum_tracer_body(symbol: String, variant_kinds: List[String]):
-    ir_emit_func_header(symbol, 1, "void")
-    ir_emit("param p")
-    pr := ir_reg()
-    ir_emit("load " + pr.to_string() + " p")
-    tag_r := ir_reg()
-    ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
-    mut vi := 0
-    while vi < variant_kinds.len():
-        if variant_kinds[vi].len() > 0:
-            kinds := variant_kinds[vi].split(",")
-            mut has_trace := false
-            mut c := 0
-            while c < kinds.len():
-                if ir_trace_kind_enabled(ir_rc_field_kind(kinds[c])):
-                    has_trace = true
-                c = c + 1
-            if has_trace:
-                vtag := ir_reg()
-                ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
-                is_v := ir_reg()
-                ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
-                hit_l := ir_label()
-                skip_l := ir_label()
-                ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
-                ir_emit_label(hit_l)
-                mut si := 0
-                while si < kinds.len():
-                    rk := ir_rc_field_kind(kinds[si])
-                    if ir_trace_kind_enabled(rk):
-                        slot_r := ir_reg()
-                        ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((si + 1) * 8).to_string() + " unknown __p" + si.to_string())
-                        ir_rc_visit_reg(slot_r, rk)
-                    si = si + 1
-                ir_emit_label(skip_l)
-        vi = vi + 1
-    zr := ir_reg()
-    ir_emit("iconst " + zr.to_string() + " 0")
-    ir_emit("ret " + zr.to_string())
-    ir_emit("endfunc")
-
 # one destructor per rc-bearing tuple signature seen in this module.
 # emitted after the bodies, since tuple shapes are only discovered at
-# their literal sites. mirrors ir_emit_struct_dtors, keyed by the
-# structural signature instead of a declared name.
-fn ir_emit_tuple_dtors():
+# their literal sites. mirrors ir_emit_struct_walks, keyed by the
+# structural signature instead of a declared name. `trace` emits the twins,
+# for the signatures with a traceable element.
+fn ir_emit_tuple_walks(trace: Bool):
     for sig in ir_tuple_dtor_sigs:
-        ir_emit_func_header(ir_tuple_dtor_name(sig), 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
+        if trace:
+            if not ir_tuple_sig_has_trace(sig):
+                continue
+        mut sym := ir_tuple_dtor_name(sig)
+        if trace:
+            sym = ir_tuple_tracer_name(sig)
+        pr := ir_emit_rc_walk_header(sym)
         mut i := 0
         while i < sig.len():
             kind := ir_tuple_dtor_code_kind(sig[i])
-            if kind.len() > 0:
+            if ir_rc_walk_covers(kind, trace):
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())
-                ir_rc_release_reg(fr, kind)
+                ir_rc_walk_slot(fr, kind, trace)
             i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
-
-# tracer twin of a tuple destructor: visit the traceable elements. keyed
-# and ordered like ir_emit_tuple_dtors — the signatures exist only after
-# the bodies emitted their tuple literals.
-fn ir_emit_tuple_tracers():
-    for sig in ir_tuple_dtor_sigs:
-        if not ir_tuple_sig_has_trace(sig):
-            continue
-        ir_emit_func_header(ir_tuple_tracer_name(sig), 1, "void")
-        ir_emit("param p")
-        pr := ir_reg()
-        ir_emit("load " + pr.to_string() + " p")
-        mut i := 0
-        while i < sig.len():
-            kind := ir_tuple_dtor_code_kind(sig[i])
-            if ir_trace_kind_enabled(kind):
-                fr := ir_reg()
-                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())
-                ir_rc_visit_reg(fr, kind)
-            i = i + 1
-        zr := ir_reg()
-        ir_emit("iconst " + zr.to_string() + " 0")
-        ir_emit("ret " + zr.to_string())
-        ir_emit("endfunc")
+        ir_emit_zero_ret_endfunc()
 
 # one equality helper per boxed enum: same pointer or same tag with
 # equal payloads. string payloads compare by content and nested boxed
@@ -10453,10 +10385,7 @@ fn ir_emit_init_globals(root: Node):
             if gkind.len() > 0 and gtarget != "tuple" and ir_expr_is_borrowed(parts.val_idx):
                 ir_rc_retain_reg(r, gkind)
             ir_emit("store " + ir_global_storage_symbol(gname) + " " + r.to_string())
-    dr := ir_reg()
-    ir_emit("iconst " + dr.to_string() + " 0")
-    ir_emit("ret " + dr.to_string())
-    ir_emit("endfunc")
+    ir_emit_zero_ret_endfunc()
 
 fn ir_emit_top_level_items(root_idx: Int, root: Node):
     mut test_ord := 0
@@ -10640,10 +10569,7 @@ fn ir_emit_cc_register_tracers():
         if not ir_generic_struct_instance_needs_tracer(sym):
             continue
         ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
-    zr := ir_reg()
-    ir_emit("iconst " + zr.to_string() + " 0")
-    ir_emit("ret " + zr.to_string())
-    ir_emit("endfunc")
+    ir_emit_zero_ret_endfunc()
 
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_base = {}
@@ -10655,11 +10581,11 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)
-    ir_emit_optional_dtors()
-    ir_emit_struct_dtors()
+    ir_emit_optional_walks(false)
+    ir_emit_struct_walks(false)
     ir_emit_enum_dtors()
-    ir_emit_optional_tracers()
-    ir_emit_struct_tracers()
+    ir_emit_optional_walks(true)
+    ir_emit_struct_walks(true)
     ir_emit_enum_tracers()
     ir_emit_enum_eq_fns()
     # pre-register all impl method specializations across the module so that
@@ -10670,14 +10596,14 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_top_level_items(root_idx, root)
     # tuple destructors last: their shapes are only known once every
     # tuple literal in the module body has been emitted.
-    ir_emit_tuple_dtors()
-    ir_emit_tuple_tracers()
+    ir_emit_tuple_walks(false)
+    ir_emit_tuple_walks(true)
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend
     # constructor call: emitted after the specializations, since those bodies
     # are where such constructions (and their attaches) are recorded.
-    ir_emit_generic_instance_dtors()
-    ir_emit_generic_instance_tracers()
+    ir_emit_generic_instance_walks(false)
+    ir_emit_generic_instance_walks(true)
     ir_emit_generic_enum_instance_dtors()
     ir_emit_generic_enum_instance_tracers()
     ir_append_lambda_bodies()

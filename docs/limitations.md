@@ -41,17 +41,16 @@ something here that now works, the page is stale and a fix to it is welcome.
   it built (`{"a": [1, 2]}` against a `Map[String, List[Int]?]`), and a
   `List[Int?]?` target widens the elements and the container at once.
 
-  two positions still report, and there the value has to be bound to a `T?`
-  local first: a map key, and anything a set does. `m.insert(k, v)` widens `v`
-  and not `k`, and `contains_key`, `get`, `get_default` and `remove` all
-  report on their key. neither container compares an optional structurally — a
-  `Map[Int?, V]` is the string-keyed map and a `Set[Int?]` the string set, and
-  both read the shell pointer as a c-string, so two distinct optionals already
-  collapse into one entry and `contains` answers true for anything. widening
-  `s.add(3)` would only add a shorter spelling for that; use a `List[T?]` or a
-  `Map[T, Bool]` until the element type itself is fixed. a list compares an
-  element the way `==` compares it, which is why its searches widen and these
-  do not.
+  a map key and a set element take no widening because the types that would
+  need it no longer exist: `Set[T?]` and `Map[T?, V]` are rejected with E254.
+  a set and a map hash int and string flavors only, and an optional's shell
+  is neither — these containers used to fall back to the string flavor and
+  read the shell pointer as a c-string, so two distinct optionals collapsed
+  into one entry and `contains` answered true for anything. a compile error
+  replaced that silent data loss; use a `List[T?]` or a `Map[T, Bool]`
+  instead. an optional map value stays legal, since only the key is hashed.
+  a list compares an element the way `==` compares it, which is why its
+  searches widen.
 
   a parameter of a *generic function* widens like any other argument —
   `pick(x, 3)` against `fn pick[T](a: T, b: Int?)` builds `Some(3)`, in both

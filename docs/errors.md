@@ -670,6 +670,23 @@ error[E253]: a catch block must end with return, fail, continue or break; it pro
 ```
 
 
+### E254 — optional set element or map key
+
+an optional type was used as a `Set` element or a `Map` key. both positions
+are hashed, and a set and a map hash int and string flavors only; an
+optional's two-word shell is neither. the container used to fall back to the
+string flavor and read the shell pointer as a c-string, so distinct optionals
+collapsed into one entry and membership answered true for anything. the type
+is rejected wherever it is formed: a written annotation, an inferred literal,
+an empty literal's first typed store, and a generic instantiation. store
+`List[T?]` instead, or key the map by the payload and track the empty case
+separately. an optional map value stays legal; only the key is hashed.
+
+```
+error[E254]: an optional cannot be a set element type; store List[T?] or key by the payload instead
+```
+
+
 ### E260 — invalid defer or errdefer
 
 `defer` and `errdefer` appear outside a function, or the deferred statement is

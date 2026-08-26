@@ -509,6 +509,26 @@ fn resolve_generic_type_from_node(node: Node) -> Int:
         type_args.push(resolve_type_implementation(child))
     return resolve_generic_type(base, type_args)
 
+# an optional cannot be hashed: a set has exactly two element flavors and a
+# map two key flavors, int and string, and an optional's two-word shell is
+# neither. the string container used to read the shell pointer as a c-string,
+# which collapsed distinct optionals into one entry and made membership
+# answer true for anything. rather than build a container that loses data,
+# the type is rejected wherever a set element or map key type is formed —
+# annotation, inferred literal, an empty literal's first typed store, and a
+# generic instantiation, which is the one path with no node to point at.
+fn reject_optional_hashed_component(node_idx: Int, tid: Int, position: String) -> Bool:
+    if tid < 0:
+        return false
+    if get_type_info(tid).kind != "optional":
+        return false
+    msg := "an optional cannot be " + position + "; store List[T?] or key by the payload instead"
+    if node_idx >= 0:
+        report_error_at(node_idx, "E254", msg)
+    else:
+        report_error("E254", msg)
+    return true
+
 fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
     # builtin generic types
     if strings_equal(base, "List"):
@@ -520,10 +540,14 @@ fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
         if type_args.len() != 1:
             report_error("E221", "Set expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
+        if reject_optional_hashed_component(0 - 1, type_args[0], "a set element type"):
+            return TID_ERR
         return intern_set_type(type_args[0])
     if strings_equal(base, "Map"):
         if type_args.len() != 2:
             report_error("E221", "Map expects 2 type arguments, got " + type_args.len().to_string())
+            return TID_ERR
+        if reject_optional_hashed_component(0 - 1, type_args[0], "a map key type"):
             return TID_ERR
         return intern_map_type(type_args[0], type_args[1])
     if strings_equal(base, "Task"):
@@ -4635,11 +4659,15 @@ fn refine_empty_literal_binding(name: String, method: String, args: List[Int], s
     elif literal_kind == "set" and method == "add" and args.len() == 1:
         elem := c_check_expr(argument_expression_index(args[0]), scope_id)
         if is_error_type(elem) == false:
+            if reject_optional_hashed_component(argument_expression_index(args[0]), elem, "a set element type"):
+                return TID_ERR
             refined = intern_set_type(elem)
     elif literal_kind == "map" and method == "insert" and args.len() == 2:
         key_type := c_check_expr(argument_expression_index(args[0]), scope_id)
         value_type := c_check_expr(argument_expression_index(args[1]), scope_id)
         if is_error_type(key_type) == false and is_error_type(value_type) == false:
+            if reject_optional_hashed_component(argument_expression_index(args[0]), key_type, "a map key type"):
+                return TID_ERR
             refined = intern_map_type(key_type, value_type)
     if is_error_type(refined):
         return TID_ERR
@@ -5409,14 +5437,9 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         report_error_with_fix("E209", "Set has no method 'insert'", "use add(value)")
         return TID_ERR
     if method == "add":
-        # `add` stores, so it would take the store widening a list's push and
-        # a map's insert now take — except that a set has exactly two element
-        # flavors, int and string, and an optional is neither. a Set[Int?]
-        # builds the string set and hands pith_set_add_cstr a tuple pointer to
-        # read as a c-string, so two distinct optionals already collapse into
-        # one entry and `contains` answers true for anything. widening here
-        # would only add a shorter spelling for that; the element type is what
-        # needs fixing first.
+        # `add` stores, but there is nothing to widen into: an optional
+        # element type is rejected outright (E254), since a set hashes int
+        # and string flavors only and an optional's shell is neither.
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
     if method == "len":
@@ -5591,12 +5614,10 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
 #
 # a search position may only widen where the search compares structurally. a
 # list's does — an optional element compares by tag and payload, so the shell
-# built here finds the equal element it names. the positions that still hold
-# the rejection are the ones whose comparison is not structural: a map key and
-# a set element are hashed as a raw slot, and a Set[Int?] or a Map[Int?, V]
-# hands the string container a tuple pointer to read as a c-string, which
-# collapses every optional into one entry. widening there would turn a
-# rejection into a wrong answer, which is the whole reason the rule exists.
+# built here finds the equal element it names. a map key and a set element
+# never reach this question: neither container hashes an optional at all, so
+# Set[T?] and Map[T?, V] are rejected as types (E254) before any store or
+# search could ask for widening.
 fn check_widened_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)
     actual := c_check_expr(expr_idx, scope_id)
@@ -6496,6 +6517,8 @@ fn check_map_expression(node: Node, scope_id: Int) -> Int:
                     # a map key is hashed and compared; the empty case of an
                     # optional is not a key.
                     report_error_at(entry.children[0], "E223", "map key cannot be none")
+                elif reject_optional_hashed_component(entry.children[0], kt, "a map key type"):
+                    return tid_err
                 elif is_error_type(key_type):
                     key_type = kt
                 elif is_error_type(kt) == false:
@@ -6528,6 +6551,8 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
             # a set element is hashed and compared; the empty case of an
             # optional is not a member.
             report_error_at(child, "E223", "set element cannot be none")
+        elif reject_optional_hashed_component(child, t, "a set element type"):
+            return tid_err
         elif is_error_type(elem_type):
             elem_type = t
         elif is_error_type(t) == false:

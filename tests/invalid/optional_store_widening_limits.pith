@@ -1,33 +1,19 @@
 # a plain value widens into a container's optional element where the container
 # compares that element structurally — every store, and a list's contains and
-# index_of. the positions below hash or compare the element as a raw slot
-# instead, or store into a container that cannot hold an optional at all, and
-# every one of them stays a compile error. the list search positions that used
-# to sit here are now legal and are covered by
-# tests/cases/test_list_optional_element_search.pith.
+# index_of. the positions below take no widening and stay compile errors. the
+# list search positions that used to sit here are now legal and are covered by
+# tests/cases/test_list_optional_element_search.pith; the hashed positions that
+# used to sit here — a Set[Int?] element and a Map[Int?, V] key — are now
+# rejected as types (E254) and live in optional_set_element.pith and
+# optional_map_key.pith.
 
 fn main():
-    # a map key is hashed, and a Map[Int?, V] is the string-keyed map: it
-    # would read the shell pointer as a c-string, so two distinct optionals
-    # already collapse into one entry.
-    mut byint: Map[Int?, String] := {}
-    print("{byint.contains_key(3)}")
-    print("{byint.get_default(3, "x")}")
-    byint.remove(3)
-
     # get_default's fallback is handed straight back out when the key is
     # missing, so it is neither a store nor a query and takes no widening:
     # the result may BE this argument, and the count handshake that makes
     # that safe is written against a value the caller still owns.
     mut byname: Map[String, Int?] := {}
     print("{byname.get_default("a", 3).unwrap_or(0)}")
-
-    # a set has exactly two element flavors, int and string, and an optional
-    # is neither — so neither its store nor its searches widen.
-    mut s: Set[Int?] := {}
-    s.add(3)
-    print("{s.contains(3)}")
-    s.remove(3)
 
     # widening still runs in one direction only, and only when the inner type
     # matches: an optional does not narrow into a plain element, and a String

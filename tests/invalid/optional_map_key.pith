@@ -1,0 +1,20 @@
+# an optional cannot be a map key. a map has int-keyed and string-keyed
+# flavors only; a Map[Int?, V] used to build the string-keyed map and read
+# each shell pointer as a c-string, so distinct optional keys collapsed into
+# one entry. the key type is rejected outright — at the annotation, at the
+# inferred literal, and at an empty literal's first typed insert. an optional
+# value type stays legal: only the key is hashed.
+
+fn main():
+    byint: Map[Int?, String] := {}
+    print("{byint.len()}")
+
+    o: Int? := 3
+    inferred := {o: "x"}
+    print("{inferred.len()}")
+
+    mut open := {}
+    open.insert(o, "y")
+
+    legal: Map[String, Int?] := {"a": 1}
+    print("{legal.len()}")

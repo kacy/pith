@@ -1,0 +1,137 @@
+# pins the values that flow through `if let` payload bindings now that the
+# binding takes a counted payload: every shape here must keep printing the
+# same totals whatever the ownership machinery does underneath. covers a
+# bound-local subject, a call subject, an escape through return, a same-name
+# rebind, nesting, a while-let drain, the none path, the match twins on the
+# same payloads, and a weak-field subject whose referent must survive the
+# binding's release.
+
+struct Pt:
+    pub val: Int
+    pub tag: String
+
+struct Chain:
+    value: Int
+    mut next: Chain?
+    weak parent: Chain?
+
+fn name_of(i: Int) -> String?:
+    if i % 5 == 4:
+        return none
+    return "name-" + i.to_string()
+
+fn mkp(i: Int) -> Pt?:
+    if i < 0:
+        return none
+    return Pt(val: i, tag: "pt-" + i.to_string())
+
+fn bound_local(i: Int) -> Int:
+    s := name_of(i)
+    mut n := 0
+    if let v = s:
+        n = v.len()
+    return n
+
+fn direct_call(i: Int) -> Int:
+    mut n := 0
+    if let v = name_of(i):
+        n = v.len()
+    return n
+
+fn struct_bound(i: Int) -> Int:
+    s := mkp(i)
+    mut n := 0
+    if let p = s:
+        n = p.val + p.tag.len()
+    return n
+
+fn escape(i: Int) -> String:
+    if let v = name_of(i):
+        return v
+    return "fell-through"
+
+fn rebind(i: Int) -> Int:
+    mut n := 0
+    if let v = name_of(i):
+        n = v.len()
+    if let v = name_of(i + 1):
+        n = n + v.len()
+    return n
+
+fn nested(i: Int) -> Int:
+    mut n := 0
+    if let a = name_of(i):
+        if let b = name_of(i + 1):
+            n = a.len() + b.len()
+    return n
+
+fn drain(i: Int) -> Int:
+    mut j := 0
+    mut n := 0
+    while let v = name_of(i + j):
+        n = n + v.len()
+        j = j + 1
+    return n
+
+fn none_path(i: Int) -> Int:
+    s := name_of(i)
+    mut n := 0
+    if let v = s:
+        n = v.len()
+    else:
+        n = 0 - 1
+    return n
+
+fn match_bound(i: Int) -> Int:
+    s := name_of(i)
+    here := match s:
+        none => 0
+        v => v.len()
+    return here
+
+fn match_direct(i: Int) -> Int:
+    here := match name_of(i):
+        none => 0
+        v => v.len()
+    return here
+
+fn read_parent(c: Chain) -> Int:
+    mut r := 0
+    if let p = c.parent:
+        r = p.value
+    return r
+
+fn main():
+    mut sums: List[Int] := [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    mut esc := ""
+    mut i := 0
+    while i < 12:
+        sums[0] = sums[0] + bound_local(i)
+        sums[1] = sums[1] + direct_call(i)
+        sums[2] = sums[2] + struct_bound(i)
+        sums[3] = sums[3] + rebind(i)
+        sums[4] = sums[4] + nested(i)
+        sums[5] = sums[5] + drain(i)
+        sums[6] = sums[6] + none_path(i)
+        sums[7] = sums[7] + match_bound(i)
+        sums[8] = sums[8] + match_direct(i)
+        esc = escape(i)
+        i = i + 1
+    print("bound_local=" + sums[0].to_string())
+    print("direct_call=" + sums[1].to_string())
+    print("struct_bound=" + sums[2].to_string())
+    print("rebind=" + sums[3].to_string())
+    print("nested=" + sums[4].to_string())
+    print("drain=" + sums[5].to_string())
+    print("none_path=" + sums[6].to_string())
+    print("match_bound=" + sums[7].to_string())
+    print("match_direct=" + sums[8].to_string())
+    print("escape_last=" + esc)
+    p := Chain(value: 7, next: none, parent: none)
+    c := Chain(value: 1, next: none, parent: p)
+    mut total := 0
+    mut k := 0
+    while k < 1000:
+        total = total + read_parent(c)
+        k = k + 1
+    print("weak_total=" + total.to_string())

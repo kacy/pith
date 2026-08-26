@@ -1,0 +1,116 @@
+# `if let` on an optional used to hand its binding an uncounted view of the
+# payload: nothing retained what the binding held and nothing released it, so
+# a heap payload was stranded once per extraction. the binding now takes its
+# count on the terms the shared gate (ir_extraction_retains) hands every
+# extraction spelling, and the exit cleanup releases it — or a return
+# transfers it out. every subject here is a bound local: a call subject still
+# pays the destructor-less returned shell, the other, still-open half of the
+# same issue, and a known-leaking shape must not sit in a gate case. the
+# match twin pins the arm-binding path this change shares machinery with.
+import leakprobe as probe
+
+struct Pt:
+    pub val: Int
+    pub tag: String
+
+fn mkp(i: Int) -> Pt?:
+    if i < 0:
+        return none
+    return Pt(val: i, tag: "pt-" + i.to_string())
+
+fn mkl(i: Int) -> List[String]?:
+    if i < 0:
+        return none
+    mut xs: List[String] := []
+    xs.push("elem-" + i.to_string())
+    return xs
+
+fn name_of(i: Int) -> String?:
+    if i % 5 == 4:
+        return none
+    return "name-" + i.to_string()
+
+# string payload on a bound local: the binding's count is the one the exit
+# cleanup releases once the local's shell-only cleanup has run
+fn bound_string(i: Int) -> Int:
+    s := name_of(i)
+    mut n := 0
+    if let v = s:
+        n = v.len()
+    return n
+
+fn bound_struct(i: Int) -> Int:
+    s := mkp(i)
+    mut n := 0
+    if let p = s:
+        n = p.val + p.tag.len()
+    return n
+
+fn bound_list(i: Int) -> Int:
+    s := mkl(i)
+    mut n := 0
+    if let xs = s:
+        n = xs.len()
+    return n
+
+# the escape shape: the bound payload leaves through a return, so the
+# binding's count transfers to the caller instead of double-releasing
+fn escape(i: Int) -> String:
+    s := name_of(i)
+    if let v = s:
+        return v
+    return "fell-through"
+
+# rebinding the same name releases the previous round's count
+fn rebind(i: Int) -> Int:
+    a := name_of(i)
+    b := name_of(i + 1)
+    mut n := 0
+    if let v = a:
+        n = v.len()
+    if let v = b:
+        n = n + v.len()
+    return n
+
+fn nested(i: Int) -> Int:
+    a := name_of(i)
+    b := name_of(i + 1)
+    mut n := 0
+    if let x = a:
+        if let y = b:
+            n = x.len() + y.len()
+    return n
+
+# the none path leaves the binding untouched; the else arm must not release
+# a count the binding never took
+fn none_path(i: Int) -> Int:
+    s := name_of(i * 5 + 4)
+    mut n := 0
+    if let v = s:
+        n = v.len()
+    else:
+        n = 1
+    return n
+
+# the match twin binds the same payload through the arm machinery
+fn match_twin(i: Int) -> Int:
+    s := name_of(i)
+    here := match s:
+        none => 0
+        v => v.len()
+    return here
+
+fn churn_round(i: Int):
+    e := escape(i).len()
+    total := bound_string(i) + bound_struct(i) + bound_list(i) + e + rebind(i) + nested(i) + none_path(i) + match_twin(i)
+    if total < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

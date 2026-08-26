@@ -181,12 +181,35 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
+- **a struct built from a fresh value inside a generic body is freed under
+  you** — `held := Local(label: "h-{tag}")` inside `fn build[T](tag: T)`
+  releases the temporary the construction never took a count on, and reading
+  the field afterwards reads freed memory. the program usually prints the
+  right answer; under `PITH_STRUCT_FREELIST=0` valgrind reports the invalid
+  read. the same function with the type parameter removed is clean. this is
+  the only memory-unsafety defect currently known; everything else
+  outstanding is a leak (issue #952).
+- **extracting a heap payload leaks it in two shapes** — `if let` never
+  releases what it binds, on any subject, where `unwrap_or` on the same bound
+  local is flat. and an optional a user function returns carries no
+  destructor, while the extraction still takes the retain it would need
+  against one that did, so both spellings pay it on a call subject. about 30
+  bytes an extraction each (issue #950).
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is
   rejected by the backend with `unknown load source 'assert'`. put the
   assertion in a function the closure calls, or use `std.testing`'s recording
   assertions, which are ordinary calls.
+- **a builtin call inside a generic body has no result kind** — `int_to_string`
+  and friends lower with an unresolved return kind in a specialization, so the
+  fresh buffer they hand back is never released. measured about 25 mb against a
+  2 mb concrete twin over 200k rounds, which makes it the largest remaining
+  generic leak now that a specialization releases its non-escaping locals
+  (issue #949).
+- **a generic instance cannot be a channel payload** — `Channel[Holder[String]](2)`
+  reports E210, because the channel constructor accepts only a bare identifier
+  payload and a parameterized type argument parses as an expression (issue #946).
 - **a generic function body has no rc prologue** — an instantiation is emitted
   without the zero-store prologue a concrete body gets, and its call results
   come back typed `unknown` rather than `string`, so no heap local or

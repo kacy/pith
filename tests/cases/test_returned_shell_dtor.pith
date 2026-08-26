@@ -1,0 +1,124 @@
+# a user function returning `T?` builds its Some at the return site, and that
+# shell owns its heap payload through __opt_dtor_<kind>. this case pins the
+# counts around that ownership: a direct-call extraction for each heap payload
+# kind and each spelling, a forwarded parameter shell whose payload the
+# caller's own local still reads afterwards (the shape that must not
+# double-free), a discarded call result, and the none path. every subject is
+# read back after its extraction, so an over-release faults where it happens.
+# the iterator section pins the companion fix: a specialized generic body's
+# `List[I.Item]` bind resolves the associated element type and builds a
+# tagged list, so `to_list` owns the rows its iterator's destructor-carrying
+# shells hand over — before, the rows lived on a leaked count and reading
+# them after the iterator died read freed memory.
+
+from std.iter import Iterator, to_list
+
+struct Pt:
+    pub val: Int
+    pub tag: String
+
+fn make_s(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "name-{i}"
+
+fn make_p(i: Int) -> Pt?:
+    if i < 0:
+        return none
+    return Pt(val: i, tag: "pt-{i}")
+
+fn make_l(i: Int) -> List[String]?:
+    if i < 0:
+        return none
+    mut xs: List[String] := []
+    j := i + 1
+    xs.push("elem-{i}")
+    xs.push("elem-{j}")
+    return xs
+
+fn fwd(v: String?) -> String?:
+    return v
+
+struct It3:
+    mut rows: List[Pt]
+    mut pos: Int
+
+impl Iterator for It3:
+    type Item = Pt
+    fn next() -> Pt?:
+        if self.pos >= self.rows.len():
+            return none
+        r := self.rows[self.pos]
+        self.pos = self.pos + 1
+        return r
+
+fn collected() -> Int:
+    all := to_list(It3(rows: [Pt(val: 1, tag: "a"), Pt(val: 2, tag: "bb")], pos: 0))
+    first := all[0]
+    return first.val + first.tag.len() + all[1].tag.len() + all.len()
+
+fn direct_cells() -> Int:
+    mut n := make_s(3).unwrap_or("d").len()
+    n = n + make_s(4).value().len()
+    if let v = make_s(5):
+        n = n + v.len()
+    p := make_p(6).unwrap_or(Pt(val: 0, tag: "z"))
+    n = n + p.val + p.tag.len()
+    dl: List[String] := []
+    n = n + make_l(7).unwrap_or(dl).len()
+    n = n + dl.len()
+    if let xs = make_l(8):
+        n = n + xs[0].len() + xs.len()
+    return n
+
+fn forwarded() -> Int:
+    o := make_s(9)
+    d := fwd(o).unwrap_or("d")
+    back := o.unwrap_or("x")
+    return d.len() + back.len()
+
+fn discarded() -> Int:
+    make_s(10)
+    make_p(11)
+    make_l(12)
+    make_s(0 - 1)
+    return 1
+
+# the rebind shape: a call-produced optional bound to a name, extracted,
+# rebound to a second name and extracted again. the extraction retains, so
+# the second read still sees the payload — and the shell's own release is
+# the retain's balance, so neither read double-frees.
+fn rebound() -> Int:
+    u: String? := make_s(13)
+    mut n := u.unwrap_or("?").len()
+    v: String? := u
+    n = n + v.unwrap_or("?").len()
+    return n
+
+fn none_paths() -> Int:
+    mut n := make_s(0 - 1).unwrap_or("dd").len()
+    if let v = make_p(0 - 1):
+        n = n + v.val
+    else:
+        n = n + 3
+    return n
+
+fn main():
+    mut rounds := 0
+    mut total := 0
+    while rounds < 200:
+        total = direct_cells() + forwarded() + discarded() + none_paths() + collected() + rebound()
+        rounds = rounds + 1
+    d := direct_cells()
+    f := forwarded()
+    x := discarded()
+    z := none_paths()
+    c := collected()
+    rb := rebound()
+    print("direct={d}")
+    print("forwarded={f}")
+    print("discarded={x}")
+    print("none={z}")
+    print("collected={c}")
+    print("rebound={rb}")
+    print("total={total}")

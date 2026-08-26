@@ -201,12 +201,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   rejected by the backend with `unknown load source 'assert'`. put the
   assertion in a function the closure calls, or use `std.testing`'s recording
   assertions, which are ordinary calls.
-- **a builtin call inside a generic body has no result kind** — `int_to_string`
-  and friends lower with an unresolved return kind in a specialization, so the
-  fresh buffer they hand back is never released. measured about 25 mb against a
-  2 mb concrete twin over 200k rounds, which makes it the largest remaining
-  generic leak now that a specialization releases its non-escaping locals
-  (issue #949).
 - **a generic instance cannot be a channel payload** — `Channel[Holder[String]](2)`
   reports E210, because the channel constructor accepts only a bare identifier
   payload and a parameterized type argument parses as an expression (issue #946).

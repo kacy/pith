@@ -1,0 +1,95 @@
+# a builtin call inside a generic body lowers with a result kind, and that
+# kind is what pairs the fresh buffer the builtin hands back with a release.
+# before #949 every such call emitted `call N int_to_string unknown` in a
+# specialization — the concrete twin beside it emitted `string` plus the
+# matching release — so each round leaked the temporary.
+#
+# every consumer position a builtin result can land in is churned here, at a
+# heap type argument and at Int: a concat operand, a chained receiver, an
+# argument, a return, a container store, and the string/list/map/bytes
+# receiver builtins whose results are temporaries of their own.
+import leakprobe as probe
+import std.bytes as bytes
+
+fn take(s: String) -> Int:
+    return s.len()
+
+fn concat_temp[T](marker: T, i: Int) -> Int:
+    return ("payload-" + i.to_string()).len()
+
+fn chained_len[T](marker: T, i: Int) -> Int:
+    return i.to_string().len()
+
+fn passed[T](marker: T, i: Int) -> Int:
+    return take(i.to_string())
+
+fn returned[T](marker: T, i: Int) -> String:
+    return i.to_string()
+
+# the container is the caller's: a list the specialization itself binds is
+# #927's untracked-locals leak and would swamp this case. the store still
+# runs inside the generic body, which is the shape at stake — the element's
+# count must transfer into the container exactly once.
+fn stored[T](marker: T, i: Int, xs: List[String]) -> Int:
+    xs.push(i.to_string())
+    return xs.len()
+
+fn chained_builtin[T](marker: T, i: Int) -> Int:
+    return i.to_string().repeat(2).len()
+
+fn string_recv[T](marker: T, s: String) -> Int:
+    return s.trim().substring(0, 3).len()
+
+fn list_recv[T](marker: T, xs: List[String]) -> Int:
+    return xs.slice(0, 1).len()
+
+fn map_recv[T](marker: T, m: Map[String, Int]) -> Int:
+    return m.keys().len()
+
+fn bytes_recv[T](marker: T, b: Bytes) -> Int:
+    return b.slice(0, 2).len()
+
+fn other_prims[T](marker: T, f: Float, flag: Bool) -> Int:
+    return f.to_string().len() + flag.to_string().len()
+
+# a string receiver's to_string is an identity lowering: the result IS the
+# receiver register, so it must stay unkinded — a kinded identity result
+# classifies owned and the owned-arg release would free the borrowed
+# receiver out from under its owner.
+fn str_identity[T](marker: T, s: String) -> Int:
+    t := s.to_string()
+    return take(t) + take(s.to_string()) + s.len()
+
+fn churn_round(i: Int, seed: String, xs: List[String], m: Map[String, Int], b: Bytes, sink: List[String]) -> Int:
+    mut acc := 0
+    acc = acc + concat_temp(seed, i) + concat_temp(7, i)
+    acc = acc + chained_len(seed, i) + chained_len(7, i)
+    acc = acc + passed(seed, i) + passed(7, i)
+    acc = acc + returned(seed, i).len() + returned(7, i).len()
+    acc = acc + stored(seed, i, sink) + stored(7, i, sink)
+    sink.clear()
+    acc = acc + chained_builtin(seed, i) + chained_builtin(7, i)
+    acc = acc + string_recv(seed, "  pad-" + i.to_string()) + string_recv(7, "  pad  ")
+    acc = acc + list_recv(seed, xs) + list_recv(7, xs)
+    acc = acc + map_recv(seed, m) + map_recv(7, m)
+    acc = acc + bytes_recv(seed, b) + bytes_recv(7, b)
+    acc = acc + other_prims(seed, 1.5, true) + other_prims(7, 2.5, false)
+    acc = acc + str_identity(seed, seed) + str_identity(7, seed)
+    return acc
+
+fn main():
+    n := probe.rounds()
+    seed := "seed-string"
+    xs := ["alpha", "beta"]
+    m: Map[String, Int] := {"one": 1, "two": 2}
+    b := bytes.from_string_utf8("abcdef")
+    mut sink: List[String] := []
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + churn_round(i, seed, xs, m, b, sink)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

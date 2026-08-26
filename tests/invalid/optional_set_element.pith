@@ -1,0 +1,23 @@
+# an optional cannot be a set element. a set has exactly two element flavors,
+# int and string; a Set[Int?] used to build the string set and read each
+# shell pointer as a c-string, so distinct optionals collapsed into one entry
+# and contains answered true for everything. the element type is rejected
+# outright — at the annotation, at the inferred literal, at an empty
+# literal's first typed store, and through a generic instantiation.
+
+struct Tracker[T]:
+    pub seen: Set[T]
+
+fn main():
+    s: Set[Int?] := {}
+    print("{s.len()}")
+
+    o: Int? := 3
+    inferred := {o}
+    print("{inferred.len()}")
+
+    mut open := {}
+    open.add(o)
+
+    t := Tracker[Int?]({})
+    print("{t.seen.len()}")

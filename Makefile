@@ -1153,6 +1153,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_atomic_context tests/cases/test_tuple_ownership \
 	tests/cases/test_channel_try_send_ownership \
 	tests/cases/test_channel_fanout_ownership \
+	tests/cases/test_generic_channel_payload \
 	tests/cases/test_empty_list_field_ownership \
 	tests/cases/test_list_bytes_ownership \
 	tests/cases/test_container_eviction_release \

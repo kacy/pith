@@ -37,6 +37,7 @@ cases=(
   tests/leaks/leak_list_transform
   tests/leaks/leak_module_call_string
   tests/leaks/leak_io_text_registry
+  tests/leaks/leak_websocket_session
   tests/leaks/leak_generic_builtin_result
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_generic_body_construction

@@ -1,0 +1,43 @@
+# a websocket session per round, torn down with close_now(). the session's
+# six threadlocal map entries had no removal path at all — a server upgrading
+# connections grew them per session, per os thread, for the life of the
+# process (issue #925). close_now() now deregisters the session, so this
+# stays flat; a teardown that misses one of the maps shows up as growth.
+#
+# the buffered io pair and the cursor under the session are the caller's here
+# (from_buffered), so the round closes them itself, the way a server would.
+#
+# valgrind sees none of it: a stranded entry stays reachable from its
+# threadlocal map, so it reads as "still reachable" rather than lost.
+import leakprobe as probe
+import std.io as io
+import std.bytes as bytes
+import std.net.websocket as websocket
+
+fn round(frame_data: Bytes):
+    cursor := io.bytes_reader(frame_data)
+    reader := cursor.buffered_chunked(64)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    ws := websocket.from_buffered(reader, writer, true)
+    # bound, not discarded: a Bytes dropped at statement position is a
+    # documented emitter leak that would drown the registry signal.
+    got := ws.recv() catch bytes.empty()
+    ws.close_now()
+    ws.close_now()
+    reader.free()
+    writer.free()
+    cursor.close()
+    sink.free()
+    if got.len() < 0:
+        return
+
+fn main():
+    frame_data := websocket.text_frame_bytes("ping") catch bytes.empty()
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        round(frame_data)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

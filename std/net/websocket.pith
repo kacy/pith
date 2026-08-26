@@ -301,10 +301,16 @@ pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[Str
     key := random_client_key()!
     key_text := encoding.b64_encode(key)
     request := client_request_with_key(default_host_header(host, port), path, headers, key)!
+    # the handshake's buffered io is registry-backed and lives only for this
+    # call — the session registers a pair of its own on success — so give the
+    # entries back on every exit, the failed handshake included.
     writer := conn.buffered_bytes_writer()
+    defer writer.free()
     writer.write_bytes(request)!
     ensure_writer_flushed(writer)!
-    response_head := read_http_head(conn.buffered_bytes_reader_chunked(1))!
+    head_reader := conn.buffered_bytes_reader_chunked(1)
+    defer head_reader.free()
+    response_head := read_http_head(head_reader)!
     if not validate_upgrade_response(response_head, bytes.from_string_utf8(key_text))!:
         fail "invalid websocket handshake response"
     return register_websocket(conn, true)
@@ -312,7 +318,10 @@ pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[Str
 pub fn upgrade(fd: Int, req: HttpRequestBytes) -> WebSocket!:
     response := upgrade_response(req)!
     stream := io.from_fd(fd)
+    # the handshake writer is registry-backed and lives only for this call
+    # (see dial_with_headers); the session registers its own on success.
     writer := stream.buffered_bytes_writer()
+    defer writer.free()
     writer.write_bytes(response)!
     ensure_writer_flushed(writer)!
     return register_websocket(stream, false)
@@ -633,7 +642,9 @@ fn handle_control_frame(ws: WebSocket, frame: WebSocketFrame) -> Bool!:
         return true
     if frame.is_close():
         if not ws.is_closed():
-            send_frame(ws, OP_CLOSE, frame.payload, true)!
+            # reply best-effort: a peer that closes and vanishes must not
+            # keep the session registered, so the teardown runs regardless.
+            send_frame(ws, OP_CLOSE, frame.payload, true) catch 0
         ws.close_now()
         fail "websocket closed"
     return false
@@ -710,18 +721,34 @@ impl WebSocket:
         return send_frame(self, OP_PING, data, true)
     fn pong(data: Bytes) -> Int!:
         return send_frame(self, OP_PONG, data, true)
+    # send a close frame with the given code and reason, then tear the session
+    # down. a failed write does not keep the session registered: the registry
+    # entries are dropped either way, so a broken peer cannot strand them. a
+    # second close returns 0.
     fn close(code: Int, reason: String) -> Int!:
         if self.is_closed():
             return 0
-        wrote := send_frame(self, OP_CLOSE, close_payload(code, reason)!, true)!
+        payload := close_payload(code, reason)!
+        wrote := send_frame(self, OP_CLOSE, payload, true)
         self.close_now()
-        return wrote
+        return wrote!
+    # tear the session down without a close frame: drop all six registry
+    # entries and, for a session that owns its transport, free its buffered io
+    # and close the socket. a deregistered session reads as closed, so a
+    # second call is a no-op.
     fn close_now():
         if self.is_closed():
             return
         if websocket_close_kind(self) == WS_CLOSE_TCP:
+            websocket_reader(self).free()
+            websocket_writer(self).free()
             TcpStream(websocket_close_handle(self)).close()
-        websocket_mark_closed(self)
+        websocket_reader_handles.remove(self.handle)
+        websocket_writer_handles.remove(self.handle)
+        websocket_client_flags.remove(self.handle)
+        websocket_closed_flags.remove(self.handle)
+        websocket_close_kinds.remove(self.handle)
+        websocket_close_handles.remove(self.handle)
     fn is_closed() -> Bool:
         if websocket_closed_flags.contains_key(self.handle):
             return websocket_closed_flags[self.handle]
@@ -817,3 +844,45 @@ test "websocket receive rejects a message past the size cap":
     assert(result.is_err)
     # the peer was told the message was too big (a close frame was written).
     assert(sink.bytes().len() > 0)
+
+test "websocket close_now deregisters the session":
+    frame_data := text_frame_bytes("ping")!
+    cursor := io.bytes_reader(frame_data)
+    reader := cursor.buffered_chunked(64)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    ws := from_buffered(reader, writer, true)
+    assert(not ws.is_closed())
+    got := ws.recv()!
+    assert_eq(got.to_string_utf8()!, "ping")
+    ws.close_now()
+    assert(ws.is_closed())
+    # the registry entries themselves are gone, not just flagged.
+    assert(not websocket_reader_handles.contains_key(ws.handle))
+    assert(not websocket_closed_flags.contains_key(ws.handle))
+    # a second close is a no-op, and a closed session refuses io.
+    ws.close_now()
+    assert(ws.send_text("late").is_err)
+    reader.free()
+    writer.free()
+    cursor.close()
+    sink.free()
+
+test "websocket close sends a close frame and deregisters":
+    cursor := io.bytes_reader(bytes.empty())
+    reader := cursor.buffered_chunked(64)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    ws := from_buffered(reader, writer, true)
+    wrote := ws.close(1000, "bye")!
+    assert(wrote > 0)
+    assert(ws.is_closed())
+    # the second close finds a deregistered session and reports nothing sent.
+    assert_eq(ws.close(1000, "again")!, 0)
+    frame := parse_frame(sink.bytes())!
+    assert(frame.is_close())
+    assert_eq(frame.close_code()!, 1000)
+    reader.free()
+    writer.free()
+    cursor.close()
+    sink.free()

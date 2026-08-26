@@ -335,24 +335,29 @@ correctness story:
   map literal, an index assignment, a binding, a struct field, a widened
   argument — so a `List[String?]` of built strings reclaims them with the
   container, and a payload the wrap borrowed keeps its owner's count intact.
-  what still leaks is a bare `none` written straight into a container store
-  (`xs.push(none)`, `m[k] = none`), about 62 bytes a store: the shell the
-  caller builds keeps a count the store never takes and the caller never
-  drops. binding it first (`v: String? := none` then `xs.push(v)`) is
-  reclaimed normally.
-- a set or map literal never releases a freshly built element, about 24 bytes
-  each, and both halves of a map literal pay it independently. the same set
-  built with `add`, the same map filled by index assignment, and a list literal
-  over the same strings are all flat (issue #942).
-- three optional shapes still strand a shell. `xs.index_of(v) != none` leaks the
-  optional the search returns, on any list and any element type, about 48 bytes
-  a call — calling `unwrap_or` on the same result is flat (issue #933). a
-  discarded call result of type `List[X]?` leaks its payload, on the generic and
-  non-generic spellings alike, which places it in the discarded-result path
-  rather than the return path (issue #935). and `if let` on an awaited optional
-  leaks its shell, because `await` is not counted as a producer of an owned
-  optional the way a call and a method call are — binding the result and
-  reading it with `unwrap_or` is flat (issue #936).
+  a bare `none` written straight into a container store (`xs.push(none)`,
+  `m[k] = none`) is a shell the caller built, so the store takes that count
+  instead of adding one of its own, the same as a widened plain value.
+- a call result dropped at statement position is reclaimed when it is a result
+  box, an optional shell, or a string, and stranded when it is any other heap
+  kind. a discarded `List[X]` or `Map[K, V]` result leaks the whole container —
+  about 590 bytes a round for a two-element list and a one-entry map together,
+  which is the largest of the ownership leaks still open. the release itself is
+  the same one line the optional shell gets; what is not settled is the set of
+  runtime producers that hand back a borrowed container with no count of their
+  own, and a release aimed at one of those is a use-after-free rather than a
+  leak. bind the result and let the local's cleanup reclaim it.
+- a heap payload behind a *fresh* optional shell that carries no destructor
+  leaks, about one count per extraction. a user function returning `T?` builds
+  its `Some` with a plain allocation and no `__opt_dtor_<kind>`, so the shell
+  holds the only count on the payload and freeing the shell does not drop it;
+  the extraction still takes the retain it would need against a shell that did
+  own the payload. `if let s = maybe():` and `maybe().unwrap_or(d)` both pay it,
+  on a call subject and an awaited one alike, while binding the shell first
+  (`o := maybe()` then `o.unwrap_or(d)`) is flat. narrowing the retain is not
+  the fix on its own: a call that returns a *widened* local shell does carry
+  the destructor, and dropping the retain there would hand out a payload the
+  shell is about to free.
 - a `Set` with an optional element type, and a `Map` with an optional key type,
   are really the string-backed containers reading a shell pointer as a
   c-string, so distinct optionals collapse into one entry. the store and query

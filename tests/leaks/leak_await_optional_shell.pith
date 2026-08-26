@@ -1,0 +1,40 @@
+# an awaited task hands its optional result to the awaiter as a fresh shell,
+# exactly as a call does: the task built the shell with a count of one and
+# pith_await hands that count over. so `if let` has to free the shell at the
+# merge, and the extraction spellings free theirs right after the extract.
+# classifying an awaited subject as borrowed left every one of those shells
+# behind — and the paren an extraction off an await has to be written with
+# (`(await t).unwrap_or(d)`) hid the call-result form the same way.
+#
+# the payloads here are scalars so the case measures the shell alone: a heap
+# payload behind a shell with no destructor is a separate, older leak that
+# this case would otherwise drown in.
+import leakprobe as probe
+
+fn maybe_len(i: Int) -> Int?:
+    if i % 3 == 0:
+        return none
+    return i % 17
+
+fn round(i: Int) -> Int:
+    mut hits := 0
+    t := spawn maybe_len(i)
+    if let n = await t:
+        hits = hits + n
+    u := spawn maybe_len(i + 1)
+    hits = hits + (await u).unwrap_or(0 - 1)
+    v := spawn maybe_len(i * 3 + 1)
+    hits = hits + (await v).value()
+    return hits
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

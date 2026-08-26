@@ -1200,6 +1200,10 @@ MEMCHECK_CASES := \
 	tests/cases/test_result_ok_reclaim \
 	tests/cases/test_os_thread_spawn_reclaim \
 	tests/cases/test_await_ownership \
+	tests/cases/test_await_optional_shell \
+	tests/cases/test_index_search_shell \
+	tests/cases/test_discarded_optional_result \
+	tests/cases/test_literal_fresh_elements \
 	tests/cases/test_yaml_structure tests/cases/test_yaml_malformed \
 	tests/cases/test_yaml_derived_decode \
 	tests/cases/test_concurrent_group \

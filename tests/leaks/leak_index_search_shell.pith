@@ -1,0 +1,56 @@
+# three shapes that build an optional shell nobody names and then drop it on
+# the floor.
+#
+# a list search answers through an optional shell, and comparing that shell
+# against `none` reads one flag out of it and never names it again. nothing
+# freed it, so `xs.index_of(v) != none` stranded a shell per call on any list
+# and any element type — no optional had to be involved for the search to
+# build one. calling `unwrap_or` on the same result was flat, which is what
+# placed the leak in the comparison rather than in the search.
+#
+# the search's target is the second: the scan only reads it, so a freshly
+# built one dies with the scan. that used to be unreachable, because a search
+# compared pointers and a fresh operand could never match; comparing
+# structurally made `xs.contains(a + b)` worth writing and every one of them
+# stranded its operand.
+#
+# the third is a bare `none` written straight into a container store. the
+# caller builds the shell, and a none literal classifies as borrowed, so the
+# store took a count of its own and left the caller's outstanding.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    mut hits := 0
+    xs := [1, 2, 3, 4, 5]
+    if xs.index_of(i % 7) != none:
+        hits = hits + 1
+    if none != xs.index_of(3):
+        hits = hits + 1
+    ss := ["alpha", "beta", "gamma"]
+    if ss.index_of("beta") != none:
+        hits = hits + 1
+    # a fresh string in the search position
+    if ss.contains(probe.fresh_string(i)):
+        hits = hits + 1
+    # two search results compared against each other
+    if xs.index_of(2) == xs.index_of(2):
+        hits = hits + 1
+    # a bare none into a list store and a map store
+    mut opts: List[Int?] := []
+    opts.push(none)
+    opts.push(i)
+    mut m: Map[String, Int?] := {}
+    m["k"] = none
+    return hits + opts.len() + m.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

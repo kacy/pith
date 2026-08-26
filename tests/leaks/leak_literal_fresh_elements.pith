@@ -1,0 +1,36 @@
+# a set literal and a map literal build their elements and then hand them to
+# a store that keeps a copy or takes its own count, so a freshly built element
+# has to die at the store. neither literal did that: the set literal released
+# nothing at all, and both halves of a map entry paid it independently — the
+# key, whose bytes the runtime copies into the map's own storage, and the
+# value, which the plain store took a second count for. the same set built
+# with `add`, the same map filled by index assignment, and a list literal over
+# the same fresh strings were all flat, which is what placed the leak in the
+# two literal emitters rather than in the containers.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    tag := i.to_string()
+    s := {"s-" + tag, "other"}
+    m := {"k-" + tag: "v-" + tag}
+    mi := {i: "v-" + tag}
+    # the flat controls, churned beside the literals so a regression in either
+    # direction shows up in the same number
+    mut s2: Set[String] := {}
+    s2.add("s-" + tag)
+    mut m2: Map[String, String] := {}
+    m2["k-" + tag] = "v-" + tag
+    xs := ["x-" + tag, "other"]
+    return s.len() + m.len() + mi.len() + s2.len() + m2.len() + xs.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

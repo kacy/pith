@@ -1,0 +1,61 @@
+# the optional shells a list search and a container store build, and who frees
+# them. a search answers through a shell; comparing it against `none` reads one
+# flag and never names it again, so the comparison is its only owner. the
+# search's target is the mirror image: the scan only reads it, so a freshly
+# built target dies with the scan while a borrowed one belongs to its binding.
+# and a bare `none` written into a store is a shell the caller built, so the
+# store takes that count rather than adding one of its own.
+#
+# run under valgrind this catches the other direction: `held`, the list
+# elements and the stored optionals all outlive the searches below, so a
+# release any of these paths was not entitled to shows up as an invalid read
+# at the reads after the loop. the printed sum catches a behavior regression.
+
+fn beta_copy() -> String:
+    # a fresh string equal to an element, built at runtime so nothing folds it
+    return "BETA".to_lower()
+
+fn main() -> Int!:
+    mut sum := 0
+    held := "beta"
+    names := ["alpha", "beta", "gamma"]
+    mut store: List[Int?] := []
+    mut m: Map[String, Int?] := {}
+    mut i := 0
+    while i < 400:
+        xs := [1, 2, 3, 4, 5]
+        if xs.index_of(i % 7) != none:
+            sum = sum + 1
+        if none != xs.index_of(3):
+            sum = sum + 2
+        # a borrowed target: the binding keeps its count through every scan
+        if names.contains(held):
+            sum = sum + 3
+        # a fresh target: nothing else ever names it
+        if names.contains(beta_copy()):
+            sum = sum + 4
+        if names.index_of(beta_copy()) != none:
+            sum = sum + 5
+        # a list of optionals, searched with a widened plain value and a none
+        opts: List[Int?] := [1, none, 3]
+        if opts.index_of(3) != none:
+            sum = sum + 6
+        if opts.contains(none):
+            sum = sum + 7
+        # two search results compared against each other
+        if xs.index_of(2) == xs.index_of(2):
+            sum = sum + 8
+        # bare `none` into a list store and a map store, read back below
+        store.push(none)
+        store.push(i % 5)
+        m["a"] = none
+        m["b"] = i % 5
+        i = i + 1
+    # everything the loop searched and stored must still be readable
+    sum = sum + held.len() + names[1].len() + store.len() + m.len()
+    if store[1] != none:
+        sum = sum + 9
+    if m["b"] != none:
+        sum = sum + 10
+    print("sum=" + sum.to_string())
+    return 0

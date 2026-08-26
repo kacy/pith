@@ -2982,6 +2982,18 @@ fn ir_release_weak_shell(operand_idx: Int, shell_r: Int):
     if ir_node_is_weak_field_read(operand_idx):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", shell_r)
 
+# free the shell of an optional operand a comparison is the sole owner of.
+# `xs.index_of(v) != none` mints one shell to answer one flag read and nothing
+# else ever names it, so without this every search-against-none stranded it —
+# on any list and any element type, since no optional has to be involved for
+# the search to build one. the same holds for every other fresh optional in
+# comparison position; a borrowed operand answers false here and is released
+# by whoever owns it. what the shell owns through its destructor goes with it,
+# exactly as it does at an if-let merge.
+fn ir_release_owned_optional_operand(operand_idx: Int, shell_r: Int):
+    if ir_optional_subject_is_owned(operand_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", shell_r)
+
 fn ir_emit_optional_unwrap(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     opt_tid := c_get_expr_type(node.children[0])
@@ -3532,11 +3544,11 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
 # consumer, and they differ on axes that are not accidental.
 #
 #   which node kinds count as a producer. a call and a method call count for
-#   all four. `await` counts for the extraction class (an awaited task hands
-#   its count to the single awaiter) and not for the optional subject — an
-#   omission, filed as its own bug, not a design choice. `struct_init` counts
-#   only for the field receiver, which is the one consumer that can be handed
-#   a construction directly.
+#   all four. `await` counts for the two shell classifiers — an awaited task
+#   hands its count to the single awaiter — and not for the two payload ones,
+#   which ask about a string or a struct header rather than a shell.
+#   `struct_init` counts only for the field receiver, which is the one
+#   consumer that can be handed a construction directly.
 #
 #   whether a generic-body guard applies. three of them consult a type — an
 #   inferred string, an rc kind, a checked tid — so they must refuse inside a
@@ -3544,10 +3556,12 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
 #   guard on purpose: it is purely syntactic, reads the node kind and nothing
 #   else, and so has nothing that specialization could have suppressed.
 #
-#   whether `.value()` is excluded. the two that can end up releasing their
+#   whether `.value()` is excluded. the three that can end up releasing their
 #   receiver exclude it, because `opt.value()` spells like a call and is a
-#   field read that hands back an uncounted view. the other two never release
-#   on that path and do not need the carve-out.
+#   field read that hands back an uncounted view. the extraction class is the
+#   one that does not: it classifies the operand of `!`, `catch` and the
+#   result-flavoured `unwrap_or`, and a result operand is never spelled
+#   `.value()` in the first place.
 #
 #   which rc kinds are in scope. the transferred-call test is strings only,
 #   the field receiver is struct-header kinds only, and the two shell
@@ -3795,10 +3809,12 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
         if left_node.kind == "none_lit" and right_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, right_r)
             ir_release_weak_shell(node.children[1], right_r)
+            ir_release_owned_optional_operand(node.children[1], right_r)
             return r
         if right_node.kind == "none_lit" and left_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, left_r)
             ir_release_weak_shell(node.children[0], left_r)
+            ir_release_owned_optional_operand(node.children[0], left_r)
             return r
         # in a generic impl body, the non-none side's type may be TID_ERR
         # because the struct's type parameters were suppressed at registration;
@@ -3817,6 +3833,8 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
         # so match by inner type rather than by tid.
         if left_info.kind == "optional" and right_info.kind == "optional" and left_info.inner >= 0 and left_info.inner == right_info.inner:
             ir_emit_optional_optional_compare(r, op, left_r, right_r, left_tid)
+            ir_release_owned_optional_operand(node.children[0], left_r)
+            ir_release_owned_optional_operand(node.children[1], right_r)
             return r
         # Inside a generic specialization the check-time tid is the un-
         # specialized generic marker, so left_info.kind isn't "optional"
@@ -3847,10 +3865,12 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
         if left_info.kind == "optional" and left_info.inner >= 0 and ir_plain_compare_operand_ok(right_tid, right_info, right_node):
             ir_emit_optional_plain_compare(r, op, left_r, right_r, left_tid)
             ir_release_owned_operand(node.children[1], right_r, ir_infer_type(node.children[1]))
+            ir_release_owned_optional_operand(node.children[0], left_r)
             return r
         if right_info.kind == "optional" and right_info.inner >= 0 and ir_plain_compare_operand_ok(left_tid, left_info, left_node):
             ir_emit_optional_plain_compare(r, op, right_r, left_r, right_tid)
             ir_release_owned_operand(node.children[0], left_r, ir_infer_type(node.children[0]))
+            ir_release_owned_optional_operand(node.children[1], right_r)
             return r
     return 0 - 1
 
@@ -4181,15 +4201,21 @@ fn ir_emit_list_is_empty_method(node: Node) -> Int:
     list_r := ir_expr(node.children[0])
     return ir_emit_list_is_empty(list_r)
 
-# true when the search target is an optional shell this frame built and
-# nothing else names: a bare `none`, or a plain value the checker widened
-# into the list's optional element type. the scan reads such a shell and
-# keeps nothing, so it goes back at the end of the search rather than being
-# stranded once per call. a shell some other expression produced —
-# `xs.contains(maybe(i))` — is left alone: showing that the caller is its
-# only owner is the general call path's callee walk, and this lowering has
-# no callee to walk.
-fn ir_search_target_is_fresh_shell(expr_idx: Int) -> Bool:
+# true when an expression's register is an optional shell this frame built and
+# nothing else names: a bare `none`, or a plain value the checker widened into
+# the target's optional type. ir_emit_call_arg builds both, so the caller is
+# trivially the shell's only owner, and the two consumers act on that in the
+# two ways available to them. a search reads the shell and keeps nothing, so
+# it goes back at the end of the scan rather than being stranded once per call.
+# a container store takes the caller's count instead of adding one — a bare
+# `none` written straight into a store (`xs.push(none)`, `m[k] = none`)
+# otherwise stranded its shell, because a none literal falls through to the
+# borrowed classification and sent the store down the retaining path.
+#
+# a shell some other expression produced — `xs.contains(maybe(i))` — is left
+# alone: showing that the caller is its only owner is the general call path's
+# callee walk, and neither of these lowerings has a callee to walk.
+fn ir_expr_is_fresh_optional_shell(expr_idx: Int) -> Bool:
     if expr_idx < 0:
         return false
     if c_argument_widens_to_optional(expr_idx):
@@ -4216,8 +4242,17 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
     # a widened shell owns its payload through the destructor
     # ir_emit_value_for_target attached, and a `none` holds nothing, so
     # releasing the shell is the whole of it either way.
-    if ir_search_target_is_fresh_shell(target_idx):
+    if ir_expr_is_fresh_optional_shell(target_idx):
         ir_rc_release_reg(target_r, "tuple")
+    else:
+        # a plain fresh target dies with the scan, exactly as it would with the
+        # call it would otherwise have fed: the loop only reads it. this used to
+        # be unreachable, because a search compared pointers and a fresh operand
+        # could never match; comparing structurally made `xs.contains(a + b)`
+        # and `bs.contains(bytes.from_string_utf8(s))` worth writing, and every
+        # one of them stranded its operand. a shell some other expression
+        # produced is left alone by the tuple carve-out inside the release.
+        ir_release_owned_operand(target_idx, target_r, ir_infer_type(target_idx))
     return out_r
 
 fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
@@ -4709,8 +4744,22 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
     if kind_store.len() > 0 and ir_store_learns_kind(entry_kind):
         tag_r := ir_emit_element_tag_const(entry_kind)
         ir_emit_call4(ir_reg(), kind_store, "void", map_r, k_r, v_r, tag_r)
+        ir_release_owned_index_key(entry.children[0], k_r)
         return
-    ir_emit_call3(ir_reg(), store_name, "void", map_r, k_r, v_r)
+    # both halves of a literal entry follow the rules `m[k] = v` already
+    # follows. the runtime copies the key bytes into the map's own storage, so
+    # a freshly built key dies at the store; and a value the store would take
+    # its own count for goes through the transferring variant, or the entry
+    # ends up with two counts and one release. neither was wired here, so a
+    # literal whose key or value was built on the spot stranded them both,
+    # while the same map filled by index assignment was flat.
+    mut plain_store := store_name
+    if entry_owned and ir_container_store_takes_count(entry_kind):
+        owned_store := ir_owned_container_store_name(store_name)
+        if owned_store.len() > 0:
+            plain_store = owned_store
+    ir_emit_call3(ir_reg(), plain_store, "void", map_r, k_r, v_r)
+    ir_release_owned_index_key(entry.children[0], k_r)
 
 fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     map_r := ir_reg()
@@ -4766,6 +4815,12 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
     for child in node.children:
         elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
+        # a set copies the element bytes into its own storage rather than
+        # keeping the caller's value, so a freshly built element dies right
+        # here. `s.add("s-" + tag)` gets that release from the general call
+        # path; the literal had no such path and stranded one element per
+        # entry, which is why the same set built by adding was flat.
+        ir_release_owned_operand(child, elem_r, ir_infer_type(child))
     return set_r
 
 # the list store that carries the element's kind with it, or "" when this is
@@ -6340,11 +6395,11 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             if value_expr >= 0:
                 mut store_kind := ir_rc_kind(ir_infer_type(value_expr))
                 mut borrowed := ir_expr_is_borrowed(value_expr)
-                # a widened store argument's register is the optional shell
-                # ir_emit_call_arg just built, not the plain value the
-                # expression names: the container learns the tuple kind and
-                # takes this caller's count, whatever the value was.
-                if c_argument_widens_to_optional(value_expr):
+                # a fresh optional shell's register is what ir_emit_call_arg
+                # just built, not the plain value the expression names: the
+                # container learns the tuple kind and takes this caller's
+                # count, whatever the value was.
+                if ir_expr_is_fresh_optional_shell(value_expr):
                     store_kind = "tuple"
                     borrowed = false
                 mut kind_store := ir_map_kind_store_name(emit_name, not borrowed)
@@ -7314,7 +7369,13 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # because nothing told a tagged list from an untagged one.
     idx_store_kind := ir_rc_kind(value_type)
     mut set_name := ir_index_set_call_name(obj_type)
-    idx_borrowed := ir_expr_is_borrowed(value_idx)
+    mut idx_borrowed := ir_expr_is_borrowed(value_idx)
+    # a fresh optional shell is built right here by ir_emit_value_for_target,
+    # so this frame is its only owner however the value itself classifies —
+    # a bare `none` falls through to borrowed and sent the store down the
+    # retaining path, stranding a shell per `m[k] = none`.
+    if ir_expr_is_fresh_optional_shell(value_idx):
+        idx_borrowed = false
     mut idx_kind_store := ir_map_kind_store_name(set_name, not idx_borrowed)
     if idx_kind_store.len() == 0 and idx_borrowed:
         idx_kind_store = ir_list_kind_store_name(set_name)
@@ -8250,6 +8311,18 @@ fn ir_stmt(idx: Int):
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
                 ir_emit_discard_result(r, stmt_tid)
                 return
+            # a discarded optional result is a shell nothing will ever name,
+            # and the caller holds a count on it either way: the callee
+            # retained a borrowed shell on the way out and transferred a fresh
+            # one. so the shell goes back here, and what it owns through its
+            # destructor goes with it — a `List[X]?` handed straight back and
+            # dropped left the caller's own local one count above zero, which
+            # stranded the shell and the list inside it. the payload of a
+            # destructor-less shell is the older leak docs/limitations.md
+            # records and is not this release's to drop.
+            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(idx):
+                ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
+                return
         # a discarded owned string result (a popped element, an unused
         # fresh string) is garbage as soon as the statement ends
         if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx):
@@ -8331,17 +8404,35 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
     ir_emit_match_bindings(pat_idx, subj_r, "")
 
 # true when an optional subject is a fresh shell the consumer owns and must
-# release after use — a call or method-call result mints one (map.get(k), f()).
+# release after use — a call or method-call result mints one (map.get(k), f()),
+# and so does an await: the task built the shell with a count of one and
+# pith_await hands that count to the single awaiter, the same transfer
+# ir_expr_is_borrowed and ir_extraction_operand_class already read it as.
 # borrowed subjects (a variable, field, element, self) are owned at their own
 # scope and released there, so releasing here would double-free. suppressed
 # inside generic/specialized bodies where the shape can't be trusted, mirroring
-# ir_expr_is_transferred_call_temp. one of the four fresh-temporary
-# predicates; see the block above ir_expr_is_transferred_call_temp.
+# ir_expr_is_transferred_call_temp. parens are transparent, as they are for
+# ir_extraction_operand_class: `(await t).unwrap_or(d)` is the only way to
+# spell an extraction off an await, and reading the paren node as an unknown
+# shape left that shell behind. one of the four fresh-temporary predicates;
+# see the block above ir_expr_is_transferred_call_temp.
 fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     if ir_in_generic_body():
         return false
-    kind := node_kind(idx)
-    return kind == "call" or kind == "method_call"
+    node := get_node(idx)
+    if node.kind == "grouped" and node.children.len() > 0:
+        return ir_optional_subject_is_owned(node.children[0])
+    kind := node.kind
+    if kind == "await":
+        return true
+    if kind != "call" and kind != "method_call":
+        return false
+    # an uncounted `.value()` spells like a method call and is a field read:
+    # on a doubly-wrapped optional it hands back the inner shell without
+    # taking a count, so releasing it here would strip the count the outer
+    # shell still holds — the over-release shape this predicate's siblings
+    # already carve out.
+    return not ir_value_extraction_is_uncounted(idx)
 
 # whether an extraction out of the optional `subject_idx` must take its own
 # count on the payload it hands out. both extraction spellings — `.value()`

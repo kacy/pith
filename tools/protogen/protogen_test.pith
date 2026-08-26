@@ -392,6 +392,9 @@ test "the geometry service generates typed client stubs":
     assert(has(out, "pub fn Corners(req: Shape) -> GeometryCornersCall!grpc.GrpcError:"))
     assert(has(out, "self.conn.server_stream("))
     assert(has(out, "pub fn collect() -> List[Point]!grpc.GrpcError:"))
+    # every streaming handle releases its stream and slot through close()
+    assert(has(out, "pub fn close():"))
+    assert(has(out, "self.inner.close()"))
 
     # client-streaming: send / close_send / recv_response
     assert(has(out, "pub struct GeometryAssembleCall:"))

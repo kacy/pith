@@ -1174,6 +1174,9 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
             out.push("                fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
             out.push("            items.push(decoded.ok)")
             out.push("        return items")
+            out.push("    # release the stream and its concurrency slot; call once when done.")
+            out.push("    pub fn close():")
+            out.push("        self.inner.close()")
             out.push("")
         elif rpc.client_streaming and not rpc.server_streaming:
             out.push("# a typed client-stream to {svc.name}.{rpc.name}.")
@@ -1194,6 +1197,9 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
             out.push("        if decoded.is_err:")
             out.push("            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
             out.push("        return decoded.ok")
+            out.push("    # release the stream and its concurrency slot; call once when done.")
+            out.push("    pub fn close():")
+            out.push("        self.inner.close()")
             out.push("")
         elif rpc.client_streaming and rpc.server_streaming:
             out.push("# a typed bidirectional stream for {svc.name}.{rpc.name}.")
@@ -1221,6 +1227,9 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
             out.push("                    fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
             out.push("                items.push(decoded.ok)")
             out.push("        return items")
+            out.push("    # release the stream and its concurrency slot; call once when done.")
+            out.push("    pub fn close():")
+            out.push("        self.inner.close()")
             out.push("")
 
     out.push("# a typed grpc client for the {svc.name} service.")

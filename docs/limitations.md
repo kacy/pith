@@ -394,10 +394,11 @@ correctness story:
   for a container that loses entries (issue #920).
 - several std types must be closed by hand and nothing enforces it. the survey,
   the assessment of what a destructor hook would take, and the staged plan are
-  in docs/destructors_roadmap.md; three registry leaks it found — buffered text
-  readers and writers, websocket, and gRPC streams, which expose no close at
-  all — are issue #925. the E307 lint flags a locally built resource that is
-  never closed and never handed off.
+  in docs/destructors_roadmap.md. the three registry leaks it found (issue
+  #925) — buffered text readers and writers, websocket sessions, and gRPC
+  streams — are fixed: each of those types closes and deregisters now. the
+  E307 lint flags a locally built resource that is never closed and never
+  handed off.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

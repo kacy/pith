@@ -198,6 +198,12 @@ impl Reader for StringReader:
     fn read(max_bytes: Int) -> String!:
         return string_reader_read(self, max_bytes)
 
+impl Closer for StringReader:
+    # drop the reader's registry entries. a closed reader reads as end of
+    # input; a second close is a no-op.
+    fn close():
+        close_string_reader_state(self.handle)
+
 impl StringBuffer:
     fn write(data: String) -> Int!:
         return string_buffer_write(self, data)
@@ -233,6 +239,13 @@ impl Writer for StringBuffer:
     fn write(data: String) -> Int!:
         return string_buffer_write(self, data)
 
+impl Closer for StringBuffer:
+    # drop the buffer's registry entries, discarding the accumulated text —
+    # read string() first. a write or clear after close leaves the buffer
+    # closed and reports nothing written; a second close is a no-op.
+    fn close():
+        close_string_buffer_state(self.handle)
+
 impl BytesCursor:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return bytes_cursor_read(self, max_bytes)
@@ -255,6 +268,12 @@ impl BytesCursor:
 impl BytesReader for BytesCursor:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return bytes_cursor_read(self, max_bytes)
+
+impl Closer for BytesCursor:
+    # drop the cursor's registry entries, releasing the bytes it was built
+    # over. a closed cursor reads as end of input; a second close is a no-op.
+    fn close():
+        close_bytes_cursor_state(self.handle)
 
 impl BytesWriter for ByteBuffer:
     fn write_bytes(data: Bytes) -> Int!:
@@ -560,6 +579,10 @@ fn string_buffer_write_line(buf: StringBuffer, data: String) -> Int!:
     return wrote.ok + wrote_nl.ok
 
 fn string_buffer_reset(buf: StringBuffer):
+    # see string_buffer_write_internal: clearing a closed buffer must not
+    # re-register it.
+    if not string_buffer_parts.contains_key(buf.handle):
+        return
     string_buffer_parts.insert(buf.handle, empty_string_parts())
     string_buffer_lengths.insert(buf.handle, 0)
 
@@ -1036,6 +1059,64 @@ fn allocate_buffered_process_stdout_handle(process_handle: Int, chunk_size: Int)
 fn allocate_buffered_process_stderr_handle(process_handle: Int, chunk_size: Int) -> Int:
     return allocate_buffered_text_reader_handle(TEXT_SOURCE_PROCESS_STDERR, process_handle, chunk_size)
 
+# --- deregistration ---------------------------------------------------------
+#
+# every reader, buffer and cursor above is a handle into threadlocal maps, and
+# a handle is never reissued, so an entry that is not removed lives for the
+# rest of the thread. close() on each type removes its entries; a second close
+# finds nothing and is a no-op. closing a buffered reader or writer releases
+# its registry state only — the stream, buffer or process underneath is closed
+# by whoever built it.
+
+# a String-valued entry is dropped with remove(), which releases the stored
+# text; a Bytes- or List-valued entry is handed to a local by take(), whose
+# cleanup releases it — the same shape free_buffered_bytes_reader uses.
+# (measured, not assumed: take() on a Map[Int, String] strands one count of
+# a fresh value, while remove() is clean, and the Bytes and List maps are
+# exactly the other way around.)
+
+fn close_string_reader_state(handle: Int):
+    string_reader_data.remove(handle)
+    string_reader_offsets.remove(handle)
+
+fn close_string_buffer_state(handle: Int):
+    parts := string_buffer_parts.take(handle)
+    string_buffer_lengths.remove(handle)
+    if parts.len() < 0:
+        return
+
+fn close_bytes_cursor_state(handle: Int):
+    data := bytes_reader_data.take(handle)
+    bytes_reader_offsets.remove(handle)
+    if data.len() < 0:
+        return
+
+# one remover for all five text-reader kinds, matching their one allocator.
+fn close_buffered_text_reader_state(handle: Int):
+    partial := buffered_text_reader_partials.take(handle)
+    buffered_text_reader_cache.remove(handle)
+    buffered_text_reader_kinds.remove(handle)
+    buffered_text_reader_sources.remove(handle)
+    buffered_text_reader_chunk_sizes.remove(handle)
+    buffered_text_reader_cursors.remove(handle)
+    if partial.len() < 0:
+        return
+
+fn close_buffered_string_writer_state(handle: Int):
+    buffered_string_writer_cache.remove(handle)
+    buffered_string_writer_targets.remove(handle)
+    buffered_string_writer_chunk_sizes.remove(handle)
+
+fn close_buffered_tcp_writer_state(handle: Int):
+    buffered_tcp_writer_cache.remove(handle)
+    buffered_tcp_writer_fds.remove(handle)
+    buffered_tcp_writer_chunk_sizes.remove(handle)
+
+fn close_buffered_file_writer_state(handle: Int):
+    buffered_file_writer_cache.remove(handle)
+    buffered_file_writer_handles.remove(handle)
+    buffered_file_writer_chunk_sizes.remove(handle)
+
 fn remaining_after_write(data: String, wrote: Int) -> String:
     if wrote >= data.len():
         return ""
@@ -1436,6 +1517,10 @@ fn string_reader_read_internal(reader: StringReader, max_bytes: Int) -> String!:
 
 fn string_buffer_write_internal(buf: StringBuffer, data: String) -> Int!:
     if data.len() == 0:
+        return 0
+    # a closed buffer stays closed: writing must not re-create the registry
+    # entries close() removed, so it reports nothing written instead.
+    if not string_buffer_parts.contains_key(buf.handle):
         return 0
     string_buffer_append_chunk(buf, data)
     string_buffer_maybe_compact(buf)
@@ -2627,6 +2712,13 @@ impl Reader for BufferedStringReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_string_reader_read(self, max_bytes)
 
+impl Closer for BufferedStringReader:
+    # drop the reader's registry entries, including any buffered text; the
+    # source reader is closed by whoever built it. a closed reader reads as
+    # end of input; a second close is a no-op.
+    fn close():
+        close_buffered_text_reader_state(self.handle)
+
 impl BufferedStringWriter:
     fn write(data: String) -> Int!:
         return buffered_string_writer_write(self, data)
@@ -2644,6 +2736,13 @@ impl Writer for BufferedStringWriter:
 impl Flusher for BufferedStringWriter:
     fn flush() -> Int!:
         return buffered_string_writer_flush(self)
+
+impl Closer for BufferedStringWriter:
+    # drop the writer's registry entries, discarding anything unflushed —
+    # flush() first. the target buffer is closed by whoever built it; a write
+    # after close reports nothing written, and a second close is a no-op.
+    fn close():
+        close_buffered_string_writer_state(self.handle)
 
 impl BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
@@ -2674,6 +2773,13 @@ impl Reader for BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
 
+impl Closer for BufferedTcpStream:
+    # drop the reader's registry entries, including any buffered text; the
+    # socket stays open and is closed by whoever built it. a closed reader
+    # reads as end of input; a second close is a no-op.
+    fn close():
+        close_buffered_text_reader_state(self.handle)
+
 impl BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stdout_read(self, max_bytes)
@@ -2702,6 +2808,13 @@ impl BufferedProcessStdout:
 impl Reader for BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stdout_read(self, max_bytes)
+
+impl Closer for BufferedProcessStdout:
+    # drop the reader's registry entries, including any buffered text; the
+    # process and its pipes are closed by whoever spawned it. a closed reader
+    # reads as end of input; a second close is a no-op.
+    fn close():
+        close_buffered_text_reader_state(self.handle)
 
 impl BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
@@ -2732,6 +2845,13 @@ impl Reader for BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stderr_read(self, max_bytes)
 
+impl Closer for BufferedProcessStderr:
+    # drop the reader's registry entries, including any buffered text; the
+    # process and its pipes are closed by whoever spawned it. a closed reader
+    # reads as end of input; a second close is a no-op.
+    fn close():
+        close_buffered_text_reader_state(self.handle)
+
 impl BufferedTcpWriter:
     fn write(data: String) -> Int!:
         return buffered_tcp_writer_write(self, data)
@@ -2759,6 +2879,14 @@ impl Flusher for BufferedTcpWriter:
     fn flush() -> Int!:
         return buffered_tcp_writer_flush(self)
 
+impl Closer for BufferedTcpWriter:
+    # drop the writer's registry entries, discarding anything unflushed —
+    # flush() first. the socket stays open and is closed by whoever built it;
+    # a write after close reports nothing written, and a second close is a
+    # no-op.
+    fn close():
+        close_buffered_tcp_writer_state(self.handle)
+
 impl BufferedFileReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_file_reader_read(self, max_bytes)
@@ -2775,6 +2903,13 @@ impl BufferedFileReader:
 impl Reader for BufferedFileReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_file_reader_read(self, max_bytes)
+
+impl Closer for BufferedFileReader:
+    # drop the reader's registry entries, including any buffered text; the
+    # file stream stays open and is closed by whoever built it. a closed
+    # reader reads as end of input; a second close is a no-op.
+    fn close():
+        close_buffered_text_reader_state(self.handle)
 
 impl BufferedFileWriter:
     fn write(data: String) -> Int!:
@@ -2793,6 +2928,14 @@ impl Writer for BufferedFileWriter:
 impl Flusher for BufferedFileWriter:
     fn flush() -> Int!:
         return buffered_file_writer_flush(self)
+
+impl Closer for BufferedFileWriter:
+    # drop the writer's registry entries, discarding anything unflushed —
+    # flush() first. the file stream stays open and is closed by whoever
+    # built it; a write after close reports nothing written, and a second
+    # close is a no-op.
+    fn close():
+        close_buffered_file_writer_state(self.handle)
 
 impl ProcessStdin:
     fn write(data: String) -> Int!:
@@ -3263,3 +3406,42 @@ test "io buffered byte streams handle separators and flushes":
     assert_eq(writer.write_bytes(bytes.from_string_utf8("e"))!, 1)
     assert_eq(writer.flush()!, 1)
     assert_eq(out.bytes().to_string_utf8()!, "abcde")
+
+test "io string readers, buffers and cursors deregister on close":
+    reader := string_reader("hello")
+    assert_eq(reader.read(4)!, "hell")
+    reader.close()
+    assert_eq(reader.read(4)!, "")
+    reader.close()
+
+    buf := string_buffer()
+    buf.write("abc")!
+    buf.close()
+    assert_eq(buf.write("more")!, 0)
+    assert_eq(buf.string(), "")
+    buf.close()
+
+    cursor := bytes_reader(bytes.from_string_utf8("xyz"))
+    assert_eq(cursor.read_bytes(2)!.to_string_utf8()!, "xy")
+    cursor.close()
+    assert(cursor.read_bytes(2)!.is_empty())
+    cursor.close()
+
+test "io buffered text readers and writers deregister on close":
+    source := string_reader("line one" + chr(10) + "line two")
+    buffered := source.buffered()
+    assert_eq(buffered.read_line()!, "line one")
+    buffered.close()
+    assert_eq(buffered.read(4)!, "")
+    buffered.close()
+    source.close()
+
+    target := string_buffer()
+    writer := target.buffered_chunked(4)
+    writer.write("abcdef")!
+    writer.flush()!
+    writer.close()
+    assert_eq(writer.write("zz")!, 0)
+    writer.close()
+    assert_eq(target.string(), "abcdef")
+    target.close()

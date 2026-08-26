@@ -565,6 +565,9 @@ impl GeometryCornersCall:
                 fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
             items.push(decoded.ok)
         return items
+    # release the stream and its concurrency slot; call once when done.
+    pub fn close():
+        self.inner.close()
 
 # a typed client-stream to Geometry.Assemble.
 pub struct GeometryAssembleCall:
@@ -584,6 +587,9 @@ impl GeometryAssembleCall:
         if decoded.is_err:
             fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Shape failed")
         return decoded.ok
+    # release the stream and its concurrency slot; call once when done.
+    pub fn close():
+        self.inner.close()
 
 # a typed bidirectional stream for Geometry.Reflect.
 pub struct GeometryReflectCall:
@@ -610,6 +616,9 @@ impl GeometryReflectCall:
                     fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
                 items.push(decoded.ok)
         return items
+    # release the stream and its concurrency slot; call once when done.
+    pub fn close():
+        self.inner.close()
 
 # a typed grpc client for the Geometry service.
 pub struct GeometryClient:

@@ -585,6 +585,11 @@ pub struct Client:
     # STREAM_UNARY event. a streaming stream is never marked, so its events flow
     # incrementally. presence means unary; removed when the stream is forgotten.
     unary: Map[Int, Bool]
+    # streams whose terminal event (end-of-stream or reset) the reader has
+    # delivered. Stream.close() consults it: a finished stream is only
+    # forgotten, while an unfinished one is reset on the wire first. entries
+    # leave in forget().
+    finished: Map[Int, Bool]
     outbound: Channel[Bytes]
     closed: AtomicInt
     mut going_away: Bool
@@ -657,14 +662,31 @@ impl Stream:
             fail "http2: connection closed before the stream completed"
         return opt?
 
-    # abandon the stream: reset it (CANCEL) if it is still open, then drop it from
-    # the client's table and free its concurrency slot. safe to call once done.
-    fn close():
-        rst := frames.rst_stream_frame(self.id, frames.ERROR_CANCEL)
-        if not rst.is_err:
-            wire := frames.frame_bytes(rst.ok)
-            if not wire.is_err:
-                self.client.outbound.send(wire.ok)
+    # release the stream: reset it (CANCEL) on the wire if its terminal event
+    # has not arrived, close its inbox, then drop it from the client's table
+    # and free its concurrency slot. call it once per opened stream when done
+    # with it — the reader does not forget a streaming stream on its own, so
+    # one that is never closed retains its channels, its table entries and a
+    # MAX_CONCURRENT_STREAMS slot for the life of the connection. a finished
+    # stream (end-of-stream or reset already delivered) is released without
+    # touching the wire, so closing a completed rpc sends nothing. a second
+    # close finds the stream gone and is a no-op.
+    pub fn close():
+        self.client.mu.lock()
+        registered := self.client.streams.contains_key(self.id)
+        done := self.client.finished.contains_key(self.id)
+        self.client.mu.unlock()
+        if not registered:
+            return
+        if not done:
+            rst := frames.rst_stream_frame(self.id, frames.ERROR_CANCEL)
+            if not rst.is_err:
+                wire := frames.frame_bytes(rst.ok)
+                if not wire.is_err:
+                    self.client.outbound.send(wire.ok)
+        # a closed inbox still yields its buffered events, so a consumer that
+        # is behind drains what already arrived and then sees the close.
+        self.inbox.close()
         self.client.forget(self.id)
 
 # a placeholder write task for offline clients, which drive the reader directly
@@ -682,6 +704,7 @@ fn client_from_connection(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
     unary_streams: Map[Int, Bool] := {}
+    finished_streams: Map[Int, Bool] := {}
     windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
     outbound := Channel[Bytes](OUTBOUND_CAP)
@@ -691,7 +714,7 @@ fn client_from_connection(conn: Connection) -> Client:
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, unary_streams, outbound, closed, false, 0, writer, reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
+    client := Client(conn, Mutex(), 1, table, ids, unary_streams, finished_streams, outbound, closed, false, 0, writer, reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -884,6 +907,8 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
                 accums.remove(hf.stream_id)
         else:
             deliver(client, hf.stream_id, headers_event(decoded, hf.end_stream))
+            if hf.end_stream:
+                client.mark_finished(hf.stream_id)
         return true
     if t == frames.FRAME_DATA:
         df := frames.parse_data(frame)!
@@ -895,6 +920,8 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
                 accums.remove(df.stream_id)
         else:
             deliver(client, df.stream_id, data_event(df.data, df.end_stream))
+            if df.end_stream:
+                client.mark_finished(df.stream_id)
         # flow control counts the whole frame payload, padding included.
         client.replenish(df.stream_id, frame.header.length, df.end_stream)!
         return true
@@ -926,6 +953,8 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
         if accums.contains_key(rs.stream_id):
             accums.remove(rs.stream_id)
         deliver(client, rs.stream_id, reset_event(rs.error_code))
+        # a reset is terminal: close() must not answer it with a reset of ours.
+        client.mark_finished(rs.stream_id)
         return true
     # PRIORITY, PUSH_PROMISE and unknown types need no action to complete our
     # requests, so they are ignored.
@@ -1351,12 +1380,23 @@ impl Client:
 
     # remove a finished stream from the table and its flow-control state, then
     # free a concurrency slot so a request queued behind the peer's limit can go.
+    # record that the reader delivered `stream_id`'s terminal event, so a
+    # later close() skips the wire reset. only a stream still in the table is
+    # marked — a late frame after forget() must not re-grow the map.
+    fn mark_finished(stream_id: Int):
+        self.mu.lock()
+        if self.streams.contains_key(stream_id):
+            self.finished.insert(stream_id, true)
+        self.mu.unlock()
+
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
             self.streams.remove(stream_id)
         if self.unary.contains_key(stream_id):
             self.unary.remove(stream_id)
+        if self.finished.contains_key(stream_id):
+            self.finished.remove(stream_id)
         if self.send_windows.contains_key(stream_id):
             self.send_windows.remove(stream_id)
         if self.credit.contains_key(stream_id):
@@ -1855,6 +1895,7 @@ fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
     unary_streams: Map[Int, Bool] := {}
+    finished_streams: Map[Int, Bool] := {}
     windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
     gate := Channel[Int](1)
@@ -1863,7 +1904,7 @@ fn offline_client(conn: Connection) -> Client:
     # wait on one that will never run.
     reader_done := Channel[Int](1)
     reader_done.close()
-    return Client(conn, Mutex(), 1, table, ids, unary_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
+    return Client(conn, Mutex(), 1, table, ids, unary_streams, finished_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -2449,3 +2490,37 @@ test "assemble_response_until fails immediately on an already-past deadline":
     result := assemble_response_until(inbox, time.mono_millis() - 1)
     assert(result.is_err)
     assert_eq(result.err, REQUEST_DEADLINE_EXCEEDED)
+
+test "a closed stream leaves the table and frees its concurrency slot":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    stream := client.open_stream_with_fields([hpack.header_field(":method", "POST"), hpack.header_field(":path", "/s"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "t")], false, false)!
+    sid := stream.id
+    # the HEADERS block reached the writer queue.
+    assert(client.outbound.try_recv() != none)
+    assert(client.streams.contains_key(sid))
+    assert_eq(client.active.len(), 1)
+    stream.close()
+    # an unfinished stream is reset on the wire: one queued RST_STREAM.
+    assert(client.outbound.try_recv() != none)
+    assert(not client.streams.contains_key(sid))
+    assert(not client.credit.contains_key(sid))
+    assert(not client.send_windows.contains_key(sid))
+    assert_eq(client.active.len(), 0)
+    # the freed slot poked the waiters' channel.
+    assert(client.slot_free.try_recv() != none)
+    # a second close finds nothing and queues nothing.
+    stream.close()
+    assert(client.outbound.try_recv() == none)
+
+test "closing a finished stream skips the wire reset":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    stream := client.open_stream_with_fields([hpack.header_field(":method", "POST"), hpack.header_field(":path", "/s"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "t")], false, false)!
+    assert(client.outbound.try_recv() != none)
+    client.mark_finished(stream.id)
+    stream.close()
+    # no RST_STREAM queued: the stream's terminal event already arrived.
+    assert(client.outbound.try_recv() == none)
+    assert(not client.streams.contains_key(stream.id))
+    assert(not client.finished.contains_key(stream.id))
+    # recv on the closed inbox reports the close instead of blocking.
+    assert(stream.recv().is_err)

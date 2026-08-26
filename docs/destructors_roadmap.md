@@ -73,10 +73,13 @@ the winner reaches `tcp_close`.
 | `http2.Client` | `close()` | the reader task, the writer task, five channels, and the transport | unguarded |
 | `http2.Stream` | `close()` | the stream's event channel, its credit channel, three map entries, and one `MAX_CONCURRENT_STREAMS` slot | safe |
 | `grpc.Conn`, `grpc.PoolConn` | `close()` | the whole underlying client | — |
-| `grpc.ServerStream` / `ClientStream` / `BidiStream` | **only `close_send()`** | `close_send` half-closes the wire and nothing else: the underlying `http2.Stream` is never closed, so every streaming rpc retains its channels and one concurrency slot permanently | n/a |
+| `grpc.ServerStream` / `ClientStream` / `BidiStream` | `close()` (`close_send()` only half-closes the request stream) | the underlying `http2.Stream`: its event and credit channels, three map entries, and one `MAX_CONCURRENT_STREAMS` slot, retained for the connection's life | safe |
 
-the grpc row is the second finding: `http2.Stream.close()` is not `pub`, so a
-caller could not reach it through the grpc types even knowing it was needed.
+the grpc row used to be the second finding: the stream types offered only
+`close_send()`, and `http2.Stream.close()` was not `pub`, so a caller could
+not release a stream even knowing it was needed. the stream types close now,
+the http/2 close is `pub`, and closing a completed rpc sends nothing — the
+reset only goes on the wire for a stream whose terminal event never arrived.
 
 ### databases
 
@@ -381,10 +384,12 @@ regression pinned at both generic-enum declaration orders.
 ### stage 2 — make std's resource types single-owner
 
 stop reconstructing a wrapper struct from a raw handle, so that one live value
-names one live resource. audit all roughly 45 handle wrappers. close the three
-leaks this survey found on the way through: the `io` buffered text and string
-registries with no removal path, `websocket`'s six threadlocal maps with no
-removes, and grpc's streams never closing their underlying http/2 stream.
+names one live resource. audit all roughly 45 handle wrappers. the three
+registry leaks this survey found — the `io` buffered text and string
+registries, `websocket`'s six threadlocal maps, and grpc's streams never
+closing their underlying http/2 stream — are closed (issue #925): each of
+those types deregisters through a `close()` now. what remains here is the
+single-owner audit itself.
 
 effort: large, and api-visible. this is the real prerequisite, and it is std
 work rather than compiler work.

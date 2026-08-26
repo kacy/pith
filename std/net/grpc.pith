@@ -760,6 +760,14 @@ impl ServerStream:
     pub fn recv() -> StreamMessage!GrpcError:
         return recv_stream_message(self.stream, self.reader)!
 
+    # release the underlying http/2 stream: its event channels, table entries
+    # and MAX_CONCURRENT_STREAMS slot. call it once per stream when done — an
+    # unclosed stream retains all of that for the connection's whole life. a
+    # completed rpc is released without touching the wire; an abandoned one is
+    # reset (CANCEL) so the server stops sending. a second close is a no-op.
+    pub fn close():
+        self.stream.close()
+
 impl Conn:
     # open a server-streaming rpc: send one request message, then read the stream
     # of responses. `full_method` is "/package.Service/Method". call recv() on the
@@ -822,6 +830,15 @@ impl ClientStream:
             got = true
         return message
 
+    # release the underlying http/2 stream and its concurrency slot. distinct
+    # from close_send(), which half-closes the rpc's request sequence on the
+    # wire: close() is the local teardown, called once when done with the
+    # stream — normally after recv_response(). an unclosed stream retains its
+    # channels and a MAX_CONCURRENT_STREAMS slot for the connection's whole
+    # life. a second close is a no-op.
+    pub fn close():
+        self.stream.close()
+
 # a bidirectional-streaming call in progress. the send side (send/close_send) and
 # the receive side (recv) are independent — send goes through the connection's
 # writer task, recv reads this stream's own event channel — so a caller may drive
@@ -845,6 +862,14 @@ impl BidiStream:
     # terminal grpc-status or a reset.
     pub fn recv() -> StreamMessage!GrpcError:
         return recv_stream_message(self.stream, self.reader)!
+
+    # release the underlying http/2 stream and its concurrency slot. distinct
+    # from close_send(): that half-closes the request stream on the wire,
+    # while close() is the local teardown once both directions are done. an
+    # unclosed stream retains its channels and a MAX_CONCURRENT_STREAMS slot
+    # for the connection's whole life. a second close is a no-op.
+    pub fn close():
+        self.stream.close()
 
 impl Conn:
     # open a client-streaming rpc: send a sequence of request messages, then read

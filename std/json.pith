@@ -1551,6 +1551,9 @@ fn json_write(out: StringBuffer, handle: Int) -> Int!:
 
 fn json_encode_result(handle: Int) -> String!:
     out := io.string_buffer()
+    # the buffer is a registry-backed resource; give its entries back on
+    # every exit now that string buffers close.
+    defer out.close()
     json_write(out, handle)!
     return out.string()
 

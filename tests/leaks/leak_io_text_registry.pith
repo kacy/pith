@@ -1,0 +1,50 @@
+# the io text registries: every reader, buffer and cursor is a handle into
+# threadlocal maps, and until close() existed nothing removed the entries —
+# a keep-alive server on the text path grew per connection, per os thread,
+# for the life of the process (issue #925). this churns one of each
+# string-backed type per round and closes it, so a close that misses one of
+# the maps shows up as growth.
+#
+# valgrind sees none of it: a stranded entry stays reachable from its
+# threadlocal map, so it reads as "still reachable" rather than lost.
+import leakprobe as probe
+import std.io as io
+import std.bytes as bytes
+
+fn round(i: Int):
+    reader := io.string_reader("abcdef-{i}")
+    # results are bound, not discarded: a Bytes dropped at statement position
+    # is a documented emitter leak, and it would drown the registry signal.
+    first := reader.read(4) catch ""
+    reader.close()
+
+    buf := io.string_buffer()
+    buf.write("x-{i}") catch 0
+    buf.close()
+
+    cursor := io.bytes_reader(bytes.from_string_utf8("abc"))
+    chunk := cursor.read_bytes(2) catch bytes.empty()
+    cursor.close()
+
+    source := io.string_reader("hello world {i}")
+    buffered := source.buffered()
+    second := buffered.read(5) catch ""
+    buffered.close()
+    source.close()
+
+    target := io.string_buffer()
+    writer := target.buffered()
+    writer.write("y") catch 0
+    writer.close()
+    target.close()
+    if first.len() + chunk.len() + second.len() < 0:
+        return
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

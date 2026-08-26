@@ -1123,7 +1123,13 @@ fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
         consume_chunk_line_ending(reader)
 
 fn decode_chunked_body(raw: Bytes) -> Bytes!:
-    return read_chunked_body(io.bytes_reader(raw).buffered_chunked(64), 0)!
+    # this runs once per chunked response, so the cursor and reader must give
+    # their registry entries back or a client accumulates two per body.
+    cursor := io.bytes_reader(raw)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(64)
+    defer reader.free()
+    return read_chunked_body(reader, 0)!
 
 fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:

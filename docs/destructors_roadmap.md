@@ -42,11 +42,14 @@ request, so a forgotten close is a leak per request.
 | `TcpStream` | `close()` | the socket fd and its reactor registration | **unsafe** |
 | `Process` | `close()` | the process-handle entry, up to three pipe fds, and the child goes unreaped | safe |
 | `BufferedBytesReader` / `BufferedBytesWriter` | `free()` | four threadlocal map entries each, including the cached `Bytes` | safe |
-| `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | **none** | their threadlocal registries have no removal path at all | n/a |
+| `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | `close()` | the type's threadlocal registry entries — two to six map entries each, including any cached text | safe |
 
-the last row is a finding rather than a design constraint: a keep-alive server
-on the buffered text path accumulates registry entries for the life of the
-process, per os thread, with no call it could make to stop it.
+the last row used to read "none": those registries had no removal path at all,
+so a keep-alive server on the buffered text path accumulated entries for the
+life of the process, per os thread, with no call it could make to stop it.
+each of the types closes now (through `io.Closer`), a closed reader reads as
+end of input, and a closed writer reports nothing written rather than
+re-registering itself.
 
 ### sockets, listeners and admission slots
 

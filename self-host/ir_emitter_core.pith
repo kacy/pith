@@ -2638,6 +2638,18 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
             return declared
     if ir_is_bool_returning_method(meth):
         return "bool"
+    # `to_string` on a scalar kind mints a fresh string. a concrete body never
+    # asks (the checker typed the call); inside a generic specialization the
+    # checked types are suppressed and the receiver's kind is the substituted
+    # one the emitter tracks, so answer from it directly — the retkind is what
+    # pairs the fresh buffer with a release, and "unknown" here leaked every
+    # such temporary (issue #949). gated on the scalar kinds only: a string
+    # receiver lowers to identity (no fresh buffer, the receiver register
+    # itself), so kinding it would hand the borrow classifier a value it
+    # releases out from under the receiver's owner; an unresolved receiver
+    # stays unknown rather than guessed at.
+    if meth == "to_string" and (obj_type == "int" or obj_type == "float" or obj_type == "bool"):
+        return "string"
     string_type := ir_known_string_method_return_type(meth)
     if string_type.len() > 0:
         return string_type

@@ -420,6 +420,12 @@ pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
         elif obj_is_int:
             emit_name = "int_to_string"
         elif obj_is_string:
+            # identity hands back the receiver register itself — no fresh
+            # buffer — so its result must never be given an rc kind (the
+            # known-return-kind tables deliberately skip string-receiver
+            # to_string): a kinded identity result classifies owned, and the
+            # consumer's release would strip a count the receiver's owner
+            # still holds.
             emit_name = "identity"
     elif obj_is_string:
         emit_name = ir_method_string_emit_name(mname)

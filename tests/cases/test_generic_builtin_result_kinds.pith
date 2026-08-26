@@ -1,0 +1,114 @@
+# a builtin call inside a generic body must lower with its real result kind,
+# not "unknown": the kind is what pairs the fresh buffer a builtin hands back
+# with a release, and what routes the value through the owned-result
+# conventions (a bind, a return, an argument, a container store, a chained
+# receiver). each shape below runs at a heap type argument and at Int, and
+# prints the value so a wrong representation (a heap address, a corrupted
+# buffer) breaks the golden rather than passing silently.
+import std.bytes as bytes
+
+fn take(s: String) -> Int:
+    return s.len()
+
+fn concat_temp[T](marker: T, i: Int) -> Int:
+    return ("payload-" + i.to_string()).len()
+
+fn chained_len[T](marker: T, i: Int) -> Int:
+    return i.to_string().len()
+
+fn passed[T](marker: T, i: Int) -> Int:
+    return take(i.to_string())
+
+fn returned[T](marker: T, i: Int) -> String:
+    return i.to_string()
+
+fn bound[T](marker: T, i: Int) -> String:
+    s := i.to_string()
+    return s
+
+fn stored[T](marker: T, i: Int) -> Int:
+    mut xs: List[String] := []
+    xs.push(i.to_string())
+    return xs[0].len()
+
+fn chained_builtin[T](marker: T, i: Int) -> String:
+    return i.to_string().repeat(2)
+
+fn string_recv[T](marker: T, s: String) -> String:
+    return s.trim().substring(0, 3)
+
+fn list_recv[T](marker: T, xs: List[String]) -> Int:
+    return xs.slice(0, 1).len()
+
+fn map_recv[T](marker: T, m: Map[String, Int]) -> Int:
+    return m.keys().len()
+
+fn bytes_recv[T](marker: T, b: Bytes) -> Int:
+    return b.slice(0, 2).len()
+
+fn other_prims[T](marker: T, f: Float, flag: Bool) -> String:
+    return f.to_string() + "/" + flag.to_string()
+
+# a string receiver's to_string is an identity lowering: the result IS the
+# receiver register, so it must stay unkinded — a kinded identity result
+# classifies owned and the owned-arg release would free the borrowed
+# receiver. bound and read after, and passed straight as an argument.
+fn str_identity[T](marker: T, s: String) -> Int:
+    t := s.to_string()
+    return take(t) + take(s.to_string()) + s.len()
+
+fn main():
+    xs := ["alpha", "beta"]
+    m: Map[String, Int] := {"one": 1, "two": 2}
+    b := bytes.from_string_utf8("abcdef")
+    tag := "h"
+    padded := "  padded  "
+    quoted := "  quoted  "
+
+    print("concat_temp")
+    a1 := concat_temp(tag, 41)
+    a2 := concat_temp(1, 41)
+    print("{a1} {a2}")
+    print("chained_len")
+    c1 := chained_len(tag, 12345)
+    c2 := chained_len(1, 12345)
+    print("{c1} {c2}")
+    print("passed")
+    p1 := passed(tag, 678)
+    p2 := passed(1, 678)
+    print("{p1} {p2}")
+    print("returned")
+    print(returned(tag, 90))
+    print(returned(1, 91))
+    print("bound")
+    print(bound(tag, 92))
+    print(bound(1, 93))
+    print("stored")
+    s1 := stored(tag, 9400)
+    s2 := stored(1, 9400)
+    print("{s1} {s2}")
+    print("chained_builtin")
+    print(chained_builtin(tag, 7))
+    print(chained_builtin(1, 8))
+    print("string_recv")
+    print(string_recv(tag, padded))
+    print(string_recv(1, quoted))
+    print("list_recv")
+    l1 := list_recv(tag, xs)
+    l2 := list_recv(1, xs)
+    print("{l1} {l2}")
+    print("map_recv")
+    k1 := map_recv(tag, m)
+    k2 := map_recv(1, m)
+    print("{k1} {k2}")
+    print("bytes_recv")
+    b1 := bytes_recv(tag, b)
+    b2 := bytes_recv(1, b)
+    print("{b1} {b2}")
+    print("other_prims")
+    print(other_prims(tag, 1.5, true))
+    print(other_prims(1, 2.5, false))
+    print("str_identity")
+    si1 := str_identity(tag, padded)
+    si2 := str_identity(1, padded)
+    print("{si1} {si2}")

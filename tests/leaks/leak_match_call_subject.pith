@@ -1,0 +1,63 @@
+# a match on a direct call subject used to strand the subject's own count:
+# `match mk(i):` left the returned enum box (and everything its destructor
+# owned) alive forever, where the same match on a bound local was flat —
+# about 190 bytes a round across the two shapes here, 112 mb over 600k
+# rounds. the subject is now released inside the match once the taken arm
+# has bound (and counted) its payload. the string-payload optional from a
+# user call is deliberately absent: its destructor-less shell still strands
+# the payload count (the open half of #950, shared with every extraction
+# spelling), and a known-leaking shape must not sit in a gate case.
+import leakprobe as probe
+
+enum Shape:
+    Dot
+    Tag(String)
+
+fn mk(i: Int) -> Shape:
+    if i % 2 == 0:
+        return Shape.Dot
+    return Shape.Tag("t-" + i.to_string())
+
+fn make(i: Int) -> Int?:
+    if i % 5 == 4:
+        return none
+    return i * 3
+
+# enum box subject from a call: the box dies inside the match, its
+# destructor freeing the payload the arm binding no longer needs
+fn enum_subject(i: Int) -> Int:
+    b := match mk(i):
+        Shape.Dot => 0
+        Shape.Tag(s) => s.len()
+    return b
+
+# optional subject from a call, plain payload: the 3-slot shell dies
+# inside the match
+fn opt_subject(i: Int) -> Int:
+    a := match make(i):
+        none => 0
+        v => v
+    return a
+
+# the bound-local twin stays flat through its own cleanup
+fn local_subject(i: Int) -> Int:
+    h := mk(i)
+    b := match h:
+        Shape.Dot => 0
+        Shape.Tag(s) => s.len()
+    return b
+
+fn round(i: Int) -> Int:
+    return enum_subject(i) + opt_subject(i) + local_subject(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

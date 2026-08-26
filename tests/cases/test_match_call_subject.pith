@@ -1,0 +1,62 @@
+# match on a call-produced subject: the subject's count is released inside
+# the match once the taken arm has bound (and counted) what it needs — in
+# expression position, at statement position, in a tail match, and past a
+# failing guard. the values printed back prove the arm bindings and the
+# match results survive that release intact.
+
+enum Shape:
+    Dot
+    Tag(String)
+
+fn mk(i: Int) -> Shape:
+    if i % 2 == 0:
+        return Shape.Dot
+    return Shape.Tag("t-" + i.to_string())
+
+fn opt_name(i: Int) -> String?:
+    if i % 5 == 4:
+        return none
+    return "name-" + i.to_string()
+
+# tail match on an enum call subject
+fn pick(i: Int) -> Int:
+    match mk(i):
+        Shape.Dot => 0 - 1
+        Shape.Tag(s) => s.len()
+
+# guards: a failing guard hands a live subject to the next arm's test
+fn guarded(i: Int) -> String:
+    out := match opt_name(i):
+        none => "none"
+        v if v.len() > 6 => "long:" + v
+        v => "short:" + v
+    return out
+
+# statement position: the discarded match still frees its subject
+fn stmt_match(i: Int) -> Int:
+    match mk(i):
+        Shape.Dot => 0
+        Shape.Tag(s) => s.len()
+    return 1
+
+# an escaping payload: the arm's expression is the binding itself
+fn escape(i: Int) -> String:
+    match opt_name(i):
+        none => "fell-through"
+        v => v
+
+fn main():
+    print("pick_even=" + pick(2).to_string())
+    print("pick_odd=" + pick(13).to_string())
+    print("guarded_none=" + guarded(4))
+    print("guarded_long=" + guarded(13))
+    print("guarded_short=" + guarded(1))
+    print("stmt=" + stmt_match(3).to_string())
+    print("escape_none=" + escape(9))
+    print("escape_some=" + escape(21))
+    mut sum := 0
+    mut i := 0
+    while i < 200:
+        sum = sum + pick(i) + stmt_match(i) + guarded(i).len() + escape(i).len()
+        i = i + 1
+    print("sum=" + sum.to_string())

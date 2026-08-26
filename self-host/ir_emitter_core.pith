@@ -7757,10 +7757,17 @@ fn ir_emit_grouped_expr(node: Node) -> Int:
 fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "match_expr":
+        # a call-produced subject arrives with a count nothing else claims,
+        # and the match emitters are where it can be released — a bound
+        # local's count belongs to the local's own cleanup instead. the
+        # classification is the extraction pair's: a fresh temporary per
+        # ir_optional_subject_is_owned, refined by ir_expr_is_borrowed so a
+        # builtin that hands back a borrow stays untouched.
+        subj_owned := node.children.len() > 0 and ir_optional_subject_is_owned(node.children[0]) and not ir_expr_is_borrowed(node.children[0])
         if idx == ir_tail_match_node:
-            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block)
+            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
             return ir_emit_zero_value()
-        return ir_emit_match_expr(idx, node, ir_expr, ir_block)
+        return ir_emit_match_expr(idx, node, ir_expr, ir_block, subj_owned)
     if kind == "if_expr":
         return ir_emit_if_expr(node, ir_expr)
     if kind == "method_call":

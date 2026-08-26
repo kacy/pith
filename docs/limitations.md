@@ -374,7 +374,8 @@ correctness story:
   its `Some` with a plain allocation and no `__opt_dtor_<kind>`, so the shell
   holds the only count on the payload and freeing the shell does not drop it;
   the extraction still takes the retain it would need against a shell that did
-  own the payload. `if let s = maybe():` and `maybe().unwrap_or(d)` both pay it,
+  own the payload. `if let s = maybe():`, `match maybe():` with a binding arm,
+  and `maybe().unwrap_or(d)` all pay it,
   on a call subject and an awaited one alike, while binding the shell first
   (`o := maybe()` then `o.unwrap_or(d)`) is flat. narrowing the retain is not
   the fix on its own: a call that returns a *widened* local shell does carry

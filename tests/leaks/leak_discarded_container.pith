@@ -1,0 +1,40 @@
+# a bare List/Map/Set result discarded at statement position used to strand
+# the whole container: a user function's return transfers a count nobody
+# dropped, and the builtin producers (keys(), values(), split(), the fresh
+# copies) hand back containers on the same terms — about 590 bytes a round
+# for the shapes here, the largest ownership leak that was still open. the
+# discard now releases the count on the classifier's terms; the get_default
+# spelling stays balanced because its call site retains the result it may
+# hand back out of the map itself.
+import leakprobe as probe
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1]
+
+fn mkm(i: Int) -> Map[String, Int]:
+    mut m: Map[String, Int] := {}
+    m.insert("k-" + i.to_string(), i)
+    return m
+
+fn round(i: Int) -> Int:
+    mk(i)
+    mkm(i)
+    mut m: Map[String, Int] := {}
+    m.insert("a", i)
+    m.keys()
+    m.values()
+    m.get_default("a", 0)
+    "a,b,c".split(",")
+    return m["a"]
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

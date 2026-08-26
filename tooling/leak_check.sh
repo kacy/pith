@@ -41,6 +41,7 @@ cases=(
   tests/leaks/leak_returned_shell_dtor
   tests/leaks/leak_weak_if_let_shell
   tests/leaks/leak_match_call_subject
+  tests/leaks/leak_discarded_container
   tests/leaks/leak_generic_builtin_result
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_generic_body_construction

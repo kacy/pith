@@ -1,0 +1,36 @@
+# container results discarded at statement position are released — and the
+# spellings that hand back a value someone else still owns are not. the
+# containers are read back after every discard, so an over-release corrupts
+# the printed values or crashes.
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1]
+
+fn main():
+    mut xs: List[Int] := [3, 1, 2]
+    # a void method's value is the receiver handed back: not released
+    xs.reverse()
+    xs.push(7)
+    mut m: Map[String, List[Int]] := {}
+    mut inner: List[Int] := [9, 8]
+    m.insert("k", inner)
+    # get_default may hand back the map's own value; the call-site retain
+    # balances the discard release, so the map's count survives
+    m.get_default("k", [])
+    m.keys()
+    m.values()
+    mk(41)
+    "x,y,z".split(",")
+    held := m.get_default("k", [])
+    print("xs=" + xs.len().to_string() + "," + xs[0].to_string() + "," + xs[2].to_string())
+    print("held=" + held.len().to_string() + "," + held[0].to_string())
+    print("map=" + m["k"].len().to_string() + "," + m["k"][1].to_string())
+    mut total := 0
+    mut i := 0
+    while i < 300:
+        m.get_default("k", [])
+        m.keys()
+        mk(i)
+        total = total + m["k"][0]
+        i = i + 1
+    print("total=" + total.to_string())

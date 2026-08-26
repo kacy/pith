@@ -8417,9 +8417,33 @@ fn ir_stmt(idx: Int):
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(idx):
                 ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
                 return
+            # a discarded plain container result is a count nobody will ever
+            # release. a user function transfers its result out (the callee
+            # retains a returned borrow, transfers a fresh container), and
+            # the builtin container producers hand back either a freshly
+            # built list/map/set (keys(), values(), to_list(), split(), the
+            # slice/sort copies, args()) or a count taken over the call
+            # (get_default, which the call site retains; take, which the
+            # map relinquishes) — the same classification every binding of
+            # these results already relies on. the one spelling whose
+            # register is NOT a count of its own is a void method's: its
+            # value is the receiver handed back for chaining, so that keeps
+            # its leak rather than freeing a container out from under its
+            # owner. a generic body's types are suppressed and prove
+            # nothing, so it keeps the old leak too.
+            if not ir_in_generic_body():
+                stmt_kind := ir_rc_kind(ir_infer_type(idx))
+                if (stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set") and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+                    ir_rc_release_reg(r, stmt_kind)
+                    return
         # a discarded owned string result (a popped element, an unused
-        # fresh string) is garbage as soon as the statement ends
-        if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx):
+        # fresh string) is garbage as soon as the statement ends. the
+        # receiver guard matters here too: `xs.reverse()` shares its name
+        # with String.reverse, the name-keyed inference calls its value a
+        # fresh string, and the release this used to emit was a cstring
+        # release aimed at a live list handle — an invalid free on any
+        # discarded void-method statement whose name a string method shares.
+        if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
             ir_string_release_reg(r)
         return
 
@@ -8444,6 +8468,26 @@ fn ir_stmt(idx: Int):
         return
 
     ir_stmt_control(idx, node)
+
+# true when a discarded method result register is really the receiver handed
+# back: a void builtin method (`xs.reverse()`, `m.clear()`) forces its
+# retkind to void and returns the receiver register so chains work (see
+# ir_emit_method_call). that register carries the receiver's count, not a
+# fresh one, and a discard release would strip a count its owner still
+# holds. resolution mirrors ir_expr_is_borrowed's method_call branch: a
+# module-qualified call and a user impl method both transfer and answer
+# false; only a resolved builtin's emit name is asked.
+fn ir_discard_value_is_receiver(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return false
+    if ir_resolve_module_alias_method_call_name(idx).len() > 0:
+        return false
+    mname := ir_plain_method_name(node.value)
+    recv_type := ir_method_receiver_type(node)
+    if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
+        return false
+    return ir_is_void_method(ir_method_emit_name(mname, recv_type))
 
 fn ir_emit_if_stmt(node: Node):
     mut elif_indices: List[Int] := []

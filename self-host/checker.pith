@@ -3612,12 +3612,16 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
 # check a Channel[T]() constructor call — resolves the type argument
 # and returns the channel type id
 fn check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id: Int) -> Int:
-    # index_node.children[1] is the type argument (e.g. "Int" in Channel[Int])
+    # index_node.children[1] is the type argument (e.g. "Int" in Channel[Int]).
+    # the payload is written in expression position, so a parameterized type
+    # arrives as an index node (Holder[String], List[Int]) and an optional as
+    # an unwrap — the shapes every other explicit type argument takes, resolved
+    # by the same helper. anything else is not a type.
     type_arg_node := get_node(index_node.children[1])
-    if type_arg_node.kind != "ident":
-        report_error("E210", "Channel type argument must be a type name")
+    if type_arg_node.kind != "ident" and type_arg_node.kind != "index" and type_arg_node.kind != "unwrap":
+        report_error("E210", "Channel type argument must be a type")
         return TID_ERR
-    inner_tid := resolve_named_type(type_arg_node.value)
+    inner_tid := resolve_explicit_type_arg(index_node.children[1])
     if is_error_type(inner_tid):
         return TID_ERR
     if arg_indices.len() > 1:

@@ -202,9 +202,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   rejected by the backend with `unknown load source 'assert'`. put the
   assertion in a function the closure calls, or use `std.testing`'s recording
   assertions, which are ordinary calls.
-- **a generic instance cannot be a channel payload** — `Channel[Holder[String]](2)`
-  reports E210, because the channel constructor accepts only a bare identifier
-  payload and a parameterized type argument parses as an expression (issue #946).
 - **a generic function body releases only the locals that cannot escape it** —
   an instantiation re-emits a body the checker skipped, so every expression in
   it reports the error type and the emitter's ownership classification has

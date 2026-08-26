@@ -1,0 +1,25 @@
+# a generic instance sent as the channel payload itself. the send hands the
+# instance and its heap string to the receiver, and the receiver's extract
+# has to release both exactly once per round. before the constructor
+# accepted a parameterized payload this shape could not be written, so no
+# case churned it.
+import leakprobe as probe
+
+struct Holder[T]:
+    pub item: T
+
+fn churn_round(i: Int, ch: Channel[Holder[String]]) -> Int:
+    ch.send(Holder("payload-" + (i % 8).to_string()))
+    got := ch.recv()
+    return got.value().item.len()
+
+fn main():
+    n := probe.rounds()
+    ch := Channel[Holder[String]](2)
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + churn_round(i, ch)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

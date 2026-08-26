@@ -1,0 +1,33 @@
+# a channel payload written as a parameterized type. the constructor used to
+# require a bare identifier (E210), so a generic instance, a builtin
+# container and an optional could not be sent as themselves. each one
+# constructs, round-trips, and hands the receiver a payload that is still
+# alive and still its own — two buffered sends per shape so distinct
+# instances cannot silently collapse into one.
+
+struct Holder[T]:
+    pub item: T
+
+fn main():
+    ch := Channel[Holder[String]](2)
+    ch.send(Holder("sent-one"))
+    ch.send(Holder("sent-two"))
+    first := ch.recv()
+    second := ch.recv()
+    print(first.value().item)
+    print(second.value().item)
+
+    xs := Channel[List[Int]](2)
+    xs.send([1, 2, 3])
+    got := xs.recv().value()
+    print("{got.len()}:{got[0]}:{got[2]}")
+
+    opts := Channel[Int?](2)
+    some_v: Int? := 7
+    opts.send(some_v)
+    none_v: Int? := none
+    opts.send(none_v)
+    a := opts.recv().value()
+    b := opts.recv().value()
+    print("{a.unwrap_or(0)}")
+    print("{b.unwrap_or(0 - 1)}")

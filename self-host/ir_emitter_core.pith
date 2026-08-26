@@ -1605,6 +1605,25 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
                     return false
                 mi = mi + 1
             return true
+    # an `if let` / `while let` bare binding on an OPTIONAL local is the same
+    # contract as the match above: the condition reads the shell's flag, and
+    # the payload binding owns its own retained count (taken at bind, tracked
+    # by the prepass, released by the exit cleanup) — so the local stays the
+    # last owner of the count the shell arrived with, and its cascade releases
+    # the payload even on the path where the condition fails and the binding
+    # never fires. bodies and the else block are judged by the ordinary
+    # rules. a RESULT subject and a variant pattern stay disqualifying.
+    if not is_result and (node.kind == "if_let" or node.kind == "while_let") and node.children.len() > 1:
+        let_subj := get_node(node.children[1])
+        if let_subj.kind == "ident" and let_subj.value == name:
+            let_pat := get_node(node.children[0])
+            if let_pat.kind == "pat_binding":
+                mut li := 2
+                while li < node.children.len():
+                    if not ir_tuple_uses_all_safe(node.children[li], name, is_result):
+                        return false
+                    li = li + 1
+                return true
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
@@ -1922,6 +1941,32 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                     if pn.kind == "pat_binding":
                         ir_prepass_track_or_poison(pn.value, payload_kind, names, poisoned)
                 ai = ai + 1
+    # an `if let` / `while let` bare binding on an optional subject binds the
+    # unwrapped payload the way a match arm does, and ir_emit_let_bindings
+    # gives an rc payload its own count on the terms of the shared
+    # counted-extraction gate (ir_extraction_retains). track the name so the
+    # prologue zero-stores it and the exit cleanup releases it (or a return
+    # transfers it), under the same name-conflict poisoning as every other
+    # owned local.
+    if (node.kind == "if_let" or node.kind == "while_let") and node.children.len() > 1:
+        let_pat := get_node(node.children[0])
+        if let_pat.kind == "pat_binding":
+            let_tid := ir_emission_tid(node.children[1])
+            if let_tid >= 0 and get_type_info(let_tid).kind == "optional":
+                let_kind := ir_rc_kind(ir_type_from_tid(get_type_info(let_tid).inner))
+                # a tuple payload is an inner optional shell whose count stays
+                # with its owner (a container element, an outer shell).
+                # tracking it would enroll the name in the tuple shell-only
+                # machinery and flip the downstream extraction gate to
+                # transfer semantics, stripping a count the owner still holds
+                # — a use-after-free on `if let v = m.get(k)` over optional
+                # map values. poison the name instead: no exit release of any
+                # kind, and the binding stays the uncounted view it was.
+                if let_kind == "tuple":
+                    if not poisoned.contains(let_pat.value):
+                        poisoned.push(let_pat.value)
+                else:
+                    ir_prepass_track_or_poison(let_pat.value, let_kind, names, poisoned)
     # a match arm's payload bindings are owned locals too: ir_match_emit
     # retains each rc payload, so track them here for the exit cleanup to
     # release (or transfer on escape), same as any other owned local.
@@ -8411,6 +8456,29 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 inner_kind := ir_type_from_tid(info.inner)
                 if inner_kind.len() > 0:
                     ir_var_types.insert(pat.value, inner_kind)
+                # give the binding its own count on an rc payload, asking the
+                # shared counted-extraction gate the other extraction
+                # spellings ask: the subject's shell or cascade can die while
+                # the binding lives on, and the exit cleanup (or a return's
+                # transfer) releases what the binding holds. the
+                # release-of-previous mirrors ir_bind_owned_rc_payload — zero
+                # on first reach, a stale payload when a loop rebinds the
+                # name — and an untracked name skips it, keeping the retain
+                # as a bounded leak in the safe direction. when the gate
+                # answers no — a shell-only local whose cleanup releases the
+                # shell alone — the binding takes over the payload's existing
+                # count instead, and the exit release balances that.
+                # a tuple payload (an inner optional shell) is skipped on
+                # the same terms the prepass poisons it: its count belongs to
+                # its owner and the binding is an uncounted view.
+                rc_kind := ir_rc_kind(inner_kind)
+                if rc_kind.len() > 0 and rc_kind != "tuple":
+                    if not ir_untracked_rc_binds.contains(pat.value):
+                        old_r := ir_reg()
+                        ir_emit("load " + old_r.to_string() + " " + pat.value)
+                        ir_rc_release_reg(old_r, rc_kind)
+                    if ir_extraction_retains(subj_idx, rc_kind, ir_optional_subject_is_owned(subj_idx)):
+                        ir_rc_retain_reg(val_r, rc_kind)
         ir_emit("store " + pat.value + " " + val_r.to_string())
         return
     ir_emit_match_bindings(pat_idx, subj_r, "")
@@ -8447,10 +8515,10 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     return not ir_value_extraction_is_uncounted(idx)
 
 # whether an extraction out of the optional `subject_idx` must take its own
-# count on the payload it hands out. both extraction spellings — `.value()`
-# and `unwrap_or` — answer through here, so a consumer that treats a
-# heap-kind extraction as owned never strips a count the subject still
-# claims. a fresh subject's shell is freed right after the extract, so the
+# count on the payload it hands out. every extraction spelling — `.value()`,
+# `unwrap_or`, and an `if let` / `while let` binding — answers through here,
+# so a consumer that treats a heap-kind extraction as owned never strips a
+# count the subject still claims. a fresh subject's shell is freed right after the extract, so the
 # payload must outlive it; a parameter, field or element subject keeps its
 # count with its owner (the caller, the shell's destructor, the container);
 # a widened shell releases the payload through its `__opt_dtor_<kind>`; and a
@@ -8475,9 +8543,9 @@ fn ir_emit_if_let_stmt(node: Node):
         return
     subj_r := ir_expr(node.children[1])
     # a fresh optional (a call/method result) is an owned shell; the binding
-    # below borrows its value into the loop-style scope, so the shell is
-    # released once at the merge — mirroring the for-each next() path — instead
-    # of leaking one shell (and its payload) per evaluation.
+    # below takes its own count on an rc payload, so the shell is released
+    # once at the merge — mirroring the for-each next() path — instead of
+    # leaking one shell per evaluation.
     owns_subject := ir_optional_subject_is_owned(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)
     then_l := ir_label()

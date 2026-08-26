@@ -1,0 +1,28 @@
+# one name, two kinds: `v` is a tracked string local in one branch and an
+# `Int?` payload binding in the other. the rc prepass poisons the name — no
+# exit release of either kind — because a string release of whatever integer
+# the binding stored last walks a non-pointer. this used to segfault within
+# a thousand rounds; the totals pin the values and the round count keeps the
+# churn high enough that a wrong-kind release cannot hide.
+
+fn maybe_int(i: Int) -> Int?:
+    if i % 3 == 0:
+        return none
+    return i % 17
+
+fn round(i: Int) -> Int:
+    mut n := 0
+    if i % 2 == 0:
+        v := "held-" + i.to_string()
+        n = v.len()
+    if let v = maybe_int(i):
+        n = n + v
+    return n
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 5000:
+        total = total + round(i)
+        i = i + 1
+    print("total=" + total.to_string())

@@ -1,0 +1,182 @@
+# a struct built inside a generic body, from values the body itself allocated.
+#
+# a generic body is never type checked, so the checker's answer for every
+# expression in one is the error sentinel — type id 15, a positive number
+# rather than a negative one. the emitter asked whether a call was a struct
+# construction by reading that answer's kind, got "primitive", and sent the
+# construction to the backend constructor instead of the inline path. the
+# backend constructor stores its arguments raw: the field takes no count of its
+# own and the instance gets no destructor. the call site then released the
+# temporary it had just built, so the field pointed at freed memory — a list or
+# map field died loudly on the next read, a string field kept answering with
+# whatever the allocator had put there since.
+#
+# every field shape is built below inside a generic body and read back, both by
+# bare name and through an import alias, and each has its concrete twin beside
+# it printing the same line. a borrowed value — a bound local, a parameter, a
+# whole struct — must gain a count rather than be handed over, so the two lines
+# stay equal there too.
+import generic_body_construction_helper as shapes
+
+struct Local:
+    pub label: String
+
+struct Bag:
+    pub items: List[String]
+
+struct Table:
+    pub rows: Map[String, String]
+
+struct Pair:
+    pub head: String
+    pub rest: List[String]
+
+struct Holder:
+    pub inner: Local
+
+struct Wrap[V]:
+    pub value: V
+    pub tag: Int
+
+struct Maker:
+    pub prefix: String
+
+impl Maker:
+    fn made[T](tag: T) -> String:
+        held := Local(label: self.prefix + "-{tag}")
+        return held.label
+
+    fn made_con(tag: Int) -> String:
+        held := Local(label: self.prefix + "-{tag}")
+        return held.label
+
+fn string_field[T](tag: T) -> String:
+    held := Local(label: "s-{tag}")
+    return held.label
+
+fn string_field_con(tag: Int) -> String:
+    held := Local(label: "s-{tag}")
+    return held.label
+
+fn list_field[T](tag: T) -> String:
+    held := Bag(items: ["a-{tag}", "b-{tag}"])
+    return held.items[0] + "/" + held.items[1] + "/" + held.items.len().to_string()
+
+fn list_field_con(tag: Int) -> String:
+    held := Bag(items: ["a-{tag}", "b-{tag}"])
+    return held.items[0] + "/" + held.items[1] + "/" + held.items.len().to_string()
+
+fn map_field[T](tag: T) -> String:
+    held := Table(rows: {"k-{tag}": "v-{tag}"})
+    return held.rows["k-{tag}"] + "/" + held.rows.len().to_string()
+
+fn map_field_con(tag: Int) -> String:
+    held := Table(rows: {"k-{tag}": "v-{tag}"})
+    return held.rows["k-{tag}"] + "/" + held.rows.len().to_string()
+
+fn two_fields[T](tag: T) -> String:
+    held := Pair(head: "h-{tag}", rest: ["r-{tag}"])
+    return held.head + "/" + held.rest[0]
+
+fn two_fields_con(tag: Int) -> String:
+    held := Pair(head: "h-{tag}", rest: ["r-{tag}"])
+    return held.head + "/" + held.rest[0]
+
+# a bound local is borrowed by the field, so it stays readable here afterwards.
+fn borrowed_local[T](tag: T) -> String:
+    text := "b-{tag}"
+    held := Local(label: text)
+    return held.label + "/" + text
+
+fn borrowed_local_con(tag: Int) -> String:
+    text := "b-{tag}"
+    held := Local(label: text)
+    return held.label + "/" + text
+
+fn borrowed_param[T](tag: T, text: String) -> String:
+    held := Local(label: text)
+    return held.label + "/" + text
+
+fn borrowed_param_con(tag: Int, text: String) -> String:
+    held := Local(label: text)
+    return held.label + "/" + text
+
+fn borrowed_struct[T](tag: T) -> String:
+    inner := Local(label: "n-{tag}")
+    outer := Holder(inner: inner)
+    return outer.inner.label + "/" + inner.label
+
+fn borrowed_struct_con(tag: Int) -> String:
+    inner := Local(label: "n-{tag}")
+    outer := Holder(inner: inner)
+    return outer.inner.label + "/" + inner.label
+
+fn returned[T](tag: T) -> Local:
+    return Local(label: "t-{tag}")
+
+fn returned_con(tag: Int) -> Local:
+    return Local(label: "t-{tag}")
+
+fn into_container[T](tag: T) -> String:
+    mut out: List[Local] := []
+    mut i := 0
+    while i < 3:
+        out.push(Local(label: "c-{tag}-{i}"))
+        i = i + 1
+    mut acc := ""
+    for item in out:
+        acc = acc + item.label + " "
+    return acc.trim()
+
+fn into_container_con(tag: Int) -> String:
+    mut out: List[Local] := []
+    mut i := 0
+    while i < 3:
+        out.push(Local(label: "c-{tag}-{i}"))
+        i = i + 1
+    mut acc := ""
+    for item in out:
+        acc = acc + item.label + " "
+    return acc.trim()
+
+fn across_module[T](tag: T) -> String:
+    held := shapes.Remote(label: "x-{tag}", parts: ["p-{tag}"])
+    return held.label + "/" + held.parts[0]
+
+fn across_module_con(tag: Int) -> String:
+    held := shapes.Remote(label: "x-{tag}", parts: ["p-{tag}"])
+    return held.label + "/" + held.parts[0]
+
+# a generic struct built by its base name keeps the backend constructor; the
+# type argument is what decides whether slot 0 releases.
+fn wrapped[T](payload: T, tag: Int) -> Wrap[T]:
+    return Wrap(payload, tag)
+
+fn main():
+    print(string_field(1))
+    print(string_field_con(1))
+    print(list_field(2))
+    print(list_field_con(2))
+    print(map_field(3))
+    print(map_field_con(3))
+    print(two_fields(4))
+    print(two_fields_con(4))
+    print(borrowed_local(5))
+    print(borrowed_local_con(5))
+    print(borrowed_param(6, "p-6"))
+    print(borrowed_param_con(6, "p-6"))
+    print(borrowed_struct(7))
+    print(borrowed_struct_con(7))
+    print(returned(8).label)
+    print(returned_con(8).label)
+    print(into_container(9))
+    print(into_container_con(9))
+    print(across_module(10))
+    print(across_module_con(10))
+    m := Maker(prefix: "im")
+    print(m.made(11))
+    print(m.made_con(11))
+    ws := wrapped("w-12", 12)
+    print(ws.value + "/" + ws.tag.to_string())
+    wi := wrapped(13, 13)
+    print(wi.value.to_string() + "/" + wi.tag.to_string())

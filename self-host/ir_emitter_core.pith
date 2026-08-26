@@ -4408,12 +4408,46 @@ fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node:
         return config_r
     return ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node)
 
+# a construction the checker never gave a type to, recognised by the name it
+# calls. a generic body is not type checked at all, so every expression in one
+# answers TID_ERR — a *positive* type id, not a negative sentinel, which is why
+# the kind test below and not a `tid < 0` test is what has to decide this. the
+# consequence used to be that `Local(label: s)` inside a generic body lowered to
+# the opaque backend constructor, which stores its arguments raw: no retain for
+# the field, no destructor on the instance. the call site still released the
+# temporary it had built for the argument, so the field was left pointing at
+# freed memory. when the callee names a plain struct this program declares, the
+# call is that struct's construction whatever the checker managed to record, and
+# the inline path gives it the retains and the destructor the concrete twin gets.
+# a generic struct stays on the backend path: its field types are type
+# parameters this site cannot resolve into a layout.
+fn ir_untyped_struct_construction(node: Node, callee_name: String) -> Bool:
+    if node.children.len() == 0:
+        return false
+    callee_node := get_node(node.children[0])
+    # the two spellings that name a type: `Local(...)` and `mod.Local(...)`.
+    # anything else is a call through a value and keeps the path it had.
+    mut names_a_type := callee_node.kind == "ident"
+    if callee_node.kind == "field_access" and callee_node.children.len() > 0:
+        recv := get_node(callee_node.children[0])
+        names_a_type = recv.kind == "ident" and ir_module_aliases.contains_key(recv.value)
+    if not names_a_type:
+        return false
+    if not ir_struct_decl_nodes.contains_key(callee_name):
+        return false
+    return not has_generic_declaration(callee_name)
+
 fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     expr_tid := c_get_expr_type(idx)
-    if expr_tid < 0:
-        return 0 - 1
-    expr_info := get_type_info(expr_tid)
-    if expr_info.kind != "struct":
+    mut checked_kind := ""
+    if expr_tid >= 0:
+        checked_kind = get_type_info(expr_tid).kind
+    mut init_name := callee_name
+    mut init_tid := 0 - 1
+    if checked_kind == "struct":
+        init_name = get_type_info(expr_tid).name
+        init_tid = expr_tid
+    elif not ir_untyped_struct_construction(node, callee_name):
         return 0 - 1
     if ir_is_declared_callable(callee_name) or ir_is_sync_primitive_name(callee_name):
         return 0 - 1
@@ -4436,7 +4470,7 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
         if i == 0:
             continue
         arg_nodes.push(child)
-    return ir_emit_struct_positional_init(expr_info.name, arg_nodes, expr_tid)
+    return ir_emit_struct_positional_init(init_name, arg_nodes, init_tid)
 
 # substitute a base field type name that is a bare generic param (I, T, U) with
 # the instance's concrete type name; anything else passes through unchanged.
@@ -4473,6 +4507,19 @@ fn ir_generic_instance_needs_dtor(base: String, params: List[String], arg_names:
 # still holds. retain each borrowed rc arg here to give the field its own count;
 # the value's own kind classifies it, since the field's declared type is a bare
 # generic param the checker leaves unresolved in a generic body.
+#
+# leaving the instance without a destructor is deliberate, and what its fields
+# hold leaks with it. a generic body takes no count for what it stores — its
+# binds, pushes and field stores are all raw while checked kinds are suppressed
+# — so a payload of this instance may be aliased somewhere longer-lived with no
+# count of its own. a destructor briefly attached here freed those aliases out
+# from under their holders: std.term.app copies each TimerSpec out of a
+# command's list into the engine's own list inside a generic body, that copy
+# rode on the command's count alone, and the command's destructor freed the
+# spec and its closure while the engine still held both — the next timer fire
+# called through freed memory (tests/cases/test_generic_container_share pins
+# the shape). the leak is the pre-existing generic-body behaviour tracked as
+# issue #927; releasing these slots safely needs the stores to retain first.
 fn ir_retain_base_name_construction_fields(node: Node, callee_name: String, arg_regs: List[Int]):
     if not ir_struct_names.contains_key(callee_name):
         return
@@ -6326,15 +6373,29 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # emit a backend constructor call and then release the owned args the
         # struct just stored — dropping a fresh heap value (e.g. `body: bytes...`).
         alias_expr_tid := c_get_expr_type(idx)
+        mut ctor_tid := 0 - 1
+        mut builds_struct := false
         if alias_expr_tid >= 0:
             alias_expr_info := get_type_info(alias_expr_tid)
             if alias_expr_info.kind == "struct" and alias_expr_info.name == call_name:
-                mut ctor_args: List[Int] := []
-                for child, ci in node.children:
-                    if ci == 0:
-                        continue
-                    ctor_args.push(child)
-                return ir_emit_struct_positional_init(call_name, ctor_args, alias_expr_tid)
+                builds_struct = true
+                ctor_tid = alias_expr_tid
+        # inside a generic body nothing is type checked, so the test above sees
+        # the TID_ERR sentinel — a positive id whose kind is "primitive" — and
+        # the construction fell through to the backend constructor and had its
+        # owned argument released out from under it. the member names a plain
+        # struct this program declares, which settles what the call is without
+        # the checker; ir_untyped_struct_construction reads the same way for the
+        # same-module spelling.
+        if not builds_struct and ir_struct_decl_nodes.contains_key(call_name) and not has_generic_declaration(call_name):
+            builds_struct = true
+        if builds_struct:
+            mut ctor_args: List[Int] := []
+            for child, ci in node.children:
+                if ci == 0:
+                    continue
+                ctor_args.push(child)
+            return ir_emit_struct_positional_init(call_name, ctor_args, ctor_tid)
         if ir_is_generic_function_name(call_name):
             mut generic_ret_type := ir_checked_type(idx)
             if generic_ret_type.len() == 0:

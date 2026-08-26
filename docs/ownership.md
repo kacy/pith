@@ -298,6 +298,31 @@ stores own their elements. an untagged out list owned nothing, and
 everything it handed back lived on counts its source dropped at its
 own scope exit.
 
+a struct built inside a generic body is picked out by name rather than by
+checked type. the checker never walks a generic body, so every expression
+in one answers the error sentinel, whose type id is positive and whose
+kind is `primitive`. asking that answer whether a call is a construction
+gets a no, so the name the call writes down settles it instead. a plain
+struct the program declares, spelled bare or through an import alias,
+lowers inline: each borrowed field takes a count of its own and the
+instance gets the type's destructor, the same as the identical line
+outside a generic body.
+
+a generic struct built by its base name keeps the backend constructor,
+because its field types are parameters the site cannot resolve into a
+layout. a borrowed rc argument is retained so the field owns its own
+count, but the instance deliberately gets no destructor, and what its
+fields hold leaks with it. a generic body takes no count for what it
+stores — binds, pushes and field stores are raw while its checked kinds
+are suppressed — so a payload of such an instance may be aliased in
+longer-lived storage with no count of its own, and a destructor here
+would free that alias out from under its holder. std.term.app's timer
+engine is the shape that proves it: a generic body copies each spec out
+of a command's list into the engine's list, the copy rides on the
+command's count, and a destructor on the command freed the spec and its
+closure while the engine still held both. the leak closes when generic
+bodies learn to retain their stores (issue #927), not before.
+
 the list methods implemented in the runtime rather than the emitter
 decide their own flavor: `slice` and `sort` copy the source list's tag
 (`reverse` builds nothing, it reorders in place), `split` is

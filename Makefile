@@ -1182,6 +1182,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_generic_variant_slots tests/cases/test_generic_field_kinds \
 	tests/cases/test_generic_instance_type_args \
 	tests/cases/test_generic_call_shapes tests/cases/test_generic_boundary \
+	tests/cases/test_generic_body_construction \
+	tests/cases/test_generic_container_share \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_lazy_adapter_pipeline tests/cases/test_named_local_adapter_chain \
 	tests/cases/test_loop_var_shadows_fn tests/cases/test_weak_reference \

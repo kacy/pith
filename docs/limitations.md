@@ -216,6 +216,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   those in `make leak-check`. every other local stays untracked and leaks one
   count per call — one that escapes into a returned struct, a container the
   frame hands on, a global, an optional, a lambda, or a callee's argument.
+  a generic struct built by its bare base name in such a body deliberately
+  carries no destructor either, so what its fields hold leaks with the
+  instance: the body's stores take no counts, and releasing those slots
+  freed payloads a longer-lived holder still aliased — std.term.app's timer
+  engine was the proof, and tests/cases/test_generic_container_share pins
+  the shape.
 
   a call inside such a body reports its result as `unknown` rather than
   `string`, so the temporary behind it is never released:
@@ -349,8 +355,11 @@ correctness story:
   handle is worse than a leak, so lifting this means teaching the
   specialization path the caller-side escape it is missing rather than
   turning the releases back on. what a *generic instance* holds is
-  unaffected: its destructor is built from the instance's concrete kinds and
-  releases the enum payload or struct field either way.
+  unaffected when the site names its concrete types (`Wrap[String](...)`) or
+  the checker typed it: its destructor is built from the instance's concrete
+  kinds and releases the enum payload or struct field either way. an
+  instance built by bare base name inside a generic body carries no
+  destructor on purpose — see the compiler-section entry above.
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) owns the optionals it holds, the same as a container
   built by pushing into it: the literal's wrapped elements are tagged like

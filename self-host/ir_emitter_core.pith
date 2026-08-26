@@ -2955,8 +2955,9 @@ fn ir_method_receiver_type(node: Node) -> String:
 # optional shell each time (ir_emit_weak_read) — unlike a normal optional,
 # which reads the stored value in place. that shell has no destructor and
 # holds a borrowed pointer, so releasing it just frees the shell. this
-# predicate lets the optional consumers (`.value()`, `!= none`, `?`) free the
-# throwaway shell instead of leaking one per read.
+# predicate lets the optional consumers (`.value()`, `!= none`, `?`, and an
+# `if let` / `while let` subject) free the throwaway shell instead of
+# leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
     # a weak LOCAL read — or a read of a weak binding captured into the
@@ -8580,11 +8581,21 @@ fn ir_emit_if_let_stmt(node: Node):
     ir_emit_label(then_l)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    # a weak-field (or weak-local) subject minted a fresh borrowing shell for
+    # this one test (ir_emit_weak_read); the binding above took its own count
+    # on the payload, so the shell is dead the moment the bindings exist.
+    # freed here — before the body, which may return — and on the else path
+    # below, exactly once per path, the way the other optional consumers
+    # (`.value()`, `!= none`, `?`) free it. the referent's strong count is
+    # untouched: the shell has no destructor, so releasing it reclaims only
+    # the 3-slot allocation.
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_block(node.children[2])
     if not ir_last_was_ret:
         ir_emit("jmp " + end_l)
     ir_emit_label(else_l)
     ir_last_was_ret = false
+    ir_release_weak_shell(node.children[1], subj_r)
     if node.children.len() > 3:
         ir_block(node.children[3])
     ir_emit_label(end_l)
@@ -8615,12 +8626,19 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
+    # a weak-read subject mints a throwaway shell per iteration on the same
+    # schedule, and the release sites mirror the owned pair exactly — the
+    # body-exit one covers each looping iteration, the post-loop one covers
+    # the shell that failed the condition (and a break's early exit, which
+    # jumps here before the body-exit release runs).
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_emit("jmp " + head_label)
     ir_emit_label(end_label)
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_last_was_ret = false
 
 fn ir_emit_while_stmt(node: Node):

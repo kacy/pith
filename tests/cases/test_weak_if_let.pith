@@ -1,0 +1,52 @@
+# `if let` and `while let` on a weak field (or weak local) read: every read
+# mints a throwaway borrowing shell, and the subject path frees it without
+# touching the referent's strong count. the values printed back after many
+# reads prove the referent survives intact — an over-release here would
+# corrupt them or crash.
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+fn read_parent(n: Node) -> Int:
+    if let p = n.parent:
+        return p.value
+    return 0
+
+fn read_with_else(n: Node) -> Int:
+    mut out := 0
+    if let p = n.parent:
+        out = p.value * 2
+    else:
+        out = 0 - 1
+    return out
+
+fn via_weak_local(target: Node) -> Int:
+    weak w := target
+    if let q = w:
+        return q.value + 100
+    return 0
+
+fn walk_break(n: Node) -> Int:
+    mut total := 0
+    while let p = n.parent:
+        total = total + p.value
+        break
+    return total
+
+fn main():
+    p := Node(value: 7, next: none, parent: none)
+    c := Node(value: 1, next: none, parent: p)
+    mut sum := 0
+    mut i := 0
+    while i < 500:
+        sum = sum + read_parent(c)
+        i = i + 1
+    print("sum=" + sum.to_string())
+    print("with_else=" + read_with_else(c).to_string())
+    print("orphan_else=" + read_with_else(p).to_string())
+    print("weak_local=" + via_weak_local(p).to_string())
+    print("walk=" + walk_break(c).to_string())
+    print("parent_alive=" + p.value.to_string())
+    print("child_alive=" + c.value.to_string())

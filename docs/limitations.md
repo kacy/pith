@@ -210,25 +210,31 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **a generic instance cannot be a channel payload** — `Channel[Holder[String]](2)`
   reports E210, because the channel constructor accepts only a bare identifier
   payload and a parameterized type argument parses as an expression (issue #946).
-- **a generic function body has no rc prologue** — an instantiation is emitted
-  without the zero-store prologue a concrete body gets, and its call results
-  come back typed `unknown` rather than `string`, so no heap local or
-  temporary inside it is ever released. the same body with the type parameter
-  removed releases all of them.
+- **a generic function body releases only the locals that cannot escape it** —
+  an instantiation re-emits a body the checker skipped, so every expression in
+  it reports the error type and the emitter's ownership classification has
+  nothing to read. a local is tracked and released the way a concrete body's
+  is when every appearance of it in the body is a use that cannot hand its
+  count on: a read under an operator, an interpolation, an index or a field
+  access; an assignment target; a method-call receiver; the value of a `push`
+  into a list the same body built tagged. `leak_generic_body_locals` covers
+  those in `make leak-check`. every other local stays untracked and leaks one
+  count per call — one that escapes into a returned struct, a container the
+  frame hands on, a global, an optional, a lambda, or a callee's argument.
+
+  a call inside such a body reports its result as `unknown` rather than
+  `string`, so the temporary behind it is never released:
 
   ```pith
   fn sized[T](marker: T, i: Int) -> Int:
-      s := "payload-" + i.to_string()   # ~80 bytes a round: both the
-      return s.len()                    # to_string temp and the concat
+      s := "payload-" + i.to_string()   # `s` is released now; the
+      return s.len()                    # to_string temporary is not
   ```
 
-  the concrete twin emits `pith_cstring_release` for the temporary and for `s`
-  on both return paths; the generic one emits neither.
-
-  it does not show up in `make leak-check`, whose generic cases now cover the
-  instance's own payload rather than the locals inside a generic body.
-  `std.testing`'s `each` and `case` are generic and pay it, on the order of a
-  couple of hundred bytes a row for the length of one test run. tracked as
+  the concrete twin releases that temporary too.
+  `std.testing`'s `each` and `case` are generic and pay both halves, on the
+  order of a hundred bytes a row for the length of one test run. the
+  temporary is issue #949; the escaping locals are the remaining stages of
   issue #927.
 
 ## standard library

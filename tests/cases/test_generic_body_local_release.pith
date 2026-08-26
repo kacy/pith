@@ -1,0 +1,164 @@
+# a generic specialization releases the locals that provably cannot escape
+# its body, and leaves every other one alone. this case is the over-release
+# side of that: each function below hands a local to a second owner — a
+# struct field, a result payload, a container element, a map value, an
+# optional, a module global, a bare return, a user function's argument, an
+# untagged list — and then reads the value back after the frame that built
+# it is gone. a specialization that released one of those would print
+# garbage or die here, which is the failure a leak gate cannot see.
+#
+# the confined locals are exercised too (`work` rebinds a string in a loop
+# and pushes it into a tagged list), so the case also fails if tracking them
+# breaks the count they legitimately hold.
+
+struct Holder:
+    pub items: List[String]
+    pub name: String
+
+struct Payload:
+    pub rows: List[String]
+    pub tag: String
+
+mut registry: List[String] := []
+mut last_seen := ""
+
+# escapes: a local list and a local string into a returned struct.
+# confined: `piece`, whose only appearance is the value of a push into a
+# list this body built tagged for string elements.
+fn build[T](t: T, n: Int) -> Holder:
+    items: List[String] := []
+    mut i := 0
+    while i < n:
+        piece := "item" + i.to_string()
+        items.push(piece)
+        i = i + 1
+    label := "box" + n.to_string()
+    return Holder(items: items, name: label)
+
+# the same escape through a result type
+fn load[T](t: T, n: Int) -> Payload!:
+    rows: List[String] := []
+    mut i := 0
+    while i < n:
+        rows.push("r" + i.to_string())
+        i = i + 1
+    name := "p" + n.to_string()
+    return Payload(rows: rows, tag: name)
+
+# escapes: into a returned container, and into a nested one
+fn collect[T](t: T, n: Int) -> List[List[String]]:
+    outer: List[List[String]] := []
+    mut i := 0
+    while i < n:
+        inner: List[String] := []
+        inner.push("n" + i.to_string())
+        outer.push(inner)
+        i = i + 1
+    return outer
+
+# escapes: into a returned map's key and value
+fn index[T](t: T, n: Int) -> Map[String, String]:
+    m: Map[String, String] := {}
+    mut i := 0
+    while i < n:
+        key := "k" + i.to_string()
+        val := "v" + i.to_string()
+        m.insert(key, val)
+        i = i + 1
+    return m
+
+# escapes: into a returned optional
+fn maybe[T](t: T, n: Int) -> String?:
+    s := "val" + n.to_string()
+    if n < 0:
+        return none
+    return s
+
+# escapes: into a module global, by push and by assignment
+fn stash[T](t: T, n: Int) -> Int:
+    s := "g" + n.to_string()
+    registry.push(s)
+    tail := "t" + n.to_string()
+    last_seen = tail
+    return registry.len()
+
+# escapes: returned bare, from two branches
+fn pick[T](t: T, n: Int) -> String:
+    chosen := "a" + n.to_string()
+    if n > 1:
+        return chosen
+    other := "b" + n.to_string()
+    return other
+
+fn keep(s: String) -> Int:
+    registry.push(s)
+    return registry.len()
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+# escapes: as an argument to a user function that keeps it, and as one to a
+# user function that reads it
+fn feed[T](t: T, n: Int) -> String:
+    held := "h" + n.to_string()
+    keep(held)
+    loud := "l" + n.to_string()
+    return shout(loud)
+
+# escapes: into an UNTAGGED list. `List[T]` over a plain-value T builds a
+# list that owns no counts, so the push takes nothing and releasing `s` here
+# would leave the returned list pointing at freed memory.
+fn untagged[T](t: T, n: Int) -> List[T]:
+    parts: List[T] := []
+    s := "u" + n.to_string()
+    parts.push(s)
+    return parts
+
+# nothing escapes: the string is rebound in a loop, the list and the map die
+# with the frame, and the only use of `s` outside its own slot is the value
+# of a push into a tagged list
+fn work[T](t: T, n: Int) -> Int:
+    mut s := "seed"
+    mut i := 0
+    while i < n:
+        s = s + "x"
+        i = i + 1
+    parts: List[String] := []
+    parts.push(s)
+    parts.push("tail")
+    counts: Map[String, String] := {}
+    body := "b" + n.to_string()
+    return parts.len() + s.len() + counts.len() + body.len()
+
+fn main() -> Int!:
+    mut k := 0
+    while k < 3:
+        h := build(1, 3)
+        print(h.name + " " + h.items.len().to_string() + " " + h.items[0] + h.items[1] + h.items[2])
+
+        p := load(1, 2)!
+        print(p.tag + " " + p.rows.len().to_string() + " " + p.rows[0] + p.rows[1])
+
+        c := collect(1, 2)
+        print(c.len().to_string() + " " + c[0][0] + c[1][0])
+
+        m := index(1, 2)
+        print(m.len().to_string() + " " + m["k0"] + m["k1"])
+
+        match maybe(1, k):
+            none => print("none")
+            v => print(v)
+
+        stash(1, k)
+        print(pick(1, k))
+        print(feed(1, k))
+
+        u := untagged(1, k)
+        print(u.len().to_string())
+
+        print(work(1, 8).to_string())
+        k = k + 1
+
+    print(registry.len().to_string() + " " + registry[0] + registry[1] + registry[2])
+    print(last_seen)
+    return 0

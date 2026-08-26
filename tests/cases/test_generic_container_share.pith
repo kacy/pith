@@ -1,0 +1,84 @@
+# a generic instance whose payload is shared into longer-lived storage by a
+# generic body, then used after its builder dies.
+#
+# the timer pattern from std.term.app, reduced: a generic body builds a struct
+# holding a closure, wraps it in a carrier, and a second generic body copies
+# the element out of the carrier into a registry the caller owns. a generic
+# body takes no count for that store — its kinds are suppressed — so the
+# registry's element rides on the carrier's count alone. when the carrier dies
+# at the caller's release, anything its destructor freed would leave the
+# registry pointing at freed memory, and the later fire would call through it.
+# a per-instance destructor briefly attached to base-name generic
+# constructions did exactly that: the carrier's list slot released the spec,
+# the spec's closure slot released make, and the fire after the carrier's
+# death read both freed blocks. the spec therefore leaks by design until a
+# generic body can retain what it stores (#927); this case pins the fire
+# staying safe, and its concrete twin prints the same lines.
+struct Spec[M]:
+    pub ms: Int
+    pub make: fn(Int) -> M
+
+struct Pack[M]:
+    pub specs: List[Spec[M]]
+
+struct Reg[M]:
+    mut specs: List[Spec[M]]
+
+struct SpecC:
+    pub ms: Int
+    pub make: fn(Int) -> Int
+
+struct PackC:
+    pub specs: List[SpecC]
+
+struct RegC:
+    mut specs: List[SpecC]
+
+fn registry[M]() -> Reg[M]:
+    return Reg(specs: [])
+
+fn pack_one[M](ms: Int, f: fn(Int) -> M) -> Pack[M]:
+    return Pack(specs: [Spec(ms: ms, make: f)])
+
+fn adopt[M](pack: Pack[M], reg: Reg[M]):
+    for spec in pack.specs:
+        reg.specs.push(spec)
+
+# store, borrow-extract, remove, then call: the extract is a borrow with no
+# count of its own, so the remove must not free what the call still needs.
+fn fire[M](reg: Reg[M], now: Int) -> M:
+    spec := reg.specs[0]
+    mk := spec.make
+    m := mk(now)
+    reg.specs.remove(0)
+    return m
+
+fn registry_con() -> RegC:
+    return RegC(specs: [])
+
+fn pack_one_con(ms: Int, f: fn(Int) -> Int) -> PackC:
+    return PackC(specs: [SpecC(ms: ms, make: f)])
+
+fn adopt_con(pack: PackC, reg: RegC):
+    for spec in pack.specs:
+        reg.specs.push(spec)
+
+fn fire_con(reg: RegC, now: Int) -> Int:
+    spec := reg.specs[0]
+    mk := spec.make
+    m := mk(now)
+    reg.specs.remove(0)
+    return m
+
+fn main():
+    reg := registry[Int]()
+    adopt[Int](pack_one(7, fn(t: Int) => t + 1), reg)
+    print("armed={reg.specs.len()}")
+    got := fire[Int](reg, 41)
+    print("fired={got} left={reg.specs.len()}")
+
+    regc := registry_con()
+    adopt_con(pack_one_con(7, fn(t: Int) => t + 1), regc)
+    print("armed={regc.specs.len()}")
+    gotc := fire_con(regc, 41)
+    print("fired={gotc} left={regc.specs.len()}")

@@ -1,0 +1,89 @@
+# a generic body is never type checked, so every expression in one answers the
+# error sentinel — a positive type id, not a negative one. the emitter's test
+# for "is this call a struct construction" read that sentinel's kind, decided
+# no, and sent the construction to the backend constructor, which stores its
+# arguments raw: no retain for the field, no destructor on the instance. the
+# call site still released the temporary it had just built, so the field was
+# left pointing at freed memory, and whatever the fields did own was stranded
+# when the instance died.
+#
+# every field shape that path can carry is built here inside a generic body and
+# handed to a concrete caller that owns it: a string, a list, a map, two fields
+# at once, a value borrowed from a parameter, another struct borrowed from a
+# parameter, and the same construction spelled across a module boundary. a
+# generic struct built by its base name is not here: it keeps the backend
+# constructor and deliberately no destructor — a generic body takes no count
+# for what it stores, so releasing such an instance's slots freed payloads a
+# longer-lived holder still aliased (tests/cases/test_generic_container_share)
+# — and its payload therefore still leaks under issue #927.
+#
+# the constructions all hand their result straight back, because a generic body
+# still binds no rc local of its own (issue #927): a `held := Local(...)` inside
+# one is never released whatever its fields hold, which is measured under
+# tests/pending/generic_body_locals.pith and would swamp everything here.
+import leakprobe as probe
+
+struct Local:
+    pub label: String
+
+struct Bag:
+    pub items: List[String]
+
+struct Table:
+    pub rows: Map[String, String]
+
+struct Pair:
+    pub head: String
+    pub rest: List[String]
+
+struct Holder:
+    pub inner: Local
+
+fn make_string[T](tag: T) -> Local:
+    return Local(label: "s-{tag}")
+
+fn make_list[T](tag: T) -> Bag:
+    return Bag(items: ["a-{tag}", "b-{tag}"])
+
+fn make_map[T](tag: T) -> Table:
+    return Table(rows: {"k-{tag}": "v-{tag}"})
+
+fn make_pair[T](tag: T) -> Pair:
+    return Pair(head: "h-{tag}", rest: ["r-{tag}"])
+
+# the field value is borrowed from a parameter the caller still owns, so it has
+# to gain a count of its own here rather than ride on the caller's.
+fn from_param[T](tag: T, text: String) -> Local:
+    return Local(label: text)
+
+# the same borrow one level up: a whole struct stored into another's field.
+fn nest[T](tag: T, item: Local) -> Holder:
+    return Holder(inner: item)
+
+# `mod.Struct(...)` resolves through the import alias rather than by bare name,
+# and had the identical defect on its own code path.
+fn across_module[T](tag: T) -> probe.Carried:
+    return probe.Carried(label: "c-{tag}")
+
+fn churn_round(i: Int):
+    a := make_string(i)
+    b := make_list(i)
+    c := make_map(i)
+    d := make_pair(i)
+    param := "p-{i}"
+    e := from_param(i, param)
+    f := nest(i, a)
+    g := across_module(i)
+    total := a.label.len() + b.items.len() + c.rows.len() + d.head.len() + d.rest.len()
+    more := e.label.len() + f.inner.label.len() + param.len() + g.label.len()
+    if total + more < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

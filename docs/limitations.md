@@ -356,18 +356,19 @@ correctness story:
   nothing), a discarded `bytes`, struct or closure result, and a container
   dropped through a discarded `!` or `await` at statement position, which
   take other paths to the discard.
-- a heap payload behind a *fresh* optional shell that carries no destructor
-  leaks, about one count per extraction. a user function returning `T?` builds
-  its `Some` with a plain allocation and no `__opt_dtor_<kind>`, so the shell
-  holds the only count on the payload and freeing the shell does not drop it;
-  the extraction still takes the retain it would need against a shell that did
-  own the payload. `if let s = maybe():`, `match maybe():` with a binding
-  arm, and `maybe().unwrap_or(d)` all pay it, on a call subject and an
-  awaited one alike, while binding the shell first
-  (`o := maybe()` then `o.unwrap_or(d)`) is flat. narrowing the retain is not
-  the fix on its own: a call that returns a *widened* local shell does carry
-  the destructor, and dropping the retain there would hand out a payload the
-  shell is about to free.
+- an optional shell reaching a *specialized generic body* from a runtime
+  call can still carry no destructor: the checked types are suppressed
+  there, so a channel receive whose element type the emitter cannot see
+  hands back a shell that owns its payload count with nothing set up to
+  release it — a bounded leak in the safe direction, the same suppression
+  trade the rest of this section describes. everywhere else the fresh-shell
+  family is closed: a user function's returned `Some` owns its payload
+  through `__opt_dtor_<kind>`, and the transferring runtime getters
+  (`env_opt` behind `os.get_env`, the string `get`, a channel receive)
+  have the matching destructor attached at the call site, so every
+  extraction spelling is flat on call subjects and bound locals alike. the
+  borrowing getters (`m.get(k)`, `xs.first()`) keep destructor-less shells
+  on purpose — their payload count stays with the container.
 - a `Set` with an optional element type, and a `Map` with an optional key type,
   are really the string-backed containers reading a shell pointer as a
   c-string, so distinct optionals collapse into one entry. the store and query

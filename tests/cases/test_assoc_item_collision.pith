@@ -1,0 +1,64 @@
+# a user `struct Item` must not hijack the associated-type fallback that
+# resolves `List[I.Item]` inside a specialized generic body. ir_rc_kind
+# answers a dotted name by its bare suffix against the struct registry, so
+# with the colliding struct in scope the still-unresolved `I.Item` read back
+# as "struct", the resolver was skipped, and to_list built Int rows as
+# struct pointers — releasing them walked integers as heap headers and
+# segfaulted once the list outgrew toy sizes, while a String iterator
+# silently printed element addresses in place of its rows. the unresolved
+# test is syntactic now (does the name still lead with an active generic
+# parameter?), so the collision changes nothing. the sizes matter: the Int
+# lane faulted at 100k elements before the fix and runs here at exactly
+# that scale, with a String lane, a lane whose Item IS the colliding
+# struct, and the struct used under its own name.
+
+from std.iter import Iterator, to_list
+
+struct Item:
+    pub v: Int
+
+struct Counter:
+    mut hi: Int
+    mut cur: Int
+
+impl Iterator for Counter:
+    type Item = Int
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        self.cur = self.cur + 1
+        return self.cur
+
+struct Namer:
+    mut hi: Int
+    mut cur: Int
+
+impl Iterator for Namer:
+    type Item = String
+    fn next() -> String?:
+        if self.cur >= self.hi:
+            return none
+        self.cur = self.cur + 1
+        return "row-{self.cur}"
+
+struct Boxer:
+    mut hi: Int
+    mut cur: Int
+
+impl Iterator for Boxer:
+    type Item = Item
+    fn next() -> Item?:
+        if self.cur >= self.hi:
+            return none
+        self.cur = self.cur + 1
+        return Item(v: self.cur)
+
+fn main():
+    ints := to_list(Counter(hi: 100000, cur: 0))
+    print("ints={ints.len()} first={ints[0]} last={ints[99999]}")
+    rows := to_list(Namer(hi: 50000, cur: 0))
+    print("rows={rows.len()} first={rows[0]} last={rows[49999]}")
+    boxes := to_list(Boxer(hi: 1000, cur: 0))
+    print("boxes={boxes.len()} first={boxes[0].v} last={boxes[999].v}")
+    it := Item(v: 7)
+    print("named={it.v}")

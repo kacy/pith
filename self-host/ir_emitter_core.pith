@@ -59,7 +59,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -1212,6 +1212,33 @@ fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
         return true
     return emit_name == "pith_list_first_opt" or emit_name == "pith_list_last_opt"
 
+# the rc payload kind of the optional shell a TRANSFERRING runtime getter
+# hands back, or "" for every other callee. `env_opt` and the string `get`
+# mint a fresh one-off string, and a channel receive hands the sent value's
+# count over — but the runtime builds each shell without a destructor,
+# because it cannot name this module's `__opt_dtor_<kind>` functions. so the
+# call site attaches the matching one the moment the shell lands, and the
+# shell owns its payload on the same terms a user function's returned Some
+# does: the extraction gate's retain balances against the shell's own
+# release instead of stranding one payload count per extraction. the
+# borrowing getters (ir_runtime_getter_borrows_payload) must never appear
+# here — their payload count stays with the container, and a destructor
+# there frees an element the container still holds. a channel whose element
+# is itself a shell (`T??`, a result) also stays out, on the inner-shell
+# convention ir_shell_producer_transfers describes.
+fn ir_runtime_opt_producer_payload_kind(emit_name: String, obj_type: String) -> String:
+    if emit_name == "env_opt" or emit_name == "pith_env_opt":
+        return "string"
+    if emit_name == "pith_cstring_char_at_opt":
+        return "string"
+    if emit_name == "pith_channel_recv" or emit_name == "pith_channel_try_recv":
+        if obj_type.starts_with("channel:"):
+            elem_kind := ir_rc_kind(ir_resolve_type_hint(obj_type.substring(8, obj_type.len())))
+            if elem_kind != "tuple":
+                return elem_kind
+        return ""
+    return ""
+
 # true when the expression that produced a result/optional shell handed its
 # own count on the payload over with it. a user-declared callable does: its
 # return path transfers a fresh value and retains a borrowed one, so the
@@ -1780,7 +1807,7 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
             # (or an unresolved optional). the emitter's own result kind still
             # resolves — the impl-subst context is active during the prologue —
             # and it is exactly the lowered kind the exit cleanup releases.
-            if ir_rc_kind(bind_type).len() == 0 and (val_node.kind == "method_call" or val_node.kind == "call"):
+            if (ir_rc_kind(bind_type).len() == 0 or ir_generic_name_unresolved(bind_type)) and (val_node.kind == "method_call" or val_node.kind == "call"):
                 bind_type = ir_expr_result_kind(parts.val_idx)
             # a catch binds the guarded result's OK value. the checker leaves
             # the catch node's type empty for collections (and inference reports
@@ -1796,7 +1823,8 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
             # type name from the field's declared `List[T]` node (the caller
             # substitutes T -> concrete). without this the element isn't tracked
             # and the returned value dangles once the list is mutated.
-            if ir_rc_kind(ir_substitute_type_name(bind_type)).len() == 0 and val_node.kind == "index" and val_node.children.len() > 0 and ir_current_impl_type.len() > 0:
+            substituted_bind := ir_substitute_type_name(bind_type)
+            if (ir_rc_kind(substituted_bind).len() == 0 or ir_generic_name_unresolved(substituted_bind)) and val_node.kind == "index" and val_node.children.len() > 0 and ir_current_impl_type.len() > 0:
                 list_node := get_node(val_node.children[0])
                 if list_node.kind == "field_access":
                     elem := ir_self_list_field_element(list_node.value)
@@ -4751,6 +4779,14 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         ir_rcall_current_idx = 0 - 1
     else:
         ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    # `env_opt` is the free-call spelling of a transferring runtime getter:
+    # its shell arrives destructor-less, so attach the payload's destructor
+    # here exactly as the method path does. declaration wins — a user's own
+    # `env_opt` routes through its declared return convention instead.
+    if not ir_is_declared_callable(callee.name):
+        free_opt_kind := ir_runtime_opt_producer_payload_kind(callee.name, "")
+        if free_opt_kind.len() > 0:
+            ir_emit_optional_attach_dtor(r, free_opt_kind)
     # a generic struct built here (backend constructor call) gets no destructor
     # from the backend; attach a per-instance one so its rc fields release
     ir_attach_generic_construction_dtor(node, ret_type, r, arg_regs)
@@ -6513,6 +6549,14 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         ir_rcall_current_idx = 0 - 1
     else:
         ir_emit_call_text(r, call_name, ret_type, call_arg_count, call_arg_text)
+    # a transferring runtime getter's shell arrives destructor-less from the
+    # runtime: give it the destructor matching its payload so the shell owns
+    # what it carries (see ir_runtime_opt_producer_payload_kind). an impl
+    # dispatch is a user method, whose return path settles this itself.
+    if not impl_dispatch:
+        runtime_opt_kind := ir_runtime_opt_producer_payload_kind(call_name, obj_type)
+        if runtime_opt_kind.len() > 0:
+            ir_emit_optional_attach_dtor(r, runtime_opt_kind)
     # a builtin that may hand an argument straight back out takes no count on
     # either branch, so the caller takes one here — before the release below,
     # which on the hand-back branch drops the very register this just counted.
@@ -8046,6 +8090,25 @@ fn ir_emit_return_box_as_pair(box_r: Int, exclude: String):
     ir_emit("iconst " + zero_r.to_string() + " 0")
     ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
 
+# true when a type name is still an unresolved generic spelling: the bare
+# parameter itself, or an associated type reached through one (`I.Item`).
+# the unresolved test has to be syntactic. ir_rc_kind resolves a dotted
+# name by its bare suffix against the struct registry, so any user
+# `struct Item` in scope makes an unresolved `I.Item` read back as
+# "struct" — and a gate that asks the kind instead of the shape then skips
+# the resolver and lowers over the wrong kind entirely (an Int-element
+# to_list built its rows as struct pointers and segfaulted at scale).
+fn ir_generic_name_unresolved(name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    mut base := name
+    dot := name.index_of(".")
+    if dot >= 0:
+        base = name.substring(0, dot)
+    if ir_active_generic_params.contains(base):
+        return true
+    return ir_current_impl_subst_params.contains(base)
+
 # the tagged constructor for an empty `List[T]` bind whose element type only
 # the annotation knows, or "" when the normal target path already handles it.
 #
@@ -8069,7 +8132,7 @@ fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) 
     if tn.kind != "generic_type" or tn.value != "List" or tn.children.len() == 0:
         return ""
     mut elem := ir_resolve_type_node(tn.children[0])
-    if ir_rc_kind(elem).len() == 0:
+    if ir_rc_kind(elem).len() == 0 or ir_generic_name_unresolved(elem):
         # impl-method substitution (T -> the impl's concrete argument) is not
         # part of ir_resolve_type_node's active-generic path, so try it as the
         # fallback — and only when it actually substituted something, so a
@@ -8085,10 +8148,14 @@ fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) 
             # `to_list` builds an untagged list that owns none of the rows
             # pushed into it — readable only for as long as some other count
             # happens to keep them alive.
-            if ir_rc_kind(elem).len() == 0:
+            if ir_rc_kind(elem).len() == 0 or ir_generic_name_unresolved(elem):
                 assoc := ir_resolve_assoc_in_generic(inner.value, ir_active_generic_params, ir_active_generic_concrete_types)
                 if assoc != inner.value:
                     elem = ir_resolve_type_hint(assoc)
+    # a name the resolvers above could not settle must never reach the kind
+    # lookup: fall back to the normal target path instead of guessing.
+    if ir_generic_name_unresolved(elem):
+        return ""
     ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem))
     if ctor == "__list_new":
         return ""

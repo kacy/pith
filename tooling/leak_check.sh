@@ -36,6 +36,7 @@ cases=(
   tests/leaks/leak_loop_var_slot
   tests/leaks/leak_list_transform
   tests/leaks/leak_module_call_string
+  tests/leaks/leak_runtime_shell_dtor
   tests/leaks/leak_io_text_registry
   tests/leaks/leak_websocket_session
   tests/leaks/leak_returned_shell_dtor

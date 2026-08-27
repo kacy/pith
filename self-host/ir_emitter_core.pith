@@ -2955,8 +2955,9 @@ fn ir_method_receiver_type(node: Node) -> String:
 # optional shell each time (ir_emit_weak_read) — unlike a normal optional,
 # which reads the stored value in place. that shell has no destructor and
 # holds a borrowed pointer, so releasing it just frees the shell. this
-# predicate lets the optional consumers (`.value()`, `!= none`, `?`) free the
-# throwaway shell instead of leaking one per read.
+# predicate lets the optional consumers (`.value()`, `!= none`, `?`, and an
+# `if let` / `while let` subject) free the throwaway shell instead of
+# leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
     # a weak LOCAL read — or a read of a weak binding captured into the
@@ -7756,10 +7757,17 @@ fn ir_emit_grouped_expr(node: Node) -> Int:
 fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "match_expr":
+        # a call-produced subject arrives with a count nothing else claims,
+        # and the match emitters are where it can be released — a bound
+        # local's count belongs to the local's own cleanup instead. the
+        # classification is the extraction pair's: a fresh temporary per
+        # ir_optional_subject_is_owned, refined by ir_expr_is_borrowed so a
+        # builtin that hands back a borrow stays untouched.
+        subj_owned := node.children.len() > 0 and ir_optional_subject_is_owned(node.children[0]) and not ir_expr_is_borrowed(node.children[0])
         if idx == ir_tail_match_node:
-            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block)
+            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
             return ir_emit_zero_value()
-        return ir_emit_match_expr(idx, node, ir_expr, ir_block)
+        return ir_emit_match_expr(idx, node, ir_expr, ir_block, subj_owned)
     if kind == "if_expr":
         return ir_emit_if_expr(node, ir_expr)
     if kind == "method_call":
@@ -8409,9 +8417,33 @@ fn ir_stmt(idx: Int):
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(idx):
                 ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
                 return
+            # a discarded plain container result is a count nobody will ever
+            # release. a user function transfers its result out (the callee
+            # retains a returned borrow, transfers a fresh container), and
+            # the builtin container producers hand back either a freshly
+            # built list/map/set (keys(), values(), to_list(), split(), the
+            # slice/sort copies, args()) or a count taken over the call
+            # (get_default, which the call site retains; take, which the
+            # map relinquishes) — the same classification every binding of
+            # these results already relies on. the one spelling whose
+            # register is NOT a count of its own is a void method's: its
+            # value is the receiver handed back for chaining, so that keeps
+            # its leak rather than freeing a container out from under its
+            # owner. a generic body's types are suppressed and prove
+            # nothing, so it keeps the old leak too.
+            if not ir_in_generic_body():
+                stmt_kind := ir_rc_kind(ir_infer_type(idx))
+                if (stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set") and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+                    ir_rc_release_reg(r, stmt_kind)
+                    return
         # a discarded owned string result (a popped element, an unused
-        # fresh string) is garbage as soon as the statement ends
-        if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx):
+        # fresh string) is garbage as soon as the statement ends. the
+        # receiver guard matters here too: `xs.reverse()` shares its name
+        # with String.reverse, the name-keyed inference calls its value a
+        # fresh string, and the release this used to emit was a cstring
+        # release aimed at a live list handle — an invalid free on any
+        # discarded void-method statement whose name a string method shares.
+        if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
             ir_string_release_reg(r)
         return
 
@@ -8436,6 +8468,26 @@ fn ir_stmt(idx: Int):
         return
 
     ir_stmt_control(idx, node)
+
+# true when a discarded method result register is really the receiver handed
+# back: a void builtin method (`xs.reverse()`, `m.clear()`) forces its
+# retkind to void and returns the receiver register so chains work (see
+# ir_emit_method_call). that register carries the receiver's count, not a
+# fresh one, and a discard release would strip a count its owner still
+# holds. resolution mirrors ir_expr_is_borrowed's method_call branch: a
+# module-qualified call and a user impl method both transfer and answer
+# false; only a resolved builtin's emit name is asked.
+fn ir_discard_value_is_receiver(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return false
+    if ir_resolve_module_alias_method_call_name(idx).len() > 0:
+        return false
+    mname := ir_plain_method_name(node.value)
+    recv_type := ir_method_receiver_type(node)
+    if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
+        return false
+    return ir_is_void_method(ir_method_emit_name(mname, recv_type))
 
 fn ir_emit_if_stmt(node: Node):
     mut elif_indices: List[Int] := []
@@ -8580,11 +8632,21 @@ fn ir_emit_if_let_stmt(node: Node):
     ir_emit_label(then_l)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    # a weak-field (or weak-local) subject minted a fresh borrowing shell for
+    # this one test (ir_emit_weak_read); the binding above took its own count
+    # on the payload, so the shell is dead the moment the bindings exist.
+    # freed here — before the body, which may return — and on the else path
+    # below, exactly once per path, the way the other optional consumers
+    # (`.value()`, `!= none`, `?`) free it. the referent's strong count is
+    # untouched: the shell has no destructor, so releasing it reclaims only
+    # the 3-slot allocation.
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_block(node.children[2])
     if not ir_last_was_ret:
         ir_emit("jmp " + end_l)
     ir_emit_label(else_l)
     ir_last_was_ret = false
+    ir_release_weak_shell(node.children[1], subj_r)
     if node.children.len() > 3:
         ir_block(node.children[3])
     ir_emit_label(end_l)
@@ -8615,12 +8677,19 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
+    # a weak-read subject mints a throwaway shell per iteration on the same
+    # schedule, and the release sites mirror the owned pair exactly — the
+    # body-exit one covers each looping iteration, the post-loop one covers
+    # the shell that failed the condition (and a break's early exit, which
+    # jumps here before the body-exit release runs).
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_emit("jmp " + head_label)
     ir_emit_label(end_label)
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
+    ir_release_weak_shell(node.children[1], subj_r)
     ir_last_was_ret = false
 
 fn ir_emit_while_stmt(node: Node):

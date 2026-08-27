@@ -41,14 +41,75 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
     # because emit_ret is a caller-supplied callback.
     ir_last_was_ret = true
 
+# whether one arm's pattern leaves the subject's count releasable once the
+# arm has bound its names. a bare binding on a non-optional subject IS the
+# subject — an uncounted alias the arm body may store or return — and a
+# tuple pattern binds element borrows the subject's cascade owns, so both
+# rule the release out; an or-pattern may hide either shape. a variant
+# pattern is safe only when every bound rc slot's kind resolved: an
+# "unknown" slot is bound without a retain (ir_bind_owned_rc_payload emits
+# nothing for it), and freeing the box would leave that binding dangling.
+# an optional subject's bare binding is the counted payload extraction, not
+# an alias, so it keeps the subject free.
+fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Bool:
+    if pat.kind == "pat_binding":
+        return subj_is_optional
+    if pat.kind == "pat_tuple" or pat.kind == "pat_or":
+        return false
+    if pat.kind == "pat_variant":
+        mut kinds: List[String] := []
+        if ir_enum_payload_kinds.contains_key(pat.value):
+            kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
+        for sub_idx, i in pat.children:
+            sub := get_node(sub_idx)
+            if sub.kind == "pat_binding":
+                if i >= kinds.len() or kinds[i] == "unknown":
+                    return false
+        return true
+    return true
+
+# the rc kind a match may release its subject with once an arm is taken, or
+# "" when the subject is not this match's to free. a subject the caller
+# proved to be an owned fresh temporary (a call, method call or await whose
+# count nothing else claims) dies inside the match — every arm binds its
+# payload with a count of its own, so once the taken arm's bindings exist
+# (or no arm matched) nothing reads the subject again. a result subject
+# stays out: its binding path takes no count (see docs/ownership.md), and
+# so does any match with an arm whose pattern aliases the subject or binds
+# an uncounted slot. asked after ir_match_subject_tid is set, because the
+# variant-kind resolution above reads it.
+fn ir_match_subject_release_kind(node: Node, subj_type: String, subj_owned: Bool) -> String:
+    if not subj_owned:
+        return ""
+    kind := ir_rc_kind(subj_type)
+    if kind.len() == 0:
+        return ""
+    if ir_match_subject_tid < 0:
+        return ""
+    info := get_type_info(ir_match_subject_tid)
+    if info.kind == "result":
+        return ""
+    subj_is_optional := info.kind == "optional"
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        if arm.children.len() > 0:
+            if not ir_match_pattern_keeps_subject_free(get_node(arm.children[0]), subj_is_optional):
+                return ""
+        i = i + 1
+    return kind
+
 # Lower a tail-position match: each matching arm returns its value. A no-match
 # fall-through lands on the function's default return.
 
-## lower a function-tail match directly into returns.
-pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
+## lower a function-tail match directly into returns. subj_owned reports
+## whether the subject expression is an owned fresh temporary whose count
+## this match must release (the caller classifies; see ir_expr_complex).
+pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int, subj_owned: Bool):
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
     ir_match_subject_tid = ir_emission_tid(node.children[0])
+    subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
     mut i := 1
     while i < node.children.len():
         arm := get_node(node.children[i])
@@ -75,9 +136,19 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
             body_l := ir_label()
             ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
             ir_emit_label(body_l)
+        # the subject dies here: this arm has bound (and counted) what it
+        # needs, no later arm's condition runs on this path, and the arm
+        # returns without ever reaching a merge. released after the guard so
+        # a failing guard still hands a live subject to the next arm's test.
+        if subj_release.len() > 0:
+            ir_rc_release_reg(subj_r, subj_release)
         ir_emit_match_arm_return(body_idx, emit_ret, emit_block)
         ir_emit_label(next_l)
         i = i + 1
+    # no arm matched: the fall-through lands on the function's default
+    # return, and the subject dies unread.
+    if subj_release.len() > 0:
+        ir_rc_release_reg(subj_r, subj_release)
 
 # Emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
 # (those are emitted separately, only in the branch where the pattern matched).
@@ -487,11 +558,14 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
 
-## lower a match used as an expression.
-pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int) -> Int:
+## lower a match used as an expression. subj_owned reports whether the
+## subject expression is an owned fresh temporary whose count this match
+## must release (the caller classifies; see ir_expr_complex).
+pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool) -> Int:
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
     ir_match_subject_tid = ir_emission_tid(node.children[0])
+    subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
     result_temp := ir_new_temp_name("match")
     end_l := ir_label()
     mut i := 1
@@ -520,12 +594,21 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
             body_l := ir_label()
             ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
             ir_emit_label(body_l)
+        # the subject dies here: this arm has bound (and counted) what it
+        # needs, no later arm's condition runs on this path, and a block
+        # body may return without reaching the merge. released after the
+        # guard so a failing guard still hands a live subject onward.
+        if subj_release.len() > 0:
+            ir_rc_release_reg(subj_r, subj_release)
         ir_emit_match_arm_body(body_idx, result_temp, emit_expr, emit_block)
         if not ir_last_was_ret:
             ir_emit("jmp " + end_l)
         ir_emit_label(next_l)
         i = i + 1
-    # no arm matched: leave a zero so the result temp is always defined.
+    # no arm matched: the subject dies unread, and a zero keeps the result
+    # temp defined.
+    if subj_release.len() > 0:
+        ir_rc_release_reg(subj_r, subj_release)
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")
     ir_emit("store " + result_temp + " " + zero_r.to_string())

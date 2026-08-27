@@ -1,0 +1,44 @@
+# a weak field read mints a fresh borrowing optional shell per read
+# (ir_emit_weak_read). the other optional consumers — `.value()`, `!= none`,
+# `?` — free that throwaway shell once the value is out, but an `if let`
+# subject did not: every `if let p = n.parent` stranded one 3-slot shell,
+# about 64 bytes a read, while the payload's retain/release pair stayed
+# balanced. the subject path now frees the shell on both branches (and a
+# `while let` frees per iteration), touching only the shell — the referent's
+# strong count must never move, which leak_weak_field's valgrind run and
+# test_weak_read_loop's total both pin.
+import leakprobe as probe
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+fn read_parent(n: Node) -> Int:
+    if let p = n.parent:
+        return p.value
+    return 0
+
+# the none path frees the shell in the else arm; the fall-through must not
+# release a count the binding never took
+fn read_orphan(n: Node) -> Int:
+    mut out := 0
+    if let p = n.parent:
+        out = p.value
+    else:
+        out = 1
+    return out
+
+fn main():
+    n := probe.rounds()
+    p := Node(value: 7, next: none, parent: none)
+    c := Node(value: 1, next: none, parent: p)
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + read_parent(c) + read_orphan(p)
+        i = i + 1
+    if total == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

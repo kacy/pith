@@ -167,11 +167,12 @@ pub fn ir_emit_optional_none_value() -> Int:
 # destructor is attached, so releasing the optional frees the two slots
 # and drops nothing else. that is right for a primitive, and for a
 # payload whose count is transferred into the slot and released by
-# whoever unwraps it (the return path, an index read). it is wrong for a
-# payload the shell is meant to own — use ir_emit_optional_owned_some for
-# a struct, list, map, set, bytes, closure or string payload, or the
-# target dies while the optional still points at it, or nothing ever
-# releases it. the shell itself is owned by the caller.
+# whoever unwraps it (an index read, an inner `T??` shell). it is wrong
+# for a payload the shell is meant to own — use ir_emit_optional_owned_some
+# for a struct, list, map, set, bytes, closure or string payload (the
+# return path and the widening wrap both do), or the target dies while
+# the optional still points at it, or nothing ever releases it. the
+# shell itself is owned by the caller.
 pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
     flag_r := ir_reg()
     ir_emit("iconst " + flag_r.to_string() + " 1")

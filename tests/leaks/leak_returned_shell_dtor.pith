@@ -1,0 +1,78 @@
+# the other half of #950: a user function returning `T?` built its Some with
+# no destructor, so a heap payload extracted off a call subject kept the
+# retain the extraction takes while the shell's release dropped nothing —
+# about 30 bytes stranded per extraction, in every extraction spelling. the
+# returned Some now owns its payload through __opt_dtor_<kind>, attached at
+# the return-site wrap. this case churns the direct-call column for string,
+# struct and list payloads across all three spellings, a forwarded parameter
+# shell extracted by the caller, a discarded call result, and the none path.
+# the bound-local column is pinned by leak_if_let_payload and
+# leak_unwrap_extract.
+import leakprobe as probe
+
+struct Pt:
+    pub val: Int
+    pub tag: String
+
+fn make_s(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "name-{i}"
+
+fn make_p(i: Int) -> Pt?:
+    if i < 0:
+        return none
+    return Pt(val: i, tag: "pt-{i}")
+
+fn make_l(i: Int) -> List[String]?:
+    if i < 0:
+        return none
+    mut xs: List[String] := []
+    xs.push("elem-{i}")
+    return xs
+
+fn fwd(v: String?) -> String?:
+    return v
+
+# the generic-collect twin (to_list over a struct-yielding iterator, pinned
+# by test_returned_shell_dtor and test_sql_core) is deliberately NOT churned
+# here: a `for` over a fresh user iterator strands the iterator object, and a
+# specialized generic returning a fresh local list retains a count nothing
+# releases — both pre-existing, documented under the generic-body limitation,
+# and a known-leaking shape must not sit in a gate case.
+
+# the rebind shape from the pithgen seed-20 finding: bound, extracted,
+# rebound, extracted again. both extractions retain and the shell's own
+# release balances them, so the round is flat.
+fn rebound(i: Int) -> Int:
+    u: String? := make_s(i)
+    mut n := u.unwrap_or("?").len()
+    v: String? := u
+    n = n + v.unwrap_or("?").len()
+    return n
+
+fn churn_round(i: Int):
+    mut n := make_s(i).unwrap_or("d").len()
+    n = n + make_s(i + 1).value().len()
+    if let v = make_s(i + 2):
+        n = n + v.len()
+    p := make_p(i).unwrap_or(Pt(val: 0, tag: "z"))
+    n = n + p.val + p.tag.len()
+    if let xs = make_l(i):
+        n = n + xs.len()
+    o := make_s(i + 3)
+    n = n + fwd(o).unwrap_or("d").len()
+    make_s(i + 4)
+    n = n + make_s(0 - 1).unwrap_or("dd").len()
+    n = n + rebound(i + 5)
+    if n < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

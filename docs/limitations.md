@@ -188,13 +188,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   read. the same function with the type parameter removed is clean. this is
   the only memory-unsafety defect currently known; everything else
   outstanding is a leak (issue #952).
-- **extracting a heap payload from a call subject leaks it** — an optional a
-  user function returns carries no destructor, while the extraction still
-  takes the retain it would need against one that did, so `unwrap_or` and an
-  `if let` binding both pay about 30 bytes an extraction on a call subject.
-  a bound-local subject is clean in every spelling: an `if let` binding now
-  takes a counted payload and releases it at scope exit, the way the other
-  extraction spellings already did (issue #950).
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is

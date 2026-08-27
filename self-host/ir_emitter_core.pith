@@ -112,24 +112,11 @@ mut ir_rc_local_kinds: List[String] := []
 # count it was built with, so the cleanup path is the payload's only releaser.
 # for those the cleanup releases the live payload before freeing the shell. a
 # local with any other use (returned, bound, matched, iterated, captured, ...)
-# is left out and keeps the shell-only behavior, which may still leak but
-# can never double-free. see ir_tuple_use_is_whitelisted.
+# is left out and keeps the plain shell release, which frees what the shell
+# owns through its destructor and nothing more — a bounded leak for a
+# destructor-less shell, never a double free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
-# tuple LOCALS the cascade scan rejected AND whose shell would then release
-# nothing but itself: an extraction there must keep handing the shell's
-# payload count out rather than retaining a fresh one nothing would ever
-# release. params, fields, elements and fresh shells are deliberately not in
-# this list — their payload count stays with its owner, so extraction retains.
-mut ir_tuple_shell_only_names: List[String] := []
-# tuple locals whose shell is NOT the payload's last owner, so the cleanup
-# path does drop the payload and an extraction has to take a count of its
-# own. two producers land here: a plain rc value widened into the shell,
-# which ir_emit_value_for_target hands a __opt_dtor_<kind> destructor, and a
-# borrowed shell (`e := rows[0]`, `e := h.opt`), whose real owner keeps
-# releasing the payload after this local dies. neither may be treated as
-# shell-only, whatever the cascade scan decides about it.
-mut ir_tuple_shell_owns_payload_names: List[String] := []
 # every name the function currently being emitted binds for the whole body: a
 # local, an `if let` or `match` payload. parameters and lambda captures are
 # the same thing and live in ir_var_regs; a `for` variable is not, and is
@@ -1254,45 +1241,6 @@ fn ir_shell_producer_transfers(idx: Int) -> Bool:
         return true
     return not ir_runtime_getter_borrows_payload(ir_method_emit_name(mname, recv_type))
 
-# record whether this bind leaves the local holding a shell that is the
-# payload's LAST owner. it is not, in three shapes, and all of them have to be
-# known before an extraction decides whether to retain:
-#
-#   - a plain rc value widened into the shell (`o: List[Int]? := [1, 2]`,
-#     and the same wrap inside a literal or a field). ir_emit_value_for_target
-#     attaches __opt_dtor_<kind>, so releasing the shell releases the payload
-#     with it — an extraction that transferred the shell's count instead of
-#     taking its own would leave the extracted value pointing at freed memory
-#     the moment the shell died.
-#   - a borrowed shell (`e := rows[0]`, `e := h.opt`). the bind retains the
-#     SHELL and takes nothing on the payload, so the container or struct
-#     behind it goes on releasing that payload; handing its count out would
-#     over-release once the extracted value was dropped.
-#   - a shell a borrowing runtime getter built (`e := m.get(k)`,
-#     `e := xs.first()`). the shell itself is fresh, so nothing above catches
-#     it, but the count on what it points at never left the container.
-#
-# recorded per name and never unrecorded: one non-transferring bind is enough
-# to disqualify the name, since the scan cannot tell which bind reached an
-# extraction.
-fn ir_tuple_record_shell_ownership(name: String, val_idx: Int):
-    if ir_tuple_shell_owns_payload_names.contains(name):
-        return
-    if ir_expr_is_borrowed(val_idx):
-        ir_tuple_shell_owns_payload_names.push(name)
-        return
-    tid := c_get_expr_type(val_idx)
-    if tid < 0:
-        return
-    info := get_type_info(tid)
-    if info.kind == "optional" or info.kind == "result" or info.kind == "tuple":
-        if not ir_shell_producer_transfers(val_idx):
-            ir_tuple_shell_owns_payload_names.push(name)
-        return
-    # a plain value with no rc payload has no count to argue about
-    if ir_rc_kind(ir_infer_type(val_idx)).len() > 0:
-        ir_tuple_shell_owns_payload_names.push(name)
-
 # true when `parent` uses its child ident `name` in a way that leaves the tuple
 # holding the count it was built with, so the cleanup path is the only thing
 # that ever releases the payload:
@@ -1638,10 +1586,11 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
 
 # after prologue tracking is finalized, decide which tuple locals may cascade:
 # a known result/optional type with an rc payload to release, and every use in
-# the body provably safe. anything unknown stays shell-only (leak, never UAF).
+# the body provably safe. anything unknown keeps the plain shell release,
+# which frees what the shell owns through its destructor and nothing more
+# (leak, never UAF).
 fn ir_tuple_cascade_scan(body_idx: Int):
     ir_tuple_cascade_names = []
-    ir_tuple_shell_only_names = []
     if body_idx < 0:
         return
     mut i := 0
@@ -1653,22 +1602,19 @@ fn ir_tuple_cascade_scan(body_idx: Int):
         # a param is a borrow: the caller owns the payload and the prologue only
         # retains the shell, so cascading one would over-release. skip anything
         # already in ir_var_regs, which at this point holds exactly the params.
+        # a rejected local keeps the plain shell release. that used to make
+        # it "shell-only" — a name whose extraction transferred rather than
+        # retained, because a retained count would have had no release — but
+        # a returned Some owns its payload now, so the shell's release is
+        # the balance and the extraction gate retains everywhere
+        # (ir_extraction_retains).
         if kind == "tuple" and not ir_var_regs.contains_key(name):
-            mut cascades := false
             if ir_tuple_local_tid.contains_key(name):
                 tid := ir_tuple_local_tid[name]
                 if tid >= 0 and ir_tuple_local_has_rc_payload(tid):
                     is_result := get_type_info(tid).kind == "result"
                     if ir_tuple_uses_all_safe(body_idx, name, is_result):
                         ir_tuple_cascade_names.push(name)
-                        cascades = true
-            # only a local the cleanup leaves holding nothing but a shell is
-            # shell-only. a widened or borrowed shell keeps releasing the
-            # payload after this local's cleanup runs (its destructor, or the
-            # container it was borrowed from), so an extraction there must
-            # take a count of its own or hand back freed memory.
-            if not cascades and not ir_tuple_shell_owns_payload_names.contains(name):
-                ir_tuple_shell_only_names.push(name)
         i = i + 1
 
 # true when a result/optional type holds an rc payload worth cascading: either
@@ -1920,7 +1866,6 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
             # can cascade-release the payload (only for cascade-eligible locals)
             if kind == "tuple" and parts.val_idx >= 0:
                 ir_tuple_record_tid(parts.name, parts.val_idx)
-                ir_tuple_record_shell_ownership(parts.name, parts.val_idx)
     # a match on an OPTIONAL subject binds the unwrapped payload, and
     # ir_match_emit retains an rc payload so the binding owns its own count
     # (the subject's shell or cascade can die at scope exit while the
@@ -3537,10 +3482,12 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # owns its payload through its destructor (ir_emit_optional_owned_some), so
 # only the shell is released and the destructor does the rest — releasing the
 # payload here too would drop it twice. a shell a callee built and returned
-# carries a transferred payload count and no destructor, so the cascade helper
-# drops the payload before the shell. a plain value or a none has nothing but
-# the shell. `is_method` picks the walk: the callee's own body for a plain
-# call, the impl method's for a method call.
+# goes through the cascade helper, which drops the payload, nulls the slot and
+# then frees the shell: a wrap-built shell carries the destructor and the null
+# leaves it a no-op, while a forwarded runtime shell carries none and needs
+# the explicit drop. a plain value or a none has nothing but the shell.
+# `is_method` picks the walk: the callee's own body for a plain call, the impl
+# method's for a method call.
 fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int, is_method: Bool):
     en := get_node(expr_idx)
     # inside generic or specialized bodies the checked types are suppressed
@@ -6750,8 +6697,6 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_rc_kinds := ir_rc_local_kinds
     saved_tuple_tids := ir_tuple_local_tid
     saved_tuple_cascade := ir_tuple_cascade_names
-    saved_tuple_shell_only := ir_tuple_shell_only_names
-    saved_tuple_shell_owns := ir_tuple_shell_owns_payload_names
     saved_func_local_names := ir_func_local_names
     # the lambda body is its own function frame; open loops in the enclosing
     # function must not have their iterables released by a return inside it.
@@ -6763,8 +6708,6 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
-    ir_tuple_shell_only_names = []
-    ir_tuple_shell_owns_payload_names = []
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
     ir_weak_capture_names = lambda_weak_caps
@@ -6790,8 +6733,6 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
     ir_tuple_cascade_names = saved_tuple_cascade
-    ir_tuple_shell_only_names = saved_tuple_shell_only
-    ir_tuple_shell_owns_payload_names = saved_tuple_shell_owns
     ir_func_local_names = saved_func_local_names
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
@@ -7991,7 +7932,24 @@ pub fn ir_emit_return_value(expr_child: Int):
         if expr_node.kind == "none_lit":
             r = ir_emit_optional_none_value()
         elif already_optional == false:
-            r = ir_emit_optional_some_value(r)
+            # the returned Some OWNS a heap payload: attach the matching
+            # __opt_dtor_<kind>, exactly as the widening wrap in
+            # ir_emit_value_for_target does. the payload arrives here already
+            # owned — a fresh value carries its own count, a tracked local
+            # transferred its count through `exclude`, and a borrowed value was
+            # retained above — so the wrap takes that count over and the shell
+            # becomes the payload's owner. without the destructor the shell
+            # held the only count while freeing the shell dropped nothing, and
+            # every extraction off a call subject stranded one payload: the
+            # extraction retains what it hands out and the shell's release had
+            # nothing left to balance that against. a `tuple` inner (a `T??`)
+            # keeps the borrowing wrap: the inner shell's count stays with its
+            # own owner.
+            ret_payload_kind := ir_rc_kind(ir_current_func_optional_inner_kind)
+            if ret_payload_kind.len() > 0 and ret_payload_kind != "tuple":
+                r = ir_emit_optional_owned_some(r, ret_payload_kind)
+            else:
+                r = ir_emit_optional_some_value(r)
     elif ir_current_func_return_kind == "tuple":
         if result_kind != "tuple":
             r = ir_emit_ok_result_tuple(r)
@@ -8113,6 +8071,16 @@ fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) 
             substituted := ir_substitute_type_name(inner.value)
             if substituted != inner.value:
                 elem = ir_resolve_type_hint(substituted)
+            # `List[I.Item]` names an associated type through a generic
+            # parameter. resolve it the way the specialization header does
+            # (I -> the concrete type, then its `type Item =` binding), or
+            # `to_list` builds an untagged list that owns none of the rows
+            # pushed into it — readable only for as long as some other count
+            # happens to keep them alive.
+            if ir_rc_kind(elem).len() == 0:
+                assoc := ir_resolve_assoc_in_generic(inner.value, ir_active_generic_params, ir_active_generic_concrete_types)
+                if assoc != inner.value:
+                    elem = ir_resolve_type_hint(assoc)
     ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem))
     if ctor == "__list_new":
         return ""
@@ -8525,10 +8493,7 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 # release-of-previous mirrors ir_bind_owned_rc_payload — zero
                 # on first reach, a stale payload when a loop rebinds the
                 # name — and an untracked name skips it, keeping the retain
-                # as a bounded leak in the safe direction. when the gate
-                # answers no — a shell-only local whose cleanup releases the
-                # shell alone — the binding takes over the payload's existing
-                # count instead, and the exit release balances that.
+                # as a bounded leak in the safe direction.
                 # a tuple payload (an inner optional shell) is skipped on
                 # the same terms the prepass poisons it: its count belongs to
                 # its owner and the binding is an uncounted view.
@@ -8582,22 +8547,21 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
 # count the subject still claims. a fresh subject's shell is freed right after the extract, so the
 # payload must outlive it; a parameter, field or element subject keeps its
 # count with its owner (the caller, the shell's destructor, the container);
-# a widened shell releases the payload through its `__opt_dtor_<kind>`; and a
-# cascade-eligible local's count is released by its cascade.
+# a widened or returned shell releases the payload through its
+# `__opt_dtor_<kind>`; and a cascade-eligible local's count is released by
+# its cascade.
 #
-# the one subject that still transfers is a shell-only local — one the
-# cascade walk rejected — whose cleanup releases the shell alone: a retained
-# count there would have no release, so it keeps the old transfer (and the
-# old double-extraction unsoundness) rather than trading it for a leak.
+# a cascade-rejected local used to be the one subject that transferred: its
+# cleanup released the shell alone, so a retained count had no release. that
+# ended when a returned Some took ownership of its payload — the shell's own
+# release now drops what it holds, so the retain balances there too, and the
+# transfer's two failure modes went with it (the double-extraction
+# unsoundness, and a rebind reading a Some-flagged shell whose payload the
+# transfer had walked off with). the residue is a shell a runtime call built
+# around a transferred count with no destructor bound to a rejected name:
+# its inner count now leaks — bounded, and in the safe direction.
 fn ir_extraction_retains(subject_idx: Int, inner_kind: String, owns_subject: Bool) -> Bool:
-    if inner_kind.len() == 0:
-        return false
-    if owns_subject:
-        return true
-    subj := get_node(subject_idx)
-    if subj.kind == "ident" and ir_tuple_shell_only_names.contains(subj.value):
-        return false
-    return true
+    return inner_kind.len() > 0
 
 fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() < 3:
@@ -9937,8 +9901,6 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_untracked_rc_binds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
-    ir_tuple_shell_only_names = []
-    ir_tuple_shell_owns_payload_names = []
     ir_func_local_names = {}
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []

@@ -36,6 +36,24 @@ fn make_l(i: Int) -> List[String]?:
     xs.push("elem-{j}")
     return xs
 
+fn make_m(i: Int) -> Map[String, Int]?:
+    if i < 0:
+        return none
+    mut m: Map[String, Int] := {}
+    m.insert("k-{i}", i)
+    return m
+
+fn make_set(i: Int) -> Set[Int]?:
+    if i < 0:
+        return none
+    mut s: Set[Int] := {i, i + 1}
+    return s
+
+fn make_b(i: Int) -> Bytes?:
+    if i < 0:
+        return none
+    return bytes_from_string_utf8("bytes-{i}")
+
 fn fwd(v: String?) -> String?:
     return v
 
@@ -69,6 +87,29 @@ fn direct_cells() -> Int:
     n = n + dl.len()
     if let xs = make_l(8):
         n = n + xs[0].len() + xs.len()
+    return n
+
+# the remaining heap payload kinds behind a returned Some, each extracted
+# and read back so an over-release faults where it happens: a map through
+# an `if let` and an `unwrap_or` default, a set through `if let` plus a
+# membership read, bytes through `.value()`, and the none path for each.
+fn more_kinds() -> Int:
+    mut n := 0
+    if let m = make_m(20):
+        n = n + m.len() + m.get("k-20").unwrap_or(0 - 1)
+    dm: Map[String, Int] := {}
+    n = n + make_m(21).unwrap_or(dm).len()
+    if let s = make_set(22):
+        n = n + s.len()
+        if s.contains(22):
+            n = n + 1
+    b := make_b(23).value()
+    n = n + b.len()
+    make_m(0 - 1)
+    if make_set(0 - 1) == none:
+        n = n + 1
+    if make_b(0 - 1) == none:
+        n = n + 1
     return n
 
 fn forwarded() -> Int:
@@ -107,15 +148,17 @@ fn main():
     mut rounds := 0
     mut total := 0
     while rounds < 200:
-        total = direct_cells() + forwarded() + discarded() + none_paths() + collected() + rebound()
+        total = direct_cells() + more_kinds() + forwarded() + discarded() + none_paths() + collected() + rebound()
         rounds = rounds + 1
     d := direct_cells()
+    mk := more_kinds()
     f := forwarded()
     x := discarded()
     z := none_paths()
     c := collected()
     rb := rebound()
     print("direct={d}")
+    print("kinds={mk}")
     print("forwarded={f}")
     print("discarded={x}")
     print("none={z}")

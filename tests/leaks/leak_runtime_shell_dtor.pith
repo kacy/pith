@@ -1,0 +1,54 @@
+# a transferring runtime getter — `env_opt` behind os.get_env, the string
+# `get`, a channel receive — minted its optional shell in the runtime with
+# no destructor, so the shell held the only count on its payload while
+# freeing the shell dropped nothing. bind one to a cascade-rejected local
+# (a lambda capture is enough) and extract: the extraction retained what it
+# handed out, the shell's release had nothing to balance that against, and
+# every round stranded one payload — about 64 bytes for get_env. the call
+# site now attaches the matching __opt_dtor_<kind> to what these getters
+# hand back, the same ownership a user function's returned Some carries
+# (leak_returned_shell_dtor). the borrowing getters — `m.get(k)`,
+# `xs.first()` — keep their destructor-less shells on purpose: their
+# payload count stays with the container, and a destructor there would
+# free an element the container still holds.
+import leakprobe as probe
+import std.os as os
+
+fn env_round() -> Int:
+    v := os.get_env("PITH_LEAK_PROBE_VAR")
+    f := fn():
+        if v == none:
+            return 0
+        return 1
+    return f() + v.unwrap_or("x").len()
+
+fn get_round(s: String) -> Int:
+    v := s.get(3)
+    f := fn():
+        if v == none:
+            return 0
+        return 1
+    return f() + v.unwrap_or("x").len()
+
+fn chan_round(ch: Channel[String], i: Int) -> Int:
+    ch.send("chan-payload-{i}")
+    v := ch.recv()
+    f := fn():
+        if v == none:
+            return 0
+        return 1
+    return f() + v.unwrap_or("x").len()
+
+fn main():
+    os.set_env("PITH_LEAK_PROBE_VAR", "a-reasonably-sized-payload-string")
+    ch := Channel[String](4)
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + env_round() + get_round("payload-string") + chan_round(ch, i)
+        i = i + 1
+    if acc < 0:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

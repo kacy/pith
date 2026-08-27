@@ -4,8 +4,8 @@
 # about 30 bytes stranded per extraction, in every extraction spelling. the
 # returned Some now owns its payload through __opt_dtor_<kind>, attached at
 # the return-site wrap. this case churns the direct-call column for string,
-# struct and list payloads across all three spellings, a forwarded parameter
-# shell extracted by the caller, a discarded call result, and the none path.
+# struct, list, map, set and bytes payloads, a forwarded parameter shell
+# extracted by the caller, a discarded call result, and the none path.
 # the bound-local column is pinned by leak_if_let_payload and
 # leak_unwrap_extract.
 import leakprobe as probe
@@ -30,6 +30,24 @@ fn make_l(i: Int) -> List[String]?:
     mut xs: List[String] := []
     xs.push("elem-{i}")
     return xs
+
+fn make_m(i: Int) -> Map[String, Int]?:
+    if i < 0:
+        return none
+    mut m: Map[String, Int] := {}
+    m.insert("k-{i}", i)
+    return m
+
+fn make_set(i: Int) -> Set[Int]?:
+    if i < 0:
+        return none
+    mut s: Set[Int] := {i, i + 1}
+    return s
+
+fn make_b(i: Int) -> Bytes?:
+    if i < 0:
+        return none
+    return bytes_from_string_utf8("bytes-{i}")
 
 fn fwd(v: String?) -> String?:
     return v
@@ -60,6 +78,14 @@ fn churn_round(i: Int):
     n = n + p.val + p.tag.len()
     if let xs = make_l(i):
         n = n + xs.len()
+    if let m = make_m(i):
+        n = n + m.len()
+    if let sv = make_set(i):
+        n = n + sv.len()
+    n = n + make_b(i).value().len()
+    make_m(i + 6)
+    make_set(i + 7)
+    make_b(i + 8)
     o := make_s(i + 3)
     n = n + fwd(o).unwrap_or("d").len()
     make_s(i + 4)

@@ -180,14 +180,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
-- **a struct built from a fresh value inside a generic body is freed under
-  you** — `held := Local(label: "h-{tag}")` inside `fn build[T](tag: T)`
-  releases the temporary the construction never took a count on, and reading
-  the field afterwards reads freed memory. the program usually prints the
-  right answer; under `PITH_STRUCT_FREELIST=0` valgrind reports the invalid
-  read. the same function with the type parameter removed is clean. this is
-  the only memory-unsafety defect currently known; everything else
-  outstanding is a leak (issue #952).
 - **a built-in assertion cannot be called from a closure body** — `assert`,
   `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
   a `fn(x):` block the name resolves as a value load instead: the program is
@@ -212,20 +204,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   engine was the proof, and tests/cases/test_generic_container_share pins
   the shape.
 
-  a call inside such a body reports its result as `unknown` rather than
-  `string`, so the temporary behind it is never released:
-
-  ```pith
-  fn sized[T](marker: T, i: Int) -> Int:
-      s := "payload-" + i.to_string()   # `s` is released now; the
-      return s.len()                    # to_string temporary is not
-  ```
-
-  the concrete twin releases that temporary too.
-  `std.testing`'s `each` and `case` are generic and pay both halves, on the
-  order of a hundred bytes a row for the length of one test run. the
-  temporary is issue #949; the escaping locals are the remaining stages of
-  issue #927.
+  a builtin call inside such a body now carries its result kind, so the
+  `to_string` temporary above releases the way the concrete twin's does.
+  what still leaks is the escaping local itself — the remaining stages of
+  issue #927 — which `std.testing`'s `each` and `case` pay per row for the
+  length of one test run.
 
 ## standard library
 

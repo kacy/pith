@@ -42,15 +42,17 @@ something here that now works, the page is stale and a fix to it is welcome.
   `List[Int?]?` target widens the elements and the container at once.
 
   a map key and a set element take no widening because the types that would
-  need it no longer exist: `Set[T?]` and `Map[T?, V]` are rejected with E254.
-  a set and a map hash int and string flavors only, and an optional's shell
-  is neither — these containers used to fall back to the string flavor and
-  read the shell pointer as a c-string, so two distinct optionals collapsed
-  into one entry and `contains` answered true for anything. a compile error
-  replaced that silent data loss; use a `List[T?]` or a `Map[T, Bool]`
-  instead. an optional map value stays legal, since only the key is hashed.
-  a list compares an element the way `==` compares it, which is why its
-  searches widen.
+  need it no longer exist: `Set[T?]` and `Map[T?, V]` are rejected with
+  E254, and so is every other unhashable element or key type — a container,
+  `Bytes`, a struct, an enum, a tuple, a function value, `Float`, `Bool`. a
+  set and a map hash int and string flavors only, and none of those values
+  is either — the containers used to fall back to a flavor anyway and read
+  the value's word as a c-string, so distinct values collapsed into one
+  entry and `contains` answered true for anything. a compile error replaced
+  that silent data loss; use a `List[T?]` or key by a string or integer
+  encoding instead. an optional map value stays legal, since only the key is
+  hashed. a list compares an element the way `==` compares it, which is why
+  its searches widen.
 
   a parameter of a *generic function* widens like any other argument —
   `pick(x, 3)` against `fn pick[T](a: T, b: Int?)` builds `Some(3)`, in both
@@ -369,11 +371,15 @@ correctness story:
   extraction spelling is flat on call subjects and bound locals alike. the
   borrowing getters (`m.get(k)`, `xs.first()`) keep destructor-less shells
   on purpose — their payload count stays with the container.
-- a `Set` with an optional element type, and a `Map` with an optional key type,
-  are really the string-backed containers reading a shell pointer as a
-  c-string, so distinct optionals collapse into one entry. the store and query
-  positions reject an optional element rather than offering a shorter spelling
-  for a container that loses entries (issue #920).
+- a `Set` element and a `Map` key hash int and string flavors only. any other
+  element or key type used to fall into a flavor anyway and read its value's
+  word as if it were that flavor: distinct optionals, lists and bytes
+  collapsed into one entry through their allocation headers, a struct
+  compared raw memory bytes, a plain enum stored nothing at all, and a float
+  crashed the process. every such type is rejected at the checker now (E254,
+  issues #920 and #955). the lift that would readmit them is a content-hashing
+  element flavor through both container runtimes — bytes first, whose `==`
+  already compares by content.
 - several std types must be closed by hand and nothing enforces it. the survey,
   the assessment of what a destructor hook would take, and the staged plan are
   in docs/destructors_roadmap.md. the three registry leaks it found (issue

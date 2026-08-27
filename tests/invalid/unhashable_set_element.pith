@@ -1,0 +1,56 @@
+# a set element and a map key are hashed, and the containers hash int and
+# string flavors only. every other element or key type used to fall in
+# anyway and misbehave silently: distinct lists and bytes collapsed into
+# one entry through their allocation headers, a struct compared raw memory
+# bytes, a plain enum inserted nothing, and a float crashed the process.
+# the type is rejected wherever it is formed — annotation, inferred
+# literal, an empty literal's first typed store, and a generic
+# instantiation.
+
+struct Tracker[T]:
+    pub seen: Set[T]
+
+struct Point:
+    pub x: Int
+
+enum Color:
+    Red
+    Green
+
+fn main():
+    s: Set[List[Int]] := {}
+    print("{s.len()}")
+
+    lst := [1, 2]
+    inferred := {lst}
+    print("{inferred.len()}")
+
+    mut open := {}
+    open.insert([5], 1)
+
+    m: Map[List[Int], Int] := {}
+    print("{m.len()}")
+
+    t := Tracker[List[Int]]({})
+    print("{t.seen.len()}")
+
+    by: Set[Bytes] := {}
+    print("{by.len()}")
+
+    p: Set[Point] := {}
+    print("{p.len()}")
+
+    c: Set[Color] := {}
+    print("{c.len()}")
+
+    f: Set[Float] := {}
+    print("{f.len()}")
+
+    tp: Set[(Int, Int)] := {}
+    print("{tp.len()}")
+
+    sc: Set[Channel[Int]] := {}
+    print("{sc.len()}")
+
+    b: Map[Bool, Int] := {}
+    print("{b.len()}")

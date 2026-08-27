@@ -234,7 +234,14 @@ the right side of a pipe operator (`|`) is not a valid function.
 
 ### E221 — generic type argument count mismatch
 
-a generic type was used with the wrong number of type arguments.
+a generic type was used with the wrong number of type arguments. the channel
+constructor counts too: a channel carries exactly one payload type, and
+`Channel[Int, String](1)` used to build a `Channel[Int]` silently, dropping
+the rest. send a struct when one message should carry several fields.
+
+```
+error[E221]: Channel expects 1 type argument, got 2
+```
 
 ### E222 — generic type inference failure
 
@@ -670,20 +677,23 @@ error[E253]: a catch block must end with return, fail, continue or break; it pro
 ```
 
 
-### E254 — optional set element or map key
+### E254 — unhashable set element or map key
 
-an optional type was used as a `Set` element or a `Map` key. both positions
-are hashed, and a set and a map hash int and string flavors only; an
-optional's two-word shell is neither. the container used to fall back to the
-string flavor and read the shell pointer as a c-string, so distinct optionals
-collapsed into one entry and membership answered true for anything. the type
-is rejected wherever it is formed: a written annotation, an inferred literal,
+a `Set` element or a `Map` key must hash, and a set and a map hash exactly
+two flavors: the int family and `String`. every other type used to fall into
+one of the two anyway and misbehave silently — an optional's shell and a
+list's or `Bytes`' allocation header were read as a c-string, collapsing
+distinct values into one entry; a struct compared raw memory bytes; a plain
+enum inserted nothing at all; a float crashed the process. the type is
+rejected wherever it is formed: a written annotation, an inferred literal,
 an empty literal's first typed store, and a generic instantiation. store
-`List[T?]` instead, or key the map by the payload and track the empty case
-separately. an optional map value stays legal; only the key is hashed.
+`List[T?]` instead of `Set[T?]`, and key by a string or integer encoding of
+the value otherwise (`to_string_utf8` for bytes, an id field for a struct).
+an optional map value stays legal; only the key is hashed.
 
 ```
 error[E254]: an optional cannot be a set element type; store List[T?] or key by the payload instead
+error[E254]: a list cannot be a map key type; a set element and a map key hash int and string flavors only
 ```
 
 

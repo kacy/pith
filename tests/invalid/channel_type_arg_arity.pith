@@ -1,0 +1,12 @@
+# a channel carries exactly one payload type. the constructor used to read
+# only the first type argument, so Channel[Int, String](1) — likely someone
+# expecting a pair payload — silently built a Channel[Int], and the
+# three-argument spelling dropped two. both now report the same arity error
+# the annotation position always gave.
+
+fn main():
+    ch := Channel[Int, String](1)
+    ch.send(1)
+    ch3 := Channel[Int, String, Bool](4)
+    ch3.send(2)
+    print("{ch.len()} {ch3.len()}")

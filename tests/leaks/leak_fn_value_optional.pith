@@ -1,0 +1,82 @@
+# #967: `(fn(Int) -> Int)?` could not be spelled at all — the parens read as a
+# one-element tuple type — so an optional over a fn value never existed and
+# __opt_dtor_closure was unreachable. now that the shape compiles, this churns
+# the ownership half of it: a capturing lambda built into a shell, extracted
+# through each spelling and called, plus a discarded shell, a rebind, a struct
+# field, a container element and the none path. a capture the shell forgets to
+# release strands the whole environment allocation per round, so the growth is
+# loud if the destructor ever stops being attached.
+import leakprobe as probe
+
+fn base(x: Int) -> Int:
+    return x
+
+struct Hooks:
+    pub before: (fn(Int) -> Int)?
+
+fn pick(i: Int) -> (fn(Int) -> Int)?:
+    if i < 0:
+        return none
+    return fn(x: Int) => x + i
+
+fn flat(i: Int) -> (fn(Int) -> Int)?:
+    if i < 0:
+        return none
+    return fn(x: Int) => x * 2
+
+fn run(f: (fn(Int) -> Int)?, v: Int) -> Int:
+    return f.unwrap_or(base)(v)
+
+# bound, extracted, rebound and extracted again: both extractions retain and
+# the shell's own release balances them, so the round is flat.
+fn rebound(i: Int) -> Int:
+    u: (fn(Int) -> Int)? := pick(i)
+    mut n := u.unwrap_or(base)(1)
+    v: (fn(Int) -> Int)? := u
+    return n + v.unwrap_or(base)(1)
+
+# the extracted fn outlives the shell that carried it: the retain the
+# extraction takes is the only thing holding the environment here.
+fn escaped(i: Int) -> Int:
+    mut g := fn(x: Int) => x
+    if i >= 0:
+        o: (fn(Int) -> Int)? := fn(x: Int) => x + i
+        g = o.value()
+    return g(1)
+
+fn churn_round(i: Int):
+    mut n := pick(i).unwrap_or(base)(1)
+    n = n + pick(i + 1).value()(1)
+    if let f = pick(i + 2):
+        n = n + f(1)
+    n = n + match pick(i + 3):
+        none => 0
+        f => f(1)
+    n = n + flat(i).unwrap_or(base)(1)
+    o: (fn(Int) -> Int)? := fn(x: Int) => x + i
+    n = n + o.unwrap_or(base)(1)
+    h := Hooks(before: fn(x: Int) => x + i)
+    if let b = h.before:
+        n = n + b(1)
+    xs: List[(fn(Int) -> Int)?] := [fn(x: Int) => x + i, none]
+    for cell in xs:
+        n = n + cell.unwrap_or(base)(1)
+    n = n + run(fn(x: Int) => x + i, 1)
+    n = n + run(none, 1)
+    n = n + rebound(i + 4)
+    n = n + escaped(i + 5)
+    pick(i + 6)
+    flat(i + 7)
+    pick(0 - 1)
+    n = n + pick(0 - 1).unwrap_or(base)(1)
+    if n < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -1,0 +1,15 @@
+# `(fn(Int) -> Int)?` names an optional over a fn, not a wildcard: the parens
+# group the fn type rather than building a one-element tuple, and the widening
+# that grouping unlocked is still typed. a plain Int, a fn of the wrong shape
+# and a bare `none` where the target is not optional all stay errors.
+fn takes(f: fn(Int) -> Int) -> Int:
+    return f(1)
+
+fn wrong(s: String) -> String:
+    return s
+
+fn main():
+    a: (fn(Int) -> Int)? := 3
+    b: (fn(Int) -> Int)? := wrong
+    c := takes(none)
+    print("unreachable")

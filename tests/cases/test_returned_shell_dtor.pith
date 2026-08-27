@@ -1,7 +1,8 @@
 # a user function returning `T?` builds its Some at the return site, and that
 # shell owns its heap payload through __opt_dtor_<kind>. this case pins the
 # counts around that ownership: a direct-call extraction for each heap payload
-# kind and each spelling, a forwarded parameter shell whose payload the
+# kind — string, struct, list, map, set, bytes and, since #967, a fn value —
+# in each spelling, a forwarded parameter shell whose payload the
 # caller's own local still reads afterwards (the shape that must not
 # double-free), a discarded call result, and the none path. every subject is
 # read back after its extraction, so an over-release faults where it happens.
@@ -53,6 +54,14 @@ fn make_b(i: Int) -> Bytes?:
     if i < 0:
         return none
     return bytes_from_string_utf8("bytes-{i}")
+
+fn base_fn(x: Int) -> Int:
+    return x
+
+fn make_f(i: Int) -> (fn(Int) -> Int)?:
+    if i < 0:
+        return none
+    return fn(x: Int) => x + i
 
 fn fwd(v: String?) -> String?:
     return v
@@ -112,6 +121,30 @@ fn more_kinds() -> Int:
         n = n + 1
     return n
 
+# the fn-value lane the "each heap payload kind" claim above used to skip.
+# `(fn(Int) -> Int)?` could not be spelled at all before #967 — the parens read
+# as a one-element tuple type — so a closure payload never reached a returned
+# shell and __opt_dtor_closure was unreachable. what the shell owns is the
+# lambda's capture, so every extraction here calls the fn it pulled out, and
+# the last one calls it after the shell that carried it has gone.
+fn fn_cells() -> Int:
+    mut n := make_f(30).unwrap_or(base_fn)(1)
+    n = n + make_f(31).value()(1)
+    if let f = make_f(32):
+        n = n + f(1)
+    n = n + match make_f(33):
+        none => 0
+        f => f(1)
+    n = n + make_f(0 - 1).unwrap_or(base_fn)(1)
+    make_f(34)
+    if make_f(0 - 1) == none:
+        n = n + 1
+    mut g := fn(x: Int) => x
+    if let h = make_f(35):
+        g = h
+    n = n + g(1)
+    return n
+
 fn forwarded() -> Int:
     o := make_s(9)
     d := fwd(o).unwrap_or("d")
@@ -148,10 +181,11 @@ fn main():
     mut rounds := 0
     mut total := 0
     while rounds < 200:
-        total = direct_cells() + more_kinds() + forwarded() + discarded() + none_paths() + collected() + rebound()
+        total = direct_cells() + more_kinds() + fn_cells() + forwarded() + discarded() + none_paths() + collected() + rebound()
         rounds = rounds + 1
     d := direct_cells()
     mk := more_kinds()
+    fc := fn_cells()
     f := forwarded()
     x := discarded()
     z := none_paths()
@@ -159,6 +193,7 @@ fn main():
     rb := rebound()
     print("direct={d}")
     print("kinds={mk}")
+    print("fns={fc}")
     print("forwarded={f}")
     print("discarded={x}")
     print("none={z}")

@@ -364,11 +364,22 @@ fn parse_fn_type() -> Int:
 fn parse_tuple_type() -> Int:
     advance_token()
     mut types: List[Int] := []
+    mut saw_comma := false
     if not check("rparen"):
         types.push(parse_type_expr())
-        while match_tok("comma") and not check("rparen"):
+        while match_tok("comma"):
+            saw_comma = true
+            if check("rparen"):
+                break
             types.push(parse_type_expr())
     expect("rparen")
+    # `(T)` groups a type, it does not build a one-element tuple. the parens
+    # are the only way to say "an optional over a fn" — without the grouping
+    # `fn(Int) -> Int?` reads as a fn returning `Int?` — so treating them as a
+    # tuple made `(fn(Int) -> Int)?` name an optional over a tuple, which no fn
+    # value could ever widen into. a trailing comma still spells the one-tuple.
+    if types.len() == 1 and saw_comma == false:
+        return types[0]
     return add_node_with_position("tuple_type", "", types)
 
 # ---------------------------------------------------------------

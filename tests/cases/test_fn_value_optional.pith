@@ -1,0 +1,129 @@
+# an optional over a fn value, in every position the other heap payload
+# kinds already reach: a return, an annotated binding, a struct field, a
+# list element, a map value, an argument, and a comparison against none.
+# `(fn(Int) -> Int)?` was unspellable before: the parens around a type read
+# as a one-element tuple, so the annotation named an optional over a tuple
+# and no fn value could widen into it. a closure is reference counted, so
+# each shell owns its capture through __opt_dtor_closure — every subject
+# here is extracted and called, and the last section calls one after the
+# shell that carried it has gone out of scope, which faults on an
+# over-release instead of printing.
+fn inc(x: Int) -> Int:
+    return x + 1
+
+fn base(x: Int) -> Int:
+    return x
+
+# return position, both arms. the lambda captures `i`, so the shell owns a
+# real environment rather than a bare funcref.
+fn pick(i: Int) -> (fn(Int) -> Int)?:
+    if i > 0:
+        return fn(x: Int) => x + i
+    return none
+
+# the captureless twin lowers differently — no environment to hold — and
+# must still travel through the same shell.
+fn flat(i: Int) -> (fn(Int) -> Int)?:
+    if i > 0:
+        return fn(x: Int) => x * 2
+    return none
+
+struct Hooks:
+    pub before: (fn(Int) -> Int)?
+    pub after: (fn(Int) -> Int)?
+
+fn run(f: (fn(Int) -> Int)?, v: Int) -> Int:
+    return f.unwrap_or(base)(v)
+
+fn bindings() -> Int:
+    o: (fn(Int) -> Int)? := fn(x: Int) => x + 1
+    n: (fn(Int) -> Int)? := inc
+    e: (fn(Int) -> Int)? := none
+    mut total := o.value()(10)
+    total = total + n.value()(20)
+    total = total + e.unwrap_or(base)(30)
+    return total
+
+fn returns() -> Int:
+    mut total := 0
+    if let f = pick(3):
+        total = total + f(10)
+    total = total + pick(4).value()(10)
+    total = total + pick(0).unwrap_or(base)(7)
+    if let g = flat(1):
+        total = total + g(5)
+    total = total + flat(0 - 1).unwrap_or(base)(6)
+    return total
+
+fn matched() -> Int:
+    total := match pick(2):
+        none => 0
+        f => f(100)
+    empty := match pick(0):
+        none => 9
+        f => f(100)
+    return total + empty
+
+fn fields() -> Int:
+    h := Hooks(before: fn(x: Int) => x + 7, after: none)
+    mut total := 0
+    if let b = h.before:
+        total = total + b(1)
+    total = total + h.after.unwrap_or(base)(2)
+    if h.after == none:
+        total = total + 100
+    if h.before != none:
+        total = total + 1000
+    return total
+
+fn elements() -> Int:
+    xs: List[(fn(Int) -> Int)?] := [fn(x: Int) => x + 3, none, inc]
+    mut total := 0
+    for cell in xs:
+        total = total + cell.unwrap_or(base)(10)
+    mut m: Map[String, (fn(Int) -> Int)?] := {}
+    m.insert("hit", fn(x: Int) => x + 4)
+    m.insert("miss", none)
+    if let c = m["hit"]:
+        total = total + c(10)
+    total = total + m["miss"].unwrap_or(base)(10)
+    return total
+
+fn arguments() -> Int:
+    mut total := run(fn(x: Int) => x + 5, 10)
+    total = total + run(inc, 10)
+    total = total + run(none, 10)
+    total = total + run(pick(6), 10)
+    return total
+
+# the discarded shell and the rebind: both must balance, and the payload
+# stays readable through the second name.
+fn churned() -> Int:
+    pick(8)
+    flat(9)
+    u: (fn(Int) -> Int)? := pick(2)
+    mut total := u.unwrap_or(base)(10)
+    v: (fn(Int) -> Int)? := u
+    total = total + v.unwrap_or(base)(10)
+    return total
+
+# the hazard shape: the extracted fn is called after the optional that
+# carried it has left scope. the extraction's retain is what keeps the
+# environment alive, so a missing one reads freed memory here.
+fn call_after_scope(n: Int) -> Int:
+    mut g := fn(x: Int) => x
+    if n > 0:
+        o: (fn(Int) -> Int)? := fn(x: Int) => x + n
+        g = o.value()
+    return g(10)
+
+fn main():
+    print("bindings={bindings()}")
+    print("returns={returns()}")
+    print("matched={matched()}")
+    print("fields={fields()}")
+    print("elements={elements()}")
+    print("arguments={arguments()}")
+    print("churned={churned()}")
+    print("scope={call_after_scope(5)}")
+    print("scope_none={call_after_scope(0)}")

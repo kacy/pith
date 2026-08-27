@@ -170,6 +170,14 @@ lambdas and function values:
   bare name (`ir_emit_ident_load`) and a module member such as
   `hash.sha256_bytes` (`ir_emit_field_access_expr`). saying "owned"
   where no closure was allocated would release a count nobody took
+- calling a fn value the expression itself produced (`mk(i)(1)`, an
+  immediately-invoked lambda, a payload pulled out of an optional)
+  releases that callee once the call returns. the callee is a value
+  like any other and the call is its only consumer, so skipping the
+  release stranded the whole environment allocation, once per call.
+  a borrowed callee — a local, a struct field, a container element —
+  belongs to its owner and is left alone; a plain name never reaches
+  this path at all, because it lowers to a direct call
 - `map`, `filter` and `reduce` open-code their loop rather than going
   through the general method call, so the release that reclaims an
   owned argument does not run for them. each releases the function it

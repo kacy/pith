@@ -4693,6 +4693,15 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     r := ir_reg()
     ir_emit_call_text(r, tmp, ret_kind, arg_regs.len(), ir_join_arg_regs(arg_regs))
     ir_release_owned_args(node, 1, arg_regs)
+    # the callee expression is a value like any other, and this call is its
+    # only consumer. a lambda literal, a named function, a call that built a
+    # closure and a payload pulled out of an optional all arrive owned, so
+    # without this release the whole environment allocation stranded per
+    # call — around 190 bytes a round for `mk(i)(1)`, and every extraction
+    # spelling that calls what it pulled out. a borrowed callee (a local, a
+    # struct field, a container element) belongs to its owner: left alone.
+    if not ir_expr_is_borrowed(callee_idx):
+        ir_rc_release_reg(callee_r, "closure")
     return r
 
 # true when the callee node is an expression (not a plain name) whose

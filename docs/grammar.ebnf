@@ -353,8 +353,13 @@ type_expr     = base_type , [ "?" ]          (* T? = Option[T] *)
               ;
 
 base_type     = qualified_type , [ "[" , type_list , "]" ]   (* named or generic: Map[String, Int] *)
-              | "(" , type_list , ")"                (* tuple type: (Int, String) *)
+              | "(" , type_expr , ")"                (* grouping: (fn(Int) -> Int)? *)
+              | "(" , [ type_expr , "," , [ type_list ] ] , ")"  (* tuple type: (Int, String) *)
               | fn_type ;
+
+(* one type in parens groups it rather than building a one-element tuple:
+   `(fn(Int) -> Int)?` is an optional over a fn, where `fn(Int) -> Int?`
+   would be a fn returning `Int?`. a trailing comma spells the one-tuple. *)
 
 qualified_type = IDENT , { "." , IDENT } ;
 

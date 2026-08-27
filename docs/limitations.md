@@ -191,14 +191,26 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **a generic function body releases only the locals that cannot escape it** —
   an instantiation re-emits a body the checker skipped, so every expression in
   it reports the error type and the emitter's ownership classification has
-  nothing to read. a local is tracked and released the way a concrete body's
-  is when every appearance of it in the body is a use that cannot hand its
-  count on: a read under an operator, an interpolation, an index or a field
-  access; an assignment target; a method-call receiver; the value of a `push`
-  into a list the same body built tagged. `leak_generic_body_locals` covers
-  those in `make leak-check`. every other local stays untracked and leaks one
-  count per call — one that escapes into a returned struct, a container the
-  frame hands on, a global, an optional, a lambda, or a callee's argument.
+  nothing to read. the decision is made syntactically instead: a local is
+  tracked when no appearance of it in the body leaves a second owner holding
+  its count. that covers a read under an operator, an interpolation, an index
+  or a field access; an assignment target; a method-call receiver; the value
+  of a `push` into a list the same body built tagged; and `return name`,
+  where the exit cleanup skips the local and its one count travels to the
+  caller. `leak_generic_body_locals` and `leak_generic_body_returned_local`
+  cover the two halves in `make leak-check`.
+
+  every other local stays untracked and leaks one count per call: one stored
+  into a struct the body builds, into a map or a set or a list the body
+  cannot prove tagged, into a module global, into a binding of a second name,
+  into a lambda, or into a callee's argument. the return position is
+  bare-name only, so `return Holder(items: items)` still leaks `items` (the
+  construction is lowered opaquely) and `return shout(loud)` still leaks
+  `loud` (the argument is a transfer). `fail name` is left out for a
+  different reason: whether the exit cleanup skips a failed local depends on
+  the error kind the emitter infers for the operand, and that inference is
+  exactly what an unchecked body does not have.
+
   a generic struct built by its bare base name in such a body deliberately
   carries no destructor either, so what its fields hold leaks with the
   instance: the body's stores take no counts, and releasing those slots
@@ -208,8 +220,8 @@ something here that now works, the page is stale and a fix to it is welcome.
 
   a builtin call inside such a body now carries its result kind, so the
   `to_string` temporary above releases the way the concrete twin's does.
-  what still leaks is the escaping local itself — the remaining stages of
-  issue #927 — which `std.testing`'s `each` and `case` pay per row for the
+  what still leaks is the local that genuinely escapes — the remaining stages
+  of issue #927 — which `std.testing`'s `each` and `case` pay per row for the
   length of one test run.
 
 ## standard library
@@ -319,16 +331,15 @@ correctness story:
   method on a generic receiver — and a callee that extracts a heap payload
   out of the optional rather than reading it in place. binding the value
   first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
-- a heap local inside a *generic function body* is never released. a
-  specialized body is re-emitted per instantiation and cannot run the full
-  prologue, so every reference-counted binding in it is published as
-  untracked and its scope exit frees nothing: `fn f[T](v: T, i: Int)` that
-  builds a string or a list into a local drops about 90 bytes per call. the
-  suppression is deliberate. the alternative is releasing a local whose
-  escape into the caller's module the emitter cannot see, and a recycled
-  handle is worse than a leak, so lifting this means teaching the
-  specialization path the caller-side escape it is missing rather than
-  turning the releases back on. what a *generic instance* holds is
+- a heap local inside a *generic function body* is released only where the
+  body can prove nothing else took a count of it. the rule the specialization
+  path uses, and the shapes it still refuses, are spelled out in the
+  compiler-section entry above; a name it refuses drops about 90 bytes per
+  call. the refusals are deliberate. releasing a local whose escape into the
+  caller's module the emitter cannot see hands back a recycled handle, which
+  is worse than a leak, so lifting the rest means teaching the specialization
+  path the caller-side escape it is missing rather than tracking every name
+  and hoping. what a *generic instance* holds is
   unaffected when the site names its concrete types (`Wrap[String](...)`) or
   the checker typed it: its destructor is built from the instance's concrete
   kinds and releases the enum payload or struct field either way. an

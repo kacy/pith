@@ -1,0 +1,283 @@
+# a generic specialization hands one of its own locals back to the caller.
+#
+# a generic declaration is never type checked, so the ownership
+# classification inside a specialization is blind and every rc bind in one
+# used to be published untracked. an untracked name in return position took
+# the borrowed-return path: the return retained the value a second time for
+# the caller while nothing released the count the binding took, so every
+# `return s` in a generic body leaked one value per call.
+#
+# tracking such a name is only sound because the return transfers rather
+# than drops: the exit cleanup names the returned local as its exclusion, so
+# exactly the one count the binding took leaves with the value. this case is
+# the other side of that trade. each function below reads its returned value
+# back after the frame that built it is gone, and the shapes that also let
+# the name reach an owner the emitter cannot see — a global, a callee's
+# argument, a struct field, a map store, a parameter it aliases, a deferred
+# statement — are here beside them, so a rule that widened past the bare
+# return position would print garbage or die. a lambda is the one escape
+# missing: one inside a generic body does not lower at all yet, so the shape
+# has no runnable form to pin.
+#
+# each generic function has a concrete twin printing the same line, since
+# the concrete path is the one whose ownership the checker did settle.
+import generic_body_returned_local_helper as remote
+
+struct Holder:
+    pub items: List[String]
+    pub name: String
+
+struct Maker:
+    pub prefix: String
+
+struct Bag[T]:
+    pub items: List[T]
+
+mut registry: List[String] := []
+
+# the target shape: a fresh string bound and handed straight back
+fn hand_string[T](t: T, n: Int) -> String:
+    s := "s" + n.to_string()
+    return s
+
+fn hand_string_con(n: Int) -> String:
+    s := "s" + n.to_string()
+    return s
+
+# a container the body built and returned, with a confined local pushed into
+# it. the list transfers its count; the pushed string keeps the one its
+# binding took, which the tagged list's own retain balances.
+fn hand_list[T](t: T, n: Int) -> List[String]:
+    out: List[String] := []
+    mut i := 0
+    while i < n:
+        piece := "p" + i.to_string()
+        out.push(piece)
+        i = i + 1
+    return out
+
+fn hand_list_con(n: Int) -> List[String]:
+    out: List[String] := []
+    mut i := 0
+    while i < n:
+        piece := "p" + i.to_string()
+        out.push(piece)
+        i = i + 1
+    return out
+
+# a map, whose keys and values reach a store the tagged-list proof says
+# nothing about and so stay untracked; only the map itself transfers
+fn hand_map[T](t: T, n: Int) -> Map[String, String]:
+    m: Map[String, String] := {}
+    mut i := 0
+    while i < n:
+        m.insert("k" + i.to_string(), "v" + i.to_string())
+        i = i + 1
+    return m
+
+fn hand_map_con(n: Int) -> Map[String, String]:
+    m: Map[String, String] := {}
+    mut i := 0
+    while i < n:
+        m.insert("k" + i.to_string(), "v" + i.to_string())
+        i = i + 1
+    return m
+
+# returned through the optional wrap, which takes the transferred count
+# over. the `none` branch leaves the local behind, where the exit cleanup
+# releases it instead.
+fn hand_optional[T](t: T, n: Int) -> String?:
+    s := "o" + n.to_string()
+    if n < 1:
+        return none
+    return s
+
+fn hand_optional_con(n: Int) -> String?:
+    s := "o" + n.to_string()
+    if n < 1:
+        return none
+    return s
+
+# two returns of two different locals. whichever one leaves, the other is
+# still released on that path — which is what the prologue's zero-store is
+# for, since the second binding has not run yet on the first path.
+fn hand_branch[T](t: T, n: Int) -> String:
+    first := "a" + n.to_string()
+    if n > 1:
+        return first
+    second := "b" + n.to_string()
+    return second
+
+fn hand_branch_con(n: Int) -> String:
+    first := "a" + n.to_string()
+    if n > 1:
+        return first
+    second := "b" + n.to_string()
+    return second
+
+# a struct instance bound to a local and then handed back, carrying a list
+# and a string out of the frame inside it
+fn hand_struct[T](t: T, n: Int) -> Holder:
+    items: List[String] := []
+    items.push("h" + n.to_string())
+    held := Holder(items: items, name: "n" + n.to_string())
+    return held
+
+fn hand_struct_con(n: Int) -> Holder:
+    items: List[String] := []
+    items.push("h" + n.to_string())
+    held := Holder(items: items, name: "n" + n.to_string())
+    return held
+
+fn keep(s: String) -> Int:
+    registry.push(s)
+    return registry.len()
+
+# the name is returned on one path and pushed into a module global on the
+# other. the rule is per name, not per site, so this one stays untracked and
+# the registry keeps a readable value.
+fn split_escape[T](t: T, n: Int) -> String:
+    s := "x" + n.to_string()
+    if n > 1:
+        return s
+    registry.push(s)
+    return "kept"
+
+# the name is returned bare and also handed to a user function that keeps
+# it: the argument is a transfer the walk cannot see through, so the name
+# stays untracked
+fn fed_and_returned[T](t: T, n: Int) -> String:
+    s := "f" + n.to_string()
+    keep(s)
+    return s
+
+# the returned local is an alias of a parameter, whose count the caller
+# still holds for the whole call. the binding takes a count of its own
+# because it is tracked, so the caller's value survives the return.
+fn alias_param[T](t: T, a: String, b: String, take_a: Bool) -> String:
+    chosen := a
+    if take_a:
+        return chosen
+    other := b
+    return other
+
+fn alias_param_con(a: String, b: String, take_a: Bool) -> String:
+    chosen := a
+    if take_a:
+        return chosen
+    other := b
+    return other
+
+# an `if let` payload binding is an owned local like any other: the
+# extraction gives it a count, the return hands that count on, and the
+# fall-through path releases it instead. the caller's optional keeps its own.
+fn from_iflet[T](t: T, o: String?) -> String:
+    if let v = o:
+        return v
+    return "z"
+
+fn from_iflet_con(o: String?) -> String:
+    if let v = o:
+        return v
+    return "z"
+
+# a deferred statement runs after the exit cleanup would have released the
+# local, so a name mentioned in one keeps its count to the end of the frame
+# whatever the return does with it
+fn deferred[T](t: T, n: Int) -> String:
+    s := "d" + n.to_string()
+    defer print("bye " + s)
+    return s
+
+impl Maker:
+    # a method with type parameters of its own has no single body: it is
+    # specialized per call site the way a free generic function is, with an
+    # implicit self ahead of its declared parameters
+    fn made[T](t: T, n: Int) -> String:
+        s := self.prefix + n.to_string()
+        return s
+
+    # and the same for a container the method builds
+    fn made_list[T](t: T, n: Int) -> List[String]:
+        out: List[String] := []
+        piece := "q" + n.to_string()
+        out.push(piece)
+        return out
+
+    fn made_con(n: Int) -> String:
+        s := self.prefix + n.to_string()
+        return s
+
+impl Bag:
+    # a method on a generic STRUCT is emitted once per instantiation rather
+    # than through the specialization queue, so it is the control: its
+    # returned local was already tracked and must stay that way
+    fn first() -> T?:
+        if self.items.len() == 0:
+            return none
+        v := self.items[0]
+        return v
+
+fn main():
+    mut k := 0
+    while k < 3:
+        print(hand_string(1, k))
+        print(hand_string_con(k))
+
+        l := hand_list(1, 3)
+        lc := hand_list_con(3)
+        print(l.len().to_string() + " " + l[0] + l[1] + l[2])
+        print(lc.len().to_string() + " " + lc[0] + lc[1] + lc[2])
+
+        m := hand_map(1, 2)
+        mc := hand_map_con(2)
+        print(m.len().to_string() + " " + m["k0"] + m["k1"])
+        print(mc.len().to_string() + " " + mc["k0"] + mc["k1"])
+
+        if let v = hand_optional(1, k):
+            print(v)
+        else:
+            print("none")
+        if let vc = hand_optional_con(k):
+            print(vc)
+        else:
+            print("none")
+
+        print(hand_branch(1, k))
+        print(hand_branch_con(k))
+
+        h := hand_struct(1, k)
+        hc := hand_struct_con(k)
+        print(h.name + " " + h.items[0])
+        print(hc.name + " " + hc.items[0])
+
+        print(split_escape(1, k))
+        print(fed_and_returned(1, k))
+        print(alias_param(1, "aaa", "bbb", k == 1))
+        print(alias_param_con("aaa", "bbb", k == 1))
+        opt: String? := "w" + k.to_string()
+        print(from_iflet(1, opt) + " " + from_iflet_con(opt) + " " + opt.value())
+        print(from_iflet(1, none) + " " + from_iflet_con(none))
+
+        print(deferred(1, k))
+
+        mk := Maker(prefix: "m")
+        print(mk.made(1, k) + " " + mk.made_con(k))
+        ml := mk.made_list(1, k)
+        print(ml.len().to_string() + " " + ml[0])
+
+        bag := Bag[String](items: ["z" + k.to_string()])
+        if let bv = bag.first():
+            print(bv)
+        else:
+            print("empty")
+
+        print(remote.remote_string(1, k))
+        rl := remote.remote_list(1, k)
+        print(rl.len().to_string() + " " + rl[0])
+        rs := remote.remote_struct(1, k)
+        print(rs.label + " " + rs.parts[0])
+
+        k = k + 1
+
+    print(registry.len().to_string() + " " + registry[0] + registry[1] + registry[2] + registry[3])

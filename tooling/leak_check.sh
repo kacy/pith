@@ -57,6 +57,7 @@ cases=(
   tests/leaks/leak_generic_instance_dtor
   tests/leaks/leak_generic_optional_return
   tests/leaks/leak_generic_variant_slots
+  tests/leaks/leak_generic_body_returned_local
   tests/leaks/leak_generic_field_kinds
   tests/leaks/leak_generic_call_shapes
   tests/leaks/leak_generic_boundary

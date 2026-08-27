@@ -1,0 +1,27 @@
+# helper for test_generic_body_returned_local: generic functions another
+# module declares. a specialization of one of these emits under that
+# module's path, and the count its returned local took still has to reach
+# the caller across the boundary.
+
+# a struct with one heap field of each shape, so a returned instance built
+# in a generic body carries both a string and a list out of the frame
+pub struct Remote:
+    pub label: String
+    pub parts: List[String]
+
+# a bare local handed back from another module's generic body
+pub fn remote_string[T](t: T, n: Int) -> String:
+    s := "rs" + n.to_string()
+    return s
+
+# a container built and handed back from another module's generic body
+pub fn remote_list[T](t: T, n: Int) -> List[String]:
+    out: List[String] := []
+    piece := "rp" + n.to_string()
+    out.push(piece)
+    return out
+
+# a struct instance bound to a local and then handed back
+pub fn remote_struct[T](t: T, n: Int) -> Remote:
+    held := Remote(label: "rl" + n.to_string(), parts: ["rq" + n.to_string()])
+    return held

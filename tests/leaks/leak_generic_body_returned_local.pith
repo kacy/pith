@@ -1,0 +1,66 @@
+# a generic body that hands one of its own locals back to the caller.
+#
+# a specialization re-emits a body the checker never looked at, so the
+# ownership classification is blind there and every rc bind used to be
+# published untracked. an untracked name in return position took the
+# borrowed-return path: the return retained it a second time for the caller
+# and nothing ever released the count its binding took, so a `return s` in a
+# generic body leaked one value per call.
+#
+# the locals below reach nothing but their own return statement — no call
+# argument, no container the frame hands on, no struct field, no lambda — so
+# the count each binding took is exactly the count the caller receives.
+#
+# the round's varying text arrives as a parameter: a builtin's result kind
+# does not resolve inside a specialization either, so an `i.to_string()`
+# there leaks its result as a temporary, a separate gap that would swamp
+# this measurement.
+import leakprobe as probe
+
+# the bare shape: a fresh string bound and returned
+fn hand_string[T](t: T, tag: String) -> String:
+    s := "r-" + tag
+    return s
+
+# a container the body built and returned, with a confined local pushed into
+# it — the list transfers, the pushed string keeps the count the tagged
+# list's own retain balances
+fn hand_list[T](t: T, tag: String) -> List[String]:
+    out: List[String] := []
+    piece := "p-" + tag
+    out.push(piece)
+    return out
+
+# returned through the optional wrap, which takes the transferred count over
+fn hand_optional[T](t: T, tag: String) -> String?:
+    s := "o-" + tag
+    return s
+
+# two returns of two different locals: whichever one leaves, the other is
+# still released by the exit cleanup on that path
+fn hand_branch[T](t: T, tag: String, n: Int) -> String:
+    first := "a-" + tag
+    if n > 0:
+        return first
+    second := "b-" + tag
+    return second
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        tag := i.to_string()
+        a := hand_string(1, tag)
+        total = total + a.len()
+        b := hand_list(1, tag)
+        total = total + b.len()
+        if let v = hand_optional(1, tag):
+            total = total + v.len()
+        c := hand_branch(1, tag, i)
+        total = total + c.len()
+        i = i + 1
+    kb := probe.peak_kb()
+    if total < 0:
+        print("unreachable")
+    print("{kb}")

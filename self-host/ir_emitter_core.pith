@@ -1009,7 +1009,19 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # consumer adds its own count: a leak rather than a value released
         # twice.
         if ir_rc_kind(ir_infer_type(idx)).len() > 0:
-            if ir_method_result_retains_over_args(ir_method_emit_name(mname, recv_type)):
+            resolved := ir_method_emit_name(mname, recv_type)
+            if ir_method_result_retains_over_args(resolved):
+                return false
+            # a builtin whose receiver relinquishes its own count into the
+            # result hands back an owned value the same way: the entry is
+            # gone from the container and nobody else will release what it
+            # held. the heap-container result kinds already answered owned
+            # through the rc-kind check above, so this clause is what the
+            # String flavor rides on — without it a taken string fell to the
+            # builtin fresh-name list below, classified borrowed, and the
+            # bind retained a count nobody released: one stranded string per
+            # `m.take(k)` on a string-valued map, whichever key flavor.
+            if ir_method_result_transfers_count(resolved):
                 return false
         # the optional extractions — `unwrap_or` and `.value()` — hand out an
         # owned count for every heap payload kind: either the freshly
@@ -2151,6 +2163,15 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
 # attempt at this hand back a recycled handle.
 fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
     return emit_name == "map_get_default" or emit_name == "map_get_default_ikey"
+
+# true for a builtin whose receiver relinquishes its own count into the
+# result: the value leaves the container and the container's count leaves
+# with it, so the caller owns what it gets for every value kind. `take` is
+# the only one — `remove` releases that count inside the runtime instead.
+# keyed on the resolved emit name, like the retains-over-args list, so a
+# same-named method on another receiver keeps its own classification.
+fn ir_method_result_transfers_count(emit_name: String) -> Bool:
+    return emit_name == "map_take" or emit_name == "map_take_ikey"
 
 fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
     # a named argument may land in any declared position, so a positional
@@ -8509,7 +8530,15 @@ fn ir_stmt(idx: Int):
             # nothing, so it keeps the old leak too.
             if not ir_in_generic_body():
                 stmt_kind := ir_rc_kind(ir_infer_type(idx))
-                if (stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set") and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+                mut stmt_kind_discards := stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set"
+                # bytes and struct results ride the same rule: the producers
+                # transfer their count out exactly like the container ones,
+                # so a discarded `m.take(i)` on a Bytes- or struct-valued map
+                # (or any other discarded owned result of these kinds)
+                # stranded one count per statement.
+                if stmt_kind == "bytes" or ir_kind_is_struct_header(stmt_kind):
+                    stmt_kind_discards = true
+                if stmt_kind_discards and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
                     ir_rc_release_reg(r, stmt_kind)
                     return
         # a discarded owned string result (a popped element, an unused

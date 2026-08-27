@@ -967,29 +967,24 @@ fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: 
 
 ## drop a buffered reader's registry entries. a long-running process
 ## must free readers when the stream is done, or every request's
-## buffers stay reachable forever. take() hands the cached bytes to a
-## local whose cleanup releases them.
+## buffers stay reachable forever.
 pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
     io_registry_mu.lock()
-    cached := buffered_bytes_reader_cache.take(reader.handle)
+    buffered_bytes_reader_cache.remove(reader.handle)
     buffered_bytes_reader_source_kinds.remove(reader.handle)
     buffered_bytes_reader_source_handles.remove(reader.handle)
     buffered_bytes_reader_chunk_sizes.remove(reader.handle)
     io_registry_mu.unlock()
-    if cached.len() < 0:
-        return
 
 ## drop a buffered writer's registry entries; the counterpart of
 ## free_buffered_bytes_reader for the write side.
 pub fn free_buffered_bytes_writer(writer: BufferedBytesWriter):
     io_registry_mu.lock()
-    cached := buffered_bytes_writer_cache.take(writer.handle)
+    buffered_bytes_writer_cache.remove(writer.handle)
     buffered_bytes_writer_target_kinds.remove(writer.handle)
     buffered_bytes_writer_target_handles.remove(writer.handle)
     buffered_bytes_writer_chunk_sizes.remove(writer.handle)
     io_registry_mu.unlock()
-    if cached.len() < 0:
-        return
 
 fn allocate_buffered_bytes_writer_handle(target_kind: Int, target_handle: Int, chunk_size: Int) -> Int:
     io_registry_mu.lock()
@@ -1068,39 +1063,26 @@ fn allocate_buffered_process_stderr_handle(process_handle: Int, chunk_size: Int)
 # its registry state only — the stream, buffer or process underneath is closed
 # by whoever built it.
 
-# a String-valued entry is dropped with remove(), which releases the stored
-# text; a Bytes- or List-valued entry is handed to a local by take(), whose
-# cleanup releases it — the same shape free_buffered_bytes_reader uses.
-# (measured, not assumed: take() on a Map[Int, String] strands one count of
-# a fresh value, while remove() is clean, and the Bytes and List maps are
-# exactly the other way around.)
-
 fn close_string_reader_state(handle: Int):
     string_reader_data.remove(handle)
     string_reader_offsets.remove(handle)
 
 fn close_string_buffer_state(handle: Int):
-    parts := string_buffer_parts.take(handle)
+    string_buffer_parts.remove(handle)
     string_buffer_lengths.remove(handle)
-    if parts.len() < 0:
-        return
 
 fn close_bytes_cursor_state(handle: Int):
-    data := bytes_reader_data.take(handle)
+    bytes_reader_data.remove(handle)
     bytes_reader_offsets.remove(handle)
-    if data.len() < 0:
-        return
 
 # one remover for all five text-reader kinds, matching their one allocator.
 fn close_buffered_text_reader_state(handle: Int):
-    partial := buffered_text_reader_partials.take(handle)
+    buffered_text_reader_partials.remove(handle)
     buffered_text_reader_cache.remove(handle)
     buffered_text_reader_kinds.remove(handle)
     buffered_text_reader_sources.remove(handle)
     buffered_text_reader_chunk_sizes.remove(handle)
     buffered_text_reader_cursors.remove(handle)
-    if partial.len() < 0:
-        return
 
 fn close_buffered_string_writer_state(handle: Int):
     buffered_string_writer_cache.remove(handle)

@@ -357,18 +357,18 @@ correctness story:
   `m[k] = none`) is a shell the caller built, so the store takes that count
   instead of adding one of its own, the same as a widened plain value.
 - a call result dropped at statement position is reclaimed when it is a result
-  box, an optional shell, a string, or a bare `List`/`Map`/`Set`. a user
-  function transfers its container out, and the builtin container producers
-  hand back either a freshly built one (`keys()`, `values()`, `split()`, the
-  slice/sort copies) or a count taken over the call itself (`get_default`,
-  which the call site retains; `take`, which the map relinquishes), so the
-  discard releases a count that was the statement's to drop. what still
-  strands: a discarded void-method chain (the chain's value is the receiver
-  handed back, and freeing it would free the container its owner still
-  holds), a discard inside a generic body (the suppressed types prove
-  nothing), a discarded `bytes`, struct or closure result, and a container
-  dropped through a discarded `!` or `await` at statement position, which
-  take other paths to the discard.
+  box, an optional shell, a string, `bytes`, a struct, or a bare
+  `List`/`Map`/`Set`. a user function transfers its result out, and the
+  builtin producers hand back either a freshly built value (`keys()`,
+  `values()`, `split()`, the slice/sort copies) or a count taken over the
+  call itself (`get_default`, which the call site retains; `take`, which the
+  map relinquishes), so the discard releases a count that was the
+  statement's to drop. what still strands: a discarded void-method chain
+  (the chain's value is the receiver handed back, and freeing it would free
+  the container its owner still holds), a discard inside a generic body (the
+  suppressed types prove nothing), a discarded closure result, and a
+  container dropped through a discarded `!` or `await` at statement
+  position, which take other paths to the discard.
 - an optional shell reaching a *specialized generic body* from a runtime
   call can still carry no destructor: the checked types are suppressed
   there, so a channel receive whose element type the emitter cannot see

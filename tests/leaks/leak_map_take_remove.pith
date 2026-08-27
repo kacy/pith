@@ -1,0 +1,80 @@
+# take and remove across every map value kind. `remove` drops exactly the
+# map's count in the runtime; `take` hands that count out with the value, so
+# the caller owns what it gets — bound or discarded, fresh or borrowed,
+# whichever key flavor. the string cells are the ones the classifier used to
+# get wrong (a taken string was called borrowed, and the bind retained a
+# count nobody released), and the discarded bytes and struct cells are the
+# ones the statement discard used to skip, so all of those churn here
+# alongside the cells that were always flat.
+import leakprobe as probe
+
+struct Row:
+    name: String
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    # string values: bound take (fresh and borrowed), discarded take,
+    # remove, both key flavors
+    mut sm: Map[Int, String] := {}
+    sm.insert(i, "s-{i}-payload")
+    got := sm.take(i)
+    acc = acc + got.len()
+    held := "h-{i}-payload"
+    sm.insert(i, held)
+    bound := sm.take(i)
+    acc = acc + bound.len()
+    sm.insert(i, "d-{i}-payload")
+    sm.take(i)
+    sm.insert(i, "r-{i}-payload")
+    sm.remove(i)
+    mut km: Map[String, String] := {}
+    km.insert("k-{i}", "v-{i}-payload")
+    kt := km.take("k-{i}")
+    acc = acc + kt.len()
+    km.insert("k-{i}", "w-{i}-payload")
+    km.remove("k-{i}")
+
+    # bytes values: bound take, discarded take, remove
+    mut bm: Map[Int, Bytes] := {}
+    bm.insert(i, bytes_from_string_utf8("b-{i}-payload"))
+    b := bm.take(i)
+    acc = acc + b.len()
+    bm.insert(i, bytes_from_string_utf8("bd-{i}-payload"))
+    bm.take(i)
+    bm.insert(i, bytes_from_string_utf8("br-{i}-payload"))
+    bm.remove(i)
+
+    # list values: bound take, discarded take, remove
+    mut lm: Map[Int, List[String]] := {}
+    lm.insert(i, ["l-{i}", "m-{i}"])
+    l := lm.take(i)
+    acc = acc + l.len()
+    lm.insert(i, ["ld-{i}"])
+    lm.take(i)
+    lm.insert(i, ["lr-{i}"])
+    lm.remove(i)
+
+    # struct values: bound take, discarded take, remove
+    mut rm: Map[Int, Row] := {}
+    rm.insert(i, Row("r-{i}-payload"))
+    r := rm.take(i)
+    acc = acc + r.name.len()
+    rm.insert(i, Row("rd-{i}-payload"))
+    rm.take(i)
+    rm.insert(i, Row("rr-{i}-payload"))
+    rm.remove(i)
+
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

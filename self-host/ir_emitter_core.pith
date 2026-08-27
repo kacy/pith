@@ -9481,19 +9481,39 @@ fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete
 # through every frame. mirrors ir_tuple_walk_root.
 mut ir_spec_walk_body := 0 - 1
 
-# true when a child ident `name` under `parent` is a use that leaves the
-# count `name` holds exactly where it was:
+# true when a child ident `name` under `parent` is a use that cannot leave a
+# second owner holding the count `name` took.
+#
+# most of the list reads the value and leaves that count exactly where it
+# was:
 #
 #   - an operand of a binary, unary or parenthesized expression, and a piece
 #     of an interpolation: all of them read the value and mint a new one;
 #   - either side of an index (`xs[name]`, `name[i]`), which reads;
 #   - the receiver of a field access, which reads.
 #
-# nothing on this list stores the value, hands it to a callee, or releases
-# it, so a local whose every appearance is one of them still holds the
-# single count its binding took when the exit cleanup runs. the two
-# position-sensitive parents — a method call and an assignment — are judged
-# in the walk instead, where the index is in view.
+# `return name` is the one entry that moves the count rather than leaving
+# it, and it is still balanced: ir_emit_return_value names a returned
+# tracked local as the exit cleanup's exclusion, so the single count leaves
+# with the value instead of being dropped on the way out. a return node
+# carries the returned expression as its only child, so a bare ident under
+# one is that expression and nothing else.
+#
+# the rule is still per name rather than per site. a body that returns this
+# name on one path and hands it to an owner the emitter cannot see on
+# another has already answered false at that other appearance, so the whole
+# name stays untracked and the return keeps the borrowed handling it has
+# always had.
+#
+# `fail name` is deliberately absent. its exclusion is conditional on the
+# error kind the emitter infers for the operand matching the name's tracked
+# kind, and that inference is precisely what an unchecked generic body does
+# not have: a miss leaves the name in the cleanup while its value travels
+# out as the error, which is the dangling half of the trade rather than the
+# leaking half.
+#
+# the two position-sensitive parents — a method call and an assignment — are
+# judged in the walk instead, where the index is in view.
 fn ir_spec_use_is_whitelisted(parent: Node, name: String) -> Bool:
     if parent.kind == "binary" or parent.kind == "unary" or parent.kind == "grouped":
         return true
@@ -9501,6 +9521,8 @@ fn ir_spec_use_is_whitelisted(parent: Node, name: String) -> Bool:
         return true
     if parent.kind == "index":
         return true
+    if parent.kind == "return":
+        return parent.children.len() == 1
     return parent.kind == "field_access"
 
 # the argument position a container store writes its value into, or -1 when
@@ -9605,8 +9627,8 @@ fn ir_spec_method_uses_safe(node: Node, name: String) -> Bool:
     return true
 
 # walk the subtree: every occurrence of ident `name` must sit in a position
-# that cannot hand its count to another owner. any other appearance — a call
-# argument, a return, a list or struct element, a match subject, a loop's
+# that cannot leave a second owner holding its count. any other appearance —
+# a call argument, a list or struct element, a match subject, a loop's
 # iterable, a bind of a second name from this one — answers false, and the
 # local stays untracked exactly as it is today.
 fn ir_spec_uses_all_safe(idx: Int, name: String) -> Bool:
@@ -9663,12 +9685,14 @@ fn ir_spec_uses_all_safe(idx: Int, name: String) -> Bool:
 # tests/cases/test_generic_body_local_release read freed memory when it does.
 #
 # a local is safe to track regardless of what the body's types resolved to
-# when every appearance of it is a use that cannot transfer a count. such a
-# name has provably acquired no second owner, so the exit cleanup releases
-# exactly the count its binding took. that argument does not depend on the
-# unchecked body at all, which is what makes it hold where a rule keyed on
-# the declared type does not — `items: List[String]` is as concrete as a
-# type gets, and the value it names still escapes into a returned struct.
+# when no appearance of it leaves a second owner holding its count. such a
+# name holds exactly the one count its binding took, so the exit cleanup can
+# release it — or, where the name is handed back bare, the return can
+# transfer that one count to the caller and skip the release. that argument
+# does not depend on the unchecked body at all, which is what makes it hold
+# where a rule keyed on the declared type does not — `items: List[String]`
+# is as concrete as a type gets, and the value it names still escapes into a
+# returned struct.
 #
 # "tuple" and "weak" locals stay untracked whatever the walk says. a tuple's
 # cleanup reads the producing result/optional tid to decide between a shell
@@ -9771,10 +9795,11 @@ fn ir_emit_generic_specialization(key: String):
         # a specialization re-emits a body the checker never looked at, so
         # the ownership classification the rest of the emitter runs on is
         # blind here (see ir_spec_local_is_confined). a local whose every
-        # appearance in the body cannot transfer a count is tracked anyway:
-        # it has provably acquired no second owner, so the prologue's
-        # zero-store, the release-of-previous on rebind, and the exit
-        # cleanup all balance the single count its binding took.
+        # appearance in the body leaves no second owner holding its count is
+        # tracked anyway: the prologue's zero-store, the release-of-previous
+        # on rebind, and the exit cleanup all balance the single count its
+        # binding took, and a return of it hands that same count on rather
+        # than dropping it.
         #
         # every other rc bind is published untracked, as it has always been.
         # the match emitter then skips the release-of-previous for those

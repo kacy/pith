@@ -1184,6 +1184,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_generic_instance_type_args \
 	tests/cases/test_generic_call_shapes tests/cases/test_generic_boundary \
 	tests/cases/test_generic_body_construction \
+	tests/cases/test_generic_body_local_release \
+	tests/cases/test_generic_body_returned_local \
 	tests/cases/test_generic_container_share \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_assoc_item_collision \

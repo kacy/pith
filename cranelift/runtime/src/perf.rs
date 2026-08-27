@@ -23,6 +23,14 @@ pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+// Channels created, channels successfully closed, and the bytes those channels
+// asked the allocator for. A channel is never freed (see
+// `docs/channel_ownership.md`), so the byte total only ever grows and a closed
+// channel still counts toward it: CLOSES says how many stopped carrying
+// traffic, not how many gave their memory back.
+pub static PERF_CHANNEL_NEWS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CHANNEL_CLOSES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CHANNEL_RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SOCK_READS: AtomicUsize = AtomicUsize::new(0);
@@ -233,6 +241,12 @@ pub fn dump_perf_stats() {
         PERF_BYTE_BUFFER_FREES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  channels: new={} closed={} retained_bytes={}",
+        PERF_CHANNEL_NEWS.load(Ordering::Relaxed),
+        PERF_CHANNEL_CLOSES.load(Ordering::Relaxed),
+        PERF_CHANNEL_RETAINED_BYTES.load(Ordering::Relaxed),
     );
     eprintln!(
         "  signals: waits={} deliveries={}",

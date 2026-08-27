@@ -103,6 +103,13 @@ unsafe impl Send for Ring {}
 unsafe impl Sync for Ring {}
 
 impl Ring {
+    /// how many slots a ring for `capacity` values allocates. split out of
+    /// `new` so the memory accounting in `pith_channel_new` reports the size
+    /// the ring actually asks for rather than a second copy of this rule.
+    fn slot_count(capacity: usize) -> usize {
+        capacity.next_power_of_two().max(2)
+    }
+
     /// ring size = capacity rounded up to a power of two, so the position wraps
     /// with a mask. the extra slots beyond the requested capacity are kept out
     /// of service by `try_enqueue`'s explicit capacity check, so `len()` and
@@ -114,7 +121,7 @@ impl Ring {
     /// restore the invariant; a capacity-1 channel then runs with `exact` off
     /// and the explicit check enforcing its bound.
     fn new(capacity: usize) -> Ring {
-        let size = capacity.next_power_of_two().max(2);
+        let size = Ring::slot_count(capacity);
         let buffer: Vec<Slot> = (0..size)
             .map(|i| Slot {
                 sequence: AtomicUsize::new(i),
@@ -291,7 +298,11 @@ type PithChannelHandle = Arc<ChannelInner>;
 /// registry — the registry's mutex was two global lock round trips per message
 /// (send + recv), the hottest shared line left once the ring made the channel
 /// itself lock-free. channels are never freed, so the tag never needs scrubbing;
-/// garbage handles fail the alignment or magic check and read as invalid.
+/// garbage handles fail the alignment or magic check and read as invalid. that
+/// last clause is load-bearing in both directions — a freed channel whose
+/// address the allocator handed back to a *new* channel would pass this check
+/// and silently serve the wrong traffic, which is why no free path may recycle
+/// a tagged address. `docs/channel_ownership.md` works the consequences through.
 const CHANNEL_MAGIC: u32 = 0x50434841;
 
 /// the largest buffered capacity a channel will allocate (16Mi values, 128 MiB
@@ -499,7 +510,27 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         magic: CHANNEL_MAGIC,
         channel,
     }));
+    crate::perf_count(&crate::PERF_CHANNEL_NEWS, 1);
+    crate::perf_count(&crate::PERF_CHANNEL_RETAINED_BYTES, channel_bytes(cap));
     ptr as i64
+}
+
+/// the bytes one channel asks the allocator for and never gives back: the
+/// tagged stub, the `Arc` header and its `ChannelInner`, and the ring's slots.
+/// allocator rounding is on top of this, so the number under-reports the real
+/// resident cost rather than inflating it.
+fn channel_bytes(capacity: usize) -> usize {
+    let ring = if capacity > 0 {
+        Ring::slot_count(capacity) * std::mem::size_of::<Slot>()
+    } else {
+        0
+    };
+    // an `Arc` allocation is two `usize` counts followed by the value.
+    let arc_header = 2 * std::mem::size_of::<usize>();
+    std::mem::size_of::<TaggedChannel>()
+        + arc_header
+        + std::mem::size_of::<ChannelInner>()
+        + ring
 }
 
 /// after a successful ring op, wake one parked waiter of the opposite `role` if
@@ -823,6 +854,9 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     inner.receivers.notify_all();
     wake_green(&mut state, Role::Sender);
     wake_green(&mut state, Role::Receiver);
+    // a close is not a free: the allocation stays, so this counts channels
+    // taken out of service, not memory handed back.
+    crate::perf_count(&crate::PERF_CHANNEL_CLOSES, 1);
     1
 }
 
@@ -901,6 +935,21 @@ mod tests {
             assert_eq!(*recv, 0);
             drop(Box::from_raw(handle as *mut [u64; 4]));
         }
+    }
+
+    // the retained-bytes accounting has to track the allocation it describes:
+    // a fixed part that every channel pays and a ring part that scales with the
+    // rounded-up capacity. an unbuffered channel allocates no ring at all.
+    #[test]
+    fn channel_bytes_tracks_the_ring() {
+        let fixed = channel_bytes(0);
+        assert!(fixed > 0);
+        let slot = std::mem::size_of::<Slot>();
+        // capacity 1 still rounds to two slots (see `Ring::new`).
+        assert_eq!(channel_bytes(1), fixed + 2 * slot);
+        assert_eq!(channel_bytes(256), fixed + 256 * slot);
+        // a non-power-of-two capacity pays for the slots it rounds up to.
+        assert_eq!(channel_bytes(200), fixed + 256 * slot);
     }
 
     // a buffered channel's capacity is clamped rather than allocated blindly, so

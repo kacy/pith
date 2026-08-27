@@ -344,9 +344,11 @@ keys are strings, and `map.values()` when the values are heap values.
 - the argument rules: `ir_release_owned_method_args`,
   `ir_release_owned_args` and the call paths near them. the
   kinds they release are `ir_owned_arg_kind_releases`; the position
-  they must not release is the container store's, and the callees that
+  they must not release is the container store's, the callees that
   take a count on their own result instead are
-  `ir_method_result_retains_over_args`
+  `ir_method_result_retains_over_args`, and the one whose receiver
+  relinquishes its own count into the result — map `take` — is
+  `ir_method_result_transfers_count`
 - the element tags: `ListTypeTag` and the `pith_list_new_*`
   constructors in `cranelift/runtime/src/collections/list.rs`, the
   entries for them in `cranelift/runtime-abi/runtime_functions.txt`,

@@ -1214,6 +1214,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_yaml_derived_decode \
 	tests/cases/test_concurrent_group \
 	tests/cases/test_map_value_ownership \
+	tests/cases/test_map_take_remove_counts \
 	tests/cases/test_web_session_ownership \
 	tests/cases/test_fn_value_optional \
 	tests/cases/test_tls_server_config_release

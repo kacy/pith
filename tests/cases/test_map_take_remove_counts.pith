@@ -1,0 +1,84 @@
+# take transfers the map's count on the value to the caller; remove drops it
+# in the runtime. both must be count-correct for every value kind, and a
+# taken value must stay valid however the map is mutated afterwards — this
+# case runs under the curated memcheck set to pin the release side (a
+# careless fix of the leak direction is a use-after-free here).
+struct Row:
+    name: String
+
+fn string_cells() -> Int:
+    mut m: Map[Int, String] := {}
+    m.insert(1, "one")
+    m.insert(2, "two")
+    took := m.take(1)
+    print("took {took} left {m.len()}")
+    m.remove(2)
+    print("after remove {m.len()}")
+    # the taken value outlives any amount of later map churn
+    m.insert(3, "three")
+    kept := m.take(3)
+    m.insert(4, "four")
+    m.insert(4, "four-again")
+    m.remove(4)
+    m.clear()
+    print("kept {kept}")
+    # discarded take: the count goes with the discard
+    m.insert(5, "five")
+    m.take(5)
+    # string keys walk the same paths through the cstr entry points
+    mut km: Map[String, String] := {}
+    km.insert("a", "alpha")
+    ka := km.take("a")
+    km.insert("b", "beta")
+    km.remove("b")
+    print("skey {ka} left {km.len()}")
+    return kept.len() + ka.len()
+
+fn bytes_cells() -> Int:
+    mut m: Map[Int, Bytes] := {}
+    m.insert(1, bytes_from_string_utf8("blob-one"))
+    took := m.take(1)
+    m.insert(2, bytes_from_string_utf8("blob-two"))
+    m.remove(2)
+    m.insert(3, bytes_from_string_utf8("blob-three"))
+    m.take(3)
+    print("bytes took {took.len()} left {m.len()}")
+    return took.len()
+
+fn list_cells() -> Int:
+    mut m: Map[Int, List[String]] := {}
+    m.insert(1, ["a", "b", "c"])
+    took := m.take(1)
+    m.insert(2, ["d"])
+    m.remove(2)
+    m.insert(3, ["e", "f"])
+    m.take(3)
+    print("list took {took.len()} left {m.len()}")
+    return took.len()
+
+fn struct_cells() -> Int:
+    mut m: Map[Int, Row] := {}
+    m.insert(1, Row("row-one"))
+    took := m.take(1)
+    m.insert(2, Row("row-two"))
+    m.remove(2)
+    m.insert(3, Row("row-three"))
+    m.take(3)
+    print("struct took {took.name} left {m.len()}")
+    return took.name.len()
+
+fn borrowed_cells() -> Int:
+    # a value another local still owns, inserted borrowed, then taken and
+    # removed: the local's own count must survive both calls
+    mut m: Map[Int, String] := {}
+    held := "held-value"
+    m.insert(1, held)
+    took := m.take(1)
+    m.insert(2, held)
+    m.remove(2)
+    print("borrowed took {took} held {held}")
+    return took.len() + held.len()
+
+fn main():
+    total := string_cells() + bytes_cells() + list_cells() + struct_cells() + borrowed_cells()
+    print("total {total}")

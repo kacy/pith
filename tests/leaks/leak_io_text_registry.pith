@@ -13,8 +13,8 @@ import std.bytes as bytes
 
 fn round(i: Int):
     reader := io.string_reader("abcdef-{i}")
-    # results are bound, not discarded: a Bytes dropped at statement position
-    # is a documented emitter leak, and it would drown the registry signal.
+    # results are bound, not discarded, so the flatness below is the
+    # registry's alone and no discard-path release shares the credit.
     first := reader.read(4) catch ""
     reader.close()
 

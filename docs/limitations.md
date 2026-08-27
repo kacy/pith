@@ -387,6 +387,20 @@ correctness story:
   streams — are fixed: each of those types closes and deregisters now. the
   E307 lint flags a locally built resource that is never closed and never
   handed off.
+- a channel is never freed. `Channel[T](n)` allocates a fixed part of about 416
+  bytes plus an eager ring of 16 bytes per slot, rounded up to a power of two,
+  and `close()` only takes the channel out of service — the memory stays for the
+  life of the process. nothing in the language owns one either: a channel's rc
+  kind is empty, so a handle in a local, a struct field, a container or a `spawn`
+  capture carries no count. the cost is per channel *created*, so a long-running
+  server that opens one per request grows: an http/2 client stream costs 4,960
+  bytes across its inbox and its flow-control channel, which is most of what
+  separates a streaming rpc from a unary one. run with `PITH_PERF_STATS=1` to see
+  `channels: new=N closed=C retained_bytes=B`. the free path is not a small
+  change — a freed channel can have a receiver parked inside it, and a recycled
+  handle would pass the magic-tag check and serve the wrong traffic — so the
+  lifetime analysis, the options and the staged plan are in
+  docs/channel_ownership.md (issue #960).
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

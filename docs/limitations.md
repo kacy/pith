@@ -182,12 +182,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
-- **a built-in assertion cannot be called from a closure body** — `assert`,
-  `assert_eq` and `assert_ne` are lowered by name at the call site, and inside
-  a `fn(x):` block the name resolves as a value load instead: the program is
-  rejected by the backend with `unknown load source 'assert'`. put the
-  assertion in a function the closure calls, or use `std.testing`'s recording
-  assertions, which are ordinary calls.
+- **a lambda cannot declare a return type** — `fn(x: Int) -> Int:` is E240 at
+  the arrow; a lambda infers its return type from its body instead. the
+  built-in assertions do now work inside a closure body: they are lowered by
+  name at the call site, so the body has no variable to capture, and a local
+  of the same name still shadows them.
 - **an optional over a tuple is built wrong everywhere except a return** —
   `o: (Int, String)? := (5, "d")` stores the payload where the shell belongs, so
   reading `o` back gives whatever sits in the shell's own slots rather than the

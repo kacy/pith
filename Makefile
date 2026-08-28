@@ -1,5 +1,9 @@
-.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only test clean
+.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only check-bootstrap-seed smoke-bootstrap-seed test clean
 
+
+# scratch paths for the bootstrap seed checks; both are removed by their targets
+SEED_CHECK_TMP := target/seed-check.ir
+SEED_SMOKE_DIR := target/seed-smoke
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -90,6 +94,41 @@ self-host-ir-driver: build
 # keeps working without an existing ir_driver binary.
 refresh-bootstrap-seed: self-host-ir-driver
 	PITH_DUMP_IR=self-host/bootstrap/ir_driver.ir ./target/release/pith build self-host/ir_driver.pith
+
+# the seed is a generated file, so it goes stale whenever the compiler source
+# it was generated from moves. that is invisible on a branch, because a branch
+# regenerates against its own base and is self-consistent; it only bites after
+# a merge, when the seed on the trunk was generated against a base that no
+# longer exists. this check regenerates to a scratch path and compares, so it
+# never touches the tracked file, and it is meaningful only on a branch that
+# is up to date with the trunk.
+check-bootstrap-seed: self-host-ir-driver
+	@PITH_DUMP_IR=$(SEED_CHECK_TMP) ./target/release/pith build self-host/ir_driver.pith > /dev/null
+	@if cmp -s $(SEED_CHECK_TMP) self-host/bootstrap/ir_driver.ir; then \
+		echo "bootstrap seed matches the emitter source"; \
+		rm -f $(SEED_CHECK_TMP); \
+	else \
+		echo "the tracked bootstrap seed does not match what this source emits."; \
+		echo "run 'make refresh-bootstrap-seed' and commit self-host/bootstrap/ir_driver.ir."; \
+		echo "if you changed nothing that emits, rebase onto the trunk first: the"; \
+		echo "seed was already stale and regenerating here would bury that in your diff."; \
+		rm -f $(SEED_CHECK_TMP); \
+		exit 1; \
+	fi
+
+# what a fresh clone actually does: no ir_driver binary, so the seed has to
+# build one. nothing run in a working tree exercises this, because the binary
+# is already there.
+smoke-bootstrap-seed: build
+	@rm -rf $(SEED_SMOKE_DIR)
+	@mkdir -p $(SEED_SMOKE_DIR)/self-host/bootstrap
+	@cp self-host/bootstrap/ir_driver.ir $(SEED_SMOKE_DIR)/self-host/bootstrap/
+	@printf 'fn main() -> Int:\n    print("seed ok")\n    return 0\n' > $(SEED_SMOKE_DIR)/seed_smoke.pith
+	@cd $(SEED_SMOKE_DIR) && $(CURDIR)/target/release/pith build seed_smoke.pith > /dev/null
+	@test -x $(SEED_SMOKE_DIR)/self-host/ir_driver || { echo "the seed did not produce an ir_driver: a fresh clone could not bootstrap"; rm -rf $(SEED_SMOKE_DIR); exit 1; }
+	@test "$$($(SEED_SMOKE_DIR)/seed_smoke)" = "seed ok" || { echo "a program built from the seed-built driver did not run correctly"; rm -rf $(SEED_SMOKE_DIR); exit 1; }
+	@rm -rf $(SEED_SMOKE_DIR)
+	@echo "a fresh clone can bootstrap from the tracked seed"
 
 # rebuild the self-hosted compiler using the Cranelift-compiled version of itself
 bootstrap: self-host

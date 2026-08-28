@@ -43,7 +43,8 @@ make bootstrap
 1. read the relevant subsystem before editing
 2. keep changes behavior-preserving unless the task explicitly changes semantics
 3. add or preserve stable error codes for new diagnostics
-4. validate the bootstrap and self-hosted paths for compiler changes
+4. validate the bootstrap and self-hosted paths for compiler changes, and
+   regenerate the tracked seed when you change what the compiler emits
 5. prefer small helpers and explicit ownership over long inline flows
 
 ## example style
@@ -80,6 +81,35 @@ make run-examples-self
 make run-regressions-self
 make bootstrap
 ```
+
+## the tracked bootstrap seed
+
+`self-host/bootstrap/ir_driver.ir` is generated, not written. it exists so a
+machine with no `ir_driver` binary can build one, which is the only way a fresh
+clone gets off the ground. nothing you run in a working tree reads it, because
+your `ir_driver` is already there, so it goes stale quietly.
+
+regenerate it whenever you change anything the compiler emits from. that is
+more than the emitter: `ir_driver.pith` imports the parser and the checker, so
+a one-line parser edit moves it too.
+
+```
+make refresh-bootstrap-seed     # regenerate, then commit the file
+make check-bootstrap-seed       # does the tracked seed match what this source emits?
+make smoke-bootstrap-seed       # can a fresh clone bootstrap from it?
+```
+
+both checks run in ci, and neither one closes the gap by itself. a branch
+regenerates against its own base, so it stays self-consistent and passes even
+when the trunk has moved underneath it. when several seed-touching branches
+merge in a row, whichever lands last carries a seed generated against a base
+that no longer exists, silently replaces the others, and leaves the trunk
+unbuildable from scratch. so rebase onto the trunk before merging a change that
+regenerates the seed, and merge those one at a time.
+
+if `check-bootstrap-seed` fails on a branch where you changed nothing that
+emits, do not just regenerate: the seed was already stale before you got there,
+and regenerating buries someone else's problem in your diff. rebase first.
 
 for tls-facing changes, add a live sanity check after the normal loop:
 

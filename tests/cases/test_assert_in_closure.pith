@@ -1,0 +1,20 @@
+# the built-in assertions are lowered by name at the call site, so a closure
+# body that calls one is not reading a variable and has nothing to capture.
+# capturing it made the enclosing function load a local that never existed,
+# which the backend rejected as an unknown load source rather than as a
+# diagnostic. a real local of the same name still shadows the builtin.
+
+fn main() -> Int:
+    check := fn(x: Int):
+        assert(x > 0)
+        assert_eq(x, 5)
+        assert_ne(x, 9)
+    check(5)
+
+    n := 7
+    withcap := fn(x: Int):
+        assert(x + n > 0)
+    withcap(1)
+
+    print("assertions in closures ok")
+    return 0

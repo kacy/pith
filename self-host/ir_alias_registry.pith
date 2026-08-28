@@ -157,7 +157,8 @@ pub mut ir_import_declared_globals: Map[String, Bool] := {}
 pub fn ir_resolve_type_hint(type_name: String) -> String:
     return ir_resolve_type_hint_with_state(type_name, ir_type_aliases, ir_struct_names)
 
-## names a closure may not capture: aliases and import renames.
+## names a closure may not capture: aliases, import renames, declared types
+## and functions, and the built-in assertions.
 pub fn ir_capture_blocked_names() -> Map[String, Bool]:
     mut blocked: Map[String, Bool] := {}
     for name in ir_module_aliases.keys():
@@ -168,6 +169,16 @@ pub fn ir_capture_blocked_names() -> Map[String, Bool]:
         blocked.insert(name, true)
     for name in ir_func_returns.keys():
         blocked.insert(name, true)
+    # the built-in assertions are lowered by name at the call site, so a body
+    # that calls one is not reading a variable and has nothing to capture. a
+    # closure that did capture the name made its enclosing function load a
+    # local that does not exist, which the backend rejected as an unknown load
+    # source rather than as a diagnostic. a real local of the same name still
+    # wins: ir_should_capture_name consults the enclosing scope before this
+    # list.
+    blocked.insert("assert", true)
+    blocked.insert("assert_eq", true)
+    blocked.insert("assert_ne", true)
     return blocked
 
 ## the ir return kind for a declared type name.

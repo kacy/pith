@@ -12,7 +12,9 @@ closure capture is a bare integer with no retain and no release.
 this page is the design work behind issue #960: what a channel actually costs,
 who can be holding one when it would be freed, why the obvious free path is a
 crash rather than a fix, the options with their costs, and a staged plan. it is
-a plan, not a description of what ships today. only stage 1 is implemented.
+a plan, not a description of what ships today. only stage 1 is implemented; a
+prototype of the rest exists unmerged, and what it settled is recorded under
+"what a prototype established" below.
 
 ## what a channel costs
 
@@ -530,14 +532,75 @@ this is a counter and nothing else: no free path, no behaviour change, gated by
 first because every later stage is judged against this number, and because
 until now the only way to see the leak at all was to watch rss and infer.
 
-### stage 2 — a generation in the tagged stub
+## what a prototype established
 
+a working prototype exists on the local branch `channel-reclaim-probe`. it is
+not merged, and the numbers below come from it. what it settles answers four
+questions this page left open, and removes one stage from the plan.
+
+**the free path works, and its trigger is simpler than the rc kind.** a channel
+that is closed and drained is inert: every operation on one already returns a
+fixed answer (send 0, recv none, close 0, len 0, is_closed 1). reclaiming the
+body at that moment needs no emitter change, no rc kind and no ownership
+analysis, because nothing is left for an owner to decide. twenty thousand
+create-and-close cycles of a 256-slot channel measure 92,240 kb of peak rss on
+main against 6,320 kb on the prototype, reporting `freed=20000` and
+`freed_bytes=89600000`. what remains is the permanent stubs.
+
+**stage 2 is unnecessary.** generations were kept in the plan as a defence, but
+the permanent stub already supplies what they were defending: a validated
+address can never name a different channel, because the address is never reused.
+a generation would detect a hazard the split allocation prevents outright.
+
+**stage 3's flatness requirement is the real constraint, and it decides the
+design.** the obvious reference discipline, a count on the stub held for the
+span of every operation, fails it: two shared read-modify-writes on the hot path
+cost about 25% of `chan_fanout` throughput on os threads and about 47% under
+green. per-thread hazard slots and a limbo list bring that to roughly 2%,
+because an operation then publishes the body pointer to a line no other thread
+touches, and the count that remains covers only the paths that can block. the
+guard is load-bearing rather than defensive: an arm that freed at retirement
+without it hung `chan_fanout`, with a consumer parked on a mutex freed
+underneath it.
+
+measuring this needs care. `chan_fanout` is bimodal on a two-core machine,
+clustering near 130 ms and near 195 ms, which is the task placement race rather
+than the change under test. medians over all runs are meaningless — a nine-round
+sample reported the prototype 25% *faster* than main, which cannot be true of
+code that adds bookkeeping. the figures above come from spaced, order-rotated
+launches restricted to well-placed runs, over 21 rounds for os threads and 31
+for green.
+
+**the streaming residual is mostly channels.** issue #960 asked whether the
+roughly 8.8 kb per streaming rpc was channel allocation. it is, to about 60-75%.
+counters show a streaming rpc creating exactly two channels where a unary rpc
+creates none: the 4,512-byte inbox and the 448-byte flow-control channel from
+`connection.pith`. on the prototype the streaming-minus-unary rss delta falls
+from about 6.9 kb per rpc to about 2.6 kb.
+
+**what remains.** stage 4, the element tag, is untouched and still required: the
+prototype retires only a drained ring, so a channel still holding
+reference-counted payloads at close strands them exactly as main does. nothing
+regresses without the tag, and nothing is finished while it is missing. a send
+that passes its closed-check just before a concurrent close and drain can also
+enqueue into a body that is then freed, losing the value rather than leaving it
+drainable; main has the same window with different behaviour, and the intended
+semantics want pinning by a test either way.
+
+### stage 2 — a generation in the tagged stub — not needed
+
+superseded by the prototype, and kept here for the reasoning. the idea was to
 add a `generation: u32` beside the magic word and pack it into the handle's high
 bits, as task handles do. nothing is freed yet, so no generation ever advances
 and every existing handle still validates — the stage is a no-op by
 construction, which is what makes it safe to land alone. what it buys is the
 defence that has to exist *before* any reclamation does: from here on, a stale
-handle to a reclaimed channel is detectable rather than silently valid.
+handle to a reclaimed channel would be detectable rather than silently valid.
+
+this is redundant against a permanent stub. the recommendation above already
+requires the stub never to be freed, and an address that is never reused cannot
+name a different channel, so there is no stale-but-valid handle for a generation
+to catch. skip this stage; keep the split allocation it was compensating for.
 
 ### stage 3 — a reference discipline in the runtime
 
@@ -547,6 +610,14 @@ cannot. still nothing calls a free, so this stage is measured against the
 channel throughput benchmarks and must come out flat: the fast path may not gain
 an atomic. `bench/chan_fanout.pith` is the arm to watch, interleaved, and the
 green pingpong benches for the handoff shape.
+
+the prototype has now run that measurement, and it rules out the obvious
+implementation. a count taken on the stub for the span of every operation is two
+shared read-modify-writes on the fast path and costs about 25% on os threads and
+about 47% under green. per-thread hazard slots with a limbo list, keeping the
+count only on the paths that can block, measure roughly 2%. build this stage in
+that shape, and read the note above on how to measure `chan_fanout` without the
+placement race answering for you.
 
 ### stage 4 — the element tag
 

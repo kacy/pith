@@ -188,6 +188,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   rejected by the backend with `unknown load source 'assert'`. put the
   assertion in a function the closure calls, or use `std.testing`'s recording
   assertions, which are ordinary calls.
+- **an optional over a tuple is built wrong everywhere except a return** —
+  `o: (Int, String)? := (5, "d")` stores the payload where the shell belongs, so
+  reading `o` back gives whatever sits in the shell's own slots rather than the
+  pair that went in. an optional lowers to the same tuple-shaped allocation a
+  tuple literal produces, so the wrap sites cannot tell a tuple payload from an
+  already-built shell; the return position consults the target's inner type and
+  is correct. it is a wrong answer rather than a diagnostic, and it affects
+  binds, both construction spellings, field and index and plain assignment,
+  collection elements, map entries and arguments (issue #970).
 - **a generic function body releases only the locals that cannot escape it** —
   an instantiation re-emits a body the checker skipped, so every expression in
   it reports the error type and the emitter's ownership classification has
@@ -411,7 +420,11 @@ correctness story:
   change — a freed channel can have a receiver parked inside it, and a recycled
   handle would pass the magic-tag check and serve the wrong traffic — so the
   lifetime analysis, the options and the staged plan are in
-  docs/channel_ownership.md (issue #960).
+  docs/channel_ownership.md (issue #960). an unmerged prototype reclaims the
+  body of a channel once it is closed and drained, which measures 92,240 kb of
+  peak rss against 6,320 kb over twenty thousand create-and-close cycles; what
+  it does not yet do is release reference-counted payloads left in a ring at
+  close, so it retires only a drained one.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

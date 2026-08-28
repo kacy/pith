@@ -137,6 +137,12 @@ jobs:
           install_valgrind || { echo "apt install stalled or failed; retrying once after 15s"; sleep 15; install_valgrind; }
           make memcheck
 
+      - name: verify a fresh clone can bootstrap from the seed
+        run: make smoke-bootstrap-seed
+
+      - name: verify the tracked seed matches the emitter source
+        run: make check-bootstrap-seed
+
       - name: verify bootstrap fixed point
         run: make bootstrap-verify
 

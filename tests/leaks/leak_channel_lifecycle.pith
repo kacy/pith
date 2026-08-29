@@ -1,0 +1,38 @@
+# traffic through a channel must not retain anything per message. the channel
+# itself is deliberately excluded: a stub is never freed, by design, so a case
+# that churns channels can never be flat and would be asserting the wrong
+# thing. what has to be flat is the per-message path, so a fixed set of
+# channels carries the whole run.
+#
+# string payloads are the ones that can strand: a send hands the value to the
+# ring and a recv hands it back through an optional shell, and both ends have
+# to account for exactly one count.
+import leakprobe as probe
+
+fn main():
+    n := probe.rounds()
+    ints := Channel[Int](8)
+    strs := Channel[String](8)
+    small := Channel[Int](1)
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        ints.send(i)
+        if let v = ints.recv():
+            acc = acc + v
+
+        strs.send("payload-{i}")
+        if let s = strs.recv():
+            acc = acc + s.len()
+
+        small.send(i)
+        if let t = small.try_recv():
+            acc = acc + t
+
+        i = i + 1
+    ints.close()
+    strs.close()
+    small.close()
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

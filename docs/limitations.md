@@ -406,24 +406,25 @@ correctness story:
   streams — are fixed: each of those types closes and deregisters now. the
   E307 lint flags a locally built resource that is never closed and never
   handed off.
-- a channel is never freed. `Channel[T](n)` allocates a fixed part of about 416
-  bytes plus an eager ring of 16 bytes per slot, rounded up to a power of two,
-  and `close()` only takes the channel out of service — the memory stays for the
-  life of the process. nothing in the language owns one either: a channel's rc
-  kind is empty, so a handle in a local, a struct field, a container or a `spawn`
-  capture carries no count. the cost is per channel *created*, so a long-running
-  server that opens one per request grows: an http/2 client stream costs 4,960
-  bytes across its inbox and its flow-control channel, which is most of what
-  separates a streaming rpc from a unary one. run with `PITH_PERF_STATS=1` to see
-  `channels: new=N closed=C retained_bytes=B`. the free path is not a small
-  change — a freed channel can have a receiver parked inside it, and a recycled
-  handle would pass the magic-tag check and serve the wrong traffic — so the
-  lifetime analysis, the options and the staged plan are in
-  docs/channel_ownership.md (issue #960). an unmerged prototype reclaims the
-  body of a channel once it is closed and drained, which measures 92,240 kb of
-  peak rss against 6,320 kb over twenty thousand create-and-close cycles; what
-  it does not yet do is release reference-counted payloads left in a ring at
-  close, so it retires only a drained one.
+- a channel is reclaimed once it is closed and drained, and costs 128 bytes for
+  the life of the process either way. `Channel[T](n)` allocates a fixed part of
+  about 416 bytes plus an eager ring of 16 bytes per slot, rounded up to a power
+  of two. closing and draining hands all of that back except a small permanent
+  stub, which keeps the park-path counter on a cache line of its own so ordinary
+  channel operations stay off a shared one. so the per-channel cost a process
+  carries forever fell from 4,512 bytes to 128 for a 256-slot channel, which is
+  a reduction rather than an elimination: a server opening one channel per
+  request still grows, 35 times more slowly. nothing in the language owns a
+  channel either — its rc kind is empty, so a handle in a local, a struct field,
+  a container or a `spawn` capture carries no count — and reclamation does not
+  depend on one, because a closed and drained channel is inert whoever is
+  holding it. two things it does not do: a channel closed with values still in
+  its ring is not reclaimed at all, since releasing those values needs an
+  element tag the ring does not carry yet, and a channel nobody closes is never
+  reclaimed. run with `PITH_PERF_STATS=1` to see
+  `channels: new=N closed=C freed=F retained_bytes=B freed_bytes=D`. the
+  lifetime analysis, the options and what remains are in
+  docs/channel_ownership.md (issue #960).
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

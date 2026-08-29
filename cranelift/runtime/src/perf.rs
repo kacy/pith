@@ -23,14 +23,17 @@ pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
-// Channels created, channels successfully closed, and the bytes those channels
-// asked the allocator for. A channel is never freed (see
-// `docs/channel_ownership.md`), so the byte total only ever grows and a closed
-// channel still counts toward it: CLOSES says how many stopped carrying
-// traffic, not how many gave their memory back.
+// Channels created, channels successfully closed, the bytes those channels
+// asked the allocator for, and the bodies given back. RETAINED_BYTES counts
+// every byte ever requested and only grows; FREED_BYTES counts what
+// retirement handed back, so the difference is what the process still holds.
+// A retired channel leaves its permanent handle stub behind (see
+// `docs/channel_ownership.md`), which is why the two never meet.
 pub static PERF_CHANNEL_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CHANNEL_CLOSES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CHANNEL_RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CHANNEL_FREES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CHANNEL_FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SOCK_READS: AtomicUsize = AtomicUsize::new(0);
@@ -243,10 +246,12 @@ pub fn dump_perf_stats() {
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "  channels: new={} closed={} retained_bytes={}",
+        "  channels: new={} closed={} freed={} retained_bytes={} freed_bytes={}",
         PERF_CHANNEL_NEWS.load(Ordering::Relaxed),
         PERF_CHANNEL_CLOSES.load(Ordering::Relaxed),
+        PERF_CHANNEL_FREES.load(Ordering::Relaxed),
         PERF_CHANNEL_RETAINED_BYTES.load(Ordering::Relaxed),
+        PERF_CHANNEL_FREED_BYTES.load(Ordering::Relaxed),
     );
     eprintln!(
         "  signals: waits={} deliveries={}",

@@ -49,6 +49,7 @@ cases=(
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_generic_body_construction
   tests/leaks/leak_generic_channel_payload
+  tests/leaks/leak_channel_lifecycle
   tests/leaks/leak_await_optional_shell
   tests/leaks/leak_index_search_shell
   tests/leaks/leak_discarded_optional_result

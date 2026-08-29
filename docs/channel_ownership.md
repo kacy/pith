@@ -496,12 +496,13 @@ measurement, not as the answer.
 
 three constraints shape how a is staged.
 
-**the stub stays permanent.** split the allocation: the `TaggedChannel` stub
-(16 bytes) is never freed, so a validated address never names a different
-channel and the magic check keeps the invariant it depends on; the
-`ChannelInner` and its ring — 400 bytes plus 16 per slot, which is 99.6% of a
-256-slot channel — are what a free reclaims. 16 bytes per channel ever created
-is a leak the process can carry; 4,512 is not.
+**the stub stays permanent.** split the allocation: the `TaggedChannel` stub is
+never freed, so a validated address never names a different channel and the
+magic check keeps the invariant it depends on; the `ChannelInner` and its ring —
+400 bytes plus 16 per slot — are what a free reclaims. a stub per channel ever
+created is a leak the process can carry; 4,512 bytes is not. the stub is bigger
+than the 16 bytes this section first assumed, and the prototype measured it: see
+below.
 
 **the runtime holds the count across a block, not the emitter.** the emitter
 cannot see that a receiver is parked. the runtime can, and the `Arc` is already
@@ -545,7 +546,21 @@ body at that moment needs no emitter change, no rc kind and no ownership
 analysis, because nothing is left for an owner to decide. twenty thousand
 create-and-close cycles of a 256-slot channel measure 92,240 kb of peak rss on
 main against 6,320 kb on the prototype, reporting `freed=20000` and
-`freed_bytes=89600000`. what remains is the permanent stubs.
+`freed_bytes=89600000`.
+
+what remains is the permanent stub, and it is larger than this page assumed.
+counted over a create-and-close loop, 128 bytes per channel is never freed, and
+peak rss grows about 192 bytes per channel once allocator rounding is included.
+the size is not an oversight: the stub carries the park-path reference count on
+a cache line of its own, which is what keeps the fast path off a shared line and
+buys the 2% figure below. the two are the same decision, so the cost per channel
+and the cost per operation trade against each other directly.
+
+so this is a 35-fold reduction rather than an elimination: a process that
+creates a channel per request still grows, 4,512 bytes at a time before and 128
+after. a channel leak-gate case cannot assert flatness on channel *creation* for
+that reason, and the one added here churns messages through a fixed set of
+channels instead, which is the part that must be flat and is.
 
 **stage 2 is unnecessary.** generations were kept in the plan as a defence, but
 the permanent stub already supplies what they were defending: a validated

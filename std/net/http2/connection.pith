@@ -1400,7 +1400,14 @@ impl Client:
         if self.send_windows.contains_key(stream_id):
             self.send_windows.remove(stream_id)
         if self.credit.contains_key(stream_id):
-            self.credit[stream_id].close()
+            # drain before closing: a channel the runtime can reclaim must be
+            # both closed and empty, and a stream that never spent its last
+            # credit poke leaves one value sitting in the ring.
+            credit_ch := self.credit[stream_id]
+            mut drained := credit_ch.try_recv()
+            while drained != none:
+                drained = credit_ch.try_recv()
+            credit_ch.close()
             self.credit.remove(stream_id)
         self.active = list_remove_int(self.active, stream_id)
         self.mu.unlock()

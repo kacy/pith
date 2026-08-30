@@ -571,9 +571,24 @@ a generation would detect a hazard the split allocation prevents outright.
 design.** the obvious reference discipline, a count on the stub held for the
 span of every operation, fails it: two shared read-modify-writes on the hot path
 cost about 25% of `chan_fanout` throughput on os threads and about 47% under
-green. per-thread hazard slots and a limbo list bring that to roughly 2%,
-because an operation then publishes the body pointer to a line no other thread
-touches, and the count that remains covers only the paths that can block. the
+green. per-thread hazard slots and a limbo list bring that to roughly 2%
+**on the green backend**, because an operation then publishes the body pointer
+to a line no other thread touches, and the count that remains covers only the
+paths that can block.
+
+the os-thread backend is a different story, and it was measured only after the
+change had landed. against the commit before it, spaced and order-rotated over
+21 and then 15 rounds, `PITH_GREEN=0` reads 430-492 ms before and 504-652 after
+on the first run, and a median of 477 against 581 on the second: somewhere
+between 15% and 35% slower. green over the same runs is within a few percent,
+which is what the 2% figure above describes.
+
+the likely reason is that a hazard slot is per os thread and the two backends
+have very different numbers of them. under green a fixed pool of workers carries
+any number of tasks, so retirement scans a handful of slots; under the
+os-thread backend every spawned task is its own thread, so eight producer and
+consumer tasks mean eight slots to register through a mutex and eight to scan.
+that is a hypothesis rather than a profile, and #984 carries it. the
 guard is load-bearing rather than defensive: an arm that freed at retirement
 without it hung `chan_fanout`, with a consumer parked on a mutex freed
 underneath it.

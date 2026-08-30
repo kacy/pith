@@ -425,7 +425,9 @@ correctness story:
   holding it. two things it does not do: a channel closed with values still in
   its ring is not reclaimed at all, since releasing those values needs an
   element tag the ring does not carry yet, and a channel nobody closes is never
-  reclaimed. run with `PITH_PERF_STATS=1` to see
+  reclaimed. reclamation also costs the os-thread backend 15-35% of channel
+  throughput, which the green default does not pay (see #984). run with
+  `PITH_PERF_STATS=1` to see
   `channels: new=N closed=C freed=F retained_bytes=B freed_bytes=D`. the
   lifetime analysis, the options and what remains are in
   docs/channel_ownership.md (issue #960).

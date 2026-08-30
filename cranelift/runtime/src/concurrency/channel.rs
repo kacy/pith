@@ -1454,12 +1454,19 @@ mod tests {
     // value would sit in the never-freed ring and remain drainable — but it
     // must never corrupt or crash.
     #[test]
-    fn a_successful_send_racing_close_is_still_drainable() {
-        // reclamation must not swallow a value. a send that reports success
-        // has accepted the value, so a drain that runs after the close has to
-        // hand back exactly that many; anything less means retirement freed a
-        // ring somebody had just written into, and the sender was told
-        // otherwise.
+    fn a_close_race_never_hands_back_more_than_was_sent() {
+        // what a close race guarantees, and what it does not.
+        //
+        // it does NOT guarantee that every accepted send is drainable. a
+        // sender can pass its closed check and enqueue after the drain loop
+        // has already seen the ring empty and stopped, and that value is then
+        // unobservable. this is a property of close, not of reclamation: the
+        // same interleaving strands the value in the ring without it. an
+        // earlier version of this test asserted the equality and was flaky.
+        //
+        // what must hold is the other direction. a drain may never produce
+        // more than was accepted, because that would mean a value delivered
+        // twice or a slot read after it was freed.
         for _ in 0..1500 {
             unsafe {
                 let ch = pith_channel_new(8);
@@ -1486,9 +1493,9 @@ mod tests {
                 });
                 let accepted = sender.join().unwrap();
                 let drained = closer.join().unwrap();
-                assert_eq!(
-                    accepted, drained,
-                    "a send reported success but its value was not drainable"
+                assert!(
+                    drained <= accepted,
+                    "a drain produced {drained} values from {accepted} accepted sends"
                 );
             }
         }

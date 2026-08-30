@@ -1,0 +1,32 @@
+# a lambda may declare its return type, spelled the way a function spells it.
+# without one it still infers from its body; with one, every return is held
+# against the declared type by the same check a named function's returns go
+# through, so an annotation is enforced rather than decorative.
+
+fn main() -> Int:
+    blockform := fn(x: Int) -> Int:
+        return x + 1
+    shortform := fn(x: Int) -> Int => x * 3
+    inferred := fn(x: Int):
+        return x - 1
+    print("{blockform(1)} {shortform(2)} {inferred(4)}")
+
+    # richer return types go through the same type parser a function uses
+    opt := fn(x: Int) -> Int?:
+        if x > 0:
+            return x
+        return none
+    if let v = opt(7):
+        print("optional {v}")
+    if opt(0) == none:
+        print("optional none")
+
+    listy := fn(n: Int) -> List[Int]:
+        mut out: List[Int] := []
+        out.push(n)
+        return out
+    print("list {listy(9)[0]}")
+
+    texty := fn(n: Int) -> String => "s{n}"
+    print("string {texty(3)}")
+    return 0

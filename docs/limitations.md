@@ -182,9 +182,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   matter where the payload-carrying variant sits in the declaration. a
   generic struct instance gets the same treatment from its concrete field
   kinds, whichever field the type argument made releasable.
-- **a lambda cannot declare a return type** — `fn(x: Int) -> Int:` is E240 at
-  the arrow; a lambda infers its return type from its body instead. the
-  built-in assertions do now work inside a closure body: they are lowered by
+- **a lambda may declare a return type** — `fn(x: Int) -> Int:` and
+  `fn(x: Int) -> Int => x` both parse, and the declared type is enforced: each
+  return is held against it by the same check a named function's returns go
+  through. without one a lambda still infers from its body, and two returns
+  that disagree are an error, so an annotation is also how a lambda returns
+  `Int?` from a body that returns an `Int` on one path and `none` on another.
+  the built-in assertions work inside a closure body too: they are lowered by
   name at the call site, so the body has no variable to capture, and a local
   of the same name still shadows them.
 - **an optional over a tuple is built wrong everywhere except a return** —

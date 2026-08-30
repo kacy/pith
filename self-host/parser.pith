@@ -955,6 +955,16 @@ fn parse_lambda() -> Int:
     params := parse_lambda_params()
     expect("rparen")
 
+    # an optional return type, spelled the way a function spells it. a lambda
+    # infers its return type from its body when none is given; declaring one
+    # gives the checker something to hold each return against instead, and the
+    # arrow is where a reader looks for it.
+    mut declared_return := 0 - 1
+    if match_tok("arrow"):
+        ret := parse_type_expr()
+        mut ret_children: List[Int] := [ret]
+        declared_return = add_node_with_position("returns", "", ret_children)
+
     # short form: fn(x) => expr
     if check("fat_arrow"):
         advance_token()
@@ -963,6 +973,8 @@ fn parse_lambda() -> Int:
         mut children: List[Int] := []
         for p in params:
             children.push(p)
+        if declared_return >= 0:
+            children.push(declared_return)
         children.push(add_node_with_position("body", "", body_children))
         return add_node_with_position("lambda", "", children)
 
@@ -973,6 +985,8 @@ fn parse_lambda() -> Int:
         mut children: List[Int] := []
         for p in params:
             children.push(p)
+        if declared_return >= 0:
+            children.push(declared_return)
         children.push(body)
         return add_node_with_position("lambda", "", children)
 

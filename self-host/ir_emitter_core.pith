@@ -6682,10 +6682,17 @@ struct LambdaParts:
     params: List[String]
     body_idx: Int
     captures: List[String]
+    # the lambda's declared return kind and, when that is an optional, its
+    # inner kind. both are "" when the lambda declares no return type, which
+    # leaves the body emitting exactly as it did before annotations existed.
+    ret_kind: String
+    ret_inner: String
 
 fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
     mut params: List[String] := []
     mut body_idx := 0 - 1
+    mut ret_kind := ""
+    mut ret_inner := ""
     mut i := 0
     while i < node_child_count(idx):
         child := node_child(idx, i)
@@ -6694,11 +6701,15 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
             params.push(cn.value)
         elif cn.kind == "body" or cn.kind == "block":
             body_idx = child
+        elif cn.kind == "returns":
+            if cn.children.len() > 0:
+                ret_kind = ir_resolve_type_node(cn.children[0])
+                ret_inner = ir_optional_inner_type_of_node(cn.children[0])
         i = i + 1
     mut captures: List[String] := []
     if body_idx >= 0:
         captures = ir_find_free_vars(body_idx, params)
-    return LambdaParts(params, body_idx, captures)
+    return LambdaParts(params, body_idx, captures, ret_kind, ret_inner)
 
 fn ir_reset_lambda_emit_state():
     ir_builder_reset_function()
@@ -6800,7 +6811,17 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_hidden_param()
     ir_emit_lambda_params(parts.params)
     ir_emit_lambda_capture_loads(parts.captures)
+    # a declared return type puts the body under the same return-position
+    # machinery a named function's body uses, so `return x` from a lambda
+    # declared `-> Int?` builds the Some the caller will read. without one both
+    # stay empty and nothing about the body's emission changes.
+    saved_ret_kind := ir_current_func_return_kind
+    saved_ret_inner := ir_current_func_optional_inner_kind
+    ir_current_func_return_kind = parts.ret_kind
+    ir_current_func_optional_inner_kind = parts.ret_inner
     ir_emit_lambda_body_value(parts.body_idx)
+    ir_current_func_return_kind = saved_ret_kind
+    ir_current_func_optional_inner_kind = saved_ret_inner
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_emitting_main_body = saved_in_main
@@ -9210,6 +9231,15 @@ fn ir_extract_return_type(fn_idx: Int) -> String:
                 if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
                     return ir_resolve_type_node(returns_child)
     return "unknown"
+
+# the inner type of an `optional_type` node, or "" when the node is not one.
+fn ir_optional_inner_type_of_node(type_idx: Int) -> String:
+    if type_idx < 0:
+        return ""
+    tn := get_node(type_idx)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return ir_resolve_type_node(tn.children[0])
+    return ""
 
 fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
     node := get_node(fn_idx)

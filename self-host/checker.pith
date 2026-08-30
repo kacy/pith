@@ -6467,6 +6467,8 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
     mut params: List[Int] := []
     lambda_scope := create_scope(scope_id)
     mut body_idx := -1
+    # -1 when the lambda declares no return type, which is the common case
+    mut declared_return := 0 - 1
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "param":
@@ -6478,6 +6480,9 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             else:
                 report_error("E230", "lambda parameter requires a type annotation")
                 params.push(TID_ERR)
+        elif cn.kind == "returns":
+            if cn.children.len() > 0:
+                declared_return = resolve_type_implementation(cn.children[0])
         else:
             body_idx = child
     # check body. the depth counter marks that names resolved in here cross a
@@ -6490,12 +6495,24 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             # short-form lambda: body wraps a single expression
             if body_node.children.len() > 0:
                 ret_type = c_check_expr(body_node.children[0], lambda_scope)
+                if declared_return >= 0:
+                    if is_error_type(ret_type) == false and types_structurally_equal(ret_type, declared_return) == false:
+                        report_error("E200", "lambda return type mismatch: expected " + get_type_name(declared_return) + ", got " + get_type_name(ret_type))
+                    ret_type = declared_return
         elif body_node.kind == "block":
-            block_scope := create_function_scope(lambda_scope, TID_LAMBDA_INFER)
+            # a declared return type stands in for the infer sentinel, so every
+            # return in the body is held against it by the same check a named
+            # function's returns go through.
+            mut block_expect := TID_LAMBDA_INFER
+            if declared_return >= 0:
+                block_expect = declared_return
+            block_scope := create_function_scope(lambda_scope, block_expect)
             saved_infer := lambda_inferred_return
             lambda_inferred_return = 0 - 1
             check_block_statement(body_node, block_scope)
-            if lambda_inferred_return >= 0:
+            if declared_return >= 0:
+                ret_type = declared_return
+            elif lambda_inferred_return >= 0:
                 ret_type = lambda_inferred_return
             lambda_inferred_return = saved_infer
         else:

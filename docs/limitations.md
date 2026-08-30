@@ -425,7 +425,11 @@ correctness story:
   holding it. two things it does not do: a channel closed with values still in
   its ring is not reclaimed at all, since releasing those values needs an
   element tag the ring does not carry yet, and a channel nobody closes is never
-  reclaimed. reclamation also costs the os-thread backend 15-35% of channel
+  reclaimed. a send that passes its closed check just as a concurrent close
+  drains the channel can enqueue a value nobody will read: the send reports
+  success and the value is unobservable. that is a property of close rather
+  than of reclamation, and the same interleaving strands the value in the ring
+  without it. reclamation also costs the os-thread backend 15-35% of channel
   throughput, which the green default does not pay (see #984). run with
   `PITH_PERF_STATS=1` to see
   `channels: new=N closed=C freed=F retained_bytes=B freed_bytes=D`. the

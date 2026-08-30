@@ -144,6 +144,11 @@ mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
+# element signatures for optionals whose payload is a genuine tuple. one
+# destructor is emitted per distinct signature, the way a struct gets one per
+# declaration: a tuple's elements are heterogeneous, so a single shared walk
+# cannot know what to release.
+mut ir_optional_tuple_sigs: List[String] := []
 
 # `threadlocal` module globals: name -> a process-unique slot id, and name ->
 # the global's ir retkind (for the init thunk header + access typing). Reads and
@@ -382,6 +387,7 @@ fn ir_reset_type_state():
     ir_reset_dtor_memo()
     ir_tracer_memo = {}
     ir_tuple_dtor_sigs = []
+    ir_optional_tuple_sigs = []
     ir_tuple_cascade_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
@@ -1684,6 +1690,37 @@ fn ir_tuple_cascade_signature(tid: Int) -> String:
 
 # module-suffixed so each module carries its own copy, exactly like the tuple
 # and struct destructors — no cross-module references, no name clashes.
+# the element signature of a tuple type, one letter per element, or "" when the
+# type is not a tuple or carries nothing that needs releasing. a signature of
+# all-zero letters means every element is by-value, and such a payload needs no
+# destructor at all.
+fn ir_optional_tuple_signature(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind != "tuple":
+        return ""
+    mut sig := ""
+    mut any_rc := false
+    for elem_tid in info.elements:
+        code := ir_tuple_elem_code(ir_rc_kind(ir_type_from_tid(elem_tid)))
+        if code != "0":
+            any_rc = true
+        sig = sig + code
+    if any_rc == false:
+        return ""
+    return sig
+
+# register a signature and hand back the payload kind the wrap should attach,
+# which names the destructor emitted for it.
+fn ir_optional_tuple_payload_kind(tid: Int) -> String:
+    sig := ir_optional_tuple_signature(tid)
+    if sig.len() == 0:
+        return ""
+    if ir_list_contains(ir_optional_tuple_sigs, sig) == false:
+        ir_optional_tuple_sigs.push(sig)
+    return "tuple_" + sig
+
 fn ir_tuple_cascade_helper_name(sig: String) -> String:
     return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
 
@@ -2891,6 +2928,16 @@ fn ir_lookup_name_type(name: String) -> String:
     return ir_lookup_name_type_with_state(name, ir_var_types, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_int_names, ir_global_map_names, ir_global_set_int_names, ir_global_set_names, ir_global_bool_names)
 
 fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
+    return ir_emit_value_for_target_inner(val_idx, target_type, "")
+
+# `target_inner` is the optional's inner type when the caller knows it, and ""
+# when it does not. It exists for one case: an optional lowers to the same
+# tuple-shaped allocation a tuple literal produces, so a genuine tuple payload
+# and an already-built shell are the same shape here. Without the target's own
+# word for which it wants, a `(Int, String)?` target takes the pass-through
+# path and stores the payload raw, and the extraction then reads the shell's
+# slots. The return site has always consulted the inner type for this reason.
+fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inner: String) -> Int:
     vn := get_node(val_idx)
     if target_type == "tuple":
         if vn.kind == "none_lit":
@@ -2899,7 +2946,15 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
         actual_tid := c_get_expr_type(val_idx)
         if actual_tid >= 0:
             actual_info := get_type_info(actual_tid)
-            if actual_info.kind == "optional" or actual_info.kind == "result" or actual_info.kind == "tuple":
+            # the checker records a value that needs a Some shell built for
+            # it, having excluded `none`, an already-optional value and the
+            # error type. when it says so, that settles the question: an
+            # optional lowers to a tuple-shaped allocation, so a tuple payload
+            # and a built shell are the same shape here and the check below
+            # cannot tell them apart on its own.
+            needs_shell := c_argument_widens_to_optional(val_idx)
+            passes_through := needs_shell == false and (actual_info.kind == "optional" or actual_info.kind == "result" or (actual_info.kind == "tuple" and target_inner != "tuple"))
+            if passes_through:
                 # a passed-through optional/result/tuple is owned at this
                 # position; take a count when it arrives borrowed so the holder
                 # can release it. freshly wrapped optionals below are already
@@ -2932,6 +2987,20 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, payload_kind)
             return ir_emit_optional_owned_some(value_r, payload_kind)
+        # a genuine tuple payload owns whatever its elements hold, and those
+        # elements are heterogeneous, so it needs the destructor emitted for
+        # its own signature rather than one of the uniform kinds above. a
+        # tuple of by-value elements only gets the borrowing wrap, since there
+        # is nothing for a destructor to release.
+        # the signature is empty unless the value's own type really is a tuple
+        # carrying something releasable, so this needs no guard of its own. the
+        # argument site in particular reaches here knowing only that the checker
+        # asked for a shell, with no target type to consult.
+        tuple_kind := ir_optional_tuple_payload_kind(actual_tid)
+        if tuple_kind.len() > 0:
+            if ir_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(value_r, "tuple")
+            return ir_emit_optional_owned_some(value_r, tuple_kind)
         return ir_emit_optional_some_value(value_r)
     # an empty list whose element type the checker worked out goes through the
     # literal emitter, which picks the container from that element type. the
@@ -4843,7 +4912,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
 
-fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_target: String):
+fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_target: String, val_inner: String):
     if entry.kind != "entry" or entry.children.len() < 2:
         return
     k_r := ir_expr(entry.children[0])
@@ -4851,7 +4920,7 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
     # stores Some(v), not the raw v — the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
-    v_r := ir_emit_value_for_target(entry.children[1], val_target)
+    v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
     mut store_name := "map_insert"
     if has_int_keys:
         store_name = "map_insert_ikey"
@@ -4901,11 +4970,13 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     if ir_checked_type(idx) == "map_int":
         has_int_keys = true
     mut val_target := ""
+    mut val_inner := ""
     tid := c_get_expr_type(idx)
     if tid >= 0:
         info := get_type_info(tid)
         if info.kind == "map" and info.value_type >= 0:
             val_target = ir_type_from_tid(info.value_type)
+            val_inner = ir_optional_inner_type_of_tid(info.value_type)
     # the value flavor comes from the checked value type where there is one:
     # an empty literal has no first entry to read it off, which is why `f({})`
     # for a Map[String, String] built a map that owned none of the strings put
@@ -4928,7 +4999,7 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     else:
         ir_emit_call0(map_r, "__map_new", "map")
     for child in node.children:
-        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child), val_target)
+        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child), val_target, val_inner)
     return map_r
 
 fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
@@ -5132,12 +5203,14 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # Some. without this, `[1, none, 3]` typed List[Int?] pushed raw ints
     # and a later .value() dereferenced an integer as a heap tuple.
     mut elem_target := ""
+    mut elem_inner := ""
     tid := c_get_expr_type(idx)
     if tid >= 0:
         info := get_type_info(tid)
         if info.kind == "list" and info.inner >= 0:
             elem_target = ir_type_from_tid(info.inner)
             elem_kind = ir_rc_kind(elem_target)
+            elem_inner = ir_optional_inner_type_of_tid(info.inner)
     if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
@@ -5151,7 +5224,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # (primitive) lists don't retain, so nothing to drop.
     retaining := ctor != "__list_new"
     for child in node.children:
-        elem_r := ir_emit_value_for_target(child, elem_target)
+        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
         # an optional element's register is the wrapper ir_emit_value_for_target
         # built (or retained, for a passed-through optional), owned by this
@@ -7061,6 +7134,17 @@ fn ir_ctor_field_name_at(sname: String, tid: Int, field_index: Int) -> String:
             return info.fields[field_index]
     return ir_struct_field_name_at(sname, field_index)
 
+# the optional inner type of a constructed field, or "" when the field is not
+# an optional. see ir_emit_value_for_target_inner for why a wrap site needs it.
+fn ir_ctor_field_inner_type_name(sname: String, tid: Int, field_name: String) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return ir_optional_inner_type_of_tid(info.field_types[i])
+    return ""
+
 fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> String:
     if tid >= 0:
         info := get_type_info(tid)
@@ -7099,7 +7183,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
             else:
                 field_regs.push(ir_zero_reg())
         elif value_node >= 0:
-            fr := ir_emit_value_for_target(value_node, field_type)
+            fr := ir_emit_value_for_target_inner(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name))
             named_field_kind := ir_rc_kind(field_type)
             # tuple-typed (optional) field values arrive already owned from
             # ir_emit_value_for_target, so they must not be retained again.
@@ -7109,7 +7193,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
             if default_idx >= 0:
-                field_regs.push(ir_emit_value_for_target(default_idx, field_type))
+                field_regs.push(ir_emit_value_for_target_inner(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
             else:
                 field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -7142,7 +7226,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
             field_regs.push(ir_emit_weak_payload(value_idx))
             field_idx = field_idx + 1
             continue
-        fr := ir_emit_value_for_target(value_idx, ftype)
+        fr := ir_emit_value_for_target_inner(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name))
         pos_field_kind := ir_rc_kind(ftype)
         # tuple-typed (optional) field values arrive already owned; don't retain.
         if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_expr_is_borrowed(value_idx):
@@ -7154,7 +7238,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         default_idx := ir_struct_field_default_node(sname, field_name)
         if default_idx >= 0:
-            field_regs.push(ir_emit_value_for_target(default_idx, ir_ctor_field_type_name(sname, tid, field_name)))
+            field_regs.push(ir_emit_value_for_target_inner(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
         else:
             field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -7526,7 +7610,7 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         value_type = ir_lookup_map_value_type_for_expr(target.children[0])
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
-    value_r := ir_emit_value_for_target(value_idx, value_type)
+    value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
     # value carries its kind with it, so the container adopts it where it has
     # none and takes exactly one count either way — a list used to get a
@@ -8286,7 +8370,7 @@ fn ir_emit_bind_stmt(node: Node):
             r = ir_reg()
             ir_emit_call0(r, annot_ctor, "list")
         if r < 0:
-            r = ir_emit_value_for_target(val_idx, bind_target)
+            r = ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
         if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
@@ -8374,7 +8458,7 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if fassign_kind.len() > 0 and ir_rc_release_enabled(fassign_kind):
         old_r = ir_reg()
         ir_emit_named_field_access(old_r, obj_r, lookup_key, fname, value_type)
-    value_r := ir_emit_value_for_target(value_idx, value_type)
+    value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # a tuple-typed (optional) rhs is already owned from ir_emit_value_for_target,
     # so it must not be retained again; the old value is still released below, so
     # its payload is freed via the optional's destructor.
@@ -8428,7 +8512,7 @@ fn ir_emit_compound_assignment(node: Node):
                 old_r = ir_reg()
                 ir_emit_name_load(old_r, name)
         assign_target := ir_map_init_target(name, target_type)
-        r := ir_emit_value_for_target(node.children[1], assign_target)
+        r := ir_emit_value_for_target_inner(node.children[1], assign_target, ir_optional_inner_type_of_tid(c_get_expr_type(node.children[0])))
         # a tuple (optional) rhs is owned from ir_emit_value_for_target; don't retain.
         if assign_kind.len() > 0 and assign_target != "tuple" and ir_expr_is_borrowed(node.children[1]):
             ir_rc_retain_reg(r, assign_kind)
@@ -9242,7 +9326,21 @@ fn ir_extract_return_type(fn_idx: Int) -> String:
                     return ir_resolve_type_node(returns_child)
     return "unknown"
 
+# the same answer as ir_optional_inner_type_of_node, for a site that holds a
+# type id rather than a type node.
+fn ir_optional_inner_type_of_tid(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_type_from_tid(info.inner)
+    return ""
+
 # the inner type of an `optional_type` node, or "" when the node is not one.
+# the wrap sites need this for the same reason the return site does: an
+# optional lowers to a tuple-shaped allocation, so a tuple-valued payload is
+# indistinguishable from an already-built shell unless the target says which
+# one it wants.
 fn ir_optional_inner_type_of_node(type_idx: Int) -> String:
     if type_idx < 0:
         return ""
@@ -10664,6 +10762,39 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 #
 # `trace` emits the twins instead, over the payload kinds that are traceable
 # children: a string or bytes payload is a leaf and gets none.
+# one destructor per tuple-payload signature. the payload is itself a heap
+# tuple whose elements are heterogeneous, so unlike the uniform kinds above
+# this cannot be a single shared walk: each signature gets a function that
+# releases exactly the elements that need it, then releases the payload shell.
+# the optional's own shell is freed by its caller as usual.
+#
+# a null payload is skipped rather than walked: a none shell carries no
+# destructor, but a shell whose payload was moved out reaches here zeroed.
+fn ir_emit_optional_tuple_walks():
+    for sig in ir_optional_tuple_sigs:
+        pr := ir_emit_rc_walk_header("__opt_dtor_tuple_" + sig)
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        payload_r := ir_reg()
+        ir_emit("field " + payload_r.to_string() + " " + pr.to_string() + " 8 unknown value")
+        live_r := ir_reg()
+        ir_emit("neq " + live_r.to_string() + " " + payload_r.to_string() + " " + zero_r.to_string())
+        live_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
+        ir_emit_label(live_l)
+        mut i := 0
+        while i < sig.len():
+            kind := ir_tuple_dtor_code_kind(sig.substring(i, i + 1))
+            if kind.len() > 0:
+                elem_r := ir_reg()
+                ir_emit("field " + elem_r.to_string() + " " + payload_r.to_string() + " " + (i * 8).to_string() + " unknown elem")
+                ir_rc_release_reg(elem_r, kind)
+            i = i + 1
+        ir_rc_release_reg(payload_r, "tuple")
+        ir_emit_label(done_l)
+        ir_emit_zero_ret_endfunc()
+
 fn ir_emit_optional_walks(trace: Bool):
     mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string"]
     mut prefix := "__opt_dtor_"
@@ -11285,7 +11416,10 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_generic_struct_instance_tracers()
     # tuple cascade helpers last of all: every body (top level, specializations,
     # generic instance dtors and lambdas) has registered its signatures by now.
+    # the optional-over-tuple destructors are discovered the same way and so
+    # belong in the same place.
     ir_emit_tuple_cascade_helpers()
+    ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair
     # list covers the tuple and generic-instance twins too.
     ir_emit_cc_register_tracers()

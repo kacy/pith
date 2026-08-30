@@ -39,6 +39,7 @@ cases=(
   tests/leaks/leak_fn_value_optional
   tests/leaks/leak_runtime_shell_dtor
   tests/leaks/leak_map_take_remove
+  tests/leaks/leak_optional_over_tuple
   tests/leaks/leak_io_text_registry
   tests/leaks/leak_websocket_session
   tests/leaks/leak_returned_shell_dtor

@@ -1,0 +1,56 @@
+# an optional over a tuple has to build a Some shell like any other optional.
+# it is the one payload shape that looks exactly like the shell itself, so
+# every site that wraps a value used to store the payload raw and read the
+# shell's own slots back out. the return position was always correct; these
+# are the positions that were not.
+
+struct Holder:
+    pub p: (Int, String)?
+
+fn take(p: (Int, String)?) -> String:
+    if let v = p:
+        return "{v.0}/{v.1}"
+    return "none"
+
+fn built() -> (Int, String)?:
+    return (9, "i")
+
+fn main() -> Int:
+    o: (Int, String)? := (1, "a")
+    if let q = o:
+        print("bind {q.0} {q.1}")
+
+    h := Holder(p: (2, "b"))
+    if let w = h.p:
+        print("ctor {w.0} {w.1}")
+
+    mut hb := Holder(p: none)
+    hb.p = (3, "c")
+    if let x = hb.p:
+        print("field-assign {x.0} {x.1}")
+
+    xs: List[(Int, String)?] := [(4, "d"), none]
+    if let e = xs[0]:
+        print("element {e.0} {e.1}")
+    print("element-none {take(xs[1])}")
+
+    mut m: Map[String, (Int, String)?] := {}
+    m["k"] = (5, "e")
+    if let mv = m["k"]:
+        print("index-assign {mv.0} {mv.1}")
+
+    ml: Map[String, (Int, String)?] := {"j": (6, "f")}
+    if let lv = ml["j"]:
+        print("map-literal {lv.0} {lv.1}")
+
+    mut a: (Int, String)? := none
+    a = (7, "g")
+    if let av = a:
+        print("assign {av.0} {av.1}")
+
+    print("argument {take((8, \"h\"))}")
+    print("return {take(built())}")
+    print("passthrough {take(o)}")
+    n: (Int, String)? := none
+    print("none {take(n)}")
+    return 0

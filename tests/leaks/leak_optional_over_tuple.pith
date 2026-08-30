@@ -1,0 +1,69 @@
+# every position that wraps a value into an optional whose inner type is a
+# tuple. the wrap is the interesting part for ownership: the payload is a
+# heap tuple carrying a string, and the shell it goes into is the same shape,
+# so a site that stores it raw strands both. these churn a fresh string
+# inside a fresh tuple through each wrap site in turn.
+import leakprobe as probe
+
+struct Holder:
+    pub p: (Int, String)?
+
+fn take(p: (Int, String)?) -> Int:
+    if let v = p:
+        return v.1.len()
+    return 0
+
+fn built(i: Int) -> (Int, String)?:
+    return (i, "ret-{i}-payload")
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    o: (Int, String)? := (i, "bind-{i}-payload")
+    if let q = o:
+        acc = acc + q.1.len()
+
+    h := Holder(p: (i, "ctor-{i}-payload"))
+    if let w = h.p:
+        acc = acc + w.1.len()
+
+    mut hb := Holder(p: none)
+    hb.p = (i, "fassign-{i}-payload")
+    if let x = hb.p:
+        acc = acc + x.1.len()
+
+    xs: List[(Int, String)?] := [(i, "elem-{i}-payload"), none]
+    if let e = xs[0]:
+        acc = acc + e.1.len()
+
+    mut m: Map[String, (Int, String)?] := {}
+    m["k-{i}"] = (i, "idx-{i}-payload")
+    if let mv = m["k-{i}"]:
+        acc = acc + mv.1.len()
+
+    ml: Map[String, (Int, String)?] := {"j-{i}": (i, "lit-{i}-payload")}
+    if let lv = ml["j-{i}"]:
+        acc = acc + lv.1.len()
+
+    mut a: (Int, String)? := none
+    a = (i, "assign-{i}-payload")
+    if let av = a:
+        acc = acc + av.1.len()
+
+    acc = acc + take((i, "arg-{i}-payload"))
+    acc = acc + take(built(i))
+    acc = acc + take(o)
+
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

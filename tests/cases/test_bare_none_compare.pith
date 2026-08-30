@@ -1,0 +1,38 @@
+# a binding declared with a bare `none` and no annotation carries the none type
+# rather than an optional one, but it holds the same two-slot shell an
+# annotated optional does. comparing it against `none` used to fall through to
+# a raw pointer comparison against zero, which a heap address never satisfies,
+# so `b == none` answered false for a binding holding nothing. it is a wrong
+# answer rather than a diagnostic, which is why it went unnoticed.
+
+fn main() -> Int:
+    b := none
+    if b == none:
+        print("bare let equals none")
+    if b != none:
+        print("WRONG: bare let differs from none")
+
+    mut m := none
+    if m == none:
+        print("bare mut equals none")
+
+    # the literal on the left as well as the right
+    if none == b:
+        print("none equals bare let")
+    if none != b:
+        print("WRONG: none differs from bare let")
+
+    # an annotated optional was always right and must stay so, in both states
+    e: Int? := none
+    if e == none:
+        print("annotated none equals none")
+    v: Int? := 5
+    if v == none:
+        print("WRONG: a held value equals none")
+    if v != none:
+        print("a held value differs from none")
+
+    # two literals keep the answer they already had
+    if none == none:
+        print("none equals none")
+    return 0

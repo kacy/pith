@@ -3859,13 +3859,23 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
     right_info := get_type_info(right_tid)
     left_node := get_node(node.children[0])
     right_node := get_node(node.children[1])
+    # a binding declared with a bare `none` and no annotation carries the none
+    # type rather than an optional one, but it still holds a real shell: the
+    # bind allocates the same two-slot tuple an annotated optional does. so it
+    # belongs on this path too. without it the comparison fell through to a raw
+    # pointer eq against zero, which the shell's address never satisfies, and
+    # `b == none` answered false for a binding that held nothing. the literal
+    # itself is excluded, leaving `none == none` on the path that already
+    # handles it.
+    left_holds_shell := left_info.kind == "optional" or (left_tid == TID_NONE and left_node.kind != "none_lit")
+    right_holds_shell := right_info.kind == "optional" or (right_tid == TID_NONE and right_node.kind != "none_lit")
     if op == "eq" or op == "neq":
-        if left_node.kind == "none_lit" and right_info.kind == "optional":
+        if left_node.kind == "none_lit" and right_holds_shell:
             ir_emit_optional_none_compare(r, op, right_r)
             ir_release_weak_shell(node.children[1], right_r)
             ir_release_owned_optional_operand(node.children[1], right_r)
             return r
-        if right_node.kind == "none_lit" and left_info.kind == "optional":
+        if right_node.kind == "none_lit" and left_holds_shell:
             ir_emit_optional_none_compare(r, op, left_r)
             ir_release_weak_shell(node.children[0], left_r)
             ir_release_owned_optional_operand(node.children[0], left_r)

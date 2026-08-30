@@ -17,12 +17,14 @@ something here that now works, the page is stale and a fix to it is welcome.
   payload-carrying enums compares structurally: tags, then payloads, with
   string payloads by content and nested enums recursively; struct payloads
   compare by identity.
-- **a bare `none` cannot start an inference chain** — `none` is accepted only
-  where the target is already an optional, which is every position that has
-  one: bindings, assignments, returns, arguments, struct fields, collection
-  and tuple elements, and `==` / `!=`. an unannotated `x := none` is the one
-  place with no target to check against; it binds a type nothing else accepts,
-  so the first use of `x` reports instead. write `x: T? := none`.
+- **a bare `none` takes its type from the first assignment** — `none` is
+  accepted wherever the target is already an optional, which is every position
+  that has one: bindings, assignments, returns, arguments, struct fields,
+  collection and tuple elements, and `==` / `!=`. an unannotated `mut x := none`
+  has no target to check against, so it takes one from the first concrete
+  assignment: `x = 5` makes it `Int?`, and a later assignment of another type
+  is rejected against that. an annotation still says it up front and is clearer
+  when the first assignment is far away.
 - **a plain value widens into an optional wherever one is expected, except a
   map key or a set element** — `3` is accepted where an `Int?` is expected, and
   whatever reads it back gets the `Some(3)` it expects. that covers bindings,

@@ -1,0 +1,39 @@
+# the shell an unannotated bare `none` builds is released like any other
+# optional. it used to be untracked, so every such binding stranded its shell,
+# and that is also what made inferring the binding's type from its first
+# assignment leak rather than work.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    # never assigned: the shell alone
+    u := none
+    if u == none:
+        acc = acc + 1
+
+    # promoted to an integer
+    mut n := none
+    n = i
+    if let x = n:
+        acc = acc + x
+
+    # promoted to a heap payload, then cleared
+    mut s := none
+    s = "payload-{i}-body"
+    if let v = s:
+        acc = acc + v.len()
+    s = none
+
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

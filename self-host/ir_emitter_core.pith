@@ -1834,6 +1834,14 @@ fn ir_emit_rc_cleanup(exclude: String):
 # while emission-time classification only widens, never narrows, so every
 # collected name really does hold owned counts.
 fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
+    # a binding declared with a bare `none` and no annotation has the none type,
+    # which is not an rc kind, so the name was poisoned and its shell released
+    # nowhere. the bind allocates the same two-slot tuple an annotated optional
+    # does, so it is tracked the same way: `b := none` and `b: T? := none` now
+    # differ in what the checker knows, not in what the emitter frees.
+    if parts.type_idx < 0 and parts.val_idx >= 0:
+        if get_node(parts.val_idx).kind == "none_lit":
+            return "tuple"
     mut bind_type := ""
     if parts.type_idx >= 0:
         bind_type = ir_resolve_type_node(parts.type_idx)
@@ -8345,6 +8353,14 @@ fn ir_emit_bind_stmt(node: Node):
                 if field_kind.len() > 0:
                     ir_closure_return_kinds.insert(name, field_kind)
     mut target_type := ""
+    # an unannotated bare `none` builds the same shell an annotated optional
+    # does, so it takes the same target kind here. that keeps the two spellings
+    # on one path: the shell is tracked for release, and the borrowed-rhs retain
+    # below is skipped for it exactly as it is for `b: T? := none`, which would
+    # otherwise leave the fresh shell holding a count nobody drops.
+    if type_idx < 0 and val_idx >= 0:
+        if get_node(val_idx).kind == "none_lit":
+            target_type = "tuple"
     if type_idx >= 0:
         target_type = ir_resolve_type_node(type_idx)
         if target_type.len() > 0:

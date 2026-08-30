@@ -2348,6 +2348,20 @@ fn check_assignment(node: Node, scope_id: Int):
             return
     target_type := c_check_expr(target_idx, scope_id)
     val_type := c_check_expr(value_idx, scope_id)
+    # `mut x := none` binds the none type, which only an optional target
+    # accepts, so the binding could never be assigned into and the error landed
+    # on the first use rather than on the declaration. the first concrete
+    # assignment names the type instead: the binding becomes an optional over
+    # what was assigned, which is the only type the declaration could have
+    # meant. the shell the bind already built is the one that then holds it.
+    if target_node.kind == "ident" and is_none_type(target_type):
+        if is_error_type(val_type) == false and is_none_type(val_type) == false:
+            slot := lookup_binding_index(scope_id, target_node.value)
+            if slot >= 0:
+                promoted := add_type_info(ti_optional(val_type))
+                set_binding_type_at(slot, promoted)
+                expression_type_cache.insert(target_idx, promoted)
+                return
     if is_error_type(target_type):
         return
     if value_matches_optional_target(value_idx, val_type, target_type):

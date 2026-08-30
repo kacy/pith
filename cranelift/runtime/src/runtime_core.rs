@@ -536,6 +536,28 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
+    // a closure is built and dropped once per construction, and a benchmark
+    // that builds two per iteration spends about 56ns in each against a 7ns
+    // call. almost none of that is the work; it is the allocator round-trip.
+    // so a dead closure's block goes on a per-thread stack and the next
+    // construction writes over it, the same trade the struct pool makes and
+    // behind the same switch, so `make memcheck` still sees every free.
+    let pooled = closure_pool_take();
+    if !pooled.is_null() {
+        let ptr = pooled as *mut PithClosure;
+        unsafe {
+            ptr.write(PithClosure {
+                magic: CLOSURE_MAGIC,
+                func_ptr,
+                ref_count: std::sync::atomic::AtomicI64::new(1),
+                env: [0; PITH_CLOSURE_ENV_SLOTS],
+                env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
+                cycle_flags: std::sync::atomic::AtomicU8::new(0),
+                overflow: None,
+            });
+        }
+        return ptr as i64;
+    }
     let ptr = Box::into_raw(Box::new(PithClosure {
         magic: CLOSURE_MAGIC,
         func_ptr,
@@ -546,6 +568,50 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
         overflow: None,
     }));
     ptr as i64
+}
+
+// A dead closure's block, kept per thread for the next construction. Fixed
+// size, so a single stack rather than the struct pool's size buckets, and a
+// pool of its own so the two can never hand each other a block laid out for
+// the other. Honours the same switch as the struct pool: with it off every
+// block goes back to the allocator, which is what lets valgrind see a use
+// after free.
+const CLOSURE_POOL_CAP: usize = 512;
+
+thread_local! {
+    static CLOSURE_POOL: std::cell::RefCell<Vec<*mut u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn closure_pool_take() -> *mut u8 {
+    if !struct_pool_enabled() {
+        return std::ptr::null_mut();
+    }
+    CLOSURE_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Recycle a dead closure shell, or hand it back to the allocator. The
+/// overflow spill owns its buffer either way, so it is dropped first;
+/// everything else is plain data the next construction overwrites.
+unsafe fn closure_free_shell(handle: i64) {
+    let ptr = handle as *mut PithClosure;
+    std::ptr::drop_in_place(&mut (*ptr).overflow);
+    if struct_pool_enabled() {
+        let recycled = CLOSURE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() >= CLOSURE_POOL_CAP {
+                return false;
+            }
+            pool.push(ptr as *mut u8);
+            true
+        });
+        if recycled {
+            return;
+        }
+    }
+    std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::new::<PithClosure>());
 }
 
 /// One more owner of this closure.
@@ -615,7 +681,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
         return;
     }
-    drop(Box::from_raw(handle as *mut PithClosure));
+    closure_free_shell(handle);
 }
 
 /// Mark a closure as a cycle suspect and hand it to the buffer. Outlined and
@@ -720,7 +786,7 @@ pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
         return;
     }
-    drop(Box::from_raw(handle as *mut PithClosure));
+    closure_free_shell(handle);
 }
 
 /// Drop a closure shell the graveyard parked. The magic is already scrubbed

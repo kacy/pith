@@ -1043,11 +1043,11 @@ fn parse_string_interpolation() -> Int:
 
         # interpolation expression
         if check("interpolation_expr"):
-            _tv := _cur_tok_value()
+            interp_tv := _cur_tok_value()
             interp_line := tok_line(current_token_position)
             interp_col := tok_col(current_token_position)
             advance_token()
-            split := split_format_spec(_tv)
+            split := split_format_spec(interp_tv)
             interp_expr := parse_interp_expr(split.0, interp_line, interp_col)
             if split.1.len() > 0:
                 parts.push(add_node_with_position("interp_spec", split.1, [interp_expr]))
@@ -1058,19 +1058,19 @@ fn parse_string_interpolation() -> Int:
         # string_mid — more interpolations follow
         if matched_part == false:
             if check("string_mid"):
-                _tv := _cur_tok_value()
+                mid_tv := _cur_tok_value()
                 advance_token()
-                if _tv.len() > 0:
-                    parts.push(add_leaf_with_position("lit", _tv))
+                if mid_tv.len() > 0:
+                    parts.push(add_leaf_with_position("lit", mid_tv))
                 matched_part = true
 
         # string_end — done
         if matched_part == false:
             if check("string_end"):
-                _tv := _cur_tok_value()
+                end_tv := _cur_tok_value()
                 advance_token()
-                if _tv.len() > 0:
-                    parts.push(add_leaf_with_position("lit", _tv))
+                if end_tv.len() > 0:
+                    parts.push(add_leaf_with_position("lit", end_tv))
                 matched_part = true
                 keep_parsing = false
 

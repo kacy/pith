@@ -1,0 +1,12 @@
+# a binding in a nested block does not shadow an enclosing one, it overwrites
+# it: a function gets one slot per name, so the inner binding writes the outer
+# one's storage and the outer read after the block answers with the inner
+# value, or with garbage when the two have different types. it was a wrong
+# answer with no diagnostic, so the name is rejected instead.
+fn main() -> Int:
+    b := 42
+    if true:
+        b := "inner"
+        print("{b}")
+    print("{b}")
+    return 0

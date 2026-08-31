@@ -17,7 +17,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -2242,6 +2242,18 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         fn_weak_names.push(name)
         check_weak_binding(node_idx, scope_id, name)
         return
+    # a binding in a nested block does not shadow an enclosing one, it
+    # overwrites it: the emitter gives a function one slot per name, so the
+    # inner binding writes the outer one's storage and the outer read after the
+    # block answers with the inner value — or with garbage, when the two have
+    # different types. that is a wrong answer with no diagnostic, so the name is
+    # rejected rather than allowed to shadow, the same choice E250 makes for a
+    # struct that reuses a builtin type name.
+    #
+    # sibling blocks reusing a name are untouched: neither encloses the other,
+    # so the earlier one is not visible here and they share a slot harmlessly.
+    if binding_shadows_enclosing_local(scope_id, name):
+        report_error_at(node_idx, "E262", "'" + name + "' is already bound in this function; a nested binding overwrites it rather than shadowing it")
     note_fn_binding_name(name, node_idx)
     # children: [type_expr?, value_expr]
     # if 2 children -> first is type annotation, second is value

@@ -2358,10 +2358,24 @@ fn check_assignment(node: Node, scope_id: Int):
         if is_error_type(val_type) == false and is_none_type(val_type) == false:
             slot := lookup_binding_index(scope_id, target_node.value)
             if slot >= 0:
-                promoted := add_type_info(ti_optional(val_type))
-                set_binding_type_at(slot, promoted)
-                expression_type_cache.insert(target_idx, promoted)
-                return
+                val_info := get_type_info(val_type)
+                mut promoted := 0 - 1
+                if val_info.kind == "optional":
+                    # already an optional: adopt it rather than wrap it again.
+                    # the emitter aliases the value's own shell here, so
+                    # recording an optional-of-optional described something
+                    # nobody built and the second unwrap read the payload as a
+                    # shell address.
+                    promoted = val_type
+                elif val_type != TID_VOID and val_info.kind != "result":
+                    promoted = add_type_info(ti_optional(val_type))
+                # a void call and a result have no optional to be: leaving
+                # promoted unset falls through to the ordinary check, which
+                # reports the same mismatch an annotated binding reports.
+                if promoted >= 0:
+                    set_binding_type_at(slot, promoted)
+                    expression_type_cache.insert(target_idx, promoted)
+                    return
     if is_error_type(target_type):
         return
     if value_matches_optional_target(value_idx, val_type, target_type):

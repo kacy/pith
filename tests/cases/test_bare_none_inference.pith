@@ -14,7 +14,57 @@ fn helper(i: Int) -> Int:
         return v.len()
     return 0
 
+# an already-optional value is adopted, not wrapped again. wrapping it recorded
+# a type nobody built — the emitter aliases the value's own shell here — and the
+# second unwrap read the payload as if it were a shell address.
+fn lookup(k: String) -> String?:
+    if k == "hit":
+        return "found"
+    return none
+
+fn adopts_an_optional() -> Int:
+    mut hit := none
+    hit = lookup("hit")
+    if let v = hit:
+        print("adopted {v}")
+    mut miss := none
+    miss = lookup("nope")
+    if miss == none:
+        print("adopted none stays none")
+    return 0
+
+# a captured bare-none binding must be captured the way an annotated one is,
+# with its count taken. it was stored into the closure environment untagged, so
+# once the binding became tracked, reassigning it released the count the
+# closure was relying on and the closure then read freed memory.
+fn churn(n: Int) -> Int:
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        t: Int? := i
+        if let v = t:
+            acc = acc + v
+        i = i + 1
+    return acc
+
+fn survives_capture() -> Int:
+    mut b := none
+    f := fn() -> Int:
+        if b == none:
+            return 0
+        return 1
+    if f() != 0:
+        print("WRONG: an unassigned capture read as held")
+    b = 7
+    churn(64)
+    if f() != 0:
+        print("WRONG: the captured shell was freed under the closure")
+    print("captured bare none survives")
+    return 0
+
 fn main() -> Int:
+    adopts_an_optional()
+    survives_capture()
     mut n := none
     n = 7
     if let x = n:

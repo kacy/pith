@@ -15,7 +15,45 @@ fn take(p: (Int, String)?) -> String:
 fn built() -> (Int, String)?:
     return (9, "i")
 
+# a payload that is still owned elsewhere, so releasing it twice frees a live
+# value and the next allocation reuses its block. string literals are immortal
+# and cannot show this, which is why the first version of this test passed
+# against a destructor that released every element twice.
+fn mk(n: Int) -> String:
+    return "v{n}"
+
+fn survives_release() -> Int:
+    held := mk(7)
+    mut o: (Int, String)? := (5, held)
+    o = none
+    fresh := mk(9)
+    if held != "v7":
+        print("WRONG: a live payload was freed, held reads {held}")
+    if fresh != "v9":
+        print("WRONG: fresh reads {fresh}")
+    print("aliased payload survives: {held}")
+
+    # every other reference-counted element kind, same shape
+    l := [100, 200]
+    mut ol: (List[Int], Int)? := (l, 1)
+    ol = none
+    print("list survives: {l[0]},{l[1]}")
+
+    inner := mk(3)
+    mut on: ((Int, String), Int)? := ((3, inner), 1)
+    on = none
+    print("nested survives: {inner}")
+
+    # a payload whose elements are all by-value is still a heap allocation the
+    # shell has to release
+    mut bv: (Int, Int)? := (1, 2)
+    bv = (3, 4)
+    if let v = bv:
+        print("by-value pair: {v.0} {v.1}")
+    return 0
+
 fn main() -> Int:
+    survives_release()
     o: (Int, String)? := (1, "a")
     if let q = o:
         print("bind {q.0} {q.1}")

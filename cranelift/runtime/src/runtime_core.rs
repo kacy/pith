@@ -578,17 +578,39 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
 // after free.
 const CLOSURE_POOL_CAP: usize = 512;
 
+/// The blocks one thread is holding for reuse. Wrapped in a type with a `Drop`
+/// so they are handed back when the thread exits: a bare `Vec` of raw pointers
+/// frees only its own buffer and strands everything it points at, which on the
+/// os-thread backend — where every spawned task is its own thread — loses up to
+/// the cap per task, permanently.
+struct ClosurePool(Vec<*mut u8>);
+
+impl Drop for ClosurePool {
+    fn drop(&mut self) {
+        for ptr in self.0.drain(..) {
+            unsafe {
+                std::alloc::dealloc(ptr, std::alloc::Layout::new::<PithClosure>());
+            }
+        }
+    }
+}
+
 thread_local! {
-    static CLOSURE_POOL: std::cell::RefCell<Vec<*mut u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static CLOSURE_POOL: std::cell::RefCell<ClosurePool> =
+        const { std::cell::RefCell::new(ClosurePool(Vec::new())) };
 }
 
 fn closure_pool_take() -> *mut u8 {
     if !struct_pool_enabled() {
         return std::ptr::null_mut();
     }
+    // `try_with` rather than `with`: a closure freed late in thread teardown,
+    // after this thread local has been destroyed, would otherwise panic inside
+    // an extern "C" function that cannot unwind, which aborts the process.
+    // Falling back to the allocator is always correct.
     CLOSURE_POOL
-        .with(|pool| pool.borrow_mut().pop())
+        .try_with(|pool| pool.borrow_mut().0.pop())
+        .unwrap_or(None)
         .unwrap_or(std::ptr::null_mut())
 }
 
@@ -599,14 +621,16 @@ unsafe fn closure_free_shell(handle: i64) {
     let ptr = handle as *mut PithClosure;
     std::ptr::drop_in_place(&mut (*ptr).overflow);
     if struct_pool_enabled() {
-        let recycled = CLOSURE_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() >= CLOSURE_POOL_CAP {
-                return false;
-            }
-            pool.push(ptr as *mut u8);
-            true
-        });
+        let recycled = CLOSURE_POOL
+            .try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.0.len() >= CLOSURE_POOL_CAP {
+                    return false;
+                }
+                pool.0.push(ptr as *mut u8);
+                true
+            })
+            .unwrap_or(false);
         if recycled {
             return;
         }

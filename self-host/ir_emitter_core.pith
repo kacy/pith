@@ -2937,79 +2937,86 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
 # word for which it wants, a `(Int, String)?` target takes the pass-through
 # path and stores the payload raw, and the extraction then reads the shell's
 # slots. The return site has always consulted the inner type for this reason.
+## the payload kinds an optional takes ownership of: it retains a borrowed one
+## and attaches the destructor that releases it when the shell dies.
+##
+## a string is in the set, and was left out for a long time on the grounds that
+## an optional over a string only ever borrowed one. a wrap builds a Some over
+## a fresh string too (`["a-{i}", none]`, `v: String? := "a-{i}"`), and the
+## borrowing convention left that string with a count nobody would drop once
+## the shell reached a container or a field.
+##
+## a tuple payload is deliberately absent: its elements are heterogeneous, so
+## it needs the destructor emitted for its own signature rather than one of
+## these uniform walks. see ir_optional_tuple_payload_kind.
+fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
+    if kind == "struct" or kind == "list" or kind == "map" or kind == "set":
+        return true
+    return kind == "bytes" or kind == "closure" or kind == "string"
+
+# build a Some that owns its payload. the payload arrives owned either way: a
+# fresh value carries its own count, and a borrowed one is retained here to pair
+# with the destructor's release.
+fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, dtor_kind: String) -> Int:
+    if ir_expr_is_borrowed(val_idx):
+        ir_rc_retain_reg(value_r, payload_kind)
+    return ir_emit_optional_owned_some(value_r, dtor_kind)
+
+# true when the value is already the optional, result or tuple this position
+# wants, so it needs no shell built around it.
+#
+# the checker settles the question when it can: it records the values that need
+# a Some built, having excluded `none`, an already-optional value and the error
+# type. that record is authoritative because the shapes are otherwise
+# indistinguishable here — an optional lowers to the same tuple-shaped
+# allocation a tuple literal produces, so a tuple payload and a built shell look
+# alike, and only the target's own inner type separates them.
+fn ir_value_is_already_the_optional(val_idx: Int, actual_info: TypeInfo, target_inner: String) -> Bool:
+    if c_argument_widens_to_optional(val_idx):
+        return false
+    if actual_info.kind == "optional" or actual_info.kind == "result":
+        return true
+    return actual_info.kind == "tuple" and target_inner != "tuple"
+
+# emit a value into a position whose target is an optional. `target_inner` is
+# the optional's inner type where the caller knows it, and "" where it does not
+# — the argument position has no target to consult and leans on the checker's
+# record instead.
+fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> Int:
+    if vn.kind == "none_lit":
+        return ir_emit_optional_none_value()
+    value_r := ir_expr(val_idx)
+    actual_tid := c_get_expr_type(val_idx)
+    if actual_tid >= 0:
+        if ir_value_is_already_the_optional(val_idx, get_type_info(actual_tid), target_inner):
+            # owned at this position: take a count when it arrives borrowed so
+            # the holder can release it. a freshly wrapped optional below is
+            # already owned, and the struct-construction site no longer retains
+            # tuple-typed fields, so this is the single owning retain.
+            if ir_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(value_r, "tuple")
+            return value_r
+    # in a generic impl body a method call's checked type is often TID_ERR,
+    # because the body was checked with the struct's type params suppressed.
+    # assume such a call already produces the shape its declaration promises
+    # rather than wrapping it as a Some.
+    if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
+        return value_r
+    payload_kind := ir_rc_kind(ir_infer_type(val_idx))
+    if ir_kind_is_owned_optional_payload(payload_kind):
+        return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind)
+    # a genuine tuple payload owns whatever its elements hold. the signature
+    # names the destructor emitted for that shape, and is "" for anything that
+    # is not a tuple, so it decides on its own.
+    tuple_kind := ir_optional_tuple_payload_kind(actual_tid)
+    if tuple_kind.len() > 0:
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind)
+    return ir_emit_optional_some_value(value_r)
+
 fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inner: String) -> Int:
     vn := get_node(val_idx)
     if target_type == "tuple":
-        if vn.kind == "none_lit":
-            return ir_emit_optional_none_value()
-        value_r := ir_expr(val_idx)
-        actual_tid := c_get_expr_type(val_idx)
-        if actual_tid >= 0:
-            actual_info := get_type_info(actual_tid)
-            # the checker records a value that needs a Some shell built for
-            # it, having excluded `none`, an already-optional value and the
-            # error type. when it says so, that settles the question: an
-            # optional lowers to a tuple-shaped allocation, so a tuple payload
-            # and a built shell are the same shape here and the check below
-            # cannot tell them apart on its own.
-            needs_shell := c_argument_widens_to_optional(val_idx)
-            passes_through := needs_shell == false and (actual_info.kind == "optional" or actual_info.kind == "result" or (actual_info.kind == "tuple" and target_inner != "tuple"))
-            if passes_through:
-                # a passed-through optional/result/tuple is owned at this
-                # position; take a count when it arrives borrowed so the holder
-                # can release it. freshly wrapped optionals below are already
-                # owned, and the struct-construction site no longer retains
-                # tuple-typed fields, so this is the single owning retain.
-                if ir_expr_is_borrowed(val_idx):
-                    ir_rc_retain_reg(value_r, "tuple")
-                return value_r
-        # in a generic impl body, a method call's checked type is often
-        # TID_ERR because the body was checked with the struct's type
-        # params suppressed. assume `return <method_call>` from a
-        # tuple-returning function already produces the right shape rather
-        # than wrap-it-as-Some.
-        if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
-            return value_r
-        # an optional wrapping an rc payload (a struct, list, map, set, bytes,
-        # closure or string) OWNS it: take a count when the value arrives
-        # borrowed, and attach a destructor so the payload is released when the
-        # optional dies. this keeps a `Node?` field's target alive instead of
-        # dangling. a string payload was left out of this for a long time, on
-        # the grounds that an optional over a string only ever borrowed one —
-        # but a wrap builds a Some over a *fresh* string too (`["a-{i}", none]`,
-        # `v: String? := "a-{i}"`), and the borrowed convention left that string
-        # with a count nobody would ever drop once the shell went into a
-        # container or a field. owning it here settles both shapes: a borrowed
-        # payload gets the retain that pairs with the destructor's release, and
-        # a fresh one hands its count to the shell.
-        payload_kind := ir_rc_kind(ir_infer_type(val_idx))
-        if payload_kind == "struct" or payload_kind == "list" or payload_kind == "map" or payload_kind == "set" or payload_kind == "bytes" or payload_kind == "closure" or payload_kind == "string":
-            if ir_expr_is_borrowed(val_idx):
-                ir_rc_retain_reg(value_r, payload_kind)
-            return ir_emit_optional_owned_some(value_r, payload_kind)
-        # a genuine tuple payload owns whatever its elements hold, and those
-        # elements are heterogeneous, so it needs the destructor emitted for
-        # its own signature rather than one of the uniform kinds above. a
-        # tuple of by-value elements only gets the borrowing wrap, since there
-        # is nothing for a destructor to release.
-        # the signature is empty unless the value's own type really is a tuple
-        # carrying something releasable, so this needs no guard of its own. the
-        # argument site in particular reaches here knowing only that the checker
-        # asked for a shell, with no target type to consult.
-        tuple_kind := ir_optional_tuple_payload_kind(actual_tid)
-        if tuple_kind.len() > 0:
-            if ir_expr_is_borrowed(val_idx):
-                ir_rc_retain_reg(value_r, "tuple")
-            return ir_emit_optional_owned_some(value_r, tuple_kind)
-        return ir_emit_optional_some_value(value_r)
-    # an empty list whose element type the checker worked out goes through the
-    # literal emitter, which picks the container from that element type. the
-    # shortcut below only knows the coarse target kind ("list", "list_string"),
-    # so it would build an untagged list for a List[Bytes] or List[SomeStruct]
-    # field — one that never takes a reference to what is pushed into it.
-    # ir_checked_type is empty when the checker has no type for the literal,
-    # which is exactly when the shortcut is still the only thing that knows what
-    # to build.
+        return ir_emit_optional_for_target(val_idx, vn, target_inner)
     if vn.kind == "list" and vn.children.len() == 0:
         if ir_checked_type(val_idx).starts_with("list"):
             return ir_expr(val_idx)

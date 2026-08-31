@@ -169587,6 +169587,332 @@ ret 5
 iconst 7 0
 ret 7
 endfunc
+func ir_emitter_core_ir_kind_is_owned_optional_payload 1 bool
+param kind
+iconst 1 0
+store __or_1_2135 1
+iconst 2 0
+store __or_2_2135 2
+iconst 3 0
+store __or_3_2135 3
+load 4 kind
+strref 5 m51s15
+call 6 pith_cstring_eq bool 2 4 5
+call 7 pith_cstring_release void 1 5
+store __or_3_2135 6
+brif 6 L2136 L2135
+label L2135
+load 8 kind
+strref 9 m51s20
+call 10 pith_cstring_eq bool 2 8 9
+call 11 pith_cstring_release void 1 9
+store __or_3_2135 10
+label L2136
+load 12 __or_3_2135
+store __or_2_2135 12
+brif 12 L2138 L2137
+label L2137
+load 13 kind
+strref 14 m51s19
+call 15 pith_cstring_eq bool 2 13 14
+call 16 pith_cstring_release void 1 14
+store __or_2_2135 15
+label L2138
+load 17 __or_2_2135
+store __or_1_2135 17
+brif 17 L2140 L2139
+label L2139
+load 18 kind
+strref 19 m51s18
+call 20 pith_cstring_eq bool 2 18 19
+call 21 pith_cstring_release void 1 19
+store __or_1_2135 20
+label L2140
+load 22 __or_1_2135
+brif 22 L2133 L2134
+label L2133
+iconst 23 1
+ret 23
+label L2134
+label L2132
+iconst 24 0
+store __or_24_2141 24
+iconst 25 0
+store __or_25_2141 25
+load 26 kind
+strref 27 m51s748
+call 28 pith_cstring_eq bool 2 26 27
+call 29 pith_cstring_release void 1 27
+store __or_25_2141 28
+brif 28 L2142 L2141
+label L2141
+load 30 kind
+strref 31 m51s905
+call 32 pith_cstring_eq bool 2 30 31
+call 33 pith_cstring_release void 1 31
+store __or_25_2141 32
+label L2142
+load 34 __or_25_2141
+store __or_24_2141 34
+brif 34 L2144 L2143
+label L2143
+load 35 kind
+strref 36 m51s749
+call 37 pith_cstring_eq bool 2 35 36
+call 38 pith_cstring_release void 1 36
+store __or_24_2141 37
+label L2144
+load 39 __or_24_2141
+ret 39
+iconst 40 0
+ret 40
+endfunc
+func ir_emitter_core_ir_emit_owned_some_taking 4 int
+param value_r
+param val_idx
+param payload_kind
+param dtor_kind
+load 4 val_idx
+call 5 ir_emitter_core_ir_expr_is_borrowed bool 1 4
+brif 5 L2146 L2147
+label L2146
+load 6 value_r
+load 7 payload_kind
+call 8 ir_ownership_ir_rc_retain_reg void 2 6 7
+jmp L2145
+label L2147
+label L2145
+load 9 value_r
+load 10 dtor_kind
+call 11 ir_optionals_ir_emit_optional_owned_some int 2 9 10
+ret 11
+iconst 12 0
+ret 12
+endfunc
+func ir_emitter_core_ir_value_is_already_the_optional 3 bool
+param val_idx
+param actual_info
+param target_inner
+load 3 val_idx
+call 4 checker_c_argument_widens_to_optional bool 1 3
+brif 4 L2149 L2150
+label L2149
+iconst 5 0
+ret 5
+label L2150
+label L2148
+iconst 6 0
+store __or_6_2154 6
+load 7 actual_info
+field 8 7 0 string kind
+strref 9 m51s21
+call 10 pith_cstring_eq bool 2 8 9
+call 11 pith_cstring_release void 1 9
+store __or_6_2154 10
+brif 10 L2155 L2154
+label L2154
+load 12 actual_info
+field 13 12 0 string kind
+strref 14 m51s22
+call 15 pith_cstring_eq bool 2 13 14
+call 16 pith_cstring_release void 1 14
+store __or_6_2154 15
+label L2155
+load 17 __or_6_2154
+brif 17 L2152 L2153
+label L2152
+iconst 18 1
+ret 18
+label L2153
+label L2151
+iconst 19 0
+store __and_19_2156 19
+load 20 actual_info
+field 21 20 0 string kind
+strref 22 m51s23
+call 23 pith_cstring_eq bool 2 21 22
+call 24 pith_cstring_release void 1 22
+store __and_19_2156 23
+brif 23 L2156 L2157
+label L2156
+load 25 target_inner
+strref 26 m51s23
+call 28 pith_cstring_eq bool 2 25 26
+iconst 29 1
+sub 27 29 28
+call 30 pith_cstring_release void 1 26
+store __and_19_2156 27
+label L2157
+load 31 __and_19_2156
+ret 31
+iconst 32 0
+ret 32
+endfunc
+func ir_emitter_core_ir_emit_optional_for_target 3 int
+param val_idx
+param vn
+param target_inner
+iconst 3 0
+store payload_kind 3
+iconst 4 0
+store tuple_kind 4
+load 5 vn
+field 6 5 0 string kind
+strref 7 m51s500
+call 8 pith_cstring_eq bool 2 6 7
+call 9 pith_cstring_release void 1 7
+brif 8 L2159 L2160
+label L2159
+call 10 ir_optionals_ir_emit_optional_none_value int 0
+load 11 payload_kind
+call 12 pith_cstring_release void 1 11
+load 13 tuple_kind
+call 14 pith_cstring_release void 1 13
+ret 10
+label L2160
+label L2158
+load 15 val_idx
+call 16 ir_emitter_core_ir_expr int 1 15
+store value_r 16
+load 17 val_idx
+call 18 checker_c_get_expr_type int 1 17
+store actual_tid 18
+load 19 actual_tid
+iconst 20 0
+gte 21 19 20
+brif 21 L2162 L2163
+label L2162
+load 22 val_idx
+load 23 actual_tid
+call 24 types_get_type_info struct:TypeInfo 1 23
+load 25 target_inner
+call 26 ir_emitter_core_ir_value_is_already_the_optional bool 3 22 24 25
+call 27 pith_struct_release void 1 24
+brif 26 L2165 L2166
+label L2165
+load 28 val_idx
+call 29 ir_emitter_core_ir_expr_is_borrowed bool 1 28
+brif 29 L2168 L2169
+label L2168
+load 30 value_r
+strref 31 m51s23
+call 32 ir_ownership_ir_rc_retain_reg void 2 30 31
+call 33 pith_cstring_release void 1 31
+jmp L2167
+label L2169
+label L2167
+load 34 value_r
+load 35 payload_kind
+call 36 pith_cstring_release void 1 35
+load 37 tuple_kind
+call 38 pith_cstring_release void 1 37
+ret 34
+label L2166
+label L2164
+jmp L2161
+label L2163
+label L2161
+iconst 39 0
+store __and_39_2173 39
+load 40 ir_emitter_core___g_ir_current_impl_subst_params
+call 41 pith_list_len int 1 40
+iconst 42 0
+gt 43 41 42
+store __and_39_2173 43
+brif 43 L2173 L2174
+label L2173
+iconst 44 0
+store __or_44_2175 44
+load 45 vn
+field 46 45 0 string kind
+strref 47 m51s134
+call 48 pith_cstring_eq bool 2 46 47
+call 49 pith_cstring_release void 1 47
+store __or_44_2175 48
+brif 48 L2176 L2175
+label L2175
+load 50 vn
+field 51 50 0 string kind
+strref 52 m51s44
+call 53 pith_cstring_eq bool 2 51 52
+call 54 pith_cstring_release void 1 52
+store __or_44_2175 53
+label L2176
+load 55 __or_44_2175
+store __and_39_2173 55
+label L2174
+load 56 __and_39_2173
+brif 56 L2171 L2172
+label L2171
+load 57 value_r
+load 58 payload_kind
+call 59 pith_cstring_release void 1 58
+load 60 tuple_kind
+call 61 pith_cstring_release void 1 60
+ret 57
+label L2172
+label L2170
+load 62 payload_kind
+load 63 val_idx
+call 64 ir_emitter_core_ir_infer_type string 1 63
+call 65 ir_struct_registry_ir_rc_kind string 1 64
+call 66 pith_cstring_release void 1 64
+call 67 pith_cstring_release void 1 62
+store payload_kind 65
+load 68 payload_kind
+call 69 ir_emitter_core_ir_kind_is_owned_optional_payload bool 1 68
+brif 69 L2178 L2179
+label L2178
+load 70 value_r
+load 71 val_idx
+load 72 payload_kind
+load 73 payload_kind
+call 74 ir_emitter_core_ir_emit_owned_some_taking int 4 70 71 72 73
+load 75 payload_kind
+call 76 pith_cstring_release void 1 75
+load 77 tuple_kind
+call 78 pith_cstring_release void 1 77
+ret 74
+label L2179
+label L2177
+load 79 tuple_kind
+load 80 actual_tid
+call 81 ir_emitter_core_ir_optional_tuple_payload_kind string 1 80
+call 82 pith_cstring_release void 1 79
+store tuple_kind 81
+load 83 tuple_kind
+call 84 string_len int 1 83
+iconst 85 0
+gt 86 84 85
+brif 86 L2181 L2182
+label L2181
+load 87 value_r
+load 88 val_idx
+strref 89 m51s23
+load 90 tuple_kind
+call 91 ir_emitter_core_ir_emit_owned_some_taking int 4 87 88 89 90
+call 92 pith_cstring_release void 1 89
+load 93 payload_kind
+call 94 pith_cstring_release void 1 93
+load 95 tuple_kind
+call 96 pith_cstring_release void 1 95
+ret 91
+label L2182
+label L2180
+load 97 value_r
+call 98 ir_optionals_ir_emit_optional_some_value int 1 97
+load 99 payload_kind
+call 100 pith_cstring_release void 1 99
+load 101 tuple_kind
+call 102 pith_cstring_release void 1 101
+ret 98
+load 103 payload_kind
+call 104 pith_cstring_release void 1 103
+load 105 tuple_kind
+call 106 pith_cstring_release void 1 105
+iconst 107 0
+ret 107
+endfunc
 func ir_emitter_core_ir_emit_value_for_target_inner 3 int
 param val_idx
 param target_type
@@ -169594,471 +169920,114 @@ param target_inner
 iconst 3 0
 store vn 3
 iconst 4 0
-store actual_info 4
-iconst 5 0
-store payload_kind 5
-iconst 6 0
-store tuple_kind 6
-iconst 7 0
-store empty_init_call 7
-load 8 vn
-load 9 val_idx
-call 10 ast_get_node struct:Node 1 9
-call 11 pith_struct_release void 1 8
-store vn 10
-load 12 target_type
-strref 13 m51s23
-call 14 pith_cstring_eq bool 2 12 13
-call 15 pith_cstring_release void 1 13
-brif 14 L2133 L2134
-label L2133
-load 16 vn
-field 17 16 0 string kind
-strref 18 m51s500
-call 19 pith_cstring_eq bool 2 17 18
-call 20 pith_cstring_release void 1 18
-brif 19 L2136 L2137
-label L2136
-call 21 ir_optionals_ir_emit_optional_none_value int 0
-load 22 vn
-call 23 pith_struct_release void 1 22
-load 24 actual_info
-call 25 pith_struct_release void 1 24
-load 26 payload_kind
-call 27 pith_cstring_release void 1 26
-load 28 tuple_kind
-call 29 pith_cstring_release void 1 28
-load 30 empty_init_call
-call 31 pith_cstring_release void 1 30
-ret 21
-label L2137
-label L2135
-load 32 val_idx
-call 33 ir_emitter_core_ir_expr int 1 32
-store value_r 33
-load 34 val_idx
-call 35 checker_c_get_expr_type int 1 34
-store actual_tid 35
-load 36 actual_tid
-iconst 37 0
-gte 38 36 37
-brif 38 L2139 L2140
-label L2139
-load 39 actual_info
-load 40 actual_tid
-call 41 types_get_type_info struct:TypeInfo 1 40
-call 42 pith_struct_release void 1 39
-store actual_info 41
-load 43 val_idx
-call 44 checker_c_argument_widens_to_optional bool 1 43
-store needs_shell 44
-iconst 45 0
-store __and_45_2141 45
-load 46 needs_shell
-iconst 47 0
-eq 48 46 47
-store __and_45_2141 48
-brif 48 L2141 L2142
-label L2141
-iconst 49 0
-store __or_49_2143 49
-iconst 50 0
-store __or_50_2143 50
-load 51 actual_info
-field 52 51 0 string kind
-strref 53 m51s21
-call 54 pith_cstring_eq bool 2 52 53
-call 55 pith_cstring_release void 1 53
-store __or_50_2143 54
-brif 54 L2144 L2143
-label L2143
-load 56 actual_info
-field 57 56 0 string kind
-strref 58 m51s22
-call 59 pith_cstring_eq bool 2 57 58
-call 60 pith_cstring_release void 1 58
-store __or_50_2143 59
-label L2144
-load 61 __or_50_2143
-store __or_49_2143 61
-brif 61 L2146 L2145
-label L2145
-iconst 62 0
-store __and_62_2147 62
-load 63 actual_info
-field 64 63 0 string kind
-strref 65 m51s23
-call 66 pith_cstring_eq bool 2 64 65
-call 67 pith_cstring_release void 1 65
-store __and_62_2147 66
-brif 66 L2147 L2148
-label L2147
-load 68 target_inner
-strref 69 m51s23
-call 71 pith_cstring_eq bool 2 68 69
-iconst 72 1
-sub 70 72 71
-call 73 pith_cstring_release void 1 69
-store __and_62_2147 70
-label L2148
-load 74 __and_62_2147
-store __or_49_2143 74
-label L2146
-load 75 __or_49_2143
-store __and_45_2141 75
-label L2142
-load 76 __and_45_2141
-store passes_through 76
-load 77 passes_through
-brif 77 L2150 L2151
-label L2150
-load 78 val_idx
-call 79 ir_emitter_core_ir_expr_is_borrowed bool 1 78
-brif 79 L2153 L2154
-label L2153
-load 80 value_r
-strref 81 m51s23
-call 82 ir_ownership_ir_rc_retain_reg void 2 80 81
-call 83 pith_cstring_release void 1 81
-jmp L2152
-label L2154
-label L2152
-load 84 value_r
-load 85 vn
-call 86 pith_struct_release void 1 85
-load 87 actual_info
-call 88 pith_struct_release void 1 87
-load 89 payload_kind
-call 90 pith_cstring_release void 1 89
-load 91 tuple_kind
-call 92 pith_cstring_release void 1 91
-load 93 empty_init_call
-call 94 pith_cstring_release void 1 93
-ret 84
-label L2151
-label L2149
-jmp L2138
-label L2140
-label L2138
-iconst 95 0
-store __and_95_2158 95
-load 96 ir_emitter_core___g_ir_current_impl_subst_params
-call 97 pith_list_len int 1 96
-iconst 98 0
-gt 99 97 98
-store __and_95_2158 99
-brif 99 L2158 L2159
-label L2158
-iconst 100 0
-store __or_100_2160 100
-load 101 vn
-field 102 101 0 string kind
-strref 103 m51s134
-call 104 pith_cstring_eq bool 2 102 103
-call 105 pith_cstring_release void 1 103
-store __or_100_2160 104
-brif 104 L2161 L2160
-label L2160
-load 106 vn
-field 107 106 0 string kind
-strref 108 m51s44
-call 109 pith_cstring_eq bool 2 107 108
-call 110 pith_cstring_release void 1 108
-store __or_100_2160 109
-label L2161
-load 111 __or_100_2160
-store __and_95_2158 111
-label L2159
-load 112 __and_95_2158
-brif 112 L2156 L2157
-label L2156
-load 113 value_r
-load 114 vn
-call 115 pith_struct_release void 1 114
-load 116 actual_info
-call 117 pith_struct_release void 1 116
-load 118 payload_kind
-call 119 pith_cstring_release void 1 118
-load 120 tuple_kind
-call 121 pith_cstring_release void 1 120
-load 122 empty_init_call
-call 123 pith_cstring_release void 1 122
-ret 113
-label L2157
-label L2155
-load 124 payload_kind
-load 125 val_idx
-call 126 ir_emitter_core_ir_infer_type string 1 125
-call 127 ir_struct_registry_ir_rc_kind string 1 126
-call 128 pith_cstring_release void 1 126
-call 129 pith_cstring_release void 1 124
-store payload_kind 127
-iconst 130 0
-store __or_130_2165 130
-iconst 131 0
-store __or_131_2165 131
-iconst 132 0
-store __or_132_2165 132
-iconst 133 0
-store __or_133_2165 133
-iconst 134 0
-store __or_134_2165 134
-iconst 135 0
-store __or_135_2165 135
-load 136 payload_kind
-strref 137 m51s15
-call 138 pith_cstring_eq bool 2 136 137
-call 139 pith_cstring_release void 1 137
-store __or_135_2165 138
-brif 138 L2166 L2165
-label L2165
-load 140 payload_kind
-strref 141 m51s20
-call 142 pith_cstring_eq bool 2 140 141
-call 143 pith_cstring_release void 1 141
-store __or_135_2165 142
-label L2166
-load 144 __or_135_2165
-store __or_134_2165 144
-brif 144 L2168 L2167
-label L2167
-load 145 payload_kind
-strref 146 m51s19
-call 147 pith_cstring_eq bool 2 145 146
-call 148 pith_cstring_release void 1 146
-store __or_134_2165 147
-label L2168
-load 149 __or_134_2165
-store __or_133_2165 149
-brif 149 L2170 L2169
-label L2169
-load 150 payload_kind
-strref 151 m51s18
-call 152 pith_cstring_eq bool 2 150 151
-call 153 pith_cstring_release void 1 151
-store __or_133_2165 152
-label L2170
-load 154 __or_133_2165
-store __or_132_2165 154
-brif 154 L2172 L2171
-label L2171
-load 155 payload_kind
-strref 156 m51s748
-call 157 pith_cstring_eq bool 2 155 156
-call 158 pith_cstring_release void 1 156
-store __or_132_2165 157
-label L2172
-load 159 __or_132_2165
-store __or_131_2165 159
-brif 159 L2174 L2173
-label L2173
-load 160 payload_kind
-strref 161 m51s905
-call 162 pith_cstring_eq bool 2 160 161
-call 163 pith_cstring_release void 1 161
-store __or_131_2165 162
-label L2174
-load 164 __or_131_2165
-store __or_130_2165 164
-brif 164 L2176 L2175
-label L2175
-load 165 payload_kind
-strref 166 m51s749
-call 167 pith_cstring_eq bool 2 165 166
-call 168 pith_cstring_release void 1 166
-store __or_130_2165 167
-label L2176
-load 169 __or_130_2165
-brif 169 L2163 L2164
-label L2163
-load 170 val_idx
-call 171 ir_emitter_core_ir_expr_is_borrowed bool 1 170
-brif 171 L2178 L2179
-label L2178
-load 172 value_r
-load 173 payload_kind
-call 174 ir_ownership_ir_rc_retain_reg void 2 172 173
-jmp L2177
-label L2179
-label L2177
-load 175 value_r
-load 176 payload_kind
-call 177 ir_optionals_ir_emit_optional_owned_some int 2 175 176
-load 178 vn
-call 179 pith_struct_release void 1 178
-load 180 actual_info
-call 181 pith_struct_release void 1 180
-load 182 payload_kind
-call 183 pith_cstring_release void 1 182
-load 184 tuple_kind
-call 185 pith_cstring_release void 1 184
-load 186 empty_init_call
-call 187 pith_cstring_release void 1 186
-ret 177
-label L2164
-label L2162
-load 188 tuple_kind
-load 189 actual_tid
-call 190 ir_emitter_core_ir_optional_tuple_payload_kind string 1 189
-call 191 pith_cstring_release void 1 188
-store tuple_kind 190
-load 192 tuple_kind
-call 193 string_len int 1 192
-iconst 194 0
-gt 195 193 194
-brif 195 L2181 L2182
-label L2181
-load 196 val_idx
-call 197 ir_emitter_core_ir_expr_is_borrowed bool 1 196
-brif 197 L2184 L2185
+store empty_init_call 4
+load 5 vn
+load 6 val_idx
+call 7 ast_get_node struct:Node 1 6
+call 8 pith_struct_release void 1 5
+store vn 7
+load 9 target_type
+strref 10 m51s23
+call 11 pith_cstring_eq bool 2 9 10
+call 12 pith_cstring_release void 1 10
+brif 11 L2184 L2185
 label L2184
-load 198 value_r
-strref 199 m51s23
-call 200 ir_ownership_ir_rc_retain_reg void 2 198 199
-call 201 pith_cstring_release void 1 199
-jmp L2183
+load 13 val_idx
+load 14 vn
+load 15 target_inner
+call 16 ir_emitter_core_ir_emit_optional_for_target int 3 13 14 15
+load 17 vn
+call 18 pith_struct_release void 1 17
+load 19 empty_init_call
+call 20 pith_cstring_release void 1 19
+ret 16
 label L2185
 label L2183
-load 202 value_r
-load 203 tuple_kind
-call 204 ir_optionals_ir_emit_optional_owned_some int 2 202 203
-load 205 vn
-call 206 pith_struct_release void 1 205
-load 207 actual_info
-call 208 pith_struct_release void 1 207
-load 209 payload_kind
-call 210 pith_cstring_release void 1 209
-load 211 tuple_kind
-call 212 pith_cstring_release void 1 211
-load 213 empty_init_call
-call 214 pith_cstring_release void 1 213
-ret 204
-label L2182
-label L2180
-load 215 value_r
-call 216 ir_optionals_ir_emit_optional_some_value int 1 215
-load 217 vn
-call 218 pith_struct_release void 1 217
-load 219 actual_info
-call 220 pith_struct_release void 1 219
-load 221 payload_kind
-call 222 pith_cstring_release void 1 221
-load 223 tuple_kind
-call 224 pith_cstring_release void 1 223
-load 225 empty_init_call
-call 226 pith_cstring_release void 1 225
-ret 216
-label L2134
-label L2132
-iconst 227 0
-store __and_227_2189 227
-load 228 vn
-field 229 228 0 string kind
-strref 230 m51s20
-call 231 pith_cstring_eq bool 2 229 230
-call 232 pith_cstring_release void 1 230
-store __and_227_2189 231
-brif 231 L2189 L2190
+iconst 21 0
+store __and_21_2189 21
+load 22 vn
+field 23 22 0 string kind
+strref 24 m51s20
+call 25 pith_cstring_eq bool 2 23 24
+call 26 pith_cstring_release void 1 24
+store __and_21_2189 25
+brif 25 L2189 L2190
 label L2189
-load 233 vn
-field 234 233 16 list children
-call 235 pith_list_len int 1 234
-iconst 236 0
-eq 237 235 236
-store __and_227_2189 237
+load 27 vn
+field 28 27 16 list children
+call 29 pith_list_len int 1 28
+iconst 30 0
+eq 31 29 30
+store __and_21_2189 31
 label L2190
-load 238 __and_227_2189
-brif 238 L2187 L2188
+load 32 __and_21_2189
+brif 32 L2187 L2188
 label L2187
-load 239 val_idx
-call 240 ir_type_helpers_ir_checked_type string 1 239
-strref 241 m51s20
-call 242 pith_cstring_starts_with bool 2 240 241
-call 243 pith_cstring_release void 1 241
-call 244 pith_cstring_release void 1 240
-brif 242 L2192 L2193
+load 33 val_idx
+call 34 ir_type_helpers_ir_checked_type string 1 33
+strref 35 m51s20
+call 36 pith_cstring_starts_with bool 2 34 35
+call 37 pith_cstring_release void 1 35
+call 38 pith_cstring_release void 1 34
+brif 36 L2192 L2193
 label L2192
-load 245 val_idx
-call 246 ir_emitter_core_ir_expr int 1 245
-load 247 vn
-call 248 pith_struct_release void 1 247
-load 249 actual_info
-call 250 pith_struct_release void 1 249
-load 251 payload_kind
-call 252 pith_cstring_release void 1 251
-load 253 tuple_kind
-call 254 pith_cstring_release void 1 253
-load 255 empty_init_call
-call 256 pith_cstring_release void 1 255
-ret 246
+load 39 val_idx
+call 40 ir_emitter_core_ir_expr int 1 39
+load 41 vn
+call 42 pith_struct_release void 1 41
+load 43 empty_init_call
+call 44 pith_cstring_release void 1 43
+ret 40
 label L2193
 label L2191
 jmp L2186
 label L2188
 label L2186
-load 257 empty_init_call
-load 258 vn
-field 259 258 0 string kind
-load 260 vn
-field 261 260 16 list children
-call 262 pith_list_len int 1 261
-load 263 target_type
-call 264 ir_collection_helpers_ir_empty_collection_init_call_name string 3 259 262 263
-call 265 pith_cstring_release void 1 257
-store empty_init_call 264
-load 266 empty_init_call
-call 267 string_len int 1 266
-iconst 268 0
-gt 269 267 268
-brif 269 L2195 L2196
+load 45 empty_init_call
+load 46 vn
+field 47 46 0 string kind
+load 48 vn
+field 49 48 16 list children
+call 50 pith_list_len int 1 49
+load 51 target_type
+call 52 ir_collection_helpers_ir_empty_collection_init_call_name string 3 47 50 51
+call 53 pith_cstring_release void 1 45
+store empty_init_call 52
+load 54 empty_init_call
+call 55 string_len int 1 54
+iconst 56 0
+gt 57 55 56
+brif 57 L2195 L2196
 label L2195
-call 270 ir_builder_ir_reg int 0
-store r 270
-load 271 r
-load 272 empty_init_call
-load 273 target_type
-call 274 ir_collection_helpers_ir_normalize_collection_target string 1 273
-call 275 ir_call_emit_ir_emit_call0 void 3 271 272 274
-call 276 pith_cstring_release void 1 274
-load 277 r
-load 278 vn
-call 279 pith_struct_release void 1 278
-load 280 actual_info
-call 281 pith_struct_release void 1 280
-load 282 payload_kind
-call 283 pith_cstring_release void 1 282
-load 284 tuple_kind
-call 285 pith_cstring_release void 1 284
-load 286 empty_init_call
-call 287 pith_cstring_release void 1 286
-ret 277
+call 58 ir_builder_ir_reg int 0
+store r 58
+load 59 r
+load 60 empty_init_call
+load 61 target_type
+call 62 ir_collection_helpers_ir_normalize_collection_target string 1 61
+call 63 ir_call_emit_ir_emit_call0 void 3 59 60 62
+call 64 pith_cstring_release void 1 62
+load 65 r
+load 66 vn
+call 67 pith_struct_release void 1 66
+load 68 empty_init_call
+call 69 pith_cstring_release void 1 68
+ret 65
 label L2196
 label L2194
-load 288 val_idx
-call 289 ir_emitter_core_ir_expr int 1 288
-load 290 vn
-call 291 pith_struct_release void 1 290
-load 292 actual_info
-call 293 pith_struct_release void 1 292
-load 294 payload_kind
-call 295 pith_cstring_release void 1 294
-load 296 tuple_kind
-call 297 pith_cstring_release void 1 296
-load 298 empty_init_call
-call 299 pith_cstring_release void 1 298
-ret 289
-load 300 vn
-call 301 pith_struct_release void 1 300
-load 302 actual_info
-call 303 pith_struct_release void 1 302
-load 304 payload_kind
-call 305 pith_cstring_release void 1 304
-load 306 tuple_kind
-call 307 pith_cstring_release void 1 306
-load 308 empty_init_call
-call 309 pith_cstring_release void 1 308
-iconst 310 0
-ret 310
+load 70 val_idx
+call 71 ir_emitter_core_ir_expr int 1 70
+load 72 vn
+call 73 pith_struct_release void 1 72
+load 74 empty_init_call
+call 75 pith_cstring_release void 1 74
+ret 71
+load 76 vn
+call 77 pith_struct_release void 1 76
+load 78 empty_init_call
+call 79 pith_cstring_release void 1 78
+iconst 80 0
+ret 80
 endfunc
 func ir_emitter_core_ir_checked_target_type 2 string
 param target_idx

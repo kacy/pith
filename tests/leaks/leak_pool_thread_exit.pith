@@ -1,0 +1,50 @@
+# the per-thread allocation pools must hand their blocks back when a thread
+# exits. under the green default the workers never exit, so this case runs on
+# the os-thread backend, where every spawned task is a thread of its own: that
+# is the only configuration in which the leak is reachable, and it is why both
+# pools carried it unnoticed.
+#
+# each task holds well past the 512-block cap live before dropping them, so the
+# pool is full when the thread exits. a task that releases as it goes never
+# fills it, and the case would measure flat while the leak was still there.
+#
+# both pools are exercised: structs and closure shells have separate pools and
+# each had the same defect. the round count is divided down because a thread
+# per round at the gate's usual counts is not a workload anyone wants.
+import leakprobe as probe
+
+struct Row:
+    pub a: Int
+    pub b: Int
+
+fn worker(seed: Int) -> Int:
+    mut rows: List[Row] := []
+    mut i := 0
+    while i < 700:
+        rows.push(Row(a: seed, b: i))
+        i = i + 1
+    mut fns: List[fn(Int) -> Int] := []
+    mut j := 0
+    while j < 700:
+        fns.push(fn(x: Int) => x + seed)
+        j = j + 1
+    mut acc := 0
+    for r in rows:
+        acc = acc + r.b
+    for f in fns:
+        acc = acc + f(1)
+    rows = []
+    fns = []
+    return acc
+
+fn main():
+    tasks := probe.rounds() / 2000
+    mut i := 0
+    mut acc := 0
+    while i < tasks:
+        t := spawn worker(i)
+        acc = acc + await t
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

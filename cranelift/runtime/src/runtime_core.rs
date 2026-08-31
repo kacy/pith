@@ -2125,10 +2125,35 @@ fn struct_pool_enabled() -> bool {
     }
 }
 
+/// The blocks one thread holds for reuse, bucketed by size. Wrapped in a type
+/// with a `Drop` so they go back to the allocator when the thread exits: a bare
+/// vector of raw pointers frees its own buffers and strands everything they
+/// point at. On the os-thread backend every spawned task is its own thread, so
+/// a task-per-request server lost up to the cap for every bucket, every
+/// request, permanently. The bucket index is the block size over eight, which
+/// is what lets the drop rebuild each layout.
+struct StructPool(Vec<Vec<*mut u8>>);
+
+impl Drop for StructPool {
+    fn drop(&mut self) {
+        for (bucket, stack) in self.0.iter_mut().enumerate() {
+            let total = bucket * 8;
+            if total == 0 {
+                continue;
+            }
+            for ptr in stack.drain(..) {
+                unsafe {
+                    std::alloc::dealloc(ptr, pith_layout(total, 8));
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
     // indexed by total_size / 8; each entry is a stack of reusable blocks.
-    static STRUCT_POOL: std::cell::RefCell<Vec<Vec<*mut u8>>> =
-        std::cell::RefCell::new(Vec::new());
+    static STRUCT_POOL: std::cell::RefCell<StructPool> =
+        std::cell::RefCell::new(StructPool(Vec::new()));
 }
 
 #[inline]
@@ -2148,11 +2173,18 @@ unsafe fn struct_pool_take(total: usize) -> *mut u8 {
     let Some(bucket) = struct_pool_bucket(total) else {
         return std::ptr::null_mut();
     };
-    let block = STRUCT_POOL.with(|pool| {
-        pool.borrow_mut()
-            .get_mut(bucket)
-            .and_then(|stack| stack.pop())
-    });
+    // `try_with` rather than `with`: a struct freed late in thread teardown,
+    // after this thread local has been destroyed, would otherwise panic inside
+    // an extern "C" function that cannot unwind, which aborts the process.
+    // Falling back to the allocator is always correct.
+    let block = STRUCT_POOL
+        .try_with(|pool| {
+            pool.borrow_mut()
+                .0
+                .get_mut(bucket)
+                .and_then(|stack| stack.pop())
+        })
+        .unwrap_or(None);
     match block {
         Some(ptr) => {
             std::ptr::write_bytes(ptr, 0, total);
@@ -2171,18 +2203,20 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
     let Some(bucket) = struct_pool_bucket(total) else {
         return false;
     };
-    STRUCT_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() <= bucket {
-            pool.resize(bucket + 1, Vec::new());
-        }
-        let stack = &mut pool[bucket];
-        if stack.len() >= STRUCT_POOL_CAP {
-            return false;
-        }
-        stack.push(base);
-        true
-    })
+    STRUCT_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.0.len() <= bucket {
+                pool.0.resize(bucket + 1, Vec::new());
+            }
+            let stack = &mut pool.0[bucket];
+            if stack.len() >= STRUCT_POOL_CAP {
+                return false;
+            }
+            stack.push(base);
+            true
+        })
+        .unwrap_or(false)
 }
 
 #[no_mangle]

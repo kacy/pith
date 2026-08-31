@@ -8781,14 +8781,19 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 # transfer) releases what the binding holds. the
                 # release-of-previous mirrors ir_bind_owned_rc_payload — zero
                 # on first reach, a stale payload when a loop rebinds the
-                # name — and an untracked name skips it, keeping the retain
-                # as a bounded leak in the safe direction.
+                # name — and a name this frame does not track skips it,
+                # keeping the retain as a bounded leak in the safe direction.
+                # the tracked test is the positive one ir_emit_bind_stmt asks,
+                # not the untracked list: that list is the ENCLOSING
+                # function's, and a lambda body — which is its own frame and
+                # tracks nothing — read it and emitted a load of a name the
+                # lambda has no slot for.
                 # a tuple payload (an inner optional shell) is skipped on
                 # the same terms the prepass poisons it: its count belongs to
                 # its owner and the binding is an uncounted view.
                 rc_kind := ir_rc_kind(inner_kind)
                 if rc_kind.len() > 0 and rc_kind != "tuple":
-                    if not ir_untracked_rc_binds.contains(pat.value):
+                    if ir_rc_local_kind(pat.value).len() > 0:
                         old_r := ir_reg()
                         ir_emit("load " + old_r.to_string() + " " + pat.value)
                         ir_rc_release_reg(old_r, rc_kind)

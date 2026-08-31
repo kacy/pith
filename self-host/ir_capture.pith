@@ -54,6 +54,33 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
             if cn.kind == "body" or cn.kind == "block":
                 updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names, locals)
         return updated_free
+    # an `if let` / `while let` payload is bound by the construct itself, for
+    # its body only — the same relationship a lambda's parameters have to the
+    # lambda body above. the subject is walked under the OUTER set, since the
+    # payload name means nothing yet while it is evaluated, and so is an
+    # `if let`'s else block, where the payload is not in scope at all.
+    if node.kind == "if_let" or node.kind == "while_let":
+        if node.children.len() < 3:
+            return ir_walk_children(idx, bound, free, blocked_names, locals)
+        body_bound := ir_copy_names(bound)
+        ir_collect_pattern_names(node.children[0], body_bound)
+        mut let_free := ir_find_free_vars_walk(node.children[1], bound, free, blocked_names, locals)
+        let_free = ir_find_free_vars_walk(node.children[2], body_bound, let_free, blocked_names, locals)
+        if node.children.len() > 3:
+            let_free = ir_find_free_vars_walk(node.children[3], bound, let_free, blocked_names, locals)
+        return let_free
+    # a `for` loop binds its variable (and its optional index) for the body on
+    # the same terms. the loop variable lives in the loop's own slot rather
+    # than a frame local, so capturing it emitted a load of a name neither
+    # frame has.
+    if node.kind == "for_stmt" and node.children.len() >= 2:
+        loop_bound := ir_copy_names(bound)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "loop_var" or cn.kind == "loop_index":
+                loop_bound.push(cn.value)
+        mut for_free := ir_find_free_vars_walk(node.children[0], bound, free, blocked_names, locals)
+        return ir_find_free_vars_walk(node.children[1], loop_bound, for_free, blocked_names, locals)
     if node.kind == "body" or node.kind == "block":
         mut scoped_bound := ir_copy_names(bound)
         mut updated_free := ir_copy_names(free)
@@ -65,10 +92,25 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
                 if bind_name.len() > 0 and not ir_list_contains(scoped_bound, bind_name):
                     scoped_bound.push(bind_name)
         return updated_free
+    return ir_walk_children(idx, bound, free, blocked_names, locals)
+
+fn ir_walk_children(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
     mut updated_free := ir_copy_names(free)
-    for child in node.children:
+    for child in get_node(idx).children:
         updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names, locals)
     return updated_free
+
+# every name a pattern binds, appended to `names`: the bare `pat_binding`
+# an `if let` unwraps an optional with, and the ones nested inside a tuple
+# or variant pattern. the literal and wildcard patterns bind nothing.
+fn ir_collect_pattern_names(idx: Int, names: List[String]):
+    node := get_node(idx)
+    if node.kind == "pat_binding":
+        if not ir_list_contains(names, node.value):
+            names.push(node.value)
+        return
+    for child in node.children:
+        ir_collect_pattern_names(child, names)
 
 # the names a lambda body has to capture from the scope around it: every
 # identifier under `idx` that nothing inside it declares. the emitter
@@ -84,12 +126,14 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
 # an unknown name that is not blocked and is not a known function is
 # captured on the assumption that it is a local.
 #
-# only `bind` statements and lambda parameters add to the bound set as
-# the walk descends, and a bind counts only after its own initializer is
-# walked (`x := x` captures the outer x). names introduced any other way
-# are NOT bound: a `for` loop variable and an `if let` payload are seen
-# as free and captured, which emits a load of a name the enclosing frame
-# does not have and the ir consumer rejects with "unknown load source".
+# the bound set grows as the walk descends, for each name the construct
+# that introduces it puts in scope: a `bind` statement for the rest of its
+# block (and only after its own initializer is walked, so `x := x` captures
+# the outer x), a lambda's parameters for the lambda body, an `if let` or
+# `while let` payload for that body alone, and a `for` loop's variable and
+# index for the loop body. a name introduced by one of the last three used
+# to read as free and be captured, which emitted a load of a name neither
+# frame has and the ir consumer rejected with "unknown load source".
 # `self` is captured under that name like an ordinary variable.
 pub fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
     return ir_find_free_vars_walk(idx, bound, [], blocked_names, locals)

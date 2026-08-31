@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_active_param_optional_tids, ir_active_local_optional_tids, ir_emission_tid, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -2057,6 +2057,10 @@ fn ir_emit_rc_prologue(body_idx: Int):
     # before anything resolves a name: everything this body binds is this
     # function's own storage, whatever a module global is spelled.
     ir_begin_func_local_names(body_idx)
+    # and before the prepass reads any subject's tid: inside a generic body it
+    # asks ir_emission_tid what an `if let` subject is, and a local's answer
+    # lives only in this map.
+    ir_begin_func_local_optional_tids(body_idx)
     mut poisoned: List[String] := []
     if body_idx >= 0:
         ir_collect_reassigned_string_params(body_idx, ir_rc_locals)
@@ -6863,6 +6867,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_tuple_tids := ir_tuple_local_tid
     saved_tuple_cascade := ir_tuple_cascade_names
     saved_func_local_names := ir_func_local_names
+    saved_local_optional_tids := ir_active_local_optional_tids
     # the lambda body is its own function frame; open loops in the enclosing
     # function must not have their iterables released by a return inside it.
     saved_loop_iter_vars := ir_loop_iter_vars
@@ -6886,6 +6891,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # name it binds resolves to the lambda's own storage rather than a module
     # global spelled the same.
     ir_begin_func_local_names(parts.body_idx)
+    ir_begin_func_local_optional_tids(parts.body_idx)
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
     ir_emit_lambda_params(parts.params)
@@ -6909,6 +6915,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_tuple_local_tid = saved_tuple_tids
     ir_tuple_cascade_names = saved_tuple_cascade
     ir_func_local_names = saved_func_local_names
+    ir_active_local_optional_tids = saved_local_optional_tids
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
     ir_loop_var_slots = saved_loop_var_slots
@@ -8774,14 +8781,19 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 # transfer) releases what the binding holds. the
                 # release-of-previous mirrors ir_bind_owned_rc_payload — zero
                 # on first reach, a stale payload when a loop rebinds the
-                # name — and an untracked name skips it, keeping the retain
-                # as a bounded leak in the safe direction.
+                # name — and a name this frame does not track skips it,
+                # keeping the retain as a bounded leak in the safe direction.
+                # the tracked test is the positive one ir_emit_bind_stmt asks,
+                # not the untracked list: that list is the ENCLOSING
+                # function's, and a lambda body — which is its own frame and
+                # tracks nothing — read it and emitted a load of a name the
+                # lambda has no slot for.
                 # a tuple payload (an inner optional shell) is skipped on
                 # the same terms the prepass poisons it: its count belongs to
                 # its owner and the binding is an uncounted view.
                 rc_kind := ir_rc_kind(inner_kind)
                 if rc_kind.len() > 0 and rc_kind != "tuple":
-                    if not ir_untracked_rc_binds.contains(pat.value):
+                    if ir_rc_local_kind(pat.value).len() > 0:
                         old_r := ir_reg()
                         ir_emit("load " + old_r.to_string() + " " + pat.value)
                         ir_rc_release_reg(old_r, rc_kind)
@@ -9947,6 +9959,9 @@ fn ir_emit_generic_specialization(key: String):
     # its name scope is opened here — otherwise every local in it would
     # resolve as a module global spelled the same.
     ir_begin_func_local_names(body_idx)
+    # the substitution is in place by now, so each `x: T? := ...` in the body
+    # resolves to the concrete Optional tid the checker never recorded.
+    ir_begin_func_local_optional_tids(body_idx)
     ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
     if owner_type.len() > 0:
@@ -10144,6 +10159,45 @@ fn ir_collect_param_optional_tids(fn_idx: Int, spec_key: String) -> Map[String, 
                 result.insert(cn.value, tid)
             param_idx = param_idx + 1
     return result
+
+# the locals' half of ir_collect_param_optional_tids: every name `body_idx`
+# declares, mapped to the concrete Optional tid its annotation denotes, or to
+# -1 when the declaration is anything else. a generic body is emitted from an
+# AST the checker never typed, so c_get_expr_type answers nothing for a local
+# in it and the declaration is the only place the shape survives. without this
+# the value-field extract behind `if let` was handed a non-optional tid and
+# handed back register zero — an empty string, a 0 where 4 was written, and a
+# fault on a tuple payload, none of them reported.
+#
+# every binding records something, so a name declared once as an optional and
+# again as anything else lands on -1 and is ignored, which is the checked tid's
+# answer and the direction the rest of the prepass takes on a conflicting name.
+fn ir_collect_local_optional_tids(idx: Int, out: Map[String, Int]):
+    node := get_node(idx)
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if parts.name.len() > 0:
+            mut tid := 0 - 1
+            if parts.type_idx >= 0:
+                tn := get_node(parts.type_idx)
+                if tn.kind == "optional_type" and tn.children.len() > 0:
+                    inner := ir_declared_type_node_tid(tn.children[0])
+                    if inner >= 0:
+                        tid = add_type_info(ti_optional(inner))
+            if out.contains_key(parts.name) and out[parts.name] != tid:
+                out.insert(parts.name, 0 - 1)
+            else:
+                out.insert(parts.name, tid)
+    for child in node.children:
+        ir_collect_local_optional_tids(child, out)
+
+# open a function frame's local-optional scope. outside a generic body the map
+# stays empty: there the checker typed every one of these expressions already,
+# and ir_emission_tid answers from that as it always has.
+fn ir_begin_func_local_optional_tids(body_idx: Int):
+    ir_active_local_optional_tids = {}
+    if body_idx >= 0 and ir_in_generic_body():
+        ir_collect_local_optional_tids(body_idx, ir_active_local_optional_tids)
 
 fn ir_emit_generic_specializations():
     mut i := 0

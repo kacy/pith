@@ -1,0 +1,76 @@
+# an `if let` inside a lambda body did not compile at all: the capture walk
+# read the payload name as free, so the lambda loaded it from an environment
+# slot the enclosing frame has no local for. the payload is bound by the
+# `if let` itself now and stays inside the lambda's own frame.
+#
+# what this measures is the shell, not the payload. every subject is a call,
+# which mints a shell the consumer owns and releases at the merge, and every
+# payload is a by-value kind, which strands nothing — so anything this grows
+# by is the two-slot shell itself, the half of the ownership a heap-payload
+# arm would hide.
+#
+# the arms that cannot be here, and why: a heap payload strands its count,
+# because a lambda body runs no rc prologue at all and so tracks and releases
+# no locals; a bound-local subject strands its shell for the same reason; and
+# a `return` out of the then-block jumps past the merge where the owned shell
+# is released. tests/pending/if_let_frame_ownership.pith measures those three
+# and the generic-body twin of the middle one.
+import leakprobe as probe
+
+fn count_of(i: Int) -> Int?:
+    if i % 7 == 6:
+        return none
+    return i
+
+fn flag_of(i: Int) -> Bool?:
+    if i % 3 == 2:
+        return none
+    return i % 2 == 0
+
+fn main():
+    n := probe.rounds()
+
+    # the taken path and the none path both reach the merge, so the shell is
+    # released exactly once on either
+    taken := fn(i: Int) -> Int:
+        mut m := 0
+        if let v = count_of(i):
+            m = v - i
+        return m
+
+    # the else arm releases its own shell on the path that skipped the body
+    with_else := fn(i: Int) -> Int:
+        mut m := 0
+        if let v = count_of(i):
+            m = v - i
+        else:
+            m = 1
+        return m
+
+    # two shells live at once; the inner one is released before the outer
+    nested := fn(i: Int) -> Int:
+        mut m := 0
+        if let a = count_of(i):
+            if let b = flag_of(i):
+                if b:
+                    m = a - i
+        return m
+
+    # a payload name that shadows a live local of the enclosing frame binds
+    # the lambda's own storage and must not touch the outer name's count
+    outer := 41
+    shadow := fn(i: Int) -> Int:
+        mut m := 0
+        if let outer = count_of(i):
+            m = outer - i
+        return m
+
+    mut i := 0
+    mut total := 0
+    while i < n:
+        total = total + taken(i) + with_else(i) + nested(i) + shadow(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    if total < 0 or outer < 0:
+        print("unreachable")
+    print("{kb}")

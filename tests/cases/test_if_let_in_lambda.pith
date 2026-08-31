@@ -1,0 +1,108 @@
+# an `if let` inside a lambda body did not compile: the capture walk treated
+# the payload name as a free variable, so the closure loaded it out of an
+# environment slot the enclosing frame has no local for and the ir consumer
+# rejected it with "unknown load source". a `for` loop variable inside a
+# lambda failed the same way, and for the same reason — the walk bound only
+# `bind` statements and the lambda's own parameters.
+#
+# every lambda arm here prints beside the same body written as a named
+# function. the pair is the test: a payload pulled from the wrong storage
+# cannot answer the same as the named twin.
+
+fn maybe_int(i: Int) -> Int?:
+    if i % 3 == 0:
+        return none
+    return i + 1
+
+fn maybe_str(i: Int) -> String?:
+    if i % 3 == 0:
+        return none
+    return "s" + i.to_string()
+
+fn maybe_pair(i: Int) -> (Int, String)?:
+    if i % 3 == 0:
+        return none
+    return (i, "p" + i.to_string())
+
+fn named_int(i: Int) -> Int:
+    if let v = maybe_int(i):
+        return v
+    return 0
+
+fn named_str(i: Int) -> String:
+    if let v = maybe_str(i):
+        return "some:" + v
+    return "none"
+
+fn named_pair(i: Int) -> String:
+    if let v = maybe_pair(i):
+        return "some:" + v.1
+    return "none"
+
+fn named_sum(limit: Int) -> Int:
+    mut total := 0
+    for x in 0..limit:
+        total = total + x
+    return total
+
+fn named_drain(start: Int) -> String:
+    mut k: Int? := start
+    mut acc := ""
+    while let v = k:
+        acc = acc + v.to_string()
+        if v <= 1:
+            k = none
+        else:
+            k = v - 1
+    return acc
+
+fn main():
+    lam_int := fn(i: Int) -> Int:
+        if let v = maybe_int(i):
+            return v
+        return 0
+
+    lam_str := fn(i: Int) -> String:
+        if let v = maybe_str(i):
+            return "some:" + v
+        return "none"
+
+    lam_pair := fn(i: Int) -> String:
+        if let v = maybe_pair(i):
+            return "some:" + v.1
+        return "none"
+
+    lam_sum := fn(limit: Int) -> Int:
+        mut total := 0
+        for x in 0..limit:
+            total = total + x
+        return total
+
+    lam_drain := fn(start: Int) -> String:
+        mut k: Int? := start
+        mut acc := ""
+        while let v = k:
+            acc = acc + v.to_string()
+            if v <= 1:
+                k = none
+            else:
+                k = v - 1
+        return acc
+
+    # the payload name shadows a live local of the enclosing frame: the
+    # lambda binds its own storage and leaves the outer name alone
+    v := "outer"
+    lam_shadow := fn(i: Int) -> String:
+        if let v = maybe_str(i):
+            return "inner:" + v
+        return "inner:none"
+
+    mut i := 0
+    while i < 4:
+        print("int   " + named_int(i).to_string() + " " + lam_int(i).to_string())
+        print("str   " + named_str(i) + " " + lam_str(i))
+        print("pair  " + named_pair(i) + " " + lam_pair(i))
+        print("shad  " + lam_shadow(i) + " " + v)
+        i = i + 1
+    print("sum   " + named_sum(5).to_string() + " " + lam_sum(5).to_string())
+    print("drain " + named_drain(3) + " " + lam_drain(3))

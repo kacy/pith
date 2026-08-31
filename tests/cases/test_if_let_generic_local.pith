@@ -1,0 +1,120 @@
+# `if let` over an optional LOCAL of a generic body used to bind register
+# zero. the checker types nothing inside a generic declaration and the
+# emitter's optional-tid fixup covered only parameters, so the value-field
+# extract was handed a tid that is not an Optional and answered zero: a
+# String? printed an empty payload, an Int? printed 0 where 4 was written,
+# and a tuple payload faulted on the first field read.
+#
+# every generic arm here prints beside the same body with the type parameter
+# removed. the pair is the test: a wrong bind cannot answer the same as the
+# concrete twin, and neither a valgrind run nor the leak gate would have seen
+# the difference.
+
+struct Box:
+    pub n: Int
+    pub tag: String
+
+fn g_string[T](t: T) -> String:
+    s: String? := "s3"
+    if let v = s:
+        return "some:" + v
+    return "none"
+
+fn c_string() -> String:
+    s: String? := "s3"
+    if let v = s:
+        return "some:" + v
+    return "none"
+
+fn g_int[T](t: T) -> Int:
+    n: Int? := 4
+    if let v = n:
+        return v
+    return 0 - 1
+
+fn c_int() -> Int:
+    n: Int? := 4
+    if let v = n:
+        return v
+    return 0 - 1
+
+fn g_tuple[T](t: T) -> String:
+    p: (Int, String)? := (7, "seven")
+    if let v = p:
+        return "some:" + v.1
+    return "none"
+
+fn c_tuple() -> String:
+    p: (Int, String)? := (7, "seven")
+    if let v = p:
+        return "some:" + v.1
+    return "none"
+
+fn g_list[T](t: T) -> String:
+    xs: List[String]? := ["a", "b", "c"]
+    if let v = xs:
+        return "some:" + v.len().to_string() + ":" + v[2]
+    return "none"
+
+fn c_list() -> String:
+    xs: List[String]? := ["a", "b", "c"]
+    if let v = xs:
+        return "some:" + v.len().to_string() + ":" + v[2]
+    return "none"
+
+fn g_struct[T](t: T) -> String:
+    b: Box? := Box(n: 9, tag: "boxed")
+    if let v = b:
+        return "some:" + v.tag
+    return "none"
+
+fn c_struct() -> String:
+    b: Box? := Box(n: 9, tag: "boxed")
+    if let v = b:
+        return "some:" + v.tag
+    return "none"
+
+# the none path must take the else arm rather than bind zero and read it
+fn g_none[T](t: T) -> String:
+    s: String? := none
+    if let v = s:
+        return "some:" + v
+    return "none"
+
+fn c_none() -> String:
+    s: String? := none
+    if let v = s:
+        return "some:" + v
+    return "none"
+
+# `while let` drains through the same binding path
+fn g_while[T](t: T) -> String:
+    mut n: Int? := 3
+    mut acc := ""
+    while let v = n:
+        acc = acc + v.to_string()
+        if v <= 1:
+            n = none
+        else:
+            n = v - 1
+    return acc
+
+fn c_while() -> String:
+    mut n: Int? := 3
+    mut acc := ""
+    while let v = n:
+        acc = acc + v.to_string()
+        if v <= 1:
+            n = none
+        else:
+            n = v - 1
+    return acc
+
+fn main():
+    print("string  " + c_string() + " " + g_string(1))
+    print("int     " + c_int().to_string() + " " + g_int(1).to_string())
+    print("tuple   " + c_tuple() + " " + g_tuple(1))
+    print("list    " + c_list() + " " + g_list(1))
+    print("struct  " + c_struct() + " " + g_struct(1))
+    print("none    " + c_none() + " " + g_none(1))
+    print("while   " + c_while() + " " + g_while(1))

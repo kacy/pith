@@ -383,14 +383,31 @@ struct HazardSlot {
     /// replace; nonzero pins it. owner-thread-only (a plain cell): scanners
     /// read `hazard`, never this.
     depth: Cell<usize>,
+    /// whether a live thread owns this slot. a slot is never freed, only
+    /// released back for the next thread to adopt, which is what makes the
+    /// fast path's cached pointer safe: see `SlotHandle`.
+    owned: AtomicBool,
 }
 
 /// scanners only ever read the atomic `hazard`; `depth` is owner-only.
 unsafe impl Sync for HazardSlot {}
 
-/// every live thread's hazard slot, for `flush_limbo` to scan. registration is
-/// once per thread lifetime (first channel op), removal at thread exit, and the
-/// scan holds the same lock — so a slot cannot be freed mid-scan.
+/// every hazard slot ever created, for `flush_limbo` to scan. a slot is added
+/// on a thread's first channel operation and **never removed or freed** — an
+/// exited thread's slot is released for the next thread to adopt instead.
+///
+/// that is a safety property, not a tuning one. the fast path caches the slot
+/// pointer in a `Cell`, which has no drop glue and so is never cleared at
+/// thread exit; freeing the slot would leave that cache dangling, and any
+/// later operation on the thread would read and write freed memory and publish
+/// a hazard no scan could see. never freeing makes the cached pointer valid for
+/// the life of the process.
+///
+/// it also bounds the registry at the peak number of concurrently live threads
+/// rather than the total ever created, which matters on the os-thread backend
+/// where every task is a thread, and it removes an O(n) scan under a global
+/// lock from every thread exit. `cycle.rs` reuses its mutator slots the same
+/// way for the same reasons.
 struct SlotRegistry {
     slots: Vec<*const HazardSlot>,
 }
@@ -410,15 +427,21 @@ static LIMBO: Mutex<Limbo> = Mutex::new(Limbo { entries: Vec::new() });
 /// always zero, so the common exit is one load of a rarely-written line.
 static LIMBO_PENDING: AtomicUsize = AtomicUsize::new(0);
 
-/// unregisters this thread's hazard slot when the thread exits.
+/// releases this thread's hazard slot when the thread exits, leaving it in the
+/// registry for the next thread to adopt. it is deliberately not freed: see
+/// `SlotRegistry`.
 struct SlotHandle(*const HazardSlot);
 
 impl Drop for SlotHandle {
     fn drop(&mut self) {
-        let mut registry = lock_registry();
-        registry.slots.retain(|&s| s != self.0);
-        drop(registry);
-        unsafe { drop(Box::from_raw(self.0 as *mut HazardSlot)) };
+        unsafe {
+            // the thread is done, so nothing it published can still be live.
+            // clearing before releasing keeps a scan from reading a leftover
+            // as a live claim and holding a body in limbo forever.
+            (*self.0).depth.set(0);
+            (*self.0).hazard.store(std::ptr::null_mut(), Ordering::SeqCst);
+            (*self.0).owned.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -431,25 +454,55 @@ thread_local! {
     // the owning handle: created once per thread, unregisters at thread exit.
     // touched only on the first op (registration) — every later access goes
     // through the cache above.
-    static HAZARD_SLOT: SlotHandle = {
-        let slot = Box::into_raw(Box::new(HazardSlot {
-            hazard: AtomicPtr::new(std::ptr::null_mut()),
-            depth: Cell::new(0),
-        }));
-        lock_registry().slots.push(slot);
-        SlotHandle(slot)
-    };
+    static HAZARD_SLOT: SlotHandle = SlotHandle(adopt_slot());
+}
+
+/// take over a slot an exited thread released, or add one if every slot is
+/// owned. the claim runs under the registry lock, and a released slot was
+/// already cleared by the releasing thread, so an adopted slot starts exactly
+/// as a fresh one does.
+fn adopt_slot() -> *const HazardSlot {
+    let mut registry = lock_registry();
+    for &slot in registry.slots.iter() {
+        let owned = unsafe { &(*slot).owned };
+        if owned
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return slot;
+        }
+    }
+    let slot: *const HazardSlot = Box::into_raw(Box::new(HazardSlot {
+        hazard: AtomicPtr::new(std::ptr::null_mut()),
+        depth: Cell::new(0),
+        owned: AtomicBool::new(true),
+    }));
+    registry.slots.push(slot);
+    slot
 }
 
 /// this thread's hazard slot: one tls load on every call after the first.
 #[inline]
 fn hazard_slot() -> *const HazardSlot {
+    // the cache stays valid for the life of the process because a slot is
+    // released rather than freed, so a thread that operates on a channel after
+    // its own teardown reads a slot that is still there. it may by then be
+    // owned by another thread, which is a lost hazard rather than a write to
+    // freed memory; nothing in the runtime does that today, and the
+    // `try_with` below keeps the registration path from panicking in a
+    // function that cannot unwind if anything ever does.
     let cached = HAZARD_SLOT_FAST.with(|c| c.get());
     if !cached.is_null() {
         return cached;
     }
-    let slot = HAZARD_SLOT.with(|h| h.0);
-    HAZARD_SLOT_FAST.with(|c| c.set(slot));
+    let slot = match HAZARD_SLOT.try_with(|h| h.0) {
+        Ok(slot) => slot,
+        // the owning handle is gone, so nothing will release what we take:
+        // adopt a slot directly and leave it owned. it stays scannable, which
+        // is what correctness needs, at the cost of one slot.
+        Err(_) => adopt_slot(),
+    };
+    let _ = HAZARD_SLOT_FAST.try_with(|c| c.set(slot));
     slot
 }
 

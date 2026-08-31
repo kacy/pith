@@ -2378,13 +2378,21 @@ fn check_assignment(node: Node, scope_id: Int):
                     return
     if is_error_type(target_type):
         return
-    if value_matches_optional_target(value_idx, val_type, target_type):
-        return
-    if collection_literal_matches_target(value_idx, target_type, scope_id):
-        return
+    op := node.value
+    # these two accept a value the target can be built from, which is a plain
+    # assignment's question. a compound assignment asks a different one: it
+    # reads the target, applies an operator and writes it back, so an optional
+    # target has to be unwrapped first. taking these early returns for `+=` and
+    # friends skipped the numeric check below entirely, and the operator was
+    # then emitted against the optional's shell address — `x += 3` on an
+    # `Int?` holding 5 answered 0, with no diagnostic anywhere.
+    if op == "=":
+        if value_matches_optional_target(value_idx, val_type, target_type):
+            return
+        if collection_literal_matches_target(value_idx, target_type, scope_id):
+            return
     if is_error_type(val_type):
         return
-    op := node.value
     if op == "=":
         if target_type != val_type:
             if types_structurally_equal(target_type, val_type) == false:

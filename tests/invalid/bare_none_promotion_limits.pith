@@ -1,0 +1,17 @@
+# a bare-none binding takes its type from the first assignment, but only from a
+# value that has an optional to be. a void call and a result do not, and
+# wrapping them recorded a type nobody built.
+fn nothing():
+    print("side effect")
+
+fn may(fail_it: Bool) -> Int!:
+    if fail_it:
+        fail "boom"
+    return 4
+
+fn main() -> Int:
+    mut v := none
+    v = nothing()
+    mut r := none
+    r = may(true)
+    return 0

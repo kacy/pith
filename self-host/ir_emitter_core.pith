@@ -144,11 +144,11 @@ mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
-# element signatures for optionals whose payload is a genuine tuple. one
-# destructor is emitted per distinct signature, the way a struct gets one per
-# declaration: a tuple's elements are heterogeneous, so a single shared walk
-# cannot know what to release.
-mut ir_optional_tuple_sigs: List[String] := []
+# set when some optional in this module wraps a genuine tuple, which needs the
+# shell to release its payload. one walk serves every such shell: the payload
+# already carries its own destructor for its elements, so the shell's job is
+# only to release the payload itself.
+mut ir_optional_tuple_dtor_needed := false
 
 # `threadlocal` module globals: name -> a process-unique slot id, and name ->
 # the global's ir retkind (for the init thunk header + access typing). Reads and
@@ -387,7 +387,7 @@ fn ir_reset_type_state():
     ir_reset_dtor_memo()
     ir_tracer_memo = {}
     ir_tuple_dtor_sigs = []
-    ir_optional_tuple_sigs = []
+    ir_optional_tuple_dtor_needed = false
     ir_tuple_cascade_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
@@ -1690,36 +1690,24 @@ fn ir_tuple_cascade_signature(tid: Int) -> String:
 
 # module-suffixed so each module carries its own copy, exactly like the tuple
 # and struct destructors — no cross-module references, no name clashes.
-# the element signature of a tuple type, one letter per element, or "" when the
-# type is not a tuple or carries nothing that needs releasing. a signature of
-# all-zero letters means every element is by-value, and such a payload needs no
-# destructor at all.
-fn ir_optional_tuple_signature(tid: Int) -> String:
+# the payload kind an optional over a genuine tuple attaches, or "" when the
+# inner type is not one. a `T??` inner reports kind "optional" rather than
+# "tuple" and is excluded here, which is what keeps the borrowing wrap it
+# needs: an inner shell has an owner of its own.
+#
+# every tuple payload takes the same walk, whatever its elements. an earlier
+# version keyed one destructor per element signature and released each element
+# from the shell, which released them twice: the payload carries its own
+# destructor for its elements already, so the shell releasing the payload runs
+# that walk. it also skipped a payload whose elements are all by-value, which
+# still leaves a heap allocation for the shell to release.
+fn ir_optional_tuple_payload_kind(tid: Int) -> String:
     if tid < 0:
         return ""
-    info := get_type_info(tid)
-    if info.kind != "tuple":
+    if get_type_info(tid).kind != "tuple":
         return ""
-    mut sig := ""
-    mut any_rc := false
-    for elem_tid in info.elements:
-        code := ir_tuple_elem_code(ir_rc_kind(ir_type_from_tid(elem_tid)))
-        if code != "0":
-            any_rc = true
-        sig = sig + code
-    if any_rc == false:
-        return ""
-    return sig
-
-# register a signature and hand back the payload kind the wrap should attach,
-# which names the destructor emitted for it.
-fn ir_optional_tuple_payload_kind(tid: Int) -> String:
-    sig := ir_optional_tuple_signature(tid)
-    if sig.len() == 0:
-        return ""
-    if ir_list_contains(ir_optional_tuple_sigs, sig) == false:
-        ir_optional_tuple_sigs.push(sig)
-    return "tuple_" + sig
+    ir_optional_tuple_dtor_needed = true
+    return "tuple"
 
 fn ir_tuple_cascade_helper_name(sig: String) -> String:
     return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
@@ -8361,6 +8349,12 @@ fn ir_emit_bind_stmt(node: Node):
     if type_idx < 0 and val_idx >= 0:
         if get_node(val_idx).kind == "none_lit":
             target_type = "tuple"
+            # the name's type has to be recorded as well, not just used here.
+            # a closure capture reads it to decide whether the slot holds a
+            # counted value: without it the shell went into the environment
+            # untagged and uncounted, and once the binding became tracked the
+            # reassignment released the count the closure was relying on.
+            ir_var_types.insert(name, target_type)
     if type_idx >= 0:
         target_type = ir_resolve_type_node(type_idx)
         if target_type.len() > 0:
@@ -10778,38 +10772,31 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 #
 # `trace` emits the twins instead, over the payload kinds that are traceable
 # children: a string or bytes payload is a leaf and gets none.
-# one destructor per tuple-payload signature. the payload is itself a heap
-# tuple whose elements are heterogeneous, so unlike the uniform kinds above
-# this cannot be a single shared walk: each signature gets a function that
-# releases exactly the elements that need it, then releases the payload shell.
-# the optional's own shell is freed by its caller as usual.
+# the destructor for an optional whose payload is a genuine tuple. it releases
+# the payload and nothing else: the payload is a heap tuple that carries its
+# own destructor for whatever its elements hold, so releasing it runs that walk
+# exactly once. releasing the elements here as well released each of them
+# twice, which freed values the program was still using.
 #
-# a null payload is skipped rather than walked: a none shell carries no
+# a null payload is skipped rather than released: a none shell carries no
 # destructor, but a shell whose payload was moved out reaches here zeroed.
 fn ir_emit_optional_tuple_walks():
-    for sig in ir_optional_tuple_sigs:
-        pr := ir_emit_rc_walk_header("__opt_dtor_tuple_" + sig)
-        zero_r := ir_reg()
-        ir_emit("iconst " + zero_r.to_string() + " 0")
-        payload_r := ir_reg()
-        ir_emit("field " + payload_r.to_string() + " " + pr.to_string() + " 8 unknown value")
-        live_r := ir_reg()
-        ir_emit("neq " + live_r.to_string() + " " + payload_r.to_string() + " " + zero_r.to_string())
-        live_l := ir_label()
-        done_l := ir_label()
-        ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
-        ir_emit_label(live_l)
-        mut i := 0
-        while i < sig.len():
-            kind := ir_tuple_dtor_code_kind(sig.substring(i, i + 1))
-            if kind.len() > 0:
-                elem_r := ir_reg()
-                ir_emit("field " + elem_r.to_string() + " " + payload_r.to_string() + " " + (i * 8).to_string() + " unknown elem")
-                ir_rc_release_reg(elem_r, kind)
-            i = i + 1
-        ir_rc_release_reg(payload_r, "tuple")
-        ir_emit_label(done_l)
-        ir_emit_zero_ret_endfunc()
+    if ir_optional_tuple_dtor_needed == false:
+        return
+    pr := ir_emit_rc_walk_header("__opt_dtor_tuple")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    payload_r := ir_reg()
+    ir_emit("field " + payload_r.to_string() + " " + pr.to_string() + " 8 unknown value")
+    live_r := ir_reg()
+    ir_emit("neq " + live_r.to_string() + " " + payload_r.to_string() + " " + zero_r.to_string())
+    live_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
+    ir_emit_label(live_l)
+    ir_rc_release_reg(payload_r, "tuple")
+    ir_emit_label(done_l)
+    ir_emit_zero_ret_endfunc()
 
 fn ir_emit_optional_walks(trace: Bool):
     mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string"]

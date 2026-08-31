@@ -90,6 +90,15 @@ pub mut ir_active_generic_decl_idx := 0 - 1
 ## and looked up here.
 pub mut ir_active_param_optional_tids: Map[String, Int] := {}
 
+## the same thing for the LOCALS of the body being emitted: a name declared
+## `x: T? := ...` maps to the concrete Optional tid that annotation denotes.
+## populated only inside a generic body (ir_begin_func_local_optional_tids),
+## where the checker typed nothing at all, and reset at every function frame.
+## a name whose declarations disagree — bound as an optional in one place and
+## as something else in another — records -1 and is ignored here, leaving the
+## checked tid to answer as it always did.
+pub mut ir_active_local_optional_tids: Map[String, Int] := {}
+
 ## the tid an expression should be *emitted* against.
 ##
 ## normally that is the checked tid. inside a generic specialization the body
@@ -100,9 +109,14 @@ pub mut ir_active_param_optional_tids: Map[String, Int] := {}
 ## non-optional path. the per-spec param map supplies the Optional tid the
 ## checker could not, and only for a parameter it positively knows is one.
 ##
-## anything that is not an optional parameter comes back exactly as checked,
-## so this is a safe drop-in for a bare `c_get_expr_type` at a site that
-## expects to see optionals.
+## a LOCAL of that body is worse off still: nothing about it was checked, so
+## its tid is not the unspecialized marker but nothing at all, and the same
+## consumers took the same non-optional path. the local map closes that half
+## from the declaration, on the same terms.
+##
+## anything that is not an optional parameter or an optional local comes back
+## exactly as checked, so this is a safe drop-in for a bare `c_get_expr_type`
+## at a site that expects to see optionals.
 pub fn ir_emission_tid(idx: Int) -> Int:
     checked := c_get_expr_type(idx)
     if checked >= 0 and get_type_info(checked).kind == "optional":
@@ -110,6 +124,10 @@ pub fn ir_emission_tid(idx: Int) -> Int:
     node := get_node(idx)
     if node.kind == "ident" and ir_active_param_optional_tids.contains_key(node.value):
         return ir_active_param_optional_tids[node.value]
+    if node.kind == "ident" and ir_active_local_optional_tids.contains_key(node.value):
+        local_tid := ir_active_local_optional_tids[node.value]
+        if local_tid >= 0:
+            return local_tid
     return checked
 
 ## resolve a type annotation node to an emission kind, honoring

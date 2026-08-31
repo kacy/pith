@@ -22,6 +22,12 @@ pub struct ScopeEntry:
     pub parent: Int
     pub return_type: Int
     pub in_loop: Bool
+    # true for the scope a function or lambda body opens. it marks where a
+    # name search should stop: a local shadowing a MODULE name is ordinary and
+    # everywhere, while one shadowing another local in the same function is
+    # what the emitter cannot express, since it gives a function one slot per
+    # name.
+    pub is_function: Bool
 
 # ---------------------------------------------------------------
 # bindings stored flat — parallel lists tagged by scope_id
@@ -77,7 +83,7 @@ pub fn create_scope(parent: Int) -> Int:
         p := scope_entries[parent]
         ret_type = p.return_type
         in_lp = p.in_loop
-    scope_entries.push(ScopeEntry(parent, ret_type, in_lp))
+    scope_entries.push(ScopeEntry(parent, ret_type, in_lp, false))
     return scope_entries.len() - 1
 
 # define a binding in a scope with no source node (builtins)
@@ -188,6 +194,29 @@ pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String)
 ## empty collection literal has no element type at its declaration, so
 ## the binding starts out untyped and takes its real type from the
 ## first value stored into it.
+## true when this exact scope declares the name itself, rather than inheriting
+## it from an enclosing one. the difference matters where a redeclaration is
+## legal but shadowing is not.
+pub fn binding_declared_in_scope(scope_id: Int, name: String) -> Bool:
+    return binding_index.contains_key(binding_key(scope_id, name))
+
+## true when an enclosing scope inside the SAME function already binds the
+## name. the search stops at the function boundary, so shadowing a module-level
+## name — which is ordinary, and everywhere — does not count, while shadowing
+## another local in the same body does.
+pub fn binding_shadows_enclosing_local(scope_id: Int, name: String) -> Bool:
+    mut cur := scope_id
+    while cur >= 0:
+        entry := scope_entries[cur]
+        if cur != scope_id:
+            if binding_index.contains_key(binding_key(cur, name)):
+                return true
+        if entry.is_function:
+            return false
+        cur = entry.parent
+    return false
+
+## the index of the binding a name resolves to from this scope, or -1.
 pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
     key := binding_key(scope_id, name)
     if binding_index.contains_key(key):
@@ -255,7 +284,7 @@ pub fn create_function_scope(parent: Int, return_type: Int) -> Int:
     mut in_lp := false
     if parent >= 0:
         in_lp = scope_entries[parent].in_loop
-    scope_entries.push(ScopeEntry(parent, return_type, in_lp))
+    scope_entries.push(ScopeEntry(parent, return_type, in_lp, true))
     return scope_entries.len() - 1
 
 # create a child scope marked as inside a loop
@@ -263,5 +292,5 @@ pub fn create_loop_scope(parent: Int) -> Int:
     mut ret_type := -1
     if parent >= 0:
         ret_type = scope_entries[parent].return_type
-    scope_entries.push(ScopeEntry(parent, ret_type, true))
+    scope_entries.push(ScopeEntry(parent, ret_type, true, false))
     return scope_entries.len() - 1

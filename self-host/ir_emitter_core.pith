@@ -9998,15 +9998,15 @@ fn ir_emit_generic_specialization(key: String):
         mut spec_kept_kinds: List[String] := []
         mut si := 0
         while si < ir_rc_locals.len():
-            spec_name := ir_rc_locals[si]
+            spec_local := ir_rc_locals[si]
             mut spec_kind := "string"
             if si < ir_rc_local_kinds.len():
                 spec_kind = ir_rc_local_kinds[si]
-            if ir_spec_local_is_confined(body_idx, spec_name, spec_kind, spec_poisoned):
-                spec_kept.push(spec_name)
+            if ir_spec_local_is_confined(body_idx, spec_local, spec_kind, spec_poisoned):
+                spec_kept.push(spec_local)
                 spec_kept_kinds.push(spec_kind)
-            elif not ir_untracked_rc_binds.contains(spec_name):
-                ir_untracked_rc_binds.push(spec_name)
+            elif not ir_untracked_rc_binds.contains(spec_local):
+                ir_untracked_rc_binds.push(spec_local)
             si = si + 1
         for pn in spec_poisoned:
             if not ir_untracked_rc_binds.contains(pn):

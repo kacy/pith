@@ -1,0 +1,36 @@
+# names that may be reused, alongside the nested case that may not (covered in
+# the invalid corpus). sibling blocks do not enclose one another, so they share
+# a slot harmlessly; a module-level name shadowed by a local is ordinary and
+# everywhere.
+fn count() -> Int:
+    return 99
+
+fn f(p: Int) -> Int:
+    mut total := 0
+    if p > 0:
+        s := 1
+        total = total + s
+    if p > 1:
+        s := 2
+        total = total + s
+    mut i := 0
+    while i < 3:
+        step := i * 2
+        total = total + step
+        i = i + 1
+    for n in [1, 2]:
+        total = total + n
+    o: Int? := 5
+    if let v = o:
+        total = total + v
+    return total
+
+fn shadows_a_module_name() -> Int:
+    mut count := 5
+    count = count + 1
+    return count
+
+fn main() -> Int:
+    print("siblings and loops {f(2)}")
+    print("module shadow {shadows_a_module_name()} {count()}")
+    return 0

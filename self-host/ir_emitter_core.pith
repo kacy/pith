@@ -11398,10 +11398,6 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # FilterIter[Range, Int].next)
     ir_preregister_all_impl_specializations(root_idx, root)
     ir_emit_top_level_items(root_idx, root)
-    # tuple destructors last: their shapes are only known once every
-    # tuple literal in the module body has been emitted.
-    ir_emit_tuple_walks(false)
-    ir_emit_tuple_walks(true)
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend
     # constructor call: emitted after the specializations, since those bodies
@@ -11417,10 +11413,16 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # destructor emitted before its registration is a reference to nothing.
     ir_emit_generic_struct_instance_dtors()
     ir_emit_generic_struct_instance_tracers()
-    # tuple cascade helpers last of all: every body (top level, specializations,
-    # generic instance dtors and lambdas) has registered its signatures by now.
-    # the optional-over-tuple destructors are discovered the same way and so
-    # belong in the same place.
+    # every tuple family last of all: a signature is only registered as the
+    # body that builds the tuple is emitted, and that includes specializations
+    # and lambda bodies. these used to run before those two, so a tuple whose
+    # shape appeared first inside a generic body or a lambda got no destructor
+    # and the program failed to compile — and whether it did depended on
+    # whether unrelated code elsewhere happened to register the same shape
+    # first. the cascade helpers and the optional-over-tuple walks were always
+    # here for this reason; the plain walks belong with them.
+    ir_emit_tuple_walks(false)
+    ir_emit_tuple_walks(true)
     ir_emit_tuple_cascade_helpers()
     ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair

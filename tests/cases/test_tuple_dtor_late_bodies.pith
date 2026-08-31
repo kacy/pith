@@ -1,0 +1,33 @@
+# a tuple's destructor is emitted per element signature, and a signature is
+# only registered as the body that builds the tuple is emitted. generic
+# specializations and lambda bodies are emitted after the module's own, so a
+# tuple whose shape first appears in one of those used to get no destructor at
+# all and the program failed to compile.
+#
+# what made it worth a test rather than a note: whether such a program compiled
+# depended on whether unrelated code elsewhere happened to register the same
+# shape first, so adding or removing a tuple somewhere else could break it.
+
+fn in_generic[T](t: T) -> String:
+    p := (1, "from-generic")
+    return "{p.1}"
+
+fn in_generic_heap[T](t: T) -> Int:
+    p := ([1, 2, 3], "with-a-list")
+    return p.0.len()
+
+fn main() -> Int:
+    print("generic {in_generic(true)}")
+    print("generic-heap {in_generic_heap(false)}")
+
+    f := fn(n: Int) -> String:
+        p := (n, "from-lambda")
+        return "{p.1}"
+    print("lambda {f(1)}")
+
+    # a shape that appears only inside a lambda, with a heap element
+    g := fn(n: Int) -> Int:
+        p := ("owned-{n}", n)
+        return p.0.len()
+    print("lambda-heap {g(2)}")
+    return 0

@@ -145,6 +145,20 @@ before the pith one**: they are fixed programs, so when they reproduce their
 published figures the run is trustworthy, and when they do not, nothing in that
 run is.
 
+a third habit, for changes inside the runtime rather than across languages:
+**prefer instruction counts to wall time for attribution.** a compile-time
+change once read +5.6% eight rounds running and was noise — a byte-identical
+binary at two paths read −2.8% under the same protocol — while callgrind put
+it at +0.06%. `tooling/callgrind_ab.sh` runs two arms under callgrind and
+reports totals, the delta, and the hottest functions of each; the linker
+strips symbols by default, so build the program under test with
+`PITH_KEEP_SYMBOLS=1` first or the runtime reports as anonymous addresses.
+`tooling/null_ab.sh` times one binary against a copy of itself to show what
+the box adds on its own; a real a/b that lands inside that spread has shown
+nothing. an instruction count cannot see a memory-ordering stall, so the two
+instruments answer different questions and a barrier's cost still needs the
+timing protocol — but with the null floor established first.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

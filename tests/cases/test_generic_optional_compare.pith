@@ -1,0 +1,55 @@
+# an optional local inside a generic body compares against none the way one in
+# an ordinary body does. a generic body is never type-checked, so the checker
+# records no optional type for its locals, and the comparison fell through to a
+# raw pointer equality against zero — which a shell's address never satisfies,
+# so `s == none` answered false for a binding holding nothing.
+#
+# every generic arm prints beside its plain twin, so a wrong answer cannot
+# match the expected output by coincidence.
+
+fn gen[T](t: T) -> String:
+    mut out := ""
+    e: String? := none
+    if e == none:
+        out = out + "none-eq "
+    if e != none:
+        out = out + "WRONG-none-neq "
+    h: String? := "held"
+    if h == none:
+        out = out + "WRONG-held-eq "
+    if h != none:
+        out = out + "held-neq "
+    if let v = h:
+        out = out + "bind:{v} "
+    return out
+
+fn plain() -> String:
+    mut out := ""
+    e: String? := none
+    if e == none:
+        out = out + "none-eq "
+    if e != none:
+        out = out + "WRONG-none-neq "
+    h: String? := "held"
+    if h == none:
+        out = out + "WRONG-held-eq "
+    if h != none:
+        out = out + "held-neq "
+    if let v = h:
+        out = out + "bind:{v} "
+    return out
+
+# an optional parameter of a generic function, which always worked and must
+# keep working: the params map is what this fix widened past.
+fn genp[T](t: T, o: Int?) -> String:
+    if o == none:
+        return "param-none"
+    if let v = o:
+        return "param:{v}"
+    return "WRONG-param"
+
+fn main() -> Int:
+    print("generic {gen(true)}")
+    print("plain   {plain()}")
+    print("param   {genp(true, 5)} {genp(true, none)}")
+    return 0

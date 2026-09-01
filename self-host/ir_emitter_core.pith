@@ -3881,13 +3881,25 @@ fn ir_emit_short_circuit_logic(node: Node) -> Int:
 # the emission-kind concrete_types list flattens Optional to "tuple" and
 # would lose the inner type, so we route through the arg tids recorded at
 # call sites.
+# the Optional tid of a name inside a generic body, where the checker recorded
+# none because the body is never checked. a parameter's comes from the
+# signature; a local's from its own annotation. without the second, an optional
+# local's `== none` fell through to a raw pointer comparison against zero, and
+# a shell's address is never zero, so it answered false for a binding holding
+# nothing — the same mechanism #987 fixed for a bare-none binding.
 fn ir_generic_param_optional_tid(operand_node: Node) -> Int:
     if operand_node.kind != "ident":
         return -1
     name := operand_node.value
-    if not ir_active_param_optional_tids.contains_key(name):
-        return -1
-    return ir_active_param_optional_tids[name]
+    if ir_active_param_optional_tids.contains_key(name):
+        return ir_active_param_optional_tids[name]
+    if ir_active_local_optional_tids.contains_key(name):
+        # -1 marks a name declared with conflicting types in one body, which
+        # has no single answer; fall through rather than guess.
+        local_tid := ir_active_local_optional_tids[name]
+        if local_tid >= 0:
+            return local_tid
+    return -1
 
 fn ir_emit_binary_expr(node: Node) -> Int:
     if node.value == "eq" or node.value == "neq":
@@ -4001,7 +4013,10 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
         # the per-spec param map and dispatch structurally. Match by inner
         # type since add_type_info doesn't intern (the two params get
         # different Optional tids for the same shape).
-        if ir_active_param_optional_tids.len() > 0:
+        # the locals map counts as well as the params one: a generic body whose
+        # own parameters are not optionals still has optional locals, and
+        # gating on the params map alone skipped this branch entirely for them.
+        if ir_active_param_optional_tids.len() > 0 or ir_active_local_optional_tids.len() > 0:
             gen_left_tid := ir_generic_param_optional_tid(left_node)
             gen_right_tid := ir_generic_param_optional_tid(right_node)
             if gen_left_tid >= 0 and gen_right_tid >= 0:

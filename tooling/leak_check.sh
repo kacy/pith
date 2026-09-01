@@ -42,6 +42,7 @@ cases=(
   tests/leaks/leak_optional_over_tuple
   tests/leaks/leak_bare_none_binding
   "tests/leaks/leak_pool_thread_exit PITH_GREEN=0"
+  "tests/leaks/leak_pool_adoption PITH_GREEN=0"
   tests/leaks/leak_io_text_registry
   tests/leaks/leak_websocket_session
   tests/leaks/leak_returned_shell_dtor

@@ -1,0 +1,50 @@
+# the recycled-block pool is released at thread exit and adopted by the next
+# thread, never freed. this case runs one short task after another on the
+# os-thread backend, each allocating structs of several sizes and a handful
+# of closures, and expects the process to stay flat: the blocks a task leaves
+# behind are the blocks the next task reuses, so the registry plateaus at one
+# slot rather than growing a pool per thread.
+#
+# registered with PITH_GREEN=0, because under green a worker outlives the
+# task and this shape never exercised the exit path in the first place.
+import leakprobe as probe
+
+struct Two:
+    pub a: Int
+    pub b: Int
+
+struct Six:
+    pub a: Int
+    pub b: Int
+    pub c: Int
+    pub d: Int
+    pub e: Int
+    pub f: Int
+
+fn worker(seed: Int) -> Int:
+    mut twos: List[Two] := []
+    mut sixes: List[Six] := []
+    mut i := 0
+    while i < 300:
+        twos.push(Two(a: seed, b: i))
+        sixes.push(Six(a: seed, b: i, c: 1, d: 2, e: 3, f: 4))
+        i = i + 1
+    add := fn(x: Int) => x + seed
+    mut acc := 0
+    for t in twos:
+        acc = acc + add(t.b)
+    for s in sixes:
+        acc = acc + s.f
+    return acc
+
+fn main():
+    tasks := probe.rounds() / 400
+    mut i := 0
+    mut acc := 0
+    while i < tasks:
+        t := spawn worker(i)
+        acc = acc + await t
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

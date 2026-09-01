@@ -40,8 +40,19 @@ pub fn link_executable(
         .arg(obj_file)
         .arg(runtime_lib)
         .arg("-lpthread") // Required by our runtime
-        .arg("-lm") // Math library
-        .args(PLATFORM_LINK_ARGS);
+        .arg("-lm"); // Math library
+
+    // a profiler can only attribute cost to names it can see. callgrind and
+    // perf report a stripped binary as anonymous addresses, so a measurement
+    // build keeps the symbol table; the size cost is the reason stripping is
+    // the default and this is opt-in.
+    let keep_symbols = std::env::var("PITH_KEEP_SYMBOLS").is_ok_and(|v| v == "1");
+    for arg in PLATFORM_LINK_ARGS {
+        let strips_symbols = *arg == "-s" || *arg == "-Wl,-x";
+        if !(keep_symbols && strips_symbols) {
+            cmd.arg(arg);
+        }
+    }
 
     let output_result = cmd
         .output()

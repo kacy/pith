@@ -1,0 +1,49 @@
+# task_churn — one short task after another, each allocating a batch of
+# structs into a list and releasing them at return.
+#
+# this is the shape the per-thread struct pool loses on: under PITH_GREEN=0
+# every task is a fresh thread, so the pool is built, filled once, and torn
+# down without a single block being reused. under green the worker outlives
+# the task and the pool pays for itself. run both arms:
+#
+#   pith build bench/task_churn.pith
+#   PITH_GREEN=0 ./bench/task_churn
+#   PITH_GREEN=0 PITH_STRUCT_FREELIST=0 ./bench/task_churn
+#
+# the checksum must match across arms; a mismatch voids the comparison.
+
+struct Blob:
+    pub a: Int
+    pub b: Int
+
+fn worker(seed: Int, per_task: Int) -> Int:
+    mut rows: List[Blob] := []
+    mut i := 0
+    while i < per_task:
+        rows.push(Blob(a: seed, b: i))
+        i = i + 1
+    mut acc := 0
+    for r in rows:
+        acc = acc + r.b
+    return acc
+
+fn main() -> Int:
+    mut tasks := 2000
+    per_task := 400
+    argv := args()
+    if argv.len() > 1:
+        tasks = parse_int(argv[1]) catch tasks
+    start := time()
+    mut acc := 0
+    mut i := 0
+    while i < tasks:
+        t := spawn worker(i, per_task)
+        acc = acc + await t
+        i = i + 1
+    elapsed := time() - start
+    print("task churn benchmark")
+    print("tasks={tasks}")
+    print("structs_per_task={per_task}")
+    print("elapsed_ms={elapsed}")
+    print("checksum={acc}")
+    return 0

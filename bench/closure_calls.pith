@@ -1,0 +1,66 @@
+# closure_calls — splits the cost of a closure into its three parts so a
+# change to one of them is visible on its own.
+#
+#   build   two million closures, each built, called once, and dropped
+#   call    one closure called two million times
+#   direct  a plain function called two million times, the floor
+#
+# the build phase is what the per-thread closure pool sped up; the call
+# phase is the dispatch cost that remains, and the direct phase is what it
+# is measured against. every phase folds its results into one checksum so
+# a compiler that elided the work would change the printed number.
+#
+#   pith build bench/closure_calls.pith && ./bench/closure_calls
+
+fn direct_add(base: Int, x: Int) -> Int:
+    return base + x
+
+fn bench_build(n: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < n:
+        base := i % 13
+        f := fn(x: Int) => base + x
+        total = total + f(i)
+        i = i + 1
+    return total
+
+fn bench_call(n: Int) -> Int:
+    base := 7
+    f := fn(x: Int) => base + x
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + f(i)
+        i = i + 1
+    return total
+
+fn bench_direct(n: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + direct_add(7, i)
+        i = i + 1
+    return total
+
+fn main() -> Int:
+    mut n := 2000000
+    argv := args()
+    if argv.len() > 1:
+        n = parse_int(argv[1]) catch n
+
+    t0 := time()
+    build := bench_build(n)
+    t1 := time()
+    call := bench_call(n)
+    t2 := time()
+    direct := bench_direct(n)
+    t3 := time()
+
+    print("closure calls benchmark")
+    print("iterations={n}")
+    print("build_ms={t1 - t0}")
+    print("call_ms={t2 - t1}")
+    print("direct_ms={t3 - t2}")
+    print("checksum={build + call + direct}")
+    return 0

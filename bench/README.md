@@ -450,6 +450,74 @@ zig's timing is by far the noisiest of the four — probably the plain
 feels like. the median is stable enough to compare, but read any single
 zig run with suspicion.
 
+## task churn benchmark (per-thread pools)
+
+`bench/task_churn.pith` runs one short task after another, each allocating
+a batch of structs into a list and releasing them at return. It is the
+shape the per-thread struct pool loses on: under `PITH_GREEN=0` every task
+is a fresh thread, so the pool is built, filled once, and torn down without
+a block being reused. Under green the worker outlives the task and the pool
+pays for itself. Run both arms and compare; the checksum must match.
+
+```
+pith build bench/task_churn.pith
+PITH_GREEN=0 ./bench/task_churn
+PITH_GREEN=0 PITH_STRUCT_FREELIST=0 ./bench/task_churn
+```
+
+On the two-core box the pool-on arm is about 35% slower by wall time and
+about 25% more instructions under callgrind (100 tasks). The instruction
+count is the number to trust; see "measuring" below.
+
+## closure calls benchmark (dispatch cost)
+
+`bench/closure_calls.pith` splits a closure's cost into three phases so a
+change to one is visible on its own: two million closures each built,
+called once, and dropped (`build_ms`); one closure called two million times
+(`call_ms`); and a plain function called two million times as the floor
+(`direct_ms`). All three fold into one checksum. Typical split on the
+two-core box: build 111 ms, call 14 ms, direct 4 ms — so a closure call is
+about 7 ns against a 2 ns direct call, and construction dominates.
+
+```
+pith build bench/closure_calls.pith && ./bench/closure_calls
+```
+
+## measuring: instruction counts over wall time
+
+Wall time on a shared two-core box drifts by more than most effects under
+study: a compile-time change once read +5.6% eight rounds running, and
+callgrind put it at +0.06%. Two scripts make the reliable measurement the
+easy one.
+
+`tooling/callgrind_ab.sh` runs two arms under `valgrind --tool=callgrind`
+and prints their instruction totals, the delta, and (with `--annotate N`)
+the hottest functions of each. Attribution needs a symbol table, which the
+linker strips by default; build the program under test with
+`PITH_KEEP_SYMBOLS=1` first.
+
+```
+PITH_KEEP_SYMBOLS=1 pith build bench/task_churn.pith
+tooling/callgrind_ab.sh --annotate 10 \
+  pool-on  'PITH_GREEN=0 ./bench/task_churn 100' \
+  pool-off 'PITH_GREEN=0 PITH_STRUCT_FREELIST=0 ./bench/task_churn 100'
+```
+
+`tooling/null_ab.sh` copies one binary to two paths and times them against
+each other with the same interleaved, order-rotated, spaced protocol a real
+A/B uses. The two arms are identical, so the spread it reports is the box.
+Run it before believing a timing delta; a real A/B inside that spread has
+shown nothing. The floor here has been about ±3% on the minimum.
+
+```
+PITH_GREEN=0 tooling/null_ab.sh ./bench/task_churn 15 -- 2000
+```
+
+`tooling/ir_hash.sh` hashes the emitted IR of every corpus source into one
+file. A compiler change that should be behaviour-neutral reproduces every
+hash; one that should touch a single shape changes exactly the files that
+have it. Capture before and after, then `diff`.
+
 ## std pipeline benchmark
 
 `bench/std_pipeline.*` is a batteries-included data pipeline benchmark. it

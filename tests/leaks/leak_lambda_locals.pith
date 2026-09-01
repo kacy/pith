@@ -1,0 +1,48 @@
+# a lambda body must release its own locals. it ran no reference-counting
+# prologue at all, so the tracking list stayed empty for the whole body and
+# scope exit released nothing: every heap value a closure bound leaked on every
+# call, which is ordinary code with no diagnostic.
+#
+# the captured arm is the other half. a capture belongs to the closure
+# environment, which drops it when the closure is freed, so a body that also
+# released one would drop the count twice — a leak gate cannot see that, which
+# is why the golden checks the captured value is still readable afterwards.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+
+    # a heap local bound inside the lambda
+    f := fn(n: Int) -> Int:
+        s := "payload-{n}-body"
+        return s.len()
+    acc = acc + f(i)
+
+    # a heap value captured from the enclosing frame, called several times
+    held := "cap-{i}-body"
+    g := fn(n: Int) -> Int:
+        return held.len() + n
+    mut j := 0
+    while j < 4:
+        acc = acc + g(j)
+        j = j + 1
+
+    # a container local, and a by-value local as the control arm
+    h := fn(n: Int) -> Int:
+        xs: List[Int] := [n, n + 1]
+        plain := n * 2
+        return xs.len() + plain
+    acc = acc + h(i)
+
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

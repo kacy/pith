@@ -2053,6 +2053,25 @@ fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
 # prologue for the collected names: zero-store each one and retain string
 # params (params are locals under the same rule, so the exit cleanup
 # releasing them stays balanced with the caller's count).
+# drop names from this frame's owned-local tracking. used for a lambda's
+# captures, which the closure environment owns.
+fn ir_untrack_rc_locals(names: List[String]):
+    if names.len() == 0:
+        return
+    mut kept: List[String] := []
+    mut kept_kinds: List[String] := []
+    mut i := 0
+    while i < ir_rc_locals.len():
+        if not names.contains(ir_rc_locals[i]):
+            kept.push(ir_rc_locals[i])
+            if i < ir_rc_local_kinds.len():
+                kept_kinds.push(ir_rc_local_kinds[i])
+            else:
+                kept_kinds.push("string")
+        i = i + 1
+    ir_rc_locals = kept
+    ir_rc_local_kinds = kept_kinds
+
 fn ir_emit_rc_prologue(body_idx: Int):
     # before anything resolves a name: everything this body binds is this
     # function's own storage, whatever a module global is spelled.
@@ -6881,6 +6900,10 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_loop_iter_kinds := ir_loop_iter_kinds
     saved_loop_var_slots := ir_loop_var_slots
     saved_weak_caps := ir_weak_capture_names
+    # the prologue publishes this frame's poisoned names, and a lambda's must
+    # not outlive its body: leaving them set changed the enclosing function's
+    # release decisions and made it load a name the ir had not declared.
+    saved_untracked_binds := ir_untracked_rc_binds
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -6897,12 +6920,22 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # ir_var_regs below, and everything the body binds is collected here, so a
     # name it binds resolves to the lambda's own storage rather than a module
     # global spelled the same.
-    ir_begin_func_local_names(parts.body_idx)
-    ir_begin_func_local_optional_tids(parts.body_idx)
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
     ir_emit_lambda_params(parts.params)
     ir_emit_lambda_capture_loads(parts.captures)
+    # the body's own owned locals, collected the way a named function's are,
+    # and in the same position: after the header and the params, so the
+    # prologue's zero-stores land in this function rather than the enclosing
+    # one. without this the tracking list stayed empty for the whole body, so
+    # scope exit released nothing and every heap value a closure bound leaked
+    # on every call.
+    ir_emit_rc_prologue(parts.body_idx)
+    # a captured name belongs to the closure environment, which drops it when
+    # the closure is freed. the body must not release it as well, and the
+    # prepass cannot tell the difference: a capture is loaded into a slot that
+    # looks like any other local.
+    ir_untrack_rc_locals(parts.captures)
     # a declared return type puts the body under the same return-position
     # machinery a named function's body uses, so `return x` from a lambda
     # declared `-> Int?` builds the Some the caller will read. without one both
@@ -6929,6 +6962,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # restored before the capture setup below, so a nested lambda's setup
     # still sees which of the ENCLOSING lambda's names are weak captures
     ir_weak_capture_names = saved_weak_caps
+    ir_untracked_rc_binds = saved_untracked_binds
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)

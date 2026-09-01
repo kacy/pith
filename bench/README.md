@@ -465,9 +465,12 @@ PITH_GREEN=0 ./bench/task_churn
 PITH_GREEN=0 PITH_STRUCT_FREELIST=0 ./bench/task_churn
 ```
 
-On the two-core box the pool-on arm is about 35% slower by wall time and
-about 25% more instructions under callgrind (100 tasks). The instruction
-count is the number to trust; see "measuring" below.
+This shape used to lose: the pool-on arm was about 35% slower by wall time
+and 25% more instructions under callgrind, because the thread-exit destructor
+deallocated every retained block in a burst. Pool slots are now released at
+exit and adopted by the next thread, and the same arm is about 48% fewer
+instructions and 19% faster than no pool. The instruction count is the number
+to trust; see "measuring" below.
 
 ## closure calls benchmark (dispatch cost)
 

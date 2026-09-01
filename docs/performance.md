@@ -577,6 +577,22 @@ it needs boxing thunks wherever such a function is used as a value (every
 higher-order call), which is a large, delicate change for a compute-only
 gain the freelist already mostly captures.
 
+the freelist is per thread, and that had a cost the compute numbers did not
+show. on the os-thread backend every spawned task is a fresh thread, so a
+task that allocated a batch and returned built a pool, filled it once, and
+tore it down without reusing a block — and the teardown was the expensive
+part: callgrind put the thread-exit destructor's burst of deallocations at
+8.1M of 33M instructions in a task-per-thread benchmark, a quarter of the
+run, with glibc consolidating on every one. that made the pool about 35%
+slower than no pool for that shape. the pool now releases its slot at thread
+exit and the next thread adopts it, blocks and all, so a task's first
+allocation is a reuse and nothing is torn down. the retained bytes are also
+now bounded in bytes (256 KiB per slot, `STRUCT_POOL_MAX_BYTES`) rather than
+in blocks per size bucket, which had quietly meant about 2.1 MiB per thread;
+process retention is that budget times the peak number of live threads.
+`bench/task_churn` is the reproducer, and `tooling/callgrind_ab.sh` is how
+the cost was attributed after three timing-driven fixes had missed it.
+
 a later thread-safety pass moved `std.binary`'s reader off shared global
 maps into its own struct fields (so two http/2 reader threads can't race
 them). that also dropped a global-map access per frame parse: a

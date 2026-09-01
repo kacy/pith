@@ -51,6 +51,7 @@ cases=(
   tests/leaks/leak_generic_builtin_result
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let
+  tests/leaks/leak_lambda_locals
   tests/leaks/leak_generic_body_construction
   tests/leaks/leak_generic_channel_payload
   tests/leaks/leak_channel_lifecycle

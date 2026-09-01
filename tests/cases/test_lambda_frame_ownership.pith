@@ -1,0 +1,39 @@
+# a lambda releases its own locals and leaves its captures alone. the leak gate
+# can only see the first half: releasing a capture twice is under-counting,
+# which shows up as a freed value still in use rather than as growth. so the
+# captured value is read back after the closure has run many times, and a
+# second closure over the same value is called after the first is done with it.
+
+fn main() -> Int:
+    held := "captured-value"
+    f := fn(n: Int) -> Int:
+        return held.len() + n
+    mut acc := 0
+    mut i := 0
+    while i < 200:
+        acc = acc + f(i)
+        i = i + 1
+    if held != "captured-value":
+        print("WRONG: the captured value was freed, reads {held}")
+    print("captured survives {held} acc={acc}")
+
+    g := fn(n: Int) -> Int:
+        return held.len() * n
+    print("second closure over the same value {g(2)}")
+    if held != "captured-value":
+        print("WRONG: the second closure freed the captured value")
+
+    # locals of each heap kind, bound inside the body
+    kinds := fn(n: Int) -> Int:
+        s := "local-{n}"
+        xs: List[Int] := [n, n + 1]
+        plain := n * 3
+        return s.len() + xs.len() + plain
+    print("locals {kinds(2)}")
+
+    # a local that is also returned, so its count leaves with the value
+    outward := fn(n: Int) -> String:
+        s := "out-{n}"
+        return s
+    print("returned {outward(5)}")
+    return 0

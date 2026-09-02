@@ -181517,6 +181517,112 @@ ret 20
 iconst 23 0
 ret 23
 endfunc
+func ir_emitter_core_ir_push_channel_ctor_args 2 void
+param arg_regs
+param explicit_generic_types
+load 2 arg_regs
+call 3 pith_list_len int 1 2
+iconst 4 0
+eq 5 3 4
+brif 5 L3333 L3334
+label L3333
+call 6 ir_builder_ir_reg int 0
+store zero_r 6
+strref 7 m51s915
+load 8 zero_r
+call 9 int_to_string string 1 8
+concat 10 7 9
+call 11 pith_cstring_release void 1 7
+call 12 pith_cstring_release void 1 9
+strref 13 m51s914
+concat 14 10 13
+call 15 pith_cstring_release void 1 10
+call 16 pith_cstring_release void 1 13
+call 17 ir_builder_ir_emit void 1 14
+call 18 pith_cstring_release void 1 14
+load 19 arg_regs
+load 20 zero_r
+call 21 pith_list_push_value void 2 19 20
+jmp L3332
+label L3334
+label L3332
+iconst 22 0
+store payload_tag 22
+load 23 explicit_generic_types
+call 24 pith_list_len int 1 23
+iconst 25 0
+gt 26 24 25
+brif 26 L3336 L3337
+label L3336
+load 27 explicit_generic_types
+iconst 28 0
+call 29 pith_list_get_value_strict string 2 27 28
+call 30 ir_struct_registry_ir_rc_kind string 1 29
+call 31 ir_emitter_core_ir_element_tag_code int 1 30
+call 32 pith_cstring_release void 1 30
+store payload_tag 31
+jmp L3335
+label L3337
+label L3335
+call 33 ir_builder_ir_reg int 0
+store tag_r 33
+strref 34 m51s915
+load 35 tag_r
+call 36 int_to_string string 1 35
+concat 37 34 36
+call 38 pith_cstring_release void 1 34
+call 39 pith_cstring_release void 1 36
+strref 40 m51s348
+concat 41 37 40
+call 42 pith_cstring_release void 1 37
+call 43 pith_cstring_release void 1 40
+load 44 payload_tag
+call 45 int_to_string string 1 44
+concat 46 41 45
+call 47 pith_cstring_release void 1 41
+call 48 pith_cstring_release void 1 45
+call 49 ir_builder_ir_emit void 1 46
+call 50 pith_cstring_release void 1 46
+load 51 arg_regs
+load 52 tag_r
+call 53 pith_list_push_value void 2 51 52
+iconst 54 0
+ret 54
+endfunc
+func ir_emitter_core_ir_emit_devirtualized_call 5 void
+param r
+param lambda_symbol
+param ret_type
+param handle_name
+param arg_regs
+call 5 ir_builder_ir_reg int 0
+store handle_r 5
+load 6 handle_r
+load 7 handle_name
+call 8 ir_emitter_core_ir_emit_name_load void 2 6 7
+load 9 r
+load 10 lambda_symbol
+load 11 ret_type
+load 12 arg_regs
+call 13 pith_list_len int 1 12
+iconst 14 1
+add 15 13 14
+strref 16 m51s348
+load 17 handle_r
+call 18 int_to_string string 1 17
+concat 19 16 18
+call 20 pith_cstring_release void 1 16
+call 21 pith_cstring_release void 1 18
+load 22 arg_regs
+call 23 ir_call_helpers_ir_join_arg_regs string 1 22
+concat 24 19 23
+call 25 pith_cstring_release void 1 19
+call 26 pith_cstring_release void 1 23
+call 27 ir_call_emit_ir_emit_call_text void 5 9 10 11 15 24
+call 28 pith_cstring_release void 1 24
+iconst 29 0
+ret 29
+endfunc
 func ir_emitter_core_ir_emit_static_call 2 int
 param idx
 param node
@@ -181549,8 +181655,8 @@ field 16 15 16 list children
 call 17 pith_list_len int 1 16
 iconst 18 0
 gt 19 17 18
-brif 19 L3333 L3334
-label L3333
+brif 19 L3339 L3340
+label L3339
 load 20 callee_node
 load 21 node
 field 22 21 16 list children
@@ -181564,8 +181670,8 @@ field 28 27 0 string kind
 strref 29 m51s35
 call 30 pith_cstring_eq bool 2 28 29
 call 31 pith_cstring_release void 1 29
-brif 30 L3336 L3337
-label L3336
+brif 30 L3342 L3343
+label L3342
 load 32 idx
 load 33 node
 load 34 node
@@ -181578,8 +181684,8 @@ store special_r 39
 load 40 special_r
 iconst 41 0
 gte 42 40 41
-brif 42 L3339 L3340
-label L3339
+brif 42 L3345 L3346
+label L3345
 load 43 special_r
 load 44 explicit_generic_types
 call 45 pith_list_release_handle void 1 44
@@ -181602,24 +181708,24 @@ call 61 pith_cstring_release void 1 60
 load 62 free_opt_kind
 call 63 pith_cstring_release void 1 62
 ret 43
-label L3340
-label L3338
+label L3346
+label L3344
 load 64 explicit_generic_types
 load 65 callee_node
 call 66 ir_emitter_core_ir_explicit_generic_concrete_types list_string 1 65
 call 67 pith_list_release_handle void 1 64
 store explicit_generic_types 66
-jmp L3335
-label L3337
-label L3335
+jmp L3341
+label L3343
+label L3341
 load 68 node
 field 69 68 16 list children
 iconst 70 0
 call 71 pith_list_get_value_strict int 2 69 70
 load 72 callee_node
 call 73 ir_emitter_core_ir_callee_is_function_expr bool 2 71 72
-brif 73 L3342 L3343
-label L3342
+brif 73 L3348 L3349
+label L3348
 load 74 idx
 load 75 node
 load 76 node
@@ -181648,11 +181754,11 @@ call 98 pith_cstring_release void 1 97
 load 99 free_opt_kind
 call 100 pith_cstring_release void 1 99
 ret 80
-label L3343
-label L3341
-jmp L3332
-label L3334
-label L3332
+label L3349
+label L3347
+jmp L3338
+label L3340
+label L3338
 load 101 callee
 strref 102 m51s905
 iconst 103 0
@@ -181673,8 +181779,8 @@ field 113 112 16 list children
 call 114 pith_list_len int 1 113
 iconst 115 0
 gt 116 114 115
-brif 116 L3345 L3346
-label L3345
+brif 116 L3351 L3352
+label L3351
 load 117 callee
 load 118 node
 field 119 118 16 list children
@@ -181688,8 +181794,8 @@ field 125 124 0 string name
 call 126 string_len int 1 125
 iconst 127 0
 eq 128 126 127
-brif 128 L3348 L3349
-label L3348
+brif 128 L3354 L3355
+label L3354
 load 129 callee
 strref 130 m51s905
 iconst 131 0
@@ -181701,9 +181807,9 @@ funcref 134 ir_emitter_core___dtor_ResolvedCallee
 call 135 pith_struct_set_dtor void 2 132 134
 call 136 pith_struct_release void 1 129
 store callee 132
-jmp L3347
-label L3349
-label L3347
+jmp L3353
+label L3355
+label L3353
 load 137 callee_n
 load 138 node
 field 139 138 16 list children
@@ -181713,25 +181819,25 @@ call 142 ast_get_node struct:Node 1 141
 call 143 pith_struct_release void 1 137
 store callee_n 142
 iconst 144 0
-store __and_144_3353 144
+store __and_144_3359 144
 load 145 callee_n
 field 146 145 0 string kind
 strref 147 m51s37
 call 148 pith_cstring_eq bool 2 146 147
 call 149 pith_cstring_release void 1 147
-store __and_144_3353 148
-brif 148 L3353 L3354
-label L3353
+store __and_144_3359 148
+brif 148 L3359 L3360
+label L3359
 load 150 callee
 field 151 150 0 string name
 call 152 ir_method_tables_ir_is_declared_callable bool 1 151
 iconst 154 1
 sub 153 154 152
-store __and_144_3353 153
-label L3354
-load 155 __and_144_3353
-brif 155 L3351 L3352
-label L3351
+store __and_144_3359 153
+label L3360
+load 155 __and_144_3359
+brif 155 L3357 L3358
+label L3357
 load 156 direct
 load 157 callee
 field 158 157 0 string name
@@ -181742,8 +181848,8 @@ load 161 direct
 call 162 string_len int 1 161
 iconst 163 0
 gt 164 162 163
-brif 164 L3356 L3357
-label L3356
+brif 164 L3362 L3363
+label L3362
 load 165 devirt_name
 load 166 callee
 field 167 166 0 string name
@@ -181762,9 +181868,9 @@ funcref 176 ir_emitter_core___dtor_ResolvedCallee
 call 177 pith_struct_set_dtor void 2 174 176
 call 178 pith_struct_release void 1 170
 store callee 174
-jmp L3355
-label L3357
-label L3355
+jmp L3361
+label L3363
+label L3361
 load 179 loop_slot
 load 180 callee
 field 181 180 0 string name
@@ -181775,8 +181881,8 @@ load 184 loop_slot
 call 185 string_len int 1 184
 iconst 186 0
 gt 187 185 186
-brif 187 L3359 L3360
-label L3359
+brif 187 L3365 L3366
+label L3365
 load 188 callee
 load 189 loop_slot
 call 190 pith_cstring_retain void 1 189
@@ -181790,63 +181896,63 @@ funcref 195 ir_emitter_core___dtor_ResolvedCallee
 call 196 pith_struct_set_dtor void 2 193 195
 call 197 pith_struct_release void 1 188
 store callee 193
-jmp L3358
-label L3360
+jmp L3364
+label L3366
 iconst 198 0
-store __and_198_3363 198
+store __and_198_3369 198
 iconst 199 0
-store __and_199_3363 199
+store __and_199_3369 199
 load 200 callee
 field 201 200 8 bool imported
 iconst 203 1
 sub 202 203 201
-store __and_199_3363 202
-brif 202 L3363 L3364
-label L3363
+store __and_199_3369 202
+brif 202 L3369 L3370
+label L3369
 load 204 callee
 field 205 204 0 string name
 call 206 ir_emitter_core_ir_name_is_func_local bool 1 205
 iconst 208 1
 sub 207 208 206
-store __and_199_3363 207
-label L3364
-load 209 __and_199_3363
-store __and_198_3363 209
-brif 209 L3365 L3366
-label L3365
+store __and_199_3369 207
+label L3370
+load 209 __and_199_3369
+store __and_198_3369 209
+brif 209 L3371 L3372
+label L3371
 load 210 ir_alias_registry___g_ir_global_slot_names
 load 211 callee
 field 212 211 0 string name
 iconst 213 -1
-store __list_index_result_L3367 213
+store __list_index_result_L3373 213
 iconst 214 0
-store __list_index_i_L3368 214
+store __list_index_i_L3374 214
 call 215 pith_list_len int 1 210
-label L3369
-load 216 __list_index_i_L3368
+label L3375
+load 216 __list_index_i_L3374
 lt 217 216 215
-brif 217 L3370 L3373
-label L3370
+brif 217 L3376 L3379
+label L3376
 call 218 pith_list_get_value string 2 210 216
 call 219 pith_cstring_eq bool 2 218 212
-brif 219 L3371 L3372
-label L3371
-store __list_index_result_L3367 216
-jmp L3373
-label L3372
+brif 219 L3377 L3378
+label L3377
+store __list_index_result_L3373 216
+jmp L3379
+label L3378
 iconst 220 1
 add 221 216 220
-store __list_index_i_L3368 221
-jmp L3369
-label L3373
-load 222 __list_index_result_L3367
+store __list_index_i_L3374 221
+jmp L3375
+label L3379
+load 222 __list_index_result_L3373
 iconst 223 0
 gte 224 222 223
-store __and_198_3363 224
-label L3366
-load 225 __and_198_3363
-brif 225 L3361 L3362
-label L3361
+store __and_198_3369 224
+label L3372
+load 225 __and_198_3369
+brif 225 L3367 L3368
+label L3367
 load 226 callee
 load 227 callee
 field 228 227 0 string name
@@ -181860,35 +181966,35 @@ funcref 233 ir_emitter_core___dtor_ResolvedCallee
 call 234 pith_struct_set_dtor void 2 231 233
 call 235 pith_struct_release void 1 226
 store callee 231
-jmp L3358
-label L3362
+jmp L3364
+label L3368
+label L3364
+jmp L3356
 label L3358
+label L3356
 jmp L3350
 label L3352
 label L3350
-jmp L3344
-label L3346
-label L3344
 iconst 236 0
-store __and_236_3377 236
+store __and_236_3383 236
 load 237 callee
 field 238 237 0 string name
 strref 239 m51s1351
 call 240 pith_cstring_eq bool 2 238 239
 call 241 pith_cstring_release void 1 239
-store __and_236_3377 240
-brif 240 L3377 L3378
-label L3377
+store __and_236_3383 240
+brif 240 L3383 L3384
+label L3383
 load 242 node
 field 243 242 16 list children
 call 244 pith_list_len int 1 243
 iconst 245 2
 gte 246 244 245
-store __and_236_3377 246
-label L3378
-load 247 __and_236_3377
-brif 247 L3375 L3376
-label L3375
+store __and_236_3383 246
+label L3384
+load 247 __and_236_3383
+brif 247 L3381 L3382
+label L3381
 load 248 node
 field 249 248 16 list children
 iconst 250 1
@@ -181899,8 +182005,8 @@ store byte_r 253
 load 254 byte_r
 iconst 255 0
 gte 256 254 255
-brif 256 L3380 L3381
-label L3380
+brif 256 L3386 L3387
+label L3386
 load 257 byte_r
 load 258 explicit_generic_types
 call 259 pith_list_release_handle void 1 258
@@ -181923,11 +182029,11 @@ call 275 pith_cstring_release void 1 274
 load 276 free_opt_kind
 call 277 pith_cstring_release void 1 276
 ret 257
-label L3381
-label L3379
-jmp L3374
-label L3376
-label L3374
+label L3387
+label L3385
+jmp L3380
+label L3382
+label L3380
 load 278 idx
 load 279 node
 load 280 callee
@@ -181937,8 +182043,8 @@ store higher_order_r 282
 load 283 higher_order_r
 iconst 284 0
 gte 285 283 284
-brif 285 L3383 L3384
-label L3383
+brif 285 L3389 L3390
+label L3389
 load 286 higher_order_r
 load 287 explicit_generic_types
 call 288 pith_list_release_handle void 1 287
@@ -181961,8 +182067,8 @@ call 304 pith_cstring_release void 1 303
 load 305 free_opt_kind
 call 306 pith_cstring_release void 1 305
 ret 286
-label L3384
-label L3382
+label L3390
+label L3388
 load 307 idx
 load 308 node
 load 309 callee
@@ -181972,8 +182078,8 @@ store struct_r 311
 load 312 struct_r
 iconst 313 0
 gte 314 312 313
-brif 314 L3386 L3387
-label L3386
+brif 314 L3392 L3393
+label L3392
 load 315 struct_r
 load 316 explicit_generic_types
 call 317 pith_list_release_handle void 1 316
@@ -181996,8 +182102,8 @@ call 333 pith_cstring_release void 1 332
 load 334 free_opt_kind
 call 335 pith_cstring_release void 1 334
 ret 315
-label L3387
-label L3385
+label L3393
+label L3391
 load 336 callee
 load 337 idx
 load 338 node
@@ -182017,533 +182123,451 @@ field 349 348 0 string name
 strref 350 m51s336
 call 351 pith_cstring_eq bool 2 349 350
 call 352 pith_cstring_release void 1 350
-brif 351 L3389 L3390
-label L3389
-load 353 arg_regs
-call 354 pith_list_len int 1 353
-iconst 355 0
-eq 356 354 355
-brif 356 L3392 L3393
-label L3392
-call 357 ir_builder_ir_reg int 0
-store zero_r 357
-strref 358 m51s915
-load 359 zero_r
-call 360 int_to_string string 1 359
-concat 361 358 360
-call 362 pith_cstring_release void 1 358
-call 363 pith_cstring_release void 1 360
-strref 364 m51s914
-concat 365 361 364
-call 366 pith_cstring_release void 1 361
-call 367 pith_cstring_release void 1 364
-call 368 ir_builder_ir_emit void 1 365
-call 369 pith_cstring_release void 1 365
-load 370 arg_regs
-load 371 zero_r
-call 372 pith_list_push_value void 2 370 371
-jmp L3391
-label L3393
-label L3391
-iconst 373 0
-store payload_tag 373
-load 374 explicit_generic_types
-call 375 pith_list_len int 1 374
-iconst 376 0
-gt 377 375 376
-brif 377 L3395 L3396
+brif 351 L3395 L3396
 label L3395
-load 378 explicit_generic_types
-iconst 379 0
-call 380 pith_list_get_value_strict string 2 378 379
-call 381 ir_struct_registry_ir_rc_kind string 1 380
-call 382 ir_emitter_core_ir_element_tag_code int 1 381
-call 383 pith_cstring_release void 1 381
-store payload_tag 382
+load 353 arg_regs
+load 354 explicit_generic_types
+call 355 ir_emitter_core_ir_push_channel_ctor_args void 2 353 354
 jmp L3394
 label L3396
 label L3394
-call 384 ir_builder_ir_reg int 0
-store tag_r 384
-strref 385 m51s915
-load 386 tag_r
-call 387 int_to_string string 1 386
-concat 388 385 387
-call 389 pith_cstring_release void 1 385
-call 390 pith_cstring_release void 1 387
-strref 391 m51s348
-concat 392 388 391
-call 393 pith_cstring_release void 1 388
-call 394 pith_cstring_release void 1 391
-load 395 payload_tag
-call 396 int_to_string string 1 395
-concat 397 392 396
-call 398 pith_cstring_release void 1 392
-call 399 pith_cstring_release void 1 396
-call 400 ir_builder_ir_emit void 1 397
-call 401 pith_cstring_release void 1 397
-load 402 arg_regs
-load 403 tag_r
-call 404 pith_list_push_value void 2 402 403
-jmp L3388
-label L3390
-label L3388
-iconst 405 0
-store __and_405_3400 405
-iconst 406 0
-store __and_406_3400 406
-load 407 callee
-field 408 407 0 string name
-strref 409 m51s1085
-call 410 pith_cstring_eq bool 2 408 409
-call 411 pith_cstring_release void 1 409
-store __and_406_3400 410
-brif 410 L3400 L3401
+iconst 356 0
+store __and_356_3400 356
+iconst 357 0
+store __and_357_3400 357
+load 358 callee
+field 359 358 0 string name
+strref 360 m51s1085
+call 361 pith_cstring_eq bool 2 359 360
+call 362 pith_cstring_release void 1 360
+store __and_357_3400 361
+brif 361 L3400 L3401
 label L3400
-load 412 arg_regs
-call 413 pith_list_len int 1 412
-iconst 414 1
-gte 415 413 414
-store __and_406_3400 415
+load 363 arg_regs
+call 364 pith_list_len int 1 363
+iconst 365 1
+gte 366 364 365
+store __and_357_3400 366
 label L3401
-load 416 __and_406_3400
-store __and_405_3400 416
-brif 416 L3402 L3403
+load 367 __and_357_3400
+store __and_356_3400 367
+brif 367 L3402 L3403
 label L3402
-strref 417 m51s1085
-call 418 ir_method_tables_ir_is_declared_callable bool 1 417
-call 419 pith_cstring_release void 1 417
-iconst 421 1
-sub 420 421 418
-store __and_405_3400 420
+strref 368 m51s1085
+call 369 ir_method_tables_ir_is_declared_callable bool 1 368
+call 370 pith_cstring_release void 1 368
+iconst 372 1
+sub 371 372 369
+store __and_356_3400 371
 label L3403
-load 422 __and_405_3400
-brif 422 L3398 L3399
+load 373 __and_356_3400
+brif 373 L3398 L3399
 label L3398
-load 423 arg_regs
-call 424 ir_emitter_core_ir_emit_test_assert int 1 423
-load 425 explicit_generic_types
-call 426 pith_list_release_handle void 1 425
-load 427 callee_node
-call 428 pith_struct_release void 1 427
-load 429 callee
-call 430 pith_struct_release void 1 429
-load 431 devirt_name
-call 432 pith_cstring_release void 1 431
-load 433 callee_n
-call 434 pith_struct_release void 1 433
-load 435 direct
-call 436 pith_cstring_release void 1 435
-load 437 loop_slot
-call 438 pith_cstring_release void 1 437
-load 439 arg_regs
-call 440 pith_list_release_handle void 1 439
-load 441 ret_type
-call 442 pith_cstring_release void 1 441
-load 443 free_opt_kind
-call 444 pith_cstring_release void 1 443
-ret 424
+load 374 arg_regs
+call 375 ir_emitter_core_ir_emit_test_assert int 1 374
+load 376 explicit_generic_types
+call 377 pith_list_release_handle void 1 376
+load 378 callee_node
+call 379 pith_struct_release void 1 378
+load 380 callee
+call 381 pith_struct_release void 1 380
+load 382 devirt_name
+call 383 pith_cstring_release void 1 382
+load 384 callee_n
+call 385 pith_struct_release void 1 384
+load 386 direct
+call 387 pith_cstring_release void 1 386
+load 388 loop_slot
+call 389 pith_cstring_release void 1 388
+load 390 arg_regs
+call 391 pith_list_release_handle void 1 390
+load 392 ret_type
+call 393 pith_cstring_release void 1 392
+load 394 free_opt_kind
+call 395 pith_cstring_release void 1 394
+ret 375
 label L3399
 label L3397
-iconst 445 0
-store __and_445_3407 445
-iconst 446 0
-store __and_446_3407 446
-load 447 callee
-field 448 447 0 string name
-strref 449 m51s401
-call 450 pith_cstring_eq bool 2 448 449
-call 451 pith_cstring_release void 1 449
-store __and_446_3407 450
-brif 450 L3407 L3408
+iconst 396 0
+store __and_396_3407 396
+iconst 397 0
+store __and_397_3407 397
+load 398 callee
+field 399 398 0 string name
+strref 400 m51s401
+call 401 pith_cstring_eq bool 2 399 400
+call 402 pith_cstring_release void 1 400
+store __and_397_3407 401
+brif 401 L3407 L3408
 label L3407
-load 452 arg_regs
-call 453 pith_list_len int 1 452
-iconst 454 2
-gte 455 453 454
-store __and_446_3407 455
+load 403 arg_regs
+call 404 pith_list_len int 1 403
+iconst 405 2
+gte 406 404 405
+store __and_397_3407 406
 label L3408
-load 456 __and_446_3407
-store __and_445_3407 456
-brif 456 L3409 L3410
+load 407 __and_397_3407
+store __and_396_3407 407
+brif 407 L3409 L3410
 label L3409
-strref 457 m51s401
-call 458 ir_method_tables_ir_is_declared_callable bool 1 457
-call 459 pith_cstring_release void 1 457
-iconst 461 1
-sub 460 461 458
-store __and_445_3407 460
+strref 408 m51s401
+call 409 ir_method_tables_ir_is_declared_callable bool 1 408
+call 410 pith_cstring_release void 1 408
+iconst 412 1
+sub 411 412 409
+store __and_396_3407 411
 label L3410
-load 462 __and_445_3407
-brif 462 L3405 L3406
+load 413 __and_396_3407
+brif 413 L3405 L3406
 label L3405
-load 463 node
-load 464 arg_regs
-iconst 465 1
-call 466 ir_emitter_core_ir_emit_test_assert_eq int 3 463 464 465
-load 467 explicit_generic_types
-call 468 pith_list_release_handle void 1 467
-load 469 callee_node
-call 470 pith_struct_release void 1 469
-load 471 callee
-call 472 pith_struct_release void 1 471
-load 473 devirt_name
-call 474 pith_cstring_release void 1 473
-load 475 callee_n
-call 476 pith_struct_release void 1 475
-load 477 direct
-call 478 pith_cstring_release void 1 477
-load 479 loop_slot
-call 480 pith_cstring_release void 1 479
-load 481 arg_regs
-call 482 pith_list_release_handle void 1 481
-load 483 ret_type
-call 484 pith_cstring_release void 1 483
-load 485 free_opt_kind
-call 486 pith_cstring_release void 1 485
-ret 466
+load 414 node
+load 415 arg_regs
+iconst 416 1
+call 417 ir_emitter_core_ir_emit_test_assert_eq int 3 414 415 416
+load 418 explicit_generic_types
+call 419 pith_list_release_handle void 1 418
+load 420 callee_node
+call 421 pith_struct_release void 1 420
+load 422 callee
+call 423 pith_struct_release void 1 422
+load 424 devirt_name
+call 425 pith_cstring_release void 1 424
+load 426 callee_n
+call 427 pith_struct_release void 1 426
+load 428 direct
+call 429 pith_cstring_release void 1 428
+load 430 loop_slot
+call 431 pith_cstring_release void 1 430
+load 432 arg_regs
+call 433 pith_list_release_handle void 1 432
+load 434 ret_type
+call 435 pith_cstring_release void 1 434
+load 436 free_opt_kind
+call 437 pith_cstring_release void 1 436
+ret 417
 label L3406
 label L3404
-iconst 487 0
-store __and_487_3414 487
-iconst 488 0
-store __and_488_3414 488
-load 489 callee
-field 490 489 0 string name
-strref 491 m51s400
-call 492 pith_cstring_eq bool 2 490 491
-call 493 pith_cstring_release void 1 491
-store __and_488_3414 492
-brif 492 L3414 L3415
+iconst 438 0
+store __and_438_3414 438
+iconst 439 0
+store __and_439_3414 439
+load 440 callee
+field 441 440 0 string name
+strref 442 m51s400
+call 443 pith_cstring_eq bool 2 441 442
+call 444 pith_cstring_release void 1 442
+store __and_439_3414 443
+brif 443 L3414 L3415
 label L3414
-load 494 arg_regs
-call 495 pith_list_len int 1 494
-iconst 496 2
-gte 497 495 496
-store __and_488_3414 497
+load 445 arg_regs
+call 446 pith_list_len int 1 445
+iconst 447 2
+gte 448 446 447
+store __and_439_3414 448
 label L3415
-load 498 __and_488_3414
-store __and_487_3414 498
-brif 498 L3416 L3417
+load 449 __and_439_3414
+store __and_438_3414 449
+brif 449 L3416 L3417
 label L3416
-strref 499 m51s400
-call 500 ir_method_tables_ir_is_declared_callable bool 1 499
-call 501 pith_cstring_release void 1 499
-iconst 503 1
-sub 502 503 500
-store __and_487_3414 502
+strref 450 m51s400
+call 451 ir_method_tables_ir_is_declared_callable bool 1 450
+call 452 pith_cstring_release void 1 450
+iconst 454 1
+sub 453 454 451
+store __and_438_3414 453
 label L3417
-load 504 __and_487_3414
-brif 504 L3412 L3413
+load 455 __and_438_3414
+brif 455 L3412 L3413
 label L3412
-load 505 node
-load 506 arg_regs
-iconst 507 0
-call 508 ir_emitter_core_ir_emit_test_assert_eq int 3 505 506 507
-load 509 explicit_generic_types
-call 510 pith_list_release_handle void 1 509
-load 511 callee_node
-call 512 pith_struct_release void 1 511
-load 513 callee
-call 514 pith_struct_release void 1 513
-load 515 devirt_name
-call 516 pith_cstring_release void 1 515
-load 517 callee_n
-call 518 pith_struct_release void 1 517
-load 519 direct
-call 520 pith_cstring_release void 1 519
-load 521 loop_slot
-call 522 pith_cstring_release void 1 521
-load 523 arg_regs
-call 524 pith_list_release_handle void 1 523
-load 525 ret_type
-call 526 pith_cstring_release void 1 525
-load 527 free_opt_kind
-call 528 pith_cstring_release void 1 527
-ret 508
+load 456 node
+load 457 arg_regs
+iconst 458 0
+call 459 ir_emitter_core_ir_emit_test_assert_eq int 3 456 457 458
+load 460 explicit_generic_types
+call 461 pith_list_release_handle void 1 460
+load 462 callee_node
+call 463 pith_struct_release void 1 462
+load 464 callee
+call 465 pith_struct_release void 1 464
+load 466 devirt_name
+call 467 pith_cstring_release void 1 466
+load 468 callee_n
+call 469 pith_struct_release void 1 468
+load 470 direct
+call 471 pith_cstring_release void 1 470
+load 472 loop_slot
+call 473 pith_cstring_release void 1 472
+load 474 arg_regs
+call 475 pith_list_release_handle void 1 474
+load 476 ret_type
+call 477 pith_cstring_release void 1 476
+load 478 free_opt_kind
+call 479 pith_cstring_release void 1 478
+ret 459
 label L3413
 label L3411
-call 529 ir_builder_ir_reg int 0
-store r 529
-load 530 callee
-load 531 idx
-call 532 ir_emitter_core_ir_callee_uses_result_abi bool 2 530 531
-store uses_result_abi 532
-load 533 ret_type
-load 534 idx
-load 535 uses_result_abi
-load 536 callee
-field 537 536 0 string name
-call 538 ir_emitter_core_ir_call_retkind_for_name string 3 534 535 537
-call 539 pith_cstring_release void 1 533
-store ret_type 538
-load 540 ir_result_abi___g_ir_result_reg_funcs
-load 541 callee
-field 542 541 0 string name
-call 543 contains_key bool 2 540 542
-brif 543 L3419 L3420
+call 480 ir_builder_ir_reg int 0
+store r 480
+load 481 callee
+load 482 idx
+call 483 ir_emitter_core_ir_callee_uses_result_abi bool 2 481 482
+store uses_result_abi 483
+load 484 ret_type
+load 485 idx
+load 486 uses_result_abi
+load 487 callee
+field 488 487 0 string name
+call 489 ir_emitter_core_ir_call_retkind_for_name string 3 485 486 488
+call 490 pith_cstring_release void 1 484
+store ret_type 489
+load 491 ir_result_abi___g_ir_result_reg_funcs
+load 492 callee
+field 493 492 0 string name
+call 494 contains_key bool 2 491 493
+brif 494 L3419 L3420
 label L3419
-load 544 idx
-store ir_emitter_core___g_ir_rcall_current_idx 544
-load 545 r
-load 546 callee
-field 547 546 0 string name
-load 548 arg_regs
-call 549 pith_list_len int 1 548
-load 550 arg_regs
-call 551 ir_call_helpers_ir_join_arg_regs string 1 550
-call 552 ir_emitter_core_ir_emit_result_reg_call int 4 545 547 549 551
-call 553 pith_cstring_release void 1 551
-store r 552
-iconst 554 0
-iconst 555 1
-sub 556 554 555
-store ir_emitter_core___g_ir_rcall_current_idx 556
+load 495 idx
+store ir_emitter_core___g_ir_rcall_current_idx 495
+load 496 r
+load 497 callee
+field 498 497 0 string name
+load 499 arg_regs
+call 500 pith_list_len int 1 499
+load 501 arg_regs
+call 502 ir_call_helpers_ir_join_arg_regs string 1 501
+call 503 ir_emitter_core_ir_emit_result_reg_call int 4 496 498 500 502
+call 504 pith_cstring_release void 1 502
+store r 503
+iconst 505 0
+iconst 506 1
+sub 507 505 506
+store ir_emitter_core___g_ir_rcall_current_idx 507
 jmp L3418
 label L3420
-load 557 devirt_name
-call 558 string_len int 1 557
-iconst 559 0
-gt 560 558 559
-brif 560 L3421 L3422
+load 508 devirt_name
+call 509 string_len int 1 508
+iconst 510 0
+gt 511 509 510
+brif 511 L3421 L3422
 label L3421
-call 561 ir_builder_ir_reg int 0
-store handle_r 561
-load 562 handle_r
-load 563 devirt_name
-call 564 ir_emitter_core_ir_emit_name_load void 2 562 563
-load 565 r
-load 566 callee
-field 567 566 0 string name
-load 568 ret_type
-load 569 arg_regs
-call 570 pith_list_len int 1 569
-iconst 571 1
-add 572 570 571
-strref 573 m51s348
-load 574 handle_r
-call 575 int_to_string string 1 574
-concat 576 573 575
-call 577 pith_cstring_release void 1 573
-call 578 pith_cstring_release void 1 575
-load 579 arg_regs
-call 580 ir_call_helpers_ir_join_arg_regs string 1 579
-concat 581 576 580
-call 582 pith_cstring_release void 1 576
-call 583 pith_cstring_release void 1 580
-call 584 ir_call_emit_ir_emit_call_text void 5 565 567 568 572 581
-call 585 pith_cstring_release void 1 581
+load 512 r
+load 513 callee
+field 514 513 0 string name
+load 515 ret_type
+load 516 devirt_name
+load 517 arg_regs
+call 518 ir_emitter_core_ir_emit_devirtualized_call void 5 512 514 515 516 517
 jmp L3418
 label L3422
-load 586 r
-load 587 callee
-field 588 587 0 string name
-load 589 ret_type
-load 590 arg_regs
-call 591 pith_list_len int 1 590
-load 592 arg_regs
-call 593 ir_call_helpers_ir_join_arg_regs string 1 592
-call 594 ir_call_emit_ir_emit_call_text void 5 586 588 589 591 593
-call 595 pith_cstring_release void 1 593
+load 519 r
+load 520 callee
+field 521 520 0 string name
+load 522 ret_type
+load 523 arg_regs
+call 524 pith_list_len int 1 523
+load 525 arg_regs
+call 526 ir_call_helpers_ir_join_arg_regs string 1 525
+call 527 ir_call_emit_ir_emit_call_text void 5 519 521 522 524 526
+call 528 pith_cstring_release void 1 526
 label L3418
-load 596 callee
-field 597 596 0 string name
-call 598 ir_method_tables_ir_is_declared_callable bool 1 597
-iconst 600 1
-sub 599 600 598
-brif 599 L3424 L3425
+load 529 callee
+field 530 529 0 string name
+call 531 ir_method_tables_ir_is_declared_callable bool 1 530
+iconst 533 1
+sub 532 533 531
+brif 532 L3424 L3425
 label L3424
-load 601 free_opt_kind
-load 602 callee
-field 603 602 0 string name
-strref 604 m51s88
-call 605 ir_emitter_core_ir_runtime_opt_producer_payload_kind string 2 603 604
-call 606 pith_cstring_release void 1 604
-call 607 pith_cstring_release void 1 601
-store free_opt_kind 605
-load 608 free_opt_kind
-call 609 string_len int 1 608
-iconst 610 0
-gt 611 609 610
-brif 611 L3427 L3428
+load 534 free_opt_kind
+load 535 callee
+field 536 535 0 string name
+strref 537 m51s88
+call 538 ir_emitter_core_ir_runtime_opt_producer_payload_kind string 2 536 537
+call 539 pith_cstring_release void 1 537
+call 540 pith_cstring_release void 1 534
+store free_opt_kind 538
+load 541 free_opt_kind
+call 542 string_len int 1 541
+iconst 543 0
+gt 544 542 543
+brif 544 L3427 L3428
 label L3427
-load 612 r
-load 613 free_opt_kind
-call 614 ir_optionals_ir_emit_optional_attach_dtor void 2 612 613
+load 545 r
+load 546 free_opt_kind
+call 547 ir_optionals_ir_emit_optional_attach_dtor void 2 545 546
 jmp L3426
 label L3428
 label L3426
 jmp L3423
 label L3425
 label L3423
-load 615 node
-load 616 ret_type
-load 617 r
-load 618 arg_regs
-call 619 ir_emitter_core_ir_attach_generic_construction_dtor void 4 615 616 617 618
-load 620 node
-call 621 ir_emitter_core_ir_is_generic_struct_construction_call bool 1 620
-iconst 623 1
-sub 622 623 621
-brif 622 L3430 L3431
+load 548 node
+load 549 ret_type
+load 550 r
+load 551 arg_regs
+call 552 ir_emitter_core_ir_attach_generic_construction_dtor void 4 548 549 550 551
+load 553 node
+call 554 ir_emitter_core_ir_is_generic_struct_construction_call bool 1 553
+iconst 556 1
+sub 555 556 554
+brif 555 L3430 L3431
 label L3430
-load 624 node
-iconst 625 1
-load 626 arg_regs
-call 627 ir_emitter_core_ir_release_owned_args void 3 624 625 626
+load 557 node
+iconst 558 1
+load 559 arg_regs
+call 560 ir_emitter_core_ir_release_owned_args void 3 557 558 559
 jmp L3429
 label L3431
 label L3429
-iconst 628 0
-store __and_628_3435 628
-iconst 629 0
-store __and_629_3435 629
-load 630 uses_result_abi
-store __and_629_3435 630
-brif 630 L3435 L3436
+iconst 561 0
+store __and_561_3435 561
+iconst 562 0
+store __and_562_3435 562
+load 563 uses_result_abi
+store __and_562_3435 563
+brif 563 L3435 L3436
 label L3435
-load 631 ret_type
-strref 632 m51s23
-call 634 pith_cstring_eq bool 2 631 632
-iconst 635 1
-sub 633 635 634
-call 636 pith_cstring_release void 1 632
-store __and_629_3435 633
+load 564 ret_type
+strref 565 m51s23
+call 567 pith_cstring_eq bool 2 564 565
+iconst 568 1
+sub 566 568 567
+call 569 pith_cstring_release void 1 565
+store __and_562_3435 566
 label L3436
-load 637 __and_629_3435
-store __and_628_3435 637
-brif 637 L3437 L3438
+load 570 __and_562_3435
+store __and_561_3435 570
+brif 570 L3437 L3438
 label L3437
-load 638 idx
-call 639 ir_type_helpers_ir_checked_result_kind string 1 638
-strref 640 m51s23
-call 641 pith_cstring_eq bool 2 639 640
-call 642 pith_cstring_release void 1 639
-call 643 pith_cstring_release void 1 640
-store __and_628_3435 641
+load 571 idx
+call 572 ir_type_helpers_ir_checked_result_kind string 1 571
+strref 573 m51s23
+call 574 pith_cstring_eq bool 2 572 573
+call 575 pith_cstring_release void 1 572
+call 576 pith_cstring_release void 1 573
+store __and_561_3435 574
 label L3438
-load 644 __and_628_3435
-brif 644 L3433 L3434
+load 577 __and_561_3435
+brif 577 L3433 L3434
 label L3433
-iconst 645 0
-store __and_645_3442 645
-load 646 ret_type
-strref 647 m51s746
-call 649 pith_cstring_eq bool 2 646 647
-iconst 650 1
-sub 648 650 649
-call 651 pith_cstring_release void 1 647
-store __and_645_3442 648
-brif 648 L3442 L3443
+iconst 578 0
+store __and_578_3442 578
+load 579 ret_type
+strref 580 m51s746
+call 582 pith_cstring_eq bool 2 579 580
+iconst 583 1
+sub 581 583 582
+call 584 pith_cstring_release void 1 580
+store __and_578_3442 581
+brif 581 L3442 L3443
 label L3442
-load 652 idx
-load 653 ir_emitter_core___g_ir_rcall_defer_idx
-eq 654 652 653
-store __and_645_3442 654
+load 585 idx
+load 586 ir_emitter_core___g_ir_rcall_defer_idx
+eq 587 585 586
+store __and_578_3442 587
 label L3443
-load 655 __and_645_3442
-brif 655 L3440 L3441
+load 588 __and_578_3442
+brif 588 L3440 L3441
 label L3440
-load 656 r
-load 657 ret_type
-load 658 callee
-field 659 658 0 string name
-call 660 ir_emitter_core_ir_emit_wrapped_legacy_pair int 3 656 657 659
-load 661 explicit_generic_types
-call 662 pith_list_release_handle void 1 661
-load 663 callee_node
-call 664 pith_struct_release void 1 663
-load 665 callee
-call 666 pith_struct_release void 1 665
-load 667 devirt_name
-call 668 pith_cstring_release void 1 667
-load 669 callee_n
-call 670 pith_struct_release void 1 669
-load 671 direct
-call 672 pith_cstring_release void 1 671
-load 673 loop_slot
-call 674 pith_cstring_release void 1 673
-load 675 arg_regs
-call 676 pith_list_release_handle void 1 675
-load 677 ret_type
-call 678 pith_cstring_release void 1 677
-load 679 free_opt_kind
-call 680 pith_cstring_release void 1 679
-ret 660
+load 589 r
+load 590 ret_type
+load 591 callee
+field 592 591 0 string name
+call 593 ir_emitter_core_ir_emit_wrapped_legacy_pair int 3 589 590 592
+load 594 explicit_generic_types
+call 595 pith_list_release_handle void 1 594
+load 596 callee_node
+call 597 pith_struct_release void 1 596
+load 598 callee
+call 599 pith_struct_release void 1 598
+load 600 devirt_name
+call 601 pith_cstring_release void 1 600
+load 602 callee_n
+call 603 pith_struct_release void 1 602
+load 604 direct
+call 605 pith_cstring_release void 1 604
+load 606 loop_slot
+call 607 pith_cstring_release void 1 606
+load 608 arg_regs
+call 609 pith_list_release_handle void 1 608
+load 610 ret_type
+call 611 pith_cstring_release void 1 610
+load 612 free_opt_kind
+call 613 pith_cstring_release void 1 612
+ret 593
 label L3441
 label L3439
-load 681 r
-load 682 ret_type
-load 683 callee
-field 684 683 0 string name
-call 685 ir_emitter_core_ir_emit_wrapped_legacy_result int 3 681 682 684
-load 686 explicit_generic_types
-call 687 pith_list_release_handle void 1 686
-load 688 callee_node
-call 689 pith_struct_release void 1 688
-load 690 callee
-call 691 pith_struct_release void 1 690
-load 692 devirt_name
-call 693 pith_cstring_release void 1 692
-load 694 callee_n
-call 695 pith_struct_release void 1 694
-load 696 direct
-call 697 pith_cstring_release void 1 696
-load 698 loop_slot
-call 699 pith_cstring_release void 1 698
-load 700 arg_regs
-call 701 pith_list_release_handle void 1 700
-load 702 ret_type
-call 703 pith_cstring_release void 1 702
-load 704 free_opt_kind
-call 705 pith_cstring_release void 1 704
-ret 685
+load 614 r
+load 615 ret_type
+load 616 callee
+field 617 616 0 string name
+call 618 ir_emitter_core_ir_emit_wrapped_legacy_result int 3 614 615 617
+load 619 explicit_generic_types
+call 620 pith_list_release_handle void 1 619
+load 621 callee_node
+call 622 pith_struct_release void 1 621
+load 623 callee
+call 624 pith_struct_release void 1 623
+load 625 devirt_name
+call 626 pith_cstring_release void 1 625
+load 627 callee_n
+call 628 pith_struct_release void 1 627
+load 629 direct
+call 630 pith_cstring_release void 1 629
+load 631 loop_slot
+call 632 pith_cstring_release void 1 631
+load 633 arg_regs
+call 634 pith_list_release_handle void 1 633
+load 635 ret_type
+call 636 pith_cstring_release void 1 635
+load 637 free_opt_kind
+call 638 pith_cstring_release void 1 637
+ret 618
 label L3434
 label L3432
-load 706 r
-load 707 explicit_generic_types
-call 708 pith_list_release_handle void 1 707
-load 709 callee_node
-call 710 pith_struct_release void 1 709
-load 711 callee
-call 712 pith_struct_release void 1 711
-load 713 devirt_name
-call 714 pith_cstring_release void 1 713
-load 715 callee_n
-call 716 pith_struct_release void 1 715
-load 717 direct
-call 718 pith_cstring_release void 1 717
-load 719 loop_slot
-call 720 pith_cstring_release void 1 719
-load 721 arg_regs
-call 722 pith_list_release_handle void 1 721
-load 723 ret_type
-call 724 pith_cstring_release void 1 723
-load 725 free_opt_kind
-call 726 pith_cstring_release void 1 725
-ret 706
-load 727 explicit_generic_types
-call 728 pith_list_release_handle void 1 727
-load 729 callee_node
-call 730 pith_struct_release void 1 729
-load 731 callee
-call 732 pith_struct_release void 1 731
-load 733 devirt_name
-call 734 pith_cstring_release void 1 733
-load 735 callee_n
-call 736 pith_struct_release void 1 735
-load 737 direct
-call 738 pith_cstring_release void 1 737
-load 739 loop_slot
-call 740 pith_cstring_release void 1 739
-load 741 arg_regs
-call 742 pith_list_release_handle void 1 741
-load 743 ret_type
-call 744 pith_cstring_release void 1 743
-load 745 free_opt_kind
-call 746 pith_cstring_release void 1 745
-iconst 747 0
-ret 747
+load 639 r
+load 640 explicit_generic_types
+call 641 pith_list_release_handle void 1 640
+load 642 callee_node
+call 643 pith_struct_release void 1 642
+load 644 callee
+call 645 pith_struct_release void 1 644
+load 646 devirt_name
+call 647 pith_cstring_release void 1 646
+load 648 callee_n
+call 649 pith_struct_release void 1 648
+load 650 direct
+call 651 pith_cstring_release void 1 650
+load 652 loop_slot
+call 653 pith_cstring_release void 1 652
+load 654 arg_regs
+call 655 pith_list_release_handle void 1 654
+load 656 ret_type
+call 657 pith_cstring_release void 1 656
+load 658 free_opt_kind
+call 659 pith_cstring_release void 1 658
+ret 639
+load 660 explicit_generic_types
+call 661 pith_list_release_handle void 1 660
+load 662 callee_node
+call 663 pith_struct_release void 1 662
+load 664 callee
+call 665 pith_struct_release void 1 664
+load 666 devirt_name
+call 667 pith_cstring_release void 1 666
+load 668 callee_n
+call 669 pith_struct_release void 1 668
+load 670 direct
+call 671 pith_cstring_release void 1 670
+load 672 loop_slot
+call 673 pith_cstring_release void 1 672
+load 674 arg_regs
+call 675 pith_list_release_handle void 1 674
+load 676 ret_type
+call 677 pith_cstring_release void 1 676
+load 678 free_opt_kind
+call 679 pith_cstring_release void 1 678
+iconst 680 0
+ret 680
 endfunc
 func ir_emitter_core_ir_emit_map_entry_insert 5 void
 param map_r

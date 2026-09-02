@@ -1,0 +1,75 @@
+# a local bound once to a lambda literal is called directly, with the closure
+# handle passed as the lambda's hidden first argument. every shape here must
+# print the same answer whether the call is direct or goes through the
+# function pointer in the closure, so a wrong lowering shows as a wrong number
+# rather than a crash that happens to pass.
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int:
+    # a closure-typed parameter: the callee is not known here, so this stays
+    # an indirect call and must keep working beside the direct ones
+    return f(x)
+
+fn direct_capture() -> Int:
+    base := 40
+    add := fn(x: Int) => base + x
+    # the same handle also travels as a value, so the direct call and the
+    # indirect call see one closure
+    return add(2) + apply(add, 2)
+
+fn direct_many_calls() -> Int:
+    step := 3
+    bump := fn(x: Int) => x + step
+    mut acc := 0
+    mut i := 0
+    while i < 1000:
+        acc = bump(acc)
+        i = i + 1
+    return acc
+
+fn rebound_is_indirect() -> Int:
+    # a `mut` binding may change, so it is never devirtualized
+    mut f := fn(x: Int) => x * 2
+    a := f(5)
+    f = fn(x: Int) => x * 3
+    return a + f(5)
+
+fn two_lambdas_one_name(flag: Bool) -> Int:
+    # the same name bound to different lambdas in sibling blocks has no single
+    # target and stays indirect on both sides
+    if flag:
+        g := fn(x: Int) => x + 100
+        return g(1)
+    g := fn(x: Int) => x + 200
+    return g(1)
+
+fn nested_frames() -> Int:
+    outer := fn(x: Int) => x + 1
+    make := fn(y: Int) -> Int:
+        # this body is its own frame: `outer` is a capture here, loaded from
+        # the environment, and calling it goes through the closure
+        inner := fn(z: Int) => z * 10
+        return inner(outer(y))
+    return make(4) + outer(0)
+
+fn multi_line_body() -> Int:
+    scale := 7
+    f := fn(a: Int, b: Int) -> Int:
+        if a > b:
+            return (a - b) * scale
+        return (b - a) * scale
+    return f(10, 3) + f(3, 10)
+
+fn returns_string() -> String:
+    tag := "v"
+    name := fn(n: Int) => tag + n.to_string()
+    return name(1) + name(2)
+
+fn main() -> Int:
+    print("capture {direct_capture()}")
+    print("many {direct_many_calls()}")
+    print("rebound {rebound_is_indirect()}")
+    print("two {two_lambdas_one_name(true)} {two_lambdas_one_name(false)}")
+    print("nested {nested_frames()}")
+    print("multi {multi_line_body()}")
+    print("string {returns_string()}")
+    return 0

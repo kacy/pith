@@ -203,8 +203,7 @@ impl Ring {
                     Ok(_) => {
                         let value = unsafe { *slot.cell.get() };
                         // hand the slot to the enqueuer one lap later.
-                        slot.sequence
-                            .store(pos + self.mask + 1, Ordering::Release);
+                        slot.sequence.store(pos + self.mask + 1, Ordering::Release);
                         return Some(value);
                     }
                     Err(actual) => pos = actual,
@@ -1080,7 +1079,11 @@ mod tests {
         unsafe { pith_channel_retain(ch) }; // the sender's own count
         let receivers: Vec<_> = (0..3)
             // recv returns an optional shell: slot 0 is the presence flag, slot 1 the value
-            .map(|_| std::thread::spawn(move || unsafe { *((pith_channel_recv(ch) as *const i64).add(1)) }))
+            .map(|_| {
+                std::thread::spawn(move || unsafe {
+                    *((pith_channel_recv(ch) as *const i64).add(1))
+                })
+            })
             .collect();
         std::thread::sleep(std::time::Duration::from_millis(60));
         unsafe { pith_channel_release(ch) }; // the creator is gone; receivers still parked
@@ -1109,8 +1112,16 @@ mod tests {
         }
         assert_eq!(unsafe { pith_channel_len(outer) }, 3);
         for &inner in &inners {
-            assert_eq!(unsafe { pith_channel_send(inner, 1) }, 1, "alive while queued");
-            assert_eq!(unsafe { *(pith_channel_try_recv(inner) as *const i64) }, 1, "present");
+            assert_eq!(
+                unsafe { pith_channel_send(inner, 1) },
+                1,
+                "alive while queued"
+            );
+            assert_eq!(
+                unsafe { *(pith_channel_try_recv(inner) as *const i64) },
+                1,
+                "present"
+            );
         }
         let before = frees();
         unsafe { pith_channel_release(outer) };
@@ -1202,7 +1213,11 @@ mod tests {
             assert_eq!((*t, *t.add(1)), (1, 42));
             pith_channel_close(ch);
 
-            assert_eq!(sender.join().unwrap(), 1, "delivered value reported as failed");
+            assert_eq!(
+                sender.join().unwrap(),
+                1,
+                "delivered value reported as failed"
+            );
         }
     }
 
@@ -1254,7 +1269,11 @@ mod tests {
             assert_eq!(*t, 0);
             let before = frees();
             pith_channel_release(ch);
-            assert_eq!(frees(), before + 1, "the owner's release frees the closed channel");
+            assert_eq!(
+                frees(),
+                before + 1,
+                "the owner's release frees the closed channel"
+            );
         }
     }
 
@@ -1315,7 +1334,11 @@ mod tests {
                 pith_channel_release(ch); // the creator's count, last or not
             }
         }
-        assert_eq!(frees(), before + 1500, "every round freed its channel exactly once");
+        assert_eq!(
+            frees(),
+            before + 1500,
+            "every round freed its channel exactly once"
+        );
     }
 
     #[test]
@@ -1533,7 +1556,10 @@ mod tests {
 
             assert_eq!(count.load(Ordering::Relaxed), total_msgs);
             // every id in 0..total_msgs was seen exactly once
-            assert_eq!(sum.load(Ordering::Relaxed), total_msgs * (total_msgs - 1) / 2);
+            assert_eq!(
+                sum.load(Ordering::Relaxed),
+                total_msgs * (total_msgs - 1) / 2
+            );
         }
     }
 }

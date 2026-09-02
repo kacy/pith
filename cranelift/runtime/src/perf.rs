@@ -34,7 +34,6 @@ pub static PERF_CHANNEL_CLOSES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CHANNEL_RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CHANNEL_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CHANNEL_FREED_BYTES: AtomicUsize = AtomicUsize::new(0);
-pub static PERF_CHANNEL_USE_AFTER_ZERO: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SIGNAL_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SOCK_READS: AtomicUsize = AtomicUsize::new(0);
@@ -247,13 +246,12 @@ pub fn dump_perf_stats() {
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "  channels: new={} closed={} freed={} retained_bytes={} freed_bytes={} use_after_zero={}",
+        "  channels: new={} closed={} freed={} retained_bytes={} freed_bytes={}",
         PERF_CHANNEL_NEWS.load(Ordering::Relaxed),
         PERF_CHANNEL_CLOSES.load(Ordering::Relaxed),
         PERF_CHANNEL_FREES.load(Ordering::Relaxed),
         PERF_CHANNEL_RETAINED_BYTES.load(Ordering::Relaxed),
         PERF_CHANNEL_FREED_BYTES.load(Ordering::Relaxed),
-        PERF_CHANNEL_USE_AFTER_ZERO.load(Ordering::Relaxed),
     );
     eprintln!(
         "  signals: waits={} deliveries={}",

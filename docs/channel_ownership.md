@@ -12,8 +12,9 @@ this page is the design work behind issue #960 and its sequel #984: what a
 channel costs, who can be holding one when it would be freed, why the first
 free path (stage 1's hazard-guarded reclamation) was sound but cost the
 os-thread backend about 14% of channel throughput, and why the language-level
-count under option (a) below replaced it. stages 1 and 5 shipped; the hazard
-machinery of stage 1 is retired by the change that follows stage 5.
+count under option (a) below replaced it. stages 1 and 5 shipped, and stage 1's
+hazard machinery has since been deleted; "the hazard" below is the record of
+why it was built and what it cost.
 
 ## what a channel costs
 
@@ -671,12 +672,17 @@ emits; the last release retires the body, and the flush drains values never
 received, releasing each by the payload tag after it has dropped its locks (a
 payload that is itself a channel releases through the same path).
 
-this landed with the hazard guard still in place, deliberately: the count
-lives beside the guard, so a counting mistake can only show as a channel
-answering its closed-and-drained default early (`use_after_zero` on the
-`channels:` perf line, an abort under `PITH_CHANNEL_STRICT=1`) or as `new`
-exceeding `freed` — never as a use-after-free. the change that follows deletes
-the guard and frees at zero, taking a count only around a park.
+it landed in two steps. the first put the count beside the still-present
+hazard guard, so a counting mistake could only show as a channel answering its
+closed-and-drained default early or as `new` exceeding `freed` — never as a
+use-after-free — and the leak programs, goldens, and memcheck runs established
+that the count was right. the second deleted the guard: a channel is one
+allocation owned by its count, an operation pays an alignment check and a magic
+check and nothing else, and a parking operation takes a count of its own for
+the span of its call (`ParkCount`, declared first in every blocking entry point
+so it releases last, after every post-wake read of the body). the magic word is
+scrubbed at free so a stale handle fails validation, the same practical guard
+every other counted kind relies on.
 
 this is the stage that can crash, so it is the stage with the standard to match:
 valgrind clean under `PITH_STRUCT_FREELIST=0` on both backends, on a

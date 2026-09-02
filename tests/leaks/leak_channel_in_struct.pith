@@ -1,12 +1,7 @@
 # a channel carried in a struct field through a function and back inside
 # another struct, then dropped. the struct destructor releases the channel;
 # the channel frees at zero.
-# pending, not registered: the channel's body is freed at the last owner,
-# but the 128-byte stub that validates the handle is still permanent, so this
-# case grows by one stub per round (measured: freed == new on both backends
-# under PITH_PERF_STATS, i.e. every body returns) and cannot be flat until the
-# change that deletes the stub. it moves to tests/leaks and is registered then.
-import pendingprobe as probe
+import leakprobe as probe
 
 struct Inbox:
     pub ch: Channel[Int]

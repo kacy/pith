@@ -213,7 +213,8 @@ pub fn dump_perf_stats() {
         "  cstrings: alloc={} free={} live={} retain={} release={}",
         PERF_CSTRING_ALLOCS.load(Ordering::Relaxed),
         PERF_CSTRING_FREES.load(Ordering::Relaxed),
-        PERF_CSTRING_ALLOCS.load(Ordering::Relaxed) as i64 - PERF_CSTRING_FREES.load(Ordering::Relaxed) as i64,
+        PERF_CSTRING_ALLOCS.load(Ordering::Relaxed) as i64
+            - PERF_CSTRING_FREES.load(Ordering::Relaxed) as i64,
         PERF_CSTRING_RETAINS.load(Ordering::Relaxed),
         PERF_CSTRING_RELEASES.load(Ordering::Relaxed),
     );
@@ -270,7 +271,8 @@ pub fn dump_perf_stats() {
         "  lists: new={} free={} live={}",
         PERF_LIST_NEWS.load(Ordering::Relaxed),
         PERF_LIST_FREES.load(Ordering::Relaxed),
-        PERF_LIST_NEWS.load(Ordering::Relaxed) as i64 - PERF_LIST_FREES.load(Ordering::Relaxed) as i64,
+        PERF_LIST_NEWS.load(Ordering::Relaxed) as i64
+            - PERF_LIST_FREES.load(Ordering::Relaxed) as i64,
     );
     eprintln!(
         "  list ops: push={} get={} get_value={} checked={} unchecked={} get_bytes={} elem8={} elem_other={} set={} insert={} remove={}",

@@ -1,0 +1,38 @@
+# channels returned from functions: a fresh one, an alias of a stored field
+# (the shape std.concurrent's accessors use), and one inside a tuple.
+
+fn fresh(cap: Int) -> Channel[Int]:
+    c := Channel[Int](cap)
+    c.send(cap)
+    return c
+
+struct Ticker:
+    pub tick: Channel[Int]
+
+fn channel_of(t: Ticker) -> Channel[Int]:
+    return t.tick
+
+fn pair() -> (Channel[Int], Int):
+    c := Channel[Int](1)
+    c.send(9)
+    return (c, 9)
+
+fn main() -> Int:
+    a := fresh(3)
+    if let v = a.recv():
+        print("fresh {v} cap {a.cap()}")
+
+    t := Ticker(tick: Channel[Int](2))
+    alias := channel_of(t)
+    t.tick.send(1)
+    if let v = alias.recv():
+        print("alias {v}")
+    alias.send(2)
+    if let v = t.tick.recv():
+        print("back through the field {v}")
+
+    p := pair()
+    c := p.0
+    if let v = c.recv():
+        print("tuple {v} {p.1}")
+    return 0

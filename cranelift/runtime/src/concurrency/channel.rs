@@ -322,6 +322,11 @@ struct PaddedCount(AtomicUsize);
 /// what stays behind is under 3% of what comes back.
 struct TaggedChannel {
     magic: u32,
+    /// the element-tag code of the payload type (the same table lists use),
+    /// recorded at construction because the binding loses the payload type and
+    /// only the constructor site knows it. a free with values still queued
+    /// releases each by this tag; 0 means a plain value with nothing to release.
+    payload_tag: u8,
     /// the requested capacity, kept out of the body so `cap()` answers the same
     /// number before and after the body is reclaimed.
     capacity: u32,
@@ -333,9 +338,40 @@ struct TaggedChannel {
     /// so a counter sharing it would put the park path's read-modify-writes on
     /// the fast path's cache line.
     body: AtomicPtr<ChannelInner>,
-    /// operations that upgraded to a counted claim because they were about to
-    /// park (see `ChannelGuard::upgrade`). the fast path never touches this.
+    /// the language's owners of this handle — one per binding, field, element,
+    /// or capture, taken by `pith_channel_retain` and given back by
+    /// `pith_channel_release` — plus operations that upgraded to a counted claim
+    /// because they were about to park (see `ChannelGuard::upgrade`). the fast
+    /// path never touches this. the last release retires the body.
     refs: PaddedCount,
+    /// why the body left service: 0 in service, 1 closed and drained, 2 the
+    /// last owner released it. an operation that finds no body under cause 2
+    /// is a program touching a channel after its own count reached zero — a
+    /// missing retain somewhere in the emitter — and is counted, and under
+    /// PITH_CHANNEL_STRICT=1 aborted, rather than answered with a default.
+    retired_by: std::sync::atomic::AtomicU8,
+}
+
+const RETIRED_IN_SERVICE: u8 = 0;
+const RETIRED_CLOSED_AND_DRAINED: u8 = 1;
+const RETIRED_BY_LAST_OWNER: u8 = 2;
+
+// 0 = not probed, 1 = off, 2 = on: whether a use after the last owner's
+// release aborts instead of counting. off by default; the counter is always
+// kept so a run with PITH_PERF_STATS=1 shows it as use_after_zero.
+static CHANNEL_STRICT_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cold]
+fn channel_strict() -> bool {
+    match CHANNEL_STRICT_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("PITH_CHANNEL_STRICT").as_deref() == Ok("1");
+            CHANNEL_STRICT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +570,10 @@ fn lock_limbo() -> MutexGuard<'static, Limbo> {
 /// order, a straddling scan could read the count before the add and the hazard
 /// after the clear and free under a live claim.
 unsafe fn flush_limbo() {
+    // values still queued in a freed body are released only after both locks
+    // are dropped: a payload that is itself a channel releases through this
+    // same path, and the mutexes are not re-entrant.
+    let mut orphans: Vec<(crate::collections::list::ListTypeTag, i64)> = Vec::new();
     let mut limbo = lock_limbo();
     let registry = lock_registry();
     limbo.entries.retain(|&(stub, body)| {
@@ -548,12 +588,32 @@ unsafe fn flush_limbo() {
             return true;
         }
         let bytes = channel_body_bytes((*body).capacity);
+        // nothing names the body any more, so the ring is quiescent and this
+        // drain is exact. values a program never received are released by the
+        // payload tag once the locks are down; a plain-value channel (tag 0)
+        // has nothing to release.
+        let tag = crate::collections::list::element_tag_from_code((*stub).payload_tag as i32);
+        if !matches!(tag, crate::collections::list::ListTypeTag::Primitive) {
+            if let Some(ring) = &(*body).ring {
+                while let Some(v) = ring.try_dequeue() {
+                    orphans.push((tag, v));
+                }
+            }
+            if let Some(v) = lock_state(&(*body).state).pending_value.take() {
+                orphans.push((tag, v));
+            }
+        }
         drop(Box::from_raw(body));
         crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
         crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
         false
     });
     LIMBO_PENDING.store(limbo.entries.len(), Ordering::SeqCst);
+    drop(registry);
+    drop(limbo);
+    for (tag, v) in orphans {
+        crate::collections::list::release_element(tag, v);
+    }
 }
 
 /// how an in-flight operation's guard is keeping the body alive.
@@ -675,6 +735,10 @@ unsafe fn retire_if_spent(guard: &ChannelGuard) {
             return;
         }
     }
+    guard
+        .stub()
+        .retired_by
+        .store(RETIRED_CLOSED_AND_DRAINED, Ordering::Release);
     retire(guard.stub());
 }
 
@@ -715,6 +779,13 @@ unsafe fn channel_acquire<'a>(handle: i64) -> Option<ChannelGuard> {
     let stub: &'a TaggedChannel = channel_stub(handle)?;
     let body = stub.body.load(Ordering::SeqCst);
     if body.is_null() {
+        if stub.retired_by.load(Ordering::Acquire) == RETIRED_BY_LAST_OWNER {
+            crate::perf_count(&crate::PERF_CHANNEL_USE_AFTER_ZERO, 1);
+            if channel_strict() {
+                eprintln!("pith: channel used after its last owner released it");
+                std::process::abort();
+            }
+        }
         return None;
     }
     let slot = hazard_slot();
@@ -904,7 +975,7 @@ fn optional_tuple(is_some: bool, value: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
+pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
     // the ring is allocated up front, so an absurd capacity would abort the
     // process on the allocation rather than fail the call. cap it: past this
     // many buffered values a program wants a queue it manages itself.
@@ -931,12 +1002,16 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         senders: Condvar::new(),
         receivers: Condvar::new(),
     }));
-    // `refs` counts only parked claims; "in service" is `body` being non-null.
+    // `refs` starts at one: the creator's count. "in service" is still `body`
+    // being non-null, because a close-and-drain can retire the body while
+    // owners remain.
     let ptr = Box::into_raw(Box::new(TaggedChannel {
         magic: CHANNEL_MAGIC,
+        payload_tag: payload_tag.clamp(0, 255) as u8,
         capacity: cap as u32,
         body: AtomicPtr::new(body),
-        refs: PaddedCount(AtomicUsize::new(0)),
+        refs: PaddedCount(AtomicUsize::new(1)),
+        retired_by: std::sync::atomic::AtomicU8::new(RETIRED_IN_SERVICE),
     }));
     crate::perf_count(&crate::PERF_CHANNEL_NEWS, 1);
     crate::perf_count(&crate::PERF_CHANNEL_RETAINED_BYTES, channel_bytes(cap));
@@ -946,6 +1021,45 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         unsafe { flush_limbo() };
     }
     ptr as i64
+}
+
+/// One more owner of this handle: a binding, a field, an element, or a
+/// capture took a copy. Garbage handles are ignored, like every other kind.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_retain(handle: i64) {
+    let Some(stub) = channel_stub(handle) else {
+        return;
+    };
+    stub.refs.0.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One owner fewer. The last owner retires the body: it goes to limbo and is
+/// freed by the flush once no in-flight operation still names it, which is
+/// what lets this release run while another thread is mid-operation on a
+/// handle it borrowed from a holder this thread just dropped. Values still
+/// queued are released by the payload tag when the body is freed.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_release(handle: i64) {
+    let Some(stub) = channel_stub(handle) else {
+        return;
+    };
+    let prev = stub.refs.0.fetch_sub(1, Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        // an over-release: put the count back rather than wrap. the same guard
+        // every other kind's release has.
+        stub.refs.0.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(Ordering::Acquire);
+    stub.retired_by
+        .store(RETIRED_BY_LAST_OWNER, Ordering::Release);
+    retire(stub);
+    // `retire` returns early when a close-and-drain already unhooked the body;
+    // that body has been waiting in limbo for this count to reach zero.
+    flush_limbo();
 }
 
 /// the reclaimable bytes of one channel: the `ChannelInner` and the ring's
@@ -1375,6 +1489,69 @@ pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
 mod tests {
     use super::*;
 
+    // the creator drops its only count while three receivers are parked on
+    // the channel. the body must survive them: a parked operation holds a
+    // counted claim of its own, so the release retires nothing yet. a fourth
+    // holder, retained before the release, then feeds them; when the last
+    // count goes, the body is retired — observable as a send that now reports
+    // the closed-and-drained default instead of delivering.
+    #[test]
+    fn parked_receivers_then_last_release_elsewhere() {
+        let ch = pith_channel_new(4, 0);
+        unsafe { pith_channel_retain(ch) }; // the sender's own count
+        let receivers: Vec<_> = (0..3)
+            // recv returns an optional shell: slot 0 is the presence flag, slot 1 the value
+            .map(|_| std::thread::spawn(move || unsafe { *((pith_channel_recv(ch) as *const i64).add(1)) }))
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        unsafe { pith_channel_release(ch) }; // the creator is gone; receivers still parked
+        for v in 1..=3 {
+            assert_eq!(unsafe { pith_channel_send(ch, v) }, 1, "still in service");
+        }
+        let mut got: Vec<i64> = receivers.into_iter().map(|t| t.join().unwrap()).collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(unsafe { pith_channel_send(ch, 4) }, 1, "one holder remains");
+        unsafe { pith_channel_release(ch) };
+        assert_eq!(unsafe { pith_channel_send(ch, 5) }, 0, "retired at the last owner");
+        assert_eq!(unsafe { pith_channel_cap(ch) }, 4, "the stub still answers cap");
+    }
+
+    // a channel whose payloads are channels: releasing the outer one to zero
+    // drains its ring by the payload tag, which releases the inner channels'
+    // only counts — through this same retire/flush path, which is why the
+    // flush must release orphans after it has dropped its locks. each inner
+    // is then retired: a send on it reports the default.
+    #[test]
+    fn zero_drains_ring_by_tag() {
+        let outer = pith_channel_new(8, 8);
+        let inners: Vec<i64> = (0..3).map(|_| pith_channel_new(1, 0)).collect();
+        for &inner in &inners {
+            assert_eq!(unsafe { pith_channel_send(outer, inner) }, 1);
+        }
+        assert_eq!(unsafe { pith_channel_len(outer) }, 3);
+        for &inner in &inners {
+            assert_eq!(unsafe { pith_channel_send(inner, 1) }, 1, "alive while queued");
+            assert_eq!(unsafe { *(pith_channel_try_recv(inner) as *const i64) }, 1, "present");
+        }
+        unsafe { pith_channel_release(outer) };
+        assert_eq!(unsafe { pith_channel_send(outer, 9) }, 0, "outer retired");
+        for &inner in &inners {
+            assert_eq!(unsafe { pith_channel_send(inner, 1) }, 0, "inner released by the drain");
+        }
+    }
+
+    #[test]
+    fn over_release_is_restored_and_garbage_is_ignored() {
+        let ch = pith_channel_new(1, 0);
+        unsafe {
+            pith_channel_release(ch); // to zero: retired
+            pith_channel_release(ch); // over-release: count restored, no double free
+            pith_channel_retain(12345); // garbage: no-op
+            pith_channel_release(12345);
+        }
+    }
+
     // an ALIGNED but bogus handle: the magic check is what has to reject this,
     // since alignment alone lets the pointer be dereferenced. the older
     // registry lookup rejected every unknown address; the tag scheme rejects
@@ -1420,7 +1597,7 @@ mod tests {
     #[test]
     fn absurd_capacity_is_clamped() {
         unsafe {
-            let ch = pith_channel_new(i64::MAX);
+            let ch = pith_channel_new(i64::MAX, 0);
             assert_eq!(pith_channel_cap(ch), MAX_CHANNEL_CAPACITY);
             assert_eq!(pith_channel_try_send(ch, 1), 1);
             let t = pith_channel_try_recv(ch) as *const i64;
@@ -1436,7 +1613,7 @@ mod tests {
     #[test]
     fn unbuffered_send_reports_delivery_not_closure() {
         unsafe {
-            let ch = pith_channel_new(0);
+            let ch = pith_channel_new(0, 0);
             let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
 
             // take the value, then close while the sender is still parked
@@ -1454,7 +1631,7 @@ mod tests {
     #[test]
     fn unbuffered_send_fails_when_closed_undelivered() {
         unsafe {
-            let ch = pith_channel_new(0);
+            let ch = pith_channel_new(0, 0);
             let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 7) });
             std::thread::sleep(std::time::Duration::from_millis(50));
             pith_channel_close(ch);
@@ -1473,7 +1650,7 @@ mod tests {
     #[test]
     fn close_with_parked_receivers_retires_safely() {
         unsafe {
-            let ch = pith_channel_new(4);
+            let ch = pith_channel_new(4, 0);
             let receivers: Vec<_> = (0..3)
                 .map(|_| {
                     std::thread::spawn(move || unsafe {
@@ -1522,7 +1699,7 @@ mod tests {
         // twice or a slot read after it was freed.
         for _ in 0..1500 {
             unsafe {
-                let ch = pith_channel_new(8);
+                let ch = pith_channel_new(8, 0);
                 let sender = std::thread::spawn(move || unsafe {
                     let mut accepted = 0;
                     for v in 0..8 {
@@ -1558,7 +1735,7 @@ mod tests {
     fn close_drain_racing_senders_never_faults() {
         for _ in 0..1500 {
             unsafe {
-                let ch = pith_channel_new(2);
+                let ch = pith_channel_new(2, 0);
                 let sender = std::thread::spawn(move || unsafe {
                     for v in 0..8 {
                         if pith_channel_send(ch, v) == 0 {
@@ -1590,7 +1767,7 @@ mod tests {
     #[test]
     fn close_then_drain_keeps_values_then_retires() {
         unsafe {
-            let ch = pith_channel_new(8);
+            let ch = pith_channel_new(8, 0);
             for v in 1..=5 {
                 assert_eq!(pith_channel_send(ch, v), 1);
             }
@@ -1640,7 +1817,7 @@ mod tests {
     #[test]
     fn unbuffered_rendezvous_many_senders_one_receiver() {
         unsafe {
-            let ch = pith_channel_new(0);
+            let ch = pith_channel_new(0, 0);
             let n = 8i64;
             let senders: Vec<_> = (1..=n)
                 .map(|v| std::thread::spawn(move || assert_eq!(pith_channel_send(ch, v), 1)))
@@ -1666,7 +1843,7 @@ mod tests {
     #[test]
     fn buffered_capacity_one_refuses_second_send() {
         unsafe {
-            let ch = pith_channel_new(1);
+            let ch = pith_channel_new(1, 0);
             assert_eq!(pith_channel_try_send(ch, 4), 1);
             assert_eq!(pith_channel_try_send(ch, 5), 0, "capacity 1 is full");
             assert_eq!(pith_channel_len(ch), 1);
@@ -1683,7 +1860,7 @@ mod tests {
     #[test]
     fn buffered_ring_honors_non_power_of_two_capacity() {
         unsafe {
-            let ch = pith_channel_new(3);
+            let ch = pith_channel_new(3, 0);
             assert_eq!(pith_channel_cap(ch), 3);
             for v in 1..=3 {
                 assert_eq!(pith_channel_try_send(ch, v), 1);
@@ -1705,7 +1882,7 @@ mod tests {
     #[test]
     fn buffered_close_drains_then_reports_closed() {
         unsafe {
-            let ch = pith_channel_new(4);
+            let ch = pith_channel_new(4, 0);
             assert_eq!(pith_channel_send(ch, 41), 1);
             assert_eq!(pith_channel_send(ch, 42), 1);
             pith_channel_close(ch);
@@ -1729,7 +1906,7 @@ mod tests {
         use std::sync::atomic::{AtomicI64, Ordering};
         use std::sync::Arc;
         unsafe {
-            let ch = pith_channel_new(4);
+            let ch = pith_channel_new(4, 0);
             let producers = 4i64;
             let per = 500i64;
             let total_msgs = producers * per;
@@ -1786,7 +1963,7 @@ mod tmp_bench {
     #[ignore]
     fn opcost() {
         unsafe {
-            let ch = pith_channel_new(256);
+            let ch = pith_channel_new(256, 0);
             let n: i64 = 5_000_000;
             let mut sink = 0i64;
             let t0 = std::time::Instant::now();

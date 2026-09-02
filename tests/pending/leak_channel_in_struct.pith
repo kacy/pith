@@ -1,0 +1,38 @@
+# a channel carried in a struct field through a function and back inside
+# another struct, then dropped. the struct destructor releases the channel;
+# the channel frees at zero.
+# pending, not registered: the channel's body is freed at the last owner,
+# but the 128-byte stub that validates the handle is still permanent, so this
+# case grows by one stub per round (measured: freed == new on both backends
+# under PITH_PERF_STATS, i.e. every body returns) and cannot be flat until the
+# change that deletes the stub. it moves to tests/leaks and is registered then.
+import pendingprobe as probe
+
+struct Inbox:
+    pub ch: Channel[Int]
+    pub tag: String
+
+struct Wrapped:
+    pub inner: Inbox
+    pub n: Int
+
+fn wrap(box: Inbox, n: Int) -> Wrapped:
+    box.ch.send(n)
+    return Wrapped(inner: box, n: n)
+
+fn round(i: Int) -> Int:
+    w := wrap(Inbox(ch: Channel[Int](2), tag: "t{i}"), i)
+    mut got := 0
+    if let v = w.inner.ch.recv():
+        got = v
+    return got
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

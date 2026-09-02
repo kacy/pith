@@ -33,12 +33,13 @@ the basic channel surface is:
 
 send on a closed channel returns `false`. recv on a closed and drained channel returns `none`.
 
-`close()` is not a free. a channel's memory — about 400 bytes plus 16 per
-buffered slot, allocated eagerly at construction — is held for the life of the
-process, and nothing in the language owns a handle. that is fine for the
-channels a program sets up once and keeps, and it is a growing cost for a server
-that creates one per request. `PITH_PERF_STATS=1` reports the running total on
-the `channels:` line; docs/channel_ownership.md has the analysis and the plan.
+`close()` is not a free, and it does not need to be one: a channel handle is
+reference-counted like a string or a list, so the channel's memory — about 400
+bytes plus 16 per buffered slot, allocated eagerly at construction — returns
+when the last binding, field, element, or capture holding it is released, and
+any values still queued are released with it. `PITH_PERF_STATS=1` reports
+`new`, `freed`, and `use_after_zero` on the `channels:` line;
+docs/channel_ownership.md has the history and the design.
 
 ## select
 

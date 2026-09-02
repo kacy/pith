@@ -1,0 +1,37 @@
+# channels as map values: the stream-table shape from the http/2 server.
+# insert, overwrite (the evicted channel must be released exactly once and
+# the new one must be the one that answers), remove, the copy-under-lock
+# idiom (read a handle out, drop the entry, keep using the copy), and a map
+# that dies with channels still in it.
+
+fn main() -> Int:
+    mut streams: Map[Int, Channel[Int]] := {}
+    mut i := 0
+    while i < 4:
+        streams.insert(i, Channel[Int](2))
+        i = i + 1
+    streams[1].send(11)
+    streams[3].send(33)
+
+    # overwrite: the old channel at 1 goes away, the new one is empty
+    streams.insert(1, Channel[Int](2))
+    streams[1].send(111)
+    mut a := 0
+    if let v = streams[1].recv():
+        a = v
+    mut b := 0
+    if let v = streams[3].recv():
+        b = v
+    print("map {a} {b} size {streams.len()}")
+
+    # copy out, drop the entry, use the copy
+    ch := streams[3]
+    streams.remove(3)
+    ch.send(3)
+    if let v = ch.recv():
+        print("copied out {v} remaining {streams.len()}")
+
+    streams[0].send(100)
+    streams = {}
+    print("map dropped")
+    return 0

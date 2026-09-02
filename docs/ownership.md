@@ -120,12 +120,12 @@ call arguments:
   at a container store, which is what stopped a tagged list counting its
   elements twice. see "container flavors" for why the store rather than
   the constructor
-- a channel send is the one store the emitter still counts for. a channel
-  is not a counted container: it holds a raw handle between the send and
-  the receive, with nothing on either side that could take a count, so
-  the sender adds one (`ir_channel_send_needs_retain`) and the value
-  outlives its local. that is a leak; a missing count would be a dangling
-  element
+- a channel send is a store into a counted container, so a borrowed value
+  sent takes a count there (`ir_channel_send_needs_retain`). that count is
+  consumed by whoever receives the value — the receive hands its optional
+  shell a destructor for the payload — or by the channel's own free, which
+  drains whatever was never received and releases each value by the payload
+  tag the constructor recorded. an owned value transfers
 - a callee that may hand an argument straight back out takes no count on
   either branch, so the caller takes one on the *result* instead.
   `m.get_default(k, d)` returns `d` unchanged when the key is missing and
@@ -431,11 +431,10 @@ gaps, all bounded leaks rather than dangling pointers:
   threshold alone. so: prefer `weak` edges; if you need the collector,
   run with `PITH_CYCLE_GC=1` and call `gc_collect()` at natural
   quiesce points rather than relying on the threshold.
-- **a value sent down a channel outlives its local.** a channel holds a
-  raw handle between the send and the receive and is not a counted
-  container, so the sender adds a count nothing drops. it is the last
-  store the emitter counts for; every other one carries the value's kind
-  and lets the container decide.
+- **a channel is a counted value like any other.** a handle is retained on
+  copy and released at scope exit, and the channel frees at its last owner,
+  releasing any values still queued by their payload tag. a value sent is
+  owned by the channel until received; a receive hands it to the receiver.
 - **arc reclaims memory, but it does not run your cleanup.** closing a
   file, rolling back a transaction, or releasing a lock is a side effect
   arc knows nothing about, and the error path (`fail`, `!`) is exactly

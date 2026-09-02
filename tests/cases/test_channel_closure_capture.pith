@@ -1,0 +1,39 @@
+# a channel captured by a closure. the closure outlives the scope that made
+# the channel, so the capture is the only thing keeping it alive; a second
+# closure over the same channel reads what the first wrote; and a closure
+# handed to another function still reaches its channel from there.
+
+fn make_writer() -> fn(Int) -> Int:
+    ch := Channel[Int](8)
+    write := fn(v: Int) -> Int:
+        ch.send(v)
+        return ch.len()
+    return write
+
+fn make_pair() -> (fn(Int) -> Int, fn() -> Int):
+    ch := Channel[Int](8)
+    put := fn(v: Int) -> Int:
+        ch.send(v)
+        return ch.len()
+    take := fn() -> Int:
+        if let v = ch.recv():
+            return v
+        return 0 - 1
+    return (put, take)
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x)
+
+fn main() -> Int:
+    w := make_writer()
+    print("writer {w(1)} {w(2)} {w(3)}")
+
+    fns := make_pair()
+    put := fns.0
+    take := fns.1
+    put(10)
+    put(20)
+    print("pair {take()} {take()}")
+
+    print("applied {apply(put, 30)} then {take()}")
+    return 0

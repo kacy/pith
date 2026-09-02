@@ -1171,7 +1171,9 @@ verify-osthread-corpus-only:
 MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
 	tests/cases/test_channel_fanout_ownership \
-	tests/cases/test_channel_try_send_ownership
+	tests/cases/test_channel_try_send_ownership \
+	tests/cases/test_channel_in_struct_field tests/cases/test_channel_in_list \
+	tests/cases/test_channel_in_map
 
 MEMCHECK_CASES := \
 	tests/cases/test_match_payload tests/cases/test_combo_enums_deep \
@@ -1193,6 +1195,10 @@ MEMCHECK_CASES := \
 	tests/cases/test_channel_try_send_ownership \
 	tests/cases/test_channel_fanout_ownership \
 	tests/cases/test_generic_channel_payload \
+	tests/cases/test_channel_in_struct_field tests/cases/test_channel_closure_capture \
+	tests/cases/test_channel_in_list tests/cases/test_channel_in_map \
+	tests/cases/test_channel_returned tests/cases/test_channel_generic_holder \
+	tests/cases/test_channel_drop_undrained \
 	tests/cases/test_empty_list_field_ownership \
 	tests/cases/test_list_bytes_ownership \
 	tests/cases/test_container_eviction_release \

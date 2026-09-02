@@ -1,0 +1,57 @@
+# a channel stored in a struct field. the struct dies inside a helper while a
+# handle copied out of it lives on, a struct carries two channels beside a
+# string, and a generic holder wraps one. every value printed is read back
+# through the channel, so a handle released one time too many or too few
+# shows as a wrong number or a crash, never as a quiet pass.
+
+struct Inbox:
+    pub ch: Channel[Int]
+    pub name: String
+
+fn make_inbox(cap: Int) -> Inbox:
+    return Inbox(ch: Channel[Int](cap), name: "inbox-{cap}")
+
+fn fill(box: Inbox, n: Int):
+    mut i := 0
+    while i < n:
+        box.ch.send(i)
+        i = i + 1
+
+fn drain(ch: Channel[Int]) -> Int:
+    mut total := 0
+    mut go := true
+    while go:
+        if let v = ch.try_recv():
+            total = total + v
+        else:
+            go = false
+    return total
+
+# the struct goes out of scope here; the handle it held is returned
+fn escape() -> Channel[Int]:
+    box := make_inbox(8)
+    fill(box, 4)
+    return box.ch
+
+struct Pair:
+    pub a: Channel[Int]
+    pub b: Channel[String]
+    pub label: String
+
+fn main() -> Int:
+    ch := escape()
+    print("escaped {drain(ch)} cap {ch.cap()}")
+
+    p := Pair(a: Channel[Int](2), b: Channel[String](2), label: "pair")
+    p.a.send(7)
+    p.b.send("seven")
+    if let v = p.a.recv():
+        print("pair a {v}")
+    if let s = p.b.recv():
+        print("pair b {s} {p.label}")
+
+    # a spawned task still receiving through its copy after the struct is gone
+    late := escape()
+    t := spawn drain(late)
+    print("task drained {await t}")
+    return 0

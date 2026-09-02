@@ -1,0 +1,45 @@
+# a channel shared by two spawned tasks per round: one sends, one receives,
+# both hold the channel through their captured environment, and the round
+# drops its own handle before the tasks are awaited. the last of the three
+# owners to finish frees it.
+# pending, not registered: the channel's body is freed at the last owner,
+# but the 128-byte stub that validates the handle is still permanent, so this
+# case grows by one stub per round (measured: freed == new on both backends
+# under PITH_PERF_STATS, i.e. every body returns) and cannot be flat until the
+# change that deletes the stub. it moves to tests/leaks and is registered then.
+import pendingprobe as probe
+
+fn producer(ch: Channel[Int], n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        ch.send(i)
+        i = i + 1
+    ch.close()
+    return n
+
+fn consumer(ch: Channel[Int]) -> Int:
+    mut total := 0
+    mut go := true
+    while go:
+        if let v = ch.recv():
+            total = total + v
+        else:
+            go = false
+    return total
+
+fn round() -> Int:
+    ch := Channel[Int](4)
+    p := spawn producer(ch, 8)
+    c := spawn consumer(ch)
+    return await p + await c
+
+fn main():
+    tasks := probe.rounds() / 40
+    mut i := 0
+    mut acc := 0
+    while i < tasks:
+        acc = acc + round()
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

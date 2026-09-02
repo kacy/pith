@@ -1,5 +1,4 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
-use crate::handle_registry::{self, HandleKind};
 use crate::string;
 use std::alloc::{alloc, Layout};
 
@@ -1972,7 +1971,7 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // slot and generates a `() -> i64` init thunk that builds the correctly-typed
 // initial value. A slot is materialized lazily the first time a thread touches
 // it. Entries are not reclaimed at thread exit — bounded by the number of
-// threadlocal globals, the same acceptable one-time leak as the struct pool.
+// threadlocal globals, retained for the life of the process by design.
 thread_local! {
     static TLS_GLOBALS: std::cell::RefCell<std::collections::HashMap<i64, i64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());

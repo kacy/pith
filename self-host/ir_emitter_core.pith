@@ -4881,6 +4881,36 @@ fn ir_callee_is_function_expr(callee_idx: Int, callee_node: Node) -> Bool:
         return false
     return get_type_info(callee_tid).kind == "function"
 
+# `Channel[T](n)` lowers to pith_channel_new(capacity, payload_tag). the
+# capacity defaults to 0 (a rendezvous channel) when the program gave none. the
+# payload tag is the element-tag code of T, recorded on the channel because a
+# binding keeps only "channel" and this call is the one site that knows T; it is
+# what lets a free release values that were never received. a payload the tables
+# do not count — a plain value, or a type this body cannot resolve — is tag 0,
+# which frees nothing.
+fn ir_push_channel_ctor_args(arg_regs: List[Int], explicit_generic_types: List[String]):
+    if arg_regs.len() == 0:
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        arg_regs.push(zero_r)
+    mut payload_tag := 0
+    if explicit_generic_types.len() > 0:
+        payload_tag = ir_element_tag_code(ir_rc_kind(explicit_generic_types[0]))
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + payload_tag.to_string())
+    arg_regs.push(tag_r)
+
+# a call through a local that holds a known lambda, emitted as a direct call to
+# the lambda's symbol. the lambda's abi takes the closure as its first parameter
+# (that is where its captures live), so the handle goes in front of the written
+# arguments. the handle is a plain load — borrowed for the call — and arg_regs
+# is left alone so the caller's owned-argument release still lines up with the
+# written arguments.
+fn ir_emit_devirtualized_call(r: Int, lambda_symbol: String, ret_type: String, handle_name: String, arg_regs: List[Int]):
+    handle_r := ir_reg()
+    ir_emit_name_load(handle_r, handle_name)
+    ir_emit_call_text(r, lambda_symbol, ret_type, arg_regs.len() + 1, " " + handle_r.to_string() + ir_join_arg_regs(arg_regs))
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
@@ -4937,21 +4967,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
     arg_regs := ir_collect_call_arg_regs(node, 1)
     if callee.name == "Channel":
-        if arg_regs.len() == 0:
-            zero_r := ir_reg()
-            ir_emit("iconst " + zero_r.to_string() + " 0")
-            arg_regs.push(zero_r)
-        # the payload's element tag, recorded on the channel at construction:
-        # a binding keeps only "channel", so this is the one site that knows T,
-        # and it is what lets a free release values that were never received.
-        # a payload the tables do not count (a plain value, or a type this body
-        # cannot resolve) is tag 0, which frees nothing — today's behaviour.
-        mut payload_tag := 0
-        if explicit_generic_types.len() > 0:
-            payload_tag = ir_element_tag_code(ir_rc_kind(explicit_generic_types[0]))
-        tag_r := ir_reg()
-        ir_emit("iconst " + tag_r.to_string() + " " + payload_tag.to_string())
-        arg_regs.push(tag_r)
+        ir_push_channel_ctor_args(arg_regs, explicit_generic_types)
 
     # the built-in assertions lower the same way in every build, not only under
     # the test runner: a helper holding a table's assertions is compiled once
@@ -4973,14 +4989,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         r = ir_emit_result_reg_call(r, callee.name, arg_regs.len(), ir_join_arg_regs(arg_regs))
         ir_rcall_current_idx = 0 - 1
     elif devirt_name.len() > 0:
-        # the lambda's abi takes the closure as its first parameter (that is
-        # where its captures live), so the handle goes in front of the written
-        # arguments. a plain load: the handle is borrowed for the call, and
-        # arg_regs is left alone so the owned-argument release below still
-        # lines up with the written arguments.
-        handle_r := ir_reg()
-        ir_emit_name_load(handle_r, devirt_name)
-        ir_emit_call_text(r, callee.name, ret_type, arg_regs.len() + 1, " " + handle_r.to_string() + ir_join_arg_regs(arg_regs))
+        ir_emit_devirtualized_call(r, callee.name, ret_type, devirt_name, arg_regs)
     else:
         ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
     # `env_opt` is the free-call spelling of a transferring runtime getter:

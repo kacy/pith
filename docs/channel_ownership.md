@@ -185,6 +185,11 @@ per-stream channels.
 
 ## the hazard
 
+*Historical. This section is the analysis that led to stage 1's guarded
+reclamation, since replaced by the language-level count of stage 5; the free
+path it describes as unsafe is now safe because a count, not a scan, decides
+when nothing names a channel. It stays as the record of the reasoning.*
+
 ### what the tag buys today
 
 a channel handle is validated by alignment plus a magic word rather than through
@@ -482,6 +487,10 @@ cost: moderate, and unavoidable if channels are ever to be freed.
 
 ## the recommendation
 
+*Historical. This recommended the split allocation and permanent stub that
+shipped as stage 1 and was later deleted in favour of option (a); see stage 5
+for what runs today.*
+
 **option a, staged, with option e as its runtime half — and with the stub
 address never recycled.**
 
@@ -534,6 +543,10 @@ first because every later stage is judged against this number, and because
 until now the only way to see the leak at all was to watch rss and infer.
 
 ## what a prototype established
+
+*Historical. The prototype measured here is the guarded reclamation; its
+numbers are the baseline the language-level count was later measured against
+(see `docs/performance.md`, the channel fan-out section).*
 
 a working prototype exists on the local branch `channel-reclaim-probe`. it is
 not merged, and the numbers below come from it. what it settles answers four

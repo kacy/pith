@@ -36,6 +36,18 @@
 //! condvars and wakes both green lists so every parked caller resumes and observes
 //! `closed`.
 //!
+//! ## ownership
+//!
+//! a channel handle is a counted value like a string or a list: the compiler
+//! retains it on every copy and releases it at every scope exit, and the
+//! channel is freed at the last release, along with any values still queued
+//! (released by the payload tag the constructor recorded). the runtime takes a
+//! count of its own only around a park, so a suspended call can never outlive
+//! the channel it points into (`ParkCount`). every operation validates its
+//! handle by alignment and magic word and pays nothing else; a freed channel
+//! has its magic word scrubbed, so a stale handle fails that check and gets the
+//! closed-and-drained default, the same way a garbage handle does.
+//!
 //! ## lock order
 //!
 //! when the channel lock and the scheduler's locks nest, the channel lock is
@@ -56,9 +68,8 @@
 //! waiter *under the channel lock* before releasing it, which we do.
 
 use crate::concurrency::green;
-use crate::handle_registry::{self, HandleKind};
+use crate::handle_registry;
 use std::cell::{Cell, UnsafeCell};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
@@ -294,12 +305,11 @@ struct ChannelInner {
 /// handle is validated by alignment + this tag rather than the global handle
 /// registry — the registry's mutex was two global lock round trips per message
 /// (send + recv), the hottest shared line left once the ring made the channel
-/// itself lock-free. the tag is sound only while a validated address can never
-/// name a *different* channel: a recycled stub would pass this check and
-/// silently serve the wrong traffic, which is a wrong answer on a concurrency
-/// primitive rather than a fault. that is why the stub outlives the body it
-/// points at and is never handed back to the allocator — only the body is
-/// reclaimed. `docs/channel_ownership.md` works the consequences through.
+/// itself lock-free. the word is scrubbed when the channel is freed, so a
+/// stale handle fails the check with high probability and is answered like a
+/// garbage one. a live handle can only be stale if the language miscounted
+/// it, and that is the same practical guard every other counted kind — list,
+/// closure, struct — relies on.
 const CHANNEL_MAGIC: u32 = 0x50434841;
 
 /// the largest buffered capacity a channel will allocate (16Mi values, 128 MiB
@@ -835,8 +845,8 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
-    // a reclaimed channel is closed and drained, and a send to a closed channel
-    // is refused — the same 0 an unknown handle gets.
+    // an unknown or freed handle gets the closed channel's answer: the send is
+    // refused.
     let Some(t) = channel_ref(handle) else {
         return 0;
     };
@@ -922,8 +932,8 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
-    // a reclaimed channel yields the empty optional, which is exactly what a
-    // closed and drained one yields.
+    // an unknown or freed handle yields the empty optional, exactly what a
+    // closed and drained channel yields.
     let Some(t) = channel_ref(handle) else {
         return optional_tuple(false, 0);
     };
@@ -983,8 +993,7 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
-    // a reclaimed channel was already closed, and a second close is a no-op
-    // that reports false — the same 0 this returns below.
+    // an unknown or freed handle reports false, the same as a second close.
     let Some(t) = channel_ref(handle) else {
         return 0;
     };
@@ -1011,8 +1020,7 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
-    // a reclaimed channel is drained, so its length is 0 — the same answer an
-    // unknown handle gets.
+    // an unknown or freed handle has length 0.
     let Some(t) = channel_ref(handle) else {
         return 0;
     };
@@ -1040,7 +1048,7 @@ pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
-    // a reclaimed channel is closed, and so is an unknown handle by convention.
+    // an unknown or freed handle reports closed, by convention.
     let Some(t) = channel_ref(handle) else {
         return 1;
     };
@@ -1067,11 +1075,10 @@ mod tests {
     use super::*;
 
     // the creator drops its only count while three receivers are parked on
-    // the channel. the body must survive them: a parked operation holds a
-    // counted claim of its own, so the release retires nothing yet. a fourth
-    // holder, retained before the release, then feeds them; when the last
-    // count goes, the body is retired — observable as a send that now reports
-    // the closed-and-drained default instead of delivering.
+    // the channel. the channel must survive them: a parked operation holds a
+    // count of its own, so the release frees nothing yet. a fourth holder,
+    // retained before the release, then feeds them; the channel is freed
+    // exactly once, when that last holder releases.
     #[test]
     fn parked_receivers_then_last_release_elsewhere() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

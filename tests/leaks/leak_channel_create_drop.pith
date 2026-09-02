@@ -2,12 +2,7 @@
 # end of the round. with channels counted by the language the body is freed
 # at the last owner, so the process stays flat; before that, every round
 # left a channel behind for the life of the process.
-# pending, not registered: the channel's body is freed at the last owner,
-# but the 128-byte stub that validates the handle is still permanent, so this
-# case grows by one stub per round (measured: freed == new on both backends
-# under PITH_PERF_STATS, i.e. every body returns) and cannot be flat until the
-# change that deletes the stub. it moves to tests/leaks and is registered then.
-import pendingprobe as probe
+import leakprobe as probe
 
 fn round(i: Int) -> Int:
     c := Channel[String](64)

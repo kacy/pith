@@ -94,6 +94,23 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 # types are suppressed (generic bodies)
 mut ir_closure_return_kinds: Map[String, String] := {}
 
+# a local bound once to a lambda literal, by name, with the symbol of that
+# lambda: `f := fn(x) => ...` then `f(1)` calls `__lambda_N` directly instead
+# of loading the function pointer out of the closure and jumping through it.
+# only a binding that is not `mut` qualifies, since the checker guarantees it
+# is assigned exactly once. a name bound to two different lambdas in one
+# function is poisoned with an empty symbol and stays indirect. per function:
+# cleared where the other per-function maps are, and stacked around a lambda
+# body so the body sees an empty map and the enclosing function gets its own
+# back — a lambda's frame state leaking into its parent was #1013.
+mut ir_local_lambda_targets: Map[String, String] := {}
+# the enclosing functions' maps while a lambda body is being emitted, keyed
+# by nesting depth (a list would do, but List has no pop)
+mut ir_local_lambda_targets_saved: Map[Int, Map[String, String]] := {}
+mut ir_local_lambda_targets_depth := 0
+# the symbol ir_emit_lambda minted last, read by the bind that owns it
+mut ir_last_lambda_symbol := ""
+
 # rc-managed locals owned by the current function, in binding order, with a
 # parallel kind list (string/list/map/set). collected by a pre-pass before
 # the body emits so every name can be zero-stored in the prologue; that
@@ -367,6 +384,7 @@ fn ir_reset_local_state():
     ir_var_regs = {}
     ir_var_types = {}
     ir_closure_return_kinds.clear()
+    ir_local_lambda_targets = {}
     ir_map_value_types = {}
 
 fn ir_reset_global_state():
@@ -4868,6 +4886,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             return ir_emit_indirect_expr_call(idx, node, node.children[0])
 
     mut callee := ResolvedCallee("unknown", false)
+    # set when the callee is a local holding a known lambda: the call names the
+    # lambda directly and passes the closure handle as its hidden first argument
+    mut devirt_name := ""
     if node.children.len() > 0:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
@@ -4879,6 +4900,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         # which keeps a loop variable that shadows nothing extra out of this.
         callee_n := get_node(node.children[0])
         if callee_n.kind == "ident" and not ir_is_declared_callable(callee.name):
+            direct := ir_devirtualized_lambda_target(callee.name)
+            if direct.len() > 0:
+                devirt_name = callee.name
+                callee = ResolvedCallee(direct, false)
             loop_slot := ir_loop_var_slot(callee.name)
             if loop_slot.len() > 0:
                 callee = ResolvedCallee(loop_slot, callee.imported)
@@ -4927,6 +4952,15 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         ir_rcall_current_idx = idx
         r = ir_emit_result_reg_call(r, callee.name, arg_regs.len(), ir_join_arg_regs(arg_regs))
         ir_rcall_current_idx = 0 - 1
+    elif devirt_name.len() > 0:
+        # the lambda's abi takes the closure as its first parameter (that is
+        # where its captures live), so the handle goes in front of the written
+        # arguments. a plain load: the handle is borrowed for the call, and
+        # arg_regs is left alone so the owned-argument release below still
+        # lines up with the written arguments.
+        handle_r := ir_reg()
+        ir_emit_name_load(handle_r, devirt_name)
+        ir_emit_call_text(r, callee.name, ret_type, arg_regs.len() + 1, " " + handle_r.to_string() + ir_join_arg_regs(arg_regs))
     else:
         ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
     # `env_opt` is the free-call spelling of a transferring runtime getter:
@@ -6840,6 +6874,9 @@ fn ir_reset_lambda_emit_state():
     ir_var_regs = {}
     ir_var_types = {}
     ir_closure_return_kinds.clear()
+    ir_local_lambda_targets_saved.insert(ir_local_lambda_targets_depth, ir_local_lambda_targets)
+    ir_local_lambda_targets_depth = ir_local_lambda_targets_depth + 1
+    ir_local_lambda_targets = {}
     # a lambda / wrapper is its own function with its own slots. an enclosing
     # loop's variable slots do not exist in that frame — the capture prologue
     # stores captured values under their plain names — so start it empty. each
@@ -6883,6 +6920,9 @@ fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[Strin
     ir_builder_restore(saved_builder)
     ir_var_regs = saved_vars
     ir_var_types = saved_types
+    if ir_local_lambda_targets_depth > 0:
+        ir_local_lambda_targets_depth = ir_local_lambda_targets_depth - 1
+        ir_local_lambda_targets = ir_local_lambda_targets_saved[ir_local_lambda_targets_depth]
 
 fn ir_emit_lambda(idx: Int) -> Int:
     # compile lambda body as a separate function
@@ -6982,6 +7022,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
     ir_emit_lambda_capture_setup(r, parts.captures)
+    # set after the body, so a lambda nested inside this one cannot leave its
+    # own symbol here for the enclosing bind to pick up
+    ir_last_lambda_symbol = lambda_name
     return r
 
 fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
@@ -7031,6 +7074,23 @@ fn ir_record_func_local_name(name: String):
 # true when a bare name in the function being emitted is that function's own
 # storage rather than a module global. parameters and lambda captures live in
 # ir_var_regs; everything else the body binds is in ir_func_local_names.
+# a local bound to a lambda literal. binding the same name to two different
+# lambdas in one function leaves no single target, so the name is poisoned
+# and its calls stay indirect.
+fn ir_record_lambda_binding(name: String, symbol: String):
+    if ir_local_lambda_targets.contains_key(name) and ir_local_lambda_targets[name] != symbol:
+        ir_local_lambda_targets.insert(name, "")
+        return
+    ir_local_lambda_targets.insert(name, symbol)
+
+# the lambda symbol a call through this name can target directly, or empty
+fn ir_devirtualized_lambda_target(name: String) -> String:
+    if not ir_name_is_func_local(name):
+        return ""
+    if not ir_local_lambda_targets.contains_key(name):
+        return ""
+    return ir_local_lambda_targets[name]
+
 fn ir_name_is_func_local(name: String) -> Bool:
     return ir_var_regs.contains_key(name) or ir_func_local_names.contains(name)
 
@@ -8453,6 +8513,11 @@ fn ir_emit_bind_stmt(node: Node):
             ir_rc_release_local(old_r, bind_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
+        # not inside a generic body: a specialization re-emits the body and
+        # mints fresh lambda symbols each time, so a recorded target would name
+        # the previous specialization's lambda
+        if val_idx >= 0 and get_node(val_idx).kind == "lambda" and not node.value.contains(" mut") and ir_active_generic_params.len() == 0:
+            ir_record_lambda_binding(name, ir_last_lambda_symbol)
         if not ir_var_types.contains_key(name):
             inferred := ir_infer_type(val_idx)
             if inferred.len() > 0:
@@ -10352,6 +10417,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_var_regs = {}
     ir_var_types = {}
     ir_closure_return_kinds.clear()
+    ir_local_lambda_targets = {}
     ir_map_value_types = {}
     ir_rc_locals = []
     ir_rc_local_kinds = []

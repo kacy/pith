@@ -1,0 +1,38 @@
+# channels as list elements: built in a loop (the fan-out-then-collect
+# idiom), read back, an alias kept while the list is dropped, and a list that
+# dies still holding loaded channels.
+
+fn main() -> Int:
+    mut chans: List[Channel[Int]] := []
+    mut i := 0
+    while i < 5:
+        c := Channel[Int](2)
+        c.send(i * 10)
+        chans.push(c)
+        i = i + 1
+    mut total := 0
+    for c in chans:
+        if let v = c.recv():
+            total = total + v
+    print("list total {total} len {chans.len()}")
+
+    # keep one alias, drop the list, the alias still works
+    keep := chans[2]
+    chans = []
+    keep.send(5)
+    if let v = keep.recv():
+        print("kept {v} cap {keep.cap()}")
+
+    # a list that dies still holding loaded channels
+    mut loaded: List[Channel[String]] := []
+    mut j := 0
+    while j < 3:
+        c2 := Channel[String](4)
+        c2.send("x{j}")
+        c2.send("y{j}")
+        loaded.push(c2)
+        j = j + 1
+    print("loaded {loaded.len()}")
+    loaded = []
+    print("dropped loaded")
+    return 0

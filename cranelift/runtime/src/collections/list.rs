@@ -61,6 +61,7 @@ pub enum ListTypeTag {
     Bytes,     // Bytes handle - needs retain/release
     Closure,   // closure handle - needs retain/release
     Set,       // Set handle - needs retain/release
+    Channel,   // channel handle - needs retain/release
 }
 
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
@@ -281,6 +282,7 @@ pub(crate) fn element_tag_from_code(code: i32) -> ListTypeTag {
         5 => ListTypeTag::Bytes,
         6 => ListTypeTag::Closure,
         7 => ListTypeTag::Set,
+        8 => ListTypeTag::Channel,
         _ => ListTypeTag::Primitive,
     }
 }
@@ -299,6 +301,7 @@ pub(crate) unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Bytes => crate::bytes::pith_bytes_retain(raw),
         ListTypeTag::Closure => crate::runtime_core::pith_closure_retain(raw),
         ListTypeTag::Set => crate::collections::set::pith_set_retain_handle(raw),
+        ListTypeTag::Channel => crate::concurrency::channel::pith_channel_retain(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -337,6 +340,7 @@ pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Bytes => crate::bytes::pith_bytes_release(raw),
         ListTypeTag::Closure => crate::runtime_core::pith_closure_release(raw),
         ListTypeTag::Set => crate::collections::set::pith_set_release_handle(raw),
+        ListTypeTag::Channel => crate::concurrency::channel::pith_channel_release(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -447,6 +451,13 @@ pub unsafe extern "C" fn pith_list_new_closure() -> PithList {
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_set() -> PithList {
     pith_list_new(8, 7)
+}
+
+/// a list of channel handles owns one count per element, like a list of any
+/// other counted handle; without the tag it held handles it did not own.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_channel() -> PithList {
+    pith_list_new(8, 8)
 }
 
 #[no_mangle]

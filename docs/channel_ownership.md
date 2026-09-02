@@ -1,20 +1,19 @@
 # channel ownership
 
-a `Channel[T]` is allocated once and never freed. `pith_channel_new`
-(`cranelift/runtime/src/concurrency/channel.rs`) hands the language a raw
-pointer built with `Box::into_raw`, and there is no `Box::from_raw` anywhere in
-the runtime — no `pith_channel_free`, no `pith_channel_release`, nothing in the
-ABI table. `close()` marks the channel closed and wakes whoever is parked on it;
-the memory stays. nothing in the language owns one either: `ir_rc_kind` answers
-`""` for a channel, so a channel in a local, a struct field, a container or a
-closure capture is a bare integer with no retain and no release.
+a `Channel[T]` is a reference-counted value: `ir_rc_kind` answers `"channel"`,
+so a handle in a local, a struct field, a container element, or a closure
+capture is retained on copy and released at scope exit
+(`pith_channel_retain` / `pith_channel_release`), and the channel's body is
+freed at the last owner, with any values still queued released by the payload
+tag the constructor recorded. `close()` marks the channel closed and wakes
+whoever is parked on it; it is not, and need not be, a free.
 
-this page is the design work behind issue #960: what a channel actually costs,
-who can be holding one when it would be freed, why the obvious free path is a
-crash rather than a fix, the options with their costs, and a staged plan. it is
-a plan, not a description of what ships today. only stage 1 is implemented; a
-prototype of the rest exists unmerged, and what it settled is recorded under
-"what a prototype established" below.
+this page is the design work behind issue #960 and its sequel #984: what a
+channel costs, who can be holding one when it would be freed, why the first
+free path (stage 1's hazard-guarded reclamation) was sound but cost the
+os-thread backend about 14% of channel throughput, and why the language-level
+count under option (a) below replaced it. stages 1 and 5 shipped; the hazard
+machinery of stage 1 is retired by the change that follows stage 5.
 
 ## what a channel costs
 
@@ -660,13 +659,24 @@ gives the cycle collector the edges it currently cannot see. it is a real
 ownership change with real goldens exposure, and it lands before any free
 because a free that leaves its payloads behind trades one leak for another.
 
-### stage 5 — the rc kind, and the free
+### stage 5 — the rc kind, and the free (shipped)
 
-add `"channel"` to `ir_rc_kind` and thread it through the kind tables listed
-under option a. the release path calls a new `pith_channel_release`, which drops
-the stub's `Arc` and, at the last count, drains the ring releasing each element
-by its tag and retires the body. the stub is left in place with its generation
-bumped.
+`"channel"` is an rc kind: `ir_rc_kind` answers it, and every kind table has a
+channel row at its next free code — element tag 8, closure capture tag 9, tuple
+element letter `h`. `pith_channel_new` takes the payload's element tag as a
+second argument, recorded on the stub, because the binding keeps only
+`"channel"` and the constructor site is the one place that knows T.
+`pith_channel_retain` and `pith_channel_release` are the pair the emitter
+emits; the last release retires the body, and the flush drains values never
+received, releasing each by the payload tag after it has dropped its locks (a
+payload that is itself a channel releases through the same path).
+
+this landed with the hazard guard still in place, deliberately: the count
+lives beside the guard, so a counting mistake can only show as a channel
+answering its closed-and-drained default early (`use_after_zero` on the
+`channels:` perf line, an abort under `PITH_CHANNEL_STRICT=1`) or as `new`
+exceeding `freed` — never as a use-after-free. the change that follows deletes
+the guard and frees at zero, taking a count only around a park.
 
 this is the stage that can crash, so it is the stage with the standard to match:
 valgrind clean under `PITH_STRUCT_FREELIST=0` on both backends, on a

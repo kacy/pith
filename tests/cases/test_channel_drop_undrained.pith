@@ -1,0 +1,13 @@
+# a channel closed with values still queued and then dropped by its last
+# owner. the values are heap strings; releasing the channel must release
+# them too. the printed line is the semantics check, memcheck is the proof.
+
+fn main() -> Int:
+    c := Channel[String](8)
+    mut i := 0
+    while i < 5:
+        c.send("payload-{i}")
+        i = i + 1
+    c.close()
+    print("closed with {c.len()} queued, closed {c.is_closed()}")
+    return 0

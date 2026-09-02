@@ -1,0 +1,23 @@
+# a channel as a generic type argument: held in Holder[T], built through a
+# generic function, and used through the field. the checker records no types
+# inside a generic body, so the emitter has to recover the channel's kind from
+# the substitution; a miss here is a leak, never a wrong number, so the
+# numbers are the semantics check and memcheck is the ownership check.
+
+struct Holder[T]:
+    pub item: T
+
+fn stash[T](v: T) -> Holder[T]:
+    return Holder(item: v)
+
+fn main() -> Int:
+    h := stash(Channel[Int](2))
+    h.item.send(5)
+    h.item.send(6)
+    mut total := 0
+    if let v = h.item.recv():
+        total = total + v
+    if let v = h.item.recv():
+        total = total + v
+    print("generic holder {total} cap {h.item.cap()}")
+    return 0

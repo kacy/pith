@@ -33,6 +33,11 @@ pub fn ir_struct_base_name(sname: String) -> String:
 pub fn ir_rc_kind(type_hint: String) -> String:
     if type_hint == "string":
         return "string"
+    # a channel handle is counted like every other heap value: retained on
+    # copy, released at scope exit, freed at zero. the method-receiver form
+    # carries the payload type as a suffix, the binding form does not.
+    if type_hint == "channel" or type_hint.starts_with("channel:"):
+        return "channel"
     if type_hint == "list" or type_hint == "list_string":
         return "list"
     if type_hint == "map" or type_hint == "map_int":

@@ -670,6 +670,28 @@ same checksum. medians of 9 on this 2-core box, 2026-07-26:
 | total (2026-07-29) | — | ~133ms | ~75ms | ~75ms | ~240ms |
 | peak rss | 3.0 mb | 3.0 mb | 2.0 mb | 2.4 mb | 2.7 mb |
 
+the os-thread column carried a cost the table above predates. the first
+channel reclamation (`#979`, august 2026) let the runtime free a closed and
+drained channel by discovering for itself that nothing still named it: a
+permanent stub, a hazard slot per thread, a limbo list, and a claim taken on
+every send and recv. measured against the commit before it under the
+interleaved protocol — 21 rounds, arm order rotated each round, a null a/b of
+identical binaries first to learn the day's floor — the os-thread backend was
+13% to 23% slower at the median; green, whose workers outlive the work, paid
+about 2%. ablating the pieces one at a time attributed none of it: removing
+the barrier alone, or the entire hazard protocol, moved the benchmark by less
+than the null floor, and the per-piece ladder that followed turned out to be
+code-layout noise (removing work read *slower* twice). only the whole was
+trustworthy. the fix was to make the runtime not need any of it: channel
+handles are now counted by the language like strings and lists (`#1020`), and
+the guard, stub, and limbo are gone (`#1021`). the language-level count reads
+8.8% faster than the guarded runtime at the median on os threads and 12%
+slower than the pre-reclaim baseline (two earlier runs: 8% and 9%), against a
+null floor of 4% to 5% on those days — about half the regression recovered,
+the rest real but small. green is unchanged. the one candidate that was tried
+and refuted for the remainder is padding the count onto its own cache line,
+which read worse; the untested one is the park path's two atomics.
+
 read the rows that oversubscribe os threads (pith os-thread, rust, zig)
 with the box in mind: eight threads on two cores, so they swing run to run.
 across two suite runs a week apart rust moved 135 -> 94 ms and zig 135 -> 204

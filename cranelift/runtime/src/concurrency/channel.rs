@@ -59,7 +59,7 @@ use crate::concurrency::green;
 use crate::handle_registry::{self, HandleKind};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 static SELECT_COUNTER: AtomicI64 = AtomicI64::new(0);
@@ -203,8 +203,7 @@ impl Ring {
                     Ok(_) => {
                         let value = unsafe { *slot.cell.get() };
                         // hand the slot to the enqueuer one lap later.
-                        slot.sequence
-                            .store(pos + self.mask + 1, Ordering::Release);
+                        slot.sequence.store(pos + self.mask + 1, Ordering::Release);
                         return Some(value);
                     }
                     Err(actual) => pos = actual,
@@ -309,443 +308,53 @@ const CHANNEL_MAGIC: u32 = 0x50434841;
 /// asked for" instead of "process dies".
 const MAX_CHANNEL_CAPACITY: i64 = 1 << 24;
 
-/// a counter alone on its cache line, so the write traffic it takes never
-/// invalidates the read-only line beside it.
-#[repr(align(64))]
-struct PaddedCount(AtomicUsize);
-
-/// the permanent half of a channel allocation. the stub is never freed, which
-/// is what keeps the magic tag sound across a reclamation: an address that once
-/// named a channel never names a different one, so a stale handle either finds
-/// its own stub — reclaimed or not — or fails the alignment or magic check. the
-/// stub is two cache lines against the 4,512 bytes a 256-slot channel costs, so
-/// what stays behind is under 3% of what comes back.
+/// a channel is one allocation, owned by its count. the language retains a
+/// handle on every copy and releases it at every scope exit, exactly as it does
+/// for a string or a list, and the channel is freed when the count reaches
+/// zero. an operation in flight is executed by a frame that holds a count for
+/// the handle it passed — a binding, a field of a live struct, an element of a
+/// live container, a capture of a live closure — so nothing can free the body
+/// under it, and the fast path pays nothing: alignment check, magic check, and
+/// the operation.
+///
+/// the one exception is a park. a caller may have borrowed its handle from a
+/// holder another task owns — a channel in a shared struct, the sanctioned way
+/// to share one — and if that task releases the holder while this one sleeps,
+/// the last count could go while a suspended call still points into the body.
+/// so a parking operation takes a count of its own before it blocks and gives
+/// it back when the call completes (`ParkCount`), off the per-message path.
+///
+/// this replaced a permanent stub, per-thread hazard slots, and a limbo list
+/// that let the runtime discover for itself when a channel could be freed:
+/// measured at about 14% of os-thread channel throughput, all of it in the
+/// per-operation guard. the magic word is scrubbed at free so a stale handle
+/// fails validation with high probability — the same practical guard every
+/// other counted kind relies on.
+#[repr(C)]
 struct TaggedChannel {
     magic: u32,
     /// the element-tag code of the payload type (the same table lists use),
-    /// recorded at construction because the binding loses the payload type and
-    /// only the constructor site knows it. a free with values still queued
-    /// releases each by this tag; 0 means a plain value with nothing to release.
+    /// recorded at construction because only the constructor site knows T. a
+    /// free with values still queued releases each by this tag; 0 means a plain
+    /// value with nothing to release.
     payload_tag: u8,
-    /// the requested capacity, kept out of the body so `cap()` answers the same
-    /// number before and after the body is reclaimed.
+    /// the requested capacity, fixed at construction.
     capacity: u32,
-    /// the body while the channel is in service, null once retired. written
-    /// exactly twice in a stub's life — construction and `retire` — so a
-    /// non-null read can never be a *different* body (no ABA). with `refs`
-    /// padded onto its own line, the line this shares with the magic word is
-    /// read-only between those two writes — every operation reads it (twice),
-    /// so a counter sharing it would put the park path's read-modify-writes on
-    /// the fast path's cache line.
-    body: AtomicPtr<ChannelInner>,
-    /// the language's owners of this handle — one per binding, field, element,
-    /// or capture, taken by `pith_channel_retain` and given back by
-    /// `pith_channel_release` — plus operations that upgraded to a counted claim
-    /// because they were about to park (see `ChannelGuard::upgrade`). the fast
-    /// path never touches this. the last release retires the body.
-    refs: PaddedCount,
-    /// why the body left service: 0 in service, 1 closed and drained, 2 the
-    /// last owner released it. an operation that finds no body under cause 2
-    /// is a program touching a channel after its own count reached zero — a
-    /// missing retain somewhere in the emitter — and is counted, and under
-    /// PITH_CHANNEL_STRICT=1 aborted, rather than answered with a default.
-    retired_by: std::sync::atomic::AtomicU8,
+    /// owners: one per binding, field, element, or capture holding the handle
+    /// (`pith_channel_retain` / `pith_channel_release`), plus one per parked
+    /// operation for the span of its call (`ParkCount`). the fast path never
+    /// writes this; copies and parks do. it shares the header line with the
+    /// magic word deliberately: padding it onto a line of its own was measured
+    /// and read worse, not better, on os-thread fanout.
+    refs: AtomicUsize,
+    inner: ChannelInner,
 }
 
-const RETIRED_IN_SERVICE: u8 = 0;
-const RETIRED_CLOSED_AND_DRAINED: u8 = 1;
-const RETIRED_BY_LAST_OWNER: u8 = 2;
-
-// 0 = not probed, 1 = off, 2 = on: whether a use after the last owner's
-// release aborts instead of counting. off by default; the counter is always
-// kept so a run with PITH_PERF_STATS=1 shows it as use_after_zero.
-static CHANNEL_STRICT_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cold]
-fn channel_strict() -> bool {
-    match CHANNEL_STRICT_STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("PITH_CHANNEL_STRICT").as_deref() == Ok("1");
-            CHANNEL_STRICT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// reclamation: hazard slots + a limbo list
-//
-// the body of a retired channel may still be in use by an operation that
-// resolved its handle just before the retire. two kinds of claim protect it:
-//
-//  * a **hazard**: every operation publishes the body pointer into its own
-//    per-thread, cache-line-padded slot for the span of the call. publishing is
-//    a swap on a line no other thread writes, so the fast path costs no shared
-//    read-modify-write at all. the slot keys on the *os thread*, which is
-//    coherent because a channel operation runs from entry to return on one
-//    thread: green preemption fires only at emitted loop back-edges, never
-//    inside a runtime call, and the one place an operation parks cooperatively
-//    (`block_on_channel`) upgrades to a counted claim first.
-//  * a **count** (`TaggedChannel::refs`): taken by `upgrade` on the paths that
-//    can block, because a green task's suspended coroutine keeps `&ChannelInner`
-//    alive while its worker thread — and so its hazard slot — moves on to run
-//    other tasks. the upgrade order (count first, then clear the hazard) means
-//    a scanner always sees at least one of the two.
-//
-// `retire` never frees: it swaps the body out of the stub — after which no new
-// claim can be minted, since `channel_acquire` re-validates against `body`
-// after publishing — and pushes it onto the limbo list. `flush_limbo` frees an
-// entry once its stub's count is zero and no hazard slot holds it. every guard
-// drop re-checks the (almost always zero) limbo counter, so a body parked in
-// limbo by its own closer is freed as soon as that closer's guard drops.
-//
-// all protocol accesses are SeqCst: with a single total order, a validation
-// that saw the body non-null precedes the retire swap, which precedes the
-// scan — so the scan cannot miss that operation's hazard. retirement is rare
-// (a channel dies once), so the scan and the limbo mutex are off every path
-// that matters.
-// ---------------------------------------------------------------------------
-
-/// one os thread's hazard slot: the channel body an operation on that thread is
-/// currently inside, or null. padded so scans by other threads never share a
-/// line with a neighbour's publishes.
-#[repr(align(64))]
-struct HazardSlot {
-    hazard: AtomicPtr<ChannelInner>,
-    /// how many live guards on the owning thread share the published hazard.
-    /// 0 means the slot's content is a sticky leftover, free to reuse or
-    /// replace; nonzero pins it. owner-thread-only (a plain cell): scanners
-    /// read `hazard`, never this.
-    depth: Cell<usize>,
-    /// whether a live thread owns this slot. a slot is never freed, only
-    /// released back for the next thread to adopt, which is what makes the
-    /// fast path's cached pointer safe: see `SlotHandle`.
-    owned: AtomicBool,
-}
-
-/// scanners only ever read the atomic `hazard`; `depth` is owner-only.
-unsafe impl Sync for HazardSlot {}
-
-/// every hazard slot ever created, for `flush_limbo` to scan. a slot is added
-/// on a thread's first channel operation and **never removed or freed** — an
-/// exited thread's slot is released for the next thread to adopt instead.
-///
-/// that is a safety property, not a tuning one. the fast path caches the slot
-/// pointer in a `Cell`, which has no drop glue and so is never cleared at
-/// thread exit; freeing the slot would leave that cache dangling, and any
-/// later operation on the thread would read and write freed memory and publish
-/// a hazard no scan could see. never freeing makes the cached pointer valid for
-/// the life of the process.
-///
-/// it also bounds the registry at the peak number of concurrently live threads
-/// rather than the total ever created, which matters on the os-thread backend
-/// where every task is a thread, and it removes an O(n) scan under a global
-/// lock from every thread exit. `cycle.rs` reuses its mutator slots the same
-/// way for the same reasons.
-struct SlotRegistry {
-    slots: Vec<*const HazardSlot>,
-}
-unsafe impl Send for SlotRegistry {}
-
-static SLOT_REGISTRY: Mutex<SlotRegistry> = Mutex::new(SlotRegistry { slots: Vec::new() });
-
-/// bodies retired but not yet proven unclaimed, with the stub that counts for
-/// them. lock order where both are held: LIMBO, then SLOT_REGISTRY.
-struct Limbo {
-    entries: Vec<(*const TaggedChannel, *mut ChannelInner)>,
-}
-unsafe impl Send for Limbo {}
-
-static LIMBO: Mutex<Limbo> = Mutex::new(Limbo { entries: Vec::new() });
-/// how many bodies sit in limbo — the one word every guard drop reads. almost
-/// always zero, so the common exit is one load of a rarely-written line.
-static LIMBO_PENDING: AtomicUsize = AtomicUsize::new(0);
-
-/// releases this thread's hazard slot when the thread exits, leaving it in the
-/// registry for the next thread to adopt. it is deliberately not freed: see
-/// `SlotRegistry`.
-struct SlotHandle(*const HazardSlot);
-
-impl Drop for SlotHandle {
-    fn drop(&mut self) {
-        unsafe {
-            // the thread is done, so nothing it published can still be live.
-            // clearing before releasing keeps a scan from reading a leftover
-            // as a live claim and holding a body in limbo forever.
-            (*self.0).depth.set(0);
-            (*self.0).hazard.store(std::ptr::null_mut(), Ordering::SeqCst);
-            (*self.0).owned.store(false, Ordering::Release);
-        }
-    }
-}
-
-thread_local! {
-    // the fast cache: a const-initialized cell compiles to a direct
-    // tls-relative load with no lazy-init machinery on the access path. null
-    // until the first channel op on this thread registers a slot.
-    static HAZARD_SLOT_FAST: Cell<*const HazardSlot> = const { Cell::new(std::ptr::null()) };
-
-    // the owning handle: created once per thread, unregisters at thread exit.
-    // touched only on the first op (registration) — every later access goes
-    // through the cache above.
-    static HAZARD_SLOT: SlotHandle = SlotHandle(adopt_slot());
-}
-
-/// take over a slot an exited thread released, or add one if every slot is
-/// owned. the claim runs under the registry lock, and a released slot was
-/// already cleared by the releasing thread, so an adopted slot starts exactly
-/// as a fresh one does.
-fn adopt_slot() -> *const HazardSlot {
-    let mut registry = lock_registry();
-    for &slot in registry.slots.iter() {
-        let owned = unsafe { &(*slot).owned };
-        if owned
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return slot;
-        }
-    }
-    let slot: *const HazardSlot = Box::into_raw(Box::new(HazardSlot {
-        hazard: AtomicPtr::new(std::ptr::null_mut()),
-        depth: Cell::new(0),
-        owned: AtomicBool::new(true),
-    }));
-    registry.slots.push(slot);
-    slot
-}
-
-/// this thread's hazard slot: one tls load on every call after the first.
+/// the channel behind a handle, or None for anything that is not one. an
+/// aligned pointer whose first word is the tag is accepted; a freed channel had
+/// its tag scrubbed, so a stale handle is rejected here like a garbage one.
 #[inline]
-fn hazard_slot() -> *const HazardSlot {
-    // the cache stays valid for the life of the process because a slot is
-    // released rather than freed, so a thread that operates on a channel after
-    // its own teardown reads a slot that is still there. it may by then be
-    // owned by another thread, which is a lost hazard rather than a write to
-    // freed memory; nothing in the runtime does that today, and the
-    // `try_with` below keeps the registration path from panicking in a
-    // function that cannot unwind if anything ever does.
-    let cached = HAZARD_SLOT_FAST.with(|c| c.get());
-    if !cached.is_null() {
-        return cached;
-    }
-    let slot = match HAZARD_SLOT.try_with(|h| h.0) {
-        Ok(slot) => slot,
-        // the owning handle is gone, so nothing will release what we take:
-        // adopt a slot directly and leave it owned. it stays scannable, which
-        // is what correctness needs, at the cost of one slot.
-        Err(_) => adopt_slot(),
-    };
-    let _ = HAZARD_SLOT_FAST.try_with(|c| c.set(slot));
-    slot
-}
-
-// an asymmetric-fence variant (barrier-free publish repaired by a
-// membarrier(PRIVATE_EXPEDITED) at retire) was tried and measured SLOWER:
-// registering for expedited membarrier taxes every context switch, and the
-// os-thread backend context-switches once per would-block — the tax cost more
-// than the publish barrier it removed. the classic SeqCst publish stays.
-
-fn lock_registry() -> MutexGuard<'static, SlotRegistry> {
-    SLOT_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn lock_limbo() -> MutexGuard<'static, Limbo> {
-    LIMBO.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// free every limbo body no operation can still be inside: no hazard slot
-/// holding it and counted claims gone. entries are taken under the limbo lock,
-/// so a body is freed exactly once no matter how many drops race the flush.
-///
-/// the scan order — hazards first, then the count — is load-bearing against
-/// `upgrade`, which transitions a claim the other way (count added first, then
-/// hazard cleared). a scan that straddles an upgrade either reads the hazard
-/// before the clear and keeps the entry, or reads the clear — which the add
-/// precedes, so the later count read must see it. scanned in the reverse
-/// order, a straddling scan could read the count before the add and the hazard
-/// after the clear and free under a live claim.
-unsafe fn flush_limbo() {
-    // values still queued in a freed body are released only after both locks
-    // are dropped: a payload that is itself a channel releases through this
-    // same path, and the mutexes are not re-entrant.
-    let mut orphans: Vec<(crate::collections::list::ListTypeTag, i64)> = Vec::new();
-    let mut limbo = lock_limbo();
-    let registry = lock_registry();
-    limbo.entries.retain(|&(stub, body)| {
-        if registry
-            .slots
-            .iter()
-            .any(|&s| (*s).hazard.load(Ordering::SeqCst) == body)
-        {
-            return true;
-        }
-        if (*stub).refs.0.load(Ordering::SeqCst) != 0 {
-            return true;
-        }
-        let bytes = channel_body_bytes((*body).capacity);
-        // nothing names the body any more, so the ring is quiescent and this
-        // drain is exact. values a program never received are released by the
-        // payload tag once the locks are down; a plain-value channel (tag 0)
-        // has nothing to release.
-        let tag = crate::collections::list::element_tag_from_code((*stub).payload_tag as i32);
-        if !matches!(tag, crate::collections::list::ListTypeTag::Primitive) {
-            if let Some(ring) = &(*body).ring {
-                while let Some(v) = ring.try_dequeue() {
-                    orphans.push((tag, v));
-                }
-            }
-            if let Some(v) = lock_state(&(*body).state).pending_value.take() {
-                orphans.push((tag, v));
-            }
-        }
-        drop(Box::from_raw(body));
-        crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
-        crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
-        false
-    });
-    LIMBO_PENDING.store(limbo.entries.len(), Ordering::SeqCst);
-    drop(registry);
-    drop(limbo);
-    for (tag, v) in orphans {
-        crate::collections::list::release_element(tag, v);
-    }
-}
-
-/// how an in-flight operation's guard is keeping the body alive.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ClaimMode {
-    /// the body pointer sits in this thread's hazard slot — and stays there
-    /// when the guard drops. leaving the claim published ("sticky") is what
-    /// makes the next operation on the same channel barrier-free: its claim
-    /// already exists before it loads `stub.body`, so a non-null load *is* the
-    /// proof of protection and no publish/validate round is needed.
-    Hazard(*const HazardSlot),
-    /// the operation holds one unit of the stub's `refs`.
-    Counted,
-}
-
-/// an in-flight operation's claim on a channel body. holding one is what makes
-/// a `&ChannelInner` safe to keep for the span of the call: nothing frees the
-/// body until every claim is gone. an operation about to park must call
-/// `upgrade` first — a hazard belongs to the os thread, which under the green
-/// backend goes on to run other tasks while this one is suspended.
-struct ChannelGuard {
-    stub: *const TaggedChannel,
-    body: *const ChannelInner,
-    mode: Cell<ClaimMode>,
-}
-
-impl ChannelGuard {
-    fn inner(&self) -> &ChannelInner {
-        unsafe { &*self.body }
-    }
-
-    fn stub(&self) -> &TaggedChannel {
-        unsafe { &*self.stub }
-    }
-
-    /// trade the thread-bound hazard claim for a counted one, so the guard
-    /// survives a park. count first, then clear the hazard: a limbo scan
-    /// between the two sees both, never neither (`flush_limbo` scans in the
-    /// matching hazards-then-count order). the slot is cleared only when no
-    /// other live guard on this thread shares it, and clearing also frees the
-    /// slot for the other green tasks this worker will run while we are
-    /// suspended. idempotent — the second and later parks of one operation
-    /// are no-ops.
-    #[inline]
-    fn upgrade(&self) {
-        let ClaimMode::Hazard(slot) = self.mode.get() else {
-            return;
-        };
-        self.stub().refs.0.fetch_add(1, Ordering::SeqCst);
-        unsafe {
-            (*slot).depth.set((*slot).depth.get() - 1);
-            (*slot).hazard.store(std::ptr::null_mut(), Ordering::SeqCst);
-        }
-        self.mode.set(ClaimMode::Counted);
-    }
-}
-
-impl Drop for ChannelGuard {
-    fn drop(&mut self) {
-        match self.mode.get() {
-            // releasing a claim needs only Release (a plain store on x86): a
-            // flush that sees the cleared slot or the zero count acquires
-            // everything this operation did to the body before freeing it, and
-            // a flush that reads the stale value keeps the entry —
-            // conservative, never wrong. the SeqCst total order is only needed
-            // on the publish/validate versus retire/scan edge.
-            //
-            // (a "sticky" variant that left the hazard published for the next
-            // same-channel operation to reuse was tried and measured SLOWER in
-            // the compiled binary than republishing each time — the branchier
-            // acquire cost more than the barrier it saved.)
-            ClaimMode::Hazard(slot) => unsafe {
-                (*slot).depth.set((*slot).depth.get() - 1);
-                (*slot).hazard.store(std::ptr::null_mut(), Ordering::Release);
-            },
-            ClaimMode::Counted => {
-                self.stub().refs.0.fetch_sub(1, Ordering::Release);
-            }
-        }
-        // the claim just released may be the last thing keeping a limbo body:
-        // its own channel's if this operation closed or drained it, any other
-        // retired channel's if the retire raced this operation. Relaxed is
-        // enough — the flush re-verifies everything under its locks, and a
-        // stale zero read here only defers the free to the next release point.
-        if LIMBO_PENDING.load(Ordering::Relaxed) > 0 {
-            unsafe { flush_limbo() };
-        }
-    }
-}
-
-/// take the channel out of service: unhook the body so no new claim can be
-/// minted, and hand it to the limbo list for whichever claim drops last.
-/// idempotent — only the caller whose swap comes back non-null retires.
-unsafe fn retire(stub: &TaggedChannel) {
-    let body = stub.body.swap(std::ptr::null_mut(), Ordering::SeqCst);
-    if body.is_null() {
-        return;
-    }
-    {
-        let mut limbo = lock_limbo();
-        limbo.entries.push((stub as *const TaggedChannel, body));
-        LIMBO_PENDING.store(limbo.entries.len(), Ordering::SeqCst);
-    }
-    flush_limbo();
-}
-
-/// retire the body when the channel can no longer hand anything to anyone: it
-/// is closed *and* its ring is empty. closure alone is not enough — a closed
-/// channel still drains, and `connection.pith` depends on that — so this is
-/// called from `close` and again from the receive that empties a closed ring,
-/// whichever gets there second.
-unsafe fn retire_if_spent(guard: &ChannelGuard) {
-    let inner = guard.inner();
-    if !inner.closed_flag.load(Ordering::SeqCst) {
-        return;
-    }
-    if let Some(ring) = &inner.ring {
-        if ring.len() != 0 {
-            return;
-        }
-    }
-    guard
-        .stub()
-        .retired_by
-        .store(RETIRED_CLOSED_AND_DRAINED, Ordering::Release);
-    retire(guard.stub());
-}
-
-/// the stub behind a handle, validated by alignment and the magic word. a
-/// reclaimed channel still has its stub, so this resolves where
-/// `channel_acquire` does not: `cap()` reads the stub alone.
-unsafe fn channel_stub<'a>(handle: i64) -> Option<&'a TaggedChannel> {
+unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a TaggedChannel> {
     let ptr = handle as *const TaggedChannel;
     if !handle_registry::plausibly_aligned::<TaggedChannel>(ptr as *const ()) {
         return None;
@@ -756,65 +365,89 @@ unsafe fn channel_stub<'a>(handle: i64) -> Option<&'a TaggedChannel> {
     Some(&*ptr)
 }
 
-/// resolve a handle and claim its body for the length of one operation. `None`
-/// covers two cases that answer alike: the handle is not a channel, or it names
-/// one whose body has been reclaimed. the second folds into the first because a
-/// reclaimed channel is by construction closed and drained, and every operation
-/// on a closed, drained channel returns what this `None` makes the caller
-/// return.
-///
-/// two paths:
-///
-///  * **publish + validate** — the classic hazard protocol: publish the
-///    pointer (the one SeqCst store per operation, so the validating load
-///    cannot pass it), then re-check that the stub still hooks the body. a
-///    successful validation precedes any retire in the SeqCst total order, so
-///    that retire's scan sees the hazard; a failed one withdraws without ever
-///    dereferencing.
-///  * **counted fallback** — a live guard already owns the slot (re-entrant
-///    channel op, which no current path does): take a count instead, with its
-///    own validation.
-#[inline]
-unsafe fn channel_acquire<'a>(handle: i64) -> Option<ChannelGuard> {
-    let stub: &'a TaggedChannel = channel_stub(handle)?;
-    let body = stub.body.load(Ordering::SeqCst);
-    if body.is_null() {
-        if stub.retired_by.load(Ordering::Acquire) == RETIRED_BY_LAST_OWNER {
-            crate::perf_count(&crate::PERF_CHANNEL_USE_AFTER_ZERO, 1);
-            if channel_strict() {
-                eprintln!("pith: channel used after its last owner released it");
-                std::process::abort();
+#[cfg(test)]
+static TEST_FREES: AtomicUsize = AtomicUsize::new(0);
+
+/// the count an operation takes for itself when it is about to park, so the
+/// body outlives the suspended call even if every language owner releases it
+/// meanwhile. declared as the FIRST local of every entry point that can block:
+/// rust drops locals in reverse order, so this releases last — after the state
+/// guard, after the post-wake `parked_*` bookkeeping, after `take_handoff`, and
+/// after the return value has been built. that declaration order is what
+/// guarantees every post-wake read of the body happens before a free that this
+/// release might perform. do not move it.
+struct ParkCount {
+    t: *const TaggedChannel,
+    taken: Cell<bool>,
+}
+
+impl ParkCount {
+    fn new(t: &TaggedChannel) -> ParkCount {
+        ParkCount {
+            t: t as *const TaggedChannel,
+            taken: Cell::new(false),
+        }
+    }
+
+    /// idempotent: an unbuffered loop that parks repeatedly pays one count.
+    #[inline]
+    fn take(&self) {
+        if !self.taken.get() {
+            unsafe { (*self.t).refs.fetch_add(1, Ordering::Relaxed) };
+            self.taken.set(true);
+        }
+    }
+}
+
+impl Drop for ParkCount {
+    fn drop(&mut self) {
+        if self.taken.get() {
+            unsafe { release_count(&*self.t) };
+        }
+    }
+}
+
+/// one owner fewer; the last one frees. shared by the language's release and
+/// by a parked operation's completion.
+unsafe fn release_count(t: &TaggedChannel) {
+    let prev = t.refs.fetch_sub(1, Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        // an over-release: put the count back rather than wrap. the same guard
+        // every other kind's release has.
+        t.refs.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(Ordering::Acquire);
+    free_channel(t as *const TaggedChannel as *mut TaggedChannel);
+}
+
+/// nothing names the body any more — no owner, no parked call — so the ring is
+/// quiescent and the drain is exact. values a program never received are
+/// released by the payload tag; a payload that is itself a channel releases
+/// through this same path, which holds no lock, so that is fine.
+unsafe fn free_channel(p: *mut TaggedChannel) {
+    let tag = crate::collections::list::element_tag_from_code((*p).payload_tag as i32);
+    if !matches!(tag, crate::collections::list::ListTypeTag::Primitive) {
+        if let Some(ring) = &(*p).inner.ring {
+            while let Some(v) = ring.try_dequeue() {
+                crate::collections::list::release_element(tag, v);
             }
         }
-        return None;
-    }
-    let slot = hazard_slot();
-    // only this thread writes its own slot's depth, so a plain read decides.
-    if (*slot).depth.get() > 0 {
-        stub.refs.0.fetch_add(1, Ordering::SeqCst);
-        if stub.body.load(Ordering::SeqCst).is_null() {
-            // retired between the peek and the count: the count landed too late
-            // to be certain a flush had not already freed the body.
-            stub.refs.0.fetch_sub(1, Ordering::SeqCst);
-            return None;
+        if let Some(v) = lock_state(&(*p).inner.state).pending_value.take() {
+            crate::collections::list::release_element(tag, v);
         }
-        return Some(ChannelGuard {
-            stub: stub as *const TaggedChannel,
-            body,
-            mode: Cell::new(ClaimMode::Counted),
-        });
     }
-    (*slot).hazard.store(body, Ordering::SeqCst);
-    if stub.body.load(Ordering::SeqCst) != body {
-        (*slot).hazard.store(std::ptr::null_mut(), Ordering::Release);
-        return None;
-    }
-    (*slot).depth.set((*slot).depth.get() + 1);
-    Some(ChannelGuard {
-        stub: stub as *const TaggedChannel,
-        body,
-        mode: Cell::new(ClaimMode::Hazard(slot)),
-    })
+    let bytes = channel_bytes((*p).capacity as usize);
+    // a stale handle must fail validation from here on
+    (*p).magic = 0;
+    drop(Box::from_raw(p));
+    crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
+    crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
+    #[cfg(test)]
+    TEST_FREES.fetch_add(1, Ordering::Relaxed);
 }
 
 fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
@@ -902,18 +535,16 @@ fn wake_senders(inner: &ChannelInner, state: &mut ChannelState) {
 /// lock), releases the lock, and suspends its coroutine back to the scheduler; it
 /// re-locks and continues its loop when a later send/recv wakes it.
 fn block_on_channel<'a>(
-    guard: &ChannelGuard,
+    park: &ParkCount,
     inner: &'a ChannelInner,
     mut state: MutexGuard<'a, ChannelState>,
     green_task: Option<usize>,
     role: Role,
 ) -> MutexGuard<'a, ChannelState> {
-    // about to park: the hazard claim is bound to this os thread, which under
-    // the green backend goes on to run other tasks while this one is suspended
-    // — trade it for a counted claim the suspension can carry. the os-thread
-    // arm keeps its thread, but upgrading unconditionally keeps the invariant
-    // simple: a published hazard never spans a block.
-    guard.upgrade();
+    // about to park: hold a count of our own for the span of this call, so the
+    // body outlives the suspension even if every language owner releases it
+    // while we sleep (see `ParkCount`).
+    park.take();
     match green_task {
         None => {
             // count this os-thread waiter under the channel lock before
@@ -992,34 +623,25 @@ pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
         green_receivers: Vec::new(),
         green_senders: Vec::new(),
     };
-    let body = Box::into_raw(Box::new(ChannelInner {
-        ring: if cap > 0 { Some(Ring::new(cap)) } else { None },
-        capacity: cap,
-        closed_flag: AtomicBool::new(false),
-        parked_senders: AtomicUsize::new(0),
-        parked_receivers: AtomicUsize::new(0),
-        state: Mutex::new(state),
-        senders: Condvar::new(),
-        receivers: Condvar::new(),
-    }));
-    // `refs` starts at one: the creator's count. "in service" is still `body`
-    // being non-null, because a close-and-drain can retire the body while
-    // owners remain.
     let ptr = Box::into_raw(Box::new(TaggedChannel {
         magic: CHANNEL_MAGIC,
         payload_tag: payload_tag.clamp(0, 255) as u8,
         capacity: cap as u32,
-        body: AtomicPtr::new(body),
-        refs: PaddedCount(AtomicUsize::new(1)),
-        retired_by: std::sync::atomic::AtomicU8::new(RETIRED_IN_SERVICE),
+        // the creator's count
+        refs: AtomicUsize::new(1),
+        inner: ChannelInner {
+            ring: if cap > 0 { Some(Ring::new(cap)) } else { None },
+            capacity: cap,
+            closed_flag: AtomicBool::new(false),
+            parked_senders: AtomicUsize::new(0),
+            parked_receivers: AtomicUsize::new(0),
+            state: Mutex::new(state),
+            senders: Condvar::new(),
+            receivers: Condvar::new(),
+        },
     }));
     crate::perf_count(&crate::PERF_CHANNEL_NEWS, 1);
     crate::perf_count(&crate::PERF_CHANNEL_RETAINED_BYTES, channel_bytes(cap));
-    // construction is off every hot path and a natural bound on limbo growth:
-    // a program churning channels flushes at least once per channel it makes.
-    if LIMBO_PENDING.load(Ordering::Relaxed) > 0 {
-        unsafe { flush_limbo() };
-    }
     ptr as i64
 }
 
@@ -1027,58 +649,30 @@ pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
 /// capture took a copy. Garbage handles are ignored, like every other kind.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_retain(handle: i64) {
-    let Some(stub) = channel_stub(handle) else {
-        return;
-    };
-    stub.refs.0.fetch_add(1, Ordering::Relaxed);
+    if let Some(t) = channel_ref(handle) {
+        t.refs.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-/// One owner fewer. The last owner retires the body: it goes to limbo and is
-/// freed by the flush once no in-flight operation still names it, which is
-/// what lets this release run while another thread is mid-operation on a
-/// handle it borrowed from a holder this thread just dropped. Values still
-/// queued are released by the payload tag when the body is freed.
+/// One owner fewer; the last owner frees the channel, releasing any values
+/// still queued by the payload tag.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_release(handle: i64) {
-    let Some(stub) = channel_stub(handle) else {
-        return;
-    };
-    let prev = stub.refs.0.fetch_sub(1, Ordering::Release);
-    if prev > 1 {
-        return;
+    if let Some(t) = channel_ref(handle) {
+        release_count(t);
     }
-    if prev == 0 {
-        // an over-release: put the count back rather than wrap. the same guard
-        // every other kind's release has.
-        stub.refs.0.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    std::sync::atomic::fence(Ordering::Acquire);
-    stub.retired_by
-        .store(RETIRED_BY_LAST_OWNER, Ordering::Release);
-    retire(stub);
-    // `retire` returns early when a close-and-drain already unhooked the body;
-    // that body has been waiting in limbo for this count to reach zero.
-    flush_limbo();
 }
 
-/// the reclaimable bytes of one channel: the `ChannelInner` and the ring's
-/// slots. this is what a retirement hands back, and for a 256-slot channel it
-/// is over 99% of the allocation.
-fn channel_body_bytes(capacity: usize) -> usize {
+/// every byte one channel asks the allocator for: the channel and its ring's
+/// slots. allocator rounding is on top of this, so the number under-reports
+/// the real resident cost rather than inflating it.
+fn channel_bytes(capacity: usize) -> usize {
     let ring = if capacity > 0 {
         Ring::slot_count(capacity) * std::mem::size_of::<Slot>()
     } else {
         0
     };
-    std::mem::size_of::<ChannelInner>() + ring
-}
-
-/// every byte one channel asks the allocator for: the permanent stub plus the
-/// reclaimable body. allocator rounding is on top of this, so the number
-/// under-reports the real resident cost rather than inflating it.
-fn channel_bytes(capacity: usize) -> usize {
-    std::mem::size_of::<TaggedChannel>() + channel_body_bytes(capacity)
+    std::mem::size_of::<TaggedChannel>() + ring
 }
 
 /// after a successful ring op, wake one parked waiter of the opposite `role` if
@@ -1150,8 +744,7 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
 /// spin: their park is a userspace suspend, already cheap.
 const SPIN_TRIES: usize = 64;
 
-unsafe fn buffered_send(guard: &ChannelGuard, ring: &Ring, value: i64) -> i64 {
-    let inner = guard.inner();
+unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
     let capacity = inner.capacity;
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
@@ -1182,7 +775,7 @@ unsafe fn buffered_send(guard: &ChannelGuard, ring: &Ring, value: i64) -> i64 {
             wake_parked(inner, ring, Role::Receiver);
             return 1;
         }
-        state = block_on_channel(guard, inner, state, green_task, Role::Sender);
+        state = block_on_channel(park, inner, state, green_task, Role::Sender);
         drop(state);
         inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1191,8 +784,7 @@ unsafe fn buffered_send(guard: &ChannelGuard, ring: &Ring, value: i64) -> i64 {
 /// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
 /// path; park under the mutex only when the ring is empty. a closed channel
 /// still drains — the dequeue try comes before the closed check.
-unsafe fn buffered_recv(guard: &ChannelGuard, ring: &Ring) -> i64 {
-    let inner = guard.inner();
+unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> i64 {
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
@@ -1226,7 +818,7 @@ unsafe fn buffered_recv(guard: &ChannelGuard, ring: &Ring) -> i64 {
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
             return optional_tuple(false, 0);
         }
-        state = block_on_channel(guard, inner, state, green_task, Role::Receiver);
+        state = block_on_channel(park, inner, state, green_task, Role::Receiver);
         drop(state);
         inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
         // a green task may have been handed its value by the waker (see
@@ -1245,14 +837,15 @@ unsafe fn buffered_recv(guard: &ChannelGuard, ring: &Ring) -> i64 {
 pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     // a reclaimed channel is closed and drained, and a send to a closed channel
     // is refused — the same 0 an unknown handle gets.
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 0;
     };
-    let inner = guard.inner();
+    let park = ParkCount::new(t);
+    let inner = &t.inner;
     // a buffered channel's values live in the lock-free ring; the mutex is only
     // the parking lot. the unbuffered rendezvous below is untouched.
     if let Some(ring) = &inner.ring {
-        return buffered_send(&guard, ring, value);
+        return buffered_send(&park, inner, ring, value);
     }
     // is this send running inside a green task? if so it yields on a would-block
     // instead of parking the worker; if not (main thread / os-thread backend) it
@@ -1277,7 +870,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
                 // never be notified (a hang on the rendezvous handshake).
                 state.sender_waiting += 1;
                 while !state.closed && state.pending_value.is_some() {
-                    state = block_on_channel(&guard, inner, state, green_task, Role::Sender);
+                    state = block_on_channel(&park, inner, state, green_task, Role::Sender);
                 }
                 state.sender_waiting -= 1;
                 // delivered is the authority, not `closed`: a receiver may have
@@ -1287,7 +880,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
                 return if delivered { 1 } else { 0 };
             }
             state.sender_waiting += 1;
-            state = block_on_channel(&guard, inner, state, green_task, Role::Sender);
+            state = block_on_channel(&park, inner, state, green_task, Role::Sender);
             state.sender_waiting -= 1;
         }
         return 0;
@@ -1299,10 +892,10 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 0;
     };
-    let inner = guard.inner();
+    let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if inner.closed_flag.load(Ordering::SeqCst) {
             return 0;
@@ -1331,22 +924,13 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
 pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
     // a reclaimed channel yields the empty optional, which is exactly what a
     // closed and drained one yields.
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return optional_tuple(false, 0);
     };
-    let inner = guard.inner();
+    let park = ParkCount::new(t);
+    let inner = &t.inner;
     if let Some(ring) = &inner.ring {
-        let taken = buffered_recv(&guard, ring);
-        // only a recv that came back empty can be the one that observes a
-        // closed, drained channel — a recv carrying a value costs nothing
-        // here. the trade: a closed ring whose last value is taken and never
-        // followed by another recv keeps its body until close-time retirement
-        // or process end, which is the abandoned-stream shape that already
-        // retains far more than one ring.
-        if taken != 0 && *(taken as *const i64) == 0 {
-            retire_if_spent(&guard);
-        }
-        return taken;
+        return buffered_recv(&park, inner, ring);
     }
     let green_task = green::current_task();
     let mut state = lock_state(&inner.state);
@@ -1369,24 +953,23 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
         // sibling receiver here is exactly what caused the single-worker livelock.
         state.receiver_waiting += 1;
         wake_senders(inner, &mut state);
-        state = block_on_channel(&guard, inner, state, green_task, Role::Receiver);
+        state = block_on_channel(&park, inner, state, green_task, Role::Receiver);
         state.receiver_waiting -= 1;
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return optional_tuple(false, 0);
     };
-    let inner = guard.inner();
+    let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if let Some(value) = ring.try_dequeue() {
             wake_parked(inner, ring, Role::Sender);
             return optional_tuple(true, value);
         }
         // the empty case is the one that can observe a closed, drained ring.
-        retire_if_spent(&guard);
         return optional_tuple(false, 0);
     }
     let mut state = lock_state(&inner.state);
@@ -1402,10 +985,10 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     // a reclaimed channel was already closed, and a second close is a no-op
     // that reports false — the same 0 this returns below.
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 0;
     };
-    let inner = guard.inner();
+    let inner = &t.inner;
     let mut state = lock_state(&inner.state);
     if state.closed {
         return 0;
@@ -1423,10 +1006,6 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     wake_green(&mut state, Role::Sender);
     wake_green(&mut state, Role::Receiver);
     crate::perf_count(&crate::PERF_CHANNEL_CLOSES, 1);
-    drop(state);
-    // an already-drained channel is spent the moment it closes; one with values
-    // still in the ring is retired by the receive that takes the last of them.
-    retire_if_spent(&guard);
     1
 }
 
@@ -1434,10 +1013,10 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
 pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
     // a reclaimed channel is drained, so its length is 0 — the same answer an
     // unknown handle gets.
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 0;
     };
-    let channel = guard.inner();
+    let channel = &t.inner;
     if let Some(ring) = &channel.ring {
         return ring.len() as i64;
     }
@@ -1453,21 +1032,19 @@ pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
-    // capacity lives in the permanent stub, so it reads the same before and
-    // after the body is reclaimed — no operation on a channel changes it.
-    let Some(stub) = channel_stub(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 0;
     };
-    stub.capacity as i64
+    t.capacity as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
     // a reclaimed channel is closed, and so is an unknown handle by convention.
-    let Some(guard) = channel_acquire(handle) else {
+    let Some(t) = channel_ref(handle) else {
         return 1;
     };
-    let channel = guard.inner();
+    let channel = &t.inner;
     let state = lock_state(&channel.state);
     if state.closed {
         1
@@ -1497,11 +1074,16 @@ mod tests {
     // the closed-and-drained default instead of delivering.
     #[test]
     fn parked_receivers_then_last_release_elsewhere() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let ch = pith_channel_new(4, 0);
         unsafe { pith_channel_retain(ch) }; // the sender's own count
         let receivers: Vec<_> = (0..3)
             // recv returns an optional shell: slot 0 is the presence flag, slot 1 the value
-            .map(|_| std::thread::spawn(move || unsafe { *((pith_channel_recv(ch) as *const i64).add(1)) }))
+            .map(|_| {
+                std::thread::spawn(move || unsafe {
+                    *((pith_channel_recv(ch) as *const i64).add(1))
+                })
+            })
             .collect();
         std::thread::sleep(std::time::Duration::from_millis(60));
         unsafe { pith_channel_release(ch) }; // the creator is gone; receivers still parked
@@ -1512,18 +1094,17 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![1, 2, 3]);
         assert_eq!(unsafe { pith_channel_send(ch, 4) }, 1, "one holder remains");
+        let before = frees();
         unsafe { pith_channel_release(ch) };
-        assert_eq!(unsafe { pith_channel_send(ch, 5) }, 0, "retired at the last owner");
-        assert_eq!(unsafe { pith_channel_cap(ch) }, 4, "the stub still answers cap");
+        assert_eq!(frees(), before + 1, "the last owner frees exactly once");
     }
 
     // a channel whose payloads are channels: releasing the outer one to zero
     // drains its ring by the payload tag, which releases the inner channels'
-    // only counts — through this same retire/flush path, which is why the
-    // flush must release orphans after it has dropped its locks. each inner
-    // is then retired: a send on it reports the default.
+    // only counts through this same path — four frees for one release.
     #[test]
     fn zero_drains_ring_by_tag() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let outer = pith_channel_new(8, 8);
         let inners: Vec<i64> = (0..3).map(|_| pith_channel_new(1, 0)).collect();
         for &inner in &inners {
@@ -1531,22 +1112,33 @@ mod tests {
         }
         assert_eq!(unsafe { pith_channel_len(outer) }, 3);
         for &inner in &inners {
-            assert_eq!(unsafe { pith_channel_send(inner, 1) }, 1, "alive while queued");
-            assert_eq!(unsafe { *(pith_channel_try_recv(inner) as *const i64) }, 1, "present");
+            assert_eq!(
+                unsafe { pith_channel_send(inner, 1) },
+                1,
+                "alive while queued"
+            );
+            assert_eq!(
+                unsafe { *(pith_channel_try_recv(inner) as *const i64) },
+                1,
+                "present"
+            );
         }
+        let before = frees();
         unsafe { pith_channel_release(outer) };
-        assert_eq!(unsafe { pith_channel_send(outer, 9) }, 0, "outer retired");
-        for &inner in &inners {
-            assert_eq!(unsafe { pith_channel_send(inner, 1) }, 0, "inner released by the drain");
-        }
+        assert_eq!(frees(), before + 4, "the outer and its three queued inners");
     }
 
     #[test]
-    fn over_release_is_restored_and_garbage_is_ignored() {
+    fn extra_owners_delay_the_free_and_garbage_is_ignored() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let ch = pith_channel_new(1, 0);
+        let before = frees();
         unsafe {
-            pith_channel_release(ch); // to zero: retired
-            pith_channel_release(ch); // over-release: count restored, no double free
+            pith_channel_retain(ch);
+            pith_channel_release(ch);
+            assert_eq!(frees(), before, "one owner remains");
+            pith_channel_release(ch);
+            assert_eq!(frees(), before + 1);
             pith_channel_retain(12345); // garbage: no-op
             pith_channel_release(12345);
         }
@@ -1621,7 +1213,11 @@ mod tests {
             assert_eq!((*t, *t.add(1)), (1, 42));
             pith_channel_close(ch);
 
-            assert_eq!(sender.join().unwrap(), 1, "delivered value reported as failed");
+            assert_eq!(
+                sender.join().unwrap(),
+                1,
+                "delivered value reported as failed"
+            );
         }
     }
 
@@ -1639,16 +1235,17 @@ mod tests {
         }
     }
 
-    // the reclamation hazard, pinned as a test: receivers parked on an empty
-    // ring when close() retires the body. the closer's retire runs while the
-    // receivers' suspended calls still hold `&ChannelInner` — the exact shape
-    // that hung (an effective use-after-free) when an ablation freed the body
-    // without honoring their claims. the parked callers upgraded to counted
-    // claims before waiting, so the body must outlive them all; afterwards the
-    // stub must answer like any closed, drained channel and the body must be
-    // unhooked.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    fn frees() -> usize {
+        TEST_FREES.load(Ordering::Relaxed)
+    }
+
+    // receivers parked on an empty ring when close() wakes them: every one
+    // sees the close, the channel then answers like any closed, drained one
+    // while its owner still holds it, and the owner's release frees it once.
     #[test]
-    fn close_with_parked_receivers_retires_safely() {
+    fn close_with_parked_receivers_then_release_frees() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let ch = pith_channel_new(4, 0);
             let receivers: Vec<_> = (0..3)
@@ -1664,27 +1261,29 @@ mod tests {
             for h in receivers {
                 assert_eq!(h.join().unwrap(), 0, "parked recv must see the close");
             }
-            // retired: the stub no longer hooks a body, and every operation
-            // answers the closed-and-drained default.
-            let stub = channel_stub(ch).expect("stub outlives the body");
-            assert!(stub.body.load(Ordering::SeqCst).is_null(), "body not retired");
             assert_eq!(pith_channel_is_closed(ch), 1);
             assert_eq!(pith_channel_len(ch), 0);
             assert_eq!(pith_channel_send(ch, 1), 0);
-            assert_eq!(pith_channel_cap(ch), 4, "capacity survives retirement");
+            assert_eq!(pith_channel_cap(ch), 4);
             let t = pith_channel_recv(ch) as *const i64;
             assert_eq!(*t, 0);
+            let before = frees();
+            pith_channel_release(ch);
+            assert_eq!(
+                frees(),
+                before + 1,
+                "the owner's release frees the closed channel"
+            );
         }
     }
 
-    // senders racing a concurrent close-and-drain, many rounds: every
-    // interleaving must end with the channel retired and nobody faulting. a
-    // send that slips a value in after the drain decided "empty" may lose that
-    // value with the body — the documented narrowing against main, where the
-    // value would sit in the never-freed ring and remain drainable — but it
-    // must never corrupt or crash.
+    // senders racing a concurrent close-and-drain, many rounds, each thread
+    // holding its own count and releasing it at its end so the last one out
+    // frees the channel under contention: every interleaving must end with the
+    // channel freed exactly once and nobody faulting.
     #[test]
     fn a_close_race_never_hands_back_more_than_was_sent() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // what a close race guarantees, and what it does not.
         //
         // it does NOT guarantee that every accepted send is drainable. a
@@ -1697,9 +1296,12 @@ mod tests {
         // what must hold is the other direction. a drain may never produce
         // more than was accepted, because that would mean a value delivered
         // twice or a slot read after it was freed.
+        let before = frees();
         for _ in 0..1500 {
             unsafe {
                 let ch = pith_channel_new(8, 0);
+                pith_channel_retain(ch); // the sender's count
+                pith_channel_retain(ch); // the closer's count
                 let sender = std::thread::spawn(move || unsafe {
                     let mut accepted = 0;
                     for v in 0..8 {
@@ -1707,6 +1309,7 @@ mod tests {
                             accepted += 1;
                         }
                     }
+                    pith_channel_release(ch);
                     accepted
                 });
                 let closer = std::thread::spawn(move || unsafe {
@@ -1719,6 +1322,7 @@ mod tests {
                         }
                         drained += 1;
                     }
+                    pith_channel_release(ch);
                     drained
                 });
                 let accepted = sender.join().unwrap();
@@ -1727,21 +1331,31 @@ mod tests {
                     drained <= accepted,
                     "a drain produced {drained} values from {accepted} accepted sends"
                 );
+                pith_channel_release(ch); // the creator's count, last or not
             }
         }
+        assert_eq!(
+            frees(),
+            before + 1500,
+            "every round freed its channel exactly once"
+        );
     }
 
     #[test]
     fn close_drain_racing_senders_never_faults() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = frees();
         for _ in 0..1500 {
             unsafe {
                 let ch = pith_channel_new(2, 0);
+                pith_channel_retain(ch);
                 let sender = std::thread::spawn(move || unsafe {
                     for v in 0..8 {
                         if pith_channel_send(ch, v) == 0 {
                             break;
                         }
                     }
+                    pith_channel_release(ch);
                 });
                 let closer = std::thread::spawn(move || unsafe {
                     let _ = pith_channel_try_recv(ch);
@@ -1757,38 +1371,32 @@ mod tests {
                 closer.join().unwrap();
                 assert_eq!(pith_channel_is_closed(ch), 1);
                 assert_eq!(pith_channel_send(ch, 99), 0);
+                pith_channel_release(ch);
             }
         }
+        assert_eq!(frees(), before + 1500);
     }
 
-    // a consumer draining after close must still get every buffered value even
-    // though the close already wanted the channel gone; the body may only
-    // retire at the receive that empties the ring.
+    // a consumer draining after close must still get every buffered value:
+    // close is not a free, and nothing is freed until the last owner is gone.
     #[test]
-    fn close_then_drain_keeps_values_then_retires() {
+    fn close_then_drain_keeps_values() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let ch = pith_channel_new(8, 0);
             for v in 1..=5 {
                 assert_eq!(pith_channel_send(ch, v), 1);
             }
             pith_channel_close(ch);
-            let stub = channel_stub(ch).unwrap();
-            assert!(
-                !stub.body.load(Ordering::SeqCst).is_null(),
-                "close with a loaded ring must not retire"
-            );
             for v in 1..=5 {
                 let t = pith_channel_recv(ch) as *const i64;
                 assert_eq!((*t, *t.add(1)), (1, v));
             }
-            // the recv that carried the last value does not pay the retire
-            // check; the empty recv that observes closed-and-drained does.
             let t = pith_channel_recv(ch) as *const i64;
             assert_eq!(*t, 0);
-            assert!(
-                stub.body.load(Ordering::SeqCst).is_null(),
-                "the recv that observes the drained close retires the body"
-            );
+            let before = frees();
+            pith_channel_release(ch);
+            assert_eq!(frees(), before + 1);
         }
     }
 
@@ -1948,32 +1556,10 @@ mod tests {
 
             assert_eq!(count.load(Ordering::Relaxed), total_msgs);
             // every id in 0..total_msgs was seen exactly once
-            assert_eq!(sum.load(Ordering::Relaxed), total_msgs * (total_msgs - 1) / 2);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tmp_bench {
-    use super::*;
-
-    // temporary micro-bench for the reclamation work: run with
-    //   cargo test -p pith-runtime --release tmp_bench -- --nocapture --ignored
-    #[test]
-    #[ignore]
-    fn opcost() {
-        unsafe {
-            let ch = pith_channel_new(256, 0);
-            let n: i64 = 5_000_000;
-            let mut sink = 0i64;
-            let t0 = std::time::Instant::now();
-            for i in 0..n {
-                pith_channel_send(ch, i);
-                let t = pith_channel_recv(ch) as *const i64;
-                sink += *t.add(1);
-            }
-            let per = t0.elapsed().as_nanos() as i64 / n;
-            eprintln!("ns_per_pair={per} sink={sink}");
+            assert_eq!(
+                sum.load(Ordering::Relaxed),
+                total_msgs * (total_msgs - 1) / 2
+            );
         }
     }
 }

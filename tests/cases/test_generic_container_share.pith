@@ -3,17 +3,15 @@
 #
 # the timer pattern from std.term.app, reduced: a generic body builds a struct
 # holding a closure, wraps it in a carrier, and a second generic body copies
-# the element out of the carrier into a registry the caller owns. a generic
-# body takes no count for that store — its kinds are suppressed — so the
-# registry's element rides on the carrier's count alone. when the carrier dies
-# at the caller's release, anything its destructor freed would leave the
-# registry pointing at freed memory, and the later fire would call through it.
-# a per-instance destructor briefly attached to base-name generic
-# constructions did exactly that: the carrier's list slot released the spec,
-# the spec's closure slot released make, and the fire after the carrier's
-# death read both freed blocks. the spec therefore leaks by design until a
-# generic body can retain what it stores (#927); this case pins the fire
-# staying safe, and its concrete twin prints the same lines.
+# the element out of the carrier into a registry the caller owns. when the
+# carrier dies at the caller's release, anything its destructor freed that the
+# registry still held would leave the registry pointing at freed memory, and
+# the later fire would call through it. a per-instance destructor once
+# attached to base-name generic constructions while the body took no count
+# for its stores did exactly that. with the body typed, the push into the
+# registry takes its own count and the carrier's destructor drops only the
+# carrier's; this case pins the fire staying safe, and its concrete twin
+# prints the same lines.
 struct Spec[M]:
     pub ms: Int
     pub make: fn(Int) -> M

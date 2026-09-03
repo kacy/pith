@@ -1,0 +1,25 @@
+# an optional local inside a generic body. `k: Int? := i % 9` allocates a
+# shell, and a specialization used to keep no tuple local, so the shell was
+# given its destructor and then dropped on the floor: 15.2 mb at 200k rounds,
+# 52.7 mb at 800k, while the named twin stayed at 2.7 mb (this was shape 3 of
+# tests/pending/if_let_frame_ownership). with a generic body typed against its
+# concrete types and tracked like a concrete one, the shell is released at the
+# frame's exit and the peak is the same at both round counts.
+import leakprobe as probe
+
+fn generic_bound[T](t: T, i: Int) -> Int:
+    k: Int? := i % 9
+    mut m := 0
+    if let v = k:
+        m = v
+    return m
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + generic_bound("t", i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

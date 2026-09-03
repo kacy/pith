@@ -1,11 +1,11 @@
-# a generic specialization releases the locals that provably cannot escape
-# its body, and leaves every other one alone. this case is the over-release
-# side of that: each function below hands a local to a second owner — a
-# struct field, a result payload, a container element, a map value, an
-# optional, a module global, a bare return, a user function's argument —
-# and then reads the value back after the frame that built it is gone. a
-# specialization that released one of those would print garbage or die
-# here, which is the failure a leak gate cannot see.
+# a generic body is typed against its concrete types and releases its locals
+# the way a concrete body does. this case is the over-release side of that:
+# each function below hands a local to a second owner — a struct field, a
+# result payload, a container element, a map value, an optional, a module
+# global, a bare return, a user function's argument — and then reads the
+# value back after the frame that built it is gone. a body that released one
+# of those would print garbage or die here, which is the failure a leak gate
+# cannot see.
 #
 # an earlier row pushed a string local into a `List[T]` at `T = Int` to
 # stand for an escape into an untagged list. that body is ill-typed, and

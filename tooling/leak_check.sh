@@ -65,6 +65,9 @@ cases=(
   tests/leaks/leak_discarded_optional_result
   tests/leaks/leak_literal_fresh_elements
   tests/leaks/leak_generic_body_locals
+  tests/leaks/leak_generic_body_escapes
+  tests/leaks/leak_generic_optional_local
+  tests/leaks/leak_generic_body_instance
   tests/leaks/leak_list_search_widened_arg
   tests/leaks/leak_generic_instance_dtor
   tests/leaks/leak_generic_optional_return

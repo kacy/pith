@@ -1,0 +1,80 @@
+# a generic struct built by its bare name inside a generic body. the
+# construction used to lower through the backend constructor with no
+# destructor, because the unchecked body took no count for what it stored and
+# a destructor would have freed a payload some longer-lived holder still
+# aliased. with the body typed, the construction takes the inline path every
+# concrete body takes: each borrowed field is retained, the instance carries
+# its destructor, and a copy of a payload into longer-lived storage takes its
+# own count. the instances below are stored, returned, nested and read back
+# after the frames that built them are gone, so a destructor that released a
+# payload still held elsewhere would print garbage or die here.
+#
+# each generic function has a concrete twin printing the same line; the twin
+# is the control, and the expected output is its lines.
+
+struct Holder[T]:
+    pub item: T
+
+struct Spec:
+    pub name: String
+
+struct Pack[T]:
+    pub specs: List[T]
+
+mut registry: List[Spec] := []
+
+fn build[T](v: T) -> Holder[T]:
+    h := Holder(v)
+    return h
+
+fn build_con(v: String) -> Holder[String]:
+    h := Holder(v)
+    return h
+
+fn keep_in_list[T](v: T) -> List[Holder[T]]:
+    h := Holder(v)
+    out: List[Holder[T]] := []
+    out.push(h)
+    return out
+
+fn keep_in_list_con(v: String) -> List[Holder[String]]:
+    h := Holder(v)
+    out: List[Holder[String]] := []
+    out.push(h)
+    return out
+
+fn nested[T](t: T, label: String) -> Pack[Spec]:
+    s := Spec(name: label)
+    p := Pack(specs: [s])
+    return p
+
+fn nested_con(t: Int, label: String) -> Pack[Spec]:
+    s := Spec(name: label)
+    p := Pack(specs: [s])
+    return p
+
+# the std.term.app shape: a generic body copies a payload out of a carrier
+# into storage the caller owns, then the carrier dies.
+fn adopt[T](t: T, pack: Pack[Spec]):
+    for s in pack.specs:
+        registry.push(s)
+
+fn adopt_con(t: Int, pack: Pack[Spec]):
+    for s in pack.specs:
+        registry.push(s)
+
+fn plain[T](v: T) -> Int:
+    h := Holder(1)
+    return h.item
+
+fn main():
+    print(build("x").item)
+    print(build_con("x").item)
+    l := keep_in_list("y")
+    lc := keep_in_list_con("y")
+    print(l[0].item + " " + lc[0].item)
+    print(nested(1, "n").specs[0].name + " " + nested_con(1, "n").specs[0].name)
+    adopt(1, nested(1, "first"))
+    adopt_con(1, nested_con(1, "second"))
+    print(registry[0].name + " " + registry[1].name)
+    print(plain("z").to_string())

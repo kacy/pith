@@ -1,20 +1,16 @@
 # a generic body that hands one of its own locals back to the caller.
 #
-# a specialization re-emits a body the checker never looked at, so the
-# ownership classification is blind there and every rc bind used to be
-# published untracked. an untracked name in return position took the
-# borrowed-return path: the return retained it a second time for the caller
-# and nothing ever released the count its binding took, so a `return s` in a
-# generic body leaked one value per call.
+# before generic bodies were typed, every rc bind in a specialization was
+# published untracked and a `return s` retained the value a second time for
+# the caller while nothing released the binding's count: one leaked value
+# per call. the body is now typed and tracked like a concrete one, and a
+# returned local's count leaves with the value.
 #
 # the locals below reach nothing but their own return statement — no call
 # argument, no container the frame hands on, no struct field, no lambda — so
-# the count each binding took is exactly the count the caller receives.
-#
-# the round's varying text arrives as a parameter: a builtin's result kind
-# does not resolve inside a specialization either, so an `i.to_string()`
-# there leaks its result as a temporary, a separate gap that would swamp
-# this measurement.
+# the count each binding took is exactly the count the caller receives. the
+# round's varying text arrives as a parameter, so the case measures the
+# returns and nothing else.
 import leakprobe as probe
 
 # the bare shape: a fresh string bound and returned

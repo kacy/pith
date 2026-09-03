@@ -1,0 +1,32 @@
+# a generic struct built by its bare name inside a generic body. the
+# construction used to lower through the backend constructor with no
+# destructor attached, because the unchecked body took no count for what it
+# stored and a destructor would have freed a payload some other holder still
+# used: 12.0 mb at 200k rounds, 40.1 mb at 800k, while the twin that built the
+# instance at the call site stayed at 2.7 mb (shape 3 of
+# tests/pending/generic_body_locals). with the body typed, the construction
+# takes the inline path every concrete body takes: the field is retained, the
+# instance carries its destructor, and the local is released at the exit.
+#
+# the round's varying text arrives as a parameter, as in
+# leak_generic_body_locals, so the case measures the instance and not a
+# builtin temporary.
+import leakprobe as probe
+
+struct Holder[T]:
+    pub item: T
+
+fn generic_instance[T](v: T) -> Int:
+    h := Holder(v)
+    return h.item.len()
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        text := "text-" + i.to_string()
+        acc = acc + generic_instance(text)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

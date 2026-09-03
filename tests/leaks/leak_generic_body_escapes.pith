@@ -1,0 +1,113 @@
+# locals that escape a generic body: into a struct field, a map value, a set
+# element, a list element, a module global, a lambda's capture, a callee's
+# argument; a struct returned by construction, a call result returned, a
+# failure payload, a reassigned string parameter. a specialization used to
+# track only the locals it could prove confined and published every one of
+# these untracked, so each leaked one count per call (docs/limitations.md,
+# "a generic function body releases only the locals that cannot escape it").
+# with the body typed and tracked like a concrete one, every store takes its
+# own count and every exit releases the local's, so the peak is the same at
+# both round counts.
+#
+# the round's varying text arrives as a parameter, as in
+# leak_generic_body_locals, so the case measures the escapes and nothing
+# else.
+import leakprobe as probe
+
+struct Carrier:
+    pub items: List[String]
+    pub name: String
+
+mut registry: List[String] := []
+
+fn keep(s: String) -> Int:
+    return s.len()
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+fn into_field[T](t: T, tag: String) -> Int:
+    name := "n-" + tag
+    items: List[String] := []
+    piece := "i-" + tag
+    items.push(piece)
+    c := Carrier(items: items, name: name)
+    return c.name.len() + c.items.len()
+
+fn into_map[T](t: T, tag: String) -> Int:
+    m: Map[String, String] := {}
+    v := "v-" + tag
+    m.insert("k", v)
+    return m.len()
+
+fn into_set[T](t: T, tag: String) -> Int:
+    s: Set[String] := {}
+    e := "e-" + tag
+    s.add(e)
+    return s.len()
+
+fn into_list[T](t: T, tag: String) -> Int:
+    xs: List[String] := []
+    x := "x-" + tag
+    xs.push(x)
+    return xs.len()
+
+fn into_global[T](t: T, tag: String) -> Int:
+    g := "g-" + tag
+    registry.push(g)
+    if registry.len() > 8:
+        registry = []
+    return registry.len()
+
+fn into_capture[T](t: T, tag: String) -> Int:
+    c := "c-" + tag
+    f := fn() => c.len()
+    return f()
+
+fn into_arg[T](t: T, tag: String) -> Int:
+    a := "a-" + tag
+    return keep(a)
+
+fn returned_holder[T](t: T, tag: String) -> Carrier:
+    items: List[String] := []
+    piece := "r-" + tag
+    items.push(piece)
+    return Carrier(items: items, name: "h")
+
+fn returned_call[T](t: T, tag: String) -> String:
+    loud := "l-" + tag
+    return shout(loud)
+
+fn failing[T](t: T, tag: String) -> Int!:
+    name := "f-" + tag
+    if tag.len() > 0:
+        fail name
+    return 0
+
+fn reassigned[T](t: T, s: String) -> Int:
+    mut text := s
+    text = text + "-x"
+    text = text + "-y"
+    return text.len()
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        tag := "t-" + i.to_string()
+        acc = acc + into_field(1, tag)
+        acc = acc + into_map(1, tag)
+        acc = acc + into_set(1, tag)
+        acc = acc + into_list(1, tag)
+        acc = acc + into_global(1, tag)
+        acc = acc + into_capture(1, tag)
+        acc = acc + into_arg(1, tag)
+        h := returned_holder(1, tag)
+        acc = acc + h.items.len()
+        acc = acc + returned_call(1, tag).len()
+        acc = acc + (failing(1, tag) catch 0)
+        acc = acc + reassigned(1, tag)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

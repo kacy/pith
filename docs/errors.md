@@ -277,7 +277,11 @@ error[E224]: try requires a result type, got Int
 
 ### E225 — branch type mismatch
 
-if/elif/else branches return different types when used as an expression.
+if/elif/else branches, match arms or select arms produce different types when
+the whole is used as an expression. a `none` beside a value is not a mismatch:
+the branches settle on the value's optional, so `match v: none => none; x => x`
+is a `T?`, and a value beside its own optional settles on the optional the same
+way.
 
 ### E226 — interface constraint violation
 

@@ -137,7 +137,12 @@ pub fn sort_by_key[T](items: List[T], key: fn(T) -> String) -> List[T]:
 
 ## sort by a string key, descending: the reverse of sort_by_key.
 pub fn sort_by_key_desc[T](items: List[T], key: fn(T) -> String) -> List[T]:
-    return sort_by_key(items, key).reverse()
+    # reverse works in place and returns nothing; returning its result
+    # handed back whatever the call left in the register, which happened
+    # to be the list. the body was never type-checked, so nothing said so.
+    sorted := sort_by_key(items, key)
+    sorted.reverse()
+    return sorted
 
 ## index of a value in a sorted int list, or none when absent.
 pub fn binary_search(list: List[Int], value: Int) -> Int?:

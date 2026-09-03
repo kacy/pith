@@ -13,6 +13,14 @@ print("count: {items.len()}")
 print("best: {record.name} ({record.score})")
 ```
 
+An optional interpolates as its payload's text, or as `none` when it is empty,
+so a value that may be missing needs no unwrapping to be shown:
+
+```pith
+mut found: Int? := lookup(key)
+print("found: {found}")    # "found: 4" or "found: none"
+```
+
 Use `std.fmt` when formatting is reused or when a value is a common collection
 shape:
 

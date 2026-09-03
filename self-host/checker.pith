@@ -2974,6 +2974,10 @@ fn type_supports_stringify(tid: Int) -> Bool:
         return type_supports_stringify(info.key_type) and type_supports_stringify(info.value_type)
     if info.kind == "struct":
         return true
+    # an optional renders as "none" or as its payload's own text, so it is
+    # stringifiable exactly when the payload is
+    if info.kind == "optional":
+        return type_supports_stringify(info.inner)
     return false
 
 # ---------------------------------------------------------------

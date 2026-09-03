@@ -149,7 +149,10 @@ error[E209]: field 'z' not found on type 'Point'
 
 ### E210 — not a struct type
 
-a field access or struct constructor was used on a non-struct type.
+a field access or struct constructor was used on a non-struct type. the same
+code reports an explicit type argument that is not a type at all, such as
+`Channel[1](2)` or `Holder[f()]()`; a type written in expression position may
+be a name, a parameterized type, an optional or a tuple of those.
 
 ### E211 — not an enum type
 

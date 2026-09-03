@@ -3489,11 +3489,15 @@ fn check_explicit_generic_callee_name(index_node: Node) -> String:
 
 # an explicit type argument at a call site is parsed as an expression, not as
 # a type: `Holder[List[Int]]` is an index node whose argument is itself an
-# index node, and `Holder[Int?]` is an index node over an unwrap. neither kind
-# means anything to the type-expression resolver, so both used to come back as
-# the error type — which is a wildcard everywhere it is compared, so the
-# instance took `<error>` for its field and the field read guessed a layout and
-# faulted. resolve the two expression shapes here instead.
+# index node, `Holder[Int?]` is an index node over an unwrap, and
+# `Channel[(Int, String)?]` is an unwrap over a tuple node whose elements are
+# expressions. none of those kinds means anything to the type-expression
+# resolver, so they used to come back as the error type — which is a wildcard
+# everywhere it is compared, so the instance took `<error>` for its field and
+# the field read guessed a layout and faulted, and a channel built over one
+# type-checked clean while its `recv` resolved to nothing. resolve the
+# expression shapes here instead, and refuse a shape that is not a type at all
+# (a literal, a call) out loud rather than handing the wildcard back silently.
 fn resolve_explicit_type_arg(type_arg_idx: Int) -> Int:
     type_arg := get_node(type_arg_idx)
     if type_arg.kind == "ident":
@@ -3507,7 +3511,31 @@ fn resolve_explicit_type_arg(type_arg_idx: Int) -> Int:
         if is_error_type(inner):
             return TID_ERR
         return add_type_info(ti_optional(inner))
-    return resolve_type_implementation(type_arg_idx)
+    if type_arg.kind == "grouped" and type_arg.children.len() == 1:
+        return resolve_explicit_type_arg(type_arg.children[0])
+    if type_arg.kind == "tuple":
+        if type_arg.children.len() == 0:
+            report_error_at(type_arg_idx, "E210", "type argument must be a type, not an empty tuple")
+            return TID_ERR
+        mut elems: List[Int] := []
+        for child in type_arg.children:
+            elem := resolve_explicit_type_arg(child)
+            if is_error_type(elem):
+                return TID_ERR
+            elems.push(elem)
+        return add_type_info(ti_tuple(elems))
+    if is_type_node_kind(type_arg.kind):
+        return resolve_type_implementation(type_arg_idx)
+    report_error_at(type_arg_idx, "E210", "type argument must be a type")
+    return TID_ERR
+
+# the node kinds the type-expression resolver understands: what an annotation
+# parses to, as opposed to the expression shapes a call site's type argument
+# takes.
+fn is_type_node_kind(kind: String) -> Bool:
+    if kind == "type" or kind == "generic_type" or kind == "optional_type":
+        return true
+    return kind == "result_type" or kind == "tuple_type" or kind == "fn_type"
 
 # `List[Int]` and `mod.Box[String]` in explicit-type-argument position. the
 # base names a generic type the same way the enclosing call's base does, so it
@@ -3733,13 +3761,12 @@ fn check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id:
         report_error("E221", "Channel expects 1 type argument, got " + extra_args.to_string())
         return TID_ERR
     # the payload is written in expression position, so a parameterized type
-    # arrives as an index node (Holder[String], List[Int]) and an optional as
-    # an unwrap — the shapes every other explicit type argument takes, resolved
-    # by the same helper. anything else is not a type.
-    type_arg_node := get_node(index_node.children[1])
-    if type_arg_node.kind != "ident" and type_arg_node.kind != "index" and type_arg_node.kind != "unwrap":
-        report_error("E210", "Channel type argument must be a type")
-        return TID_ERR
+    # arrives as an index node (Holder[String], List[Int]), an optional as an
+    # unwrap and a pair as a tuple — the shapes every other explicit type
+    # argument takes, resolved and refused by the same helper. a kind test
+    # here used to stand in for that helper, and it looked only at the outer
+    # node: `(Int, String)?` is an unwrap, so it passed, and the tuple under it
+    # resolved to the error wildcard without a word.
     inner_tid := resolve_explicit_type_arg(index_node.children[1])
     if is_error_type(inner_tid):
         return TID_ERR
@@ -5605,15 +5632,17 @@ fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], sc
     tid_bool := lookup_type_id("Bool")
     tid_err := lookup_type_id("<error>")
     inner := info.inner
+    # a send is a store into the channel's element type, so a plain value
+    # widens into an optional payload there the same way a list push does.
     if method == "send":
-        expect_one_typed_argument("Channel.send", args, inner, scope_id)
+        expect_one_widened_argument("Channel.send", args, inner, scope_id)
         return tid_bool
     if method == "recv":
         # recv() returns T? (optional of inner type)
         expect_no_arguments("Channel.recv", args)
         return add_type_info(ti_optional(inner))
     if method == "try_send":
-        expect_one_typed_argument("Channel.try_send", args, inner, scope_id)
+        expect_one_widened_argument("Channel.try_send", args, inner, scope_id)
         return tid_bool
     if method == "try_recv":
         expect_no_arguments("Channel.try_recv", args)

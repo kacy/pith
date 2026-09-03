@@ -1265,8 +1265,12 @@ fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
 # borrowing getters (ir_runtime_getter_borrows_payload) must never appear
 # here — their payload count stays with the container, and a destructor
 # there frees an element the container still holds. a channel whose element
-# is itself a shell (`T??`, a result) also stays out, on the inner-shell
-# convention ir_shell_producer_transfers describes.
+# is a tuple, an optional or a result is no exception: the shell the receive
+# hands back owns that element like any other, and releasing the shell
+# through `__opt_dtor_tuple` drops the element's count exactly as the
+# channel's own drain does for the elements nobody received. this used to
+# leave such an element out, and every received pair, `Int?` or result
+# leaked with everything it carried.
 fn ir_runtime_opt_producer_payload_kind(emit_name: String, obj_type: String) -> String:
     if emit_name == "env_opt" or emit_name == "pith_env_opt":
         return "string"
@@ -1274,9 +1278,7 @@ fn ir_runtime_opt_producer_payload_kind(emit_name: String, obj_type: String) -> 
         return "string"
     if emit_name == "pith_channel_recv" or emit_name == "pith_channel_try_recv":
         if obj_type.starts_with("channel:"):
-            elem_kind := ir_rc_kind(ir_resolve_type_hint(obj_type.substring(8, obj_type.len())))
-            if elem_kind != "tuple":
-                return elem_kind
+            return ir_rc_kind(ir_resolve_type_hint(obj_type.substring(8, obj_type.len())))
         return ""
     return ""
 
@@ -6785,6 +6787,10 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if not impl_dispatch:
         runtime_opt_kind := ir_runtime_opt_producer_payload_kind(call_name, obj_type)
         if runtime_opt_kind.len() > 0:
+            # the tuple walk is emitted only for a module that asked for it;
+            # a receive over a tuple, optional or result element asks here
+            if runtime_opt_kind == "tuple":
+                ir_optional_tuple_dtor_needed = true
             ir_emit_optional_attach_dtor(r, runtime_opt_kind)
     # a builtin that may hand an argument straight back out takes no count on
     # either branch, so the caller takes one here — before the release below,

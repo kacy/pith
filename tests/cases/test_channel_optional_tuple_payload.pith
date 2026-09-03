@@ -1,0 +1,40 @@
+# a channel payload written as an optional over a tuple, and as a bare tuple.
+# the constructor's kind gate looked only at the outer node: `(Int, String)?`
+# is an unwrap, so it passed, and the tuple under it resolved to the error
+# wildcard — the program type-checked clean and its recv lowered to a call
+# nothing defines (issue #996). a bare tuple was refused outright. both now
+# resolve, and a plain pair sent into the optional payload widens into the
+# Some the receiver reads back, as a list push already did.
+#
+# the expected output is written by hand: neither shape compiled before the
+# fix, so no earlier compiler could produce it.
+
+fn main():
+    pairs := Channel[(Int, String)?](4)
+    pairs.send((1, "one"))
+    none_pair: (Int, String)? := none
+    pairs.send(none_pair)
+    some_pair: (Int, String)? := (3, "three")
+    pairs.send(some_pair)
+    queued := pairs.try_send((5, "five"))
+    print("try_send {queued} len {pairs.len()}")
+    mut i := 0
+    while i < 4:
+        got := pairs.recv()
+        mut line := "channel empty"
+        if let inner = got:
+            line = "pair none"
+            if let p = inner:
+                line = "pair {p.0} {p.1}"
+        print(line)
+        i = i + 1
+
+    bare := Channel[(Int, String)](2)
+    bare.send((7, "seven"))
+    bare.send((8, "eight"))
+    if let p = bare.recv():
+        print("bare {p.0} {p.1}")
+    if let q = bare.recv():
+        print("bare {q.0} {q.1}")
+    ok := bare.try_send((9, "nine"))
+    print("bare try_send {ok} len {bare.len()}")

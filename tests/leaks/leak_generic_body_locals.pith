@@ -1,27 +1,15 @@
-# a generic declaration is never type checked — check_function_declaration
-# returns early for one — so every expression in a specialization's body
-# answers TID_ERR, which is a positive tid the emitter's `< 0` guards wave
-# straight through. the emitter's ownership classification is blind there,
-# and the specialization answered that by publishing every rc bind in the
-# body as untracked: no zero-store, no release of the previous value on
-# rebind, and no exit cleanup. every heap local a generic body built leaked,
-# once per call.
-#
-# the locals churned here cannot escape their frame: a string rebound in a
+# the locals a generic body builds and keeps to itself: a string rebound in a
 # loop, a list, a map, a set, a bytes value, and a string whose only use is
-# the value of a push into a list the same body built tagged for string
-# elements. none of them reaches a call argument, a return, a container the
-# frame hands on, a struct field or a lambda, so the exit cleanup releases
-# exactly the count each binding took.
+# the value of a push into a list the same body built. before generic bodies
+# were typed, every rc bind in a specialization was published untracked (no
+# zero-store, no release of the previous value on rebind, no exit cleanup)
+# and each of these leaked once per call. the body is now typed against its
+# concrete types and tracked like a concrete one, so the exit cleanup
+# releases exactly the count each binding took.
 #
-# the round's varying text arrives as a parameter rather than being built in
-# the body: a builtin's result kind does not resolve inside a specialization
-# either, so `i.to_string()` there leaks its result as a temporary — a
-# separate gap, tracked on its own, that would swamp this measurement. a
-# struct built from an owned temporary is left out for a related reason: a
-# specialization lowers the construction opaquely, so the field's count is
-# released at the site and never taken, and the case would be measuring that
-# rather than what its locals hold.
+# the round's varying text arrives as a parameter, so the case measures the
+# locals and nothing else. leak_generic_body_escapes covers the locals that
+# leave the frame.
 import leakprobe as probe
 import std.bytes as bytes
 

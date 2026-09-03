@@ -297,39 +297,26 @@ the result outlive the list it was filtered from. an element type with
 no constructor of its own — a boxed enum, an optional or a result —
 still builds an untagged list, the same gap literals have.
 
-a generic body is the one place the checked types cannot pick the
-flavor, because specialization suppresses them. an empty list bound
-with an annotation (`mut out: List[T] := []`) resolves the element
-type from that annotation under the active substitution instead, so
-`algo.sort_by_key` over structs builds a struct-tagged list whose
-stores own their elements. an untagged out list owned nothing, and
-everything it handed back lived on counts its source dropped at its
-own scope exit.
+a generic body is typed against each set of concrete types just before it
+is emitted (docs/generics.md), so the checked types pick the flavor there
+too. `mut out: List[T] := []` at `T = Post` builds a struct-tagged list
+whose stores own their elements; an annotation is still resolved under the
+active substitution for the same answer. a struct built inside the body,
+a plain one or a generic one by its bare name, lowers inline: each
+borrowed field takes a count of its own and the instance gets its
+destructor, the same as the identical line outside a generic body. every
+bind, push and field store in the body takes its count the way a concrete
+body's does, and the exit releases what the frame still holds.
 
-a struct built inside a generic body is picked out by name rather than by
-checked type. the checker never walks a generic body, so every expression
-in one answers the error sentinel, whose type id is positive and whose
-kind is `primitive`. asking that answer whether a call is a construction
-gets a no, so the name the call writes down settles it instead. a plain
-struct the program declares, spelled bare or through an import alias,
-lowers inline: each borrowed field takes a count of its own and the
-instance gets the type's destructor, the same as the identical line
-outside a generic body.
-
-a generic struct built by its base name keeps the backend constructor,
-because its field types are parameters the site cannot resolve into a
-layout. a borrowed rc argument is retained so the field owns its own
-count, but the instance deliberately gets no destructor, and what its
-fields hold leaks with it. a generic body takes no count for what it
-stores — binds, pushes and field stores are raw while its checked kinds
-are suppressed — so a payload of such an instance may be aliased in
-longer-lived storage with no count of its own, and a destructor here
-would free that alias out from under its holder. std.term.app's timer
-engine is the shape that proves it: a generic body copies each spec out
-of a command's list into the engine's list, the copy rides on the
-command's count, and a destructor on the command freed the spec and its
-closure while the engine still held both. the leak closes when generic
-bodies learn to retain their stores (issue #927), not before.
+the shape that once kept a bare-name generic instance from carrying a
+destructor is safe for the same reason. std.term.app's timer engine copies
+each spec out of a command's list into the engine's own list inside a
+generic body; when that body took no counts, the copy rode on the
+command's count and a destructor on the command freed the spec and its
+closure while the engine still held both. with the body typed, the push
+into the engine's list takes its own count, so the command's destructor
+drops only the command's. tests/cases/test_generic_container_share and
+test_generic_bare_construction_dtor pin the shape.
 
 the list methods implemented in the runtime rather than the emitter
 decide their own flavor: `slice` and `sort` copy the source list's tag

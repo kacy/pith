@@ -202,41 +202,24 @@ something here that now works, the page is stale and a fix to it is welcome.
   is correct. it is a wrong answer rather than a diagnostic, and it affects
   binds, both construction spellings, field and index and plain assignment,
   collection elements, map entries and arguments (issue #970).
-- **a generic function body releases only the locals that cannot escape it** —
-  an instantiation re-emits a body the checker skipped, so every expression in
-  it reports the error type and the emitter's ownership classification has
-  nothing to read. the decision is made syntactically instead: a local is
-  tracked when no appearance of it in the body leaves a second owner holding
-  its count. that covers a read under an operator, an interpolation, an index
-  or a field access; an assignment target; a method-call receiver; the value
-  of a `push` into a list the same body built tagged; and `return name`,
-  where the exit cleanup skips the local and its one count travels to the
-  caller. `leak_generic_body_locals` and `leak_generic_body_returned_local`
-  cover the two halves in `make leak-check`.
+- **two specializations can share one emitted body** — a specialization is
+  keyed by emission kind, and every optional is the "tuple" kind, so
+  `first[Int?]` and `first[String?]` land on one key and the body is checked
+  and emitted for the first caller's types. a body whose emission would
+  differ between the two is wrong for the second. keying specializations on
+  type ids is the follow-up under issue #927 that separates them.
 
-  every other local stays untracked and leaks one count per call: one stored
-  into a struct the body builds, into a map or a set or a list the body
-  cannot prove tagged, into a module global, into a binding of a second name,
-  into a lambda, or into a callee's argument. the return position is
-  bare-name only, so `return Holder(items: items)` still leaks `items` (the
-  construction is lowered opaquely) and `return shout(loud)` still leaks
-  `loud` (the argument is a transfer). `fail name` is left out for a
-  different reason: whether the exit cleanup skips a failed local depends on
-  the error kind the emitter infers for the operand, and that inference is
-  exactly what an unchecked body does not have.
-
-  a generic struct built by its bare base name in such a body deliberately
-  carries no destructor either, so what its fields hold leaks with the
-  instance: the body's stores take no counts, and releasing those slots
-  freed payloads a longer-lived holder still aliased — std.term.app's timer
-  engine was the proof, and tests/cases/test_generic_container_share pins
-  the shape.
-
-  a builtin call inside such a body now carries its result kind, so the
-  `to_string` temporary above releases the way the concrete twin's does.
-  what still leaks is the local that genuinely escapes — the remaining stages
-  of issue #927 — which `std.testing`'s `each` and `case` pay per row for the
-  length of one test run.
+  a generic body is otherwise typed against each set of concrete types just
+  before it is emitted (docs/generics.md) and tracks its locals like a
+  concrete body: the escapes an earlier version of this entry listed as
+  leaking one count per call — a local stored into a struct, a map, a set, a
+  list, a module global, a lambda or a callee's argument; `return
+  Holder(items: items)`; `return shout(loud)`; `fail name`; a generic struct
+  built by its bare name — release the way their concrete twins do.
+  `leak_generic_body_escapes`, `leak_generic_optional_local` and
+  `leak_generic_body_instance` pin that in `make leak-check`, and
+  `test_generic_body_escape_release` and `test_generic_bare_construction_dtor`
+  read each escaped value back after its frame is gone.
 
 ## standard library
 

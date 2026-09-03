@@ -1,26 +1,19 @@
-# a generic specialization hands one of its own locals back to the caller.
+# a generic body hands one of its own locals back to the caller.
 #
-# a generic declaration is never type checked, so the ownership
-# classification inside a specialization is blind and every rc bind in one
-# used to be published untracked. an untracked name in return position took
-# the borrowed-return path: the return retained the value a second time for
-# the caller while nothing released the count the binding took, so every
-# `return s` in a generic body leaked one value per call.
+# a returned local's count leaves with the value: the exit cleanup names the
+# returned local as its exclusion, so exactly the one count the binding took
+# travels to the caller. before generic bodies were typed, every rc bind in a
+# specialization was published untracked and a `return s` retained the value
+# a second time while nothing released the binding's count, one leaked value
+# per call. this case is the over-release side of the fix: each function
+# below reads its returned value back after the frame that built it is gone,
+# and the shapes that also let the name reach another owner — a global, a
+# callee's argument, a struct field, a map store, a parameter it aliases, a
+# deferred statement — sit beside them, so a release that reached past the
+# transferred count would print garbage or die.
 #
-# tracking such a name is only sound because the return transfers rather
-# than drops: the exit cleanup names the returned local as its exclusion, so
-# exactly the one count the binding took leaves with the value. this case is
-# the other side of that trade. each function below reads its returned value
-# back after the frame that built it is gone, and the shapes that also let
-# the name reach an owner the emitter cannot see — a global, a callee's
-# argument, a struct field, a map store, a parameter it aliases, a deferred
-# statement — are here beside them, so a rule that widened past the bare
-# return position would print garbage or die. a lambda is the one escape
-# missing: one inside a generic body does not lower at all yet, so the shape
-# has no runnable form to pin.
-#
-# each generic function has a concrete twin printing the same line, since
-# the concrete path is the one whose ownership the checker did settle.
+# each generic function has a concrete twin printing the same line; the twin
+# is the control.
 import generic_body_returned_local_helper as remote
 
 struct Holder:

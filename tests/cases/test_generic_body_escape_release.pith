@@ -1,0 +1,114 @@
+# the over-release side of releasing a generic body's locals like a concrete
+# body's. each function below hands a local to an owner that outlives the
+# frame — a lambda's capture, a deferred statement, a generic struct's field,
+# a set element, a failure payload, a string parameter it reassigns a copy
+# of, a callee in another module that keeps its argument — and the value is
+# read back after the frame is gone. a body that released one of those would
+# print garbage or die here, which is the failure a leak gate cannot see.
+#
+# each generic function has a concrete twin printing the same line; the twin
+# is the control, and the expected output is its lines.
+import generic_escape_helper as helper
+
+struct Bag[T]:
+    pub items: List[T]
+
+mut seen: List[String] := []
+
+fn capture_later[T](t: T, n: Int) -> fn() -> String:
+    s := "cap-" + n.to_string()
+    return fn() => s + "!"
+
+fn capture_later_con(t: Int, n: Int) -> fn() -> String:
+    s := "cap-" + n.to_string()
+    return fn() => s + "!"
+
+fn with_defer[T](t: T, n: Int) -> Int:
+    s := "d-" + n.to_string()
+    defer seen.push(s)
+    return s.len()
+
+fn with_defer_con(t: Int, n: Int) -> Int:
+    s := "d-" + n.to_string()
+    defer seen.push(s)
+    return s.len()
+
+fn into_bag[T](t: T, n: Int) -> Bag[String]:
+    s := "b-" + n.to_string()
+    return Bag(items: [s])
+
+fn into_bag_con(t: Int, n: Int) -> Bag[String]:
+    s := "b-" + n.to_string()
+    return Bag(items: [s])
+
+fn into_set[T](t: T, n: Int) -> Set[String]:
+    s := "s-" + n.to_string()
+    out: Set[String] := {}
+    out.add(s)
+    return out
+
+fn into_set_con(t: Int, n: Int) -> Set[String]:
+    s := "s-" + n.to_string()
+    out: Set[String] := {}
+    out.add(s)
+    return out
+
+fn failing[T](t: T, n: Int) -> String!:
+    msg := "f-" + n.to_string()
+    if n >= 0:
+        fail msg
+    return "ok"
+
+fn failing_con(t: Int, n: Int) -> String!:
+    msg := "f-" + n.to_string()
+    if n >= 0:
+        fail msg
+    return "ok"
+
+fn reassigned[T](t: T, s: String) -> String:
+    mut text := s
+    text = text + "-x"
+    return text
+
+fn reassigned_con(t: Int, s: String) -> String:
+    mut text := s
+    text = text + "-x"
+    return text
+
+fn cross_keep[T](t: T, n: Int) -> Int:
+    s := "k-" + n.to_string()
+    helper.keep(s)
+    return s.len()
+
+fn cross_keep_con(t: Int, n: Int) -> Int:
+    s := "k-" + n.to_string()
+    helper.keep(s)
+    return s.len()
+
+fn main():
+    f := capture_later(1, 7)
+    g := capture_later_con(1, 7)
+    print(f())
+    print(g())
+
+    print(with_defer(1, 3).to_string())
+    print(with_defer_con(1, 3).to_string())
+    print(seen[0] + " " + seen[1])
+
+    b := into_bag(1, 5)
+    bc := into_bag_con(1, 5)
+    print(b.items[0] + " " + bc.items[0])
+
+    st := into_set(1, 9)
+    stc := into_set_con(1, 9)
+    print(st.contains("s-9").to_string() + " " + stc.contains("s-9").to_string())
+
+    r := failing(1, 2) catch "caught"
+    rc := failing_con(1, 2) catch "caught"
+    print(r + " " + rc)
+
+    base := "base"
+    print(reassigned(1, base) + " " + reassigned_con(1, base) + " " + base)
+
+    print(cross_keep(1, 4).to_string() + " " + cross_keep_con(1, 4).to_string())
+    print(helper.kept[0] + " " + helper.kept[1])

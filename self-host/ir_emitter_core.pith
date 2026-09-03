@@ -9053,16 +9053,17 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
 # pith_await hands that count to the single awaiter, the same transfer
 # ir_expr_is_borrowed and ir_extraction_operand_class already read it as.
 # borrowed subjects (a variable, field, element, self) are owned at their own
-# scope and released there, so releasing here would double-free. suppressed
-# inside generic/specialized bodies where the shape can't be trusted, mirroring
-# ir_expr_is_transferred_call_temp. parens are transparent, as they are for
-# ir_extraction_operand_class: `(await t).unwrap_or(d)` is the only way to
+# scope and released there, so releasing here would double-free. this used to
+# answer false inside a generic body, where the shape could not be trusted
+# before the body was typed; with each specialization type-checked before it
+# is emitted the answer is the concrete body's, and the twin comparison
+# (tooling/spec_twin_diff.sh) is what showed the refusal leaking one shell per
+# `if let w = f()` in a specialization. parens are transparent, as they are
+# for ir_extraction_operand_class: `(await t).unwrap_or(d)` is the only way to
 # spell an extraction off an await, and reading the paren node as an unknown
 # shape left that shell behind. one of the four fresh-temporary predicates;
 # see the block above ir_expr_is_transferred_call_temp.
 fn ir_optional_subject_is_owned(idx: Int) -> Bool:
-    if ir_in_generic_body():
-        return false
     node := get_node(idx)
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_optional_subject_is_owned(node.children[0])
@@ -9919,245 +9920,6 @@ fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete
         i = i + 1
     return type_name
 
-# the body a specialization's escape walk is reading, so the tagged-list
-# proof below can find a receiver's binding without threading the index
-# through every frame. mirrors ir_tuple_walk_root.
-mut ir_spec_walk_body := 0 - 1
-
-# true when a child ident `name` under `parent` is a use that cannot leave a
-# second owner holding the count `name` took.
-#
-# most of the list reads the value and leaves that count exactly where it
-# was:
-#
-#   - an operand of a binary, unary or parenthesized expression, and a piece
-#     of an interpolation: all of them read the value and mint a new one;
-#   - either side of an index (`xs[name]`, `name[i]`), which reads;
-#   - the receiver of a field access, which reads.
-#
-# `return name` is the one entry that moves the count rather than leaving
-# it, and it is still balanced: ir_emit_return_value names a returned
-# tracked local as the exit cleanup's exclusion, so the single count leaves
-# with the value instead of being dropped on the way out. a return node
-# carries the returned expression as its only child, so a bare ident under
-# one is that expression and nothing else.
-#
-# the rule is still per name rather than per site. a body that returns this
-# name on one path and hands it to an owner the emitter cannot see on
-# another has already answered false at that other appearance, so the whole
-# name stays untracked and the return keeps the borrowed handling it has
-# always had.
-#
-# `fail name` is deliberately absent. its exclusion is conditional on the
-# error kind the emitter infers for the operand matching the name's tracked
-# kind, and that inference is precisely what an unchecked generic body does
-# not have: a miss leaves the name in the cleanup while its value travels
-# out as the error, which is the dangling half of the trade rather than the
-# leaking half.
-#
-# the two position-sensitive parents — a method call and an assignment — are
-# judged in the walk instead, where the index is in view.
-fn ir_spec_use_is_whitelisted(parent: Node, name: String) -> Bool:
-    if parent.kind == "binary" or parent.kind == "unary" or parent.kind == "grouped":
-        return true
-    if parent.kind == "interp" or parent.kind == "string_interp":
-        return true
-    if parent.kind == "index":
-        return true
-    if parent.kind == "return":
-        return parent.children.len() == 1
-    return parent.kind == "field_access"
-
-# the argument position a container store writes its value into, or -1 when
-# this method is not one. only `push` is here: it is the store whose count
-# behaviour the tagged-list proof below can settle, and widening the list
-# means proving the same thing for another runtime entry point.
-fn ir_spec_container_store_value_pos(mname: String) -> Int:
-    if mname == "push":
-        return 0
-    return 0 - 1
-
-# how many times the body binds or assigns `name`, in either spelling of an
-# assignment (the target lives in the node's value, or as an ident child).
-fn ir_spec_name_write_count(idx: Int, name: String) -> Int:
-    node := get_node(idx)
-    mut writes := 0
-    if ir_is_binding_kind(node.kind):
-        if ir_collect_bind_parts(node).name == name:
-            writes = 1
-    elif node.kind == "assign" and node.value == name:
-        writes = 1
-    elif node.kind == "assignment" and node.children.len() > 0:
-        target := get_node(node.children[0])
-        if target.kind == "ident" and target.value == name:
-            writes = 1
-    for child_idx in node.children:
-        writes = writes + ir_spec_name_write_count(child_idx, name)
-    return writes
-
-# the rc kind of the element type a `List[E]` annotation on a binding of
-# `name` declares, or "". resolved through the active specialization, so
-# `List[T]` answers for the concrete T this instance was queued with.
-fn ir_spec_annotated_list_elem_kind(idx: Int, name: String) -> String:
-    node := get_node(idx)
-    if ir_is_binding_kind(node.kind):
-        parts := ir_collect_bind_parts(node)
-        if parts.name == name and parts.type_idx >= 0:
-            tnode := get_node(parts.type_idx)
-            if tnode.kind == "generic_type" and tnode.value == "List" and tnode.children.len() > 0:
-                return ir_rc_kind(ir_resolve_type_node(tnode.children[0]))
-    for child_idx in node.children:
-        found := ir_spec_annotated_list_elem_kind(child_idx, name)
-        if found.len() > 0:
-            return found
-    return ""
-
-# true when this receiver is a local list the body built tagged for a heap
-# element kind. that tag is the whole proof: `pith_list_push_value` retains
-# through the list's element tag, so a tagged list takes a count of its own
-# for the value pushed into it and the pushed local is still the owner of
-# the count its binding took. an untagged list (`List[T]` over a plain-value
-# T, or a list this body cannot see the declaration of) takes nothing, and
-# releasing the pushed local would leave the list pointing at freed memory —
-# so anything short of a single annotated binding of a heap element type
-# answers false and the pushed name stays untracked.
-fn ir_spec_receiver_is_tagged_list(recv_idx: Int) -> Bool:
-    if ir_spec_walk_body < 0:
-        return false
-    recv := get_node(recv_idx)
-    if recv.kind != "ident":
-        return false
-    # a parameter's list was built by the caller, whose annotation this body
-    # cannot read
-    if ir_var_regs.contains_key(recv.value):
-        return false
-    if ir_spec_name_write_count(ir_spec_walk_body, recv.value) != 1:
-        return false
-    return ir_spec_annotated_list_elem_kind(ir_spec_walk_body, recv.value).len() > 0
-
-# the walk's view of one method call. the receiver only reads: an ident is
-# classified borrowed, so the call site takes no count off it and skips the
-# owned-receiver release. an argument is a transfer unless it is the value
-# position of a store into a list proven tagged, which takes a count of its
-# own. a named argument makes positions untrustworthy, so any of them rules
-# the whole call out.
-fn ir_spec_method_uses_safe(node: Node, name: String) -> Bool:
-    mut has_named := false
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "arg" and cn.value.len() > 0:
-            has_named = true
-    store_pos := ir_spec_container_store_value_pos(ir_plain_method_name(node.value))
-    for child, i in node.children:
-        cn := get_node(child)
-        mut expr_idx := child
-        if cn.kind == "arg":
-            if cn.children.len() > 0:
-                expr_idx = cn.children[0]
-            else:
-                expr_idx = 0 - 1
-        if expr_idx >= 0:
-            en := get_node(expr_idx)
-            if en.kind == "ident" and en.value == name:
-                if i == 0:
-                    continue
-                if has_named or i - 1 != store_pos:
-                    return false
-                if not ir_spec_receiver_is_tagged_list(node.children[0]):
-                    return false
-            elif not ir_spec_uses_all_safe(expr_idx, name):
-                return false
-    return true
-
-# walk the subtree: every occurrence of ident `name` must sit in a position
-# that cannot leave a second owner holding its count. any other appearance —
-# a call argument, a list or struct element, a match subject, a loop's
-# iterable, a bind of a second name from this one — answers false, and the
-# local stays untracked exactly as it is today.
-fn ir_spec_uses_all_safe(idx: Int, name: String) -> Bool:
-    node := get_node(idx)
-    # the walk judges an occurrence of the name by the parent it hangs off,
-    # so a subtree that IS the bare name has no parent to judge it by and
-    # cannot be waved through. only a self-assignment reaches here that way,
-    # and refusing it costs a name nothing worth having.
-    if node.kind == "ident" and node.value == name:
-        return false
-    # a lambda captures the local into an environment that outlives this
-    # frame, and a spawned call hands it to a task that certainly does.
-    # neither is a use the positional rules below can see, so any mention
-    # under one rules the name out.
-    if node.kind == "lambda" or node.kind == "spawn":
-        return not ir_subtree_mentions_ident(idx, name)
-    # a deferred statement runs after the exit cleanup that would have
-    # released the local, so a name mentioned in one must keep its count to
-    # the end of the frame.
-    if node.kind == "defer" or node.kind == "errdefer":
-        return not ir_subtree_mentions_ident(idx, name)
-    # `name = expr`: a store into the local's own slot, which the tracked
-    # release-of-previous already balances. the other spelling puts the
-    # target in the node's value, where the loop below never sees it.
-    if node.kind == "assignment" and node.children.len() > 0:
-        target := get_node(node.children[0])
-        if target.kind == "ident" and target.value == name:
-            mut ai := 1
-            while ai < node.children.len():
-                if not ir_spec_uses_all_safe(node.children[ai], name):
-                    return false
-                ai = ai + 1
-            return true
-    if node.kind == "method_call":
-        return ir_spec_method_uses_safe(node, name)
-    for child_idx in node.children:
-        child := get_node(child_idx)
-        if child.kind == "ident" and child.value == name:
-            if not ir_spec_use_is_whitelisted(node, name):
-                return false
-        elif not ir_spec_uses_all_safe(child_idx, name):
-            return false
-    return true
-
-# whether a specialization may track one of its rc locals after all.
-#
-# a specialization re-emits a body the checker skipped entirely (a generic
-# declaration returns early from check_function_declaration), so every node
-# in it answers TID_ERR — a positive tid the emitter's `< 0` guards wave
-# through. the ownership classification the rest of the emitter runs on is
-# therefore blind here, which is why the whole body's rc binds have been
-# published untracked: releasing them wholesale frees values the body handed
-# to an owner the emitter could not see, and five of the shapes in
-# tests/cases/test_generic_body_local_release read freed memory when it does.
-#
-# a local is safe to track regardless of what the body's types resolved to
-# when no appearance of it leaves a second owner holding its count. such a
-# name holds exactly the one count its binding took, so the exit cleanup can
-# release it — or, where the name is handed back bare, the return can
-# transfer that one count to the caller and skip the release. that argument
-# does not depend on the unchecked body at all, which is what makes it hold
-# where a rule keyed on the declared type does not — `items: List[String]`
-# is as concrete as a type gets, and the value it names still escapes into a
-# returned struct.
-#
-# "tuple" and "weak" locals stay untracked whatever the walk says. a tuple's
-# cleanup reads the producing result/optional tid to decide between a shell
-# release and a payload cascade, and that tid is exactly the TID_ERR this
-# body hands out; a weak binding's store path keys on the tracked kind, so
-# tracking one would change how the binding itself lowers.
-fn ir_spec_local_is_confined(body_idx: Int, name: String, kind: String, poisoned: List[String]) -> Bool:
-    if body_idx < 0 or kind.len() == 0:
-        return false
-    if kind == "tuple" or kind == "weak":
-        return false
-    if poisoned.contains(name):
-        return false
-    # a parameter is a borrow: the caller owns the value for the whole call
-    if ir_var_regs.contains_key(name):
-        return false
-    saved_walk_body := ir_spec_walk_body
-    ir_spec_walk_body = body_idx
-    confined := ir_spec_uses_all_safe(body_idx, name)
-    ir_spec_walk_body = saved_walk_body
-    return confined
-
 fn ir_emit_generic_specialization(key: String):
     if not ir_generic_specialization_names.contains_key(key):
         return
@@ -10213,14 +9975,6 @@ fn ir_emit_generic_specialization(key: String):
     else:
         ir_active_generic_module_path = ""
     ir_prepare_func_emission(ret_type)
-    # a specialization re-emits a body without running ir_emit_rc_prologue
-    # (it decides its own tracked set — see the comment on that below), so
-    # its name scope is opened here — otherwise every local in it would
-    # resolve as a module global spelled the same.
-    ir_begin_func_local_names(body_idx)
-    # the substitution is in place by now, so each `x: T? := ...` in the body
-    # resolves to the concrete Optional tid the checker never recorded.
-    ir_begin_func_local_optional_tids(body_idx)
     ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
     if owner_type.len() > 0:
@@ -10252,49 +10006,18 @@ fn ir_emit_generic_specialization(key: String):
     elif concrete_types.len() == 1 and ir_is_json_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
         ir_emit_json_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, ir_emit_value_for_target, ir_emit_default_return)
     else:
-        # a specialization re-emits a body the checker never looked at, so
-        # the ownership classification the rest of the emitter runs on is
-        # blind here (see ir_spec_local_is_confined). a local whose every
-        # appearance in the body leaves no second owner holding its count is
-        # tracked anyway: the prologue's zero-store, the release-of-previous
-        # on rebind, and the exit cleanup all balance the single count its
-        # binding took, and a return of it hands that same count on rather
-        # than dropping it.
-        #
-        # every other rc bind is published untracked, as it has always been.
-        # the match emitter then skips the release-of-previous for those
-        # names — without a zero-store that release would load a name the ir
-        # never declared — and the binding's retain leaks at exit, bounded
-        # and in the safe direction.
-        mut spec_poisoned: List[String] := []
-        ir_collect_rc_bind_names(body_idx, ir_rc_locals, spec_poisoned)
-        mut spec_kept: List[String] := []
-        mut spec_kept_kinds: List[String] := []
-        mut si := 0
-        while si < ir_rc_locals.len():
-            spec_local := ir_rc_locals[si]
-            mut spec_kind := "string"
-            if si < ir_rc_local_kinds.len():
-                spec_kind = ir_rc_local_kinds[si]
-            if ir_spec_local_is_confined(body_idx, spec_local, spec_kind, spec_poisoned):
-                spec_kept.push(spec_local)
-                spec_kept_kinds.push(spec_kind)
-            elif not ir_untracked_rc_binds.contains(spec_local):
-                ir_untracked_rc_binds.push(spec_local)
-            si = si + 1
-        for pn in spec_poisoned:
-            if not ir_untracked_rc_binds.contains(pn):
-                ir_untracked_rc_binds.push(pn)
-        ir_rc_locals = spec_kept
-        ir_rc_local_kinds = spec_kept_kinds
-        # the cascade scan is what clears the previous function's tuple
-        # decisions; no tuple local is ever kept above, so it settles on
-        # empty lists here rather than leaving stale names in view.
-        ir_tuple_cascade_scan(body_idx)
-        for spec_kept_name in ir_rc_locals:
-            spec_zero := ir_reg()
-            ir_emit("iconst " + spec_zero.to_string() + " 0")
-            ir_emit_name_store(spec_kept_name, spec_zero)
+        # the body was type-checked against this specialization's concrete
+        # types just above, so the ownership classification reads real
+        # types here and the prologue every concrete body runs applies: the
+        # bind prepass, the zero-stores, the release of a previous value on
+        # rebind and the exit cleanup, with the same escape rules (a
+        # returned local's count leaves with the value, a container store
+        # takes its own, a capture is untracked). a specialization used to
+        # decide its own tracked set with a syntactic walk over the body,
+        # tracking only the locals it could prove confined and publishing
+        # every other one untracked; that walk is gone with the blindness
+        # it worked around.
+        ir_emit_rc_prologue(body_idx)
         ir_finish_func_emission(body_idx)
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types

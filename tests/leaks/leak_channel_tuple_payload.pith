@@ -1,0 +1,38 @@
+# one channel per round over an optional-of-tuple payload and one over a
+# bare tuple: plain pairs sent (widened into Some shells on the optional
+# channel), one received and read, the rest left in the ring when the handle
+# drops. the last owner's free drains the ring by payload tag, so a tuple
+# payload and the shell around it must both go with it; a channel over a
+# tuple is the one element kind the recv-side ownership rule carves out, and
+# this is the case that says whether that carve-out leaks.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    c := Channel[(Int, String)?](8)
+    mut k := 0
+    while k < 3:
+        c.send((k, "m{k}"))
+        k = k + 1
+    mut seen := 0
+    if let got = c.recv():
+        if let p = got:
+            seen = seen + p.0 + p.1.len()
+    none_pair: (Int, String)? := none
+    c.send(none_pair)
+
+    b := Channel[(Int, String)](4)
+    b.send((i, "b{i}"))
+    b.send((i + 1, "c{i}"))
+    if let q = b.recv():
+        seen = seen + q.0
+    return seen + c.len() + b.len()
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

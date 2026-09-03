@@ -59,6 +59,7 @@ cases=(
   tests/leaks/leak_channel_create_drop
   tests/leaks/leak_channel_in_struct
   "tests/leaks/leak_channel_shared_tasks PITH_GREEN=0"
+  tests/leaks/leak_channel_tuple_payload
   tests/leaks/leak_await_optional_shell
   tests/leaks/leak_index_search_shell
   tests/leaks/leak_discarded_optional_result

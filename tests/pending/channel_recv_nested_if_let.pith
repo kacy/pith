@@ -1,0 +1,67 @@
+# PENDING — a channel receive over an optional payload, bound to a local and
+# then opened with two nested `if let`s, leaks the received shell and
+# everything under it. not registered in tooling/leak_check.sh; it fails.
+#
+# the shape needs all three parts. the same receive opened by a single
+# `if let` on the bound local is flat (shape 2), the same receive opened by
+# two nested `if let`s straight off the call is flat (shape 3), and the same
+# two nested `if let`s over a local bound from a user function returning the
+# same `((Int, String)?)?` are flat (shape 4). only the received local that
+# is opened twice leaks.
+#
+# measured on this file at PITH_LEAK_ROUNDS 200000 vs 800000, peak kb:
+#   shape 1, received local, two nested if lets     46488 -> 177640
+#   shape 2, received local, one if let              2656 ->   2732
+#   shape 3, receive opened directly, two if lets    2788 ->   2732
+#   shape 4, user function local, two if lets        2768 ->   2628
+#
+# register shape 1 in tooling/leak_check.sh once it is fixed.
+import pendingprobe as probe
+import std.env as env
+
+fn mk(i: Int) -> ((Int, String)?)?:
+    inner: (Int, String)? := (i, "m{i}")
+    return inner
+
+fn shape(s: Int, i: Int) -> Int:
+    mut seen := 0
+    if s == 1:
+        c := Channel[(Int, String)?](8)
+        c.send((i, "m{i}"))
+        got := c.recv()
+        if let inner = got:
+            if let p = inner:
+                seen = seen + p.0
+        return seen
+    if s == 2:
+        c := Channel[(Int, String)?](8)
+        c.send((i, "m{i}"))
+        got := c.recv()
+        if let inner = got:
+            seen = seen + 1
+        return seen
+    if s == 3:
+        c := Channel[(Int, String)?](8)
+        c.send((i, "m{i}"))
+        if let inner = c.recv():
+            if let p = inner:
+                seen = seen + p.0
+        return seen
+    if s == 4:
+        got := mk(i)
+        if let inner = got:
+            if let p = inner:
+                seen = seen + p.0
+        return seen
+    return 0
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

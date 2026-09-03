@@ -160,6 +160,14 @@ pub fn ir_resolve_type_node_with_subst_with_state(type_idx: Int, generic_params:
         return ir_resolve_type_hint_with_state(base.value, type_aliases, struct_names)
     if tn.kind == "unwrap":
         return "tuple"
+    # a pair written at a call site is a tuple expression node, as `(Int,
+    # String)?` above is an unwrap over one; it used to resolve to "", so a
+    # channel over a bare pair tagged its payload as nothing and freed none
+    # of it
+    if tn.kind == "tuple":
+        return "tuple"
+    if tn.kind == "grouped" and tn.children.len() == 1:
+        return ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
     if tn.kind == "result_type" and tn.children.len() > 0:
         inner_type := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
         return ir_resolve_result_type_kind(inner_type)

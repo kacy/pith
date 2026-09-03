@@ -23,7 +23,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner
 
@@ -43,6 +43,57 @@ mut generic_wildcard_import_entries: List[String] := []
 mut current_checker_module_path: String := ""
 mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
+
+# --- generic bodies walked per specialization --------------------------
+# the substitution in force while a generic body is walked against one set
+# of concrete types: a type parameter name resolves to the tid at the same
+# position. empty outside such a walk. resolve_named_type consults it first,
+# ahead of the suppression that lets a generic signature register with its
+# parameters unknown — with a substitution active, a parameter name must
+# never reach that arm.
+mut active_subst_params: List[String] := []
+mut active_subst_args: List[Int] := []
+# the type arguments settled at each generic call node (inferred, or
+# resolved from an explicit spelling), comma-encoded and keyed by the call
+# node. rewritten on every check of the node, so inside a generic body the
+# entry is the specialization most recently walked — which is the one the
+# emitter is about to emit when it reads it, since it asks for that walk
+# first.
+pub mut generic_call_subst: Map[Int, String] := {}
+# the bodies still to walk and the ones already walked. an entry is
+# "F\t<decl idx>\t<self tid>\t<tids>" for a generic function or a generic
+# method on a concrete owner (self tid -1 for a free function), or
+# "M\t<method idx>\t<instance tid>" for a plain method of a generic struct
+# against one instance it is called on. a walk can queue more, so the drain
+# loops until the queue stops growing. `queued` keeps a pending entry from being pushed
+# twice; `checked` keeps a walked one from being walked again in a later
+# module's drain.
+mut generic_body_worklist: List[String] := []
+mut generic_body_queued: Map[String, Bool] := {}
+mut generic_body_checked: Map[String, Bool] := {}
+# how many distinct type sets each declaration has been queued at. past
+# generic_body_spec_limit the declaration is reported once (E267) and queued
+# no further: `f[T]` calling `f[List[T]]` would otherwise never stop.
+mut generic_body_spec_counts: Map[Int, Int] := {}
+generic_body_spec_limit := 64
+# each generic struct instance's declaration node, so a method walked
+# against the instance reads the type parameters off the declaration the
+# instance was built from — never a same-named declaration in another
+# module. and the module each impl method was registered from, so its body
+# is walked in that module's context.
+mut struct_instance_decl_idx: Map[Int, Int] := {}
+mut impl_method_modules: Map[Int, String] := {}
+# per-module snapshots taken as each module is checked, so a generic body
+# one module declares can be walked during a later module's turn with the
+# declaring module's imports, file stamp and global names in force.
+mut checker_module_roots: Map[String, Int] := {}
+mut checker_module_files: Map[String, String] := {}
+mut checker_module_alias_lists: Map[String, String] := {}
+# PITH_CHECK_GENERIC_BODIES, read once per initialize_checker. "off" leaves
+# generic bodies unwalked, as pass 2 always has; "silent" walks them and
+# records nothing; "count" records what the walks find as warnings, so a
+# corpus can be surveyed without a build turning red; "on" records errors.
+mut generic_body_check_mode := "off"
 
 fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
     mut dst: Map[String, String] := {}
@@ -183,6 +234,19 @@ pub fn initialize_checker(file_path: String):
     current_checker_module_path = ""
     checked_module_paths = {}
     generic_inference_subst = {}
+    active_subst_params = []
+    active_subst_args = []
+    generic_call_subst = {}
+    generic_body_worklist = []
+    generic_body_queued = {}
+    generic_body_checked = {}
+    generic_body_spec_counts = {}
+    struct_instance_decl_idx = {}
+    impl_method_modules = {}
+    checker_module_roots = {}
+    checker_module_files = {}
+    checker_module_alias_lists = {}
+    generic_body_check_mode = env_opt("PITH_CHECK_GENERIC_BODIES").unwrap_or("off")
     current_scope = create_scope(-1)
     register_builtin_types(current_scope)
 
@@ -472,6 +536,21 @@ fn resolve_type_by_module_basename(name: String) -> Int:
     return -1
 
 fn resolve_named_type(name: String) -> Int:
+    # a generic body walked against concrete types: its type parameters
+    # resolve to those types before anything else is consulted, and a
+    # dotted `T.Item` resolves through the concrete type's own binding
+    if active_subst_params.len() > 0:
+        for sp, si in active_subst_params:
+            if sp == name:
+                return active_subst_args[si]
+        if name.contains("."):
+            sparts := name.split(".")
+            if sparts.len() == 2:
+                for sp, si in active_subst_params:
+                    if sp == sparts[0]:
+                        assoc := resolve_assoc_type_of_instance(active_subst_args[si], sparts[1])
+                        if is_error_type(assoc) == false:
+                            return assoc
     # an associated type name resolves to the binding of the impl currently
     # being processed (e.g. `Item` -> `Int` inside `impl Container for IntBox`)
     if active_assoc_bindings.contains_key(name):
@@ -1044,6 +1123,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             method_params := suppress_method_type_params(concrete_name, method_node_idx, cn)
             register_method_declaration_aliased(concrete_name, generic_alias, method_node_idx, cn, method_is_pub, interface_name != "")
             release_method_type_params(method_params)
+            impl_method_modules.insert(method_node_idx, current_checker_module_path)
     active_assoc_bindings = {}
 
     # clear the suppression for the next impl block
@@ -2658,6 +2738,7 @@ fn iterator_element_type(iter_type: Int) -> Int:
     if has_method_declaration(next_key) == false:
         return 0 - 1
     method_node := get_node(get_method_declaration_index(next_key))
+    queue_dispatched_method(get_method_declaration_index(next_key), iter_type)
     mut struct_params: List[String] := []
     mut struct_args: List[Int] := []
     if struct_instance_type_args.contains_key(iter_type):
@@ -3607,6 +3688,8 @@ fn check_generic_function_call_explicit(name: String, index_node: Node, arg_indi
             subst_map.insert(gp, subst_args[gp_i])
     if check_type_parameter_bounds(decl_idx, subst_map) == false:
         return TID_ERR
+    record_generic_call_subst(subst_args)
+    queue_function_specialization(decl_idx, 0 - 1, subst_args)
 
     mut arg_types: List[Int] := []
     for ai in arg_indices:
@@ -4639,6 +4722,8 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
     # check interface bounds
     if check_type_parameter_bounds(decl_idx, generic_inference_subst) == false:
         return TID_ERR
+    record_generic_call_subst(subst_args)
+    queue_function_specialization(decl_idx, 0 - 1, subst_args)
     # resolve return type with substitution
     mut ret_type := TID_VOID
     for child in decl_node.children:
@@ -5156,6 +5241,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     if key.len() > 0 and has_method_declaration(key):
         record_definition(checker_current_node_index(), get_method_declaration_index(key))
         method_node := get_node(get_method_declaration_index(key))
+        queue_dispatched_method(get_method_declaration_index(key), dispatch_type)
         # if the receiver is a generic struct instance, build a substitution
         # map (T -> Int, ...) so the method signature resolves concretely
         mut struct_params: List[String] := []
@@ -5195,6 +5281,8 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 struct_params.push(mp)
             for ma in method_type_args:
                 struct_args.push(ma)
+            record_generic_call_subst(method_type_args)
+            queue_function_specialization(get_method_declaration_index(key), dispatch_type, method_type_args)
         param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
         ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
         # check arg count
@@ -6851,6 +6939,7 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
     struct_instance_type_args.insert(tid, encode_tid_list(type_args))
     struct_instance_base_name.insert(tid, base_name)
     struct_instance_tids.push(tid)
+    struct_instance_decl_idx.insert(tid, decl_idx)
     mut field_names: List[String] := []
     mut field_types: List[Int] := []
     mut field_pub: List[Bool] := []
@@ -7033,8 +7122,10 @@ fn types_compatible(actual: Int, expected: Int) -> Bool:
 pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     initialize_checker(file_path)
     process_import_aliases(root_idx)
+    snapshot_module_context(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
+    drain_generic_body_worklist()
     return checker_get_diagnostics()
 
 # run checker passes on a single module without re-initializing.
@@ -7042,10 +7133,305 @@ pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
 pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     saved_aliases := copy_string_map(module_aliases)
     process_import_aliases(root_idx)
+    snapshot_module_context(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
+    drain_generic_body_worklist()
     module_aliases = saved_aliases
     return checker_get_diagnostics()
+
+# ---------------------------------------------------------------
+# generic bodies, walked per specialization
+# ---------------------------------------------------------------
+#
+# pass 2 skips a generic body: it has no concrete types until something
+# instantiates it. the functions below walk those bodies afterwards, once
+# per distinct set of concrete types the program asks for, with the type
+# parameters resolving to those types. a call site records the types it
+# settled (generic_call_subst) and queues the pair; a method call on a
+# generic struct instance queues that method against that instance; the
+# queue is drained at the end of each module's check, and a walk that meets
+# another generic call queues that one too. the emitter asks for the same walk
+# again, silently, just before it emits each specialization, so the
+# expression types it reads for that body are the ones for the types it is
+# emitting. see docs/generics.md.
+
+# the module a declaration was registered from, or "" for the root file.
+fn declaration_module(decl_idx: Int) -> String:
+    if generic_declaration_modules.contains_key(decl_idx):
+        return generic_declaration_modules[decl_idx]
+    if impl_method_modules.contains_key(decl_idx):
+        return impl_method_modules[decl_idx]
+    return ""
+
+# record what a later walk of this module's generic bodies needs: its root,
+# its file, and its import aliases as they stand once the imports are
+# processed.
+fn snapshot_module_context(root_idx: Int):
+    checker_module_roots.insert(current_checker_module_path, root_idx)
+    checker_module_files.insert(current_checker_module_path, checker_current_file_path())
+    mut entries: List[String] := []
+    for alias in module_aliases.keys():
+        entries.push(alias + "=" + module_aliases[alias])
+    checker_module_alias_lists.insert(current_checker_module_path, entries.join(chr(9)))
+
+# make `module_path` the module being checked — its scoped lookups, imports,
+# diagnostic file stamp and global names — from the snapshot taken when it
+# was checked, and answer the module that was current so the caller can put
+# it back the same way. process_import_aliases is not re-run: it appends to
+# lists that accumulate over the whole run.
+fn enter_module_context(module_path: String) -> String:
+    prev := current_checker_module_path
+    if module_path == prev:
+        return prev
+    current_checker_module_path = module_path
+    set_defining_module(module_path)
+    mut aliases: Map[String, String] := {}
+    if checker_module_alias_lists.contains_key(module_path):
+        for entry in checker_module_alias_lists[module_path].split(chr(9)):
+            pair := entry.split("=")
+            if pair.len() == 2:
+                aliases.insert(pair[0], pair[1])
+    module_aliases = aliases
+    if checker_module_files.contains_key(module_path):
+        checker_set_file_path(checker_module_files[module_path])
+    if checker_module_roots.contains_key(module_path):
+        collect_module_global_names(checker_module_roots[module_path])
+    return prev
+
+# " in first[Int]": the specialization a report inside a generic body was
+# found at.
+fn specialization_suffix(name: String, tids: List[Int]) -> String:
+    mut names: List[String] := []
+    for t in tids:
+        names.push(get_type_name(t))
+    return " in " + name + "[" + names.join(", ") + "]"
+
+# record the type arguments settled for the generic call being checked,
+# keyed by the call node, for the emitter to read back.
+fn record_generic_call_subst(tids: List[Int]):
+    node_idx := checker_current_node_index()
+    if node_idx >= 0:
+        generic_call_subst.insert(node_idx, encode_tid_list(tids))
+
+## the type arguments recorded for the generic call at `node_idx` by the
+## most recent check of that node, or an empty list when none was.
+pub fn c_generic_call_subst(node_idx: Int) -> List[Int]:
+    if generic_call_subst.contains_key(node_idx):
+        return decode_tid_list(generic_call_subst[node_idx])
+    mut empty: List[Int] := []
+    return empty
+
+# queue a generic function's body, or a generic method's on a concrete
+# owner, for a walk against `tids`. `self_tid` is the owner for a method and
+# -1 for a free function. a type set with an unresolved member is not
+# queued: the call site reported it already, and the walk would only repeat
+# the report against the error type.
+fn queue_function_specialization(decl_idx: Int, self_tid: Int, tids: List[Int]):
+    if generic_body_check_mode == "off" or decl_idx < 0:
+        return
+    for t in tids:
+        if t < 0 or is_error_type(t):
+            return
+    entry := "F" + chr(9) + decl_idx.to_string() + chr(9) + self_tid.to_string() + chr(9) + encode_tid_list(tids)
+    if generic_body_checked.contains_key(entry) or generic_body_queued.contains_key(entry):
+        return
+    mut count := 0
+    if generic_body_spec_counts.contains_key(decl_idx):
+        count = generic_body_spec_counts[decl_idx]
+    if count >= generic_body_spec_limit:
+        if count == generic_body_spec_limit:
+            report_error_at(decl_idx, "E267", "'" + get_node(decl_idx).value + "' is instantiated at more than " + generic_body_spec_limit.to_string() + " distinct type sets; a generic that calls itself at a larger type never stops")
+            generic_body_spec_counts.insert(decl_idx, count + 1)
+        return
+    generic_body_spec_counts.insert(decl_idx, count + 1)
+    generic_body_queued.insert(entry, true)
+    generic_body_worklist.push(entry)
+
+# queue a plain method of a generic struct for a walk against one instance.
+fn queue_method_specialization(method_idx: Int, inst_tid: Int):
+    if generic_body_check_mode == "off" or method_idx < 0 or inst_tid < 0:
+        return
+    entry := "M" + chr(9) + method_idx.to_string() + chr(9) + inst_tid.to_string()
+    if generic_body_checked.contains_key(entry) or generic_body_queued.contains_key(entry):
+        return
+    generic_body_queued.insert(entry, true)
+    generic_body_worklist.push(entry)
+
+# a method call whose receiver is a generic struct instance: queue the
+# method's body against that instance. the pairs walked are the ones the
+# program dispatches, not every method of every instance — a method that is
+# never called at some instance (`size()` on a `Holder[Int?]` the program
+# only ever builds) is not a fault of the program, and would be reported as
+# one otherwise. a method with type parameters of its own goes through
+# queue_function_specialization from the same call.
+fn queue_dispatched_method(method_idx: Int, receiver_tid: Int):
+    if struct_instance_decl_idx.contains_key(receiver_tid) == false:
+        return
+    if declaration_has_generic_params(get_node(method_idx)):
+        return
+    queue_method_specialization(method_idx, receiver_tid)
+
+# walk one body with `self` (when given) and the parameters bound to the
+# types handed in: the shape of check_function_declaration and
+# check_method_body, minus the signature resolution they do themselves.
+fn walk_specialized_body(decl_idx: Int, decl_node: Node, self_tid: Int, param_types: List[Int], ret_type: Int):
+    fn_scope := create_function_scope(current_scope, ret_type)
+    reset_fn_weak_tracking()
+    if self_tid >= 0:
+        define_binding_at(fn_scope, "self", self_tid, false, decl_idx)
+    mut param_idx := 0
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            pname := extract_binding_name(cn.value)
+            if param_idx < param_types.len():
+                define_binding_at(fn_scope, pname, param_types[param_idx], cn.value.contains("mut"), child)
+            note_fn_binding_name(pname, child)
+            param_idx = param_idx + 1
+        elif cn.kind == "body":
+            check_function_body(child, fn_scope)
+
+## walk a generic function's body, or a generic method's on a concrete owner,
+## with its type parameters resolving to `concrete_tids`. `self_tid` is the
+## owner for a method and -1 for a free function. with `report` false nothing
+## is recorded: the emitter walks this way to have the expression types for
+## the body it is about to emit, after the check pass reported already.
+pub fn c_check_specialization(decl_idx: Int, self_tid: Int, concrete_tids: List[Int], report: Bool):
+    if decl_idx < 0:
+        return
+    decl_node := get_node(decl_idx)
+    if decl_node.kind != "fn_decl":
+        return
+    generic_params := collect_generic_parameter_names(decl_node)
+    if generic_params.len() != concrete_tids.len():
+        return
+    for t in concrete_tids:
+        if t < 0 or is_error_type(t):
+            return
+    mut prev_reporting := true
+    if report == false:
+        prev_reporting = checker_set_reporting(false)
+    prev_module := enter_module_context(declaration_module(decl_idx))
+    prev_suffix := checker_set_message_suffix(specialization_suffix(decl_node.value, concrete_tids))
+    saved_params := active_subst_params
+    saved_args := active_subst_args
+    active_subst_params = generic_params
+    active_subst_args = concrete_tids
+    param_types := collect_function_param_types_with_subst(decl_node, generic_params, concrete_tids)
+    ret_type := collect_function_return_type_with_subst(decl_node, generic_params, concrete_tids)
+    walk_specialized_body(decl_idx, decl_node, self_tid, param_types, ret_type)
+    active_subst_params = saved_params
+    active_subst_args = saved_args
+    checker_set_message_suffix(prev_suffix)
+    enter_module_context(prev_module)
+    if report == false:
+        checker_set_reporting(prev_reporting)
+
+## walk a plain method of a generic struct against one instance of it, with
+## the struct's type parameters and associated types resolving to the
+## instance's. `report` as in c_check_specialization.
+pub fn c_check_method_specialization(method_idx: Int, inst_tid: Int, report: Bool):
+    if method_idx < 0 or inst_tid < 0:
+        return
+    method_node := get_node(method_idx)
+    if method_node.kind != "fn_decl":
+        return
+    if struct_instance_decl_idx.contains_key(inst_tid) == false:
+        return
+    if struct_instance_base_name.contains_key(inst_tid) == false:
+        return
+    base := struct_instance_base_name[inst_tid]
+    sdecl := get_node(struct_instance_decl_idx[inst_tid])
+    params := collect_generic_parameter_names(sdecl)
+    args := decode_tid_list(struct_instance_type_args[inst_tid])
+    if params.len() != args.len():
+        return
+    mut prev_reporting := true
+    if report == false:
+        prev_reporting = checker_set_reporting(false)
+    prev_module := enter_module_context(declaration_module(method_idx))
+    prev_suffix := checker_set_message_suffix(" in " + get_type_name(inst_tid) + "." + method_node.value)
+    saved_assoc := active_assoc_bindings
+    active_assoc_bindings = {}
+    if type_assoc_names.contains_key(base):
+        for an in type_assoc_names[base].split(","):
+            bkey := base + "." + an
+            if assoc_type_binding_node.contains_key(bkey):
+                active_assoc_bindings.insert(an, resolve_type_with_substitution_map(assoc_type_binding_node[bkey], params, args))
+    saved_params := active_subst_params
+    saved_args := active_subst_args
+    active_subst_params = params
+    active_subst_args = args
+    param_types := collect_function_param_types_with_subst(method_node, params, args)
+    ret_type := collect_function_return_type_with_subst(method_node, params, args)
+    walk_specialized_body(method_idx, method_node, inst_tid, param_types, ret_type)
+    active_subst_params = saved_params
+    active_subst_args = saved_args
+    active_assoc_bindings = saved_assoc
+    checker_set_message_suffix(prev_suffix)
+    enter_module_context(prev_module)
+    if report == false:
+        checker_set_reporting(prev_reporting)
+
+## walk a method body once more against `self_tid`: an interface default
+## inherited by several types is checked once per implementing type, and
+## the emitter asks for the walk again before each per-type copy it emits.
+## `report` as in c_check_specialization.
+pub fn c_check_method_body_for(method_idx: Int, self_tid: Int, report: Bool):
+    if method_idx < 0 or self_tid < 0:
+        return
+    method_node := get_node(method_idx)
+    if method_node.kind != "fn_decl":
+        return
+    mut prev_reporting := true
+    if report == false:
+        prev_reporting = checker_set_reporting(false)
+    prev_module := enter_module_context(declaration_module(method_idx))
+    check_method_body(get_type_name(self_tid), self_tid, method_idx, method_node)
+    enter_module_context(prev_module)
+    if report == false:
+        checker_set_reporting(prev_reporting)
+
+# one queued entry, in either of the two spellings generic_body_worklist
+# describes.
+fn check_worklist_entry(entry: String):
+    parts := entry.split(chr(9))
+    if parts.len() >= 4 and parts[0] == "F":
+        c_check_specialization(parse_integer_string(parts[1]), parse_integer_string(parts[2]), decode_tid_list(parts[3]), true)
+    elif parts.len() >= 3 and parts[0] == "M":
+        c_check_method_specialization(parse_integer_string(parts[1]), parse_integer_string(parts[2]), true)
+
+# walk every queued body, and whatever those walks queue, until the queue
+# is empty. the expression-type cache is swapped out for the duration: what
+# a walk writes there is one specialization's answer for nodes the emitter
+# reads only after asking for its own walk, and pass 2's entries for the
+# concrete code must not be disturbed. definition_of is left alone on
+# purpose, so go-to-definition works inside a generic body.
+fn drain_generic_body_worklist():
+    if generic_body_check_mode == "off":
+        return
+    saved_cache := expression_type_cache
+    expression_type_cache = {}
+    prev_reporting := checker_set_reporting(generic_body_check_mode != "silent")
+    mut prev_severity := ""
+    if generic_body_check_mode == "count":
+        prev_severity = checker_set_severity_override("warning")
+    checker_begin_dedup()
+    mut i := 0
+    while i < generic_body_worklist.len():
+        entry := generic_body_worklist[i]
+        i = i + 1
+        if generic_body_checked.contains_key(entry) == false:
+            generic_body_checked.insert(entry, true)
+            check_worklist_entry(entry)
+    generic_body_worklist = []
+    generic_body_queued = {}
+    checker_end_dedup()
+    if generic_body_check_mode == "count":
+        checker_set_severity_override(prev_severity)
+    checker_set_reporting(prev_reporting)
+    expression_type_cache = saved_cache
 
 # render diagnostics as the machine-readable JSON array editors and
 # tests consume: one object per diagnostic, in the order they were

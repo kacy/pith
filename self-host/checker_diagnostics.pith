@@ -10,6 +10,32 @@ mut checker_file_path := ""
 # doesn't thread a node through
 mut checker_current_node := 0 - 1
 
+# controls for a body that is checked more than once. a generic body is
+# walked once per specialization, and the emitter walks each one again
+# just before emitting it; a fault inside such a body would otherwise be
+# reported once per walk. the switches below are set by the specialization
+# driver and left alone by everything else, so an ordinary pass-2 walk
+# reports exactly as it always has.
+#
+# reporting off: every report_* call returns without recording anything.
+# the emitter's re-check runs this way, because the check pass already
+# reported what the body had to say.
+mut checker_reporting_enabled := true
+# a suffix appended to every message while set, naming the specialization
+# the walk is checking against (" in first[Int]"), so a reader can tell a
+# fault at one type from a body that is wrong at every type.
+mut checker_message_suffix := ""
+# a severity that replaces "error" while set. the count mode of the
+# generic-body check records what it finds as warnings, so a corpus can be
+# surveyed for faults inside bodies nothing ever checked before without
+# turning a build red.
+mut checker_severity_override := ""
+# while a dedup scope is open, one (node, code) pair records once; the
+# second specialization that trips over the same fault at the same node
+# adds nothing. the first report names the type it was found at.
+mut checker_dedup_active := false
+mut checker_dedup_seen: Map[String, Bool] := {}
+
 ## stamp `idx` as the node that plain report_error calls take their line
 ## and column from, and hand back the previous stamp so a nested check
 ## can put it back with checker_restore_current_node. a caller that
@@ -46,6 +72,11 @@ fn checker_node_position(node_idx: Int) -> (Int, Int):
 pub fn checker_reset_diagnostics(file_path: String):
     checker_diagnostics = []
     checker_file_path = file_path
+    checker_reporting_enabled = true
+    checker_message_suffix = ""
+    checker_severity_override = ""
+    checker_dedup_active = false
+    checker_dedup_seen = {}
 
 ## change the file stamped on diagnostics from here on, keeping the ones
 ## already reported. a check run walks several modules through one
@@ -53,6 +84,43 @@ pub fn checker_reset_diagnostics(file_path: String):
 ## each module or every error will name whichever file was named last.
 pub fn checker_set_file_path(file_path: String):
     checker_file_path = file_path
+
+## the file currently stamped on diagnostics, so a walk that leaves the
+## module being checked can put the right file back when it returns.
+pub fn checker_current_file_path() -> String:
+    return checker_file_path
+
+## turn recording on or off and hand back the previous setting, so the
+## caller can restore it. see checker_reporting_enabled.
+pub fn checker_set_reporting(on: Bool) -> Bool:
+    prev := checker_reporting_enabled
+    checker_reporting_enabled = on
+    return prev
+
+## set the text appended to every message from here on and hand back the
+## previous one. pass "" to stop appending.
+pub fn checker_set_message_suffix(suffix: String) -> String:
+    prev := checker_message_suffix
+    checker_message_suffix = suffix
+    return prev
+
+## record errors under `severity` instead of "error" from here on, and hand
+## back the previous override. pass "" to record errors as errors again.
+pub fn checker_set_severity_override(severity: String) -> String:
+    prev := checker_severity_override
+    checker_severity_override = severity
+    return prev
+
+## open a scope in which one (node, code) pair records once. nesting is
+## not supported: a second begin resets the seen set.
+pub fn checker_begin_dedup():
+    checker_dedup_active = true
+    checker_dedup_seen = {}
+
+## close the scope opened by checker_begin_dedup.
+pub fn checker_end_dedup():
+    checker_dedup_active = false
+    checker_dedup_seen = {}
 
 ## everything reported since the last checker_reset_diagnostics, in the
 ## order it was reported. nothing is filtered or deduplicated, and
@@ -74,14 +142,31 @@ pub fn checker_reported_at_current() -> Bool:
             return true
     return false
 
+# every report lands here. applies the switches above in order: nothing
+# records while reporting is off; a dedup scope drops a repeat of a
+# (node, code) pair; the suffix joins the message; an error takes the
+# override severity when one is set.
+fn checker_record(node_idx: Int, severity: String, code: String, message: String, fix: String):
+    if checker_reporting_enabled == false:
+        return
+    if checker_dedup_active:
+        dedup_key := node_idx.to_string() + ":" + code
+        if checker_dedup_seen.contains_key(dedup_key):
+            return
+        checker_dedup_seen.insert(dedup_key, true)
+    mut recorded_severity := severity
+    if severity == "error" and checker_severity_override.len() > 0:
+        recorded_severity = checker_severity_override
+    pos := checker_node_position(node_idx)
+    checker_diagnostics.push(Diagnostic(recorded_severity, code, message + checker_message_suffix, checker_file_path, pos.0, pos.1, fix))
+
 ## report an error against a specific AST node, for a site that holds
 ## the offending node but is not the node currently being checked — an
 ## argument, or a child of the expression under check. a negative
 ## node_idx reports at line 0, and the text renderer then prints the
 ## file and message with no line number and no source snippet.
 pub fn report_error_at(node_idx: Int, code: String, message: String):
-    pos := checker_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
+    checker_record(node_idx, "error", code, message, "")
 
 ## report an error at whatever node checking is currently inside. this
 ## is the common form: the statement and expression walkers stamp the
@@ -90,8 +175,7 @@ pub fn report_error_at(node_idx: Int, code: String, message: String):
 ## through. with no node stamped yet the error lands at line 0 and
 ## prints without a location.
 pub fn report_error(code: String, message: String):
-    pos := checker_node_position(checker_current_node)
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
+    checker_record(checker_current_node, "error", code, message, "")
 
 ## report_error_at plus a suggested repair. the fix travels in its own
 ## field, not in the message: the text renderer prints it on a separate
@@ -100,16 +184,14 @@ pub fn report_error(code: String, message: String):
 ## clause continuing the message. an empty fix prints no `fix:` line and
 ## comes out as JSON null.
 pub fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
-    pos := checker_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
+    checker_record(node_idx, "error", code, message, fix)
 
 ## report_error plus a suggested repair, positioned at the node
 ## currently being checked. the fix follows the same rules as in
 ## report_error_with_fix_at: a standalone instruction, rendered on its
 ## own line, and skipped when empty.
 pub fn report_error_with_fix(code: String, message: String, fix: String):
-    pos := checker_node_position(checker_current_node)
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
+    checker_record(checker_current_node, "error", code, message, fix)
 
 ## record a warning at a node's position, into the same list the errors
 ## go into — severity "warning" is all that distinguishes it, and
@@ -118,12 +200,11 @@ pub fn report_error_with_fix(code: String, message: String, fix: String):
 ## calls this today; the E3xx warnings a user sees come from the
 ## linter's own diagnostic list, not this one.
 pub fn report_warning_at(node_idx: Int, code: String, message: String):
-    pos := checker_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, pos.0, pos.1, ""))
+    checker_record(node_idx, "warning", code, message, "")
 
 ## record a warning with no source position at all. unlike report_error
 ## it ignores the current-node stamp entirely and always writes line 0,
 ## column 0, so it renders with the file and message but no line and no
 ## snippet. like report_warning_at, no checker pass calls it today.
 pub fn report_warning(code: String, message: String):
-    checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, 0, 0, ""))
+    checker_record(0 - 1, "warning", code, message, "")

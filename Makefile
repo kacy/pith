@@ -1177,6 +1177,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_branch_optional_unify \
+	tests/cases/test_optional_interpolation \
 	tests/cases/test_match_payload tests/cases/test_combo_enums_deep \
 	tests/cases/test_fn_value_positions tests/cases/test_global_fn_value \
 	tests/cases/test_fn_value_ownership tests/cases/test_closure_list_ownership \

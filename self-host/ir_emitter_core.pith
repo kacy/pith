@@ -3301,7 +3301,11 @@ fn ir_emit_interp_spec_part(node: Node) -> Int:
 
 fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
     mut part_r := ir_expr(expr_idx)
-    part_tid := c_get_expr_type(expr_idx)
+    # the emission tid rather than the bare checked one: inside a generic
+    # specialization an optional parameter's tid comes from the substitution
+    # (ir_active_param_optional_tids), and the optional branch below needs
+    # it to find the payload type
+    part_tid := ir_emission_tid(expr_idx)
     part_type := ir_infer_type(expr_idx)
     if part_type == "string":
         return part_r
@@ -3321,6 +3325,8 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
         part_info := get_type_info(part_tid)
         if part_info.kind == "result":
             return ir_emit_result_value_to_string(part_r, part_tid)
+        if part_info.kind == "optional":
+            return ir_emit_optional_value_to_string(part_r, part_tid)
         if part_info.kind == "list":
             return ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
         if part_info.kind == "map":
@@ -6109,6 +6115,43 @@ fn ir_emit_result_value_to_string(recv_r: Int, recv_tid: Int) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# render an optional as text: "none" for the empty case, the payload's own
+# rendering otherwise, so `"{maybe}"` prints what the value holds and a
+# generic body can interpolate a `T` that is instantiated at an optional. the
+# payload is read through the same field extract `if let` uses. both paths
+# answer a string the caller may release as its own: a string payload is
+# retained first, since the fold that concatenates interpolation parts
+# releases every converted part once it has been copied.
+fn ir_emit_optional_value_to_string(value_r: Int, value_tid: Int) -> Int:
+    mut inner_tid := 0 - 1
+    if value_tid >= 0:
+        value_info := get_type_info(value_tid)
+        if value_info.kind == "optional":
+            inner_tid = value_info.inner
+    cond_r := ir_reg()
+    ir_emit_optional_none_compare(cond_r, "neq", value_r)
+    temp_name := ir_new_temp_name("optional_to_string")
+    some_l := ir_label()
+    none_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + some_l + " " + none_l)
+    ir_emit_label(some_l)
+    payload_r := ir_optional_value_field(value_r, value_tid)
+    text_r := ir_emit_stringify_value(payload_r, inner_tid)
+    if ir_type_from_tid(inner_tid) == "string":
+        ir_rc_retain_reg(text_r, "string")
+    ir_emit("store " + temp_name + " " + text_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(none_l)
+    none_si := ir_str("none")
+    none_r := ir_reg()
+    ir_emit("strref " + none_r.to_string() + " " + none_si)
+    ir_emit("store " + temp_name + " " + none_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
     value_type := ir_type_from_tid(value_tid)
     if value_type == "string":
@@ -6127,6 +6170,8 @@ fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
         value_info := get_type_info(value_tid)
         if value_info.kind == "result":
             return ir_emit_result_value_to_string(value_r, value_tid)
+        if value_info.kind == "optional":
+            return ir_emit_optional_value_to_string(value_r, value_tid)
     return value_r
 
 fn ir_emit_result_to_string(node: Node) -> Int:
@@ -11721,6 +11766,11 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_collect_strings(root_idx)
     ir_collect_struct_field_strings(root_idx)
     ir_preseed_result_error_strings()
+    # the text an interpolated optional renders as when empty
+    # (ir_emit_optional_value_to_string) is no literal the collector sees,
+    # so it is interned here, ahead of the table like every other string a
+    # body refers to
+    _none_id := ir_str("none")
     # test names live on the test_decl node, not in a string literal the collector
     # would see, so intern them here — before the table is emitted — for the test
     # main's per-test report line.

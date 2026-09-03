@@ -1,0 +1,38 @@
+# an optional interpolates: "none" for the empty case, the payload's own
+# text otherwise. the checker used to refuse the shape (E219, "requires a
+# stringifiable value, got optional") while std.testing's generic assert_eq
+# spelled exactly that for a `T` instantiated at `Int?`, so a failing
+# assertion over optionals had nowhere to go. concrete shapes first, then the
+# generic one the std shape reduces to.
+#
+# the expected output is written by hand: the shape did not compile before.
+#
+# the generic rows stop at `Int?`. a specialization is keyed by emission
+# kind, and every optional is the "tuple" kind, so `describe[Int?]` and
+# `describe[String?]` would share one emitted body and the second would
+# render the first's payload type; that is the kind-key conflation the
+# generic-body work (#927) removes by keying specializations on type ids.
+
+fn describe[T](v: T) -> String:
+    return "got {v}"
+
+fn main():
+    a: Int? := 4
+    b: Int? := none
+    print("{a} {b}")
+    s: String? := "hi"
+    t: String? := none
+    print("{s} {t}")
+    ok: Bool? := true
+    print("{ok}")
+    print(describe(a))
+    print(describe(b))
+    print(describe(7))
+    mut n: Int? := 5
+    print("{n}!")
+    n = none
+    print("{n}!")
+    fresh := "x" + "y"
+    held: String? := fresh
+    print("{held}/{held}")
+    print(fresh)

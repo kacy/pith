@@ -1177,6 +1177,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_generic_body_escape_release tests/cases/test_generic_bare_construction_dtor \
+	tests/cases/test_interface_default_per_type \
 	tests/cases/test_branch_optional_unify \
 	tests/cases/test_optional_interpolation \
 	tests/cases/test_generic_lambda_interp tests/cases/test_generic_optional_local_release \

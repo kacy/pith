@@ -251,7 +251,12 @@ pub fn initialize_checker(file_path: String):
     checker_module_roots = {}
     checker_module_files = {}
     checker_module_alias_lists = {}
-    generic_body_check_mode = env_opt("PITH_CHECK_GENERIC_BODIES").unwrap_or("off")
+    # silent by default: the walk runs in every build so a generic struct
+    # instance first made inside a generic body is registered before any
+    # emission starts, and so the emitter's own re-check finds the call-site
+    # type arguments recorded. reporting stays off until the corpus survey
+    # (tooling/generic_body_dryrun.sh) reads zero.
+    generic_body_check_mode = env_opt("PITH_CHECK_GENERIC_BODIES").unwrap_or("silent")
     current_scope = create_scope(-1)
     register_builtin_types(current_scope)
 

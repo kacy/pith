@@ -64,7 +64,10 @@ check run.
 | `count` | faults are recorded as warnings, so `pith check` prints them and exits 0 |
 | `on` | faults are recorded as errors |
 
-The default is `off` while the corpus is being surveyed for faults inside
+The default is `silent`: the pass runs in every build, so a generic struct
+instance first made inside a generic body is registered before any emission
+starts and the emitter finds the call-site type arguments recorded, but
+nothing is reported while the corpus is being surveyed for faults inside
 bodies that were never checked before. `tooling/generic_body_dryrun.sh` runs
 the checker in `count` mode over `tests/cases`, `examples`, `std` and
 `self-host` and tallies what it finds by code and by file; each finding is
@@ -76,11 +79,25 @@ and needs adjusting before the default moves to `on`.
 The expression types the pass computes are one specialization's answers for
 the body's nodes. The pass keeps them out of the cache pass 2 filled, so a
 `c_get_expr_type` on a node inside a generic body still answers the error type
-after the pass, exactly as it did before. When the emitter is about to emit a
-specialization it asks the checker for the same walk again, silently
-(`c_check_specialization`, `c_check_method_specialization`), and reads the
-types for that body straight after. The type arguments recorded per call node
-(`c_generic_call_subst`) are what the emitter uses to name the walk it wants.
+after the pass. When the emitter is about to emit a specialization it asks the
+checker for the same walk again, silently (`c_check_specialization` for a
+generic function or a generic method on a concrete owner,
+`c_check_method_specialization` for a method of a generic struct instance),
+and reads the types for that body straight after. The type arguments the
+checker recorded at the call that first asked for the specialization
+(`c_generic_call_subst`) name the walk; the emitter copies them into its
+specialization record when it queues the body, since the call's own entry is
+overwritten by later checks of the same node.
+
+Two specializations can share one emitted body: specializations are keyed by
+emission kind, and every optional is the "tuple" kind, so `first[Int?]` and
+`first[String?]` land on one key and the body is checked and emitted for the
+first caller's types. Keying specializations on type ids is the follow-up that
+separates them.
+
+`PITH_SPEC_RECHECK=0` turns the emitter's re-check off for one build, which
+makes every generic body read the error type again exactly as before: one
+binary, two emissions, for measurement and for bisecting a difference.
 
 ## a generic that never stops
 

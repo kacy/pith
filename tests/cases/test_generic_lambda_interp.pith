@@ -1,0 +1,46 @@
+# interpolation inside a generic body, checked per specialization. a lambda
+# parameter of type `T` interpolated inside a generic body used to hand the
+# raw register to the string concatenation: the body was never type-checked,
+# so the interpolation lowering never learned the part was an Int and left
+# out the int-to-string conversion (issue #997). with the body checked against
+# its concrete types before it is emitted, the part's type is known and the
+# same code that renders a concrete Int renders it here.
+#
+# each generic function has a concrete twin printing the same line; the twin
+# is the control, and the expected output is its lines.
+
+fn describe_all[T](xs: List[T]) -> String:
+    show := fn(x: T) => "v={x}"
+    parts: List[String] := []
+    for x in xs:
+        parts.push(show(x))
+    return parts.join(",")
+
+fn describe_all_con(xs: List[Int]) -> String:
+    show := fn(x: Int) => "v={x}"
+    parts: List[String] := []
+    for x in xs:
+        parts.push(show(x))
+    return parts.join(",")
+
+fn label[T](v: T) -> String:
+    return "got {v}"
+
+fn label_con(v: Bool) -> String:
+    return "got {v}"
+
+fn count_text[T](xs: List[T]) -> String:
+    n := xs.len()
+    return "{n} items"
+
+fn main():
+    print(describe_all([1, 2, 3]))
+    print(describe_all_con([1, 2, 3]))
+    print(describe_all([true, false]))
+    print(describe_all(["a", "b"]))
+    print(label(7))
+    print(label(true))
+    print(label_con(true))
+    print(label("x"))
+    print(count_text([1, 2]))
+    print(count_text(["only"]))

@@ -1,0 +1,36 @@
+# a generic struct instantiated only inside a generic body, at a type the
+# program uses nowhere else, with a method called on it. the methods of a
+# generic struct are emitted once per instance the checker registered, and
+# that emission runs before the specialization drain, so an instance first
+# made inside a generic body looked like it could be registered too late for
+# its methods. this case pins the shape: it passes with the checker's
+# per-specialization walk on (which registers the instance before any
+# emission) and with it off, so whatever else changes around instance
+# registration, a method on a late instance keeps resolving.
+#
+# the concrete twin builds the same instances directly; its lines are the
+# expected output.
+
+struct Bag[T]:
+    pub items: List[T]
+
+impl Bag:
+    fn count() -> Int:
+        return self.items.len()
+
+    fn doubled() -> Int:
+        return self.items.len() * 2
+
+fn build_and_count[T](x: T) -> Int:
+    b := Bag(items: [x, x])
+    return b.count() + b.doubled()
+
+fn build_and_count_con(x: Bool) -> Int:
+    b := Bag(items: [x, x])
+    return b.count() + b.doubled()
+
+fn main():
+    print("{build_and_count(true)}")
+    print("{build_and_count_con(true)}")
+    print("{build_and_count(2.5)}")
+    print("{build_and_count("s")}")

@@ -290,6 +290,56 @@ pub fn ir_record_generic_spec_arg_tids(name: String, arg_types: List[String], ar
         encoded = encoded + tid.to_string()
     ir_generic_specialization_arg_tids.insert(key, encoded)
 
+## the checker's type arguments for each specialization key, comma-encoded:
+## the tids `T`, `U`, ... take in that specialization, as the checker settled
+## them at the call node that first asked for it (c_generic_call_subst).
+## these are type-parameter tids, not argument tids, and they come from the
+## checker rather than from c_get_expr_type on the arguments — which inside
+## an unchecked body answers the error type — so a specialization first
+## requested from another generic body still records real types. the emitter
+## hands them to c_check_specialization just before it emits the body.
+## first record per key wins: two tid lists can share one emission-kind key
+## (`Int?` and `String?` are both "tuple"), and the body is emitted once.
+pub mut ir_generic_specialization_subst_tids: Map[String, String] := {}
+
+## record the checker's type arguments for a spec key. an empty list (the
+## checker recorded nothing at this call) records nothing.
+pub fn ir_record_generic_spec_subst_tids(name: String, arg_types: List[String], tids: List[Int]):
+    if tids.len() == 0:
+        return
+    key := ir_generic_specialization_key(name, arg_types)
+    if ir_generic_specialization_subst_tids.contains_key(key):
+        return
+    mut parts: List[String] := []
+    for tid in tids:
+        parts.push(tid.to_string())
+    ir_generic_specialization_subst_tids.insert(key, parts.join(","))
+
+## the checker's type arguments recorded for a spec key, or an empty list.
+pub fn ir_decode_generic_spec_subst_tids(key: String) -> List[Int]:
+    result: List[Int] := []
+    if not ir_generic_specialization_subst_tids.contains_key(key):
+        return result
+    encoded := ir_generic_specialization_subst_tids[key]
+    if encoded.len() == 0:
+        return result
+    for part in encoded.split(","):
+        mut val := 0
+        mut neg := false
+        mut i := 0
+        if part.len() > 0 and part[0] == "-":
+            neg = true
+            i = 1
+        while i < part.len():
+            c := part[i]
+            if c >= "0" and c <= "9":
+                val = val * 10 + (ord(c) - 48)
+            i = i + 1
+        if neg:
+            val = 0 - val
+        result.push(val)
+    return result
+
 ## decode a spec's arg tids, or an empty list if none were recorded.
 pub fn ir_decode_generic_spec_arg_tids(key: String) -> List[Int]:
     result: List[Int] := []

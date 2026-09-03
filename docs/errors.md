@@ -598,6 +598,22 @@ a `for` variable is exempt. it is the one binding whose storage is scoped to a
 block rather than the function, so the global is still reachable on either side
 of the loop and nothing is ambiguous.
 
+### E267 — a generic instantiated at more than 64 distinct type sets
+
+a generic body is checked once per distinct set of concrete types the program
+asks for (see docs/generics.md). a generic that calls itself at a larger type
+(`fn grow[T](x: T)` calling `grow([x])`) asks for `T`, then `List[T]`, then
+`List[List[T]]`, without end. the checker stops queueing the declaration after
+64 sets and reports it once.
+
+```
+error[E267]: 'grow' is instantiated at more than 64 distinct type sets; a generic that calls itself at a larger type never stops
+```
+
+only reported while generic bodies are being checked (`PITH_CHECK_GENERIC_BODIES`
+is `count` or `on`); with the check off the declaration is left unchecked, as
+every generic body was before.
+
 before globals were given a storage namespace of their own, this compiled and
 miscompiled: the binding wrote the GLOBAL's slot, so the local and the global
 were one value and the global's next reader anywhere in the program saw

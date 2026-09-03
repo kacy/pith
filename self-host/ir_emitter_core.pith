@@ -39,13 +39,13 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import generic_base_identity, generic_identity_bare_name, c_get_expr_type, c_argument_widens_to_optional, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import generic_base_identity, generic_identity_bare_name, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
-from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
+from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_arg_tids, ir_generic_specialization_subst_tids, ir_record_generic_spec_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
@@ -435,6 +435,8 @@ fn ir_reset_type_state():
     ir_generic_specialization_names = {}
     ir_generic_specialization_type_lists = {}
     ir_generic_emitted_specializations = {}
+    ir_generic_specialization_arg_tids = {}
+    ir_generic_specialization_subst_tids = {}
     ir_active_generic_params = []
     ir_active_generic_concrete_types = []
     ir_active_generic_module_path = ""
@@ -526,6 +528,7 @@ fn ir_call_result_kind(idx: Int, node: Node) -> String:
             if generic_ret_type.len() == 0:
                 generic_ret_type = ir_infer_type(idx)
             ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
+            ir_record_generic_spec_subst_tids(callee.name, concrete_types, c_generic_call_subst(idx))
             callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
         declared_kind := ir_declared_callable_ir_retkind(callee.name)
         if declared_kind.len() > 0:
@@ -2463,9 +2466,9 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
             method_idx := ir_unwrap_pub_child(child)
             child_node := get_node(method_idx)
             if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
-                ir_impl_func_specialized(method_idx, impl_type, instance_type_name, struct_params, arg_names)
+                ir_impl_func_specialized(method_idx, impl_type, instance_type_name, inst_tid, struct_params, arg_names)
 
-fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, params: List[String], arg_names: List[String]):
+fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, inst_tid: Int, params: List[String], arg_names: List[String]):
     node := get_node(idx)
     orig_name := node.value
     # specialized symbol name e.g. MapIter_Range_int_int_next
@@ -2504,6 +2507,11 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_current_impl_type = instance_type
     ir_current_impl_subst_params = params
     ir_current_impl_subst_args = arg_names
+    # type-check the method against this instance before emitting it (see
+    # ir_emit_generic_specialization); the prologue's bind prepass then reads
+    # real tids for the body's nodes.
+    if ir_spec_recheck_enabled():
+        c_check_method_specialization(idx, inst_tid, false)
     ir_emit_func_header(full_name, param_count, ret_type)
     ir_emit_named_param("self", instance_type)
     ir_emit_fn_params(idx)
@@ -4849,6 +4857,7 @@ fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, exp
     if concrete_types.len() == 0:
         concrete_types = ir_infer_generic_concrete_types(callee.name, node)
     ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
+    ir_record_generic_spec_subst_tids(callee.name, concrete_types, c_generic_call_subst(idx))
     return ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
 
 # a call whose callee is an expression rather than a name — a function
@@ -5724,6 +5733,21 @@ fn ir_emit_ok_result_tuple(ok_r: Int) -> Int:
 fn ir_emit_err_result_tuple(err_r: Int) -> Int:
     zero := ir_zero_reg()
     return ir_emit_result_tuple(zero, zero, err_r)
+
+# whether a specialization body is type-checked against its concrete types
+# just before it is emitted. on unless PITH_SPEC_RECHECK=0, which is the
+# measurement and bisection switch: one binary, two emissions, the second
+# reading the error type in every generic body exactly as before.
+mut ir_spec_recheck_flag := 0 - 1
+
+fn ir_spec_recheck_enabled() -> Bool:
+    if ir_spec_recheck_flag < 0:
+        value := env_opt("PITH_SPEC_RECHECK").unwrap_or("1")
+        if value == "0":
+            ir_spec_recheck_flag = 0
+        else:
+            ir_spec_recheck_flag = 1
+    return ir_spec_recheck_flag == 1
 
 # whether the two-register result ABI is on for this process. read once: the
 # emitter must make the same decision for a function's header and for every
@@ -6664,6 +6688,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
                 generic_ret_type = ir_infer_type(idx)
             mct := ir_infer_generic_concrete_types(call_name, node)
             ir_record_generic_spec_arg_tids(call_name, mct, ir_generic_arg_tids(node))
+            ir_record_generic_spec_subst_tids(call_name, mct, c_generic_call_subst(idx))
             call_name = ir_queue_generic_specialization(call_name, mct, generic_ret_type)
         arg_regs := ir_collect_call_arg_regs(node, 1)
         mut r := ir_reg()
@@ -9707,6 +9732,7 @@ fn ir_queue_generic_method_call(idx: Int, node: Node, base_name: String) -> Stri
         ret_type = ir_infer_type(idx)
     concrete_types := ir_infer_generic_concrete_types(base_name, node)
     ir_record_generic_spec_arg_tids(base_name, concrete_types, ir_generic_arg_tids(node))
+    ir_record_generic_spec_subst_tids(base_name, concrete_types, c_generic_call_subst(idx))
     return ir_queue_generic_specialization(base_name, concrete_types, ret_type)
 
 # the type node a named parameter of a function declaration was written
@@ -10158,6 +10184,20 @@ fn ir_emit_generic_specialization(key: String):
     mut owner_type := ""
     if ir_generic_method_owners.contains_key(base_name):
         owner_type = ir_generic_method_owners[base_name]
+    # type-check the body against this specialization's concrete types
+    # before emitting it, so c_get_expr_type answers real tids for its nodes
+    # instead of the error type the unchecked body carries. the walk records
+    # nothing: the checker's own pass reported already. the type arguments
+    # come from the checker's record at the call that first asked for this
+    # specialization; a key with none recorded (an explicit spelling the
+    # checker did not resolve) is emitted as before.
+    if ir_spec_recheck_enabled():
+        spec_tids := ir_decode_generic_spec_subst_tids(key)
+        if spec_tids.len() == generic_params.len():
+            mut owner_tid := 0 - 1
+            if owner_type.len() > 0:
+                owner_tid = lookup_type_id(owner_type)
+            c_check_specialization(decl_idx, owner_tid, spec_tids, false)
     saved_impl_type := ir_current_impl_type
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types

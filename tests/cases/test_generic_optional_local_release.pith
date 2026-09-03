@@ -1,0 +1,58 @@
+# optional locals inside a generic body, checked per specialization. an
+# unannotated optional local bound from a call inside a generic body had no
+# checked type, so its shell registered as zero and every read of it took
+# the wrong branch (issue #1010). with the body checked against its concrete
+# types before it is emitted, the local is a `T?` and the compares, `if let`
+# extractions and payload reads below behave as they do in the concrete twin.
+#
+# each generic function has a concrete twin printing the same line; the twin
+# is the control, and the expected output is its lines.
+
+fn first_or_none[T](xs: List[T]) -> T?:
+    if xs.len() == 0:
+        return none
+    return xs[0]
+
+fn probe[T](xs: List[T], tag: String) -> String:
+    s: String? := none
+    mut out := tag
+    if s == none:
+        out = out + " s-none"
+    k := first_or_none(xs)
+    if let v = k:
+        out = out + " k={v}"
+    if k == none:
+        out = out + " k-none"
+    if let w = first_or_none(xs):
+        out = out + " w={w}"
+    return out
+
+fn probe_con(xs: List[Int], tag: String) -> String:
+    s: String? := none
+    mut out := tag
+    if s == none:
+        out = out + " s-none"
+    k := first_or_none(xs)
+    if let v = k:
+        out = out + " k={v}"
+    if k == none:
+        out = out + " k-none"
+    if let w = first_or_none(xs):
+        out = out + " w={w}"
+    return out
+
+fn opt_len[T](v: T?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+fn main():
+    print(probe([4, 5], "ints"))
+    print(probe_con([4, 5], "ints"))
+    empty: List[Int] := []
+    print(probe(empty, "empty"))
+    print(probe_con(empty, "empty"))
+    print(probe(["p", "q"], "strs"))
+    some_v: Int? := 3
+    none_v: Int? := none
+    print("{opt_len(some_v)} {opt_len(none_v)}")

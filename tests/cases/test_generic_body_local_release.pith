@@ -2,10 +2,15 @@
 # its body, and leaves every other one alone. this case is the over-release
 # side of that: each function below hands a local to a second owner — a
 # struct field, a result payload, a container element, a map value, an
-# optional, a module global, a bare return, a user function's argument, an
-# untagged list — and then reads the value back after the frame that built
-# it is gone. a specialization that released one of those would print
-# garbage or die here, which is the failure a leak gate cannot see.
+# optional, a module global, a bare return, a user function's argument —
+# and then reads the value back after the frame that built it is gone. a
+# specialization that released one of those would print garbage or die
+# here, which is the failure a leak gate cannot see.
+#
+# an earlier row pushed a string local into a `List[T]` at `T = Int` to
+# stand for an escape into an untagged list. that body is ill-typed, and
+# once generic bodies are checked per specialization it cannot be written;
+# a plain-value list cannot hold a heap value, so there is no such escape.
 #
 # the confined locals are exercised too (`work` rebinds a string in a loop
 # and pushes it into a tagged list), so the case also fails if tracking them
@@ -105,15 +110,6 @@ fn feed[T](t: T, n: Int) -> String:
     loud := "l" + n.to_string()
     return shout(loud)
 
-# escapes: into an UNTAGGED list. `List[T]` over a plain-value T builds a
-# list that owns no counts, so the push takes nothing and releasing `s` here
-# would leave the returned list pointing at freed memory.
-fn untagged[T](t: T, n: Int) -> List[T]:
-    parts: List[T] := []
-    s := "u" + n.to_string()
-    parts.push(s)
-    return parts
-
 # nothing escapes: the string is rebound in a loop, the list and the map die
 # with the frame, and the only use of `s` outside its own slot is the value
 # of a push into a tagged list
@@ -152,9 +148,6 @@ fn main() -> Int!:
         stash(1, k)
         print(pick(1, k))
         print(feed(1, k))
-
-        u := untagged(1, k)
-        print(u.len().to_string())
 
         print(work(1, 8).to_string())
         k = k + 1

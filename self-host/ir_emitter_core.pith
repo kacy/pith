@@ -6219,13 +6219,15 @@ fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_t
         ir_emit("store " + bind_name + " " + bind_r.to_string())
     body_node := get_node(body_idx)
     mut body_r := ir_zero_reg()
+    # through the call-argument emitter, so an arm value the checker settled
+    # on an optional beside a `none` arm is built as the Some it widens to
     if body_node.kind == "body":
         if body_node.children.len() > 0:
-            body_r = ir_expr(body_node.children[0])
+            body_r = ir_emit_call_arg(body_node.children[0])
     elif body_node.kind == "block":
         ir_block(body_idx)
     else:
-        body_r = ir_expr(body_idx)
+        body_r = ir_emit_call_arg(body_idx)
     ir_var_regs = saved_vars
     ir_var_types = saved_types
     return body_r
@@ -8122,9 +8124,13 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         if idx == ir_tail_match_node:
             ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
             return ir_emit_zero_value()
-        return ir_emit_match_expr(idx, node, ir_expr, ir_block, subj_owned)
+        # arm values go through the call-argument emitter: a plain value in
+        # an arm the checker settled on an optional (`none => none; x => x`)
+        # is recorded as widening, and the Some is built here rather than the
+        # bare value landing in a slot every reader takes for a shell.
+        return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_block, subj_owned)
     if kind == "if_expr":
-        return ir_emit_if_expr(node, ir_expr)
+        return ir_emit_if_expr(node, ir_emit_call_arg)
     if kind == "method_call":
         return ir_emit_method_call(idx)
 

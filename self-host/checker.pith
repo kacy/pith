@@ -43,6 +43,11 @@ mut generic_wildcard_import_entries: List[String] := []
 mut current_checker_module_path: String := ""
 mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
+# the value expression the arm helper just typed, or -1 for a block arm or
+# an empty body. the match and select expression checkers read it straight
+# after each arm, so a branch can be recorded as widening into the optional
+# the arms settle on (see mark_widened_branches).
+mut last_branch_value_expr := 0 - 1
 
 # --- generic bodies walked per specialization --------------------------
 # the substitution in force while a generic body is walked against one set
@@ -5347,6 +5352,13 @@ fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> I
     if method == "len":
         expect_no_arguments(method, args)
         return tid_int
+    # a string's to_string is itself. the method exists so a generic body
+    # can spell `v.to_string()` for a `T` that is a string as well as a
+    # number; a body checked at String used to be refused here while the
+    # same body ran fine, since the emitter lowers it to the value itself.
+    if method == "to_string":
+        expect_no_arguments(method, args)
+        return tid_string
     if method == "trim":
         expect_no_arguments(method, args)
         return tid_string
@@ -6173,9 +6185,14 @@ fn check_select_expression(node: Node, scope_id: Int) -> Int:
     mut result_type := TID_ERR
     mut saw_default := false
     mut saw_timeout := false
+    mut branch_exprs: List[Int] := []
+    mut branch_types: List[Int] := []
     for child in node.children:
         arm_node := get_node(child)
+        last_branch_value_expr = 0 - 1
         arm_type := check_select_arm(arm_node, scope_id)
+        branch_exprs.push(last_branch_value_expr)
+        branch_types.push(arm_type)
         if arm_node.kind == "select_default_arm":
             if saw_default:
                 report_error("E232", "select can only have one default arm")
@@ -6188,13 +6205,65 @@ fn check_select_expression(node: Node, scope_id: Int) -> Int:
             result_type = arm_type
         elif is_error_type(arm_type) == false:
             if arm_type != result_type:
-                # composite types (tuples, optionals) are allocated fresh per
-                # resolution, so two arms with the same shape can carry
-                # different ids — compare structure before reporting.
-                if types_structurally_equal(arm_type, result_type) == false:
-                    if arm_type != TID_VOID and result_type != TID_VOID:
+                if arm_type != TID_VOID and result_type != TID_VOID:
+                    unified := unify_branch_types(result_type, arm_type)
+                    if unified < 0:
                         report_error("E225", "select arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
+                    else:
+                        result_type = unified
+    mark_widened_branches(branch_exprs, branch_types, result_type)
     return result_type
+
+# the type two branches of one expression settle on, or -1 when they cannot.
+# equal or same-shape types keep the first — composite types (tuples,
+# optionals) are allocated fresh per resolution, so two branches with the
+# same shape can carry different ids. a `none` beside a value takes the
+# value's optional, and a value beside its own optional takes the optional,
+# so `match v: none => none; x => x` in a body returning `T?` is a `T?`
+# rather than a fault between `none` and `Int`.
+fn unify_branch_types(result_type: Int, arm_type: Int) -> Int:
+    if arm_type == result_type:
+        return result_type
+    if types_structurally_equal(arm_type, result_type):
+        return result_type
+    if is_none_type(result_type):
+        if is_none_type(arm_type):
+            return result_type
+        return optional_over(arm_type)
+    if is_none_type(arm_type):
+        return optional_over(result_type)
+    rinfo := get_type_info(result_type)
+    if rinfo.kind == "optional":
+        if rinfo.inner == arm_type or types_structurally_equal(rinfo.inner, arm_type):
+            return result_type
+    ainfo := get_type_info(arm_type)
+    if ainfo.kind == "optional":
+        if ainfo.inner == result_type or types_structurally_equal(ainfo.inner, result_type):
+            return arm_type
+    return 0 - 1
+
+# `tid` as an optional: itself when it already is one.
+fn optional_over(tid: Int) -> Int:
+    if get_type_info(tid).kind == "optional":
+        return tid
+    return add_type_info(ti_optional(tid))
+
+# once the branches of one expression settle on an optional, each branch that
+# produced a plain value is recorded as widening into it — the same record a
+# call argument uses (optional_widened_arguments) — so the emitter builds the
+# Some the readers of the whole expect rather than storing the bare value in
+# a slot read as a shell. a `none` branch and an already-optional branch need
+# nothing.
+fn mark_widened_branches(exprs: List[Int], types: List[Int], result_type: Int):
+    if result_type < 0 or is_error_type(result_type):
+        return
+    if get_type_info(result_type).kind != "optional":
+        return
+    for e, i in exprs:
+        t := types[i]
+        if e >= 0 and t >= 0 and is_error_type(t) == false and is_none_type(t) == false and t != TID_VOID:
+            if get_type_info(t).kind != "optional":
+                optional_widened_arguments.insert(e, true)
 
 fn check_select_arm(arm: Node, scope_id: Int) -> Int:
     if arm.kind == "select_recv_arm":
@@ -6255,11 +6324,15 @@ fn check_select_arm_body(arm: Node, body_idx: Int, scope_id: Int) -> Int:
     body_node := get_node(arm.children[body_idx])
     if body_node.kind == "body":
         if body_node.children.len() == 0:
+            last_branch_value_expr = 0 - 1
             return TID_VOID
+        last_branch_value_expr = body_node.children[0]
         return c_check_expr(body_node.children[0], scope_id)
     if body_node.kind == "block":
         check_block_statement(body_node, scope_id)
+        last_branch_value_expr = 0 - 1
         return TID_VOID
+    last_branch_value_expr = arm.children[body_idx]
     return c_check_expr(arm.children[body_idx], scope_id)
 
 # ---------------------------------------------------------------
@@ -6277,6 +6350,8 @@ fn check_if_expression(node: Node, scope_id: Int) -> Int:
     # check then branch
     then_type := c_check_expr(node.children[1], scope_id)
     mut result_type := then_type
+    mut branch_exprs: List[Int] := [node.children[1]]
+    mut branch_types: List[Int] := [then_type]
     # check remaining branches (skip first 2: condition + then)
     mut skip_br := 2
     for child in node.children:
@@ -6291,23 +6366,32 @@ fn check_if_expression(node: Node, scope_id: Int) -> Int:
                     if econd != TID_BOOL:
                         report_error("E200", "condition must be Bool, got " + get_type_name(econd))
                 etype := c_check_expr(cn.children[1], scope_id)
+                branch_exprs.push(cn.children[1])
+                branch_types.push(etype)
                 if is_error_type(result_type):
                     result_type = etype
                 elif is_error_type(etype) == false:
                     if etype != result_type:
-                        # same-shape composites can carry different ids; see
-                        # the select-arm check above.
-                        if types_structurally_equal(etype, result_type) == false:
+                        unified := unify_branch_types(result_type, etype)
+                        if unified < 0:
                             report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
+                        else:
+                            result_type = unified
         else:
             # else branch
             etype := c_check_expr(child, scope_id)
+            branch_exprs.push(child)
+            branch_types.push(etype)
             if is_error_type(result_type):
                 result_type = etype
             elif is_error_type(etype) == false:
                 if etype != result_type:
-                    if types_structurally_equal(etype, result_type) == false:
+                    unified := unify_branch_types(result_type, etype)
+                    if unified < 0:
                         report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
+                    else:
+                        result_type = unified
+    mark_widened_branches(branch_exprs, branch_types, result_type)
     return result_type
 
 # ---------------------------------------------------------------
@@ -6325,6 +6409,8 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
         return TID_ERR
     mut result_type := TID_ERR
     mut arm_values: List[String] := []
+    mut branch_exprs: List[Int] := []
+    mut branch_types: List[Int] := []
     mut skip_subj := 1
     for child in node.children:
         if skip_subj > 0:
@@ -6333,6 +6419,8 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
         arm_node := get_node(child)
         if arm_node.kind == "arm":
             arm_type := check_match_arm(arm_node, subject_type, scope_id)
+            branch_exprs.push(last_branch_value_expr)
+            branch_types.push(arm_type)
             # collect pattern values for exhaustiveness; an or-pattern covers
             # each of its alternatives.
             if arm_node.children.len() > 0:
@@ -6352,10 +6440,12 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
                 if arm_type != result_type:
                     if arm_type != TID_VOID:
                         if result_type != TID_VOID:
-                            # same-shape composites can carry different ids;
-                            # see the select-arm check above.
-                            if types_structurally_equal(arm_type, result_type) == false:
+                            unified := unify_branch_types(result_type, arm_type)
+                            if unified < 0:
                                 report_error("E225", "match arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
+                            else:
+                                result_type = unified
+    mark_widened_branches(branch_exprs, branch_types, result_type)
     # exhaustiveness checking
     check_match_exhaustiveness(subject_type, arm_values, node_idx)
     return result_type
@@ -6378,6 +6468,7 @@ fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
                     if guard_type != TID_BOOL:
                         report_error("E218", "match guard must be Bool, got " + get_type_name(guard_type))
             body_idx = 2
+    last_branch_value_expr = 0 - 1
     if body_idx >= arm.children.len():
         return TID_VOID
     body_node := get_node(arm.children[body_idx])
@@ -6385,12 +6476,14 @@ fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
     # expression's type so the match can be used as a value.
     if body_node.kind == "body":
         if body_node.children.len() > 0:
+            last_branch_value_expr = body_node.children[0]
             return c_check_expr(body_node.children[0], arm_scope)
         return TID_VOID
     if body_node.kind == "block":
         check_block_statement(body_node, arm_scope)
         return TID_VOID
     # expression arm
+    last_branch_value_expr = arm.children[body_idx]
     return c_check_expr(arm.children[body_idx], arm_scope)
 
 # ---------------------------------------------------------------

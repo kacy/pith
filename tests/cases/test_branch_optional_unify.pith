@@ -1,0 +1,47 @@
+# the concrete twins of three shapes the per-specialization walk of generic
+# bodies found the checker refusing while the same bodies ran fine as
+# generics. a match whose arms are `none` and a value settles on the value's
+# optional instead of failing on `none vs Int` (E225); a string's to_string
+# is itself; and the descending sort in std.algo returns the list it sorted
+# rather than the nothing that `reverse` returns.
+#
+# the expected output is written by hand: the first two shapes did not
+# compile as concrete code before the change.
+import std.algo as algo
+
+fn wrap_match(v: Int?) -> Int?:
+    match v:
+        none => none
+        x => x
+
+fn bump(v: Int?) -> Int?:
+    r := match v:
+        none => none
+        x => x + 1
+    return r
+
+fn label(v: String?) -> String:
+    match v:
+        none => "nothing"
+        s => s.to_string()
+
+fn key_of(s: String) -> String:
+    return s
+
+fn main():
+    some_v: Int? := 4
+    none_v: Int? := none
+    if let a = wrap_match(some_v):
+        print("wrap {a}")
+    if wrap_match(none_v) == none:
+        print("wrap none")
+    if let c = bump(some_v):
+        print("bump {c}")
+    print(label("x"))
+    print(label(none))
+    print("abc".to_string())
+    name := "shout"
+    print(name.to_string().to_upper())
+    sorted := algo.sort_by_key_desc(["pear", "apple", "fig"], key_of)
+    print(sorted.join(","))
+    print("{sorted.len()}")

@@ -1,0 +1,52 @@
+# an interface default inherited by two types is emitted once per
+# implementing type, and the checker walks it once per type too. the
+# expression-type cache is keyed by node, so before each per-type copy was
+# checked again just before its emission, the copy for the type checked
+# FIRST read the types the LAST check left behind. here the two `name()`
+# implementations differ in ownership: one hands back a borrowed field, the
+# other a fresh string. a default that concatenates `self.name()` typed
+# against the wrong implementation classifies the value the wrong way — a
+# fresh string held as borrowed leaks, a borrowed field released as fresh is
+# freed under its owner and read back here as garbage.
+#
+# the expected output is the plain meaning of the lines.
+
+interface Named:
+    fn name() -> String
+
+    fn label() -> String:
+        return "<" + self.name() + ">"
+
+    fn twice() -> String:
+        first := self.name()
+        second := self.name()
+        return first + "/" + second
+
+struct Borrowed:
+    pub s: String
+
+struct Fresh:
+    pub prefix: String
+
+impl Named for Borrowed:
+    fn name() -> String:
+        return self.s
+
+impl Named for Fresh:
+    fn name() -> String:
+        return self.prefix + "!"
+
+fn labels(n: Int) -> String:
+    b := Borrowed(s: "b" + n.to_string())
+    f := Fresh(prefix: "f" + n.to_string())
+    out := b.label() + " " + f.label() + " " + b.twice() + " " + f.twice()
+    return out + " " + b.s
+
+fn main():
+    mut i := 0
+    while i < 3:
+        print(labels(i))
+        i = i + 1
+    held := Borrowed(s: "kept")
+    print(held.label())
+    print(held.s)

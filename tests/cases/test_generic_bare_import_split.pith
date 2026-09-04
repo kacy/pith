@@ -1,0 +1,34 @@
+# a generic imported by name and called bare (`from m import show`, then
+# `show(v)`) is keyed by the checker's type arguments like any other generic
+# call. the checker used to type such a call through the plain-call arm,
+# because every module's top-level names share one scope and the imported
+# generic sits there as a function binding; no type arguments were recorded,
+# the emitter fell back to its own inference, and every optional argument
+# spelled the same emission kind: `show[Int?]` and `show[String?]` shared one
+# body checked for the first caller and the second printed a pointer. the
+# builtin spelling of `assert_eq` took the same path.
+#
+# the module-qualified spelling (`m.show(v)`) always recorded; the
+# `_q` lines are that control and every bare line must equal its `_q` line.
+import generic_bare_import_helper as m
+from generic_bare_import_helper import show, same
+from std.testing import assert_eq
+
+fn main():
+    a: Int? := 4
+    s: String? := "hi"
+    n: Int? := none
+    print(show(a))
+    print(m.show(a))
+    print(show(s))
+    print(m.show(s))
+    print(show(n))
+    print(m.show(n))
+    print("{same(a, a)}")
+    print("{m.same(a, a)}")
+    print("{same(s, s)}")
+    print("{m.same(s, s)}")
+    t: String? := "hi"
+    assert_eq(a, a)
+    assert_eq(s, t)
+    print("checked")

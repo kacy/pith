@@ -3839,6 +3839,22 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
                 # enum variant constructor (qualified as EnumName.Variant)
                 # — this case shouldn't happen for plain ident calls
                 return check_function_call_expression(callee_idx, arg_indices, scope_id)
+        # a bare call to a generic imported by name (`from std.testing import
+        # assert_eq`, then `assert_eq(a, b)`). every module's top-level names
+        # share one scope, so the binding arm below finds the generic's
+        # function type and types the call as a plain one, which records no
+        # type arguments; the emitter then cannot key the specialization by
+        # them and falls back to its own inference (`assert_eq[Int?]` and
+        # `assert_eq[String?]` land on one body). the named import says which
+        # module's generic this is, so resolve through it first, the way the
+        # module-qualified spelling already does.
+        imported_from := from_import_source_module(name)
+        if imported_from.len() > 0:
+            imported_key := module_generic_target_name(imported_from, name)
+            if has_generic_declaration(imported_key):
+                imported_decl := get_node(get_generic_declaration_index(imported_key))
+                if imported_decl.kind == "fn_decl":
+                    return check_generic_function_call(imported_key, arg_indices, scope_id)
         existing_fn := lookup_binding(scope_id, name)
         if existing_fn >= 0:
             existing_info := get_type_info(existing_fn)
@@ -4180,6 +4196,12 @@ fn check_assertion_equality(name: String, arg_indices: List[Int], scope_id: Int)
         if is_error_type(t2) == false:
             if t1 != t2 and types_structurally_equal(t1, t2) == false:
                 report_error("E219", name + " arguments must be the same type: " + get_type_name(t1) + " vs " + get_type_name(t2))
+        # the builtin spelling lowers to std.testing's generic; its one type
+        # argument is the operands' type, recorded here so the emitter keys the
+        # specialization by it like any other generic call.
+        mut type_args: List[Int] := []
+        type_args.push(t1)
+        record_generic_call_subst(type_args)
     return TID_VOID
 
 fn call_arg_expr_index(arg_idx: Int) -> Int:

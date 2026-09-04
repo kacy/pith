@@ -1,0 +1,43 @@
+# helper module for test_generic_alias_shapes: the things a generic body can
+# reach through an import alias.
+pub struct Remote:
+    pub label: String
+    pub parts: List[String]
+
+impl Remote:
+    pub fn describe() -> String:
+        return self.label + ":" + self.parts.len().to_string()
+
+pub enum Kind:
+    Small
+    Big(Int)
+
+pub GREETING := "hi"
+
+pub fn make_label(tag: Int) -> String:
+    return "L-{tag}"
+
+pub fn make_remote(tag: Int) -> Remote:
+    return Remote(label: "R-{tag}", parts: ["a", "b"])
+
+pub fn maybe(tag: Int) -> Int?:
+    if tag > 0:
+        return tag
+    return none
+
+# a generic reached through the alias from another generic body: its own body
+# has an unannotated optional local and a lambda that interpolates its
+# parameter, the two shapes that only lower correctly when the body is typed.
+pub fn wrap[T](tag: T) -> String:
+    k := maybe(3)
+    mut out := ""
+    if let v = k:
+        out = "{v}"
+    f := fn(x: T) -> String => "{x}"
+    return out + "/" + f(tag)
+
+pub fn kind_name(k: Kind) -> String:
+    out := match k:
+        Kind.Big(n) => "big {n}"
+        Kind.Small => "small"
+    return out

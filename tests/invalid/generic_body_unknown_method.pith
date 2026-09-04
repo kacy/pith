@@ -1,0 +1,12 @@
+# a fault inside a generic body, reported where it sits once the body is
+# checked against the types the program instantiates it at: `Int` has no
+# method `nonexistent`. before generic bodies were checked, this program
+# type-checked clean and the call resolved to nothing at runtime.
+
+fn first[T](xs: List[T]) -> T:
+    v := xs[0]
+    v.nonexistent()
+    return v
+
+fn main():
+    print("{first([1, 2])}")

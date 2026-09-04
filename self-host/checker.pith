@@ -251,12 +251,13 @@ pub fn initialize_checker(file_path: String):
     checker_module_roots = {}
     checker_module_files = {}
     checker_module_alias_lists = {}
-    # silent by default: the walk runs in every build so a generic struct
-    # instance first made inside a generic body is registered before any
-    # emission starts, and so the emitter's own re-check finds the call-site
-    # type arguments recorded. reporting stays off until the corpus survey
-    # (tooling/generic_body_dryrun.sh) reads zero.
-    generic_body_check_mode = env_opt("PITH_CHECK_GENERIC_BODIES").unwrap_or("silent")
+    # on by default: a fault inside a generic body is an error, reported at
+    # its line with the specialization it was found at. the walk also
+    # registers a generic struct instance first made inside a generic body
+    # before any emission starts, and records the call-site type arguments
+    # the emitter's own re-check reads. `silent` keeps the walk and drops the
+    # reports; `count` records them as warnings; `off` skips the walk.
+    generic_body_check_mode = env_opt("PITH_CHECK_GENERIC_BODIES").unwrap_or("on")
     current_scope = create_scope(-1)
     register_builtin_types(current_scope)
 
@@ -3608,6 +3609,16 @@ fn resolve_explicit_type_arg(type_arg_idx: Int) -> Int:
         return add_type_info(ti_optional(inner))
     if type_arg.kind == "grouped" and type_arg.children.len() == 1:
         return resolve_explicit_type_arg(type_arg.children[0])
+    # an associated type of a type parameter, `engine[A.Msg]()`, parses as a
+    # field access on the parameter's name. the dotted spelling is what
+    # resolve_named_type already takes for `T.Item`: under the substitution a
+    # walked generic body runs with, it resolves through the concrete type's
+    # binding; while a generic signature registers, it is the suppressed
+    # error type it always was.
+    if type_arg.kind == "field_access" and type_arg.children.len() > 0:
+        recv := get_node(type_arg.children[0])
+        if recv.kind == "ident":
+            return resolve_named_type(recv.value + "." + type_arg.value)
     if type_arg.kind == "tuple":
         if type_arg.children.len() == 0:
             report_error_at(type_arg_idx, "E210", "type argument must be a type, not an empty tuple")

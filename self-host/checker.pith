@@ -7293,10 +7293,14 @@ fn snapshot_module_context(root_idx: Int):
 # was checked, and answer the module that was current so the caller can put
 # it back the same way. process_import_aliases is not re-run: it appends to
 # lists that accumulate over the whole run.
+#
+# the snapshot is installed even when the path already matches: c_run_module
+# puts the caller's alias table back when a module's run ends, so a walk that
+# starts after the run (the emitter re-checking a specialization) finds the
+# module current but its aliases gone, and every `mod.Thing` in the body then
+# resolves to nothing.
 fn enter_module_context(module_path: String) -> String:
     prev := current_checker_module_path
-    if module_path == prev:
-        return prev
     current_checker_module_path = module_path
     set_defining_module(module_path)
     mut aliases: Map[String, String] := {}

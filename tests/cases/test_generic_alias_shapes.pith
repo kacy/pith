@@ -1,0 +1,93 @@
+# every shape a generic body can reach through an import alias, each beside a
+# concrete twin (the `_con` function) whose body is the same text with the
+# type parameter replaced. the twin is the control: the generic half must
+# print the same line and lower the same way.
+#
+# a specialization is type checked twice, by the checker's worklist and again
+# by the emitter just before it is emitted. the second walk once found the
+# declaring module current but its import aliases gone (c_run_module puts the
+# caller's table back when the module's run ends), so every `shapes.Thing`
+# below resolved to nothing at emission. most shapes were rescued by the
+# emitter's untyped fallbacks; `temp_field` was not: the label read off the
+# owned temporary was returned without a retain and the caller read freed
+# memory. this file runs under memcheck (MEMCHECK_CASES), and it fails there
+# on the old compiler only as long as no concrete body calls an aliased
+# generic (see nested_generic).
+import generic_alias_helper as shapes
+
+fn construct[T](tag: T) -> String:
+    held := shapes.Remote(label: "x-{tag}", parts: ["p-{tag}"])
+    return held.label + "/" + held.parts[0]
+
+fn construct_con(tag: Int) -> String:
+    held := shapes.Remote(label: "x-{tag}", parts: ["p-{tag}"])
+    return held.label + "/" + held.parts[0]
+
+fn fresh_string[T](tag: T) -> String:
+    s := shapes.make_label(7)
+    n := s.len()
+    return s + "#" + n.to_string()
+
+fn fresh_string_con(tag: Int) -> String:
+    s := shapes.make_label(7)
+    n := s.len()
+    return s + "#" + n.to_string()
+
+fn returned_struct[T](tag: T) -> String:
+    r := shapes.make_remote(8)
+    return r.label
+
+fn returned_struct_con(tag: Int) -> String:
+    r := shapes.make_remote(8)
+    return r.label
+
+# no twin on purpose. a concrete call to `shapes.wrap` records a substitution
+# for `wrap__int`, whose re-check at emission switches the checker into the
+# helper module and back, and that switch reinstalled this module's aliases
+# for every specialization emitted afterwards, hiding the fault this file
+# pins. with the call made only from a generic body, nothing reinstalls them.
+fn nested_generic[T](tag: T) -> String:
+    return shapes.wrap(tag)
+
+fn variant[T](tag: T) -> shapes.Kind:
+    return shapes.Kind.Big(9)
+
+fn variant_con(tag: Int) -> shapes.Kind:
+    return shapes.Kind.Big(9)
+
+fn constant[T](tag: T) -> String:
+    return shapes.GREETING + "-{tag}"
+
+fn constant_con(tag: Int) -> String:
+    return shapes.GREETING + "-{tag}"
+
+fn temp_field[T](tag: T) -> String:
+    return shapes.Remote(label: "t-{tag}", parts: []).label
+
+fn temp_field_con(tag: Int) -> String:
+    return shapes.Remote(label: "t-{tag}", parts: []).label
+
+fn method_on_aliased[T](tag: T) -> String:
+    held := shapes.Remote(label: "m-{tag}", parts: ["q"])
+    return held.describe()
+
+fn method_on_aliased_con(tag: Int) -> String:
+    held := shapes.Remote(label: "m-{tag}", parts: ["q"])
+    return held.describe()
+
+fn main():
+    print(construct(1))
+    print(construct_con(1))
+    print(fresh_string(2))
+    print(fresh_string_con(2))
+    print(returned_struct(3))
+    print(returned_struct_con(3))
+    print(nested_generic(4))
+    print(shapes.kind_name(variant(5)))
+    print(shapes.kind_name(variant_con(5)))
+    print(constant(6))
+    print(constant_con(6))
+    print(temp_field(7))
+    print(temp_field_con(7))
+    print(method_on_aliased(8))
+    print(method_on_aliased_con(8))

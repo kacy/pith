@@ -90178,136 +90178,123 @@ load 5 checker___g_current_checker_module_path
 call 6 pith_cstring_retain void 1 5
 call 7 pith_cstring_release void 1 4
 store prev 5
-load 8 module_path
-load 9 prev
-call 10 pith_cstring_eq bool 2 8 9
-brif 10 L6030 L6031
+load 8 checker___g_current_checker_module_path
+load 9 module_path
+call 10 pith_cstring_retain void 1 9
+call 11 pith_cstring_release void 1 8
+store checker___g_current_checker_module_path 9
+load 12 module_path
+call 13 scope_set_defining_module void 1 12
+load 14 aliases
+call 15 pith_map_new_cstr_val map 0
+call 16 pith_map_release_handle void 1 14
+store aliases 15
+load 17 checker___g_checker_module_alias_lists
+load 18 module_path
+call 19 contains_key bool 2 17 18
+brif 19 L6030 L6031
 label L6030
-load 11 prev
-load 12 aliases
-call 13 pith_map_release_handle void 1 12
-load 14 pair
-call 15 pith_list_release_handle void 1 14
-ret 11
+load 20 checker___g_checker_module_alias_lists
+load 21 module_path
+call 22 map_get_strict string 2 20 21
+iconst 23 9
+call 24 chr string 1 23
+call 25 pith_string_split_to_list list_string 2 22 24
+call 26 pith_cstring_release void 1 24
+call 27 pith_auto_len int 1 25
+iconst 28 0
+store __for_idx_258 28
+store __for_len_258 27
+store __for_iter_258 25
+label L6032
+load 29 __for_idx_258
+load 30 __for_len_258
+lt 31 29 30
+brif 31 L6033 L6035
+label L6033
+load 32 __for_iter_258
+load 33 __for_idx_258
+call 34 pith_list_get_value_unchecked string 2 32 33
+store __loopvar_258_entry 34
+load 35 pair
+load 36 __loopvar_258_entry
+strref 37 m18s340
+call 38 pith_string_split_to_list list_string 2 36 37
+call 39 pith_cstring_release void 1 37
+call 40 pith_list_release_handle void 1 35
+store pair 38
+load 41 pair
+call 42 pith_list_len int 1 41
+iconst 43 2
+eq 44 42 43
+brif 44 L6037 L6038
+label L6037
+load 45 aliases
+load 46 pair
+iconst 47 0
+call 48 pith_list_get_value_strict string 2 46 47
+load 49 pair
+iconst 50 1
+call 51 pith_list_get_value_strict string 2 49 50
+call 52 map_insert void 3 45 48 51
+jmp L6036
+label L6038
+label L6036
+label L6034
+load 53 __for_idx_258
+iconst 54 1
+add 55 53 54
+store __for_idx_258 55
+jmp L6032
+label L6035
+load 56 __for_iter_258
+call 57 pith_list_release_handle void 1 56
+jmp L6029
 label L6031
 label L6029
-load 16 checker___g_current_checker_module_path
-load 17 module_path
-call 18 pith_cstring_retain void 1 17
-call 19 pith_cstring_release void 1 16
-store checker___g_current_checker_module_path 17
-load 20 module_path
-call 21 scope_set_defining_module void 1 20
-load 22 aliases
-call 23 pith_map_new_cstr_val map 0
-call 24 pith_map_release_handle void 1 22
-store aliases 23
-load 25 checker___g_checker_module_alias_lists
-load 26 module_path
-call 27 contains_key bool 2 25 26
-brif 27 L6033 L6034
-label L6033
-load 28 checker___g_checker_module_alias_lists
-load 29 module_path
-call 30 map_get_strict string 2 28 29
-iconst 31 9
-call 32 chr string 1 31
-call 33 pith_string_split_to_list list_string 2 30 32
-call 34 pith_cstring_release void 1 32
-call 35 pith_auto_len int 1 33
-iconst 36 0
-store __for_idx_258 36
-store __for_len_258 35
-store __for_iter_258 33
-label L6035
-load 37 __for_idx_258
-load 38 __for_len_258
-lt 39 37 38
-brif 39 L6036 L6038
-label L6036
-load 40 __for_iter_258
-load 41 __for_idx_258
-call 42 pith_list_get_value_unchecked string 2 40 41
-store __loopvar_258_entry 42
-load 43 pair
-load 44 __loopvar_258_entry
-strref 45 m18s340
-call 46 pith_string_split_to_list list_string 2 44 45
-call 47 pith_cstring_release void 1 45
-call 48 pith_list_release_handle void 1 43
-store pair 46
-load 49 pair
-call 50 pith_list_len int 1 49
-iconst 51 2
-eq 52 50 51
-brif 52 L6040 L6041
+load 58 checker___g_module_aliases
+load 59 aliases
+call 60 pith_map_retain_handle void 1 59
+call 61 pith_map_release_handle void 1 58
+store checker___g_module_aliases 59
+load 62 checker___g_checker_module_files
+load 63 module_path
+call 64 contains_key bool 2 62 63
+brif 64 L6040 L6041
 label L6040
-load 53 aliases
-load 54 pair
-iconst 55 0
-call 56 pith_list_get_value_strict string 2 54 55
-load 57 pair
-iconst 58 1
-call 59 pith_list_get_value_strict string 2 57 58
-call 60 map_insert void 3 53 56 59
+load 65 checker___g_checker_module_files
+load 66 module_path
+call 67 map_get_strict string 2 65 66
+call 68 checker_diagnostics_checker_set_file_path void 1 67
 jmp L6039
 label L6041
 label L6039
-label L6037
-load 61 __for_idx_258
-iconst 62 1
-add 63 61 62
-store __for_idx_258 63
-jmp L6035
-label L6038
-load 64 __for_iter_258
-call 65 pith_list_release_handle void 1 64
-jmp L6032
-label L6034
-label L6032
-load 66 checker___g_module_aliases
-load 67 aliases
-call 68 pith_map_retain_handle void 1 67
-call 69 pith_map_release_handle void 1 66
-store checker___g_module_aliases 67
-load 70 checker___g_checker_module_files
-load 71 module_path
-call 72 contains_key bool 2 70 71
-brif 72 L6043 L6044
+load 69 checker___g_checker_module_roots
+load 70 module_path
+call 71 contains_key bool 2 69 70
+brif 71 L6043 L6044
 label L6043
-load 73 checker___g_checker_module_files
-load 74 module_path
-call 75 map_get_strict string 2 73 74
-call 76 checker_diagnostics_checker_set_file_path void 1 75
+load 72 checker___g_checker_module_roots
+load 73 module_path
+call 74 map_get_strict int 2 72 73
+call 75 checker_collect_module_global_names void 1 74
 jmp L6042
 label L6044
 label L6042
-load 77 checker___g_checker_module_roots
-load 78 module_path
-call 79 contains_key bool 2 77 78
-brif 79 L6046 L6047
-label L6046
-load 80 checker___g_checker_module_roots
-load 81 module_path
-call 82 map_get_strict int 2 80 81
-call 83 checker_collect_module_global_names void 1 82
-jmp L6045
-label L6047
-label L6045
-load 84 prev
-load 85 aliases
-call 86 pith_map_release_handle void 1 85
-load 87 pair
-call 88 pith_list_release_handle void 1 87
-ret 84
-load 89 prev
-call 90 pith_cstring_release void 1 89
-load 91 aliases
-call 92 pith_map_release_handle void 1 91
-load 93 pair
-call 94 pith_list_release_handle void 1 93
-iconst 95 0
-ret 95
+load 76 prev
+load 77 aliases
+call 78 pith_map_release_handle void 1 77
+load 79 pair
+call 80 pith_list_release_handle void 1 79
+ret 76
+load 81 prev
+call 82 pith_cstring_release void 1 81
+load 83 aliases
+call 84 pith_map_release_handle void 1 83
+load 85 pair
+call 86 pith_list_release_handle void 1 85
+iconst 87 0
+ret 87
 endfunc
 func checker_specialization_suffix 2 string
 param name
@@ -90324,12 +90311,12 @@ iconst 8 0
 store __for_idx_259 8
 store __for_len_259 7
 store __for_iter_259 6
-label L6048
+label L6045
 load 9 __for_idx_259
 load 10 __for_len_259
 lt 11 9 10
-brif 11 L6049 L6051
-label L6049
+brif 11 L6046 L6048
+label L6046
 load 12 __for_iter_259
 load 13 __for_idx_259
 call 14 pith_list_get_value unknown 2 12 13
@@ -90338,13 +90325,13 @@ load 15 names
 load 16 __loopvar_259_t
 call 17 types_get_type_name string 1 16
 call 18 pith_list_push_value_owned void 2 15 17
-label L6050
+label L6047
 load 19 __for_idx_259
 iconst 20 1
 add 21 19 20
 store __for_idx_259 21
-jmp L6048
-label L6051
+jmp L6045
+label L6048
 strref 22 m18s330
 load 23 name
 concat 24 22 23
@@ -90379,16 +90366,16 @@ store node_idx 1
 load 2 node_idx
 iconst 3 0
 gte 4 2 3
-brif 4 L6053 L6054
-label L6053
+brif 4 L6050 L6051
+label L6050
 load 5 checker___g_generic_call_subst
 load 6 node_idx
 load 7 tids
 call 8 checker_encode_tid_list string 1 7
 call 9 pith_map_insert_ikey_owned void 3 5 6 8
-jmp L6052
-label L6054
-label L6052
+jmp L6049
+label L6051
+label L6049
 iconst 10 0
 ret 10
 endfunc
@@ -90399,8 +90386,8 @@ store empty 1
 load 2 checker___g_generic_call_subst
 load 3 node_idx
 call 4 map_contains_ikey bool 2 2 3
-brif 4 L6056 L6057
-label L6056
+brif 4 L6053 L6054
+label L6053
 load 5 checker___g_generic_call_subst
 load 6 node_idx
 call 7 map_get_ikey_strict string 2 5 6
@@ -90408,8 +90395,8 @@ call 8 checker_decode_tid_list list 1 7
 load 9 empty
 call 10 pith_list_release_handle void 1 9
 ret 8
-label L6057
-label L6055
+label L6054
+label L6052
 load 11 empty
 call 12 pith_list_new_default list 0
 call 13 pith_list_release_handle void 1 11
@@ -90428,72 +90415,72 @@ param tids
 iconst 3 0
 store entry 3
 iconst 4 0
-store __or_4_6061 4
+store __or_4_6058 4
 load 5 checker___g_generic_body_check_mode
 strref 6 m18s326
 call 7 pith_cstring_eq bool 2 5 6
 call 8 pith_cstring_release void 1 6
-store __or_4_6061 7
-brif 7 L6062 L6061
-label L6061
+store __or_4_6058 7
+brif 7 L6059 L6058
+label L6058
 load 9 decl_idx
 iconst 10 0
 lt 11 9 10
-store __or_4_6061 11
-label L6062
-load 12 __or_4_6061
-brif 12 L6059 L6060
+store __or_4_6058 11
 label L6059
+load 12 __or_4_6058
+brif 12 L6056 L6057
+label L6056
 load 13 entry
 call 14 pith_cstring_release void 1 13
 iconst 15 0
 ret 15
-label L6060
-label L6058
+label L6057
+label L6055
 load 16 tids
 call 17 pith_auto_len int 1 16
 iconst 18 0
 store __for_idx_260 18
 store __for_len_260 17
 store __for_iter_260 16
-label L6063
+label L6060
 load 19 __for_idx_260
 load 20 __for_len_260
 lt 21 19 20
-brif 21 L6064 L6066
-label L6064
+brif 21 L6061 L6063
+label L6061
 load 22 __for_iter_260
 load 23 __for_idx_260
 call 24 pith_list_get_value unknown 2 22 23
 store __loopvar_260_t 24
 iconst 25 0
-store __or_25_6070 25
+store __or_25_6067 25
 load 26 __loopvar_260_t
 iconst 27 0
 lt 28 26 27
-store __or_25_6070 28
-brif 28 L6071 L6070
-label L6070
+store __or_25_6067 28
+brif 28 L6068 L6067
+label L6067
 load 29 __loopvar_260_t
 call 30 types_is_error_type bool 1 29
-store __or_25_6070 30
-label L6071
-load 31 __or_25_6070
-brif 31 L6068 L6069
+store __or_25_6067 30
 label L6068
+load 31 __or_25_6067
+brif 31 L6065 L6066
+label L6065
 load 32 entry
 call 33 pith_cstring_release void 1 32
 iconst 34 0
 ret 34
-label L6069
-label L6067
-label L6065
+label L6066
+label L6064
+label L6062
 load 35 __for_idx_260
 iconst 36 1
 add 37 35 36
 store __for_idx_260 37
-jmp L6063
-label L6066
+jmp L6060
+label L6063
 load 38 entry
 strref 39 m18s328
 iconst 40 9
@@ -90529,51 +90516,51 @@ call 69 pith_cstring_release void 1 66
 call 70 pith_cstring_release void 1 38
 store entry 67
 iconst 71 0
-store __or_71_6075 71
+store __or_71_6072 71
 load 72 checker___g_generic_body_checked
 load 73 entry
 call 74 contains_key bool 2 72 73
-store __or_71_6075 74
-brif 74 L6076 L6075
-label L6075
+store __or_71_6072 74
+brif 74 L6073 L6072
+label L6072
 load 75 checker___g_generic_body_queued
 load 76 entry
 call 77 contains_key bool 2 75 76
-store __or_71_6075 77
-label L6076
-load 78 __or_71_6075
-brif 78 L6073 L6074
+store __or_71_6072 77
 label L6073
+load 78 __or_71_6072
+brif 78 L6070 L6071
+label L6070
 load 79 entry
 call 80 pith_cstring_release void 1 79
 iconst 81 0
 ret 81
-label L6074
-label L6072
+label L6071
+label L6069
 iconst 82 0
 store count 82
 load 83 checker___g_generic_body_spec_counts
 load 84 decl_idx
 call 85 map_contains_ikey bool 2 83 84
-brif 85 L6078 L6079
-label L6078
+brif 85 L6075 L6076
+label L6075
 load 86 checker___g_generic_body_spec_counts
 load 87 decl_idx
 call 88 map_get_ikey_strict int 2 86 87
 store count 88
-jmp L6077
-label L6079
-label L6077
+jmp L6074
+label L6076
+label L6074
 load 89 count
 load 90 checker___g_generic_body_spec_limit
 gte 91 89 90
-brif 91 L6081 L6082
-label L6081
+brif 91 L6078 L6079
+label L6078
 load 92 count
 load 93 checker___g_generic_body_spec_limit
 eq 94 92 93
-brif 94 L6084 L6085
-label L6084
+brif 94 L6081 L6082
+label L6081
 load 95 decl_idx
 strref 96 m18s338
 strref 97 m18s337
@@ -90607,15 +90594,15 @@ load 124 count
 iconst 125 1
 add 126 124 125
 call 127 map_insert_ikey void 3 122 123 126
-jmp L6083
-label L6085
-label L6083
+jmp L6080
+label L6082
+label L6080
 load 128 entry
 call 129 pith_cstring_release void 1 128
 iconst 130 0
 ret 130
-label L6082
-label L6080
+label L6079
+label L6077
 load 131 checker___g_generic_body_spec_counts
 load 132 decl_idx
 load 133 count
@@ -90640,39 +90627,39 @@ param inst_tid
 iconst 2 0
 store entry 2
 iconst 3 0
-store __or_3_6089 3
+store __or_3_6086 3
 iconst 4 0
-store __or_4_6089 4
+store __or_4_6086 4
 load 5 checker___g_generic_body_check_mode
 strref 6 m18s326
 call 7 pith_cstring_eq bool 2 5 6
 call 8 pith_cstring_release void 1 6
-store __or_4_6089 7
-brif 7 L6090 L6089
-label L6089
+store __or_4_6086 7
+brif 7 L6087 L6086
+label L6086
 load 9 method_idx
 iconst 10 0
 lt 11 9 10
-store __or_4_6089 11
-label L6090
-load 12 __or_4_6089
-store __or_3_6089 12
-brif 12 L6092 L6091
-label L6091
+store __or_4_6086 11
+label L6087
+load 12 __or_4_6086
+store __or_3_6086 12
+brif 12 L6089 L6088
+label L6088
 load 13 inst_tid
 iconst 14 0
 lt 15 13 14
-store __or_3_6089 15
-label L6092
-load 16 __or_3_6089
-brif 16 L6087 L6088
-label L6087
+store __or_3_6086 15
+label L6089
+load 16 __or_3_6086
+brif 16 L6084 L6085
+label L6084
 load 17 entry
 call 18 pith_cstring_release void 1 17
 iconst 19 0
 ret 19
-label L6088
-label L6086
+label L6085
+label L6083
 load 20 entry
 strref 21 m18s327
 iconst 22 9
@@ -90698,27 +90685,27 @@ call 41 pith_cstring_release void 1 38
 call 42 pith_cstring_release void 1 20
 store entry 39
 iconst 43 0
-store __or_43_6096 43
+store __or_43_6093 43
 load 44 checker___g_generic_body_checked
 load 45 entry
 call 46 contains_key bool 2 44 45
-store __or_43_6096 46
-brif 46 L6097 L6096
-label L6096
+store __or_43_6093 46
+brif 46 L6094 L6093
+label L6093
 load 47 checker___g_generic_body_queued
 load 48 entry
 call 49 contains_key bool 2 47 48
-store __or_43_6096 49
-label L6097
-load 50 __or_43_6096
-brif 50 L6094 L6095
+store __or_43_6093 49
 label L6094
+load 50 __or_43_6093
+brif 50 L6091 L6092
+label L6091
 load 51 entry
 call 52 pith_cstring_release void 1 51
 iconst 53 0
 ret 53
-label L6095
-label L6093
+label L6092
+label L6090
 load 54 checker___g_generic_body_queued
 load 55 entry
 iconst 56 1
@@ -90739,22 +90726,22 @@ load 3 receiver_tid
 call 4 map_contains_ikey bool 2 2 3
 iconst 5 0
 eq 6 4 5
-brif 6 L6099 L6100
-label L6099
+brif 6 L6096 L6097
+label L6096
 iconst 7 0
 ret 7
-label L6100
-label L6098
+label L6097
+label L6095
 load 8 method_idx
 call 9 ast_get_node struct:Node 1 8
 call 10 checker_declaration_has_generic_params bool 1 9
 call 11 pith_struct_release void 1 9
-brif 10 L6102 L6103
-label L6102
+brif 10 L6099 L6100
+label L6099
 iconst 12 0
 ret 12
-label L6103
-label L6101
+label L6100
+label L6098
 load 13 method_idx
 load 14 receiver_tid
 call 15 checker_queue_method_specialization void 2 13 14
@@ -90779,8 +90766,8 @@ call 10 checker_reset_fn_weak_tracking void 0
 load 11 self_tid
 iconst 12 0
 gte 13 11 12
-brif 13 L6105 L6106
-label L6105
+brif 13 L6102 L6103
+label L6102
 load 14 fn_scope
 strref 15 m18s334
 load 16 self_tid
@@ -90788,9 +90775,9 @@ iconst 17 0
 load 18 decl_idx
 call 19 scope_define_binding_at void 5 14 15 16 17 18
 call 20 pith_cstring_release void 1 15
-jmp L6104
-label L6106
-label L6104
+jmp L6101
+label L6103
+label L6101
 iconst 21 0
 store param_idx 21
 load 22 decl_node
@@ -90800,12 +90787,12 @@ iconst 25 0
 store __for_idx_261 25
 store __for_len_261 24
 store __for_iter_261 23
-label L6107
+label L6104
 load 26 __for_idx_261
 load 27 __for_len_261
 lt 28 26 27
-brif 28 L6108 L6110
-label L6108
+brif 28 L6105 L6107
+label L6105
 load 29 __for_iter_261
 load 30 __for_idx_261
 call 31 pith_list_get_value unknown 2 29 30
@@ -90820,8 +90807,8 @@ field 37 36 0 string kind
 strref 38 m18s333
 call 39 pith_cstring_eq bool 2 37 38
 call 40 pith_cstring_release void 1 38
-brif 39 L6112 L6113
-label L6112
+brif 39 L6109 L6110
+label L6109
 load 41 pname
 load 42 cn
 field 43 42 8 string value
@@ -90832,8 +90819,8 @@ load 46 param_idx
 load 47 param_types
 call 48 pith_list_len int 1 47
 lt 49 46 48
-brif 49 L6115 L6116
-label L6115
+brif 49 L6112 L6113
+label L6112
 load 50 fn_scope
 load 51 pname
 load 52 param_types
@@ -90846,9 +90833,9 @@ call 58 pith_cstring_contains bool 2 56 57
 call 59 pith_cstring_release void 1 57
 load 60 __loopvar_261_child
 call 61 scope_define_binding_at void 5 50 51 54 58 60
-jmp L6114
-label L6116
-label L6114
+jmp L6111
+label L6113
+label L6111
 load 62 pname
 load 63 __loopvar_261_child
 call 64 checker_note_fn_binding_name void 2 62 63
@@ -90856,28 +90843,28 @@ load 65 param_idx
 iconst 66 1
 add 67 65 66
 store param_idx 67
-jmp L6111
-label L6113
+jmp L6108
+label L6110
 load 68 cn
 field 69 68 0 string kind
 strref 70 m18s331
 call 71 pith_cstring_eq bool 2 69 70
 call 72 pith_cstring_release void 1 70
-brif 71 L6117 L6118
-label L6117
+brif 71 L6114 L6115
+label L6114
 load 73 __loopvar_261_child
 load 74 fn_scope
 call 75 checker_check_function_body void 2 73 74
-jmp L6111
-label L6118
-label L6111
-label L6109
+jmp L6108
+label L6115
+label L6108
+label L6106
 load 76 __for_idx_261
 iconst 77 1
 add 78 76 77
 store __for_idx_261 78
-jmp L6107
-label L6110
+jmp L6104
+label L6107
 load 79 cn
 call 80 pith_struct_release void 1 79
 load 81 pname
@@ -90907,8 +90894,8 @@ store param_types 10
 load 11 decl_idx
 iconst 12 0
 lt 13 11 12
-brif 13 L6120 L6121
-label L6120
+brif 13 L6117 L6118
+label L6117
 load 14 decl_node
 call 15 pith_struct_release void 1 14
 load 16 generic_params
@@ -90925,8 +90912,8 @@ load 26 param_types
 call 27 pith_list_release_handle void 1 26
 iconst 28 0
 ret 28
-label L6121
-label L6119
+label L6118
+label L6116
 load 29 decl_node
 load 30 decl_idx
 call 31 ast_get_node struct:Node 1 30
@@ -90939,8 +90926,8 @@ call 37 pith_cstring_eq bool 2 34 35
 iconst 38 1
 sub 36 38 37
 call 39 pith_cstring_release void 1 35
-brif 36 L6123 L6124
-label L6123
+brif 36 L6120 L6121
+label L6120
 load 40 decl_node
 call 41 pith_struct_release void 1 40
 load 42 generic_params
@@ -90957,8 +90944,8 @@ load 52 param_types
 call 53 pith_list_release_handle void 1 52
 iconst 54 0
 ret 54
-label L6124
-label L6122
+label L6121
+label L6119
 load 55 generic_params
 load 56 decl_node
 call 57 checker_collect_generic_parameter_names list_string 1 56
@@ -90969,8 +90956,8 @@ call 60 pith_list_len int 1 59
 load 61 concrete_tids
 call 62 pith_list_len int 1 61
 neq 63 60 62
-brif 63 L6126 L6127
-label L6126
+brif 63 L6123 L6124
+label L6123
 load 64 decl_node
 call 65 pith_struct_release void 1 64
 load 66 generic_params
@@ -90987,39 +90974,39 @@ load 76 param_types
 call 77 pith_list_release_handle void 1 76
 iconst 78 0
 ret 78
-label L6127
-label L6125
+label L6124
+label L6122
 load 79 concrete_tids
 call 80 pith_auto_len int 1 79
 iconst 81 0
 store __for_idx_262 81
 store __for_len_262 80
 store __for_iter_262 79
-label L6128
+label L6125
 load 82 __for_idx_262
 load 83 __for_len_262
 lt 84 82 83
-brif 84 L6129 L6131
-label L6129
+brif 84 L6126 L6128
+label L6126
 load 85 __for_iter_262
 load 86 __for_idx_262
 call 87 pith_list_get_value unknown 2 85 86
 store __loopvar_262_t 87
 iconst 88 0
-store __or_88_6135 88
+store __or_88_6132 88
 load 89 __loopvar_262_t
 iconst 90 0
 lt 91 89 90
-store __or_88_6135 91
-brif 91 L6136 L6135
-label L6135
+store __or_88_6132 91
+brif 91 L6133 L6132
+label L6132
 load 92 __loopvar_262_t
 call 93 types_is_error_type bool 1 92
-store __or_88_6135 93
-label L6136
-load 94 __or_88_6135
-brif 94 L6133 L6134
+store __or_88_6132 93
 label L6133
+load 94 __or_88_6132
+brif 94 L6130 L6131
+label L6130
 load 95 decl_node
 call 96 pith_struct_release void 1 95
 load 97 generic_params
@@ -91036,28 +91023,28 @@ load 107 param_types
 call 108 pith_list_release_handle void 1 107
 iconst 109 0
 ret 109
-label L6134
-label L6132
-label L6130
+label L6131
+label L6129
+label L6127
 load 110 __for_idx_262
 iconst 111 1
 add 112 110 111
 store __for_idx_262 112
-jmp L6128
-label L6131
+jmp L6125
+label L6128
 iconst 113 1
 store prev_reporting 113
 load 114 report
 iconst 115 0
 eq 116 114 115
-brif 116 L6138 L6139
-label L6138
+brif 116 L6135 L6136
+label L6135
 iconst 117 0
 call 118 checker_diagnostics_checker_set_reporting bool 1 117
 store prev_reporting 118
-jmp L6137
-label L6139
-label L6137
+jmp L6134
+label L6136
+label L6134
 load 119 prev_module
 load 120 decl_idx
 call 121 checker_declaration_module string 1 120
@@ -91131,13 +91118,13 @@ call 178 pith_cstring_release void 1 177
 load 179 report
 iconst 180 0
 eq 181 179 180
-brif 181 L6141 L6142
-label L6141
+brif 181 L6138 L6139
+label L6138
 load 182 prev_reporting
 call 183 checker_diagnostics_checker_set_reporting bool 1 182
-jmp L6140
-label L6142
-label L6140
+jmp L6137
+label L6139
+label L6137
 load 184 decl_node
 call 185 pith_struct_release void 1 184
 load 186 generic_params
@@ -91184,21 +91171,21 @@ store saved_args 13
 iconst 14 0
 store param_types 14
 iconst 15 0
-store __or_15_6146 15
+store __or_15_6143 15
 load 16 method_idx
 iconst 17 0
 lt 18 16 17
-store __or_15_6146 18
-brif 18 L6147 L6146
-label L6146
+store __or_15_6143 18
+brif 18 L6144 L6143
+label L6143
 load 19 inst_tid
 iconst 20 0
 lt 21 19 20
-store __or_15_6146 21
-label L6147
-load 22 __or_15_6146
-brif 22 L6144 L6145
+store __or_15_6143 21
 label L6144
+load 22 __or_15_6143
+brif 22 L6141 L6142
+label L6141
 load 23 method_node
 call 24 pith_struct_release void 1 23
 load 25 base
@@ -91225,8 +91212,8 @@ load 45 param_types
 call 46 pith_list_release_handle void 1 45
 iconst 47 0
 ret 47
-label L6145
-label L6143
+label L6142
+label L6140
 load 48 method_node
 load 49 method_idx
 call 50 ast_get_node struct:Node 1 49
@@ -91239,8 +91226,8 @@ call 56 pith_cstring_eq bool 2 53 54
 iconst 57 1
 sub 55 57 56
 call 58 pith_cstring_release void 1 54
-brif 55 L6149 L6150
-label L6149
+brif 55 L6146 L6147
+label L6146
 load 59 method_node
 call 60 pith_struct_release void 1 59
 load 61 base
@@ -91267,15 +91254,15 @@ load 81 param_types
 call 82 pith_list_release_handle void 1 81
 iconst 83 0
 ret 83
-label L6150
-label L6148
+label L6147
+label L6145
 load 84 checker___g_struct_instance_decl_idx
 load 85 inst_tid
 call 86 map_contains_ikey bool 2 84 85
 iconst 87 0
 eq 88 86 87
-brif 88 L6152 L6153
-label L6152
+brif 88 L6149 L6150
+label L6149
 load 89 method_node
 call 90 pith_struct_release void 1 89
 load 91 base
@@ -91302,15 +91289,15 @@ load 111 param_types
 call 112 pith_list_release_handle void 1 111
 iconst 113 0
 ret 113
-label L6153
-label L6151
+label L6150
+label L6148
 load 114 checker___g_struct_instance_base_name
 load 115 inst_tid
 call 116 map_contains_ikey bool 2 114 115
 iconst 117 0
 eq 118 116 117
-brif 118 L6155 L6156
-label L6155
+brif 118 L6152 L6153
+label L6152
 load 119 method_node
 call 120 pith_struct_release void 1 119
 load 121 base
@@ -91337,8 +91324,8 @@ load 141 param_types
 call 142 pith_list_release_handle void 1 141
 iconst 143 0
 ret 143
-label L6156
-label L6154
+label L6153
+label L6151
 load 144 base
 load 145 checker___g_struct_instance_base_name
 load 146 inst_tid
@@ -91370,8 +91357,8 @@ call 167 pith_list_len int 1 166
 load 168 args
 call 169 pith_list_len int 1 168
 neq 170 167 169
-brif 170 L6158 L6159
-label L6158
+brif 170 L6155 L6156
+label L6155
 load 171 method_node
 call 172 pith_struct_release void 1 171
 load 173 base
@@ -91398,21 +91385,21 @@ load 193 param_types
 call 194 pith_list_release_handle void 1 193
 iconst 195 0
 ret 195
-label L6159
-label L6157
+label L6156
+label L6154
 iconst 196 1
 store prev_reporting 196
 load 197 report
 iconst 198 0
 eq 199 197 198
-brif 199 L6161 L6162
-label L6161
+brif 199 L6158 L6159
+label L6158
 iconst 200 0
 call 201 checker_diagnostics_checker_set_reporting bool 1 200
 store prev_reporting 201
-jmp L6160
-label L6162
-label L6160
+jmp L6157
+label L6159
+label L6157
 load 202 prev_module
 load 203 method_idx
 call 204 checker_declaration_module string 1 203
@@ -91451,8 +91438,8 @@ store checker___g_active_assoc_bindings 231
 load 233 checker___g_type_assoc_names
 load 234 base
 call 235 contains_key bool 2 233 234
-brif 235 L6164 L6165
-label L6164
+brif 235 L6161 L6162
+label L6161
 load 236 checker___g_type_assoc_names
 load 237 base
 call 238 map_get_strict string 2 236 237
@@ -91464,12 +91451,12 @@ iconst 243 0
 store __for_idx_263 243
 store __for_len_263 242
 store __for_iter_263 240
-label L6166
+label L6163
 load 244 __for_idx_263
 load 245 __for_len_263
 lt 246 244 245
-brif 246 L6167 L6169
-label L6167
+brif 246 L6164 L6166
+label L6164
 load 247 __for_iter_263
 load 248 __for_idx_263
 call 249 pith_list_get_value_unchecked string 2 247 248
@@ -91487,8 +91474,8 @@ store bkey 256
 load 259 checker___g_assoc_type_binding_node
 load 260 bkey
 call 261 contains_key bool 2 259 260
-brif 261 L6171 L6172
-label L6171
+brif 261 L6168 L6169
+label L6168
 load 262 checker___g_active_assoc_bindings
 load 263 __loopvar_263_an
 load 264 checker___g_assoc_type_binding_node
@@ -91498,21 +91485,21 @@ load 267 params
 load 268 args
 call 269 checker_resolve_type_with_substitution_map int 3 266 267 268
 call 270 map_insert void 3 262 263 269
-jmp L6170
-label L6172
-label L6170
-label L6168
+jmp L6167
+label L6169
+label L6167
+label L6165
 load 271 __for_idx_263
 iconst 272 1
 add 273 271 272
 store __for_idx_263 273
-jmp L6166
-label L6169
+jmp L6163
+label L6166
 load 274 __for_iter_263
 call 275 pith_list_release_handle void 1 274
-jmp L6163
-label L6165
-label L6163
+jmp L6160
+label L6162
+label L6160
 load 276 saved_params
 load 277 checker___g_active_subst_params
 call 278 pith_list_retain_handle void 1 277
@@ -91575,13 +91562,13 @@ call 325 pith_cstring_release void 1 324
 load 326 report
 iconst 327 0
 eq 328 326 327
-brif 328 L6174 L6175
-label L6174
+brif 328 L6171 L6172
+label L6171
 load 329 prev_reporting
 call 330 checker_diagnostics_checker_set_reporting bool 1 329
-jmp L6173
-label L6175
-label L6173
+jmp L6170
+label L6172
+label L6170
 load 331 method_node
 call 332 pith_struct_release void 1 331
 load 333 base
@@ -91618,29 +91605,29 @@ store method_node 3
 iconst 4 0
 store prev_module 4
 iconst 5 0
-store __or_5_6179 5
+store __or_5_6176 5
 load 6 method_idx
 iconst 7 0
 lt 8 6 7
-store __or_5_6179 8
-brif 8 L6180 L6179
-label L6179
+store __or_5_6176 8
+brif 8 L6177 L6176
+label L6176
 load 9 self_tid
 iconst 10 0
 lt 11 9 10
-store __or_5_6179 11
-label L6180
-load 12 __or_5_6179
-brif 12 L6177 L6178
+store __or_5_6176 11
 label L6177
+load 12 __or_5_6176
+brif 12 L6174 L6175
+label L6174
 load 13 method_node
 call 14 pith_struct_release void 1 13
 load 15 prev_module
 call 16 pith_cstring_release void 1 15
 iconst 17 0
 ret 17
-label L6178
-label L6176
+label L6175
+label L6173
 load 18 method_node
 load 19 method_idx
 call 20 ast_get_node struct:Node 1 19
@@ -91653,29 +91640,29 @@ call 26 pith_cstring_eq bool 2 23 24
 iconst 27 1
 sub 25 27 26
 call 28 pith_cstring_release void 1 24
-brif 25 L6182 L6183
-label L6182
+brif 25 L6179 L6180
+label L6179
 load 29 method_node
 call 30 pith_struct_release void 1 29
 load 31 prev_module
 call 32 pith_cstring_release void 1 31
 iconst 33 0
 ret 33
-label L6183
-label L6181
+label L6180
+label L6178
 iconst 34 1
 store prev_reporting 34
 load 35 report
 iconst 36 0
 eq 37 35 36
-brif 37 L6185 L6186
-label L6185
+brif 37 L6182 L6183
+label L6182
 iconst 38 0
 call 39 checker_diagnostics_checker_set_reporting bool 1 38
 store prev_reporting 39
-jmp L6184
-label L6186
-label L6184
+jmp L6181
+label L6183
+label L6181
 load 40 prev_module
 load 41 method_idx
 call 42 checker_declaration_module string 1 41
@@ -91696,13 +91683,13 @@ call 55 pith_cstring_release void 1 54
 load 56 report
 iconst 57 0
 eq 58 56 57
-brif 58 L6188 L6189
-label L6188
+brif 58 L6185 L6186
+label L6185
 load 59 prev_reporting
 call 60 checker_diagnostics_checker_set_reporting bool 1 59
-jmp L6187
-label L6189
-label L6187
+jmp L6184
+label L6186
+label L6184
 load 61 method_node
 call 62 pith_struct_release void 1 61
 load 63 prev_module
@@ -91723,25 +91710,25 @@ call 7 pith_cstring_release void 1 5
 call 8 pith_list_release_handle void 1 2
 store parts 6
 iconst 9 0
-store __and_9_6193 9
+store __and_9_6190 9
 load 10 parts
 call 11 pith_list_len int 1 10
 iconst 12 4
 gte 13 11 12
-store __and_9_6193 13
-brif 13 L6193 L6194
-label L6193
+store __and_9_6190 13
+brif 13 L6190 L6191
+label L6190
 load 14 parts
 iconst 15 0
 call 16 pith_list_get_value_strict string 2 14 15
 strref 17 m18s328
 call 18 pith_cstring_eq bool 2 16 17
 call 19 pith_cstring_release void 1 17
-store __and_9_6193 18
-label L6194
-load 20 __and_9_6193
-brif 20 L6191 L6192
+store __and_9_6190 18
 label L6191
+load 20 __and_9_6190
+brif 20 L6188 L6189
+label L6188
 load 21 parts
 iconst 22 1
 call 23 pith_list_get_value_strict string 2 21 22
@@ -91757,28 +91744,28 @@ call 32 checker_decode_tid_list list 1 31
 iconst 33 1
 call 34 checker_c_check_specialization void 4 24 28 32 33
 call 35 pith_list_release_handle void 1 32
-jmp L6190
-label L6192
+jmp L6187
+label L6189
 iconst 36 0
-store __and_36_6197 36
+store __and_36_6194 36
 load 37 parts
 call 38 pith_list_len int 1 37
 iconst 39 3
 gte 40 38 39
-store __and_36_6197 40
-brif 40 L6197 L6198
-label L6197
+store __and_36_6194 40
+brif 40 L6194 L6195
+label L6194
 load 41 parts
 iconst 42 0
 call 43 pith_list_get_value_strict string 2 41 42
 strref 44 m18s327
 call 45 pith_cstring_eq bool 2 43 44
 call 46 pith_cstring_release void 1 44
-store __and_36_6197 45
-label L6198
-load 47 __and_36_6197
-brif 47 L6195 L6196
+store __and_36_6194 45
 label L6195
+load 47 __and_36_6194
+brif 47 L6192 L6193
+label L6192
 load 48 parts
 iconst 49 1
 call 50 pith_list_get_value_strict string 2 48 49
@@ -91789,9 +91776,9 @@ call 54 pith_list_get_value_strict string 2 52 53
 call 55 checker_parse_integer_string int 1 54
 iconst 56 1
 call 57 checker_c_check_method_specialization void 3 51 55 56
-jmp L6190
-label L6196
-label L6190
+jmp L6187
+label L6193
+label L6187
 load 58 parts
 call 59 pith_list_release_handle void 1 58
 iconst 60 0
@@ -91808,8 +91795,8 @@ load 3 checker___g_generic_body_check_mode
 strref 4 m18s326
 call 5 pith_cstring_eq bool 2 3 4
 call 6 pith_cstring_release void 1 4
-brif 5 L6200 L6201
-label L6200
+brif 5 L6197 L6198
+label L6197
 load 7 saved_cache
 call 8 pith_map_release_handle void 1 7
 load 9 prev_severity
@@ -91818,8 +91805,8 @@ load 11 entry
 call 12 pith_cstring_release void 1 11
 iconst 13 0
 ret 13
-label L6201
-label L6199
+label L6198
+label L6196
 load 14 saved_cache
 load 15 checker___g_expression_type_cache
 call 16 pith_map_retain_handle void 1 15
@@ -91845,27 +91832,27 @@ load 31 checker___g_generic_body_check_mode
 strref 32 m18s324
 call 33 pith_cstring_eq bool 2 31 32
 call 34 pith_cstring_release void 1 32
-brif 33 L6203 L6204
-label L6203
+brif 33 L6200 L6201
+label L6200
 load 35 prev_severity
 strref 36 m18s323
 call 37 checker_diagnostics_checker_set_severity_override string 1 36
 call 38 pith_cstring_release void 1 36
 call 39 pith_cstring_release void 1 35
 store prev_severity 37
-jmp L6202
-label L6204
-label L6202
+jmp L6199
+label L6201
+label L6199
 call 40 checker_diagnostics_checker_begin_dedup void 0
 iconst 41 0
 store i 41
-label L6205
+label L6202
 load 42 i
 load 43 checker___g_generic_body_worklist
 call 44 pith_list_len int 1 43
 lt 45 42 44
-brif 45 L6206 L6207
-label L6206
+brif 45 L6203 L6204
+label L6203
 load 46 entry
 load 47 checker___g_generic_body_worklist
 load 48 i
@@ -91882,19 +91869,19 @@ load 56 entry
 call 57 contains_key bool 2 55 56
 iconst 58 0
 eq 59 57 58
-brif 59 L6209 L6210
-label L6209
+brif 59 L6206 L6207
+label L6206
 load 60 checker___g_generic_body_checked
 load 61 entry
 iconst 62 1
 call 63 map_insert void 3 60 61 62
 load 64 entry
 call 65 checker_check_worklist_entry void 1 64
-jmp L6208
-label L6210
-label L6208
 jmp L6205
 label L6207
+label L6205
+jmp L6202
+label L6204
 load 66 checker___g_generic_body_worklist
 call 67 pith_list_new_cstr list 0
 call 68 pith_list_release_handle void 1 66
@@ -91908,14 +91895,14 @@ load 73 checker___g_generic_body_check_mode
 strref 74 m18s324
 call 75 pith_cstring_eq bool 2 73 74
 call 76 pith_cstring_release void 1 74
-brif 75 L6212 L6213
-label L6212
+brif 75 L6209 L6210
+label L6209
 load 77 prev_severity
 call 78 checker_diagnostics_checker_set_severity_override string 1 77
 call 79 pith_cstring_release void 1 78
-jmp L6211
-label L6213
-label L6211
+jmp L6208
+label L6210
+label L6208
 load 80 prev_reporting
 call 81 checker_diagnostics_checker_set_reporting bool 1 80
 load 82 checker___g_expression_type_cache

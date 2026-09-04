@@ -1,0 +1,59 @@
+# fresh temporaries inside a generic body, churned: a one-char string from
+# `s[i]` compared in a loop, a string call result compared as an operand, a
+# field read straight off a call result, a fresh optional shell passed as an
+# argument, a container result discarded at statement position. each used to
+# leak its temporary per evaluation, because the predicates that release such
+# temporaries answered "borrowed" inside a generic body. with the body typed
+# they release as a concrete body's do, and the peak is the same at both
+# round counts.
+#
+# the round's varying text arrives as a parameter, as in
+# leak_generic_body_locals, so the case measures the temporaries and nothing
+# else.
+import leakprobe as probe
+
+struct Point:
+    pub label: String
+    pub n: Int
+
+fn make_point(n: Int) -> Point:
+    return Point(label: "p" + n.to_string(), n: n)
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+fn opt_len(v: String?) -> Int:
+    if let s = v:
+        return s.len()
+    return 0
+
+fn maybe(n: Int) -> String?:
+    return "m" + n.to_string()
+
+fn churn[T](t: T, s: String, n: Int) -> Int:
+    mut i := 0
+    mut acc := 0
+    while i < s.len():
+        if s[i] == ":":
+            acc = acc + 1
+        i = i + 1
+    if shout(s) == "never!":
+        acc = acc + 100
+    acc = acc + make_point(n).label.len()
+    acc = acc + opt_len(maybe(n))
+    m: Map[String, Int] := {}
+    m.insert("a", n)
+    m.keys()
+    m.take("a")
+    return acc + m.len()
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        text := "t:" + i.to_string()
+        acc = acc + churn(1, text, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

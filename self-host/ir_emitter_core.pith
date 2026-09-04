@@ -3557,12 +3557,6 @@ fn ir_expr_is_fresh_string_index(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind != "index" or node.children.len() == 0:
         return false
-    # inside generic or specialized bodies the checked types are suppressed
-    # and inference can misname a map or list receiver as a string; a wrong
-    # answer here frees a container's element, so freshness requires the
-    # non-generic certainty path.
-    if ir_in_generic_body():
-        return false
     # replicate ir_emit_index_expr's dispatch exactly: checked type first,
     # inference as fallback.
     mut obj_type := ir_checked_type(node.children[0])
@@ -3686,10 +3680,6 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # method's for a method call.
 fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int, is_method: Bool):
     en := get_node(expr_idx)
-    # inside generic or specialized bodies the checked types are suppressed
-    # and a wrong answer here frees a register that is not a shell
-    if ir_in_generic_body():
-        return
     mut sig := ""
     mut dtor_owned := false
     if en.kind == "none_lit":
@@ -3773,13 +3763,15 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
 # than the one it means.
 
 # true for call and method-call results whose checked or inferred type is
-# string, outside generic bodies where the types cannot be trusted. one of the
-# four fresh-temporary predicates; see the block above.
+# string. one of the four fresh-temporary predicates; see the block above.
+# these predicates used to answer false inside a generic body, where the
+# checked types were the error type and a wrong answer freed a register that
+# was not what it seemed; a specialization is type-checked against its
+# concrete types before it is emitted now, so the answer is the concrete
+# body's.
 fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind != "call" and node.kind != "method_call":
-        return false
-    if ir_in_generic_body():
         return false
     # a `.value()` the emitter could not count spells like a call and is a
     # field read: it hands back an uncounted view of the shell's payload (see
@@ -5710,10 +5702,8 @@ fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
 # true when a field access's receiver is a fresh value nothing else names: a
 # call or method result, a struct construction, or an unwrap that built its
 # answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
-# kind, outside generic bodies where the types cannot be trusted.
+# kind.
 fn ir_field_receiver_is_owned_temp(recv_idx: Int) -> Bool:
-    if ir_in_generic_body():
-        return false
     recv := get_node(recv_idx)
     if recv.kind != "call" and recv.kind != "method_call" and recv.kind != "struct_init":
         return false
@@ -8911,21 +8901,19 @@ fn ir_stmt(idx: Int):
             # register is NOT a count of its own is a void method's: its
             # value is the receiver handed back for chaining, so that keeps
             # its leak rather than freeing a container out from under its
-            # owner. a generic body's types are suppressed and prove
-            # nothing, so it keeps the old leak too.
-            if not ir_in_generic_body():
-                stmt_kind := ir_rc_kind(ir_infer_type(idx))
-                mut stmt_kind_discards := stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set"
-                # bytes and struct results ride the same rule: the producers
-                # transfer their count out exactly like the container ones,
-                # so a discarded `m.take(i)` on a Bytes- or struct-valued map
-                # (or any other discarded owned result of these kinds)
-                # stranded one count per statement.
-                if stmt_kind == "bytes" or ir_kind_is_struct_header(stmt_kind):
-                    stmt_kind_discards = true
-                if stmt_kind_discards and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
-                    ir_rc_release_reg(r, stmt_kind)
-                    return
+            # owner.
+            stmt_kind := ir_rc_kind(ir_infer_type(idx))
+            mut stmt_kind_discards := stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set"
+            # bytes and struct results ride the same rule: the producers
+            # transfer their count out exactly like the container ones,
+            # so a discarded `m.take(i)` on a Bytes- or struct-valued map
+            # (or any other discarded owned result of these kinds)
+            # stranded one count per statement.
+            if stmt_kind == "bytes" or ir_kind_is_struct_header(stmt_kind):
+                stmt_kind_discards = true
+            if stmt_kind_discards and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+                ir_rc_release_reg(r, stmt_kind)
+                return
         # a discarded owned string result (a popped element, an unused
         # fresh string) is garbage as soon as the statement ends. the
         # receiver guard matters here too: `xs.reverse()` shares its name

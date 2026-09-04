@@ -289,11 +289,11 @@ pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], re
 ## the checker's type arguments for each specialization key, comma-encoded:
 ## the tids `T`, `U`, ... take in that specialization, as the checker settled
 ## them at the call node that first asked for it (c_generic_call_subst).
-## these are type-parameter tids, not argument tids. a tid-keyed request
-## records them at queue time; a request that fell back to the emitter's
-## inference records them per emission-kind key, first record wins. the
-## emitter hands them to c_check_specialization just before it emits the
-## body.
+## these are type-parameter tids, not argument tids; a tid-keyed request
+## records them at queue time, and the emitter hands them to
+## c_check_specialization just before it emits the body. a kind-keyed request
+## (a decode target, or a call the checker left without a record) has none,
+## and its body is emitted without the re-check, as before.
 pub mut ir_generic_specialization_subst_tids: Map[String, String] := {}
 
 ## the symbol spelling of one type argument. primitives, structs and enums
@@ -346,11 +346,6 @@ pub fn ir_tid_symbol_spelling(tid: Int) -> String:
         return ir_sanitize_symbol_part(kind)
     return ir_sanitize_symbol_part(get_type_name(tid)) + "_t" + tid.to_string()
 
-## how many queue requests fell back to the emitter's own inference because
-## the checker recorded no type arguments at the call. read by the driver
-## under PITH_SPEC_FALLBACKS to measure whether the inference is still needed.
-pub mut ir_generic_queue_fallbacks := 0
-
 ## request a specialization by the checker's type arguments: the key and the
 ## symbol come from the spellings, the emission kinds for the substitution
 ## from the type ids, and the ids themselves are recorded for the re-check
@@ -380,19 +375,6 @@ pub fn ir_queue_generic_specialization_for_tids(name: String, tids: List[Int], r
     ir_generic_specialization_subst_tids.insert(key, parts.join(","))
     ir_func_returns.insert(spec_name, ret_type)
     return spec_name
-
-## record the checker's type arguments for a spec key. an empty list (the
-## checker recorded nothing at this call) records nothing.
-pub fn ir_record_generic_spec_subst_tids(name: String, arg_types: List[String], tids: List[Int]):
-    if tids.len() == 0:
-        return
-    key := ir_generic_specialization_key(name, arg_types)
-    if ir_generic_specialization_subst_tids.contains_key(key):
-        return
-    mut parts: List[String] := []
-    for tid in tids:
-        parts.push(tid.to_string())
-    ir_generic_specialization_subst_tids.insert(key, parts.join(","))
 
 ## the checker's type arguments recorded for a spec key, or an empty list.
 pub fn ir_decode_generic_spec_subst_tids(key: String) -> List[Int]:

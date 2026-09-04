@@ -328,20 +328,14 @@ correctness story:
   method on a generic receiver — and a callee that extracts a heap payload
   out of the optional rather than reading it in place. binding the value
   first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
-- a heap local inside a *generic function body* is released only where the
-  body can prove nothing else took a count of it. the rule the specialization
-  path uses, and the shapes it still refuses, are spelled out in the
-  compiler-section entry above; a name it refuses drops about 90 bytes per
-  call. the refusals are deliberate. releasing a local whose escape into the
-  caller's module the emitter cannot see hands back a recycled handle, which
-  is worse than a leak, so lifting the rest means teaching the specialization
-  path the caller-side escape it is missing rather than tracking every name
-  and hoping. what a *generic instance* holds is
-  unaffected when the site names its concrete types (`Wrap[String](...)`) or
-  the checker typed it: its destructor is built from the instance's concrete
-  kinds and releases the enum payload or struct field either way. an
-  instance built by bare base name inside a generic body carries no
-  destructor on purpose — see the compiler-section entry above.
+- a heap local inside a *generic function body* follows the same release
+  rules as one in a concrete body: the body is typed against each set of
+  concrete types before it is emitted, so escapes, stores and returns are
+  classified from real types. what a *generic instance* holds is released by
+  a destructor built from the instance's concrete kinds whether the site
+  names them (`Wrap[String](...)`), the checker inferred them, or the
+  instance was built by bare base name inside another generic body. the
+  compiler-section entry above lists what remains.
 - a collection literal whose element type is an optional (`List[Int?]`,
   `Map[String, Int?]`) owns the optionals it holds, the same as a container
   built by pushing into it: the literal's wrapped elements are tagged like
@@ -362,23 +356,17 @@ correctness story:
   map relinquishes), so the discard releases a count that was the
   statement's to drop. what still strands: a discarded void-method chain
   (the chain's value is the receiver handed back, and freeing it would free
-  the container its owner still holds), a discard inside a generic body (the
-  suppressed types prove nothing), a discarded closure result, and a
+  the container its owner still holds), a discarded closure result, and a
   container dropped through a discarded `!` or `await` at statement
   position, which take other paths to the discard.
-- an optional shell reaching a *specialized generic body* from a runtime
-  call can still carry no destructor: the checked types are suppressed
-  there, so a channel receive whose element type the emitter cannot see
-  hands back a shell that owns its payload count with nothing set up to
-  release it — a bounded leak in the safe direction, the same suppression
-  trade the rest of this section describes. everywhere else the fresh-shell
-  family is closed: a user function's returned `Some` owns its payload
-  through `__opt_dtor_<kind>`, and the transferring runtime getters
-  (`env_opt` behind `os.get_env`, the string `get`, a channel receive)
-  have the matching destructor attached at the call site, so every
-  extraction spelling is flat on call subjects and bound locals alike. the
-  borrowing getters (`m.get(k)`, `xs.first()`) keep destructor-less shells
-  on purpose — their payload count stays with the container.
+- the fresh-shell family is closed, inside generic bodies as well: a user
+  function's returned `Some` owns its payload through `__opt_dtor_<kind>`,
+  and the transferring runtime getters (`env_opt` behind `os.get_env`, the
+  string `get`, a channel receive) have the matching destructor attached at
+  the call site, so every extraction spelling is flat on call subjects and
+  bound locals alike. the borrowing getters (`m.get(k)`, `xs.first()`) keep
+  destructor-less shells on purpose — their payload count stays with the
+  container.
 - a `Set` element and a `Map` key hash int and string flavors only. any other
   element or key type used to fall into a flavor anyway and read its value's
   word as if it were that flavor: distinct optionals, lists and bytes

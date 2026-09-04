@@ -90,8 +90,7 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 # types; set by the match emitters before lowering arms
 # declared return kinds of closure-typed parameters in the current
 # function: `key: fn(T) -> String` records "string" under "key", so a
-# call through the parameter infers its result kind even where checked
-# types are suppressed (generic bodies)
+# call through the parameter infers its result kind without a checked type
 mut ir_closure_return_kinds: Map[String, String] := {}
 
 # a local bound once to a lambda literal, by name, with the symbol of that
@@ -285,23 +284,7 @@ mut ir_current_impl_type := ""
 mut ir_current_impl_subst_params: List[String] := []
 mut ir_current_impl_subst_args: List[String] := []
 
-# true while a generic function body or a specialized impl method body is
-# being emitted. the checker ran on the unspecialized declaration, so inside
-# one the checked types are suppressed and inference can name a type
-# parameter's stand-in instead of the concrete type. a predicate that decides
-# ownership by consulting a type therefore has nothing trustworthy to consult
-# here and must refuse to answer. every caller's refusal is the conservative
-# side of its own question: an untaken count leaks, where acting on a wrong
-# type releases a register that is not what it looked like.
-fn ir_in_generic_body() -> Bool:
-    return ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0
-
-# per-instance destructors needed for generic structs built via the backend
-# constructor call (`Name[params](...)` inside a generic function). keyed by the
-# sanitized instance symbol: one map holds the base struct name, the other the
-# instance's concrete type-arg names (joined by chr(1), which never appears in a
-# type name) so the destructor body can substitute them into each field type.
-# the same idea for generic enums. a generic enum's declaration records its
+# per-instance destructors for generic enums. a generic enum's declaration records its
 # type parameter names as payload kinds, so the shared `__dtor_<enum>` sees
 # no rc payload and is never generated — `Holder[String].Some(s)` freed its
 # box and stranded the string. a construction site knows its instance from
@@ -922,9 +905,8 @@ fn ir_name_is_weak_read(name: String) -> Bool:
 # borrowed makes the consumer take a second count nobody releases — a leak.
 # calling a borrowed value owned skips the retain and lets the consumer
 # release a count it never took — a dangling pointer. so wherever the answer
-# cannot be proved (inside a generic body, where the checked types are
-# suppressed, or on a receiver that will not resolve) the clause falls through
-# to borrowed on purpose.
+# cannot be proved (a receiver that will not resolve, a call whose type the
+# checker did not record) the clause falls through to borrowed on purpose.
 #
 # the sequence of early returns below is the classification. they are ordered
 # so a specific shape answers before the general rule it would otherwise fall
@@ -1032,8 +1014,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # same-named method on another receiver keeps its own classification —
         # and on the same rc kind the call site retains through, so "owned"
         # here can never outrun the count that backs it. where the kind is
-        # unknown (a generic body, where specialization suppresses the checked
-        # types) no retain is emitted, so the answer stays "borrowed" and the
+        # unknown no retain is emitted, so the answer stays "borrowed" and the
         # consumer adds its own count: a leak rather than a value released
         # twice.
         if ir_rc_kind(ir_infer_type(idx)).len() > 0:
@@ -1871,11 +1852,12 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
             bind_type = ir_checked_type(parts.val_idx)
             if bind_type.len() == 0:
                 bind_type = ir_infer_type(parts.val_idx)
-            # in a generic impl body the checker suppresses the struct's type
-            # params, so a bind from a method/call comes back with no rc kind
-            # (or an unresolved optional). the emitter's own result kind still
-            # resolves — the impl-subst context is active during the prologue —
-            # and it is exactly the lowered kind the exit cleanup releases.
+            # a call whose checked type carries no rc kind while the emitter's
+            # own result kind does. generic bodies are typed before emission,
+            # so this no longer fires for them; the one corpus case is a
+            # concrete body binding a no-payload enum, which lowers as an int
+            # and which ir_expr_result_kind still reports as a struct (#1038).
+            # kept until that classifier agrees with the lowering.
             if (ir_rc_kind(bind_type).len() == 0 or ir_generic_name_unresolved(bind_type)) and (val_node.kind == "method_call" or val_node.kind == "call"):
                 bind_type = ir_expr_result_kind(parts.val_idx)
             # a catch binds the guarded result's OK value. the checker leaves
@@ -2484,9 +2466,10 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_emit_named_param("self", instance_type)
     ir_emit_fn_params(idx)
     # like every other function body, track owned locals so the exit cleanup
-    # releases them. the impl-subst context (set above) is active here, so the
-    # prologue's bind prepass can resolve a method result's lowered kind even
-    # though the checker suppressed the struct's type params in this body.
+    # releases them. the body was re-checked against this instance just above,
+    # so the prologue's bind prepass reads real tids for its nodes; the
+    # impl-subst context (set above) still names the concrete types for the
+    # emitter's own resolution of annotations spelled with the parameters.
     ir_emit_rc_prologue(body_idx)
     ir_func_returns.insert(method_key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
@@ -2734,12 +2717,10 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
             return declared
     if ir_is_bool_returning_method(meth):
         return "bool"
-    # `to_string` on a scalar kind mints a fresh string. a concrete body never
-    # asks (the checker typed the call); inside a generic specialization the
-    # checked types are suppressed and the receiver's kind is the substituted
-    # one the emitter tracks, so answer from it directly — the retkind is what
-    # pairs the fresh buffer with a release, and "unknown" here leaked every
-    # such temporary (issue #949). gated on the scalar kinds only: a string
+    # `to_string` on a scalar kind mints a fresh string. this is the emitter's
+    # own inference, consulted only where the checked type is absent, and the
+    # retkind is what pairs the fresh buffer with a release: "unknown" here
+    # leaked every such temporary (issue #949). gated on the scalar kinds only: a string
     # receiver lowers to identity (no fresh buffer, the receiver register
     # itself), so kinding it would hand the borrow classifier a value it
     # releases out from under the receiver's owner; an unresolved receiver
@@ -3654,11 +3635,11 @@ fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, exp
 #   `struct_init` counts only for the field receiver, which is the one
 #   consumer that can be handed a construction directly.
 #
-#   whether a generic-body guard applies. three of them consult a type — an
-#   inferred string, an rc kind, a checked tid — so they must refuse inside a
-#   generic body (see ir_in_generic_body). ir_extraction_operand_class has no
-#   guard on purpose: it is purely syntactic, reads the node kind and nothing
-#   else, and so has nothing that specialization could have suppressed.
+#   what they consult. three of them consult a type — an inferred string, an
+#   rc kind, a checked tid — and answer the same inside a generic body as in a
+#   concrete one, since the body is typed before it is emitted.
+#   ir_extraction_operand_class is purely syntactic and reads the node kind
+#   and nothing else.
 #
 #   whether `.value()` is excluded. the three that can end up releasing their
 #   receiver exclude it, because `opt.value()` spells like a call and is a
@@ -8080,8 +8061,7 @@ fn ir_emit_bind_stmt(node: Node):
         ir_var_regs.insert(name, new_w)
         return
     # a bind from a call through a closure-typed parameter carries the
-    # closure's declared return kind — the one type source that stays
-    # reliable in generic bodies, where checked types are suppressed
+    # closure's declared return kind
     if type_idx < 0 and val_idx >= 0:
         vn := get_node(val_idx)
         if vn.kind == "call" and vn.children.len() > 0:
@@ -9158,10 +9138,12 @@ fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
             return ir_impl_methods[base_key]
     return ""
 
-# the receiver's checked declaration tid, or -1 when the checker never typed
+# the receiver's checked declaration tid, or -1 when the checker did not type
 # the expression as a plain struct or enum — or typed it under a different
-# name than emission sees (a re-emitted generic body), in which case the tid
-# is stale and must not steer dispatch.
+# name than emission sees: two type-argument lists that share an emission
+# kind share one specialization body, and that body was checked for the
+# first caller's types, so the tid is stale and must not steer dispatch
+# (tid-keyed specialization is the follow-up that removes the sharing).
 fn ir_checked_receiver_tid(recv_idx: Int, type_name: String) -> Int:
     if recv_idx < 0:
         return 0 - 1

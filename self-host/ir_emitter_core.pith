@@ -2956,12 +2956,6 @@ fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> 
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, "tuple")
             return value_r
-    # in a generic impl body a method call's checked type is often TID_ERR,
-    # because the body was checked with the struct's type params suppressed.
-    # assume such a call already produces the shape its declaration promises
-    # rather than wrapping it as a Some.
-    if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
-        return value_r
     payload_kind := ir_rc_kind(ir_infer_type(val_idx))
     if ir_kind_is_owned_optional_payload(payload_kind):
         return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind)
@@ -3865,11 +3859,8 @@ fn ir_try_emit_none_to_none_compare(node: Node) -> Int:
 
 # `==` / `!=` where at least one operand is an Optional. A raw pointer eq would
 # compare heap addresses, so compare by (is_some, value) instead. Covers a none
-# literal against an optional, `T? == T?`, and the two generic forms where the
-# operand's optional type is invisible to the checker — inside a generic impl
-# body (parameters suppressed at registration) or a generic specialization (the
-# tid is still the un-specialized marker). Returns -1 when neither operand is an
-# optional comparison, leaving the value-operator path to handle it.
+# literal against an optional and `T? == T?`. Returns -1 when neither operand
+# is an optional comparison, leaving the value-operator path to handle it.
 fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
     left_tid := c_get_expr_type(node.children[0])
@@ -3899,16 +3890,6 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
             ir_release_weak_shell(node.children[0], left_r)
             ir_release_owned_optional_operand(node.children[0], left_r)
             return r
-        # in a generic impl body, the non-none side's type may be TID_ERR
-        # because the struct's type parameters were suppressed at registration;
-        # treat `expr == none` / `expr != none` as an optional comparison anyway
-        if ir_current_impl_subst_params.len() > 0:
-            if left_node.kind == "none_lit":
-                ir_emit_optional_none_compare(r, op, right_r)
-                return r
-            if right_node.kind == "none_lit":
-                ir_emit_optional_none_compare(r, op, left_r)
-                return r
         # T? == T?: raw pointer eq would compare heap addresses, not contents.
         # Compare by (is_some, value) so callers can put an Optional inside
         # assert_eq or a generic container without silently getting identity.
@@ -6113,9 +6094,7 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
 
 # Methods whose lowering is chosen by the receiver's static type rather than by
 # name resolution: unsigned `to_string`, the `Result` combinators, and the
-# `Optional` accessors. Also handles a bare `.value()` extract inside a
-# specialized generic impl body, where the receiver's optional type was
-# suppressed at registration. Returns -1 when none apply.
+# `Optional` accessors. Returns -1 when none apply.
 fn ir_emit_typed_receiver_method(idx: Int) -> Int:
     node := get_node(idx)
     mname := ir_plain_method_name(node_value(idx))
@@ -6195,15 +6174,6 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 out_r := ir_reg()
                 ir_emit("load " + out_r.to_string() + " " + tmp)
                 return out_r
-    # In a specialized generic impl body the receiver of `.value()` may have
-    # type T? where T was suppressed at registration (so c_get_expr_type returns
-    # TID_ERR). Emit the optional value-field extract directly when we're
-    # clearly inside such a body.
-    if mname == "value" and ir_current_impl_subst_params.len() > 0 and node.children.len() == 1:
-        obj_r := ir_expr(node.children[0])
-        r := ir_reg()
-        ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 unknown value")
-        return r
     return 0 - 1
 
 # A module-qualified call, `mod.member(...)`, where `mod` is an import alias.

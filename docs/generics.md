@@ -94,10 +94,6 @@ emission kind, and every optional is the "tuple" kind, so `first[Int?]` and
 first caller's types. Keying specializations on type ids is the follow-up that
 separates them.
 
-`PITH_SPEC_RECHECK=0` turns the emitter's re-check off for one build, which
-makes every generic body read the error type again exactly as before: one
-binary, two emissions, for measurement and for bisecting a difference.
-
 ## a generic that never stops
 
 A generic that calls itself at a larger type (`grow(x)` calling `grow([x])`)

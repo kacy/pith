@@ -230,7 +230,6 @@ pub mut ir_generic_emitted_specializations: Map[String, Int] := {}
 ## emission-kind concrete_types list. Used by the emitter to recover the
 ## concrete Optional tid inside a specialization body (concrete_types
 ## flattens Optional to "tuple").
-pub mut ir_generic_specialization_arg_tids: Map[String, String] := {}
 ## The impl target of every generic declaration that is a method rather than a
 ## free function, keyed by the same symbol name ir_generic_decl_indices uses.
 ## A method's specialization takes a leading self parameter and emits inside
@@ -275,21 +274,6 @@ pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], re
     ir_func_returns.insert(spec_name, ret_type)
     return spec_name
 
-## record arg tids for a spec-key so the emitter can recover Optional
-## inner types the emission-kind concrete_types list flattened. Safe to
-## call multiple times per key — first record wins (later callers of the
-## same spec have equivalent arg tids by construction).
-pub fn ir_record_generic_spec_arg_tids(name: String, arg_types: List[String], arg_tids: List[Int]):
-    key := ir_generic_specialization_key(name, arg_types)
-    if ir_generic_specialization_arg_tids.contains_key(key):
-        return
-    mut encoded := ""
-    for tid, i in arg_tids:
-        if i > 0:
-            encoded = encoded + chr(9)
-        encoded = encoded + tid.to_string()
-    ir_generic_specialization_arg_tids.insert(key, encoded)
-
 ## the checker's type arguments for each specialization key, comma-encoded:
 ## the tids `T`, `U`, ... take in that specialization, as the checker settled
 ## them at the call node that first asked for it (c_generic_call_subst).
@@ -324,32 +308,6 @@ pub fn ir_decode_generic_spec_subst_tids(key: String) -> List[Int]:
     if encoded.len() == 0:
         return result
     for part in encoded.split(","):
-        mut val := 0
-        mut neg := false
-        mut i := 0
-        if part.len() > 0 and part[0] == "-":
-            neg = true
-            i = 1
-        while i < part.len():
-            c := part[i]
-            if c >= "0" and c <= "9":
-                val = val * 10 + (ord(c) - 48)
-            i = i + 1
-        if neg:
-            val = 0 - val
-        result.push(val)
-    return result
-
-## decode a spec's arg tids, or an empty list if none were recorded.
-pub fn ir_decode_generic_spec_arg_tids(key: String) -> List[Int]:
-    result: List[Int] := []
-    if not ir_generic_specialization_arg_tids.contains_key(key):
-        return result
-    encoded := ir_generic_specialization_arg_tids[key]
-    if encoded.len() == 0:
-        return result
-    for part in encoded.split(chr(9)):
-        # parse_int-ish: rebuild the integer manually to avoid stdlib dep
         mut val := 0
         mut neg := false
         mut i := 0

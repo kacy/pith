@@ -1887,38 +1887,7 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
                 catch_ok := ir_result_ok_kind_for_expr(val_node.children[0])
                 if ir_rc_kind(catch_ok).len() > 0:
                     bind_type = catch_ok
-            # `c := self.list[i]` on a generic list field: the checked/inferred
-            # element type is suppressed to "unknown", so recover the element
-            # type name from the field's declared `List[T]` node (the caller
-            # substitutes T -> concrete). without this the element isn't tracked
-            # and the returned value dangles once the list is mutated.
-            substituted_bind := ir_substitute_type_name(bind_type)
-            if (ir_rc_kind(substituted_bind).len() == 0 or ir_generic_name_unresolved(substituted_bind)) and val_node.kind == "index" and val_node.children.len() > 0 and ir_current_impl_type.len() > 0:
-                list_node := get_node(val_node.children[0])
-                if list_node.kind == "field_access":
-                    elem := ir_self_list_field_element(list_node.value)
-                    if elem.len() > 0:
-                        bind_type = elem
     return bind_type
-
-# the element type name of a `self`-list field declared `List[T]` on the
-# current generic impl's struct (e.g. "T"/"C"), or "". reads the declaration
-# node because the resolved field kind is just "list".
-fn ir_self_list_field_element(field_name: String) -> String:
-    if ir_current_impl_type.len() == 0:
-        return ""
-    base := ir_strip_type_args(ir_current_impl_type)
-    if not ir_struct_decl_nodes.contains_key(base):
-        return ""
-    decl := get_node(ir_struct_decl_nodes[base])
-    for child in decl.children:
-        fnode := ir_unwrap_pub_node(child)
-        if fnode.kind == "field" and ir_struct_field_name(fnode) == field_name:
-            if fnode.children.len() > 0:
-                tnode := get_node(fnode.children[0])
-                if tnode.kind == "generic_type" and tnode.value == "List" and tnode.children.len() > 0:
-                    return get_node(tnode.children[0]).value
-    return ""
 
 # the prepass policy for one owned-local candidate: track the name under its
 # rc kind, or poison it. a name bound with DIFFERENT rc kinds in sibling
@@ -2821,39 +2790,6 @@ fn ir_index_expr_type(idx: Int, node: Node) -> String:
         return "string"
     if coll_type == "map" or coll_type == "map_int":
         return ir_lookup_map_value_type_for_expr(node.children[0])
-    # inside a generic specialization the checked types are suppressed, so
-    # indexing a List[T] parameter answers nothing here and the element loses
-    # its rc identity — the return path then skips the retain a borrowed
-    # element needs, and the caller inherits a value the dying list still
-    # owns. resolve the parameter's declared type under the active
-    # substitution instead.
-    coll_node := get_node(node.children[0])
-    if coll_node.kind == "ident":
-        elem := ir_spec_param_list_element_type(coll_node.value)
-        if elem.len() > 0:
-            return elem
-    return ""
-
-# the element type of an indexed list parameter inside a generic
-# specialization, resolved from the active declaration's type node under the
-# T -> concrete substitution. "" when no specialization is active, the name
-# is not a parameter of the active declaration, or its type is not a list.
-fn ir_spec_param_list_element_type(name: String) -> String:
-    if ir_active_generic_params.len() == 0 or ir_active_generic_decl_idx < 0:
-        return ""
-    decl := get_node(ir_active_generic_decl_idx)
-    for child in decl.children:
-        cn := get_node(child)
-        if cn.kind == "param" and cn.value == name:
-            for tc in cn.children:
-                tn := get_node(tc)
-                if tn.kind == "type" or tn.kind == "generic_type":
-                    tid := ir_declared_type_node_tid(tc)
-                    if tid >= 0:
-                        info := get_type_info(tid)
-                        if info.kind == "list":
-                            return ir_type_from_tid(info.inner)
-                    return ""
     return ""
 
 fn ir_call_expr_type(idx: Int, node: Node) -> String:
@@ -7994,19 +7930,7 @@ pub fn ir_emit_return_value(expr_child: Int):
         # signal as a tuple retkind — the guard against an Optional[Tuple]
         # inner still applies.
         ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
-        # the emitter's own inference is the third witness, and the one that
-        # answers inside a generic specialization. the body was checked before
-        # the substitution, so an `Optional[T]` parameter, an `Optional[T]`
-        # field of the receiver, and an `Optional[T]`-returning inner call all
-        # read back as the bare generic marker rather than an optional — the
-        # two witnesses above see nothing, the return wraps a shell that is
-        # already a shell, and the caller unwraps one layer and reads the
-        # inner shell's address as the value. ir_infer_type answers "tuple"
-        # for exactly the optional-shaped expressions, because that is the
-        # representation an optional lowers to; the same Optional[Tuple] guard
-        # keeps a genuinely tuple-valued inner out of it.
-        infer_tuple := ir_infer_type(expr_child) == "tuple"
-        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local or infer_tuple) and ir_current_func_optional_inner_kind != "tuple")
+        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
         if expr_node.kind == "none_lit":
             r = ir_emit_optional_none_value()
         elif already_optional == false:
@@ -8135,58 +8059,6 @@ fn ir_generic_name_unresolved(name: String) -> Bool:
         return true
     return ir_current_impl_subst_params.contains(base)
 
-# the tagged constructor for an empty `List[T]` bind whose element type only
-# the annotation knows, or "" when the normal target path already handles it.
-#
-# active only inside specialized generic bodies, where the checked types are
-# suppressed: everywhere else the checked type on the literal picks the
-# constructor, and second-guessing it here would fight that path. `List[T]`
-# with T substituted to string already resolves to the list_string target
-# upstream; every other heap element kind used to collapse to the coarse
-# "list" target and build untagged — a list whose stores own nothing, handing
-# back elements that lived on counts their source dropped at its own exit
-# (algo.sort_by_key over structs was the live case).
-fn ir_generic_empty_list_ctor(val_idx: Int, type_idx: Int, bind_target: String) -> String:
-    if bind_target != "list" or val_idx < 0 or type_idx < 0:
-        return ""
-    if ir_active_generic_params.len() == 0 and ir_current_impl_subst_params.len() == 0:
-        return ""
-    vn := get_node(val_idx)
-    if vn.kind != "list" or vn.children.len() > 0:
-        return ""
-    tn := get_node(type_idx)
-    if tn.kind != "generic_type" or tn.value != "List" or tn.children.len() == 0:
-        return ""
-    mut elem := ir_resolve_type_node(tn.children[0])
-    if ir_rc_kind(elem).len() == 0 or ir_generic_name_unresolved(elem):
-        # impl-method substitution (T -> the impl's concrete argument) is not
-        # part of ir_resolve_type_node's active-generic path, so try it as the
-        # fallback — and only when it actually substituted something, so a
-        # still-abstract T cannot clobber a resolution that already worked
-        inner := get_node(tn.children[0])
-        if inner.kind == "type":
-            substituted := ir_substitute_type_name(inner.value)
-            if substituted != inner.value:
-                elem = ir_resolve_type_hint(substituted)
-            # `List[I.Item]` names an associated type through a generic
-            # parameter. resolve it the way the specialization header does
-            # (I -> the concrete type, then its `type Item =` binding), or
-            # `to_list` builds an untagged list that owns none of the rows
-            # pushed into it — readable only for as long as some other count
-            # happens to keep them alive.
-            if ir_rc_kind(elem).len() == 0 or ir_generic_name_unresolved(elem):
-                assoc := ir_resolve_assoc_in_generic(inner.value, ir_active_generic_params, ir_active_generic_concrete_types)
-                if assoc != inner.value:
-                    elem = ir_resolve_type_hint(assoc)
-    # a name the resolvers above could not settle must never reach the kind
-    # lookup: fall back to the normal target path instead of guessing.
-    if ir_generic_name_unresolved(elem):
-        return ""
-    ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem))
-    if ctor == "__list_new":
-        return ""
-    return ctor
-
 fn ir_emit_bind_stmt(node: Node):
     parts := ir_collect_bind_parts(node)
     name := parts.name
@@ -8259,13 +8131,7 @@ fn ir_emit_bind_stmt(node: Node):
             old_r = ir_reg()
             ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
-        mut r := 0 - 1
-        annot_ctor := ir_generic_empty_list_ctor(val_idx, type_idx, bind_target)
-        if annot_ctor.len() > 0:
-            r = ir_reg()
-            ir_emit_call0(r, annot_ctor, "list")
-        if r < 0:
-            r = ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
+        r := ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
         if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
@@ -9639,68 +9505,6 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_module_path = saved_module_path
     ir_active_generic_decl_idx = saved_decl_idx
     ir_current_impl_type = saved_impl_type
-
-# the tid a declared type name denotes, or -1 when it names nothing the type
-# table knows. a source-level name (`Int`, a struct) resolves directly; a name
-# that arrived as a substituted generic concrete is an emission kind, so map
-# the primitive kinds back. anything else stays unresolved and the caller
-# falls back to whatever the call sites recorded.
-fn ir_tid_for_declared_type_name(name: String) -> Int:
-    direct := lookup_type_id(name)
-    if direct >= 0:
-        return direct
-    if name == "int":
-        return TID_INT
-    if name == "float":
-        return TID_FLOAT
-    if name == "bool":
-        return TID_BOOL
-    if name == "string":
-        return TID_STRING
-    if name == "bytes":
-        return TID_BYTES
-    return -1
-
-# the tid a *declared* type node denotes under the active substitution, or -1
-# when the shape is one this cannot rebuild. only the shape has to be right:
-# every consumer reads the emission kind off the tid, never its identity.
-fn ir_declared_type_node_tid(type_idx: Int) -> Int:
-    tn := get_node(type_idx)
-    if tn.kind == "type":
-        mut name := tn.value
-        for generic_param, i in ir_active_generic_params:
-            if generic_param == name and i < ir_active_generic_concrete_types.len():
-                name = ir_active_generic_concrete_types[i]
-        return ir_tid_for_declared_type_name(name)
-    if tn.kind == "generic_type":
-        if tn.value == "List" and tn.children.len() == 1:
-            elem := ir_declared_type_node_tid(tn.children[0])
-            if elem < 0:
-                return -1
-            return add_type_info(ti_list(elem))
-        if tn.value == "Set" and tn.children.len() == 1:
-            elem := ir_declared_type_node_tid(tn.children[0])
-            if elem < 0:
-                return -1
-            return add_type_info(ti_set(elem))
-        if tn.value == "Map" and tn.children.len() == 2:
-            key := ir_declared_type_node_tid(tn.children[0])
-            val := ir_declared_type_node_tid(tn.children[1])
-            if key < 0 or val < 0:
-                return -1
-            return add_type_info(ti_map(key, val))
-        # a generic struct: its emission kind comes from the base name, and
-        # the type arguments do not change it
-        return ir_tid_for_declared_type_name(tn.value)
-    if tn.kind == "tuple_type":
-        mut element_tids: List[Int] := []
-        for element_idx in tn.children:
-            element_tid := ir_declared_type_node_tid(element_idx)
-            if element_tid < 0:
-                return -1
-            element_tids.push(element_tid)
-        return add_type_info(ti_tuple(element_tids))
-    return -1
 
 fn ir_emit_generic_specializations():
     mut i := 0

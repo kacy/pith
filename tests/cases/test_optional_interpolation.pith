@@ -7,11 +7,11 @@
 #
 # the expected output is written by hand: the shape did not compile before.
 #
-# the generic rows stop at `Int?`. a specialization is keyed by emission
-# kind, and every optional is the "tuple" kind, so `describe[Int?]` and
-# `describe[String?]` would share one emitted body and the second would
-# render the first's payload type; that is the kind-key conflation the
-# generic-body work (#927) removes by keying specializations on type ids.
+# the generic rows cover `Int?` and `String?` together. specializations used
+# to be keyed by emission kind, and every optional is the "tuple" kind, so
+# `describe[Int?]` and `describe[String?]` shared one emitted body and the
+# second rendered the first's payload type. keying by the checker's type
+# arguments gives each its own body; the `String?` rows pin that.
 
 fn describe[T](v: T) -> String:
     return "got {v}"
@@ -27,6 +27,8 @@ fn main():
     print("{ok}")
     print(describe(a))
     print(describe(b))
+    print(describe(s))
+    print(describe(t))
     print(describe(7))
     mut n: Int? := 5
     print("{n}!")

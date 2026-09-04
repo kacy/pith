@@ -1,0 +1,44 @@
+# two type-argument lists that share an emission kind must not share a body.
+# every optional lowers to the "tuple" kind, so `show[Int?]` and
+# `show[String?]` used to land on one specialization key: the body was
+# checked and emitted for whichever caller came first, and the other caller
+# read its payload through the wrong type (an integer printed as a string
+# pointer, or the reverse). specializations are keyed by the checker's type
+# arguments now, so each optional gets its own body. the concrete twins
+# (`show_int_opt`, `show_str_opt`) are the control: every generic line must
+# equal the twin line printed after it. a generic that RETURNS its optional
+# `T` (`first_or[T](xs: List[T], fallback: T) -> T` at `Int?`) is a separate
+# defect that predates the keying and lives in tests/pending.
+
+fn show[T](v: T) -> String:
+    return "<{v}>"
+
+fn show_int_opt(v: Int?) -> String:
+    return "<{v}>"
+
+fn show_str_opt(v: String?) -> String:
+    return "<{v}>"
+
+fn tag[T](label: String, v: T) -> String:
+    return label + "=" + show(v)
+
+fn main():
+    a: Int? := 4
+    s: String? := "hi"
+    n: Int? := none
+    t: String? := none
+    print(show(a))
+    print(show_int_opt(a))
+    print(show(s))
+    print(show_str_opt(s))
+    print(show(n))
+    print(show_int_opt(n))
+    print(show(t))
+    print(show_str_opt(t))
+    fresh: String? := "x" + "y"
+    print(show(fresh))
+    print(show_str_opt(fresh))
+    print(tag("a", a))
+    print(tag("s", s))
+    print(tag("n", n))
+    print(tag("t", t))

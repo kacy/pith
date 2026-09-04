@@ -301,8 +301,6 @@ fn ir_in_generic_body() -> Bool:
 # sanitized instance symbol: one map holds the base struct name, the other the
 # instance's concrete type-arg names (joined by chr(1), which never appears in a
 # type name) so the destructor body can substitute them into each field type.
-mut ir_generic_dtor_base: Map[String, String] := {}
-mut ir_generic_dtor_args: Map[String, String] := {}
 # the same idea for generic enums. a generic enum's declaration records its
 # type parameter names as payload kinds, so the shared `__dtor_<enum>` sees
 # no rc payload and is never generated — `Holder[String].Some(s)` freed its
@@ -4568,35 +4566,6 @@ fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node:
         return config_r
     return ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node)
 
-# a construction the checker never gave a type to, recognised by the name it
-# calls. a generic body is not type checked at all, so every expression in one
-# answers TID_ERR — a *positive* type id, not a negative sentinel, which is why
-# the kind test below and not a `tid < 0` test is what has to decide this. the
-# consequence used to be that `Local(label: s)` inside a generic body lowered to
-# the opaque backend constructor, which stores its arguments raw: no retain for
-# the field, no destructor on the instance. the call site still released the
-# temporary it had built for the argument, so the field was left pointing at
-# freed memory. when the callee names a plain struct this program declares, the
-# call is that struct's construction whatever the checker managed to record, and
-# the inline path gives it the retains and the destructor the concrete twin gets.
-# a generic struct stays on the backend path: its field types are type
-# parameters this site cannot resolve into a layout.
-fn ir_untyped_struct_construction(node: Node, callee_name: String) -> Bool:
-    if node.children.len() == 0:
-        return false
-    callee_node := get_node(node.children[0])
-    # the two spellings that name a type: `Local(...)` and `mod.Local(...)`.
-    # anything else is a call through a value and keeps the path it had.
-    mut names_a_type := callee_node.kind == "ident"
-    if callee_node.kind == "field_access" and callee_node.children.len() > 0:
-        recv := get_node(callee_node.children[0])
-        names_a_type = recv.kind == "ident" and ir_module_aliases.contains_key(recv.value)
-    if not names_a_type:
-        return false
-    if not ir_struct_decl_nodes.contains_key(callee_name):
-        return false
-    return not has_generic_declaration(callee_name)
-
 fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     expr_tid := c_get_expr_type(idx)
     mut checked_kind := ""
@@ -4607,7 +4576,7 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     if checked_kind == "struct":
         init_name = get_type_info(expr_tid).name
         init_tid = expr_tid
-    elif not ir_untyped_struct_construction(node, callee_name):
+    else:
         return 0 - 1
     if ir_is_declared_callable(callee_name) or ir_is_sync_primitive_name(callee_name):
         return 0 - 1
@@ -4631,222 +4600,6 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
             continue
         arg_nodes.push(child)
     return ir_emit_struct_positional_init(init_name, arg_nodes, init_tid)
-
-# substitute a base field type name that is a bare generic param (I, T, U) with
-# the instance's concrete type name; anything else passes through unchanged.
-fn ir_subst_generic_field_type(base_ftype: String, params: List[String], arg_names: List[String]) -> String:
-    mut i := 0
-    while i < params.len():
-        if params[i] == base_ftype and i < arg_names.len():
-            return arg_names[i]
-        i = i + 1
-    return base_ftype
-
-# does a generic struct instance have any field that must be released once its
-# type params are substituted in (e.g. `src: I` bound to a struct)?
-fn ir_generic_instance_needs_dtor(base: String, params: List[String], arg_names: List[String]) -> Bool:
-    count := ir_struct_field_count(base)
-    mut i := 0
-    while i < count:
-        fname := ir_struct_field_name_at(base, i)
-        base_ftype := ir_struct_field_type_name(base, fname)
-        if ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names)).len() > 0:
-            return true
-        i = i + 1
-    return false
-
-# a generic struct built inside a generic function lowers to a backend
-# constructor call (`call MapIter struct:MapIter`) which attaches no destructor,
-# because the checker typed the construction as TID_ERR (its params were
-# suppressed). at the specialization site we do know the concrete type args, so
-# resolve them and attach a per-instance destructor to the freshly built struct.
-# a generic struct built by base name (`Wrap(v, ...)` with no explicit `[args]`)
-# lowers to a plain backend `call Wrap` that stores its fields as-is and gets no
-# per-instance destructor. it still keeps only the caller's count for a borrowed
-# rc field arg, so the caller's owned-arg release would free a value the struct
-# still holds. retain each borrowed rc arg here to give the field its own count;
-# the value's own kind classifies it, since the field's declared type is a bare
-# generic param the checker leaves unresolved in a generic body.
-#
-# leaving the instance without a destructor is deliberate, and what its fields
-# hold leaks with it. a generic body takes no count for what it stores — its
-# binds, pushes and field stores are all raw while checked kinds are suppressed
-# — so a payload of this instance may be aliased somewhere longer-lived with no
-# count of its own. a destructor briefly attached here freed those aliases out
-# from under their holders: std.term.app copies each TimerSpec out of a
-# command's list into the engine's own list inside a generic body, that copy
-# rode on the command's count alone, and the command's destructor freed the
-# spec and its closure while the engine still held both — the next timer fire
-# called through freed memory (tests/cases/test_generic_container_share pins
-# the shape). the leak is the pre-existing generic-body behaviour tracked as
-# issue #927; releasing these slots safely needs the stores to retain first.
-fn ir_retain_base_name_construction_fields(node: Node, callee_name: String, arg_regs: List[Int]):
-    if not ir_struct_names.contains_key(callee_name):
-        return
-    if not has_generic_declaration(callee_name):
-        return
-    mut reg_i := 0
-    for child, i in node.children:
-        if i == 0:
-            continue
-        if reg_i >= arg_regs.len():
-            return
-        mut expr_idx := child
-        cn := get_node(child)
-        if cn.kind == "arg":
-            if cn.children.len() == 0:
-                reg_i = reg_i + 1
-                continue
-            expr_idx = cn.children[0]
-        arg_kind := ir_rc_kind(ir_infer_type(expr_idx))
-        if arg_kind.len() > 0 and ir_expr_is_borrowed(expr_idx):
-            ir_rc_retain_reg(arg_regs[reg_i], arg_kind)
-        reg_i = reg_i + 1
-
-# true when a static call is really a generic struct being built through the
-# backend constructor path (`Wrap(...)` or `Wrap[T](...)` whose base names a
-# generic struct). such a call stores every argument into a field, so its
-# arguments follow the container-store transfer rule rather than the
-# owned-argument release rule.
-fn ir_is_generic_struct_construction_call(node: Node) -> Bool:
-    if node.children.len() == 0:
-        return false
-    cn := get_node(node.children[0])
-    mut base := ""
-    if cn.kind == "ident":
-        base = cn.value
-    elif cn.kind == "index" and cn.children.len() >= 2:
-        bn := get_node(cn.children[0])
-        if bn.kind == "ident":
-            base = bn.value
-    if base.len() == 0:
-        return false
-    return ir_struct_names.contains_key(base) and has_generic_declaration(base)
-
-fn ir_attach_generic_construction_dtor(node: Node, ret_type: String, struct_r: Int, arg_regs: List[Int]):
-    # the callee is `Base[args]` — an index node whose base names a generic
-    # struct; that identifies this call as a generic struct construction.
-    callee_node := get_node(node.children[0])
-    if callee_node.kind == "ident":
-        ir_retain_base_name_construction_fields(node, callee_node.value, arg_regs)
-        return
-    if callee_node.kind != "index" or callee_node.children.len() < 2:
-        return
-    base_node := get_node(callee_node.children[0])
-    if base_node.kind != "ident":
-        return
-    base := base_node.value
-    if not ir_struct_names.contains_key(base):
-        return
-    if not has_generic_declaration(base):
-        return
-    arg_names := ir_explicit_generic_concrete_types(callee_node)
-    if arg_names.len() == 0:
-        return
-    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
-    if not ir_generic_instance_needs_dtor(base, params, arg_names):
-        return
-    # the backend stored the field args as-is; a borrowed rc arg (a field
-    # holding another struct/closure passed by value from a local or param)
-    # keeps only its caller's count. the per-instance dtor below releases it,
-    # so retain it here to give the field its own count — otherwise the caller
-    # and the dtor both release the one count and free it twice. a fresh arg
-    # already arrives owned, so is_borrowed gates the retain exactly like the
-    # non-generic ir_emit_struct_positional_init path.
-    ir_retain_generic_construction_fields(node, base, params, arg_names, arg_regs)
-    sym := ir_sanitize_symbol(base + "[" + arg_names.join(",") + "]")
-    ir_generic_dtor_base.insert(sym, base)
-    ir_generic_dtor_args.insert(sym, arg_names.join(chr(1)))
-    fr := ir_reg()
-    ir_emit("funcref " + fr.to_string() + " __dtor_" + sym)
-    ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
-
-# retain each borrowed rc field arg of a backend-constructed generic struct so
-# the field owns its own count, balancing the per-instance destructor's release.
-fn ir_retain_generic_construction_fields(node: Node, base: String, params: List[String], arg_names: List[String], arg_regs: List[Int]):
-    mut reg_i := 0
-    for child, i in node.children:
-        if i == 0:
-            continue
-        if reg_i >= arg_regs.len():
-            return
-        mut expr_idx := child
-        cn := get_node(child)
-        if cn.kind == "arg":
-            if cn.children.len() == 0:
-                reg_i = reg_i + 1
-                continue
-            expr_idx = cn.children[0]
-        field_pos := reg_i
-        if field_pos < ir_struct_field_count(base):
-            fname := ir_struct_field_name_at(base, field_pos)
-            base_ftype := ir_struct_field_type_name(base, fname)
-            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
-            if fkind.len() > 0 and ir_expr_is_borrowed(expr_idx):
-                ir_rc_retain_reg(arg_regs[reg_i], fkind)
-        reg_i = reg_i + 1
-
-# one destructor per generic struct instance that was constructed via a backend
-# constructor call, emitted after the body so every construction site recorded
-# its instance. resolves each field type with the instance's args before
-# deciding whether to release it. `trace` emits the tracer twin instead: the
-# same substituted field walk, visiting traceable children rather than
-# releasing them, and only for the instances that have one.
-fn ir_emit_generic_instance_walks(trace: Bool):
-    for sym in ir_generic_dtor_base.keys():
-        if trace:
-            if not ir_generic_instance_needs_tracer(sym):
-                continue
-        base := ir_generic_dtor_base[sym]
-        arg_names := ir_generic_instance_arg_names(sym)
-        params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
-        pr := ir_emit_rc_walk_header(ir_rc_walk_prefix(trace) + sym)
-        count := ir_struct_field_count(base)
-        mut i := 0
-        while i < count:
-            fname := ir_struct_field_name_at(base, i)
-            base_ftype := ir_struct_field_type_name(base, fname)
-            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
-            mut walk_slot := ir_rc_walk_covers(fkind, trace)
-            # a weak field holds no strong count, so it is not an edge of the
-            # ownership graph the collector trial-deletes; the destructor
-            # still releases the slot.
-            if trace and ir_struct_field_is_weak(base, fname):
-                walk_slot = false
-            if walk_slot:
-                fr := ir_reg()
-                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
-                ir_rc_walk_slot(fr, fkind, trace)
-            i = i + 1
-        ir_emit_zero_ret_endfunc()
-
-# the generic parameter names and substituted argument names for a recorded
-# generic instance destructor, packed as (params, arg_names) lookups shared
-# by the instance tracer emitter and its needs test.
-fn ir_generic_instance_arg_names(sym: String) -> List[String]:
-    mut arg_names: List[String] := []
-    args_str := ir_generic_dtor_args[sym]
-    if args_str.len() > 0:
-        arg_names = args_str.split(chr(1))
-    return arg_names
-
-# true when a generic instance destructor has a traceable field once the
-# instance's type arguments are substituted in — the per-instance answer to
-# ir_struct_needs_tracer. weak fields are skipped like everywhere else.
-fn ir_generic_instance_needs_tracer(sym: String) -> Bool:
-    base := ir_generic_dtor_base[sym]
-    arg_names := ir_generic_instance_arg_names(sym)
-    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
-    count := ir_struct_field_count(base)
-    mut i := 0
-    while i < count:
-        fname := ir_struct_field_name_at(base, i)
-        base_ftype := ir_struct_field_type_name(base, fname)
-        fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
-        if not ir_struct_field_is_weak(base, fname) and ir_trace_kind_enabled(fkind):
-            return true
-        i = i + 1
-    return false
 
 fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
     if not ir_is_generic_function_name(callee.name):
@@ -5018,16 +4771,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         free_opt_kind := ir_runtime_opt_producer_payload_kind(callee.name, "")
         if free_opt_kind.len() > 0:
             ir_emit_optional_attach_dtor(r, free_opt_kind)
-    # a generic struct built here (backend constructor call) gets no destructor
-    # from the backend; attach a per-instance one so its rc fields release
-    ir_attach_generic_construction_dtor(node, ret_type, r, arg_regs)
-    # a generic construction stores every argument into a field: a borrowed one
-    # is retained above, a fresh one transfers its count. either way the count
-    # now belongs to the struct, so the caller must not also release it here —
-    # that is the container-store transfer rule (docs/ownership.md) applied to a
-    # backend struct build. ordinary calls still release their owned arguments.
-    if not ir_is_generic_struct_construction_call(node):
-        ir_release_owned_args(node, 1, arg_regs)
+    ir_release_owned_args(node, 1, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         if ret_type != "float" and idx == ir_rcall_defer_idx:
             return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
@@ -6665,15 +6409,6 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
             if alias_expr_info.kind == "struct" and alias_expr_info.name == call_name:
                 builds_struct = true
                 ctor_tid = alias_expr_tid
-        # inside a generic body nothing is type checked, so the test above sees
-        # the TID_ERR sentinel — a positive id whose kind is "primitive" — and
-        # the construction fell through to the backend constructor and had its
-        # owned argument released out from under it. the member names a plain
-        # struct this program declares, which settles what the call is without
-        # the checker; ir_untyped_struct_construction reads the same way for the
-        # same-module spelling.
-        if not builds_struct and ir_struct_decl_nodes.contains_key(call_name) and not has_generic_declaration(call_name):
-            builds_struct = true
         if builds_struct:
             mut ctor_args: List[Int] := []
             for child, ci in node.children:
@@ -11399,10 +11134,6 @@ fn ir_emit_cc_register_tracers():
         if not ir_tuple_sig_has_trace(sig):
             continue
         ir_emit_cc_register_pair(ir_tuple_dtor_name(sig), ir_tuple_tracer_name(sig))
-    for sym in ir_generic_dtor_base.keys():
-        if not ir_generic_instance_needs_tracer(sym):
-            continue
-        ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     for sym in ir_generic_struct_dtor_base.keys():
         if not ir_generic_struct_instance_needs_tracer(sym):
             continue
@@ -11410,8 +11141,6 @@ fn ir_emit_cc_register_tracers():
     ir_emit_zero_ret_endfunc()
 
 fn ir_emit_root_module(root_idx: Int, root: Node):
-    ir_generic_dtor_base = {}
-    ir_generic_dtor_args = {}
     ir_generic_enum_dtor_base = {}
     ir_generic_enum_dtor_kinds = {}
     ir_generic_struct_dtor_base = {}
@@ -11436,8 +11165,6 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # per-instance destructors for generic structs built via a backend
     # constructor call: emitted after the specializations, since those bodies
     # are where such constructions (and their attaches) are recorded.
-    ir_emit_generic_instance_walks(false)
-    ir_emit_generic_instance_walks(true)
     ir_emit_generic_enum_instance_dtors()
     ir_emit_generic_enum_instance_tracers()
     ir_append_lambda_bodies()

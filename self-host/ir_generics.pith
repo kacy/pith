@@ -2,7 +2,8 @@
 
 from ast import get_node, Node
 from ir_names import ir_import_target_name
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_result_type_kind
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_result_type_kind, ir_type_from_tid
+from types import get_type_info, get_type_name
 from ir_method_tables import ir_func_returns
 from ir_utils import ir_push_string
 
@@ -262,12 +263,23 @@ pub fn ir_is_generic_method_name(name: String) -> Bool:
 pub fn ir_generic_preferred_name(preferred: String, fallback: String) -> String:
     return ir_generic_preferred_name_with_state(preferred, fallback, ir_generic_decl_indices)
 
+## every specialization symbol emitted so far, mapped to the key that first
+## requested it. a body can be requested by the checker's type arguments
+## (ir_queue_generic_specialization_for_tids) and, from a site that has no
+## call node such as a decode target, by emission kinds; for primitives,
+## structs and enums both spell the same symbol, and without this map the
+## drain emitted that function twice.
+pub mut ir_generic_specialization_by_symbol: Map[String, String] := {}
+
 ## request a specialization; names it and records its types once.
 pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], ret_type: String) -> String:
     key := ir_generic_specialization_key(name, arg_types)
     if ir_generic_specialization_names.contains_key(key):
         return ir_generic_specialization_names[key]
     spec_name := ir_generic_specialization_name(name, arg_types)
+    if ir_generic_specialization_by_symbol.contains_key(spec_name):
+        return spec_name
+    ir_generic_specialization_by_symbol.insert(spec_name, key)
     ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
     ir_generic_specialization_names.insert(key, spec_name)
     ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
@@ -277,14 +289,97 @@ pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], re
 ## the checker's type arguments for each specialization key, comma-encoded:
 ## the tids `T`, `U`, ... take in that specialization, as the checker settled
 ## them at the call node that first asked for it (c_generic_call_subst).
-## these are type-parameter tids, not argument tids, and they come from the
-## checker rather than from c_get_expr_type on the arguments — which inside
-## an unchecked body answers the error type — so a specialization first
-## requested from another generic body still records real types. the emitter
-## hands them to c_check_specialization just before it emits the body.
-## first record per key wins: two tid lists can share one emission-kind key
-## (`Int?` and `String?` are both "tuple"), and the body is emitted once.
+## these are type-parameter tids, not argument tids. a tid-keyed request
+## records them at queue time; a request that fell back to the emitter's
+## inference records them per emission-kind key, first record wins. the
+## emitter hands them to c_check_specialization just before it emits the
+## body.
 pub mut ir_generic_specialization_subst_tids: Map[String, String] := {}
+
+## the symbol spelling of one type argument. primitives, structs and enums
+## keep the emission kind that named specializations before (`int`,
+## `string`, `Holder`), so their symbols do not move; a composite spells its
+## structure, because the emission kind collapses every optional and result
+## to "tuple" and every list to "list", and two type-argument lists that
+## differ only there must not share a body. two type ids with the same
+## spelling denote the same type (optional and tuple types are not interned),
+## so the spelling is also the dedupe identity. a kind the map does not
+## cover carries its type id, which keeps distinct types distinct.
+pub fn ir_tid_symbol_spelling(tid: Int) -> String:
+    if tid < 0:
+        return "unknown"
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        return "opt_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "result":
+        if info.value_type >= 0:
+            return "res_" + ir_tid_symbol_spelling(info.inner) + "_" + ir_tid_symbol_spelling(info.value_type)
+        return "res_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "tuple":
+        mut parts: List[String] := []
+        for element in info.elements:
+            parts.push(ir_tid_symbol_spelling(element))
+        return "tup_" + parts.join("_") + "_end"
+    if info.kind == "list":
+        return "list_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "set":
+        return "set_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "map":
+        return "map_" + ir_tid_symbol_spelling(info.key_type) + "_" + ir_tid_symbol_spelling(info.value_type)
+    if info.kind == "task":
+        return "task_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "channel":
+        return "chan_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "function":
+        mut parts: List[String] := []
+        for param in info.param_types:
+            parts.push(ir_tid_symbol_spelling(param))
+        return "fn_" + parts.join("_") + "_r_" + ir_tid_symbol_spelling(info.return_type)
+    # an enum spells its name even when it lowers to an int (no payload
+    # variant): two enums are two types, and each module emits the
+    # specializations its own code requests, so a shared spelling would put
+    # the same symbol into two module sections.
+    if info.kind == "enum":
+        return ir_sanitize_symbol_part(info.name)
+    kind := ir_type_from_tid(tid)
+    if kind.len() > 0:
+        return ir_sanitize_symbol_part(kind)
+    return ir_sanitize_symbol_part(get_type_name(tid)) + "_t" + tid.to_string()
+
+## how many queue requests fell back to the emitter's own inference because
+## the checker recorded no type arguments at the call. read by the driver
+## under PITH_SPEC_FALLBACKS to measure whether the inference is still needed.
+pub mut ir_generic_queue_fallbacks := 0
+
+## request a specialization by the checker's type arguments: the key and the
+## symbol come from the spellings, the emission kinds for the substitution
+## from the type ids, and the ids themselves are recorded for the re-check
+## the emitter runs before the body is emitted.
+pub fn ir_queue_generic_specialization_for_tids(name: String, tids: List[Int], ret_type: String) -> String:
+    mut spellings: List[String] := []
+    mut kinds: List[String] := []
+    for tid in tids:
+        spellings.push(ir_tid_symbol_spelling(tid))
+        mut kind := ir_type_from_tid(tid)
+        if kind.len() == 0:
+            kind = "unknown"
+        kinds.push(kind)
+    key := name + chr(9) + "tids" + chr(9) + spellings.join(chr(9))
+    if ir_generic_specialization_names.contains_key(key):
+        return ir_generic_specialization_names[key]
+    spec_name := name + "__" + spellings.join("_")
+    if ir_generic_specialization_by_symbol.contains_key(spec_name):
+        return spec_name
+    ir_generic_specialization_by_symbol.insert(spec_name, key)
+    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
+    ir_generic_specialization_names.insert(key, spec_name)
+    ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(kinds))
+    mut parts: List[String] := []
+    for tid in tids:
+        parts.push(tid.to_string())
+    ir_generic_specialization_subst_tids.insert(key, parts.join(","))
+    ir_func_returns.insert(spec_name, ret_type)
+    return spec_name
 
 ## record the checker's type arguments for a spec key. an empty list (the
 ## checker recorded nothing at this call) records nothing.

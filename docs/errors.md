@@ -152,7 +152,8 @@ error[E209]: field 'z' not found on type 'Point'
 a field access or struct constructor was used on a non-struct type. the same
 code reports an explicit type argument that is not a type at all, such as
 `Channel[1](2)` or `Holder[f()]()`; a type written in expression position may
-be a name, a parameterized type, an optional or a tuple of those.
+be a name, a parameterized type, an optional, a tuple of those, or an
+associated type of a type parameter (`engine[A.Msg]()`).
 
 ### E211 — not an enum type
 
@@ -614,9 +615,9 @@ asks for (see docs/generics.md). a generic that calls itself at a larger type
 error[E267]: 'grow' is instantiated at more than 64 distinct type sets; a generic that calls itself at a larger type never stops
 ```
 
-only reported while generic bodies are being checked (`PITH_CHECK_GENERIC_BODIES`
-is `count` or `on`); with the check off the declaration is left unchecked, as
-every generic body was before.
+not reported when the check is switched off (`PITH_CHECK_GENERIC_BODIES=off`
+or `silent`); the declaration is then left unchecked past the cap, as every
+generic body was before the check existed.
 
 before globals were given a storage namespace of their own, this compiled and
 miscompiled: the binding wrote the GLOBAL's slot, so the local and the global

@@ -1,0 +1,42 @@
+# a generic body that is valid at every type the program uses it at is
+# checked at each of them and reports nothing: no false positive on a body
+# that only compiles because of its concrete types, and no duplicate report.
+# this program compiles clean with the generic-body check on and prints what
+# it always printed.
+
+struct Pair[T]:
+    pub left: T
+    pub right: T
+
+impl Pair:
+    fn swapped() -> Pair[T]:
+        return Pair(left: self.right, right: self.left)
+
+fn describe[T](xs: List[T], tag: String) -> String:
+    mut out := tag + ":"
+    for x in xs:
+        out = out + " {x}"
+    return out + " (" + xs.len().to_string() + ")"
+
+fn largest[T](xs: List[T], fallback: T) -> T:
+    if xs.len() == 0:
+        return fallback
+    mut best := xs[0]
+    for x in xs:
+        if x > best:
+            best = x
+    return best
+
+fn main():
+    print(describe([3, 1, 2], "ints"))
+    print(describe(["b", "a"], "strs"))
+    print(describe([true], "bools"))
+    print("{largest([3, 9, 4], 0)}")
+    print(largest(["pear", "apple"], ""))
+    empty: List[Int] := []
+    print("{largest(empty, 7)}")
+    p := Pair(left: 1, right: 2)
+    q := p.swapped()
+    print("{q.left} {q.right}")
+    s := Pair(left: "x", right: "y").swapped()
+    print(s.left + s.right)

@@ -1,0 +1,12 @@
+# a generic that calls itself at a larger type asks for `T`, then `List[T]`,
+# then `List[List[T]]`, without end. the checker stops queueing the
+# declaration after 64 distinct type sets and reports E267 once, rather than
+# walking forever.
+
+fn grow[T](x: T, depth: Int) -> Int:
+    if depth == 0:
+        return 0
+    return 1 + grow([x], depth - 1)
+
+fn main():
+    print("{grow(1, 3)}")

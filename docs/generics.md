@@ -64,15 +64,14 @@ check run.
 | `count` | faults are recorded as warnings, so `pith check` prints them and exits 0 |
 | `on` | faults are recorded as errors |
 
-The default is `silent`: the pass runs in every build, so a generic struct
-instance first made inside a generic body is registered before any emission
-starts and the emitter finds the call-site type arguments recorded, but
-nothing is reported while the corpus is being surveyed for faults inside
-bodies that were never checked before. `tooling/generic_body_dryrun.sh` runs
-the checker in `count` mode over `tests/cases`, `examples`, `std` and
-`self-host` and tallies what it finds by code and by file; each finding is
-either a real fault to fix or a check that assumed a concrete declaration site
-and needs adjusting before the default moves to `on`.
+The default is `on`: a fault inside a generic body is an error. The pass ran
+silently for a while so the corpus could be surveyed for faults inside bodies
+that nothing had ever checked; the survey's findings were settled and it reads
+zero, so the reports are on. `tooling/generic_body_dryrun.sh` still runs the
+checker in `count` mode over `tests/cases`, `examples`, `std` and `self-host`
+and tallies what it finds by code and by file, which is how a large body of
+new code is surveyed before its faults become errors. `silent` keeps the walk
+(the emitter still needs it) and drops the reports for one run.
 
 ## what the emitter reads
 

@@ -1,0 +1,67 @@
+# a generic that hands back its `T` unchanged returns the value as it is when
+# `T` is an optional. the specialization's return type is written as the bare
+# parameter (`-> T`), whose substituted kind is "tuple", and the return path
+# used to read that kind as a result and box the optional a second time: at
+# `T = Int?` the caller then read the inner shell's address as the payload
+# (a pointer where `7` belongs) and at `T = String?` an empty string. the
+# concrete twins (`first_or_int_opt`, `first_or_str_opt`) are the control:
+# every generic line must equal the twin line after it. the method form does
+# the same through a generic struct's own type parameter.
+fn first_or[T](xs: List[T], fallback: T) -> T:
+    if xs.len() > 0:
+        return xs[0]
+    return fallback
+
+fn first_or_int_opt(xs: List[Int?], fallback: Int?) -> Int?:
+    if xs.len() > 0:
+        return xs[0]
+    return fallback
+
+fn first_or_str_opt(xs: List[String?], fallback: String?) -> String?:
+    if xs.len() > 0:
+        return xs[0]
+    return fallback
+
+fn passthrough[T](v: T) -> T:
+    return v
+
+struct Slot[T]:
+    pub item: T
+
+impl Slot:
+    fn get() -> T:
+        return self.item
+
+struct SlotIntOpt:
+    pub item: Int?
+
+impl SlotIntOpt:
+    fn get() -> Int?:
+        return self.item
+
+fn main():
+    a: Int? := 4
+    s: String? := "hi"
+    n: Int? := none
+    t: String? := none
+    ints: List[Int?] := [7, none]
+    strs: List[String?] := ["x" + "y", none]
+    print("{first_or(ints, n)}")
+    print("{first_or_int_opt(ints, n)}")
+    print("{first_or(strs, t)}")
+    print("{first_or_str_opt(strs, t)}")
+    empty_ints: List[Int?] := []
+    empty_strs: List[String?] := []
+    print("{first_or(empty_ints, a)}")
+    print("{first_or_int_opt(empty_ints, a)}")
+    print("{first_or(empty_strs, s)}")
+    print("{first_or_str_opt(empty_strs, s)}")
+    print("{passthrough(a)}")
+    print("{passthrough(s)}")
+    print("{passthrough(n)}")
+    slot := Slot(item: a)
+    print("{slot.get()}")
+    twin := SlotIntOpt(item: a)
+    print("{twin.get()}")
+    empty := Slot(item: n)
+    print("{empty.get()}")

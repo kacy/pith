@@ -9184,6 +9184,28 @@ fn ir_generic_kinds_from_subst(idx: Int) -> List[String]:
         kinds.push(kind)
     return kinds
 
+# the payload kind of a specialization's return when the declaration writes
+# the return type as a bare type parameter (`-> T`) and the type argument for
+# that parameter is an optional; "" otherwise. the written-`T?` extractor
+# cannot see this case, and without it the return path reads the substituted
+# "tuple" kind as a result and boxes the optional a second time (#1042).
+fn ir_optional_inner_kind_of_param_return(decl_idx: Int, generic_params: List[String], tids: List[Int]) -> String:
+    decl := get_node(decl_idx)
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "returns" and cn.children.len() > 0:
+            rn := get_node(cn.children[0])
+            if rn.kind != "type":
+                return ""
+            for gp, i in generic_params:
+                if gp == rn.value and i < tids.len() and tids[i] >= 0:
+                    info := get_type_info(tids[i])
+                    if info.kind == "optional":
+                        return ir_type_from_tid(info.inner)
+                    return ""
+            return ""
+    return ""
+
 # queue the specialization one generic call asks for. the checker recorded
 # the type arguments it settled at this call node (c_generic_call_subst), and
 # when it did, and every one of them is a real type, they are the request:
@@ -9303,7 +9325,18 @@ fn ir_emit_generic_specialization(key: String):
     else:
         ir_active_generic_module_path = ""
     ir_prepare_func_emission(ret_type)
+    # a return type written as the bare parameter (`-> T`) is an optional
+    # whenever the type argument is one, and the return path must then forward
+    # the value instead of boxing it: the substituted kind is "tuple", which
+    # the return path otherwise reads as a result and wraps as an ok box (a
+    # second shell around the optional, #1042). the written-`T?` extractor
+    # below answers nothing for it, so the type argument answers instead.
+    mut param_return_inner := ""
+    if spec_tids.len() == generic_params.len():
+        param_return_inner = ir_optional_inner_kind_of_param_return(decl_idx, generic_params, spec_tids)
     ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
+    if ir_current_func_optional_inner_kind.len() == 0:
+        ir_current_func_optional_inner_kind = param_return_inner
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
     if owner_type.len() > 0:
         ir_current_impl_type = owner_type

@@ -88,11 +88,17 @@ checker recorded at the call that first asked for the specialization
 specialization record when it queues the body, since the call's own entry is
 overwritten by later checks of the same node.
 
-Two specializations can share one emitted body: specializations are keyed by
-emission kind, and every optional is the "tuple" kind, so `first[Int?]` and
-`first[String?]` land on one key and the body is checked and emitted for the
-first caller's types. Keying specializations on type ids is the follow-up that
-separates them.
+A specialization is keyed by those recorded type arguments, and its symbol is
+spelled from them: a primitive, struct or enum spells as its emission kind
+(`first__int`, `nothing__CounterMsg`), a composite spells its structure
+(`first__opt_int`, `first__opt_string`, `walk__list_int`), so two type-argument
+lists that share an emission kind get two bodies. Two type ids with the same
+spelling denote the same type, which is what dedupes them, since optional and
+tuple types are not interned. The record exists for every generic call the
+checker resolves, including a bare call to a generic imported by name and the
+builtin spelling of `assert_eq`; the emitter has no type inference of its own.
+A request that arrives with no call node (a json or config decode target) is
+still keyed by emission kinds, and a body requested both ways is emitted once.
 
 ## a generic that never stops
 

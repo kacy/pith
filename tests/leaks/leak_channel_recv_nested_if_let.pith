@@ -1,0 +1,28 @@
+# a channel receive over an optional payload, bound to a local and then
+# opened with two nested `if let`s. the received shell and everything under
+# it were stranded (issue #1025: 46 mb to 178 mb at 200k vs 800k rounds)
+# while the same receive opened by one `if let`, or by two nested `if let`s
+# straight off the call, was flat. the stage-5 ownership work fixed it on the
+# way; this pins it. the payload's text varies per round so a retained copy
+# cannot hide behind the string table.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    c := Channel[(Int, String)?](8)
+    c.send((i, probe.fresh_string(i)))
+    got := c.recv()
+    mut seen := 0
+    if let inner = got:
+        if let p = inner:
+            seen = seen + p.0
+    return seen
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

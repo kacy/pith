@@ -60,18 +60,11 @@ pub(crate) fn set_nonblocking(fd: RawFd) {
 /// way: at this length a wait and a wait that never ends are the same wait.
 const MAX_WAIT_MS: i64 = i32::MAX as i64;
 
-/// poll a single fd until it is ready, times out, or errors. the blocking wait
+/// poll a single fd until it is ready, times out, or errors: the blocking wait
 /// every non-green caller uses, and the whole story on platforms without the
-/// epoll reactor (see `netpoll_fallback`).
-pub(crate) fn poll_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
-    if fd <= 0 {
-        return -1;
-    }
-    poll_wait_any_fd(fd, events, timeout_ms)
-}
-
-/// `poll_wait` for any non-negative fd, including 0. same body, minus the
-/// no-handle guard; see `wait_ready_unguarded` for why the split exists.
+/// epoll reactor (see `netpoll_fallback`). accepts any non-negative fd,
+/// including 0; see `wait_ready_unguarded` for why the guarded and unguarded
+/// waits are split.
 fn poll_wait_any_fd(fd: i64, events: i16, timeout_ms: i64) -> i64 {
     if fd < 0 {
         return -1;

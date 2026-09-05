@@ -14,10 +14,8 @@ pub(crate) fn plausibly_aligned<T>(ptr: *const ()) -> bool {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum HandleKind {
     AtomicInt,
-    Channel,
     List,
     Map,
-    Mutex,
     Process,
     ProcessOutput,
     Semaphore,

@@ -12,9 +12,9 @@ differently, and, for a leak, the growth measured across the two round counts
 environment to pick one shape, so a fix can be checked one row at a time:
 
 ```
-pith build tests/pending/optional_value_extraction.pith
-SHAPE=1 PITH_LEAK_ROUNDS=200000 ./tests/pending/optional_value_extraction
-SHAPE=1 PITH_LEAK_ROUNDS=800000 ./tests/pending/optional_value_extraction
+pith build tests/pending/<reproducer>.pith
+SHAPE=1 PITH_LEAK_ROUNDS=200000 ./tests/pending/<reproducer>
+SHAPE=1 PITH_LEAK_ROUNDS=800000 ./tests/pending/<reproducer>
 ```
 
 When the underlying defect is fixed, a leak reproducer moves to `tests/leaks/`

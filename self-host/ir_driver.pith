@@ -62,6 +62,35 @@ fn remove_main_from_import_lines(lines: List[String]) -> List[String]:
             out.push(line)
     return out
 
+# one body per function name in the combined file. two module sections can
+# both emit the same body: std/io's conformance idiom declares a method in
+# the inherent impl and again in the interface impl, and a generic
+# specialization requested by two modules is drained by each. the consumer
+# compiles the first definition it meets and skips the rest, so keeping the
+# first and dropping later copies changes nothing that runs and removes the
+# dead text (#1043). a copy that differs from the first would be a fault the
+# checker should have reported (E263); here it is simply the loser, as it
+# was in the consumer.
+fn drop_repeated_function_bodies(lines: List[String]) -> List[String]:
+    mut out: List[String] := []
+    mut seen: Map[String, Bool] := {}
+    mut skipping := false
+    for line in lines:
+        if skipping:
+            if line.trim() == "endfunc":
+                skipping = false
+            continue
+        if line.starts_with("func "):
+            name_start := 5
+            name_end := next_space(line, name_start)
+            name := line.substring(name_start, name_end)
+            if seen.contains_key(name):
+                skipping = true
+                continue
+            seen.insert(name, true)
+        out.push(line)
+    return out
+
 fn collect_declared_ir_names_from_lines(lines: List[String], prefix: String, init_prefix: String) -> DeclaredIrNames:
     mut global_set: Map[String, Bool] := {}
     mut function_set: Map[String, Bool] := {}
@@ -285,6 +314,12 @@ fn validate_declared_func_retkind(line_no: Int, parts: List[String], struct_name
     retkind := parts[3]
     if is_bare_declared_retkind(retkind, struct_names):
         ir_contract_error(line_no, "bare or unknown function retkind '" + retkind + "'")
+    # one definition per name. the consumer compiles the first body it meets
+    # and skips the rest, so a second definition is dead text at best and a
+    # silently ignored body at worst; the combine step drops repeats before
+    # the file gets here, and a repeat that reaches this check is a fault.
+    if func_kinds.contains_key(parts[1]):
+        ir_contract_error(line_no, "function '" + parts[1] + "' is defined more than once")
     func_kinds.insert(parts[1], retkind)
 
 fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[String, Bool]):
@@ -512,7 +547,7 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
     main_ir = rewrite_main_ir(main_ir, imported_init_funcs)
     all_ir.push(main_ir)
 
-    combined_ir := all_ir.join(chr(10) + chr(10))
+    combined_ir := drop_repeated_function_bodies(ir_lines(all_ir.join(chr(10) + chr(10)))).join(chr(10))
     if validate_combined:
         validate_combined_ir_contract(combined_ir)
     print(combined_ir)

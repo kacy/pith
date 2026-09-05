@@ -202,14 +202,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   is correct. it is a wrong answer rather than a diagnostic, and it affects
   binds, both construction spellings, field and index and plain assignment,
   collection elements, map entries and arguments (issue #970).
-- **two specializations can share one emitted body** — a specialization is
-  keyed by emission kind, and every optional is the "tuple" kind, so
-  `first[Int?]` and `first[String?]` land on one key and the body is checked
-  and emitted for the first caller's types. a body whose emission would
-  differ between the two is wrong for the second. keying specializations on
-  type ids is the follow-up under issue #927 that separates them.
+- **a generic body the program never instantiates is never checked** — each
+  specialization is type checked against its concrete types and keyed by them
+  (`first[Int?]` and `first[String?]` are two bodies, docs/generics.md), so a
+  fault in a body shows only at the types the program uses; a body valid at
+  `Int` but not at every type its bound admits is not reported until a caller
+  reaches the failing type. `pith check` reports what it does find with the
+  specialization named (`... in first[String]`).
 
-  a generic body is otherwise typed against each set of concrete types just
+  a generic body is typed against each set of concrete types just
   before it is emitted (docs/generics.md) and tracks its locals like a
   concrete body: the escapes an earlier version of this entry listed as
   leaking one count per call — a local stored into a struct, a map, a set, a

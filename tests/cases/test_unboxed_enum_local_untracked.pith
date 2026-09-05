@@ -1,0 +1,53 @@
+# an enum with no payload variant lowers to a plain integer tag. a local
+# bound from a call that returns one used to be classified as an rc struct
+# by the bind prepass, because every enum is registered beside the structs
+# and the kind lookup went by name: the emitter then retained and released
+# an integer, harmlessly only because the runtime magic-checks what it is
+# handed. the boxed twin (`Shape`, which carries a payload) is a real heap
+# value and keeps its counts. the output is the same before and after the
+# fix; the IR is what changes (no `_retain`/`_release` on `dir` locals), and
+# the corpus comparison in the fixing PR lists it.
+enum Dir:
+    North
+    South
+
+enum Shape:
+    Dot
+    Circle(Int)
+
+fn pick(flag: Bool) -> Dir:
+    if flag:
+        return Dir.North
+    return Dir.South
+
+fn draw(flag: Bool) -> Shape:
+    if flag:
+        return Shape.Circle(3)
+    return Shape.Dot
+
+fn name(d: Dir) -> String:
+    out := match d:
+        Dir.North => "north"
+        Dir.South => "south"
+    return out
+
+fn describe(s: Shape) -> String:
+    out := match s:
+        Shape.Circle(r) => "circle {r}"
+        Shape.Dot => "dot"
+    return out
+
+fn main():
+    d := pick(true)
+    print(name(d))
+    e := pick(false)
+    print(name(e))
+    print("{d == Dir.North}")
+    print("{d == e}")
+    mut again := pick(false)
+    again = pick(true)
+    print(name(again))
+    s := draw(true)
+    print(describe(s))
+    t := draw(false)
+    print(describe(t))

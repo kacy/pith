@@ -28,6 +28,21 @@ pub fn ir_struct_base_name(sname: String) -> String:
         return sname.substring(0, bracket)
     return sname
 
+## whether a type hint names an enum that lowers to a plain integer (no
+## payload variant). accepts the bare name, the module-qualified name and
+## the `struct:` emission hint, with or without type arguments.
+pub fn ir_unboxed_enum_hint(type_hint: String) -> Bool:
+    mut name := type_hint
+    if name.starts_with("struct:"):
+        name = name.substring(7, name.len())
+    name = ir_struct_base_name(name)
+    dotted := name.last_index_of(".")
+    if dotted >= 0:
+        name = name.substring(dotted + 1, name.len())
+    if name.len() == 0:
+        return false
+    return ir_enum_variant_lists.contains_key(name) and not ir_boxed_enums.contains_key(name)
+
 ## the reference-counting kind for an emission type hint, or ""
 ## for kinds that never own heap memory.
 pub fn ir_rc_kind(type_hint: String) -> String:
@@ -56,6 +71,14 @@ pub fn ir_rc_kind(type_hint: String) -> String:
     # the last count, and types with rc fields additionally run their
     # generated destructor. checked types carry the bare name; emission
     # hints carry the struct: prefix.
+    # an enum with no payload variant lowers to a plain integer tag: nothing
+    # is allocated, so nothing is counted. every enum is registered in
+    # ir_struct_names (the boxed ones share the struct layout), so the name
+    # alone would classify the integer as a struct and the prepass would
+    # retain and release it as one (#1038). the boxed set is the arbiter, for
+    # the bare name, the module-qualified name and the `struct:` hint alike.
+    if ir_unboxed_enum_hint(type_hint):
+        return ""
     if type_hint.starts_with("struct:"):
         return "struct"
     base := ir_struct_base_name(type_hint)

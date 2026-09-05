@@ -28,23 +28,23 @@ struct DeclaredIrNames:
 fn usage():
     print("usage: ir_driver [--combined] [--tests] [--validate] <file.pith>")
 
-fn line_end(text: String, start: Int) -> Int:
-    mut end := start
-    while end < text.len():
-        if text[end] == chr(10):
-            return end
-        end = end + 1
-    return text.len()
-
+# split IR text into lines, keeping empty ones. the combined IR of a program
+# that links the http stack is several megabytes, and this runs over all of it
+# more than once, so it scans newline bytes as integers. the earlier form
+# compared `text[end] == chr(10)`, which builds two one-character strings per
+# character; each pass cost about four billion instructions on such a program.
 fn ir_lines(text: String) -> List[String]:
+    raw := bytes_from_string_utf8(text)
+    n := raw.len()
     mut lines: List[String] := []
     mut start := 0
-    while start <= text.len():
-        end := line_end(text, start)
-        lines.push(text.substring(start, end))
-        if end >= text.len():
-            break
-        start = end + 1
+    mut i := 0
+    while i < n:
+        if raw[i] == 10:
+            lines.push(text.substring(start, i))
+            start = i + 1
+        i = i + 1
+    lines.push(text.substring(start, n))
     return lines
 
 fn remove_main_from_import_lines(lines: List[String]) -> List[String]:

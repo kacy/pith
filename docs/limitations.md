@@ -193,15 +193,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   the built-in assertions work inside a closure body too: they are lowered by
   name at the call site, so the body has no variable to capture, and a local
   of the same name still shadows them.
-- **an optional over a tuple is built wrong everywhere except a return** —
-  `o: (Int, String)? := (5, "d")` stores the payload where the shell belongs, so
-  reading `o` back gives whatever sits in the shell's own slots rather than the
-  pair that went in. an optional lowers to the same tuple-shaped allocation a
-  tuple literal produces, so the wrap sites cannot tell a tuple payload from an
-  already-built shell; the return position consults the target's inner type and
-  is correct. it is a wrong answer rather than a diagnostic, and it affects
-  binds, both construction spellings, field and index and plain assignment,
-  collection elements, map entries and arguments (issue #970).
 - **a generic body the program never instantiates is never checked** — each
   specialization is type checked against its concrete types and keyed by them
   (`first[Int?]` and `first[String?]` are two bodies, docs/generics.md), so a

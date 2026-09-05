@@ -1,0 +1,93 @@
+# optionals over tuple-shaped payloads handed back by a return. the return
+# path used to build a borrowing shell for a tuple payload, so `if let` straight
+# off the call freed the shell and stranded the tuple (#1052), and a `(A, B)?`
+# local returned where `((A, B)?)?` was declared was forwarded without its
+# second shell, so the caller's second `if let` read the tuple's first field as
+# the tag and its string pointer as the payload (#1051). the same name bound at
+# two optional depths in one function took one release lowering for both
+# (#1053). every row prints the values it reads back; the expected file was
+# derived from the annotated twins beside them, and on the compiler before the
+# fix the double-optional rows print garbage. runs under valgrind with the
+# freelist off (MEMCHECK_CASES).
+
+fn fresh(i: Int) -> (Int, String)?:
+    return (i, "m{i}")
+
+fn via_local(i: Int) -> (Int, String)?:
+    t := (i, "v{i}")
+    return t
+
+fn doubled(i: Int) -> ((Int, String)?)?:
+    inner: (Int, String)? := (i, "d{i}")
+    return inner
+
+fn doubled_none(i: Int) -> ((Int, String)?)?:
+    inner: (Int, String)? := none
+    if i < 0:
+        return none
+    return inner
+
+fn int_doubled(i: Int) -> (Int?)?:
+    inner: Int? := i
+    return inner
+
+fn wrap[T](x: T) -> T?:
+    return x
+
+fn show_pair(label: String, p: (Int, String)):
+    print("{label} {p.0} {p.1}")
+
+fn rebound(i: Int) -> Int:
+    mut seen := 0
+    got := fresh(i)
+    if let p = got:
+        seen = seen + p.0
+    got2 := doubled(i)
+    if let inner = got2:
+        if let p = inner:
+            seen = seen + p.0
+    return seen
+
+fn main():
+    # a tuple payload opened straight off the call, then through a local
+    if let p = fresh(1):
+        show_pair("direct", p)
+    got := fresh(2)
+    if let p = got:
+        show_pair("local", p)
+    if let p = via_local(3):
+        show_pair("via_local", p)
+    # the annotated twin of the double optional: built at a binding
+    twin_inner: (Int, String)? := (4, "t4")
+    twin: ((Int, String)?)? := twin_inner
+    if let inner = twin:
+        if let p = inner:
+            show_pair("twin", p)
+    # the double optional handed back by a return
+    if let inner = doubled(5):
+        if let p = inner:
+            show_pair("doubled", p)
+    both := doubled(6)
+    if let inner = both:
+        if let p = inner:
+            show_pair("doubled_local", p)
+    # the none paths: an inner none keeps its outer shell, an outer none has none
+    if let inner = doubled_none(7):
+        if inner == none:
+            print("inner none")
+    if doubled_none(-1) == none:
+        print("outer none")
+    # the scalar twin
+    if let inner = int_doubled(8):
+        if let v = inner:
+            print("int_doubled {v}")
+    # a generic T? at an optional and at a tuple argument
+    if let inner = wrap(int_doubled(9)):
+        if let inner2 = inner:
+            if let v = inner2:
+                print("generic_over_optional {v}")
+    if let inner = wrap(fresh(10)):
+        if let p = inner:
+            show_pair("generic_over_tuple_optional", p)
+    # one name bound at two optional depths in one function
+    print("rebound {rebound(11)}")

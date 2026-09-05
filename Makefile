@@ -1177,6 +1177,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_optional_struct_value_release \
+	tests/cases/test_optional_tuple_return_ownership \
 	tests/cases/test_generic_optional_return_passthrough \
 	tests/cases/test_generic_optional_key_split \
 	tests/cases/test_generic_alias_shapes \

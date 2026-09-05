@@ -1,0 +1,57 @@
+# optionals over tuple-shaped payloads handed back by a return, one shape per
+# SHAPE value (tooling/leak_check.sh registers each). the return path used to
+# build a borrowing shell for a tuple payload: `if let` straight off the call
+# released the shell only and stranded the tuple and its string every round
+# (shapes 1 and 3, issue #1052: 21 mb to 78 mb), while the same call bound to a
+# local first was flat because a local goes through the tuple cascade (shape
+# 2). shape 4 is the double optional of #1051, whose payload the fixed return
+# path now wraps and owns. the payload's text varies per round so a retained
+# copy cannot hide behind the string table.
+import leakprobe as probe
+import std.env as env
+
+fn fresh(i: Int) -> (Int, String)?:
+    return (i, probe.fresh_string(i))
+
+fn via_local(i: Int) -> (Int, String)?:
+    t := (i, probe.fresh_string(i))
+    return t
+
+fn doubled(i: Int) -> ((Int, String)?)?:
+    inner: (Int, String)? := (i, probe.fresh_string(i))
+    return inner
+
+fn shape(s: Int, i: Int) -> Int:
+    mut seen := 0
+    if s == 1:
+        if let p = fresh(i):
+            seen = seen + p.0
+        return seen
+    if s == 2:
+        got := fresh(i)
+        if let p = got:
+            seen = seen + p.0
+        return seen
+    if s == 3:
+        if let p = via_local(i):
+            seen = seen + p.0
+        return seen
+    if s == 4:
+        both := doubled(i)
+        if let inner = both:
+            if let p = inner:
+                seen = seen + p.0
+        return seen
+    return 0
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i)
+        i = i + 1
+    want := probe.rounds() * (probe.rounds() - 1) / 2
+    if acc != want:
+        print("WRONG shape {s}: got {acc} want {want}")
+    print("{probe.peak_kb()}")

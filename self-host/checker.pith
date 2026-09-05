@@ -957,7 +957,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                     check_weak_field(fname, ftid)
                 if cn.children.len() > 1:
                     default_tid := c_check_expr(cn.children[1], current_scope)
-                    if value_matches_optional_target(cn.children[1], default_tid, ftid):
+                    if optional_target_accepts_value(cn.children[1], default_tid, ftid):
                         struct_field_default_nodes.insert(base_name + "." + fname, cn.children[1])
                     elif is_error_type(default_tid) == false and default_tid != ftid:
                         if types_structurally_equal(default_tid, ftid) == false:
@@ -2067,7 +2067,16 @@ fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int
         return false
     if is_none_type(actual_tid) or is_none_type(expected_tid):
         return false
-    if optional_accepts_plain(expected_tid, actual_tid) == false:
+    # the inner value may itself be an optional: `x: Int?` into an `Int??`
+    # target is a plain value to that target and needs its shell like any
+    # other. only a value that already IS the target (excluded above) arrives
+    # in the right shape. an earlier form refused every optional value here,
+    # so the deeper wrap was never recorded and the emitter, reading the
+    # value's kind, forwarded the inner shell as the outer one (#1051).
+    expected_info := get_type_info(expected_tid)
+    if expected_info.kind != "optional" or expected_info.inner < 0:
+        return false
+    if actual_tid != expected_info.inner and types_structurally_equal(actual_tid, expected_info.inner) == false:
         return false
     optional_widened_arguments.insert(expr_idx, true)
     return true
@@ -2081,8 +2090,11 @@ pub fn c_argument_widens_to_optional(expr_idx: Int) -> Bool:
 # build for it. the two answers differ: `none` and a value that is already the
 # optional arrive in the right shape and are recorded as nothing, while a
 # plain inner value needs the Some shell, which is what the recording asks
-# for. positions that have both cases in one check — a container store, an
-# enum variant payload — ask through here rather than repeating the pairing.
+# for. every acceptance site goes through here: a binding, an assignment, a
+# struct field or its default, an argument. the record is what tells the
+# emitter that an optional value handed to a deeper optional (`x: Int?` into
+# an `Int??`) still needs its shell, since by kind it already looks like one
+# (#1051).
 fn optional_target_accepts_value(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
     if value_matches_optional_target(value_idx, actual_tid, expected_tid) == false:
         return false
@@ -2374,7 +2386,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                         if ainfo.kind == "enum" and extract_base_type_name(ainfo.name) == gbase:
                             expression_type_cache.insert(node.children[1], annotated)
                             val_type = annotated
-            if value_matches_optional_target(node.children[1], val_type, annotated):
+            if optional_target_accepts_value(node.children[1], val_type, annotated):
                 define_binding_at(scope_id, name, annotated, is_mut, node_idx)
                 return
             if is_error_type(val_type) == false:
@@ -2490,7 +2502,7 @@ fn check_assignment(node: Node, scope_id: Int):
     # then emitted against the optional's shell address — `x += 3` on an
     # `Int?` holding 5 answered 0, with no diagnostic anywhere.
     if op == "=":
-        if value_matches_optional_target(value_idx, val_type, target_type):
+        if optional_target_accepts_value(value_idx, val_type, target_type):
             return
         if collection_literal_matches_target(value_idx, target_type, scope_id):
             return
@@ -2565,11 +2577,15 @@ fn check_return_statement(node: Node, scope_id: Int):
             return
         if types_structurally_equal(actual, exp_info.inner):
             return
-    # allow returning inner type from optional-returning function
+    # allow returning inner type from optional-returning function. the
+    # return is recorded as widening, the same record an argument or a
+    # binding leaves, because the emitter cannot always tell from the
+    # value's shape: `return inner` with `inner: (Int, String)?` into a
+    # `((Int, String)?)?` return is an optional handed to an optional and
+    # still needs its second shell (#1051).
     if exp_info.kind == "optional":
-        if actual == exp_info.inner:
-            return
-        if types_structurally_equal(actual, exp_info.inner):
+        if actual == exp_info.inner or types_structurally_equal(actual, exp_info.inner):
+            argument_widens_to_optional(node.children[0], actual, expected)
             return
     # check structural equality (tuples)
     if types_structurally_equal(actual, expected):
@@ -3996,7 +4012,7 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
                 propagate_empty_collection_literal(expr, info.field_types[idx])
             if is_error_type(arg_type) == false:
                 expected := info.field_types[idx]
-                if value_matches_optional_target(expr, arg_type, expected) == false:
+                if optional_target_accepts_value(expr, arg_type, expected) == false:
                     if collection_literal_matches_target(expr, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
                             report_error_at(expr, "E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
@@ -4033,7 +4049,7 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
         if is_error_type(arg_type) == false:
             if idx < info.field_types.len():
                 expected := info.field_types[idx]
-                if value_matches_optional_target(arg_expr_idx, arg_type, expected) == false:
+                if optional_target_accepts_value(arg_expr_idx, arg_type, expected) == false:
                     if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
                             report_error_at(arg_expr_idx, "E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
@@ -6965,7 +6981,7 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
         if is_error_type(arg_type) == false:
             if idx < info.field_types.len():
                 expected := info.field_types[idx]
-                if value_matches_optional_target(child, arg_type, expected) == false:
+                if optional_target_accepts_value(child, arg_type, expected) == false:
                     if collection_literal_matches_target(child, expected, scope_id) == false:
                         if types_compatible(arg_type, expected) == false:
                             report_error_at(child, "E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))

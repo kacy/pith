@@ -2953,6 +2953,13 @@ fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> 
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, "tuple")
             return value_r
+    # an optional handed to a deeper optional (`x: Int?` into an `Int??`): the
+    # inner shell is the payload, and the outer shell owns it the way it owns
+    # a tuple payload. the checker's record brought the value here; without it
+    # the kind test above called the inner shell the outer one (#1051).
+    if actual_tid >= 0 and get_type_info(actual_tid).kind == "optional":
+        ir_optional_tuple_dtor_needed = true
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", "tuple")
     payload_kind := ir_rc_kind(ir_infer_type(val_idx))
     if ir_kind_is_owned_optional_payload(payload_kind):
         return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind)
@@ -7873,7 +7880,14 @@ pub fn ir_emit_return_value(expr_child: Int):
         # signal as a tuple retkind — the guard against an Optional[Tuple]
         # inner still applies.
         ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
-        already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
+        # the checker records a return of the payload type into an optional
+        # return as a widening (check_return_statement). that record answers
+        # what the shape tests below cannot when the payload is itself an
+        # optional: `return inner` with `inner: (Int, String)?` in a function
+        # declared `-> ((Int, String)?)?` reads as already optional by kind
+        # and was forwarded without its second shell (#1051).
+        widened := c_argument_widens_to_optional(expr_child)
+        already_optional := (not widened) and (expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple"))
         if expr_node.kind == "none_lit":
             r = ir_emit_optional_none_value()
         elif already_optional == false:
@@ -7887,11 +7901,20 @@ pub fn ir_emit_return_value(expr_child: Int):
             # held the only count while freeing the shell dropped nothing, and
             # every extraction off a call subject stranded one payload: the
             # extraction retains what it hands out and the shell's release had
-            # nothing left to balance that against. a `tuple` inner (a `T??`)
-            # keeps the borrowing wrap: the inner shell's count stays with its
-            # own owner.
+            # nothing left to balance that against. a tuple-shaped payload is
+            # owned the same way: a genuine tuple arrives here with its own
+            # count, and so does an inner optional shell (a `T??`), whose
+            # count left its local through `exclude` or was retained above.
+            # the borrowing wrap this used to build for kind "tuple" stranded
+            # the tuple of every `-> (A, B)?` return opened straight off the
+            # call, since the direct-subject release frees the shell only
+            # (#1052); a caller that cascades instead nulls the payload slot
+            # before the shell's release, so the owning shell double-frees
+            # nothing there.
             ret_payload_kind := ir_rc_kind(ir_current_func_optional_inner_kind)
-            if ret_payload_kind.len() > 0 and ret_payload_kind != "tuple":
+            if ret_payload_kind.len() > 0:
+                if ret_payload_kind == "tuple":
+                    ir_optional_tuple_dtor_needed = true
                 r = ir_emit_optional_owned_some(r, ret_payload_kind)
             else:
                 r = ir_emit_optional_some_value(r)

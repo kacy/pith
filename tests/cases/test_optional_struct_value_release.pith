@@ -1,0 +1,44 @@
+# `.value()` on an optional holding a struct, with the extraction bound to a
+# local or handed to a function. it used to release what it extracted one time
+# too many: the program printed the right answer and exited 0, and only
+# valgrind saw the read of a freed block (with the struct freelist on, the
+# block came straight back). the shape was found through a recursive walk over
+# a `next: Node?` chain, which extracts the next link out of an optional field
+# at every step and hands it over. the last block is the clean twin:
+# unwrap_or, a match, and a member read chained straight onto the extraction.
+# runs under valgrind with the freelist off (MEMCHECK_CASES).
+import std.env as env
+
+struct Plain:
+    pub value: String
+    pub next: Plain?
+
+fn name_of(n: Plain) -> String:
+    return n.value
+
+fn build(tag: String) -> Plain:
+    tail := Plain(value: "tail-" + tag, next: none)
+    return Plain(value: "head-" + tag, next: tail)
+
+fn walk(n: Plain) -> String:
+    if n.next == none:
+        return n.value
+    return n.value + ">" + walk(n.next.value())
+
+fn main():
+    # the smallest form: an optional local holding a struct, extracted and bound
+    o: Plain? := Plain(value: "v", next: none)
+    inner := o.value()
+    print(inner.value)
+    # the extraction handed straight to a function
+    c := build("a")
+    print(name_of(c.next.value()))
+    # every step of the recursion extracts the next link and hands it over
+    print(walk(build("b")))
+    # the clean twin
+    d := build("c")
+    print(name_of(d.next.unwrap_or(d)))
+    match d.next:
+        none => print("none")
+        tail => print(name_of(tail))
+    print(d.next.value().value)

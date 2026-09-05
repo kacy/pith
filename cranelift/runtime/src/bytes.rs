@@ -291,7 +291,6 @@ pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
     }
 }
 
-#[no_mangle]
 /// Free a byte buffer: single-owner lifecycle, no refcount. After this
 /// call the handle is dead and fails the magic check.
 ///

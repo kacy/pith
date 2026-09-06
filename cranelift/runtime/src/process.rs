@@ -23,14 +23,15 @@
 use crate::blocking::{self, Pool};
 use crate::collections::list::PithList;
 use crate::concurrency::scheduler::{backend, Backend};
+use crate::fd_handle::{self, FdKind};
 use crate::fdio;
 use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 use crate::handle_registry::{self, HandleKind};
 use crate::netpoll;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::os::unix::io::{IntoRawFd, RawFd};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 
@@ -53,12 +54,13 @@ pub(crate) fn command_status(mut command: Command) -> Option<std::process::ExitS
     blocking::run(&POOL, move || command.status().ok())
 }
 
-/// which of a child's three pipes a caller wants.
+/// which of a child's three pipes a caller wants. the discriminant indexes
+/// `ProcessHandle::pipes`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipe {
-    Stdin,
-    Stdout,
-    Stderr,
+    Stdin = 0,
+    Stdout = 1,
+    Stderr = 2,
 }
 
 /// every pipe, for the paths that have to touch all three.
@@ -66,24 +68,43 @@ const PIPES: [Pipe; 3] = [Pipe::Stdin, Pipe::Stdout, Pipe::Stderr];
 
 pub(crate) struct ProcessHandle {
     pub(crate) child: Child,
-    pub(crate) stdin: Option<ChildStdin>,
-    pub(crate) stdout: Option<ChildStdout>,
-    pub(crate) stderr: Option<ChildStderr>,
+    /// our end of each captured pipe, as an `fd_handle` handle rather than the
+    /// `ChildStdin`/`ChildStdout` std hands out: `process_io` takes a hold on
+    /// the handle for each read or write, outside the registry lock, and a
+    /// close from another task retires the handle rather than closing a number
+    /// a read is still inside on. `None` for a pipe that was not captured.
+    pipes: [Option<i64>; 3],
 }
 
 impl ProcessHandle {
-    /// the raw fd behind one of the child's pipes, or `None` if it was not
-    /// captured. `process_io` reads and writes through the fd rather than
-    /// through the `ChildStdout`/`ChildStdin` so it can drop the registry lock
-    /// before it waits — see the note on `pith_process_close` for what keeps
-    /// that fd alive.
-    pub(crate) fn pipe(&self, pipe: Pipe) -> Option<RawFd> {
-        match pipe {
-            Pipe::Stdin => self.stdin.as_ref().map(|s| s.as_raw_fd()),
-            Pipe::Stdout => self.stdout.as_ref().map(|s| s.as_raw_fd()),
-            Pipe::Stderr => self.stderr.as_ref().map(|s| s.as_raw_fd()),
-        }
+    /// the handle of one of the child's pipes, or `None` if it was not
+    /// captured. the caller takes its own hold on it (`fd_handle::acquire`),
+    /// which is what keeps the descriptor alive across its syscall.
+    pub(crate) fn pipe(&self, pipe: Pipe) -> Option<i64> {
+        self.pipes[pipe as usize]
     }
+}
+
+/// register our end of a captured pipe as a handle, non-blocking under green.
+///
+/// under green the pipes have to be non-blocking, or a read with nothing on
+/// the other end sleeps the worker instead of yielding to the reactor. this
+/// is our end of each pipe only — the child's end is a separate open file
+/// description and keeps the blocking semantics it expects. the os-thread
+/// backend leaves them alone: there is no worker to protect and a blocking
+/// read is exactly what it wants.
+fn register_pipe(fd: Option<RawFd>) -> Option<i64> {
+    let fd = fd?;
+    if backend() == Backend::Green {
+        fdio::set_nonblocking(fd);
+    }
+    let handle = fd_handle::open(fd, FdKind::Pipe);
+    if handle == 0 {
+        // SAFETY: closing a pipe end we own that never became a handle.
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    Some(handle)
 }
 
 struct ProcessOutputHandle {
@@ -143,25 +164,16 @@ fn pith_store_process_output(status: i64, stdout: String, stderr: String) -> i64
 
 fn pith_store_process_handle(mut child: Child) -> i64 {
     let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
+    // the pipes are taken out of the `Child` here and owned as handles from
+    // now on: `Child` never closes them again, and neither does `wait`.
     let entry = ProcessHandle {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take(),
-        stderr: child.stderr.take(),
+        pipes: [
+            register_pipe(child.stdin.take().map(IntoRawFd::into_raw_fd)),
+            register_pipe(child.stdout.take().map(IntoRawFd::into_raw_fd)),
+            register_pipe(child.stderr.take().map(IntoRawFd::into_raw_fd)),
+        ],
         child,
     };
-    // under green the pipes have to be non-blocking, or a read with nothing on
-    // the other end sleeps the worker instead of yielding to the reactor. this
-    // is our end of each pipe only — the child's end is a separate open file
-    // description and keeps the blocking semantics it expects. the os-thread
-    // backend leaves them alone: there is no worker to protect and a blocking
-    // read is exactly what it wants.
-    if backend() == Backend::Green {
-        for pipe in PIPES {
-            if let Some(fd) = entry.pipe(pipe) {
-                fdio::set_nonblocking(fd);
-            }
-        }
-    }
     process_handles().lock().insert(handle, entry);
     handle_registry::register_id(handle, HandleKind::Process);
     handle
@@ -440,20 +452,21 @@ pub extern "C" fn pith_process_kill(handle: i64) -> i64 {
 /// Close and forget a process handle
 #[no_mangle]
 pub extern "C" fn pith_process_close(handle: i64) {
-    // take the entry out under the lock but drop it after, so the pipes close
-    // outside the lock and a task parked on one of them can be woken first.
+    // take the entry out under the lock but close its pipes after, so the
+    // closes run outside the lock and a task parked on one of them can be
+    // woken without contending for it.
     let entry = process_handles().lock().remove(&handle);
     handle_registry::unregister_id(handle, HandleKind::Process);
 
-    // a task suspended in the reactor on one of these pipes has to come back
-    // before the fd is closed. otherwise it stays parked on a number the kernel
-    // is free to hand to the next socket we open, and waits on that instead.
-    // `on_close` hands it a closed-fd outcome, which its read reports as an
-    // error; this is the same teardown a socket gets in `pith_tcp_close`.
+    // retiring a pipe's handle is the same teardown a socket gets in
+    // `pith_tcp_close`: a task parked on it in the reactor is woken with a
+    // closed outcome and its read reports an error, a read blocked in the
+    // kernel keeps the number reserved until it returns, and the descriptor
+    // is closed once no call is inside — never while one is.
     if let Some(entry) = &entry {
         for pipe in PIPES {
-            if let Some(fd) = entry.pipe(pipe) {
-                netpoll::on_close(fd);
+            if let Some(pipe_handle) = entry.pipe(pipe) {
+                fd_handle::close(pipe_handle);
             }
         }
     }

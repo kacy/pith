@@ -46,6 +46,7 @@ pub mod crypto;
 pub mod cycle;
 pub mod dns;
 pub mod encoding;
+pub mod fd_handle;
 pub mod fdio;
 pub mod ffi_util;
 pub mod handle_registry;

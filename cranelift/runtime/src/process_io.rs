@@ -8,17 +8,20 @@
 //!
 //! the one rule the shape here exists to keep is that the handle registry's
 //! lock is never held across that yield. each entry point takes the lock only
-//! long enough to look up an fd, then does its syscall outside it. holding it
-//! across a park would deadlock at one worker — the parked task cannot resume
-//! to release the lock while its own worker sits blocked on that lock for
-//! another task.
+//! long enough to look up the pipe's handle, then takes its own hold on that
+//! handle (`fd_handle::acquire`) and does its syscall outside the lock. holding
+//! it across a park would deadlock at one worker — the parked task cannot
+//! resume to release the lock while its own worker sits blocked on that lock
+//! for another task. the hold is what keeps the pipe's descriptor from being
+//! closed and its number reused while the syscall is inside; a process handle
+//! closed meanwhile makes the call fail rather than read another fd.
 
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::fd_handle::{self, FdKind, Guard};
 use crate::ffi_util::cstr_str_or_empty;
 use crate::fdio;
 use crate::handle_registry::{is_valid_id, HandleKind};
 use crate::process::{process_handles, Pipe};
-use std::os::unix::io::RawFd;
 
 /// what came back from one read of a child's pipe.
 enum PipeRead {
@@ -41,25 +44,32 @@ fn chunk_size(max_bytes: i64) -> usize {
     }
 }
 
-/// the fd behind one of a child's pipes, taking the registry lock only for the
-/// lookup. `None` for an unknown handle; `Some(None)` for a handle whose pipe
-/// was never captured.
-fn pipe_fd(handle: i64, pipe: Pipe) -> Option<Option<RawFd>> {
+/// a hold on one of a child's pipes, taking the registry lock only for the
+/// lookup. `None` for an unknown process handle, or a pipe whose handle has
+/// been retired since; `Some(None)` for a handle whose pipe was never
+/// captured.
+fn pipe_guard(handle: i64, pipe: Pipe) -> Option<Option<Guard>> {
     if !is_valid_id(handle, HandleKind::Process) {
         return None;
     }
-    let handles = process_handles().lock();
-    handles.get(&handle).map(|entry| entry.pipe(pipe))
+    let pipe_handle = {
+        let handles = process_handles().lock();
+        handles.get(&handle)?.pipe(pipe)
+    };
+    match pipe_handle {
+        Some(pipe_handle) => Some(Some(fd_handle::acquire(pipe_handle, FdKind::Pipe)?)),
+        None => Some(None),
+    }
 }
 
 /// read one chunk from a child's pipe.
 fn read_pipe(handle: i64, pipe: Pipe, max_bytes: i64) -> PipeRead {
-    let fd = match pipe_fd(handle, pipe) {
-        Some(Some(fd)) => fd,
+    let guard = match pipe_guard(handle, pipe) {
+        Some(Some(guard)) => guard,
         Some(None) => return PipeRead::Absent,
         None => return PipeRead::Failed,
     };
-    match fdio::read_yielding(fd as i64, chunk_size(max_bytes)) {
+    match fdio::read_yielding(&guard, chunk_size(max_bytes)) {
         Some(buf) => PipeRead::Data(buf),
         None => PipeRead::Failed,
     }
@@ -69,8 +79,8 @@ fn read_pipe(handle: i64, pipe: Pipe, max_bytes: i64) -> PipeRead {
 /// covers an unknown handle, a closed child, and a failed write alike, as
 /// before.
 fn write_stdin(handle: i64, data: &[u8]) -> i64 {
-    match pipe_fd(handle, Pipe::Stdin) {
-        Some(Some(fd)) => fdio::write_yielding(fd as i64, data),
+    match pipe_guard(handle, Pipe::Stdin) {
+        Some(Some(guard)) => fdio::write_yielding(&guard, data),
         _ => 0,
     }
 }

@@ -39,7 +39,7 @@ request, so a forgotten close is a leak per request.
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
 | `FileStream` | `close()` | the os fd and the runtime's file-handle entry | safe |
-| `TcpStream` | `close()` | the socket fd and its reactor registration | **unsafe** |
+| `TcpStream` | `close()` | the socket fd and its reactor registration | safe |
 | `Process` | `close()` | the process-handle entry, up to three pipe fds, and the child goes unreaped | safe |
 | `BufferedBytesReader` / `BufferedBytesWriter` | `free()` | four threadlocal map entries each, including the cached `Bytes` | safe |
 | `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | `close()` | the type's threadlocal registry entries — two to six map entries each, including any cached text | safe |
@@ -55,21 +55,26 @@ re-registering itself.
 
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
-| a bare tcp fd (`std/net/tcp.pith`) | `tcp.close(fd)` | the fd | **unsafe** |
+| a bare tcp fd (`std/net/tcp.pith`) | `tcp.close(fd)` | the fd | safe |
 | a registered listener (`std/shutdown.pith`) | `shutdown.close_listener(fd)` | the fd | safe by construction |
 | a `web` connection slot | `release_connection_slot()` | one permanent unit off the connection ceiling; the server wedges hours later with no trace | n/a |
 | an http/2 admission slot | the semaphore release in `serve_h2c_slot` / `serve_h2_tls_slot` | same shape | n/a |
 
-`shutdown.close_listener` is the only fd closer in std that is exactly-once by
-construction: it removes the registration and reports whether it won, so only
-the winner reaches `tcp_close`.
+every fd closer is exactly-once now. the `Int` a socket or pipe reaches the
+language as is a handle carrying a generation and a user count (see "closing a
+connection another task is using" in docs/concurrency.md), so a second
+`tcp_close` on the same value is a no-op rather than a `close(2)` on whatever
+socket took the number in between, and a call on the closed value fails
+instead of reaching that socket. `shutdown.close_listener` keeps its own
+registration check so that a drain and a normal teardown agree on which of
+them owns the close, but the fd itself no longer depends on it.
 
 ### http, http/2 and grpc
 
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
-| `http.ClientConn` | `close()` | the stream; note it does **not** free the reader and writer, so two `io` registries leak per connection | fd path unsafe |
-| `http2.Connection` | `close()` | the fd or the tls conn handle | fd path unsafe |
+| `http.ClientConn` | `close()` | the stream; note it does **not** free the reader and writer, so two `io` registries leak per connection | safe |
+| `http2.Connection` | `close()` | the fd or the tls conn handle | safe |
 | `http2.Client` | `close()` | the reader task, the writer task, five channels, and the transport | unguarded |
 | `http2.Stream` | `close()` | the stream's event channel, its credit channel, three map entries, and one `MAX_CONCURRENT_STREAMS` slot | safe |
 | `grpc.Conn`, `grpc.PoolConn` | `close()` | the whole underlying client | — |
@@ -85,7 +90,7 @@ reset only goes on the wire for a stream whose terminal event never arrived.
 
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
-| `postgres.Conn`, `mysql.Conn`, `redis.Client` | `close()` | the tls conn handle and the socket | fd path unsafe |
+| `postgres.Conn`, `mysql.Conn`, `redis.Client` | `close()` | the tls conn handle and the socket | safe |
 | `postgres.Pool`, `mysql.Pool`, `redis.Pool` | `close()` | the idle connections; checked-out ones are not reached | safe |
 | `db.Db` | `close()` | the pool is drained but never removed from the module-global pool list, so its slot channel is retained for process life | safe |
 | `db.Tx` | `commit()` or `rollback()` | the pinned connection never returns to the pool — `max_open` permanently loses a slot — and the transaction stays open on the server | safe |
@@ -152,10 +157,11 @@ modules this survey found real leaks in — `io`, `grpc`, `websocket` — are ne
 the bottom of that list.
 
 the two rules std does hold to are worth keeping: whoever builds a resource
-closes it, and a closer backed by a map removal is idempotent. the split on the
-second one is clean. anything that reaches `tcp_close(fd)` is not idempotent,
-because the call closes unconditionally and the kernel may have reissued the
-number; everything backed by a map lookup is safe to call twice.
+closes it, and a closer is idempotent. the second one used to split cleanly:
+anything that reached `tcp_close(fd)` closed unconditionally, and the kernel
+may have reissued the number, so only the closers backed by a map lookup were
+safe to call twice. `tcp_close` now retires a generation-stamped handle rather
+than a number, so it is idempotent too, and the split is gone.
 
 ## what the machinery already does
 

@@ -1,9 +1,38 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::concurrency::scheduler::{backend, Backend};
+use crate::fd_handle::{self, FdKind, Guard};
 use crate::fdio;
 use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 use crate::netpoll;
 use std::os::unix::io::RawFd;
+
+// ---------------------------------------------------------------------------
+// handles
+//
+// what the language holds for a socket is a handle from `fd_handle`, not the
+// descriptor: the fd number stamped with a generation, so a connection that
+// was closed — and whose number the kernel has since handed to another — is a
+// stale handle that every entry point below refuses with an ordinary failure,
+// where the raw number would have reached the other connection's syscalls.
+// `socket()` takes the hold for one call; `open_socket()` registers a
+// descriptor pith just created and returns the handle the caller gets.
+// ---------------------------------------------------------------------------
+
+/// the hold on `handle` for one socket call, or `None` for a handle that is
+/// not a live socket.
+fn socket(handle: i64) -> Option<Guard> {
+    fd_handle::acquire(handle, FdKind::Socket)
+}
+
+/// register a socket pith just created or accepted and return its handle.
+/// a descriptor the table cannot hold is closed and reported as a failure.
+fn open_socket(fd: RawFd) -> i64 {
+    let handle = fd_handle::open(fd, FdKind::Socket);
+    if handle == 0 {
+        close_raw(fd);
+    }
+    handle
+}
 
 // ---------------------------------------------------------------------------
 // green-backend helpers
@@ -156,11 +185,11 @@ fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
             return 0;
         }
     }
-    fd as i64
+    open_socket(fd)
 }
 
-/// close a raw fd, cleaning up any reactor state first. used by the green connect
-/// path on its error branches.
+/// close a raw fd that never became a handle, cleaning up any reactor state
+/// first. used by the green connect path on its error branches.
 fn close_raw(fd: RawFd) {
     netpoll::on_close(fd);
     // SAFETY: closing an fd we own.
@@ -173,7 +202,7 @@ fn close_raw(fd: RawFd) {
 // FFI surface
 // ---------------------------------------------------------------------------
 
-/// TCP listen — bind and listen on addr:port, return server fd
+/// TCP listen — bind and listen on addr:port, return the listener's handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpListener;
@@ -195,13 +224,13 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
             if is_green() {
                 fdio::set_nonblocking(fd as RawFd);
             }
-            fd
+            open_socket(fd as RawFd)
         }
         Err(_) => 0,
     }
 }
 
-/// TCP connect — connect to addr:port, return connection fd
+/// TCP connect — connect to addr:port, return the connection's handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpStream;
@@ -230,35 +259,37 @@ pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
             // per round-trip.
             let _ = stream.set_nodelay(true);
             use std::os::unix::io::IntoRawFd;
-            stream.into_raw_fd() as i64
+            open_socket(stream.into_raw_fd())
         }
         Err(_) => 0,
     }
 }
 
-/// TCP accept — accept a connection on a server fd, return client fd
+/// TCP accept — accept a connection on a listener handle, return the client's
+/// handle. a listener closed while this is parked on it returns a failure,
+/// which is how an accept loop learns the listener is gone.
 #[no_mangle]
-pub extern "C" fn pith_tcp_accept(server_fd: i64) -> i64 {
-    if server_fd <= 0 {
+pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
+    let Some(listener) = socket(server) else {
         return 0;
-    }
+    };
+    let server_fd = listener.fd();
 
     // green mode: accept on the non-blocking listener, yielding on would-block.
     if is_green() {
         loop {
-            // SAFETY: accept on a valid listener fd; a null addr/len asks the
-            // kernel not to report the peer address, which we don't need.
-            let fd = unsafe {
-                libc::accept(server_fd as i32, std::ptr::null_mut(), std::ptr::null_mut())
-            };
+            // SAFETY: accept on a listener fd the guard holds open; a null
+            // addr/len asks the kernel not to report the peer address, which we
+            // don't need.
+            let fd = unsafe { libc::accept(server_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
             if fd >= 0 {
                 fdio::set_nonblocking(fd);
                 set_nodelay_raw(fd);
-                return fd as i64;
+                return open_socket(fd);
             }
             let err = fdio::errno();
             if fdio::is_would_block(err) {
-                if fdio::wait_ready(server_fd, true, -1) != 1 {
+                if fdio::wait_guarded(&listener, true, -1) != 1 {
                     return 0;
                 }
                 continue;
@@ -273,16 +304,16 @@ pub extern "C" fn pith_tcp_accept(server_fd: i64) -> i64 {
     use std::net::TcpListener;
     use std::os::unix::io::FromRawFd;
 
-    let listener = unsafe { TcpListener::from_raw_fd(server_fd as i32) };
-    let result = match listener.accept() {
+    let listener_ref = unsafe { TcpListener::from_raw_fd(server_fd) };
+    let result = match listener_ref.accept() {
         Ok((stream, _addr)) => {
             use std::os::unix::io::IntoRawFd;
-            stream.into_raw_fd() as i64
+            open_socket(stream.into_raw_fd())
         }
         Err(_) => 0,
     };
     use std::os::unix::io::IntoRawFd;
-    let _ = listener.into_raw_fd();
+    let _ = listener_ref.into_raw_fd();
     result
 }
 
@@ -296,34 +327,30 @@ fn read_size(max_bytes: i64) -> usize {
     }
 }
 
-/// one read from a connection fd, whichever backend is running: the green path
-/// yields the task to the reactor on would-block, the os-thread path blocks in
-/// the kernel. `None` is a failure, `Some(empty)` is end of stream.
-///
-/// both go through `fdio`'s socket calls, which use `recv` rather than `read` so
-/// that an fd the process closed and the kernel handed to some later `open`
-/// fails with `ENOTSOCK` instead of quietly returning that file's bytes.
-fn socket_read(conn_fd: i64, size: usize) -> Option<Vec<u8>> {
-    if conn_fd <= 0 {
-        return None;
-    }
+/// one read from a connection handle, whichever backend is running: the green
+/// path yields the task to the reactor on would-block, the os-thread path blocks
+/// in the kernel. `None` is a failure — a stale handle, a closed connection, or
+/// a handle closed by another task while this read was inside — and
+/// `Some(empty)` is end of stream.
+fn socket_read(conn: i64, size: usize) -> Option<Vec<u8>> {
+    let guard = socket(conn)?;
     if is_green() {
-        fdio::socket_read_yielding(conn_fd, size)
+        fdio::socket_read_yielding(&guard, size)
     } else {
-        fdio::socket_read_blocking(conn_fd, size)
+        fdio::socket_read_blocking(&guard, size)
     }
 }
 
-/// one write to a connection fd, the counterpart of `socket_read`. returns the
-/// bytes accepted, `0` for a failure or a closed peer.
-fn socket_write(conn_fd: i64, data: &[u8]) -> i64 {
-    if conn_fd <= 0 {
+/// one write to a connection handle, the counterpart of `socket_read`. returns
+/// the bytes accepted, `0` for a failure or a closed peer.
+fn socket_write(conn: i64, data: &[u8]) -> i64 {
+    let Some(guard) = socket(conn) else {
         return 0;
-    }
+    };
     if is_green() {
-        fdio::socket_write_yielding(conn_fd, data)
+        fdio::socket_write_yielding(&guard, data)
     } else {
-        fdio::socket_write_blocking(conn_fd, data)
+        fdio::socket_write_blocking(&guard, data)
     }
 }
 
@@ -353,14 +380,24 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn pith_tcp_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
-    fdio::wait_ready(fd, true, timeout_ms)
+/// wait for a handle to become readable or writable, the tri-state contract of
+/// `fdio::wait_ready`: `1` ready, `0` timed out, `-1` an error — which covers
+/// a stale handle and a handle closed while the wait was inside.
+fn wait_handle(conn: i64, read: bool, timeout_ms: i64) -> i64 {
+    let Some(guard) = socket(conn) else {
+        return -1;
+    };
+    fdio::wait_guarded(&guard, read, timeout_ms)
 }
 
 #[no_mangle]
-pub extern "C" fn pith_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
-    fdio::wait_ready(fd, false, timeout_ms)
+pub extern "C" fn pith_tcp_wait_readable(conn: i64, timeout_ms: i64) -> i64 {
+    wait_handle(conn, true, timeout_ms)
+}
+
+#[no_mangle]
+pub extern "C" fn pith_tcp_wait_writable(conn: i64, timeout_ms: i64) -> i64 {
+    wait_handle(conn, false, timeout_ms)
 }
 
 /// TCP write — write data to connection fd, return bytes written
@@ -377,17 +414,18 @@ pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
     socket_write(conn_fd, &bytes.data)
 }
 
-/// TCP set read timeout in milliseconds (0 = no timeout)
+/// TCP set read timeout in milliseconds (0 = no timeout). a stale handle is
+/// left alone.
 #[no_mangle]
-pub extern "C" fn pith_tcp_set_timeout(fd: i64, ms: i64) {
-    if fd < 0 {
+pub extern "C" fn pith_tcp_set_timeout(conn: i64, ms: i64) {
+    let Some(guard) = socket(conn) else {
         return;
-    }
+    };
 
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
 
-    let stream = unsafe { TcpStream::from_raw_fd(fd as i32) };
+    let stream = unsafe { TcpStream::from_raw_fd(guard.fd()) };
     if ms <= 0 {
         let _ = stream.set_read_timeout(None);
     } else {
@@ -397,46 +435,41 @@ pub extern "C" fn pith_tcp_set_timeout(fd: i64, ms: i64) {
     let _ = stream.into_raw_fd();
 }
 
-/// TCP close — close the file descriptor
+/// TCP close — retire the handle and close its descriptor.
+///
+/// the close is exactly once per handle: a second call, or a call on a handle
+/// that was never open, does nothing, where a raw `close(2)` would have landed
+/// on whatever now holds the number. a call still inside on this handle —
+/// parked in the reactor, or blocked in the kernel on the os-thread backend —
+/// is returned with an error, and the descriptor itself is closed once the last
+/// such call is out (see `fd_handle::close`).
 #[no_mangle]
-pub extern "C" fn pith_tcp_close(fd: i64) {
-    if fd <= 0 {
-        return;
-    }
-    // drop any reactor registration for this fd before closing it, so a parked
-    // waiter's stale (fd, interest) entry can't linger or be reused for a fresh
-    // fd with the same number. a no-op when the reactor was never built.
-    netpoll::on_close(fd as RawFd);
-    unsafe {
-        libc::close(fd as i32);
-    }
+pub extern "C" fn pith_tcp_close(conn: i64) {
+    fd_handle::close(conn);
 }
 
 /// shut a socket down for both directions without closing it — the graceful
 /// shutdown primitive for a *listening* socket. returns 1 on success, 0 if the
-/// kernel refuses (an fd that is not a socket, or already shut down).
+/// kernel refuses (a stale handle, or a socket already shut down).
 ///
-/// this exists because closing a listener is not enough to stop an accept loop.
-/// a green task parked on `accept` is woken by the close (the reactor's
-/// `on_close` resolves its wait), but an accept loop running on a thread with no
-/// green task behind it — `listen()` called straight from `main`, the shape
-/// every server example uses — is blocked inside `accept`/`poll`, and closing an
-/// fd does not wake a blocking call already waiting on it. `shutdown` does: the
-/// blocked `accept` returns `EINVAL` and a poll/epoll wait reports `HUP`.
-///
-/// it also removes the close race. the fd stays valid, so the accept loop that
-/// owns the listener closes it itself, once, on its own way out — rather than
-/// having it closed underneath by another task, which risks closing whatever the
-/// kernel has since handed that number to.
+/// this is how a loop is stopped without taking its socket away from it. a
+/// blocked `accept` returns `EINVAL`, a poll/epoll wait reports `HUP`, and a
+/// blocked read returns end of stream, whichever backend and whichever thread
+/// the loop runs on; the handle stays open, so the loop that owns it closes it
+/// itself, once, on its own way out. closing from another task is safe as
+/// well — `pith_tcp_close` wakes a call still inside the same way and the
+/// handle refuses every call after — but a shutdown leaves the close where the
+/// ownership is, and a reader told to stop can tell that apart from a
+/// connection that is gone.
 #[no_mangle]
-pub extern "C" fn pith_tcp_shutdown(fd: i64) -> i64 {
-    if fd <= 0 {
+pub extern "C" fn pith_tcp_shutdown(conn: i64) -> i64 {
+    let Some(guard) = socket(conn) else {
         return 0;
-    }
-    // SAFETY: `shutdown` on an fd pith owns. it does not free the descriptor, so
-    // it is safe to call while another task is blocked on the same fd — which is
-    // the entire point.
-    let rc = unsafe { libc::shutdown(fd as i32, libc::SHUT_RDWR) };
+    };
+    // SAFETY: `shutdown` on an fd the guard holds open. it does not free the
+    // descriptor, so it is safe to call while another task is blocked on the
+    // same fd — which is the entire point.
+    let rc = unsafe { libc::shutdown(guard.fd(), libc::SHUT_RDWR) };
     if rc == 0 {
         1
     } else {

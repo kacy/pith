@@ -411,21 +411,17 @@ correctness story:
   candidate fixes (snapshot the environment at startup, or make late `set_env`
   write to an overlay that child processes inherit) both change observable
   semantics, so this is documented rather than decided for now.
-- closing an fd-backed handle races a concurrent call on the same handle. a
-  task parked on a socket or pipe that another task closes is woken with an
-  error (the reactor's close teardown), which is the common case and safe.
-  what remains is the standard raw-fd hazard: between one task's handle
-  lookup and its syscall, a close plus a new open can recycle the fd number,
-  and the syscall lands on the wrong fd. present on both backends and
-  inherited from fd semantics; closing it needs handles that carry liveness
-  (a generation, like task handles have) rather than raw fd numbers. do not
-  share a connection between tasks without coordinating its close. the
-  coordination std uses wherever a task of its own reads a socket — the http/2
-  client's reader, the h2 server's drain — is `tcp_shutdown` first, which ends
-  that task's current and next call while the descriptor number stays
-  reserved, then wait for it to stop, and only then close. closing first hands
-  the number back for the next open anywhere in the process, and a reader that
-  has not stopped yet reads whatever lands on it.
+- closing an fd-backed handle from another task is safe, but a pipe read
+  blocked in the kernel holds the number. a socket or a child's pipe reaches
+  the language as a handle that carries a generation and a user count rather
+  than as its raw descriptor number (see "closing a connection another task
+  is using" in docs/concurrency.md), so a call on a closed handle fails with
+  an error and the number is not reused while a call is inside on it. the one
+  case that cannot be woken is a read on a child's pipe blocked in the kernel
+  under `PITH_GREEN=0`: a pipe has no `shutdown`, so the read returns only
+  when the child writes or exits, and the descriptor is closed then. the
+  green backend, the default, wakes it at once through the reactor. the
+  handle is dead to every other call from the moment of the close either way.
 
 ## the green backend, now the default on linux
 

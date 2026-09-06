@@ -418,6 +418,15 @@ fn register_new_slot() -> Arc<MutatorSlot> {
 /// registered mutator without an explicit spawn seam. `None` only while
 /// thread-local storage is tearing down, where the thread is exiting and a
 /// bracket can no longer matter.
+///
+/// this and the two readers below it are never inlined: the cell is a
+/// `RefCell`, so touching it means holding its address as a value, and a
+/// green task reaches the gate and the brackets from frames that can park. a
+/// task resumed on another worker would then act on the first worker's slot.
+/// behind a call the address is computed and consumed on the thread that is
+/// running. the rule and the mechanism are in the accessor block of
+/// `concurrency/green.rs`.
+#[inline(never)]
 fn mutator_slot() -> Option<Arc<MutatorSlot>> {
     MY_MUTATOR
         .try_with(|cell| {
@@ -435,11 +444,19 @@ fn mutator_slot() -> Option<Arc<MutatorSlot>> {
 /// this thread's slot if it already has one; never creates. the stop path
 /// uses this so a dedicated collector thread does not become a registered
 /// mutator merely by asking for the world.
+#[inline(never)]
 fn existing_mutator_slot() -> Option<Arc<MutatorSlot>> {
     MY_MUTATOR
         .try_with(|cell| cell.borrow().as_ref().map(|owner| Arc::clone(&owner.0)))
         .ok()
         .flatten()
+}
+
+/// is this the thread running a collection pass? a plain cell, so the read
+/// is one `%fs:`-relative load wherever it is inlined.
+#[inline]
+fn on_collector() -> bool {
+    ON_COLLECTOR.with(Cell::get)
 }
 
 /// Create and register a mutator slot on behalf of a thread about to be
@@ -458,6 +475,7 @@ pub(crate) fn mutator_slot_for_spawn() -> Option<Arc<MutatorSlot>> {
 /// Install a slot created by `mutator_slot_for_spawn` as the calling thread's
 /// own. The first thing a spawned mutator body does; the thread-local owner
 /// then marks the slot exited when the thread returns.
+#[inline(never)]
 pub(crate) fn adopt_mutator_slot(slot: Option<Arc<MutatorSlot>>) {
     let Some(slot) = slot else {
         return;
@@ -483,7 +501,7 @@ fn mutator_gate_slow() {
     // the thread running the collection pass must never park on its own stop
     // request: a compiled destructor it calls during teardown could carry a
     // safe-point, and parking there would deadlock the stopped world.
-    if ON_COLLECTOR.with(Cell::get) {
+    if on_collector() {
         return;
     }
     let Some(slot) = mutator_slot() else {
@@ -524,7 +542,7 @@ impl Drop for NativeBracket {
 
 #[inline(never)]
 fn enter_native() {
-    if ON_COLLECTOR.with(Cell::get) {
+    if on_collector() {
         return;
     }
     if let Some(slot) = mutator_slot() {
@@ -534,7 +552,7 @@ fn enter_native() {
 
 #[inline(never)]
 fn exit_native() {
-    if ON_COLLECTOR.with(Cell::get) {
+    if on_collector() {
         return;
     }
     let Some(slot) = mutator_slot() else {

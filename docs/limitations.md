@@ -508,17 +508,30 @@ gap to go on coordination-heavy work.
 the obvious fix is to move a parked task to whichever worker keeps waking it,
 and it does work: prototyped, it took the fan-out from a bimodal ~120 ms median
 to a flat ~42 ms, ahead of go's ~69, with cross-worker wakes dropping from
-~100k to single digits. it is also unsound, and the reason is worth recording
-so nobody spends the same day rediscovering it. the problem is not the
-coroutine stack, which migrates fine; it is that the compiler caches the
-thread-local base in a frame across a suspension, so a coroutine resumed on
-another thread reads the previous thread's `CURRENT_TASK` and `CURRENT_WORKER`.
-that was observed directly — one os thread reporting two different values of a
-variable written once at startup — and it silently dropped channel messages. no
-source-level barrier covers it, because every thread-local read in every frame
-that can span a park is exposed. so migration is gated on removing those reads
-from the resumable path, which is its own project rather than a scheduler
-tweak. `examples/grpc_chat` and `examples/grpc_reflect` are the two programs
+~100k to single digits. the first attempt was also unsound, and the reason is
+worth recording so nobody spends the same day rediscovering it. the problem
+was not the coroutine stack, which migrates fine; it was that the runtime's
+own rust frames cached the thread-local base across a suspension, so a
+coroutine resumed on another thread read the previous thread's `CURRENT_TASK`
+and `CURRENT_WORKER`. that was observed directly — one os thread reporting two
+different values of a variable written once at startup — and it silently
+dropped channel messages. the mechanism is the tls model the runtime archive
+was compiled with: a library function fetches its thread's tls base once and
+adds offsets to it for every access in the frame, so any frame that reads a
+thread-local both before and after a park reads the second one stale. that
+hazard is now closed. the workspace is compiled for the executable the runtime
+always ends up in (`-C relocation-model=pie`, in `.cargo/config.toml`), which
+makes every plain thread-local access one `%fs:`-relative instruction with no
+base for a frame to keep; the few cells whose address has to exist as a value
+(the lazily initialized pool handle, the `RefCell` maps behind `threadlocal`
+globals off the green backend and the collector's mutator slot) are touched
+only inside functions the optimizer may not inline. `make check-tls-barriers`
+audits the built archive for both, and `cargo test` drives a forced
+cross-thread resume against the shipped archive to keep it that way. what is
+still missing is migration itself: a task still pins to the first worker that
+runs it, and the placement cost above is unchanged until the
+move-to-the-waking-worker policy lands.
+`examples/grpc_chat` and `examples/grpc_reflect` are the two programs
 sensitive enough to catch a placement change going wrong; run them first.
 
 one caveat on the numbers themselves: every comparison in docs/performance.md

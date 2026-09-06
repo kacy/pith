@@ -1,4 +1,4 @@
-.PHONY: tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only check-bootstrap-seed smoke-bootstrap-seed test clean
+.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only check-bootstrap-seed smoke-bootstrap-seed test clean
 
 
 # scratch paths for the bootstrap seed checks; both are removed by their targets
@@ -67,6 +67,12 @@ build:
 
 check-no-panics:
 	bash tooling/check_no_panics.sh
+
+# no frame in the runtime may hold a thread-local's address, or a green task
+# resumed on another worker reads the wrong thread's cell. this audits the
+# built archive, not the source: the relocation model and the accessors.
+check-tls-barriers:
+	bash tooling/check_tls_barriers.sh target/release/libpith_runtime.a
 
 # the world-stopping cycle-gc tests run one at a time in their own process:
 # a stop request parks every gated thread in the binary, and the collector

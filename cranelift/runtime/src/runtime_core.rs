@@ -2020,18 +2020,36 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
         return value;
     }
 
-    if let Some(v) = TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied()) {
+    if let Some(v) = tls_globals_get(slot) {
         return v;
     }
     // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
     let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
     let value = thunk();
+    // another access on this thread during the thunk can't have run (single
+    // thread), so a plain insert is correct.
+    tls_globals_set(slot, value);
+    value
+}
+
+/// the two touches of the per-os-thread map, each behind a call the optimizer
+/// cannot inline. a `RefCell<HashMap>` has to be addressed as a value, and
+/// inlined into `pith_tls_get_or_init` that address was computed once and
+/// kept in a register across the initializer thunk — pith code. the branch
+/// is only taken off a green task, where the thunk cannot suspend a
+/// coroutine, but the rule that no frame spanning pith code holds a
+/// thread-local address is kept without exceptions, so that coupling is not
+/// load-bearing. see the accessor block in `concurrency/green.rs`.
+#[inline(never)]
+fn tls_globals_get(slot: i64) -> Option<i64> {
+    TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied())
+}
+
+#[inline(never)]
+fn tls_globals_set(slot: i64, value: i64) {
     TLS_GLOBALS.with(|t| {
-        // another access on this thread during the thunk can't have run (single
-        // thread), so a plain insert is correct.
         t.borrow_mut().insert(slot, value);
     });
-    value
 }
 
 /// Set this thread's value for a threadlocal global (a reassignment). The old
@@ -2046,9 +2064,7 @@ pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
         (*map).insert(slot, value);
         return;
     }
-    TLS_GLOBALS.with(|t| {
-        t.borrow_mut().insert(slot, value);
-    });
+    tls_globals_set(slot, value);
 }
 
 // Small structs are allocated and freed constantly — the result box built for
@@ -2212,6 +2228,17 @@ fn adopt_pool_slot() -> *mut PoolSlot {
 /// when the pool cannot be used — before the thread-local machinery is up, or
 /// after this thread released its slot — and the caller then goes to the
 /// allocator, which is always correct.
+///
+/// the fast path is a single `%fs:`-relative load of the cached pointer and
+/// may be inlined anywhere: the runtime is compiled for the executable it
+/// lives in, so the access carries no thread-local base a frame could keep
+/// across a park (see the accessor block in `concurrency/green.rs`). the
+/// first-use path is different: the lazily initialized handle's address has
+/// to exist as a value, and a struct release runs the value's destructor —
+/// pith code, which under the green backend can park — right before it
+/// returns the block here. so that path stays behind a call the optimizer
+/// may not inline, where the address is computed and consumed on whichever
+/// thread is running, never hoisted above the destructor.
 #[inline]
 fn pool_slot() -> *mut PoolSlot {
     let cached = POOL_SLOT_FAST
@@ -2223,9 +2250,15 @@ fn pool_slot() -> *mut PoolSlot {
     if !cached.is_null() {
         return cached;
     }
-    // first use on this thread: adopt, then cache. `try_with` because a
-    // struct freed during thread teardown, after the handle's turn in the
-    // destructor list has passed, must not re-create the thread-local.
+    pool_slot_slow()
+}
+
+/// first use on this thread: adopt, then cache. `try_with` because a struct
+/// freed during thread teardown, after the handle's turn in the destructor
+/// list has passed, must not re-create the thread-local.
+#[cold]
+#[inline(never)]
+fn pool_slot_slow() -> *mut PoolSlot {
     let slot = POOL_SLOT.try_with(|h| h.0).unwrap_or(std::ptr::null_mut());
     if !slot.is_null() {
         let _ = POOL_SLOT_FAST.try_with(|c| c.set(slot));

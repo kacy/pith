@@ -262,13 +262,32 @@ peak at 284 mb, measured interleaved against a server built from the
 same tree without that release, which came back at 672 mb. one edit
 costs 57 mb rather than 87, so the slope across the remaining nineteen
 is 12 mb an edit rather than 31. the thirty tables `initialize_checker`
-rebinds and the twenty-one the driver rebinds all reclaim; what is left
-per edit is the arena and whatever else a run allocates and never
-names.
+rebinds and the twenty-one the driver rebinds all reclaim.
 
-12 mb an edit is still a session that ends in the oom killer, just a
-much longer one. per-module caching, below, is what would stop the work
-being redone at all.
+what was left per edit was one emitter defect, found by diffing a
+full valgrind leak check after five analyses against one after two: `for ch in s`
+binds a fresh one-byte string every iteration (`char_at` allocates it,
+where a list loop's get borrows the element) and nothing released it.
+the checker walks module paths that way in its name helpers on every
+lookup, and the driver in every path helper, so the closure leaked
+about 60,000 one-byte strings an analysis before the arena or a table
+was counted. the loop owns that string now (see the `for` rule in
+[ownership.md](ownership.md)), and `tests/leaks/leak_string_chars`
+pins every exit a string loop has.
+
+resident set after 1, 10 and 50 analyses, one server driven over stdio
+with the same one-line edit repeated, sampled from `/proc` after each
+publish:
+
+| closure                       | modules | before (1 / 10 / 50)  | after (1 / 10 / 50)  |
+|-------------------------------|---------|-----------------------|----------------------|
+| self-host/pith_main.pith      |      53 |  65 / 116 / 317 mb    |  61 / 73 / 74 mb     |
+| examples/web_login.pith       |      54 |  88 / 191 / 649 mb    |  77 / 86 / 87 mb     |
+
+the slope was 5 mb an analysis on the first closure and 11.5 mb on the
+second; it is under 30 kb an analysis on both now, which is the
+allocator settling rather than a leak. what remains between the first
+analysis and the tenth is the working set reaching its size.
 
 ### what per-module caching would take
 
@@ -357,9 +376,6 @@ are diagnostic latency only.
 - document sync is full-text only; incremental sync is not offered. on
   a large file the cost of shipping and decoding the whole buffer per
   keystroke exceeds the cost of parsing it.
-- the server grows by about 12 mb per analysis and never gives it back,
-  so a long enough session on a large closure still ends in the oom
-  killer. see "memory over a session" above.
 - one document is analyzed per debounce — the most recently changed
   one — though diagnostics for other open documents that fall out of
   that run are published too.

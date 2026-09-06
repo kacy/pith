@@ -8759,6 +8759,21 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_emit("store " + fi + " " + idx_r.to_string())
     ir_emit("store " + fl + " " + len_r.to_string())
     ir_emit("store " + ft + " " + iter_r.to_string())
+    # a string loop's variable is a fresh one-byte string every iteration:
+    # char_at allocates, where a list's get borrows the element. nothing
+    # else holds a count on it, so the loop does. the slot starts null and
+    # is released at the step label (which a `continue` reaches) and nulled
+    # again there, so the end label's release (which a `break` reaches with
+    # the last byte still in the slot) is a no-op on the normal path; an
+    # early return leaves through the exit edges, which release it like the
+    # loop's iterable. before this every `for ch in s` leaked one string per
+    # byte walked, a megabyte an analysis in the checker's own name helpers.
+    owns_value := item_kind == "char" and names.value_name.len() > 0
+    value_slot := ir_loop_var_slot_name(fid, names.value_name)
+    if owns_value:
+        null_r := ir_reg()
+        ir_emit("iconst " + null_r.to_string() + " 0")
+        ir_emit("store " + value_slot + " " + null_r.to_string())
     head_l := ir_label()
     body_l := ir_label()
     step_l := ir_label()
@@ -8786,7 +8801,13 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
         ir_loop_iter_vars.push(ft)
         ir_loop_iter_kinds.push(iter_release_kind)
         pushed_iter = true
+    if owns_value:
+        ir_loop_iter_vars.push(value_slot)
+        ir_loop_iter_kinds.push("string")
     ir_block(node.children[1])
+    if owns_value:
+        ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+        ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
     if pushed_iter:
         ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
         ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
@@ -8796,6 +8817,11 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
+    if owns_value:
+        ir_emit_for_char_release(value_slot)
+        null_again := ir_reg()
+        ir_emit("iconst " + null_again.to_string() + " 0")
+        ir_emit("store " + value_slot + " " + null_again.to_string())
     idx3 := ir_reg()
     ir_emit("load " + idx3.to_string() + " " + fi)
     one_r := ir_reg()
@@ -8805,10 +8831,20 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_emit("store " + fi + " " + inc_r.to_string())
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
+    if owns_value:
+        ir_emit_for_char_release(value_slot)
     if iter_release_kind.len() > 0:
         fin_r := ir_reg()
         ir_emit("load " + fin_r.to_string() + " " + ft)
         ir_rc_release_reg(fin_r, iter_release_kind)
+
+# release the one-byte string a string loop's variable slot holds; a null
+# slot (before the first iteration, or after the step label cleared it)
+# releases as a no-op.
+fn ir_emit_for_char_release(value_slot: String):
+    held_r := ir_reg()
+    ir_emit("load " + held_r.to_string() + " " + value_slot)
+    ir_string_release_reg(held_r)
 
 # `for i in lo..hi` lowers to a counted loop over an Int counter, with no
 # intermediate list allocation. exclusive (`..`) stops at hi, inclusive

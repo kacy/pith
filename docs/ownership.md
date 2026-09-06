@@ -45,7 +45,14 @@ variables:
   its own. so it gets storage of its own for the length of the body,
   which keeps it out of the slot a local of the same name uses — where
   the rebind's release-the-old, and the exit cleanup on an early
-  return, would drop a count the loop never took
+  return, would drop a count the loop never took. the one exception is
+  a loop over a string: `char_at` mints a fresh one-byte string per
+  iteration and no container holds it, so the loop owns that count.
+  the slot is released at the step label (which `continue` reaches)
+  and cleared, at the end label (which `break` reaches with the byte
+  still bound), and at the function's exit edges alongside the loop's
+  owned iterable. the body still sees a borrow, so `return ch` and
+  `x := ch` retain as they always did
 - a module-level global's slot owns its value the same way a local
   does, so assigning one releases what it held. nothing else would: a
   global is not in any function's exit cleanup, and the store itself

@@ -78,6 +78,7 @@ cases=(
   tests/leaks/leak_list_search_widened_arg
   tests/leaks/leak_generic_instance_dtor
   tests/leaks/leak_generic_optional_return
+  tests/leaks/leak_string_chars
   tests/leaks/leak_generic_variant_slots
   tests/leaks/leak_generic_body_returned_local
   tests/leaks/leak_generic_field_kinds

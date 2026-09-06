@@ -258,11 +258,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   import closure on every change, so type errors on a large file still trail
   the last keystroke by the closure's check time. the fast lane takes itself
   out of the way on a file too large to parse inside the debounce window.
-  editing a module does not re-report its dependents, and the server grows by
-  about 12 mb per analysis without giving it back, so a long enough session on
-  a large closure still ends in the oom killer. it was about 31 mb an analysis
-  until an assignment over a global started releasing the table it replaces.
-  queries answer instantly from the last snapshot throughout. see
+  editing a module does not re-report its dependents. memory is flat across
+  analyses now: the growth of about 12 mb an analysis (31 mb before an
+  assignment over a global started releasing the table it replaces) was one
+  emitter defect, a string loop that never released the byte it bound, and a
+  50-analysis session on a 54-module closure sits at 87 mb where it reached
+  649 mb. queries answer instantly from the last snapshot throughout. see
   [docs/lsp.md](lsp.md) for the feature list, the measured phase split, the
   memory figures, and what per-module caching would take.
 - **no package registry** — dependencies are local path entries in `pith.toml`.

@@ -1,0 +1,94 @@
+# `for ch in s` binds a fresh one-byte string every iteration: char_at
+# allocates it, where a list loop's get borrows the element. nothing
+# released it, so every string walked leaked one string per byte. the
+# checker's own name helpers walk module paths that way on every lookup,
+# which made a language server grow by a megabyte an analysis before the
+# arena or a single table was counted.
+#
+# every exit a string loop has is here: the step label, `continue`,
+# `break` with the byte still bound, and a `return` from inside the body,
+# including one that hands the byte itself out. each is one count.
+import leakprobe as probe
+
+# the accumulate shape: module_symbol_prefix in the checker
+fn underscored(module_path: String) -> String:
+    mut out := ""
+    for ch in module_path:
+        if ch == ".":
+            out = out + "_"
+        else:
+            out = out + ch
+    return out + "_"
+
+# the indexed compare shape: get_directory in the driver
+fn last_slash(path: String) -> Int:
+    mut last := 0 - 1
+    for ch, i in path:
+        if ch == "/":
+            last = i
+    return last
+
+# a break leaves the loop with the byte still bound
+fn first_dot(path: String) -> Int:
+    mut at := 0 - 1
+    for ch, i in path:
+        if ch == ".":
+            at = i
+            break
+    return at
+
+# a continue reaches the step label from the middle of the body
+fn count_letters(text: String) -> Int:
+    mut n := 0
+    for ch in text:
+        if ch == "." or ch == "/":
+            continue
+        n = n + 1
+    return n
+
+# a return from inside the body leaves through the function's exit edges,
+# and the byte returned is the loop variable itself
+fn first_non_dot(text: String) -> String:
+    for ch in text:
+        if ch != ".":
+            return ch
+    return ""
+
+# the byte is bound and kept past the iteration
+fn bytes_of(text: String) -> List[String]:
+    mut out: List[String] := []
+    for ch in text:
+        kept := ch
+        out.push(kept)
+    return out
+
+# an inner loop reusing the outer loop's variable name has a slot of its own
+fn pairs(a: String, b: String) -> Int:
+    mut n := 0
+    for ch in a:
+        for ch in b:
+            if ch == "x":
+                n = n + 1
+        n = n + 1
+    return n
+
+fn churn_round(i: Int):
+    path := "std.net.http.server" + i.to_string()
+    mut used := underscored(path).len()
+    used = used + last_slash("self-host/lsp/state.pith")
+    used = used + first_dot(path)
+    used = used + count_letters(path)
+    used = used + first_non_dot("..." + path).len()
+    used = used + bytes_of(path).len()
+    used = used + pairs("abc", "xyx")
+    if used < 0:
+        print("unreachable")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

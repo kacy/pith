@@ -49,6 +49,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 normalize="$here/ir_normalize.py"
 [ -n "$out" ] || out="$(mktemp -d "${TMPDIR:-/tmp}/ir_compare.XXXXXX")"
 mkdir -p "$out"
+# the loop below runs from tree A, so a relative --out has to be made
+# absolute first or every trace line lands under A (or nowhere)
+out="$(cd "$out" && pwd)"
 : > "$out/trace.txt"; : > "$out/differ.txt"
 
 echo "A: $a ($(git -C "$a" rev-parse --short HEAD 2>/dev/null))"

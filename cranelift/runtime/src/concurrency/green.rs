@@ -236,7 +236,7 @@ pub extern "C" fn pith_green_maybe_yield() {
     let Some(id) = current_task() else {
         return;
     };
-    let Some(worker_index) = CURRENT_WORKER.with(|c| c.get()) else {
+    let Some(worker_index) = current_worker() else {
         return;
     };
 
@@ -977,12 +977,87 @@ thread_local! {
 
 }
 
+// ---------------------------------------------------------------------------
+// the thread-local accessors, and the rule they enforce.
+//
+// a coroutine that parks on one worker may be resumed on another (that is
+// what task migration is), so no frame that can be on the stack across a park
+// may hold the *address* of a thread-local cell. the compiler is the threat,
+// not the source. compiled as an ordinary library, a function that touches a
+// thread-local fetches the thread's tls base once (`__tls_get_addr`, which
+// the linker relaxes to a `%fs:0` load) and adds offsets to it for every
+// access in the frame, so a read after a suspend goes through the base of the
+// thread that ran the read before it. that was observed when migration was
+// first tried: one os thread reporting two different values of
+// `CURRENT_WORKER`, and a resumed receiver reading the previous thread's
+// handoff and dropping a message.
+//
+// two things close it, and both are checked on the built archive by
+// `tooling/check_tls_barriers.sh`:
+//
+// 1. the workspace is compiled with `-C relocation-model=pie`
+//    (`.cargo/config.toml`). the runtime is only ever linked into an
+//    executable, and telling the compiler so switches its thread-local model
+//    to local-exec: a plain cell read or write becomes one `%fs:`-relative
+//    instruction, the hardware applies the running thread's base on every
+//    access, and there is no base register for a frame to keep. every
+//    `CURRENT_*` access, the pool's fast-path slot and the collector's flag
+//    compile to that shape, which is why the accessors below are ordinary
+//    inlinable functions and cost nothing on the hot path.
+//
+// 2. a cell whose *address* has to exist as a value — the lazily initialized
+//    handle behind the pool slot, the `RefCell` maps `TLS_GLOBALS` and
+//    `MY_MUTATOR` — is touched only inside a `#[inline(never)]` function that
+//    returns before anything can suspend. the optimizer may fold identical
+//    address computations within one function; it may not fold them across
+//    a call it cannot inline.
+//
+// what a frame that spans a park holds is then only values. of those, a task
+// id and the tls map pointer belong to the task and stay right across a
+// migration; a worker index belongs to the thread and must be re-read (call
+// the accessor again) after any park.
+// ---------------------------------------------------------------------------
+
 /// the slab id of the green task running on this worker thread, or `None` when
 /// no green task is active here (the main thread, a non-worker thread, or the
 /// os-thread backend — where nothing ever sets this). `channel.rs` uses it to
 /// choose between suspending the coroutine (green) and condvar-waiting (os).
+///
+/// a task id is task-owned: reading it once at the top of a block site and
+/// carrying it across a park is right, and every block site does exactly that.
+#[inline]
 pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
+}
+
+/// the index of the worker this os thread is, or `None` off the pool. a
+/// worker index is thread-owned: it must not be carried across a park, and a
+/// caller that needs it after one calls this again.
+#[inline]
+fn current_worker() -> Option<usize> {
+    CURRENT_WORKER.with(|c| c.get())
+}
+
+/// stamp (or clear) this os thread's worker index. worker startup and the
+/// tests that pose as a worker.
+#[inline]
+fn set_current_worker(index: Option<usize>) {
+    CURRENT_WORKER.with(|c| c.set(index));
+}
+
+/// install a task's identity on this thread for the duration of a resume,
+/// returning what was there before. the two cells are always written
+/// together, which is what lets `pith_tls_get_or_init` take the per-task map
+/// branch for every green task: a coroutine never runs with `CURRENT_TASK`
+/// set and `CURRENT_TLS` null.
+#[inline]
+fn swap_task_identity(
+    task: Option<TaskId>,
+    tls: *mut HashMap<i64, i64>,
+) -> (Option<TaskId>, *mut HashMap<i64, i64>) {
+    let prev_task = CURRENT_TASK.with(|c| c.replace(task));
+    let prev_tls = CURRENT_TLS.with(|c| c.replace(tls));
+    (prev_task, prev_tls)
 }
 
 /// suspend the green task `id` back to its worker. must be called only from
@@ -1000,8 +1075,8 @@ pub(crate) fn current_task() -> Option<TaskId> {
 /// loaded. that is harmless only while a task always resumes on the thread it
 /// parked on. the slab id, by contrast, is a plain index that means the same
 /// thing on every thread, and the yielder is read out of the task's own sync
-/// block — so this path holds no thread-derived value at all. see the note on
-/// `debug_assert_stealable` for why that matters.
+/// block — so this path holds no thread-derived value at all. see the accessor
+/// block above `current_task` for the rule this is one instance of.
 pub(crate) fn park_current(id: TaskId) {
     // SAFETY: the caller is running inside task `id`, which means this worker
     // holds the Running claim on its block (see the claim protocol on
@@ -1096,7 +1171,7 @@ pub(crate) fn wake(id: TaskId) {
     // profiling: categorize this wake by where the waker sits relative to the
     // task's owner worker (read-only, gated).
     if stats_on() {
-        let caller = CURRENT_WORKER.with(|c| c.get());
+        let caller = current_worker();
         match (caller, owner) {
             (Some(w), Some(o)) if w == o => WAKE_SAME.fetch_add(1, AtomicOrdering::Relaxed),
             (Some(_), Some(_)) => WAKE_CROSS.fetch_add(1, AtomicOrdering::Relaxed),
@@ -1189,11 +1264,13 @@ pub(crate) fn take_handoff(id: TaskId) -> Option<i64> {
 /// this so that, under the green backend, each task reads and writes its own
 /// thread-local globals rather than sharing the worker OS thread's map.
 ///
-/// the returned pointer is only valid to dereference synchronously, from this
-/// same thread, before control returns to the scheduler — that is, from within
-/// the pith call that produced this access. `run_task` guarantees the pointed-to
-/// `Box` outlives the whole `resume`, and only this worker thread ever touches
-/// its own current task, so there is no aliasing across threads.
+/// the returned pointer is task-owned: it targets the `Box` the task's slab
+/// entry holds, which `run_task` keeps alive for the whole `resume` and which
+/// only the running task ever dereferences — so it stays right across a park
+/// even when the task resumes on another thread, and the `threadlocal`
+/// initializer thunk (pith code, which can park) may run between a read of
+/// this and the map insert that follows it.
+#[inline]
 pub(crate) fn current_task_tls() -> Option<*mut HashMap<i64, i64>> {
     let ptr = CURRENT_TLS.with(|c| c.get());
     if ptr.is_null() {
@@ -1391,7 +1468,7 @@ fn monitor_loop() {
 /// queue is stack-empty and safe to move across threads.
 fn enqueue_fresh(id: TaskId) {
     let sched = scheduler();
-    match CURRENT_WORKER.with(|c| c.get()) {
+    match current_worker() {
         Some(i) => sched.workers[i]
             .local
             .lock()
@@ -1439,7 +1516,7 @@ fn enqueue_woken(owner: usize, id: TaskId) {
         // the tasks queued behind it (preemption cannot rescue that shape —
         // each half re-parks long before it overruns a quantum). cross-worker
         // wakes are plain fifo.
-        if CURRENT_WORKER.with(|c| c.get()) == Some(owner) {
+        if current_worker() == Some(owner) {
             pinned.push_next(id);
         } else {
             pinned.push(id);
@@ -1524,69 +1601,22 @@ fn note_notify() {
 /// worker than last time — a coroutine that may carry live pith stack, the
 /// unsound case the manual `Send` forbids. cheap, and compiled out in release.
 ///
-/// worth knowing before anyone tries to relax this: the obvious win here is to
-/// re-home a *parked* task to whichever worker keeps waking it, so a pair that
-/// talks to each other stops paying a cross-worker wake per message. the state
-/// machine allows it — a parked task's coroutine is back in its block, in no
-/// queue, and the waker that wins the Parked -> Ready CAS could name a new owner
-/// in that same CAS. it was tried and it is fast. it was also **unsound**, for a
-/// reason that is worth stating precisely, because the earlier note here got it
-/// wrong twice over.
-///
-/// the hazard is not the pith compiler. pith emits no thread-local access at
-/// all: a `threadlocal` global lowers to a CALL (`pith_tls_get_or_init` /
-/// `pith_tls_set`), so there is nothing for it to cache. and `CURRENT_TLS` is
-/// per-TASK, not per-thread, so pith-level thread-locals are migration-correct
-/// by construction.
-///
-/// the hazard is *this file's own Rust frames*. rustc may hoist the address of a
-/// `thread_local!` and reuse it after a suspension, at which point a coroutine
-/// resumed on a different thread reads the previous thread's cell. that was
-/// observed: one physical thread reporting two different values of
-/// `CURRENT_WORKER`, which is written once at worker startup and never changes,
-/// and `take_handoff` returning `None` for a migrated receiver — silently
-/// dropping channel messages.
-///
-/// so the fix is not a barrier, it is removing the reads. the invariant now is:
-///
-///   **the `CURRENT_*` cells may be read only at task entry — from `run_task`
-///   or the top of a coroutine body — and never re-read after a park.**
-///
-/// `park_current` and `take_handoff` take a `TaskId` rather than looking one up,
-/// every block site reads its id once before parking and threads it through by
-/// value, and a slab index means the same thing on every thread. `CURRENT_WORKER`
-/// is read in a spanning frame only by `pith_green_maybe_yield`, where the index
-/// is bounds-checked before use, so a stale value cannot even index out of range.
-///
-/// the object code has now been checked, and the invariant holds: across every
-/// unit that both touches thread-local storage and can be on the stack at a
-/// suspend, no TLS-derived address survives the suspend into a use — in a
-/// register or a spilled stack slot. no `std`, allocator, `parking_lot` or
-/// cycle-collector thread-local is reachable from such a frame at all. panic
-/// machinery in particular is clean: `run_task`'s `catch_unwind` sits on the
-/// *worker* stack, which structurally cannot migrate, and a coroutine that
-/// panicked is dropped rather than resumed.
-///
-/// ★ how to re-check it, because the obvious method silently measures nothing.
-/// `libpith_runtime.a` is relocatable, so its thread-local accesses are still in
-/// the general/local-dynamic form — `lea tlsld(%rip),%rdi; call __tls_get_addr`
-/// — and contain **zero** bytes of `%fs:`. grepping the archive for `%fs:`
-/// therefore returns 0 for every function, including ones that read a
-/// thread-local on every line. either count TLS *relocations* (`R_X86_64_TLSGD`
-/// / `TLSLD` / `DTPOFF32`) in the function's own body, or link first and read the
-/// relaxed form. the archive currently carries 51 TLSGD + 67 TLSLD + 149
-/// DTPOFF32 and 0 `%fs:`, which is the proof that the grep is vacuous.
-///
-/// ★★ one hazard of exactly the kind described above is live TODAY, and is safe
-/// only by coupling: `pith_tls_get_or_init` caches the address of the
-/// `TLS_GLOBALS` cell in a callee-saved register across the compiler-emitted
-/// `threadlocal` initializer thunk, which is arbitrary pith code and can park.
-/// the source splits that into two separate `.with()` closures; LLVM CSE'd the
-/// address across them anyway. it is safe because that branch is taken iff
-/// `CURRENT_TLS` is null or the backend is not green — i.e. iff no coroutine
-/// exists to suspend — and `run_task` sets and clears `CURRENT_TLS` and
-/// `CURRENT_TASK` together. if migration is built, that coupling becomes
-/// load-bearing and should be asserted rather than assumed.
+/// worth knowing before anyone relaxes this: the obvious win is to re-home a
+/// *parked* task to whichever worker keeps waking it, so a pair that talks to
+/// each other stops paying a cross-worker wake per message. the state machine
+/// allows it — a parked task's coroutine is back in its block, in no queue,
+/// and the waker that wins the Parked -> Ready CAS can name a new owner in
+/// that same CAS. it was tried, it is fast, and the first attempt was unsound
+/// for a reason that had nothing to do with the coroutine stack, which
+/// migrates fine: this file's own rust frames held thread-local cell addresses
+/// across a suspend (see the accessor block above `current_task` for the
+/// mechanism and the rule that now prevents it). the pith compiler was never
+/// the hazard — a `threadlocal` global lowers to a call, and `CURRENT_TLS` is
+/// per-task — so with the runtime compiled for the executable it lives in and
+/// its address-taking reads behind calls, nothing on the resumable path
+/// derives a value from the thread it parked on. `pith_green_cross_thread_probe`
+/// forces the cross-thread resume by hand, and `tests/cross_thread_resume.rs`
+/// runs it against the shipped archive; that is the check to keep green.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
     if let Some(block) = sync_block(id) {
@@ -1820,7 +1850,7 @@ fn has_any_work(index: usize) -> bool {
 
 /// the worker thread body: take work, run it, park when there is none.
 fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>) {
-    CURRENT_WORKER.with(|c| c.set(Some(index)));
+    set_current_worker(Some(index));
     // a worker moves reference counts, so it is a mutator the cycle collector
     // must be able to stop. the slot was registered by the spawning thread
     // (see `ensure_workers_started`); adopting it makes it this thread's own.
@@ -1965,7 +1995,7 @@ fn run_task(id: TaskId) {
         }
         let mut next = (word & S_OWNER_MASK) | S_RUNNING;
         if next & S_OWNER_MASK == 0 {
-            if let Some(w) = CURRENT_WORKER.with(|c| c.get()) {
+            if let Some(w) = current_worker() {
                 next |= owner_bits(w);
             }
         }
@@ -2013,14 +2043,13 @@ fn run_task(id: TaskId) {
     // restored afterward. the yielder is NOT installed here — it lives in the
     // task's own sync block, published by the body on its first resume, so the
     // park path never has to consult a thread-local at all.
-    let prev_tls = CURRENT_TLS.with(|c| c.replace(tls_ptr));
-    let prev_task = CURRENT_TASK.with(|c| c.replace(Some(id)));
+    let (prev_task, prev_tls) = swap_task_identity(Some(id), tls_ptr);
 
     // publish this task as the worker's running task and stamp the epoch, so the
     // monitor thread can detect a quantum overrun and set the preempt flag. only
     // the monitor reads these, and only via atomics, so this never races the
     // coroutine. cleared right after the resume returns.
-    let worker_index = CURRENT_WORKER.with(|c| c.get());
+    let worker_index = current_worker();
     if let Some(w) = worker_index {
         let worker = &scheduler().workers[w];
         worker
@@ -2056,8 +2085,7 @@ fn run_task(id: TaskId) {
             .store(0, AtomicOrdering::Relaxed);
     }
 
-    CURRENT_TASK.with(|c| c.set(prev_task));
-    CURRENT_TLS.with(|c| c.set(prev_tls));
+    swap_task_identity(prev_task, prev_tls);
 
     match outcome {
         Ok(CoroutineResult::Return(result)) => {
@@ -2362,6 +2390,155 @@ fn join_for(task_handle: i64) -> Option<Arc<(Mutex<Join>, Condvar)>> {
         .map(|task| task.join.clone())
 }
 
+// ---------------------------------------------------------------------------
+// the cross-thread resume probe.
+//
+// a task parked on one os thread and resumed on another must see the resuming
+// thread's identity — its worker index — and must still find its own task id
+// and tls map, which the resuming thread's `run_task` installs. that is the
+// resume a migration performs, and this probe forces it by hand: the calling
+// thread poses as worker 0 and runs a task until it parks; a second os thread,
+// posing as the last worker, claims the task and resumes it; the task body
+// reports what it saw. `tests/cross_thread_resume.rs` drives it.
+//
+// it lives in library code rather than in the test module for a reason that
+// is the whole point of the check. what makes a stale read possible is the
+// code shape of the *shipped* runtime — the tls model `libpith_runtime.a`
+// is compiled with (see the accessor block above `current_task`). a `cargo
+// test` binary is an executable in its own right, always gets the local-exec
+// model whatever the workspace is configured with, and so can never observe
+// the hazard however its body is written: the archive built with the
+// dynamic model failed this probe (worker `none` after the resume, identity
+// lost) while the identical body passed inside the test binary. the probe's
+// body is therefore compiled here, and the integration test runs it a
+// second time through a c harness linked against the archive, which is how
+// every pith program links it.
+// ---------------------------------------------------------------------------
+
+/// pack the probe's readings: the pool's worker count (bits 24..32), the
+/// worker seen before the park (bits 16..24), the worker seen after (bits
+/// 8..16; 0xff for "none"), and whether the task id and tls map seen after
+/// the park are still the task's own (bit 0). `-1` means the probe could not
+/// run: the pool has fewer than two workers, so there is no second identity
+/// to pose as.
+#[doc(hidden)]
+pub fn encode_probe(workers: usize, before: Option<usize>, after: Option<usize>, own: bool) -> i64 {
+    let n = (workers.min(0xff)) as i64;
+    let b = before.map_or(0xff, |w| w as i64);
+    let a = after.map_or(0xff, |w| w as i64);
+    (n << 24) | (b << 16) | (a << 8) | i64::from(own)
+}
+
+/// run the cross-thread resume scenario and report what the task body saw,
+/// encoded by `encode_probe`. the expected value is
+/// `encode_probe(n, Some(0), Some(n - 1), true)` for a pool of `n` workers.
+///
+/// exported unmangled so a harness linked against the archive can call it.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
+    // build the scheduler without starting its workers: the two identities
+    // below are posed by this thread and a plain spawned thread, and a real
+    // worker draining queues would race the hand-off.
+    let n = scheduler().workers.len();
+    if n < 2 {
+        return -1;
+    }
+    let first = 0;
+    let second = n - 1;
+    set_current_worker(Some(first));
+
+    let coro = TaskCoroutine::with_stack(
+        take_stack(),
+        move |yielder: &TaskYielder, _input: ()| -> i64 {
+            publish_yielder(yielder as *const TaskYielder);
+            let Some(id) = current_task() else {
+                return encode_probe(n, None, None, false);
+            };
+            let tls = current_task_tls();
+            let before = current_worker();
+            park_current(id);
+            // every read from here on is on whichever thread resumed us.
+            let after = current_worker();
+            let own = current_task() == Some(id) && current_task_tls() == tls;
+            encode_probe(n, before, after, own)
+        },
+    );
+    let (id, generation) = {
+        let mut slab = lock_slab();
+        let (id, generation) = slab.insert(Task {
+            closure_handle: 0,
+            done: false,
+            result: 0,
+            reclaim_on_done: false,
+            join: Arc::new((
+                Mutex::new(Join {
+                    done: false,
+                    result: 0,
+                    green_waiters: Vec::new(),
+                    condvar_waiters: 0,
+                }),
+                Condvar::new(),
+            )),
+            tls: Box::new(HashMap::new()),
+        });
+        let tls_ptr: *mut HashMap<i64, i64> = slab
+            .get_mut(id)
+            .map(|task| &mut *task.tls as *mut _)
+            // panic-guard: `slab.insert` returned this id on the line above, still under the slab lock.
+            .expect("freshly inserted task");
+        scheduler()
+            .sync
+            .ensure(id)
+            .reset(SendCoroutine(coro), tls_ptr);
+        (id, generation)
+    };
+
+    // first resume, on this thread: the body parks. claim it the way a waker
+    // does (Parked -> Ready) but hand it straight to the thread below instead
+    // of enqueueing it, so a real worker 0 — if the process has started the
+    // pool — cannot take it first.
+    run_task(id);
+    set_current_worker(None);
+    let Some(block) = sync_block(id) else {
+        return encode_probe(n, None, None, false);
+    };
+    let word = block.word.load(AtomicOrdering::Acquire);
+    if word & S_STATE_MASK != S_PARKED
+        || block
+            .word
+            .compare_exchange(
+                word,
+                (word & S_OWNER_MASK) | S_READY,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+    {
+        return encode_probe(n, None, None, false);
+    }
+
+    let resumed = std::thread::Builder::new()
+        .name("pith-probe-resumer".to_string())
+        .spawn(move || {
+            set_current_worker(Some(second));
+            run_task(id);
+            set_current_worker(None);
+            let mut slab = lock_slab();
+            match slab.get_mut(id) {
+                Some(task) if task.done => task.result,
+                _ => encode_probe(n, None, None, false),
+            }
+        });
+    let result = match resumed {
+        Ok(handle) => handle.join().unwrap_or_else(|_| encode_probe(n, None, None, false)),
+        Err(_) => encode_probe(n, None, None, false),
+    };
+    // the slot is done and nobody awaits it: give it back.
+    lock_slab().reclaim(id, generation);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2465,7 +2642,7 @@ mod tests {
     fn maybe_yield_parks_and_requeues_on_owner() {
         let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // act as worker 0 for the duration of this test.
-        CURRENT_WORKER.with(|c| c.set(Some(0)));
+        set_current_worker(Some(0));
 
         // a task body that, on its first resume, simulates the monitor observing
         // time pass (bumps the epoch past the quantum) and then hits a safe-point;
@@ -2516,7 +2693,7 @@ mod tests {
         }
 
         PITH_PREEMPT_REQUESTED.store(0, AtomicOrdering::Relaxed);
-        CURRENT_WORKER.with(|c| c.set(None));
+        set_current_worker(None);
     }
 
     // push a Ready task wrapping `coro` (with its own fresh join) into the slab
@@ -2565,7 +2742,7 @@ mod tests {
     #[test]
     fn panicking_task_marks_done_and_keeps_worker_alive() {
         let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        CURRENT_WORKER.with(|c| c.set(Some(0)));
+        set_current_worker(Some(0));
 
         let coro = TaskCoroutine::with_stack(
             corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
@@ -2625,7 +2802,7 @@ mod tests {
             assert_eq!(task.result, 7, "worker still runs tasks after a panic");
         }
 
-        CURRENT_WORKER.with(|c| c.set(None));
+        set_current_worker(None);
     }
 
     // a minimal task for the slab-logic tests below. these tests use their own
@@ -2808,7 +2985,7 @@ mod tests {
     #[test]
     fn parked_task_wakes_once_onto_owner_pinned_queue() {
         let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        CURRENT_WORKER.with(|c| c.set(Some(0)));
+        set_current_worker(Some(0));
         // start from an empty pinned queue so the assertions below see only
         // this test's enqueues.
         while scheduler().workers[0]
@@ -2870,6 +3047,6 @@ mod tests {
             S_DONE
         );
 
-        CURRENT_WORKER.with(|c| c.set(None));
+        set_current_worker(None);
     }
 }

@@ -363,8 +363,9 @@ heap instead of blocking the worker, so a task sleeping out a backoff — or a
 is also why the default is linux-only; see "which backend to use".
 
 where a task runs is decided once. a task pins to the worker that first runs it
-and stays there — a suspended coroutine may hold live pith stack, so moving it
-between threads is not safe. that makes the placement a pair of communicating
+and stays there: the scheduler does not yet move a suspended task between
+workers (the runtime is now built so that it safely could — see the placement
+note in `docs/limitations.md`). that makes the placement a pair of communicating
 tasks happens to get a lasting property of the program, and the two cases cost
 very differently: colocated, each handoff is the userspace switch above; split
 across workers, each one is a park and a futex wake. a two-task ping-pong

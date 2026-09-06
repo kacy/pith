@@ -1,0 +1,16 @@
+# the runtime is compiled for the executable it is linked into.
+#
+# libpith_runtime.a only ever lands in an executable (a pith program, the
+# compiler, ir_driver), never in a shared object, and telling the compiler so
+# changes how its thread-locals are addressed. compiled as an ordinary
+# library, a function that touches a thread-local fetches the thread's tls
+# base once and adds offsets to it for every access in the frame; a green
+# task that parks on one worker and resumes on another then reads the first
+# worker's cells through that cached base. compiled for an executable, every
+# access is one `%fs:`-relative instruction with no base to cache.
+# `tooling/check_tls_barriers.sh` (`make check-tls-barriers`) checks the built
+# archive for exactly that, and `cranelift/runtime/tests/cross_thread_resume.rs`
+# forces the cross-thread resume against it. a `RUSTFLAGS` in the environment
+# replaces this setting rather than adding to it, which both checks catch.
+[build]
+rustflags = ["-C", "relocation-model=pie"]

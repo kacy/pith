@@ -8,6 +8,7 @@ from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, node_count, reset_arena
 from checker import initialize_checker, c_run_module
 from errors import Diagnostic
+from std.collections import copy_list, copy_map
 import std.time as time
 # note: codegen removed — compilation handled by Cranelift native backend
 
@@ -174,6 +175,102 @@ pub fn import_module_timings() -> List[String]:
         lines.push(import_timed_files[i] + " " + import_timed_us[i].to_string() + "us")
         i = i + 1
     return lines
+
+# what the last walk did, in the order it did it: every import edge it
+# resolved, as (module path, the file that imported it, the file it
+# resolved to), diamond edges to an already-read file included; and
+# every module file it read, with the content it read. a cache over the
+# closure validates against these before trusting a previous walk: the
+# edges are resolved again and the files are read again, and if every
+# one answers the same the closure is what it was.
+mut walk_edge_paths: List[String] := []
+mut walk_edge_sources: List[String] := []
+mut walk_edge_files: List[String] := []
+mut walk_read_files: List[String] := []
+mut walk_contents: List[String] := []
+
+# every module file the last walk read, in walk order.
+pub fn walk_module_files() -> List[String]:
+    return copy_list(walk_read_files)
+
+# the driver's state after a walk, copied out so a later run can resume
+# from it without walking again. package dependency tables are included
+# because the walk fills them lazily and the E247 resolution of a later
+# import reads them.
+pub struct DriverSnapshot:
+    pub stdlib_root: String
+    pub visited: Map[String, Bool]
+    pub parse_diagnostics: List[Diagnostic]
+    pub module_paths: Map[Int, String]
+    pub module_files: Map[Int, String]
+    pub dependency_loaded: Map[String, Bool]
+    pub dependency_roots: Map[String, String]
+    pub range_starts: List[Int]
+    pub range_ends: List[Int]
+    pub range_files: List[String]
+    pub edge_paths: List[String]
+    pub edge_sources: List[String]
+    pub edge_files: List[String]
+    pub read_files: List[String]
+    pub contents: List[String]
+
+# copy the driver's post-walk state out.
+pub fn take_driver_snapshot() -> DriverSnapshot:
+    return DriverSnapshot(
+        stdlib_root: stdlib_root_directory,
+        visited: copy_map(visited_files),
+        parse_diagnostics: copy_list(driver_parse_diagnostics),
+        module_paths: copy_map(resolved_module_paths),
+        module_files: copy_map(resolved_module_files),
+        dependency_loaded: copy_map(package_dependency_loaded),
+        dependency_roots: copy_map(package_dependency_roots),
+        range_starts: copy_list(module_range_starts),
+        range_ends: copy_list(module_range_ends),
+        range_files: copy_list(module_range_files),
+        edge_paths: copy_list(walk_edge_paths),
+        edge_sources: copy_list(walk_edge_sources),
+        edge_files: copy_list(walk_edge_files),
+        read_files: copy_list(walk_read_files),
+        contents: copy_list(walk_contents))
+
+# make the driver's state a copy of the snapshot: what a walk over the
+# same closure would have left, timings aside. the snapshot is left as
+# it was.
+pub fn restore_driver_snapshot(s: DriverSnapshot):
+    stdlib_root_directory = s.stdlib_root
+    visited_files = copy_map(s.visited)
+    files_being_checked = {}
+    driver_parse_diagnostics = copy_list(s.parse_diagnostics)
+    resolved_module_paths = copy_map(s.module_paths)
+    resolved_module_files = copy_map(s.module_files)
+    package_dependency_loaded = copy_map(s.dependency_loaded)
+    package_dependency_roots = copy_map(s.dependency_roots)
+    module_range_starts = copy_list(s.range_starts)
+    module_range_ends = copy_list(s.range_ends)
+    module_range_files = copy_list(s.range_files)
+    walk_edge_paths = copy_list(s.edge_paths)
+    walk_edge_sources = copy_list(s.edge_sources)
+    walk_edge_files = copy_list(s.edge_files)
+    walk_read_files = copy_list(s.read_files)
+    walk_contents = copy_list(s.contents)
+    reset_import_timings()
+
+# true when walking the closure again would read exactly what the
+# recorded walk read: every import edge resolves to the same file and
+# every file's content, read through the overlays as always, is the same.
+# a file that vanished, a new file that shadows a dependency, an edited
+# module and an edited overlay all answer false. the entry file's own
+# imports are the caller's to compare; this covers what the walk did.
+pub fn walk_is_unchanged(s: DriverSnapshot) -> Bool:
+    for mod_path, i in s.edge_paths:
+        if dr_resolve_module_file(mod_path, s.edge_sources[i]) != s.edge_files[i]:
+            return false
+    for file, i in s.read_files:
+        current := dr_read_source(file) catch:
+            return false
+        if current != s.contents[i]:
+            return false
+    return true
 
 fn record_module_node_range(start: Int, end: Int, file: String):
     if end <= start:
@@ -450,6 +547,18 @@ fn dr_find_stdlib_root(source_path: String) -> String:
         depth = depth + 1
     return ""
 
+# the line and column of each import declaration in `imports`, as two
+# parallel lists, for the E247 report resolve_import_list makes when one
+# of them resolves to no file.
+pub fn import_positions(root_idx: Int, imports: List[String]) -> (List[Int], List[Int]):
+    mut lines: List[Int] := []
+    mut cols: List[Int] := []
+    for mod_path in imports:
+        pos := dr_import_position(root_idx, mod_path)
+        lines.push(pos.0)
+        cols.push(pos.1)
+    return (lines, cols)
+
 # resolve imports recursively via DFS.
 # returns module roots in dependency order (leaves first).
 pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
@@ -457,7 +566,20 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
     if driver_parse_diagnostics.len() > 0:
         return roots
     imports := find_imports(root_idx)
-    for mod_path in imports:
+    positions := import_positions(root_idx, imports)
+    return resolve_import_list(imports, positions.0, positions.1, source_path)!
+
+# the import walk from a list of module paths rather than a root node,
+# with the line and column of each import declaration alongside for the
+# E247 report. this is what lets a caller parse the entry file, take its
+# imports, and walk them before the entry file's nodes exist in the
+# arena — the language server does that so the imports' nodes come
+# first and keep their indices from one analysis to the next.
+pub fn resolve_import_list(imports: List[String], lines: List[Int], cols: List[Int], source_path: String) -> List[Int]!:
+    mut roots: List[Int] := []
+    if driver_parse_diagnostics.len() > 0:
+        return roots
+    for mod_path, position in imports:
         resolve_started := time.mono_nanos()
         file_path := dr_resolve_module_file(mod_path, source_path)
         import_resolve_us = import_resolve_us + (time.mono_nanos() - resolve_started) / 1000
@@ -466,9 +588,11 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         # `import fs` (should be `std.fs`) checked clean and emitted
         # nothing. report it here as a proper diagnostic instead.
         if not dr_source_exists(file_path):
-            pos := dr_import_position(root_idx, mod_path)
-            driver_parse_diagnostics = [Diagnostic("error", "E247", "cannot find module '" + mod_path + "'", source_path, pos.0, pos.1, "check the module path; standard modules are imported as std.<name>")]
+            driver_parse_diagnostics = [Diagnostic("error", "E247", "cannot find module '" + mod_path + "'", source_path, lines[position], cols[position], "check the module path; standard modules are imported as std.<name>")]
             return roots
+        walk_edge_paths.push(mod_path)
+        walk_edge_sources.push(source_path)
+        walk_edge_files.push(file_path)
         if visited_files.contains_key(file_path):
             continue
         # Check for import cycles (must check this AFTER checking visited)
@@ -488,6 +612,8 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         visited_files.insert(file_path, true)
         read_started := time.mono_nanos()
         content := dr_read_source(file_path)!
+        walk_read_files.push(file_path)
+        walk_contents.push(content)
         lex_started := time.mono_nanos()
         tokens := lex_all(content)
         range_start := node_count()
@@ -521,6 +647,15 @@ pub fn mark_visited(path: String):
 # initialize driver state for import resolution.
 # sets up stdlib root and resets the visited and checking maps.
 pub fn init_driver(source_path: String):
+    begin_driver(source_path)
+    # every caller parses the entry file before calling init_driver, so
+    # the arena's current contents are exactly the root module's nodes
+    record_module_node_range(0, node_count(), source_path)
+
+# init_driver without the entry file's node range: for a caller that
+# parses the entry file after the walk rather than before it, and records
+# the range itself with record_entry_node_range once the nodes exist.
+pub fn begin_driver(source_path: String):
     if not stdlib_root_known:
         cached_stdlib_root = dr_find_stdlib_root(source_path)
         stdlib_root_known = true
@@ -533,13 +668,21 @@ pub fn init_driver(source_path: String):
     package_dependency_loaded = {}
     package_dependency_roots = {}
     reset_import_timings()
-    # every caller parses the entry file before calling init_driver, so
-    # the arena's current contents are exactly the root module's nodes
     module_range_starts = []
     module_range_ends = []
     module_range_files = []
-    record_module_node_range(0, node_count(), source_path)
+    walk_edge_paths = []
+    walk_edge_sources = []
+    walk_edge_files = []
+    walk_read_files = []
+    walk_contents = []
     mark_visited(source_path)
+
+# attribute the arena slice [start, end) to the entry file. the slice
+# has to come after every range recorded by the walk, because
+# file_for_node searches the ranges in ascending order of their starts.
+pub fn record_entry_node_range(start: Int, end: Int, source_path: String):
+    record_module_node_range(start, end, source_path)
 
 # whatever went wrong during the import walk: an E247 for a module path
 # that resolves to no file, or the parser's own diagnostics for an

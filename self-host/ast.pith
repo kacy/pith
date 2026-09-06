@@ -98,3 +98,32 @@ pub fn truncate_arena(count: Int):
         return
     while nodes.len() > count:
         nodes.remove(nodes.len() - 1)
+
+# copy every node from `start` on out of the arena and drop them from it,
+# so they can be put back at another position with append_relocated_nodes.
+# the language server uses the pair to parse an entry file first (its
+# imports come from its nodes) and still end up with the imports' nodes
+# in front of it, where they keep their indices from one analysis to the
+# next.
+pub fn take_nodes_from(start: Int) -> List[Node]:
+    mut taken: List[Node] := []
+    mut i := start
+    while i < nodes.len():
+        taken.push(nodes[i])
+        i = i + 1
+    truncate_arena(start)
+    return taken
+
+# append nodes taken from `old_start` at the arena's end, rewriting every
+# child index by the distance they moved. returns that distance, so a
+# caller adds it to any index it kept (the root's). children are the
+# only place a node refers to another node, so a relocated tree reads
+# exactly as it did.
+pub fn append_relocated_nodes(taken: List[Node], old_start: Int) -> Int:
+    shift := nodes.len() - old_start
+    for n in taken:
+        mut kids: List[Int] := []
+        for c in n.children:
+            kids.push(c + shift)
+        nodes.push(Node(n.kind, n.value, kids, n.line, n.col))
+    return shift

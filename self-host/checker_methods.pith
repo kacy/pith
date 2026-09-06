@@ -8,6 +8,8 @@
 # name key remembers the owning tid so a lookup on a different declaration
 # of the same name can refuse it. only the tid can disambiguate.
 
+from std.collections import copy_map
+
 mut method_decl_index_map: Map[String, Int] := {}
 mut method_decl_owner_map: Map[String, Int] := {}
 
@@ -75,3 +77,18 @@ pub fn method_declaration_owner(key: String) -> Int:
     if method_decl_owner_map.contains_key(key):
         return method_decl_owner_map[key]
     return -1
+
+## both registries copied, so a run can be put back to the state they
+## held after some modules were checked.
+pub struct MethodsSnapshot:
+    pub decl_index: Map[String, Int]
+    pub decl_owner: Map[String, Int]
+
+## copy the registries out.
+pub fn take_methods_snapshot() -> MethodsSnapshot:
+    return MethodsSnapshot(copy_map(method_decl_index_map), copy_map(method_decl_owner_map))
+
+## make the live registries a copy of the snapshot.
+pub fn restore_methods_snapshot(s: MethodsSnapshot):
+    method_decl_index_map = copy_map(s.decl_index)
+    method_decl_owner_map = copy_map(s.decl_owner)

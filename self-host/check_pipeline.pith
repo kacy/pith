@@ -7,10 +7,11 @@
 
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
-from ast import reset_arena, get_node, node_count, truncate_arena
-from driver import init_driver, resolve_imports, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings
-from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of
+from ast import reset_arena, get_node, node_count, truncate_arena, take_nodes_from, append_relocated_nodes
+from driver import init_driver, begin_driver, resolve_imports, resolve_import_list, find_imports, import_positions, record_entry_node_range, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings, walk_module_files, walk_is_unchanged, DriverSnapshot, take_driver_snapshot, restore_driver_snapshot
+from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of, CheckerSnapshot, take_checker_snapshot, restore_checker_snapshot
 from errors import Diagnostic
+from std.collections import copy_list
 import std.time as time
 
 # where the last run's wall time went, in milliseconds per phase. the
@@ -23,6 +24,12 @@ mut timing_imports_ms := 0
 mut timing_check_ms := 0
 mut timing_module_count := 0
 mut timing_parse_only_ms := 0
+# what the closure cache did on the last run: "off" when the cache is not
+# enabled, "hit" when the imports were reused, "miss" when they were
+# walked and checked again. the snapshot figure is what copying the state
+# in or out cost.
+mut timing_cache := "off"
+mut timing_snapshot_ms := 0
 
 # how long the checker spent on each module of the last run, in
 # microseconds, in the order it checked them — imports first, entry
@@ -35,7 +42,7 @@ mut timing_check_us: List[Int] := []
 ## lexes, parses, and reads every import), and checking the closure.
 pub fn last_timing_line() -> String:
     total := timing_lex_ms + timing_parse_ms + timing_imports_ms + timing_check_ms
-    return "total={total}ms lex={timing_lex_ms}ms parse={timing_parse_ms}ms imports={timing_imports_ms}ms check={timing_check_ms}ms modules={timing_module_count}"
+    return "total={total}ms lex={timing_lex_ms}ms parse={timing_parse_ms}ms imports={timing_imports_ms}ms check={timing_check_ms}ms modules={timing_module_count} cache={timing_cache} snapshot={timing_snapshot_ms}ms"
 
 ## the last run broken down one line per module: an "import" line per
 ## file the walk read (locating, reading, lexing, and parsing it) and a
@@ -94,9 +101,175 @@ pub fn run_parse_only(path: String) -> List[Diagnostic]!:
     timing_parse_only_ms = time.mono_millis() - started
     return diags
 
+# ---------------------------------------------------------------
+# the closure cache
+# ---------------------------------------------------------------
+#
+# a long-lived tool runs the pipeline on the same entry file over and
+# over, and nearly every run finds the import closure exactly as it was:
+# the edit was in the entry file. the cache keeps what the imports
+# produced, so such a run reads, lexes, parses and checks the entry file
+# alone.
+#
+# what it keeps: the imports' nodes, left in place at the front of the
+# arena; the driver's state after the walk; and the checker's whole
+# state after the imports were checked, copied out. what it keys on:
+# the entry path, the entry's import list in order, and the walk itself
+# validated edge by edge and file by file (walk_is_unchanged), so an
+# edited module, an edited overlay, a file that appeared or vanished on
+# a resolution path, all miss.
+#
+# the arena order is the trick that makes the node indices stable. the
+# plain pipeline parses the entry file first, at index 0, so an import's
+# nodes shift whenever the entry file changes length. here the entry
+# file is parsed, its imports are read off its nodes, and its nodes are
+# lifted out (take_nodes_from) so the walk parses the imports from index
+# 0; then the entry's nodes go back at the end, child indices shifted.
+# a later run truncates the arena to the imports' end and parses the new
+# entry text there. every index the checker's tables hold for an import
+# is the same index it was.
+#
+# one entry at a time: the arena is one global list, so a snapshot for
+# a second entry file would need its own arena. switching documents
+# misses and rebuilds.
+
+mut closure_cache_enabled := false
+mut closure_cache_ready := false
+mut cache_entry_path := ""
+mut cache_imports: List[String] := []
+mut cache_prefix_end := 0
+mut cache_import_roots: List[Int] := []
+# one-element lists rather than optionals: replacing the list releases
+# the snapshot it held.
+mut cache_driver: List[DriverSnapshot] := []
+mut cache_checker: List[CheckerSnapshot] := []
+
+## turn the closure cache on for every run_check_pipeline from here on.
+## the language server calls this once; `pith check` never does, so a
+## one-shot compile keeps the plain pipeline and the entry-first arena.
+pub fn enable_closure_cache():
+    closure_cache_enabled = true
+
+## drop whatever the cache holds. the next run walks the closure again.
+pub fn clear_closure_cache():
+    closure_cache_ready = false
+    cache_driver = []
+    cache_checker = []
+    cache_imports = []
+    cache_import_roots = []
+
+## the module files the last run's closure covered, in walk order — what
+## a change to any of those files invalidates.
+pub fn last_closure_files() -> List[String]:
+    return walk_module_files()
+
+fn same_imports(imports: List[String]) -> Bool:
+    if imports.len() != cache_imports.len():
+        return false
+    for imp, i in imports:
+        if imp != cache_imports[i]:
+            return false
+    return true
+
+# check the entry file at `root` after the imports, whichever way the
+# imports got there, and finish the outcome.
+fn check_entry(path: String, root: Int, import_roots: List[Int], resolved: Int) -> CheckOutcome:
+    set_checker_module_path("")
+    set_checker_file_path(path)
+    entry_started := time.mono_nanos()
+    diags := c_run_module(root)
+    timing_check_files.push(path)
+    timing_check_us.push((time.mono_nanos() - entry_started) / 1000)
+    timing_check_ms = time.mono_millis() - resolved
+    return CheckOutcome(true, true, diags, root, import_roots)
+
+fn run_cached_pipeline(path: String) -> CheckOutcome!:
+    started := time.mono_millis()
+    source := dr_read_source(path)!
+    tokens := lex_all(source)
+    lexed := time.mono_millis()
+    timing_lex_ms = lexed - started
+    timing_snapshot_ms = 0
+    # the imports' nodes stay where they are; only the entry file is
+    # parsed again, after them
+    mut entry_start := 0
+    if closure_cache_ready and cache_entry_path == path:
+        truncate_arena(cache_prefix_end)
+        entry_start = cache_prefix_end
+    else:
+        clear_closure_cache()
+        reset_arena()
+    mut root := parse_with_file(tokens, path)
+    parsed := time.mono_millis()
+    timing_parse_ms = parsed - lexed
+    timing_imports_ms = 0
+    timing_check_ms = 0
+    timing_module_count = 1
+    timing_check_files = []
+    timing_check_us = []
+    timing_cache = "miss"
+
+    if parser_has_errors():
+        mut no_imports: List[Int] := []
+        return CheckOutcome(false, false, parser_diagnostics(), root, no_imports)
+
+    imports := find_imports(root)
+    if closure_cache_ready and same_imports(imports) and walk_is_unchanged(cache_driver[0]):
+        restore_started := time.mono_millis()
+        restore_driver_snapshot(cache_driver[0])
+        record_entry_node_range(entry_start, node_count(), path)
+        restore_checker_snapshot(cache_checker[0])
+        timing_snapshot_ms = time.mono_millis() - restore_started
+        import_roots := copy_list(cache_import_roots)
+        resolved := time.mono_millis()
+        timing_imports_ms = resolved - parsed
+        timing_module_count = import_roots.len() + 1
+        timing_cache = "hit"
+        return check_entry(path, root, import_roots, resolved)
+
+    # a miss: walk the closure from index 0 with the entry's nodes lifted
+    # out, then put them back after the imports
+    positions := import_positions(root, imports)
+    taken := take_nodes_from(entry_start)
+    reset_arena()
+    begin_driver(path)
+    import_roots := resolve_import_list(imports, positions.0, positions.1, path)!
+    root = root + append_relocated_nodes(taken, entry_start)
+    resolved := time.mono_millis()
+    timing_imports_ms = resolved - parsed
+    timing_module_count = import_roots.len() + 1
+    if driver_has_parse_errors():
+        return CheckOutcome(true, false, get_driver_parse_diagnostics(), root, import_roots)
+    prefix_end := node_count() - taken.len()
+    record_entry_node_range(prefix_end, node_count(), path)
+
+    initialize_checker(path)
+    for imp_root in import_roots:
+        module_file := get_resolved_module_file(imp_root)
+        set_checker_module_path(get_resolved_module_path(imp_root))
+        set_checker_file_path(module_file)
+        module_started := time.mono_nanos()
+        c_run_module(imp_root)
+        timing_check_files.push(module_file)
+        timing_check_us.push((time.mono_nanos() - module_started) / 1000)
+    snapshot_started := time.mono_millis()
+    cache_driver = [take_driver_snapshot()]
+    cache_checker = [take_checker_snapshot()]
+    cache_entry_path = path
+    cache_imports = copy_list(imports)
+    cache_prefix_end = prefix_end
+    cache_import_roots = copy_list(import_roots)
+    closure_cache_ready = true
+    timing_snapshot_ms = time.mono_millis() - snapshot_started
+    return check_entry(path, root, import_roots, resolved)
+
 ## run the whole front end for one entry file. sources are read through
 ## the driver's overlays, so a caller can check unsaved buffers.
 pub fn run_check_pipeline(path: String) -> CheckOutcome!:
+    if closure_cache_enabled:
+        return run_cached_pipeline(path)!
+    timing_cache = "off"
+    timing_snapshot_ms = 0
     started := time.mono_millis()
     source := dr_read_source(path)!
     tokens := lex_all(source)
@@ -257,4 +430,86 @@ test "file_for_node attributes nodes to the module that parsed them":
     assert_eq(outcome.import_roots.len(), 1)
     assert_eq(file_for_node(outcome.root), "__overlay_main.pith")
     assert_eq(file_for_node(outcome.import_roots[0]), "__overlay_helper.pith")
+    clear_source_overlays()
+
+test "closure cache answers a root edit the way a cold run does":
+    set_source_overlay("__cache_util.pith", "pub fn seven() -> Int:\n    return 7\n")
+    set_source_overlay("__cache_main.pith", "import __cache_util\n\nfn main():\n    x := __cache_util.seven()\n    print(x.to_string())\n")
+    enable_closure_cache()
+    cold := run_check_pipeline("__cache_main.pith")!
+    assert(cold.parse_ok and cold.import_ok)
+    assert_eq(cold.diags.len(), 0)
+    assert_eq(cold.import_roots.len(), 1)
+    cold_pairs := definition_pairs()
+    # the imports come first in the arena now, the entry file last
+    assert(cold.import_roots[0] < cold.root)
+    assert_eq(file_for_node(cold.import_roots[0]), "__cache_util.pith")
+    assert_eq(file_for_node(cold.root), "__cache_main.pith")
+    # an edit to the root: the import's node keeps its index and the
+    # answers are the cold run's
+    set_source_overlay("__cache_main.pith", "import __cache_util\n\nfn main():\n    x := __cache_util.seven()\n    print(x.to_string())\n# edited\n")
+    warm := run_check_pipeline("__cache_main.pith")!
+    assert(warm.parse_ok and warm.import_ok)
+    assert_eq(warm.diags.len(), 0)
+    assert_eq(warm.import_roots[0], cold.import_roots[0])
+    assert_eq(definition_pairs().join(","), cold_pairs.join(","))
+    assert_eq(file_for_node(warm.root), "__cache_main.pith")
+    # an edit that breaks the call is reported against the cached imports
+    set_source_overlay("__cache_main.pith", "import __cache_util\n\nfn main():\n    x := __cache_util.seven(1)\n    print(x.to_string())\n")
+    broken := run_check_pipeline("__cache_main.pith")!
+    assert(broken.import_ok)
+    assert_eq(broken.diags.len(), 1)
+    assert_eq(broken.diags[0].code, "E207")
+    clear_closure_cache()
+    clear_source_overlays()
+
+test "closure cache misses when an import changes and reports the new signature":
+    set_source_overlay("__cache2_util.pith", "pub fn seven() -> Int:\n    return 7\n")
+    set_source_overlay("__cache2_main.pith", "import __cache2_util\n\nfn main():\n    print(__cache2_util.seven().to_string())\n")
+    enable_closure_cache()
+    first := run_check_pipeline("__cache2_main.pith")!
+    assert_eq(first.diags.len(), 0)
+    # the module grows a parameter: the cached imports must not answer
+    set_source_overlay("__cache2_util.pith", "pub fn seven(n: Int) -> Int:\n    return n\n")
+    second := run_check_pipeline("__cache2_main.pith")!
+    assert(second.parse_ok and second.import_ok)
+    assert_eq(second.diags.len(), 1)
+    assert_eq(second.diags[0].code, "E207")
+    # and back again
+    set_source_overlay("__cache2_util.pith", "pub fn seven() -> Int:\n    return 7\n")
+    third := run_check_pipeline("__cache2_main.pith")!
+    assert_eq(third.diags.len(), 0)
+    clear_closure_cache()
+    clear_source_overlays()
+
+test "closure cache misses when the entry's import list changes":
+    set_source_overlay("__cache3_a.pith", "pub fn one() -> Int:\n    return 1\n")
+    set_source_overlay("__cache3_b.pith", "pub fn two() -> Int:\n    return 2\n")
+    set_source_overlay("__cache3_main.pith", "import __cache3_a\n\nfn main():\n    print(__cache3_a.one().to_string())\n")
+    enable_closure_cache()
+    first := run_check_pipeline("__cache3_main.pith")!
+    assert_eq(first.import_roots.len(), 1)
+    set_source_overlay("__cache3_main.pith", "import __cache3_a\nimport __cache3_b\n\nfn main():\n    print((__cache3_a.one() + __cache3_b.two()).to_string())\n")
+    second := run_check_pipeline("__cache3_main.pith")!
+    assert(second.parse_ok and second.import_ok)
+    assert_eq(second.diags.len(), 0)
+    assert_eq(second.import_roots.len(), 2)
+    assert_eq(file_for_node(second.import_roots[1]), "__cache3_b.pith")
+    clear_closure_cache()
+    clear_source_overlays()
+
+test "parse-only leaves a cached closure's arena alone":
+    set_source_overlay("__cache4_util.pith", "pub fn seven() -> Int:\n    return 7\n")
+    set_source_overlay("__cache4_main.pith", "import __cache4_util\n\nfn main():\n    print(__cache4_util.seven().to_string())\n")
+    set_source_overlay("__cache4_bad.pith", "fn main(:\n")
+    enable_closure_cache()
+    outcome := run_check_pipeline("__cache4_main.pith")!
+    before := node_count()
+    bad := run_parse_only("__cache4_bad.pith")!
+    assert(bad.len() > 0)
+    assert_eq(node_count(), before)
+    again := run_check_pipeline("__cache4_main.pith")!
+    assert_eq(again.import_roots[0], outcome.import_roots[0])
+    assert_eq(again.diags.len(), 0)
+    clear_closure_cache()
     clear_source_overlays()

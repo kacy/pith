@@ -1281,6 +1281,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_map_take_remove_counts \
 	tests/cases/test_web_session_ownership \
 	tests/cases/test_fn_value_optional \
+	tests/cases/test_optional_arg_callee_spellings \
 	tests/cases/test_tls_server_config_release
 
 memcheck: build

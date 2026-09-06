@@ -94,6 +94,7 @@ cases=(
   tests/leaks/leak_enum_bare_variant
   tests/leaks/leak_generic_enum_payload
   tests/leaks/leak_optional_shell_arg
+  tests/leaks/leak_optional_arg_unread_callee
   tests/leaks/leak_container_arg
   tests/leaks/leak_handed_back_arg
   tests/leaks/leak_empty_literal_arg

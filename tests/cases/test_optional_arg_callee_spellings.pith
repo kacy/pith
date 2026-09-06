@@ -1,0 +1,331 @@
+# a fresh optional written straight into an argument — a call result, a bare
+# `none`, a plain value widened into a `T?` parameter — is released by the
+# caller as soon as the call returns, without reading the callee's body. that
+# is only sound if every way a callee can keep or extract its optional
+# parameter takes a count of its own. each block below is one such spelling:
+# a struct construction, a field assignment, a list push, a map insert, an
+# index assignment, a channel send, a closure capture, a spawned task, a bind,
+# a list and a tuple literal element, a return of the parameter, a widening
+# into a deeper optional, an `if let`, a `match`, `unwrap_or`, `.value()`, and
+# the same through a module boundary and a generic receiver. the kept value is
+# read back after the caller's release, so a callee that did not take its own
+# count reads freed memory here. the expected output was derived from the
+# annotated controls at the end (`v: String? := ...` then `f(v)`), which have
+# always been reclaimed normally. runs under valgrind with the freelist off
+# (MEMCHECK_CASES).
+import optional_arg_helper as helper
+
+struct Holder:
+    pub text: String?
+    pub num: Int?
+
+struct Box[T]:
+    pub v: T
+
+impl Box:
+    fn peek(x: T?) -> Int:
+        if x == none:
+            return 0
+        return 1
+
+    fn keep(x: T?) -> T?:
+        return x
+
+    fn extract(x: T?) -> T:
+        return x.unwrap_or(self.v)
+
+struct Taker:
+    n: Int
+
+impl Taker:
+    fn build(x: String?) -> Holder:
+        return Holder(x, self.n)
+
+    fn read(x: String?) -> Int:
+        return x.unwrap_or("").len() + self.n
+
+fn mk(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "s{i}"
+
+fn mk_int(i: Int) -> Int?:
+    if i < 0:
+        return none
+    return i
+
+# --- the callee keeps the whole shell ---
+
+fn build(x: String?, n: Int?) -> Holder:
+    return Holder(x, n)
+
+fn build_named(x: String?) -> Holder:
+    return Holder(text: x, num: none)
+
+fn store(h: Holder, x: String?):
+    h.text = x
+
+fn push(xs: List[String?], x: String?):
+    xs.push(x)
+
+fn insert(m: Map[String, String?], k: String, x: String?):
+    m.insert(k, x)
+
+fn index_store(m: Map[String, String?], k: String, x: String?):
+    m[k] = x
+
+fn send(ch: Channel[String?], x: String?):
+    ch.send(x)
+
+fn capture(x: String?) -> fn() -> String:
+    return fn() => x.unwrap_or("captured-none")
+
+fn read_later(x: String?) -> Int:
+    return x.unwrap_or("").len()
+
+fn spawned(x: String?) -> Int:
+    t := spawn read_later(x)
+    return await t
+
+fn bound(x: String?) -> String:
+    y := x
+    return y.unwrap_or("bound-none")
+
+fn listed(x: String?) -> List[String?]:
+    return [x, none]
+
+fn paired(x: String?) -> (Int, String?):
+    return (1, x)
+
+fn forward(x: String?) -> String?:
+    return x
+
+fn forward_int(x: Int?) -> Int?:
+    return x
+
+fn deepen(x: (String?)?) -> Int:
+    if let inner = x:
+        if inner == none:
+            return 1
+        return 2
+    return 0
+
+fn deeper(x: String?) -> Int:
+    return deepen(x)
+
+# --- the callee extracts the payload ---
+
+fn opened(x: String?) -> String:
+    if let v = x:
+        return v
+    return "opened-none"
+
+fn matched(x: String?) -> String:
+    match x:
+        none => "matched-none"
+        v => v
+
+fn defaulted(x: String?) -> String:
+    return x.unwrap_or("defaulted")
+
+fn valued(x: String?) -> Int:
+    if x == none:
+        return 0
+    return x.value().len()
+
+fn probed(x: String?) -> Int:
+    if x == none:
+        return 0
+    return 1
+
+fn show(label: String, o: String?):
+    print("{label} {o.unwrap_or("none")}")
+
+fn show_int(label: String, o: Int?):
+    print("{label} {o.unwrap_or(0 - 1)}")
+
+fn main():
+    # keep spellings, each fed a call result, a bare none and a widened literal
+    h1 := build(mk(1), mk_int(1))
+    show("build.text", h1.text)
+    show_int("build.num", h1.num)
+    h2 := build(none, none)
+    show("build.none", h2.text)
+    h3 := build("lit3", 3)
+    show("build.lit", h3.text)
+    show_int("build.lit.num", h3.num)
+    h4 := build_named(mk(4))
+    show("build_named", h4.text)
+
+    h5 := Holder(none, none)
+    store(h5, mk(5))
+    show("store.call", h5.text)
+    store(h5, "lit5")
+    show("store.lit", h5.text)
+    store(h5, none)
+    show("store.none", h5.text)
+
+    xs: List[String?] := []
+    push(xs, mk(6))
+    push(xs, none)
+    push(xs, "lit6")
+    show("push.0", xs[0])
+    show("push.1", xs[1])
+    show("push.2", xs[2])
+
+    m: Map[String, String?] := {}
+    insert(m, "a", mk(7))
+    insert(m, "b", none)
+    insert(m, "c", "lit7")
+    index_store(m, "d", mk(8))
+    index_store(m, "e", "lit8")
+    show("insert.a", m["a"])
+    show("insert.b", m["b"])
+    show("insert.c", m["c"])
+    show("index.d", m["d"])
+    show("index.e", m["e"])
+
+    ch := Channel[String?](4)
+    send(ch, mk(9))
+    send(ch, none)
+    send(ch, "lit9")
+    got1 := ch.recv()
+    got2 := ch.recv()
+    got3 := ch.recv()
+    if let inner = got1:
+        show("send.0", inner)
+    if let inner = got2:
+        show("send.1", inner)
+    if let inner = got3:
+        show("send.2", inner)
+
+    c1 := capture(mk(10))
+    c2 := capture(none)
+    c3 := capture("lit10")
+    print("capture {c1()} {c2()} {c3()}")
+
+    print("spawned {spawned(mk(11))} {spawned(none)} {spawned("lit11")}")
+    print("bound {bound(mk(12))} {bound(none)} {bound("lit12")}")
+
+    l1 := listed(mk(13))
+    show("listed.0", l1[0])
+    show("listed.1", l1[1])
+    l2 := listed("lit13")
+    show("listed.lit", l2[0])
+
+    p1 := paired(mk(14))
+    show("paired", p1.1)
+    p2 := paired("lit14")
+    show("paired.lit", p2.1)
+
+    show("forward", forward(mk(15)))
+    show("forward.none", forward(none))
+    show("forward.lit", forward("lit15"))
+    show_int("forward_int", forward_int(mk_int(15)))
+    show_int("forward_int.lit", forward_int(15))
+    f1 := forward(mk(16))
+    show("forward.bound", f1)
+
+    print("deeper {deeper(mk(17))} {deeper(none)} {deeper("lit17")}")
+
+    # extraction spellings
+    print("opened {opened(mk(18))} {opened(none)} {opened("lit18")}")
+    print("matched {matched(mk(19))} {matched(none)} {matched("lit19")}")
+    print("defaulted {defaulted(mk(20))} {defaulted(none)} {defaulted("lit20")}")
+    print("valued {valued(mk(21))} {valued(none)} {valued("lit21")}")
+    print("probed {probed(mk(22))} {probed(none)} {probed("lit22")}")
+
+    # shells that borrow their payload, or that another owner still holds: the
+    # caller's release must free the box and nothing behind it. a borrowing
+    # getter's shell leaves the element with its container, and a parameter
+    # handed back by `forward` is the shell the local still owns. on the
+    # compiler before this the first two rows read freed memory and the third
+    # printed an empty string.
+    elems: List[String] := ["elem-" + "zero", "elem-" + "one"]
+    show("getter.list", elems.get(0))
+    show("getter.list.again", elems.get(0))
+    print("getter.list.kept {elems[0]} {elems.len()}")
+    em: Map[String, String] := {"k": "map-" + "value"}
+    show("getter.map", em.get("k"))
+    print("getter.map.kept {em["k"]}")
+    kept_local: String? := "kept-" + "local"
+    show("forward.local", forward(kept_local))
+    show("forward.local.kept", kept_local)
+    print("valued.local {valued(forward(kept_local))} {helper.peek(forward(kept_local))}")
+    show("forward.local.kept2", kept_local)
+
+    # a search over optional elements, a doubly wrapped extraction, an await
+    ints: List[Int?] := [1, none, 3]
+    print("search {ints.contains(mk_int(3))} {ints.contains(mk_int(2))} {ints.contains(none)} {ints.index_of(3)}")
+    strs: List[String?] := ["s40", none]
+    print("search.str {strs.contains(mk(40))} {strs.contains(mk(41))} {strs.contains(none)} {strs.contains("s40")}")
+    outer: (String?)? := mk(42)
+    print("extracted {probed(outer.value())} {defaulted(outer.value())} {defaulted(outer.unwrap_or(none))}")
+    show("extracted.kept", outer.value())
+    t43 := spawn mk(43)
+    print("awaited {defaulted(await t43)}")
+    t44 := spawn mk(44)
+    show("awaited.forward", forward(await t44))
+
+    # methods on a plain receiver
+    t := Taker(3)
+    th := t.build(mk(23))
+    show("method.build", th.text)
+    show_int("method.build.num", th.num)
+    th2 := t.build("lit23")
+    show("method.build.lit", th2.text)
+    print("method.read {t.read(mk(24))} {t.read(none)} {t.read("lit24")}")
+
+    # methods on a generic receiver
+    bi := Box[Int](100)
+    bs := Box[String]("fallback")
+    print("generic.peek {bi.peek(mk_int(25))} {bi.peek(none)} {bi.peek(25)}")
+    print("generic.peek.str {bs.peek(mk(25))} {bs.peek(none)} {bs.peek("lit25")}")
+    show_int("generic.keep", bi.keep(mk_int(26)))
+    show("generic.keep.str", bs.keep(mk(26)))
+    show("generic.keep.lit", bs.keep("lit26"))
+    kept := bs.keep(mk(27))
+    show("generic.keep.bound", kept)
+    print("generic.extract {bi.extract(mk_int(28))} {bi.extract(none)} {bs.extract(mk(28))} {bs.extract(none)} {bs.extract("lit28")}")
+
+    # the callee in another module
+    hk := helper.build(mk(29), mk_int(29))
+    show("helper.build", hk.text)
+    show_int("helper.build.num", hk.num)
+    hk2 := helper.build("lit29", 29)
+    show("helper.build.lit", hk2.text)
+    helper.store(hk, mk(30))
+    show("helper.store", hk.text)
+    helper.store(hk, none)
+    show("helper.store.none", hk.text)
+    hxs: List[String?] := []
+    helper.push_text(hxs, mk(31))
+    helper.push_text(hxs, "lit31")
+    show("helper.push.0", hxs[0])
+    show("helper.push.1", hxs[1])
+    show("helper.forward", helper.forward(mk(32)))
+    show("helper.forward.none", helper.forward(none))
+    show("helper.forward.lit", helper.forward("lit32"))
+    show_int("helper.forward_int", helper.forward_int(mk_int(32)))
+    print("helper.extract {helper.extract(mk(33))} {helper.extract(none)} {helper.extract("lit33")}")
+    print("helper.extract_int {helper.extract_int(mk_int(33))} {helper.extract_int(none)} {helper.extract_int(33)}")
+    print("helper.peek {helper.peek(mk(34))} {helper.peek(none)} {helper.peek("lit34")}")
+    print("helper.opened {helper.opened(mk(35))} {helper.opened(none)} {helper.opened("lit35")}")
+    hc1 := helper.capture(mk(36))
+    hc2 := helper.capture(none)
+    hc3 := helper.capture("lit36")
+    print("helper.capture {hc1()} {hc2()} {hc3()}")
+
+    # the annotated controls the expected output was derived from
+    v1: String? := "s1"
+    n1: Int? := 1
+    ch1 := build(v1, n1)
+    show("control.build", ch1.text)
+    show_int("control.build.num", ch1.num)
+    v2: String? := none
+    print("control.opened {opened(v1)} {opened(v2)}")
+    print("control.matched {matched(v1)} {matched(v2)}")
+    show("control.forward", forward(v1))
+    cc := capture(v1)
+    print("control.capture {cc()}")
+    print("control.helper {helper.extract(v1)} {helper.peek(v1)} {bs.extract(v1)}")

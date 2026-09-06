@@ -1,13 +1,13 @@
-# a method may declare its own type parameters only on a NON-generic type.
-# on a generic owner the two substitutions would have to compose — the owner's
-# is fixed per instantiation, the method's per call site — and nothing lowers
-# that pair, so the shape is refused at the declaration (E265) rather than
-# lowered against one substitution or the other.
+# a method of a generic type may declare type parameters of its own; the
+# owner's are fixed by the receiver's instance and the method's by the call,
+# and the two lists compose by name. a method parameter spelled like one of
+# the owner's would resolve to the owner's type everywhere it is written, so
+# that spelling is refused at the declaration (E265) rather than composed.
 struct Box[T]:
     pub item: T
 
 impl Box:
-    pub fn describe[U](other: U) -> String:
+    pub fn describe[T](other: T) -> String:
         return other.to_string()
 
 fn main():

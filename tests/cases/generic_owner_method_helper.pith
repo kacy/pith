@@ -1,0 +1,27 @@
+# a generic struct whose method carries its own type parameter, imported by
+# test_generic_owner_generic_method (and, for `wrap`, by
+# test_generic_method_type_args). the specialization a call site queues is
+# named after the module-qualified method symbol, so the owner's instance
+# arguments and the method's own both land in a symbol the importing module
+# has to reach.
+
+# Cell holds one value and a note about it.
+pub struct Cell[T]:
+    pub value: T
+    pub note: String
+
+impl Cell:
+    # a cell holding a new value, noted with the old one
+    pub fn rename[U](fresh: U) -> Cell[U]:
+        note := "was " + self.value.to_string()
+        return Cell(fresh, note)
+
+# the cell's value and note in one line
+pub fn describe_cell(c: Cell[Int]) -> String:
+    return c.value.to_string() + " (" + c.note + ")"
+
+# wrap one value of any type in brackets; called through the module alias
+# with its type argument written (`helper.wrap[Int](3)`), a shape that has
+# to keep parsing as a module function call.
+pub fn wrap[T](value: T) -> String:
+    return "[" + value.to_string() + "]"

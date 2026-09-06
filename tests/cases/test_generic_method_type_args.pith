@@ -1,0 +1,107 @@
+# a generic method's type arguments can be written at the call site,
+# `x.describe[Int](v)`, the way a free generic function's can. the written
+# list is what fixes a type parameter that appears in no argument — a method
+# that only returns `T?`, or that names `T` nowhere in its signature — where
+# inference has nothing to work from and the bare call is refused (E222).
+#
+# every written spelling here sits beside the inferred spelling of the same
+# method as a control, and the results are read back rather than counted: a
+# specialization that answers the wrong representation prints an address or
+# an empty string, which a leak gate cannot see. in the memcheck set because
+# the heap-typed instances a written argument builds exercise the same
+# release paths the inferred ones do.
+#
+# the shape a written argument list must not disturb is pinned alongside:
+# an index into a field of closures followed by a call, `t.items[0](y)` and
+# `t.items[i](y)`, keeps its meaning, and so does a module function called
+# with type arguments through its import alias, `helper.wrap[Int](3)`. the
+# one index the rule reads as type arguments, a SCREAMING_CASE constant in
+# the brackets, is written with the index grouped, `(t.items[LAST])(y)`.
+import generic_impl_method_helper as tagged
+import generic_owner_method_helper as helper
+
+struct Holder:
+    pub label: String
+
+struct Sink:
+    pub name: String
+
+impl Sink:
+    # T appears in no argument: only a written argument fixes it
+    fn blank[T]() -> T?:
+        return none
+
+    # a written argument that names a heap type builds a heap value
+    fn tagged[T](v: T) -> List[String]:
+        return [self.name, v.to_string()]
+
+    # inferred and written spellings of the same method
+    fn describe[T](v: T) -> String:
+        return self.name + ":" + v.to_string()
+
+    # two type parameters, both written
+    fn pair[A, B](a: A, b: B) -> String:
+        return a.to_string() + "/" + b.to_string()
+
+    # the written argument is a composite type
+    fn first[T](xs: List[T]) -> T:
+        return xs[0]
+
+    # a struct returned from a specialization the written argument names
+    fn hold[T](v: T) -> Holder:
+        return Holder(label: "held " + v.to_string())
+
+struct Table:
+    pub items: List[fn(Int) -> Int]
+    pub name: String
+
+LAST := 1
+
+fn main():
+    s := Sink(name: "s")
+
+    none_int := s.blank[Int]()
+    none_str := s.blank[String]()
+    if none_int == none and none_str == none:
+        print("blank none none")
+
+    print(s.describe(7))
+    print(s.describe[Int](7))
+    print(s.describe("seven"))
+    print(s.describe[String]("seven"))
+
+    print(s.pair[Int, String](1, "one"))
+    print(s.pair(2, "two"))
+
+    tags := s.tagged[String]("x")
+    print(tags.len().to_string() + " " + tags[0] + " " + tags[1])
+    more := s.tagged(4)
+    print(more[1])
+
+    print(s.first[Int]([9, 8]).to_string())
+    print(s.first[String](["a", "b"]))
+    print(s.first(["c", "d"]))
+
+    h := s.hold[Int](5)
+    print(h.label)
+    g := s.hold("five")
+    print(g.label)
+
+    # an index into a field followed by a call keeps its meaning
+    double := fn(x: Int) -> Int:
+        return x * 2
+    triple := fn(x: Int) -> Int:
+        return x * 3
+    t := Table(items: [double, triple], name: "t")
+    print(t.items[0](21).to_string())
+    i := 1
+    print(t.items[i](5).to_string())
+    print((t.items[LAST])(2).to_string())
+
+    # a module function called with type arguments through its alias, and
+    # a written argument on a method declared in another module
+    print(helper.wrap[Int](3))
+    print(helper.wrap("three"))
+    tg := tagged.Tagger(tag: "tg")
+    print(tg.render[Int](1))
+    print(tg.render("one"))

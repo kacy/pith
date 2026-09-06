@@ -1,0 +1,117 @@
+# a method of a generic struct may carry type parameters of its own:
+# `impl Box[T]: fn map[U](f: fn(T) -> U) -> Box[U]`. the owner's parameters
+# are fixed by the receiver's instance and the method's by the call, and the
+# body is checked and emitted once per combination — `Box[Int].map[String]`
+# and `Box[String].map[String]` are two bodies, spelled `Box_int_map__string`
+# and `Box_string_map__string`.
+#
+# two owner instances each call each method at two method type arguments, and
+# every result is read back out. the payloads are heap values on both sides —
+# a string owner mapped to a list, a list owner mapped to a struct — so the
+# instances a body builds (`Box[List[String]]`, `Box[Holder]`) get their
+# per-instance destructor and release what they hold; in the memcheck set for
+# that reason. a method whose parameter appears in no argument takes it
+# written, `b.empty[String]()`, and one with two parameters of its own sits
+# beside an owner with two.
+import generic_owner_method_helper as helper
+
+struct Holder:
+    pub label: String
+
+impl Holder:
+    fn to_string() -> String:
+        return self.label
+
+struct Box[T]:
+    pub item: T
+
+impl Box:
+    # the classic: build another instance of the same generic from this one
+    fn map[U](f: fn(T) -> U) -> Box[U]:
+        return Box(f(self.item))
+
+    # the method's parameter beside the owner's in one string
+    fn pair[U](other: U) -> String:
+        label := "p-" + other.to_string()
+        return self.item.to_string() + "/" + label
+
+    # U appears in no argument: only a written argument fixes it
+    fn empty[U]() -> Box[U]?:
+        return none
+
+    # a plain method beside the generic ones: the per-instance copy path is
+    # untouched by them
+    fn show() -> String:
+        return "box(" + self.item.to_string() + ")"
+
+struct Pair[A, B]:
+    pub left: A
+    pub right: B
+
+impl Pair:
+    # two owner parameters, two of the method's own
+    fn join[C, D](c: C, d: D) -> List[String]:
+        return [self.left.to_string(), self.right.to_string(), c.to_string(), d.to_string()]
+
+    # a heap local bound per call, and an instance returned
+    fn swap_right[C](c: C) -> Pair[B, C]:
+        note := "swap " + self.left.to_string()
+        if note.len() == 0:
+            print("unreachable")
+        return Pair(self.right, c)
+
+fn main():
+    to_label := fn(x: Int) -> String:
+        return "v" + x.to_string()
+    double := fn(x: Int) -> Int:
+        return x * 2
+    to_list := fn(x: String) -> List[String]:
+        return [x, x + "!"]
+    to_holder := fn(x: String) -> Holder:
+        return Holder(label: "h:" + x)
+
+    b := Box[Int](item: 3)
+    s := b.map(to_label)
+    print(s.item)
+    d := b.map(double)
+    print(d.item.to_string())
+    print(b.pair(7))
+    print(b.pair("x"))
+    print(b.show())
+
+    t := Box[String](item: "hi")
+    l := t.map(to_list)
+    print(l.item.len().to_string() + " " + l.item[1])
+    h := t.map(to_holder)
+    print(h.item.label)
+    print(t.pair[Int](9))
+    print(t.pair(1.5))
+    print(t.show())
+
+    e1 := b.empty[String]()
+    e2 := t.empty[Int]()
+    if e1 == none and e2 == none:
+        print("empty none none")
+
+    p := Pair[Int, String](left: 1, right: "one")
+    j1 := p.join("a", 2)
+    print(j1.join(","))
+    j2 := p.join[Float, Bool](0.5, true)
+    print(j2.join(","))
+    q := p.swap_right(3)
+    print(q.left + " " + q.right.to_string())
+    r := p.swap_right("three")
+    print(r.left + " " + r.right)
+
+    u := Pair[String, Holder](left: "l", right: Holder(label: "r"))
+    j3 := u.join(1, "b")
+    print(j3.len().to_string() + " " + j3[0] + " " + j3[3])
+    w := u.swap_right([1, 2])
+    print(w.left.label + " " + w.right.len().to_string())
+
+    # the same shape declared in another module
+    c := helper.Cell[Int](value: 4, note: "fresh")
+    print(helper.describe_cell(c))
+    named := c.rename("four")
+    print(named.value + " " + named.note)
+    print(c.rename[Int](44).value.to_string())

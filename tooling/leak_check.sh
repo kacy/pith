@@ -84,6 +84,7 @@ cases=(
   tests/leaks/leak_generic_field_kinds
   tests/leaks/leak_generic_call_shapes
   tests/leaks/leak_generic_boundary
+  tests/leaks/leak_generic_owner_method
   tests/leaks/leak_container_rebind
   tests/leaks/leak_optional_string_payload
   tests/leaks/leak_optional_literal_elements

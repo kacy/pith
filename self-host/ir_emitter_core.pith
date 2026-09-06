@@ -45,7 +45,7 @@ from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
-from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
+from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
@@ -412,6 +412,7 @@ fn ir_reset_type_state():
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
     ir_generic_method_owners = {}
+    ir_generic_method_owner_param_counts = {}
     ir_generic_specialization_keys = []
     ir_generic_specialization_names = {}
     ir_generic_specialization_type_lists = {}
@@ -569,7 +570,7 @@ fn ir_generic_result_ok_kind(name: String, concrete_types: List[String]) -> Stri
         return ""
     decl_idx := ir_generic_decl_indices[name]
     decl_node := get_node(decl_idx)
-    generic_params := ir_collect_generic_param_names(decl_node)
+    generic_params := ir_generic_subst_params(name)
     for child in decl_node.children:
         returns_node := get_node(child)
         if returns_node.kind != "returns":
@@ -9183,6 +9184,48 @@ fn ir_queue_generic_method_call(idx: Int, node: Node, base_name: String) -> Stri
     mut no_explicit_types: List[String] := []
     return ir_queue_generic_call(base_name, idx, no_explicit_types, ret_type)
 
+# how many type parameters an impl target declares: the generic struct's
+# bracket list for `impl Box:` on a `struct Box[T]`, 0 for a concrete type.
+fn ir_owner_type_param_count(impl_type: String) -> Int:
+    if has_generic_declaration(impl_type) == false:
+        return 0
+    return collect_generic_parameter_names(get_node(get_generic_declaration_index(impl_type))).len()
+
+# the names a generic declaration's type arguments substitute, in the order
+# the checker records them: for a method on a generic owner the owner's
+# parameters first, then the method's own; for a free function or a method
+# on a concrete owner the declaration's own list alone.
+fn ir_generic_subst_params(name: String) -> List[String]:
+    mut params: List[String] := []
+    if not ir_generic_decl_indices.contains_key(name):
+        return params
+    if ir_generic_owner_param_count(name) > 0:
+        owner := ir_generic_method_owners[name]
+        params = collect_generic_parameter_names(get_node(get_generic_declaration_index(owner)))
+    for gp in ir_collect_generic_param_names(get_node(ir_generic_decl_indices[name])):
+        params.push(gp)
+    return params
+
+# the instance of generic struct `base` whose type arguments are `tids`, or
+# -1. the arguments come from the checker's record of a call on that
+# instance, so they are the instance's own ids and compare as ids.
+fn ir_struct_instance_for_args(base: String, tids: List[Int]) -> Int:
+    for inst_tid in struct_instance_tids:
+        if struct_instance_base_name[inst_tid] != base:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        inst_args := decode_tid_list(struct_instance_type_args[inst_tid])
+        if inst_args.len() != tids.len():
+            continue
+        mut same := true
+        for t, i in inst_args:
+            if t != tids[i]:
+                same = false
+        if same:
+            return inst_tid
+    return 0 - 1
+
 # the emission kinds of the type arguments the checker recorded at a generic
 # call, or an empty list when it recorded none. this is the one source of a
 # specialization's kinds; the emitter used to infer them from the argument
@@ -9229,7 +9272,7 @@ fn ir_optional_inner_kind_of_param_return(decl_idx: Int, generic_params: List[St
 fn ir_queue_generic_call(name: String, idx: Int, explicit_types: List[String], ret_type: String) -> String:
     tids := c_generic_call_subst(idx)
     if tids.len() > 0 and ir_generic_decl_indices.contains_key(name):
-        param_count := ir_collect_generic_param_names(get_node(ir_generic_decl_indices[name])).len()
+        param_count := ir_generic_subst_params(name).len()
         mut all_real := tids.len() == param_count
         for tid in tids:
             if tid < 0 or tid == TID_ERR:
@@ -9293,7 +9336,11 @@ fn ir_emit_generic_specialization(key: String):
         return
     decl_idx := ir_generic_decl_indices[base_name]
     decl_node := get_node(decl_idx)
-    generic_params := ir_collect_generic_param_names(decl_node)
+    # the names the type arguments substitute: for a method on a generic
+    # owner the owner's parameters lead and the method's own follow, in
+    # both the kinds list and the checker's type ids, split at owner_count.
+    generic_params := ir_generic_subst_params(base_name)
+    owner_count := ir_generic_owner_param_count(base_name)
     concrete_types := ir_decode_type_list(ir_generic_specialization_type_lists[key])
     spec_name := ir_generic_specialization_names[key]
     body_idx := ir_find_body(decl_idx)
@@ -9307,10 +9354,16 @@ fn ir_emit_generic_specialization(key: String):
     # a generic impl method carries an implicit self ahead of its declared
     # parameters and emits inside its impl's context, so `self.field` resolves
     # against the owner's layout. everything else about its specialization is
-    # a free generic function's.
+    # a free generic function's. on a generic owner the context is the
+    # receiver's instance (`Box[Int]`), found from the leading type
+    # arguments, and its own parameters are in force the way they are for a
+    # per-instance copy of a plain method (ir_impl_func_specialized).
     mut owner_type := ""
     if ir_generic_method_owners.contains_key(base_name):
         owner_type = ir_generic_method_owners[base_name]
+    mut owner_tid := 0 - 1
+    mut owner_params: List[String] := []
+    mut owner_kinds: List[String] := []
     # type-check the body against this specialization's concrete types
     # before emitting it, so c_get_expr_type answers real tids for its nodes
     # instead of the error type the unchecked body carries. the walk records
@@ -9320,11 +9373,29 @@ fn ir_emit_generic_specialization(key: String):
     # checker did not resolve) is emitted as before.
     spec_tids := ir_decode_generic_spec_subst_tids(key)
     if spec_tids.len() == generic_params.len():
-        mut owner_tid := 0 - 1
+        mut method_tids := spec_tids
         if owner_type.len() > 0:
             owner_tid = lookup_type_id(owner_type)
-        c_check_specialization(decl_idx, owner_tid, spec_tids, false)
+        if owner_count > 0:
+            mut owner_tids: List[Int] := []
+            method_tids = []
+            for t, i in spec_tids:
+                if i < owner_count:
+                    owner_tids.push(t)
+                    owner_params.push(generic_params[i])
+                    owner_kinds.push(concrete_types[i])
+                else:
+                    method_tids.push(t)
+            owner_tid = ir_struct_instance_for_args(owner_type, owner_tids)
+            if owner_tid < 0:
+                return
+            owner_type = get_type_name(owner_tid)
+        c_check_specialization(decl_idx, owner_tid, method_tids, false)
+    elif owner_count > 0:
+        return
     saved_impl_type := ir_current_impl_type
+    saved_impl_params := ir_current_impl_subst_params
+    saved_impl_args := ir_current_impl_subst_args
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
@@ -9332,6 +9403,9 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
     ir_active_generic_decl_idx = decl_idx
+    if owner_count > 0:
+        ir_current_impl_subst_params = owner_params
+        ir_current_impl_subst_args = owner_kinds
     if ir_generic_decl_module_paths.contains_key(base_name):
         ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
     else:
@@ -9397,6 +9471,8 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_module_path = saved_module_path
     ir_active_generic_decl_idx = saved_decl_idx
     ir_current_impl_type = saved_impl_type
+    ir_current_impl_subst_params = saved_impl_params
+    ir_current_impl_subst_args = saved_impl_args
 
 fn ir_emit_generic_specializations():
     mut i := 0
@@ -9468,7 +9544,7 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
     # that reaches this name can queue the specialization instead of emitting a
     # call to a body that was never written out.
     if ir_has_generic_params(method_node):
-        ir_record_generic_method_decl(method_idx, full_name, impl_type, module_path)
+        ir_record_generic_method_decl(method_idx, full_name, impl_type, module_path, ir_owner_type_param_count(impl_type))
 
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
@@ -10495,6 +10571,7 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
     ir_generic_method_owners = {}
+    ir_generic_method_owner_param_counts = {}
 
     for root, preload_i in ir_preloaded_import_roots:
         mut module_path := ""
@@ -10722,7 +10799,10 @@ fn ir_register_impl_method_specialization_names(impl_node: Node, impl_type: Stri
         instance_type_name := get_type_name(inst_tid)
         for child in impl_node.children:
             child_node := get_node(child)
-            if child_node.kind == "fn_decl":
+            # a method with type parameters of its own has no per-instance
+            # copy: each call queues a specialization keyed by the instance
+            # and the method's own arguments (ir_queue_generic_method_call)
+            if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
                 ir_register_one_specialized_method_name(child_node, impl_type, instance_type_name, arg_names)
 
 fn ir_finish_module_emit():

@@ -1,10 +1,10 @@
 # generics: how a generic body is checked
 
-A generic function, a generic method on a concrete type, and a method of a
-generic struct all have bodies with no concrete types of their own. `T` is a
-name until something instantiates the declaration. This page describes when
-those bodies are type-checked, what the check knows, and how to read what it
-reports.
+A generic function, a generic method on a concrete type, a method of a
+generic struct, and a generic method of a generic struct all have bodies with
+no concrete types of their own. `T` is a name until something instantiates the
+declaration. This page describes when those bodies are type-checked, what the
+check knows, and how to read what it reports.
 
 ## the two passes
 
@@ -16,14 +16,21 @@ an error reported there would name a type the program may never use.
 The generic-body pass runs after it, once per module, over a work queue:
 
 - every generic call the concrete code makes records the type arguments the
-  checker inferred for it (or resolved from an explicit `f[Int](x)` spelling)
-  and queues the pair (declaration, type arguments);
+  checker inferred for it (or resolved from an explicit `f[Int](x)` or
+  `x.describe[Int](v)` spelling) and queues the pair (declaration, type
+  arguments);
 - every method call whose receiver is a generic struct instance
   (`holder.size()` on a `Holder[String]`, or the `next` a `for` loop calls on
   an iterator instance) queues that method against that instance. A method
   the program never calls at some instance is not walked there: `size()`
   reading `self.item.len()` is fine on a `Holder[List[Int]]` and would be a
   fault on a `Holder[Int?]` the program only ever builds;
+- a method with type parameters of its own on a generic struct
+  (`impl Box[T]: fn map[U](f: fn(T) -> U) -> Box[U]`) queues the triple
+  (declaration, receiver instance, method type arguments): `Box[Int].map` at
+  `String` and `Box[String].map` at `String` are two entries, and each is
+  walked with the owner's parameters resolving to the instance's arguments
+  and the method's to the call's;
 - a queued body is walked with its type parameters resolving to the concrete
   types, `self` bound to the instance where there is one, and the associated
   types of the instance's impl in force. A generic call met inside the body
@@ -45,7 +52,8 @@ error[E209]: no method 'nonexistent' on 'Int' in first[Int]
 The same fault at the same node reports once, named after the first type set
 that reached it. A body that is wrong at one type and right at another (`t + 1`
 called with `String` and with `Int`) reports for the type that fails, which is
-what the suffix is for.
+what the suffix is for. A generic method of a generic struct names both lists,
+`in Box[Int].map[String]`.
 
 The check does not verify that a body uses only what its bounds promise. A body
 that compiles at every type the program instantiates it at is accepted, even if
@@ -99,6 +107,42 @@ checker resolves, including a bare call to a generic imported by name and the
 builtin spelling of `assert_eq`; the emitter has no type inference of its own.
 A request that arrives with no call node (a json or config decode target) is
 still keyed by emission kinds, and a body requested both ways is emitted once.
+
+For a generic method of a generic struct the record is the whole key: the
+receiver instance's type arguments first, then the method's own. The symbol
+keeps the two lists apart by putting them where each already lives — the
+instance arguments between the owner and the method name, as the per-instance
+copies of the struct's plain methods spell them (`Box_int_show`), and the
+method's own after the method name as every specialization does:
+`Box_int_map__string` is `Box[Int].map[String]`, and `Box_string_map__string`
+is a different body. The emitter splits the record at the owner's parameter
+count, finds the instance the leading arguments name, and emits the body in
+that instance's context with both lists substituting.
+
+## writing the type arguments
+
+A generic function's type arguments can be written at the call, `f[Int](x)`,
+and so can a generic method's, `x.describe[Int](v)` or `x.blank[Int]()`. The
+written list is resolved against the method's own bracket list in order, must
+match its length (E221), and is checked against the bounds the way an inferred
+list is; it is the only way to fix a parameter that appears in no argument,
+which a bare call refuses (E222).
+
+The parser decides what the bracket after `.name` means with one rule, from
+tokens alone: it is a type-argument list when the token after its closing `]`
+is `(`, everything inside it is a token a type can be spelled from, its first
+word is a type name (an identifier beginning with an uppercase letter, or `fn`,
+with `(` allowed ahead of one for a grouped or tuple type), and the receiver
+is not one of the file's import aliases. Everything else keeps its meaning: an
+index into a field of closures followed by a call, `t.items[0](y)` or
+`t.items[i](y)`, holds a literal or a lowercase binding and stays an index; a
+module function called with type arguments, `json.decode[Row](s)`, has an
+import alias as its receiver and stays the shape the module paths read. The
+spellings the rule misreads are an index that is itself type-shaped — a
+SCREAMING_CASE constant or an enum variant indexing a field of closures,
+`t.items[MAX](y)`, `t.handlers[Kind.Click](ev)`; the checker names the repair
+(E209), which is to group the index, `(t.items[MAX])(y)`, or bind the element
+first.
 
 ## a generic that never stops
 

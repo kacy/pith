@@ -22,25 +22,41 @@
 # not the first, so a node spanning several tokens reports at its end.
 # that is the documented diagnostics limitation, and it is why anything
 # needing the declaration's own line searches the source text instead.
+#
+# type_args is the one reference to another node that is not a child: the
+# arena index of the "type_args" node holding the type arguments written at
+# a method call (`x.describe[Int](v)`), or -1 for every other node. it is
+# kept out of `children` on purpose — a method call's receiver sits at
+# children[0] and its arguments after it, and every walker that reads them
+# by position sees a call with written type arguments exactly as it sees
+# one without.
 pub struct Node:
     pub kind: String
     pub value: String
     pub children: List[Int]
     pub line: Int
     pub col: Int
+    pub type_args: Int
 
 # global node arena — all nodes live here
 mut nodes: List[Node] := []
 
 # add a node with children, return its index
 pub fn add_node(kind: String, value: String, children: List[Int], line: Int, col: Int) -> Int:
-    nodes.push(Node(kind, value, children, line, col))
+    nodes.push(Node(kind, value, children, line, col, 0 - 1))
+    return nodes.len() - 1
+
+# add a node that also carries written type arguments: `type_args` is the
+# index of the "type_args" node they were parsed into. only a method call
+# is built this way.
+pub fn add_node_with_type_args(kind: String, value: String, children: List[Int], type_args: Int, line: Int, col: Int) -> Int:
+    nodes.push(Node(kind, value, children, line, col, type_args))
     return nodes.len() - 1
 
 # add a leaf node (no children), return its index
 pub fn add_leaf(kind: String, value: String, line: Int, col: Int) -> Int:
     mut empty: List[Int] := []
-    nodes.push(Node(kind, value, empty, line, col))
+    nodes.push(Node(kind, value, empty, line, col, 0 - 1))
     return nodes.len() - 1
 
 # retrieve a node by index
@@ -116,14 +132,17 @@ pub fn take_nodes_from(start: Int) -> List[Node]:
 
 # append nodes taken from `old_start` at the arena's end, rewriting every
 # child index by the distance they moved. returns that distance, so a
-# caller adds it to any index it kept (the root's). children are the
-# only place a node refers to another node, so a relocated tree reads
-# exactly as it did.
+# caller adds it to any index it kept (the root's). children and a method
+# call's type_args are the only places a node refers to another node, so a
+# relocated tree reads exactly as it did.
 pub fn append_relocated_nodes(taken: List[Node], old_start: Int) -> Int:
     shift := nodes.len() - old_start
     for n in taken:
         mut kids: List[Int] := []
         for c in n.children:
             kids.push(c + shift)
-        nodes.push(Node(n.kind, n.value, kids, n.line, n.col))
+        mut type_args := n.type_args
+        if type_args >= 0:
+            type_args = type_args + shift
+        nodes.push(Node(n.kind, n.value, kids, n.line, n.col, type_args))
     return shift

@@ -127,6 +127,27 @@ fn main():
     print(ledger.note("open"))
     print(ledger.measure(Wing(feathers: 4)))
 
+    # the type arguments can be written at the call instead, ahead of the
+    # parentheses. that is the only way to fix a parameter that appears in
+    # no argument, like the one `blank` only returns.
+    print(ledger.note[Int](13))
+    missing_count := ledger.blank[Int]()
+    if missing_count == none:
+        print("blank: nothing")
+
+    # a generic type's methods may carry type parameters of their own as
+    # well. the type's parameters are fixed by the receiver's instance and
+    # the method's by the call, and each combination is its own
+    # specialization: Box[Float].map to a String here, to an Int below.
+    label := fn(v: Float) -> String:
+        return "about {v}"
+    boxed_label := b.map(label)
+    print(boxed_label.value)
+    floor := fn(v: Float) -> Int:
+        return v.to_int()
+    boxed_floor := b.map(floor)
+    print("floor {boxed_floor.value}")
+
 struct Wing:
     pub feathers: Int
 
@@ -151,3 +172,12 @@ impl Ledger:
     # a bound on the method's own type parameter, in the clause spelling
     fn measure[T](v: T) -> String where T: Sized:
         return self.name + " spans " + v.size().to_string()
+
+    # T appears in no argument, so a call has to write it: blank[Int]()
+    fn blank[T]() -> T?:
+        return none
+
+impl Box:
+    # U is fixed by the function passed in; T by the box it is called on
+    fn map[U](f: fn(T) -> U) -> Box[U]:
+        return Box(f(self.value))

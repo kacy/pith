@@ -1,0 +1,12 @@
+# a written type-argument list belongs to a user-declared method with type
+# parameters of its own. on a builtin method, or on a name the receiver's
+# type does not declare, there is nothing for it to fix, and the call is
+# refused (E209) rather than the list being dropped and the call answered
+# by the method table as if it had never been written.
+struct Sink:
+    pub name: String
+
+fn main():
+    s := Sink(name: "s")
+    print(s.name.len[Int]().to_string())
+    print(s.missing[Int](1))

@@ -1,0 +1,18 @@
+# type arguments written at a method call are matched against the method's
+# own bracket list: a count that differs from the declaration is refused
+# (E221), and so is a list written on a method that declares no type
+# parameters, whose count is zero.
+struct Sink:
+    pub name: String
+
+impl Sink:
+    pub fn describe[T](v: T) -> String:
+        return self.name + v.to_string()
+
+    pub fn plain(v: Int) -> Int:
+        return v
+
+fn main():
+    s := Sink(name: "s")
+    print(s.describe[Int, String](1))
+    print(s.plain[Int](1).to_string())

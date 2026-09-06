@@ -1466,50 +1466,13 @@ fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_re
     decl_idx := ir_tuple_walk_fn_decl(callee.name)
     if decl_idx < 0:
         return false
-    return ir_tuple_decl_arg_is_borrow(decl_idx, callee.name, arg_pos, arg_name, is_result)
-
-# the method-call front end of the same walk: the receiver's static type
-# names the impl block, the method name the declaration inside it. a generic
-# receiver has no single body to read and stays excluded, as does a method
-# the module being emitted cannot see.
-fn ir_tuple_method_arg_is_borrow(node: Node, arg_pos: Int, is_result: Bool) -> Bool:
-    if node.children.len() == 0:
-        return false
-    mname := ir_plain_method_name(node.value)
-    recv_type := ir_method_receiver_type(node)
-    if recv_type.len() == 0 or recv_type.contains("["):
-        return false
-    decl_idx := ir_tuple_walk_method_decl(recv_type, mname)
-    if decl_idx < 0:
-        return false
-    return ir_tuple_decl_arg_is_borrow(decl_idx, recv_type + "." + mname, arg_pos, "", is_result)
-
-# the declaration of `mname` inside an impl block for `impl_type` in the
-# module being emitted, or -1. a method's params exclude the receiver, so a
-# method argument's position lines up with the param nodes directly.
-fn ir_tuple_walk_method_decl(impl_type: String, mname: String) -> Int:
-    if ir_tuple_walk_root < 0:
-        return 0 - 1
-    for item_idx in ir_root_items(ir_tuple_walk_root):
-        item := get_node(item_idx)
-        if item.kind != "impl_decl" or ir_impl_target_type(item) != generic_identity_bare_name(impl_type):
-            continue
-        for child in item.children:
-            method_idx := ir_unwrap_pub_child(child)
-            method_node := get_node(method_idx)
-            if ir_is_fn_decl_kind(method_node.kind) and method_node.value == mname:
-                return method_idx
-    return 0 - 1
-
-# the declaration-keyed core of the walk, shared by both front ends.
-fn ir_tuple_decl_arg_is_borrow(decl_idx: Int, walk_name: String, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
     param := ir_tuple_walk_param_name(decl_idx, arg_pos, arg_name)
     if param.len() == 0:
         return false
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0:
         return false
-    walk_key := walk_name + "/" + param
+    walk_key := callee.name + "/" + param
     if ir_tuple_borrow_walk_active.contains(walk_key):
         return false
     ir_tuple_borrow_walk_active.push(walk_key)
@@ -2150,7 +2113,7 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
 # method results) die once the call they fed returns: callees borrow their
 # params, and storing callees add their own count. pairs registers with the
 # same child walk ir_collect_call_arg_regs used.
-# method variant: pairs registers with ir_method_call_arg_expr so the walk
+# method variant: pairs registers with ir_method_call_arg_expr so the pairing
 # can never drift from the collector's. skip_pos marks a container-store
 # argument: ownership transfers to the container there, and the store
 # itself completes the transfer by taking the caller's count rather than
@@ -2165,9 +2128,9 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
         if not ir_arg_release_is_skipped(expr_idx):
             ir_release_owned_operand(expr_idx, reg, ir_infer_type(expr_idx))
         # a fresh optional shell handed to a method dies with the call the
-        # same way it does for a plain function; the walk runs over the impl
-        # method's body. `obj.take(maybe(i))` leaked its shell per call.
-        ir_release_fresh_optional_arg(node, i, "", expr_idx, reg, true)
+        # same way it does for a plain function. `obj.take(maybe(i))` leaked
+        # its shell per call.
+        ir_release_fresh_optional_arg(expr_idx, reg)
 
 # true for a builtin whose result may BE one of its arguments rather than a
 # value the receiver keeps a count for. `get_default` is the only one: it
@@ -2199,14 +2162,6 @@ fn ir_method_result_transfers_count(emit_name: String) -> Bool:
     return emit_name == "map_take" or emit_name == "map_take_ikey"
 
 fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
-    # a named argument may land in any declared position, so a positional
-    # index is only handed to the fresh-optional walk when no named
-    # arguments could have shifted it
-    mut has_named := false
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "arg" and cn.value.len() > 0:
-            has_named = true
     mut reg_i := 0
     for child, i in node.children:
         if i < start_idx:
@@ -2214,20 +2169,17 @@ fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
         if reg_i >= arg_regs.len():
             return
         mut expr_idx := child
-        mut arg_name := ""
         cn := get_node(child)
         if cn.kind == "arg":
             if cn.children.len() == 0:
                 continue
-            arg_name = cn.value
             expr_idx = cn.children[0]
         if ir_arg_release_is_skipped(expr_idx) == false:
             ir_release_owned_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
         # a widened argument's register is a wrapper the operand release must
         # not touch (above), but the wrapper itself is a fresh shell this
         # caller built, and the fresh-optional release knows how to drop it.
-        if arg_name.len() > 0 or not has_named:
-            ir_release_fresh_optional_arg(node, reg_i, arg_name, expr_idx, arg_regs[reg_i], false)
+        ir_release_fresh_optional_arg(expr_idx, arg_regs[reg_i])
         reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
@@ -3563,91 +3515,43 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
         return true
     return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
 
-# a fresh optional written straight into a call argument — `take(mk(i))` —
-# is a transferred shell nothing else names, and it used to strand its
-# 64-byte box on every call. the general release above must keep "tuple"
-# excluded because the kind alone cannot tell a wrapper from a tuple
-# literal, but when the argument expression is itself a call the register
-# is a wrapper the caller alone owns, and the same body walk that
-# qualifies a named tuple local's call argument can prove the callee
-# leaves the caller sole owner. a qualifying argument releases through
-# the cascade helper — live payload first, then the shell — right after
-# the call returns; anything the walk cannot prove keeps the leak, which
-# can never free a live value.
+# a fresh optional written straight into a call argument dies with the call
+# it fed. three shapes produce one: a call returning an optional
+# (`take(mk(i))`), a bare `none`, and a plain value the checker widened into
+# a `T?` parameter (`take(3)`, `take(point)`). the general release above must
+# keep "tuple" excluded because the rc kind alone cannot tell a wrapper from a
+# tuple literal, but each of these three is judged by its node and the
+# checker's record, and each is a shell nothing but this call ever saw.
 #
-# extractions inside the callee used to be the one wrinkle: the optional
-# unwrap_or once transferred the borrowed shell's payload count out, so a
-# callee that extracted had to disqualify an rc-payload optional. it now
-# retains what it hands out on a parameter subject, so the unwrap_or
-# clause of the walk is open for every payload kind; the `is_result` flag
-# below still opens the result-only clauses (`catch`, `!`) for payloads
-# with no count to move. results stay excluded entirely for now: they
-# ride a different return abi in places, and the measured leak is the
-# optional shape.
-# a fresh optional shell in argument position dies with the call it fed,
-# once the callee's body proves the caller stayed its sole owner. three
-# shapes produce one: a call returning an optional (`take(mk(i))`), a bare
-# `none`, and a plain value the checker widened into a `T?` parameter
-# (`take(3)`, `take(point)`). the last two are built by this caller itself
-# in ir_emit_call_arg, so the caller is trivially the shell's only owner and
-# the walk only has to show the callee did not keep it; they leaked a shell
-# per call before this, `f(none)` alone at 45 call sites in std.
+# the release is the plain shell release, and it does not read the callee's
+# body. an optional parameter is a borrow of the shell: everything a callee
+# can do to keep it or its payload takes a count of its own — a struct
+# construction, a field assignment, a container store and a channel send
+# retain the shell, a lambda capture and a returned parameter retain it on
+# the way out, a bind retains it, and `unwrap_or`, `.value()`, `if let` and
+# `match` retain the payload they hand out. so once the call returns this
+# frame's count is the only one it has to drop, and dropping it is right
+# whatever the callee did: a shell the callee kept survives on the callee's
+# count, and a shell nobody kept dies here, taking with it whatever it owns
+# through its destructor (a wrap-built Some, a widened value, a transferring
+# runtime getter's shell). a shell that borrows its payload — a `xs.get(i)`
+# forwarded out of a callee — owns nothing and frees only its box.
 #
-# what is released follows what the shell holds. a shell this caller wrapped
-# owns its payload through its destructor (ir_emit_optional_owned_some), so
-# only the shell is released and the destructor does the rest — releasing the
-# payload here too would drop it twice. a shell a callee built and returned
-# goes through the cascade helper, which drops the payload, nulls the slot and
-# then frees the shell: a wrap-built shell carries the destructor and the null
-# leaves it a no-op, while a forwarded runtime shell carries none and needs
-# the explicit drop. a plain value or a none has nothing but the shell.
-# `is_method` picks the walk: the callee's own body for a plain call, the impl
-# method's for a method call.
-fn ir_release_fresh_optional_arg(node: Node, arg_pos: Int, arg_name: String, expr_idx: Int, reg: Int, is_method: Bool):
-    en := get_node(expr_idx)
-    mut sig := ""
-    mut dtor_owned := false
-    if en.kind == "none_lit":
-        sig = "00"
-    elif c_argument_widens_to_optional(expr_idx):
-        # a widened argument's shell comes from ir_emit_value_for_target, which
-        # owns every rc payload kind through the shell's destructor — a string
-        # included, since the wrap started retaining a borrowed one and taking
-        # over a fresh one. so the cascade releases the shell alone and lets the
-        # destructor drop the payload; dropping it here as well would free it
-        # twice.
-        payload_kind := ir_rc_kind(ir_infer_type(expr_idx))
-        sig = "00"
-        if payload_kind.len() > 0:
-            dtor_owned = true
-    elif en.kind == "call" or en.kind == "method_call":
-        tid := c_get_expr_type(expr_idx)
-        if tid < 0:
-            return
-        info := get_type_info(tid)
-        if info.kind != "optional":
-            return
-        # the signature says what the cascade must drop: a runtime-built
-        # optional (`xs.get(i)`) carries its payload count with no destructor,
-        # so the payload is released explicitly, exactly as before this
-        # function learned the two shapes above.
-        sig = ir_tuple_cascade_signature(tid)
-    else:
+# this used to walk the callee's body and, when the walk proved the caller
+# stayed the shell's sole owner, release through the cascade helper, which
+# drops the payload explicitly and nulls the slot before freeing the shell.
+# the walk left every callee it could not read on the leak side — one in
+# another module, a method on a generic receiver, a closure — and the cascade
+# was wrong in two places the walk could not see: a callee that returned its
+# parameter retained the shell and handed it back, so `show(forward(v))`
+# nulled the payload `v` still owned, and a shell produced by a borrowing
+# getter (`show(xs.get(0))`) had the container's own element count dropped
+# out from under it. the plain release has neither problem, because it never
+# touches the payload directly.
+fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
+    if not ir_expr_is_fresh_optional_shell(expr_idx):
         return
-    # `open_extraction` opens the result-only extraction clauses of the
-    # walk; the optional unwrap_or clause is always open, since it retains
-    # what it hands out on a parameter subject.
-    open_extraction := sig == "00" and not dtor_owned
-    mut borrow := false
-    if is_method:
-        borrow = ir_tuple_method_arg_is_borrow(node, arg_pos, open_extraction)
-    else:
-        borrow = ir_tuple_call_arg_is_borrow(node, arg_pos, arg_name, open_extraction)
-    if not borrow:
-        return
-    if not ir_tuple_cascade_sigs.contains(sig):
-        ir_tuple_cascade_sigs.push(sig)
-    ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", reg)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
 
 # --- the four "is this a fresh temporary?" predicates -----------------------
 #
@@ -4279,26 +4183,42 @@ fn ir_emit_list_is_empty_method(node: Node) -> Int:
     list_r := ir_expr(node.children[0])
     return ir_emit_list_is_empty(list_r)
 
-# true when an expression's register is an optional shell this frame built and
-# nothing else names: a bare `none`, or a plain value the checker widened into
-# the target's optional type. ir_emit_call_arg builds both, so the caller is
-# trivially the shell's only owner, and the two consumers act on that in the
-# two ways available to them. a search reads the shell and keeps nothing, so
-# it goes back at the end of the scan rather than being stranded once per call.
-# a container store takes the caller's count instead of adding one — a bare
-# `none` written straight into a store (`xs.push(none)`, `m[k] = none`)
-# otherwise stranded its shell, because a none literal falls through to the
-# borrowed classification and sent the store down the retaining path.
+# true when an expression's register is an optional shell nothing but this
+# frame names: a bare `none`, a plain value the checker widened into the
+# target's optional type, or a call, method call or await whose checked type
+# is an optional. ir_emit_call_arg builds the first two, so the caller is
+# trivially the shell's only owner; the third arrives from a callee (or a
+# task) that transferred its one count on the shell with the return, the
+# same shape ir_optional_subject_is_owned reads. the consumers act on that in
+# the ways available to them: a call argument and a search read the shell
+# and keep nothing, so they release it once the call or scan is done rather
+# than stranding it once per call; a container store takes the caller's
+# count instead of adding one — a bare `none` written straight into a store
+# (`xs.push(none)`, `m[k] = none`) otherwise stranded its shell, because a
+# none literal falls through to the borrowed classification and sent the
+# store down the retaining path.
 #
-# a shell some other expression produced — `xs.contains(maybe(i))` — is left
-# alone: showing that the caller is its only owner is the general call path's
-# callee walk, and neither of these lowerings has a callee to walk.
+# what the shell holds is not this predicate's concern. a wrap-built or
+# widened shell owns its payload through its destructor and a borrowing
+# getter's shell owns nothing, so a plain shell release is the whole of it
+# either way (see ir_release_fresh_optional_arg). a `.value()` the emitter
+# could not count has no checked type and stays out.
 fn ir_expr_is_fresh_optional_shell(expr_idx: Int) -> Bool:
     if expr_idx < 0:
         return false
     if c_argument_widens_to_optional(expr_idx):
         return true
-    return get_node(expr_idx).kind == "none_lit"
+    en := get_node(expr_idx)
+    if en.kind == "none_lit":
+        return true
+    if en.kind != "call" and en.kind != "method_call" and en.kind != "await":
+        return false
+    if ir_value_extraction_is_uncounted(expr_idx):
+        return false
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return false
+    return get_type_info(tid).kind == "optional"
 
 # emit the scan behind `xs.index_of(v)` and `xs.contains(v)`. the target goes
 # through the call-argument emitter, so a plain value the checker widened
@@ -4317,9 +4237,11 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
         elem_kind = "string"
 
     out_r := ir_emit_list_index_search_loop(list_r, target_r, ir_retkind(elem_kind), ir_list_element_tid(list_idx), ir_temp_name("__list_index_result"), ir_temp_name("__list_index_i"))
-    # a widened shell owns its payload through the destructor
-    # ir_emit_value_for_target attached, and a `none` holds nothing, so
-    # releasing the shell is the whole of it either way.
+    # a fresh shell dies with the scan: a widened one owns its payload through
+    # the destructor ir_emit_value_for_target attached, a `none` holds
+    # nothing, and a call-produced one (`xs.contains(maybe(i))`) owns or
+    # borrows its payload exactly as it would in any other argument position,
+    # so releasing the shell is the whole of it in every case.
     if ir_expr_is_fresh_optional_shell(target_idx):
         ir_rc_release_reg(target_r, "tuple")
     else:
@@ -4328,8 +4250,7 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
         # be unreachable, because a search compared pointers and a fresh operand
         # could never match; comparing structurally made `xs.contains(a + b)`
         # and `bs.contains(bytes.from_string_utf8(s))` worth writing, and every
-        # one of them stranded its operand. a shell some other expression
-        # produced is left alone by the tuple carve-out inside the release.
+        # one of them stranded its operand.
         ir_release_owned_operand(target_idx, target_r, ir_infer_type(target_idx))
     return out_r
 

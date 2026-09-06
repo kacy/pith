@@ -1,0 +1,69 @@
+# a fresh optional written straight into an argument, handed to a callee the
+# emitter used to leave on the leak side because it could not read the body:
+# a function in another module, a method on a generic receiver, and a callee
+# that extracts a heap payload out of the optional rather than reading it in
+# place. the caller now releases the shell after every call without reading
+# the callee — an optional parameter is a borrow, and a callee that keeps or
+# extracts takes its own count — so these are the same as the same-module
+# case. each shape leaked its 64-byte shell per call before, and the string
+# payload with it where the shell owned one.
+import leakprobe as probe
+import optional_arg_taker as taker
+
+struct Box[T]:
+    pub v: T
+
+impl Box:
+    fn peek(x: T?) -> Int:
+        if x == none:
+            return 0
+        return 1
+
+    fn read(x: T?) -> T:
+        return x.unwrap_or(self.v)
+
+fn maybe_int(i: Int) -> Int?:
+    if i % 7 == 0:
+        return none
+    return i
+
+fn maybe_str(i: Int) -> String?:
+    if i % 7 == 0:
+        return none
+    return "value-{i}-payload"
+
+fn take_str(v: String?) -> Int:
+    return v.unwrap_or("").len()
+
+fn churn_round(i: Int, bi: Box[Int], bs: Box[String]):
+    # a callee in another module, reading, extracting and keeping
+    taker.peek(maybe_str(i))
+    taker.peek(none)
+    taker.peek("lit-{i}")
+    taker.take_int(maybe_int(i))
+    taker.take_int(none)
+    taker.take_int(i)
+    taker.take_str(maybe_str(i))
+    taker.take_str("lit-{i}")
+    taker.keep(maybe_str(i))
+    # a method on a generic receiver
+    bi.peek(maybe_int(i))
+    bi.peek(none)
+    bi.peek(i)
+    bs.peek(maybe_str(i))
+    bs.read(maybe_str(i))
+    bs.read("lit-{i}")
+    # a same-module callee that extracts a heap payload
+    take_str(maybe_str(i))
+    take_str("lit-{i}")
+
+fn main():
+    n := probe.rounds()
+    bi := Box[Int](0)
+    bs := Box[String]("fallback")
+    mut i := 0
+    while i < n:
+        churn_round(i, bi, bs)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

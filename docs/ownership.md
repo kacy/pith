@@ -465,17 +465,36 @@ gaps, all bounded leaks rather than dangling pointers:
   a storing callee takes its own count. any other tuple-typed register
   in argument position keeps the old bounded leak rather than risking a
   double free.
-  a fresh OPTIONAL in that position is narrower and is now reclaimed:
-  when the argument expression is itself a call — `take(mk(i))` — the
-  register is a wrapper the caller alone owns, and the same callee-body
-  walk that qualifies a named tuple local's call argument proves the
-  callee leaves the caller sole owner; a qualifying argument releases
-  its live payload and shell through the cascade helper right after the
-  call returns. a callee that extracts an rc-payload optional, or one
-  the walk cannot read (imported, builtin, method, closure), keeps the
-  argument on the leak side as before. results in argument position, and
-  tuple-typed registers the emitter cannot tie back to a literal, still
-  strand their box.
+  a fresh OPTIONAL in that position is judged the same way, by its
+  spelling rather than its kind. a call or method call whose checked type
+  is an optional (`take(mk(i))`), an `await` of one, a bare `none`, and a
+  plain value the checker widened into a `T?` parameter (`take(3)`,
+  `take(point)`) are each a shell nothing but this call ever saw, and the
+  caller releases the shell right after the call returns without reading
+  the callee's body. that is sound because an optional parameter is a
+  borrow of the shell, and every way a callee can keep it or take its
+  payload retains. a struct construction, a field assignment, a container
+  store, an index store and a channel send retain the shell; a lambda
+  capture, a bind and a returned parameter retain it too; `unwrap_or`,
+  `.value()`, an `if let` binding and a `match` arm retain the payload
+  they hand out. so the caller's count is the only one it has to drop. a
+  shell the callee kept survives on the callee's count. a shell nobody
+  kept dies here and takes with it whatever it owns through its
+  destructor (a wrap-built `Some`, a widened value, a transferring runtime
+  getter's shell). a shell that borrows its payload (`xs.get(i)` forwarded
+  out of a callee) owns nothing and frees only its box. the release is the
+  plain shell release, never the payload cascade: the cascade drops the
+  payload explicitly, which is wrong as soon as a second owner holds the
+  same shell. an earlier version walked the callee's body and cascaded
+  when the walk passed. it left every callee it could not read (another
+  module, a generic receiver, a closure) on the leak side, and it emptied
+  `v` in `show(forward(v))` and freed the list's element in
+  `show(xs.get(0))`, two shapes the walk read as safe.
+  `tests/cases/test_optional_arg_callee_spellings` reads back every keep
+  and extract spelling, same-module, cross-module and through a generic
+  receiver, under valgrind with the freelist off. results in argument
+  position, and tuple-typed registers the emitter cannot tie back to a
+  literal, still strand their box.
 - **a collection literal the checker cannot type builds an untagged
   container.** `[]` and `{}` have no type of their own and take one from
   context. an annotated bind, a `return`, a struct constructor, an
@@ -525,10 +544,10 @@ gaps, all bounded leaks rather than dangling pointers:
   question left unwalked. any other use leaks as before
   — returned whole, bound by `if let`, passed across a module boundary,
   or captured by a closure, which takes the shell and not the payload.
-  an optional extracted *inside* the callee (`o.unwrap_or(d)`) also
-  disqualifies the argument, deliberately: that extraction transfers the
-  borrowed shell's payload count out, so the caller is no longer the
-  payload's owner. one more shape stays on the leak side: rebinding one
+  an extraction *inside* the callee (`o.unwrap_or(d)`, `o.value()`) does
+  not disqualify the argument: on a parameter subject it retains what it
+  hands out, so the caller stays the payload's owner. one more shape
+  stays on the leak side: rebinding one
   name to results of different payload types (`r := await ta` then
   `r := await tb` where the two tasks return different `T!`s) — the
   cleanup path is keyed by name and cannot pick one payload shape, so it

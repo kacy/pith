@@ -1,0 +1,42 @@
+# helper module for test_optional_arg_callee_spellings: the callee sits in
+# another module, so the caller's emitter never sees its body. every function
+# keeps or extracts its optional parameter in one of the ways the same-module
+# twins in the test do.
+
+pub struct Keep:
+    pub text: String?
+    pub num: Int?
+
+pub fn build(x: String?, n: Int?) -> Keep:
+    return Keep(x, n)
+
+pub fn store(k: Keep, x: String?):
+    k.text = x
+
+pub fn push_text(xs: List[String?], x: String?):
+    xs.push(x)
+
+pub fn forward(x: String?) -> String?:
+    return x
+
+pub fn forward_int(x: Int?) -> Int?:
+    return x
+
+pub fn extract(x: String?) -> String:
+    return x.unwrap_or("helper-default")
+
+pub fn extract_int(x: Int?) -> Int:
+    return x.unwrap_or(0 - 1)
+
+pub fn peek(x: String?) -> Int:
+    if x == none:
+        return 0
+    return x.value().len()
+
+pub fn opened(x: String?) -> String:
+    if let v = x:
+        return v
+    return "helper-none"
+
+pub fn capture(x: String?) -> fn() -> String:
+    return fn() => x.unwrap_or("helper-captured-none")

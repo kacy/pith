@@ -313,16 +313,24 @@ correctness story:
   container, returning early on an error path, and indexed reads of
   `List[Struct]` were all listed here once; each was fixed and each is now
   pinned flat by the leak-growth gate, measured at two round counts.)
-- a fresh optional written straight into an argument is released once the
-  emitter proves through the callee's body that the caller stayed the shell's
-  sole owner (see docs/ownership.md). that covers a call-produced optional
-  (`f(maybe(i))`), a bare `none` (`f(none)`), a plain value widened into an
-  optional parameter (`f(3)`, `f(Point(1))`), and all three handed to a
-  method (`obj.take(maybe(i))`). what stays on the leak side, about 64 bytes
-  per call: a callee the walk cannot read — one in another module, or a
-  method on a generic receiver — and a callee that extracts a heap payload
-  out of the optional rather than reading it in place. binding the value
-  first (`v: Int? := 3` then `f(v)`) is reclaimed normally either way.
+- a fresh optional written straight into an argument is released by the
+  caller as soon as the call returns, whatever the callee is (see
+  docs/ownership.md). that covers a call-produced optional (`f(maybe(i))`),
+  a bare `none` (`f(none)`), a plain value widened into an optional
+  parameter (`f(3)`, `f(Point(1))`) and an awaited one (`f(await t)`),
+  handed to a plain function, a method (`obj.take(maybe(i))`), a function
+  in another module (`mod.f(maybe(i))`), a method on a generic receiver, a
+  closure, or a callee that extracts or keeps the value. the release does
+  not read the callee's body. an optional parameter is a borrow, and every
+  way a callee can keep the shell or take its payload retains, so the
+  caller's count is the only one it has to drop. an earlier version walked
+  the callee's body and released through the payload cascade when the walk
+  passed. that left every callee it could not read leaking about 64 bytes
+  per call, and it dropped a payload two shells shared: `show(forward(v))`
+  emptied `v`, and `show(xs.get(0))` freed the list's element.
+  `test_optional_arg_callee_spellings` reads back every keep and extract
+  spelling under valgrind. a result in argument position (`f(r())`) still
+  strands its box.
 - a heap local inside a *generic function body* follows the same release
   rules as one in a concrete body: the body is typed against each set of
   concrete types before it is emitted, so escapes, stores and returns are

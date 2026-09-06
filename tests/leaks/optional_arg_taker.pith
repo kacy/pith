@@ -1,0 +1,20 @@
+# helper module for leak_optional_arg_unread_callee: callees in another
+# module, whose bodies the caller's emitter never sees. each takes an optional
+# parameter and reads it, extracts from it, or keeps it.
+
+pub struct Kept:
+    pub text: String?
+
+pub fn peek(v: String?) -> Int:
+    if v == none:
+        return 0
+    return 1
+
+pub fn take_int(v: Int?) -> Int:
+    return v.unwrap_or(0)
+
+pub fn take_str(v: String?) -> Int:
+    return v.unwrap_or("").len()
+
+pub fn keep(v: String?) -> Kept:
+    return Kept(v)

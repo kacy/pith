@@ -2,9 +2,8 @@
 # is a transferred shell nothing else names. the caller used to strand its
 # 64-byte box on every call, because the owned-argument release keeps the
 # tuple kind excluded (it cannot tell a wrapper from a tuple literal). the
-# emitter now proves through the callee's body that the caller stays sole
-# owner and releases the shell — and, for a probing callee, the payload —
-# through the cascade helper right after the call returns.
+# caller now releases the shell right after the call returns; the shell owns
+# its payload through its destructor, so the string goes with it.
 import leakprobe as probe
 
 fn mk_int(i: Int) -> Int?:

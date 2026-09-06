@@ -1,5 +1,7 @@
 # checker_interfaces.pith - interface declaration registry
 
+from std.collections import copy_list
+
 mut interface_declaration_names: List[String] := []
 
 fn names_equal(a: String, b: String) -> Bool:
@@ -59,3 +61,12 @@ pub fn has_interface_declaration(name: String) -> Bool:
             if names_equal(iface_name, base):
                 return true
     return false
+
+# the registry copied out, so a run can be put back to the state it
+# held after some modules were checked.
+pub fn take_interfaces_snapshot() -> List[String]:
+    return copy_list(interface_declaration_names)
+
+# make the live registry a copy of a snapshot taken earlier.
+pub fn restore_interfaces_snapshot(names: List[String]):
+    interface_declaration_names = copy_list(names)

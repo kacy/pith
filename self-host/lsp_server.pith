@@ -19,6 +19,7 @@ from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document,
 from lsp_features import run_analysis, syntax_diagnostics, forget_syntax_cost, DEBOUNCE_MS, ensure_analyzed, hover_result, document_symbols, workspace_symbols, code_actions, formatting_edits
 from lsp_navigation import definition_location, references_locations, completion_items, prepare_rename_range, rename_workspace_edit
 from lsp_tokens import semantic_token_legend, semantic_tokens_full, signature_help, inlay_hints
+from check_pipeline import enable_closure_cache
 from std.lsp.protocol import Message, parse_message, response_body, error_body, PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, SERVER_NOT_INITIALIZED
 import std.lsp.transport as transport
 import std.json as json
@@ -484,6 +485,9 @@ fn debounced_analysis():
 ## shutdown/exit handshake, 1 otherwise.
 pub fn run_lsp_server() -> Int:
     no_debounce = env("PITH_LSP_NO_DEBOUNCE") == "1"
+    # a server checks the same closure per keystroke; keep the imports
+    # between runs (see the closure cache in check_pipeline)
+    enable_closure_cache()
     reader := transport.reader()
     while not exit_requested:
         # a pending analysis shortens the wait so the debounce fires;

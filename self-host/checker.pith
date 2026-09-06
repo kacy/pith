@@ -16,16 +16,17 @@
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
-from checker_builtins import register_builtin_types
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup
-from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
-from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner
+from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot
+from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
+from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
+from std.collections import copy_list, copy_map
 
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
@@ -222,6 +223,12 @@ pub fn initialize_checker(file_path: String):
     generic_declaration_modules = {}
     checker_interfaces_reset()
     implementation_set = {}
+    interface_decl_index = {}
+    interface_assoc_types = {}
+    assoc_type_binding = {}
+    assoc_type_binding_node = {}
+    type_assoc_names = {}
+    active_assoc_bindings = {}
     impl_interface_args = {}
     struct_instance_type_args = {}
     struct_instance_base_name = {}
@@ -7660,3 +7667,223 @@ fn drain_generic_body_worklist():
 # that already imports the checker needs no second import.
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
     return render_diagnostics_json(diags)
+
+# ---------------------------------------------------------------
+# snapshots — every table copied, for a run that resumes from it
+# ---------------------------------------------------------------
+#
+# a long-lived tool that checks the same import closure over and over
+# (the language server, once per keystroke) takes a snapshot after the
+# imported modules are checked and restores it before checking the
+# edited file, so the imports are registered and checked once rather
+# than once per edit. correctness rests on the snapshot being complete:
+# a table missing here would carry the previous edit's entries into the
+# next run and answer with stale types. every `mut` in this module and
+# the modules it delegates to is listed, transients included, so the
+# restored state is the checked-imports state exactly.
+
+# the checker's whole state at one moment. tables are copied one level
+# down: the records they hold (TypeInfo, ScopeEntry, Diagnostic) are
+# never mutated in place, so sharing them is safe.
+pub struct CheckerSnapshot:
+    pub types: TypeTableSnapshot
+    pub scopes: ScopeSnapshot
+    pub diagnostics: DiagnosticsSnapshot
+    pub methods: MethodsSnapshot
+    pub interfaces: List[String]
+    pub builtin_scope: Int
+    pub module_aliases: Map[String, String]
+    pub module_export_entries: List[String]
+    pub wildcard_imports: List[String]
+    pub generic_named_import_entries: List[String]
+    pub generic_wildcard_import_entries: List[String]
+    pub current_checker_module_path: String
+    pub checked_module_paths: Map[String, Bool]
+    pub generic_inference_subst: Map[String, Int]
+    pub last_branch_value_expr: Int
+    pub active_subst_params: List[String]
+    pub active_subst_args: List[Int]
+    pub generic_call_subst: Map[Int, String]
+    pub generic_body_worklist: List[String]
+    pub generic_body_queued: Map[String, Bool]
+    pub generic_body_checked: Map[String, Bool]
+    pub generic_body_spec_counts: Map[Int, Int]
+    pub struct_instance_decl_idx: Map[Int, Int]
+    pub impl_method_modules: Map[Int, String]
+    pub checker_module_roots: Map[String, Int]
+    pub checker_module_files: Map[String, String]
+    pub checker_module_alias_lists: Map[String, String]
+    pub generic_body_check_mode: String
+    pub current_scope: Int
+    pub method_type_map: Map[String, Int]
+    pub method_declared_kinds: Map[String, Bool]
+    pub method_visibility_map: Map[String, Bool]
+    pub function_visibility_map: Map[String, Bool]
+    pub struct_field_default_nodes: Map[String, Int]
+    pub generic_declaration_map: Map[String, Int]
+    pub generic_declaration_names: List[String]
+    pub generic_base_first_module: Map[String, String]
+    pub ambiguous_generic_bases: Map[String, Bool]
+    pub generic_identity_bare_names: Map[String, String]
+    pub generic_declaration_modules: Map[Int, String]
+    pub checking_test_decl: Bool
+    pub implementation_set: Map[String, Int]
+    pub interface_decl_index: Map[String, Int]
+    pub interface_assoc_types: Map[String, String]
+    pub assoc_type_binding: Map[String, Int]
+    pub assoc_type_binding_node: Map[String, Int]
+    pub type_assoc_names: Map[String, String]
+    pub active_assoc_bindings: Map[String, Int]
+    pub impl_interface_args: Map[String, String]
+    pub struct_instance_type_args: Map[Int, String]
+    pub struct_instance_base_name: Map[Int, String]
+    pub struct_instance_tids: List[Int]
+    pub suppress_unknown_type_for: Map[String, Int]
+    pub expression_type_cache: Map[Int, Int]
+    pub definition_of: Map[Int, Int]
+    pub optional_widened_arguments: Map[Int, Bool]
+    pub open_empty_literal_bindings: Map[Int, Int]
+    pub type_resolve_depth: Int
+    pub c_module_global_names: List[String]
+    pub c_shadow_seen_names: List[String]
+    pub fn_bound_names: List[String]
+    pub fn_weak_names: List[String]
+    pub checker_lambda_depth: Int
+    pub lambda_inferred_return: Int
+
+# copy the checker's state out. the live state keeps changing
+# afterwards; the snapshot does not.
+pub fn take_checker_snapshot() -> CheckerSnapshot:
+    return CheckerSnapshot(
+        types: take_type_table_snapshot(),
+        scopes: take_scope_snapshot(),
+        diagnostics: take_diagnostics_snapshot(),
+        methods: take_methods_snapshot(),
+        interfaces: take_interfaces_snapshot(),
+        builtin_scope: builtin_scope_id(),
+        module_aliases: copy_map(module_aliases),
+        module_export_entries: copy_list(module_export_entries),
+        wildcard_imports: copy_list(wildcard_imports),
+        generic_named_import_entries: copy_list(generic_named_import_entries),
+        generic_wildcard_import_entries: copy_list(generic_wildcard_import_entries),
+        current_checker_module_path: current_checker_module_path,
+        checked_module_paths: copy_map(checked_module_paths),
+        generic_inference_subst: copy_map(generic_inference_subst),
+        last_branch_value_expr: last_branch_value_expr,
+        active_subst_params: copy_list(active_subst_params),
+        active_subst_args: copy_list(active_subst_args),
+        generic_call_subst: copy_map(generic_call_subst),
+        generic_body_worklist: copy_list(generic_body_worklist),
+        generic_body_queued: copy_map(generic_body_queued),
+        generic_body_checked: copy_map(generic_body_checked),
+        generic_body_spec_counts: copy_map(generic_body_spec_counts),
+        struct_instance_decl_idx: copy_map(struct_instance_decl_idx),
+        impl_method_modules: copy_map(impl_method_modules),
+        checker_module_roots: copy_map(checker_module_roots),
+        checker_module_files: copy_map(checker_module_files),
+        checker_module_alias_lists: copy_map(checker_module_alias_lists),
+        generic_body_check_mode: generic_body_check_mode,
+        current_scope: current_scope,
+        method_type_map: copy_map(method_type_map),
+        method_declared_kinds: copy_map(method_declared_kinds),
+        method_visibility_map: copy_map(method_visibility_map),
+        function_visibility_map: copy_map(function_visibility_map),
+        struct_field_default_nodes: copy_map(struct_field_default_nodes),
+        generic_declaration_map: copy_map(generic_declaration_map),
+        generic_declaration_names: copy_list(generic_declaration_names),
+        generic_base_first_module: copy_map(generic_base_first_module),
+        ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
+        generic_identity_bare_names: copy_map(generic_identity_bare_names),
+        generic_declaration_modules: copy_map(generic_declaration_modules),
+        checking_test_decl: checking_test_decl,
+        implementation_set: copy_map(implementation_set),
+        interface_decl_index: copy_map(interface_decl_index),
+        interface_assoc_types: copy_map(interface_assoc_types),
+        assoc_type_binding: copy_map(assoc_type_binding),
+        assoc_type_binding_node: copy_map(assoc_type_binding_node),
+        type_assoc_names: copy_map(type_assoc_names),
+        active_assoc_bindings: copy_map(active_assoc_bindings),
+        impl_interface_args: copy_map(impl_interface_args),
+        struct_instance_type_args: copy_map(struct_instance_type_args),
+        struct_instance_base_name: copy_map(struct_instance_base_name),
+        struct_instance_tids: copy_list(struct_instance_tids),
+        suppress_unknown_type_for: copy_map(suppress_unknown_type_for),
+        expression_type_cache: copy_map(expression_type_cache),
+        definition_of: copy_map(definition_of),
+        optional_widened_arguments: copy_map(optional_widened_arguments),
+        open_empty_literal_bindings: copy_map(open_empty_literal_bindings),
+        type_resolve_depth: type_resolve_depth,
+        c_module_global_names: copy_list(c_module_global_names),
+        c_shadow_seen_names: copy_list(c_shadow_seen_names),
+        fn_bound_names: copy_list(fn_bound_names),
+        fn_weak_names: copy_list(fn_weak_names),
+        checker_lambda_depth: checker_lambda_depth,
+        lambda_inferred_return: lambda_inferred_return)
+
+# make the live state a copy of the snapshot, leaving the snapshot as
+# it was so it can be restored again after the next run.
+pub fn restore_checker_snapshot(s: CheckerSnapshot):
+    restore_type_table_snapshot(s.types)
+    restore_scope_snapshot(s.scopes)
+    restore_diagnostics_snapshot(s.diagnostics)
+    restore_methods_snapshot(s.methods)
+    restore_interfaces_snapshot(s.interfaces)
+    set_builtin_scope_id(s.builtin_scope)
+    module_aliases = copy_map(s.module_aliases)
+    module_export_entries = copy_list(s.module_export_entries)
+    wildcard_imports = copy_list(s.wildcard_imports)
+    generic_named_import_entries = copy_list(s.generic_named_import_entries)
+    generic_wildcard_import_entries = copy_list(s.generic_wildcard_import_entries)
+    current_checker_module_path = s.current_checker_module_path
+    checked_module_paths = copy_map(s.checked_module_paths)
+    generic_inference_subst = copy_map(s.generic_inference_subst)
+    last_branch_value_expr = s.last_branch_value_expr
+    active_subst_params = copy_list(s.active_subst_params)
+    active_subst_args = copy_list(s.active_subst_args)
+    generic_call_subst = copy_map(s.generic_call_subst)
+    generic_body_worklist = copy_list(s.generic_body_worklist)
+    generic_body_queued = copy_map(s.generic_body_queued)
+    generic_body_checked = copy_map(s.generic_body_checked)
+    generic_body_spec_counts = copy_map(s.generic_body_spec_counts)
+    struct_instance_decl_idx = copy_map(s.struct_instance_decl_idx)
+    impl_method_modules = copy_map(s.impl_method_modules)
+    checker_module_roots = copy_map(s.checker_module_roots)
+    checker_module_files = copy_map(s.checker_module_files)
+    checker_module_alias_lists = copy_map(s.checker_module_alias_lists)
+    generic_body_check_mode = s.generic_body_check_mode
+    current_scope = s.current_scope
+    method_type_map = copy_map(s.method_type_map)
+    method_declared_kinds = copy_map(s.method_declared_kinds)
+    method_visibility_map = copy_map(s.method_visibility_map)
+    function_visibility_map = copy_map(s.function_visibility_map)
+    struct_field_default_nodes = copy_map(s.struct_field_default_nodes)
+    generic_declaration_map = copy_map(s.generic_declaration_map)
+    generic_declaration_names = copy_list(s.generic_declaration_names)
+    generic_base_first_module = copy_map(s.generic_base_first_module)
+    ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
+    generic_identity_bare_names = copy_map(s.generic_identity_bare_names)
+    generic_declaration_modules = copy_map(s.generic_declaration_modules)
+    checking_test_decl = s.checking_test_decl
+    implementation_set = copy_map(s.implementation_set)
+    interface_decl_index = copy_map(s.interface_decl_index)
+    interface_assoc_types = copy_map(s.interface_assoc_types)
+    assoc_type_binding = copy_map(s.assoc_type_binding)
+    assoc_type_binding_node = copy_map(s.assoc_type_binding_node)
+    type_assoc_names = copy_map(s.type_assoc_names)
+    active_assoc_bindings = copy_map(s.active_assoc_bindings)
+    impl_interface_args = copy_map(s.impl_interface_args)
+    struct_instance_type_args = copy_map(s.struct_instance_type_args)
+    struct_instance_base_name = copy_map(s.struct_instance_base_name)
+    struct_instance_tids = copy_list(s.struct_instance_tids)
+    suppress_unknown_type_for = copy_map(s.suppress_unknown_type_for)
+    expression_type_cache = copy_map(s.expression_type_cache)
+    definition_of = copy_map(s.definition_of)
+    optional_widened_arguments = copy_map(s.optional_widened_arguments)
+    open_empty_literal_bindings = copy_map(s.open_empty_literal_bindings)
+    type_resolve_depth = s.type_resolve_depth
+    c_module_global_names = copy_list(s.c_module_global_names)
+    c_shadow_seen_names = copy_list(s.c_shadow_seen_names)
+    fn_bound_names = copy_list(s.fn_bound_names)
+    fn_weak_names = copy_list(s.fn_weak_names)
+    checker_lambda_depth = s.checker_lambda_depth
+    lambda_inferred_return = s.lambda_inferred_return

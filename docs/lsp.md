@@ -100,6 +100,14 @@ it costs and when it takes itself out of the way. setting
 didOpen/didChange/didSave instead, which is what the transcript tests
 rely on for deterministic output.
 
+the pipeline keeps the import closure between runs: when the edit was
+in the document itself and every module it imports reads as it did, the
+run lexes, parses and checks that one document against the imports'
+cached state. when the edit changed the document's interface (a
+signature, a type, a global; anything but the body of a non-generic
+function), every open document whose closure holds it is analyzed next
+and its diagnostics republished. see "the closure cache" below.
+
 the modules:
 
 - `self-host/lsp_server.pith` — the loop, routing, and lifecycle
@@ -164,7 +172,9 @@ import cost to locate, read, lex and parse, and what each module cost
 the checker. that is how a slow closure names the module responsible.
 it also splits the import phase by activity, so a closure that spends
 its time probing the filesystem is told apart from one that spends it
-parsing.
+parsing. the line ends with `cache=hit|miss` and the cost of copying
+the closure cache's snapshot in or out (`snapshot=`); see "the closure
+cache" below.
 
 measured here on a 2-core host shared with other work. absolute
 figures move by a factor of two or more with the load, so what follows
@@ -289,27 +299,102 @@ second; it is under 30 kb an analysis on both now, which is the
 allocator settling rather than a leak. what remains between the first
 analysis and the tenth is the working set reaching its size.
 
-### what per-module caching would take
+### the closure cache
 
-caching a module's parse or check result across runs is not a matter
-of adding a map. node identity is a position in one global arena that
-`run_check_pipeline` resets on every run, and the entry file is parsed
-into it first, so an import's node indices are not stable between
-runs. `initialize_checker` clears thirty maps and lists keyed on those
-indices or on scope ids, which are arena positions too, and the driver
-clears twenty-one more. a cache would have to reorder the arena so
-imports come first and the edited file last, key every module's node
-range on its content, and snapshot and restore all of that checker
-state. a single structure missed there leaves stale, wrong diagnostics
-rather than a crash.
+nearly every analysis finds the import closure exactly as the last one
+left it: the keystroke was in the open document. `run_check_pipeline`
+in cache mode (the server turns it on with `enable_closure_cache`; `pith
+check` never does) keeps what the imports produced and re-does only the
+entry file.
 
-one piece of it sidesteps the arena entirely. `lex_all` returns a
-plain `List[Token]`, no node indices involved, so memoizing it per
-import on content is a safe change on its own. it is worth 113 ms of
-the mid-size closure's 360 ms and 152 ms of the worst case's 1300 ms.
-measure memory before taking it: the closure holds about 1 MB of
-imported source, and the server would keep every token of it
-resident.
+it keeps three things. the imports' nodes stay in the arena,
+because the arena is laid out imports first: the entry file is parsed,
+its import list is read off its nodes, the nodes are lifted out
+(`take_nodes_from`) so the walk parses the imports from index 0, and
+the entry's nodes go back at the end with their child indices shifted
+(`append_relocated_nodes`). a later run truncates the arena to the
+imports' end and parses the new entry text there, so every node index
+the checker's tables hold for an import is the index it was. the
+driver's post-walk state is copied out (`DriverSnapshot`). and the
+checker's whole state after the imports were checked is copied out
+(`CheckerSnapshot`): the type table, the scope arena, the diagnostics,
+the method and interface registries, and every one of the checker
+module's own tables, transients included. `initialize_checker` also
+now clears six associated-type tables it used to leave alone between
+runs; those held node indices from the previous arena.
+
+what it keys on: the entry path, the entry's import list in order, and
+the walk itself. before a hit the driver resolves every recorded import
+edge again and reads every module file again through the overlays, and
+one different answer misses (`walk_is_unchanged`). an edited module, an
+edited overlay, a file that appeared on a resolution path where none
+was, an import added to the entry file: all miss and rebuild. a miss
+costs what a cold run always cost plus one copy of the state; a hit
+costs one copy of the state back in plus the entry file. the copy is
+the whole of the hit's fixed cost and the log line reports it as
+`snapshot=`.
+
+keystroke to diagnostics on the two large closures (53 and 54
+modules), the same one-line edit repeated 49 times, `PITH_LSP_NO_DEBOUNCE=1`, median of
+the edits, measured on a quiet box against a server from the same tree
+without the cache:
+
+| closure                  | before   | after  | of which snapshot | check |
+|--------------------------|----------|--------|-------------------|-------|
+| self-host/pith_main.pith | 1525 ms  |  65 ms |             25 ms | 13 ms |
+| examples/web_login.pith  | 1113 ms  |  51 ms |             34 ms |  3 ms |
+
+the residual is the copy. the 54-module closure's checker state
+describes 184,000 nodes, 6,700 types and 17,000 bindings, and copying
+it back costs more than checking the 200-line entry file does. the
+copy is what keeps the snapshot pristine for the next hit; a journal
+that undid the entry file's writes instead would remove it, at the
+price of wrapping every table write in the checker.
+
+memory: the snapshot is a second copy of the tables, so a session sits
+about 15 mb higher than without the cache (89 mb against 74 mb after
+50 analyses of pith_main.pith, 104 mb against 87 mb for web_login.pith)
+and is flat from there.
+
+one entry at a time. the arena is one global list, so a snapshot for a
+second entry file would need an arena of its own, and switching
+between two open documents misses on each switch. a workflow that edits
+a module while its dependents are open pays the miss on every return to
+the module once a dependent has been analyzed.
+
+#### dependents
+
+the server keeps, per analyzed document, the module files its closure
+covered and a rendering of its interface: every top-level declaration
+except tests, with the bodies of non-generic functions and methods left
+out (`module_interface_digest`). after an analysis whose rendering
+differs from the document's previous one, every other open document
+whose closure holds the file is analyzed and republished. a body edit
+changes nothing a dependent's check can see, so it re-runs nothing; a
+signature change re-runs every open dependent, each as a full run
+because the module they import changed. generic bodies stay in the
+rendering because a dependent's check walks them at each instantiation.
+three transcripts pin this: `dependency_signature_edit` (a parameter
+added to an imported function reports E207 in the importer and clears
+when it is removed), `dependency_body_edit` (a changed return value
+publishes for the module alone), and `cached_types` (the type a hover
+answers after a cold run, after a cache hit, after the imported
+module's return type changed, and after the importer was edited against
+the new type).
+
+#### what a per-module cache would still take
+
+the closure cache re-checks the whole closure when any module in it
+changes. skipping the modules that neither changed nor import a changed
+module needs what this cache does not have: a checker state that can be
+cut at a module boundary. type ids, scope ids and node indices are all
+positions in shared arenas, so a module's registration cannot be lifted
+out and dropped back in at another position; the checker would have to
+register modules into per-module tables and resolve across them, which
+is the registration split the checker does not have today. the cheaper
+piece, memoizing `lex_all` per import on content, is now moot for the
+hit path (no import is lexed on a hit) and worth 113 ms of a miss on
+the mid-size closure.
 
 queries never wait on any of this: hover, definition, references and
 the rest answer from the last completed analysis, so the figures above
@@ -366,13 +451,16 @@ are diagnostic latency only.
   single-file closure, seconds on the largest ones); incoming messages
   wait in the pipe buffer meanwhile. a snapshot/multi-task split is a
   later, measured change.
-- the only incremental step is the syntax fast lane. every full
-  analysis re-reads, re-lexes, re-parses and re-checks the whole import
-  closure, however little of it changed; see "what per-module caching
-  would take" above for what stands in the way.
-- editing a module does not re-report its dependents. the server
-  analyzes the closure of the changed document, and a dependent picks
-  up the change only when it is the changed document itself.
+- the closure cache holds one entry file. switching between two open
+  documents misses on each switch, and an edit to a module re-checks
+  its whole closure, not only the modules that import it; see "what a
+  per-module cache would still take" above.
+- dependents are re-reported only while they are open, and an
+  interface change re-runs each of them in full. a dependent that is
+  not open picks up the change when it is opened or edited.
+- the interface rendering that gates dependents is syntactic and
+  conservative: a private function's signature is part of it, so
+  changing one re-runs the dependents although none can see it.
 - document sync is full-text only; incremental sync is not offered. on
   a large file the cost of shipping and decoding the whole buffer per
   keystroke exceeds the cost of parsing it.

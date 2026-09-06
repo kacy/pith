@@ -9,7 +9,7 @@
 # describe only the most recent run_check_pipeline call — so every
 # feature goes through ensure_analyzed first.
 
-from check_pipeline import run_check_pipeline, run_parse_only, last_timing_line, last_module_timing_lines, last_parse_only_ms
+from check_pipeline import run_check_pipeline, run_parse_only, last_timing_line, last_module_timing_lines, last_parse_only_ms, last_closure_files
 from driver import file_for_node, dr_read_source
 from checker import c_get_expr_type, get_definition_of
 from types import get_type_name, TID_ERR
@@ -69,6 +69,20 @@ mut last_diags_by_path: Map[String, List[Diagnostic]] := {}
 # how many diagnostics were last published per uri, so a document whose
 # problems disappear gets one clearing publish instead of silence.
 mut last_published_counts: Map[String, Int] := {}
+
+# the module files each analyzed document's closure covered, by the
+# document's path, and a rendering of each document's interface (every
+# top-level declaration minus the bodies of non-generic functions) from
+# its last analysis. together they answer "which open documents does
+# this edit reach": an edit that leaves the interface as it was cannot
+# change what any dependent's check reports, so only an edit that
+# changes it re-runs the open documents whose closure holds the file.
+mut closure_files: Map[String, List[String]] := {}
+mut interface_digests: Map[String, String] := {}
+
+# whether the last run parsed the document, checked or not; false when
+# the pipeline failed outright and the state describes an older run.
+mut analyzed_parse_ok := false
 
 # ---------------------------------------------------------------
 # diagnostics
@@ -168,14 +182,82 @@ fn log_analysis_timing(path: String, publish_ms: Int):
     for line in last_module_timing_lines():
         log.info("  " + line)
 
+# one node and its subtree rendered without positions, the body of a
+# non-generic function left out: what a dependent's check can see of it.
+# a generic body is walked at each instantiation a dependent makes, so
+# it stays in.
+fn render_interface(idx: Int, out: List[String]):
+    node := get_node(idx)
+    out.push(node.kind)
+    out.push(node.value)
+    mut skip_body := node.kind == "fn_decl"
+    if skip_body:
+        for c in node.children:
+            if get_node(c).kind == "generic_param":
+                skip_body = false
+    for c in node.children:
+        if skip_body and get_node(c).kind == "body":
+            continue
+        render_interface(c, out)
+    out.push("/")
+
+## the part of a module a dependent's check can see, rendered as one
+## string: every top-level declaration except tests, with the bodies of
+## non-generic functions and methods left out. two renderings compare
+## equal exactly when no dependent could report anything different.
+pub fn module_interface_digest(root_idx: Int) -> String:
+    mut out: List[String] := []
+    root := get_node(root_idx)
+    for child in root.children:
+        if get_node(unwrap_pub(child)).kind == "test_decl":
+            continue
+        render_interface(child, out)
+    return out.join(chr(9))
+
+# the open documents other than `uri` whose last closure held `path`.
+fn dependents_of(uri: String, path: String) -> List[String]:
+    mut found: List[String] := []
+    for open_uri in open_document_uris():
+        if open_uri == uri:
+            continue
+        open_path := uri_to_path(open_uri)
+        if not closure_files.contains_key(open_path):
+            continue
+        if closure_files[open_path].contains(path):
+            found.push(open_uri)
+    return found
+
 ## run the front end for one document and build the publishDiagnostics
 ## notifications that fall out: always one for the analyzed document,
 ## and one per other open document that has findings now or had some at
 ## its last publish. bodies are encoded strings, so they stay valid
 ## after the caller closes its json scope.
+##
+## when the edit changed the document's interface, every open document
+## whose closure holds it is analyzed after it and its bodies follow,
+## so a dependent's diagnostics change with the signature they depend
+## on. the compiler state then describes the last dependent run; a
+## query on the edited document re-runs it through ensure_analyzed.
 pub fn run_analysis(uri: String) -> List[String]:
+    mut bodies := analyze_one(uri)
+    path := uri_to_path(uri)
+    if not analyzed_parse_ok:
+        return bodies
+    digest := module_interface_digest(analyzed_root)
+    changed := interface_digests.contains_key(path) and interface_digests[path] != digest
+    interface_digests.insert(path, digest)
+    if not changed:
+        return bodies
+    for dependent in dependents_of(uri, path):
+        for body in analyze_one(dependent):
+            bodies.push(body)
+    return bodies
+
+# one document's analysis and its publish bodies, no dependents.
+fn analyze_one(uri: String) -> List[String]:
     path := uri_to_path(uri)
     mut bodies: List[String] := []
+    analyzed_parse_ok = false
     outcome := run_check_pipeline(path) catch:
         return bodies
     pipeline_done := time.mono_millis()
@@ -184,6 +266,9 @@ pub fn run_analysis(uri: String) -> List[String]:
     analyzed_root = outcome.root
     analyzed_import_roots = outcome.import_roots
     analyzed_checked = outcome.parse_ok and outcome.import_ok
+    analyzed_parse_ok = outcome.parse_ok
+    if analyzed_checked:
+        closure_files.insert(path, last_closure_files())
     mode := get_position_encoding()
 
     # group findings by the file they point at

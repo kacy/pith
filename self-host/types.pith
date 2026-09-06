@@ -3,7 +3,7 @@
 # flat type table used by the self-hosted checker and IR emitter. TypeIds are
 # plain integers indexing into a flat list.
 
-from std.collections import copy_list
+from std.collections import copy_list, copy_map
 
 # ---------------------------------------------------------------
 # type id constants — must match checker and IR emitter assumptions
@@ -515,3 +515,32 @@ pub fn initialize_type_table():
     # bare-`none` sentinel at index 16. deliberately not registered under a
     # source-visible name: `none` is a value, never something to annotate with.
     add_type_info(ti_primitive("none"))
+
+# ---------------------------------------------------------------
+# snapshots — the whole table copied, for a run that resumes from it
+# ---------------------------------------------------------------
+
+# a copy of the type table as it stood at one moment. a long-lived tool
+# that checks the same import closure again and again takes one after
+# the imports are checked and restores it before checking the edited
+# file, instead of registering every imported type over again. the copy
+# is shallow one level down: TypeInfo records are never mutated in place
+# (set_type_info replaces the whole entry), so sharing them is safe.
+pub struct TypeTableSnapshot:
+    pub types: List[TypeInfo]
+    pub names: Map[String, Int]
+    pub qualified_names: Map[String, Int]
+    pub declared_names: Map[String, Int]
+
+# copy the table out. the live table keeps changing afterwards; the
+# snapshot does not.
+pub fn take_type_table_snapshot() -> TypeTableSnapshot:
+    return TypeTableSnapshot(copy_list(tt_types), copy_map(tt_names), copy_map(tt_qualified_names), copy_map(tt_declared_names))
+
+# make the live table a copy of the snapshot. the snapshot itself is left
+# untouched, so it can be restored again after the next run.
+pub fn restore_type_table_snapshot(s: TypeTableSnapshot):
+    tt_types = copy_list(s.types)
+    tt_names = copy_map(s.names)
+    tt_qualified_names = copy_map(s.qualified_names)
+    tt_declared_names = copy_map(s.declared_names)

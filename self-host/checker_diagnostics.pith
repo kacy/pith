@@ -2,6 +2,7 @@
 
 from ast import get_node
 from errors import Diagnostic
+from std.collections import copy_list, copy_map
 
 mut checker_diagnostics: List[Diagnostic] := []
 mut checker_file_path := ""
@@ -208,3 +209,38 @@ pub fn report_warning_at(node_idx: Int, code: String, message: String):
 ## snippet. like report_warning_at, no checker pass calls it today.
 pub fn report_warning(code: String, message: String):
     checker_record(0 - 1, "warning", code, message, "")
+
+# ---------------------------------------------------------------
+# snapshots
+# ---------------------------------------------------------------
+
+## the diagnostic state as it stood at one moment: what was reported so
+## far, the file being stamped, and the switches. a run that resumes
+## from a snapshot restores the list so the imported modules' findings
+## are reported again without checking them again.
+pub struct DiagnosticsSnapshot:
+    pub diagnostics: List[Diagnostic]
+    pub file_path: String
+    pub current_node: Int
+    pub reporting_enabled: Bool
+    pub message_suffix: String
+    pub severity_override: String
+    pub dedup_active: Bool
+    pub dedup_seen: Map[String, Bool]
+
+## copy the state out. Diagnostic records are never mutated, so the
+## list is shared one level down.
+pub fn take_diagnostics_snapshot() -> DiagnosticsSnapshot:
+    return DiagnosticsSnapshot(copy_list(checker_diagnostics), checker_file_path, checker_current_node, checker_reporting_enabled, checker_message_suffix, checker_severity_override, checker_dedup_active, copy_map(checker_dedup_seen))
+
+## make the live state a copy of the snapshot, leaving the snapshot as
+## it was.
+pub fn restore_diagnostics_snapshot(s: DiagnosticsSnapshot):
+    checker_diagnostics = copy_list(s.diagnostics)
+    checker_file_path = s.file_path
+    checker_current_node = s.current_node
+    checker_reporting_enabled = s.reporting_enabled
+    checker_message_suffix = s.message_suffix
+    checker_severity_override = s.severity_override
+    checker_dedup_active = s.dedup_active
+    checker_dedup_seen = copy_map(s.dedup_seen)

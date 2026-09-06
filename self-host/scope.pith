@@ -4,6 +4,8 @@
 # links as integer indices (-1 for root). bindings are stored in
 # separate flat lists tagged with scope_id, avoiding nested structs.
 
+from std.collections import copy_list
+
 # ---------------------------------------------------------------
 # scope entry — a single lexical scope (no nested collections)
 # ---------------------------------------------------------------
@@ -294,3 +296,47 @@ pub fn create_loop_scope(parent: Int) -> Int:
         ret_type = scope_entries[parent].return_type
     scope_entries.push(ScopeEntry(parent, ret_type, true, false))
     return scope_entries.len() - 1
+
+# ---------------------------------------------------------------
+# snapshots — the whole arena copied, for a run that resumes from it
+# ---------------------------------------------------------------
+
+# a copy of every scope and binding as they stood at one moment, so a
+# later run can be put back to exactly that state rather than defining
+# every imported module's bindings over again. ScopeEntry records are
+# never mutated in place, so the scope list is shared one level down;
+# the per-name index holds lists that grow, so those are copied.
+pub struct ScopeSnapshot:
+    pub entries: List[ScopeEntry]
+    pub scope_ids: List[Int]
+    pub names: List[String]
+    pub types: List[Int]
+    pub mutable_flags: List[Bool]
+    pub module_tags: List[String]
+    pub decl_nodes: List[Int]
+    pub index: Map[String, List[Int]]
+    pub module: String
+
+fn copy_binding_index(src: Map[String, List[Int]]) -> Map[String, List[Int]]:
+    mut out: Map[String, List[Int]] := {}
+    for key in src.keys():
+        out.insert(key, copy_list(src[key]))
+    return out
+
+# copy the arena out. the live arena keeps changing afterwards; the
+# snapshot does not.
+pub fn take_scope_snapshot() -> ScopeSnapshot:
+    return ScopeSnapshot(copy_list(scope_entries), copy_list(binding_scope_ids), copy_list(binding_names), copy_list(binding_types), copy_list(binding_mutable_flags), copy_list(binding_module_tags), copy_list(binding_decl_nodes), copy_binding_index(binding_index), defining_module)
+
+# make the live arena a copy of the snapshot, leaving the snapshot as it
+# was so it can be restored again after the next run.
+pub fn restore_scope_snapshot(s: ScopeSnapshot):
+    scope_entries = copy_list(s.entries)
+    binding_scope_ids = copy_list(s.scope_ids)
+    binding_names = copy_list(s.names)
+    binding_types = copy_list(s.types)
+    binding_mutable_flags = copy_list(s.mutable_flags)
+    binding_module_tags = copy_list(s.module_tags)
+    binding_decl_nodes = copy_list(s.decl_nodes)
+    binding_index = copy_binding_index(s.index)
+    defining_module = s.module

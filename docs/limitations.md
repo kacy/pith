@@ -252,20 +252,20 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## tooling
 
-- **analysis is incremental only for syntax** — `pith lsp` parses the changed
-  document on its own and publishes its parse errors within a few milliseconds,
-  but everything else re-reads, re-lexes, re-parses and re-checks the whole
-  import closure on every change, so type errors on a large file still trail
-  the last keystroke by the closure's check time. the fast lane takes itself
-  out of the way on a file too large to parse inside the debounce window.
-  editing a module does not re-report its dependents. memory is flat across
-  analyses now: the growth of about 12 mb an analysis (31 mb before an
-  assignment over a global started releasing the table it replaces) was one
-  emitter defect, a string loop that never released the byte it bound, and a
-  50-analysis session on a 54-module closure sits at 87 mb where it reached
-  649 mb. queries answer instantly from the last snapshot throughout. see
-  [docs/lsp.md](lsp.md) for the feature list, the measured phase split, the
-  memory figures, and what per-module caching would take.
+- **analysis caches the import closure, not the module** — `pith lsp` keeps
+  the checked import closure between analyses, so an edit to the open document
+  re-checks that document alone: a keystroke in a 53-module closure reaches
+  diagnostics in about 60 ms where it took 1.1 to 1.5 s, and the residual is
+  copying the cached checker state back in. an edit to a module misses and
+  re-checks the whole closure, because the checker's tables are shared arenas
+  that cannot be cut at a module boundary; the cache also holds one entry file,
+  so switching between two open documents misses on each switch. an edit that
+  changes a module's interface re-analyzes every open document that imports
+  it; a body edit re-analyzes nothing else. memory is flat across analyses:
+  the growth of about 12 mb an analysis was a string loop that never released
+  the byte it bound, and a 50-analysis session on a 54-module closure sits at
+  104 mb. see [docs/lsp.md](lsp.md) for the feature list, the measured phase
+  split, the cache's figures and what a per-module cache would still take.
 - **no package registry** — dependencies are local path entries in `pith.toml`.
   `pith package lock` writes a `pith.lock` and `pith package install` copies
   those paths into `.pith/packages`, but nothing fetches over the network and

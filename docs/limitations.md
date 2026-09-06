@@ -527,10 +527,16 @@ base for a frame to keep; the few cells whose address has to exist as a value
 globals off the green backend and the collector's mutator slot) are touched
 only inside functions the optimizer may not inline. `make check-tls-barriers`
 audits the built archive for both, and `cargo test` drives a forced
-cross-thread resume against the shipped archive to keep it that way. what is
-still missing is migration itself: a task still pins to the first worker that
-runs it, and the placement cost above is unchanged until the
-move-to-the-waking-worker policy lands.
+cross-thread resume against the shipped archive to keep it that way. the move
+itself is in, behind `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked
+elsewhere takes it, which turns the fan-out's bimodal ~93 ms into a flat
+~43 ms at the default worker count (`docs/performance.md` has the table). it
+is off by default because the same rule pulls parallel work onto one worker
+when it synchronizes: eight compute tasks reporting to a collector run 259 ms
+on two workers without the flag and 337 ms with it, since a pinned task is
+never stolen and nothing spreads it back out. the default waits on an idle
+worker being allowed to take a ready task off a peer's queue. without the
+flag a task still pins to the first worker that runs it.
 `examples/grpc_chat` and `examples/grpc_reflect` are the two programs
 sensitive enough to catch a placement change going wrong; run them first.
 

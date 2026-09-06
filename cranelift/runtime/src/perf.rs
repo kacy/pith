@@ -41,6 +41,15 @@ pub static PERF_SOCK_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SOCK_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_SOCK_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_REACTOR_WAITS: AtomicUsize = AtomicUsize::new(0);
+// green wakes of parked tasks, by where the waker sat relative to the task's
+// worker: the same worker (a userspace handoff), a different worker (a
+// cross-thread enqueue and, if that worker is parked, a futex), or no worker
+// at all (the reactor thread or main). MIGRATIONS counts the cross-worker
+// wakes that moved the task to the waker's worker (`PITH_GREEN_MIGRATE=1`).
+pub static PERF_GREEN_WAKES_SAME: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_GREEN_WAKES_CROSS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_GREEN_WAKES_REACTOR: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_GREEN_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
@@ -266,6 +275,13 @@ pub fn dump_perf_stats() {
         PERF_SOCK_WRITES.load(Ordering::Relaxed),
         PERF_SOCK_WRITE_BYTES.load(Ordering::Relaxed),
         PERF_REACTOR_WAITS.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  green wakes: same_worker={} cross_worker={} reactor={} migrated={}",
+        PERF_GREEN_WAKES_SAME.load(Ordering::Relaxed),
+        PERF_GREEN_WAKES_CROSS.load(Ordering::Relaxed),
+        PERF_GREEN_WAKES_REACTOR.load(Ordering::Relaxed),
+        PERF_GREEN_MIGRATIONS.load(Ordering::Relaxed)
     );
     eprintln!(
         "  lists: new={} free={} live={}",

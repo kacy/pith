@@ -38,16 +38,27 @@
 //! lock and then calls `park_current`, and `green_await` does the same under the
 //! join lock. see those sites for the race and lock-order notes.
 //!
-//! ## pinning (what keeps `SendCoroutine` sound under yielding)
+//! ## pinning, and moving a task (what keeps `SendCoroutine` sound)
 //!
-//! a *suspended* coroutine holds live pith stack across the suspension, so it
-//! must never resume on a different OS thread than it first ran on. we guarantee
-//! that by **pinning**: the first worker to resume a task becomes its `owner`;
-//! from then on the task is never stealable and every wake re-enqueues it onto
-//! its owner worker's private `pinned` queue. only *fresh* (never-resumed) tasks
-//! — which capture nothing but a `Send` closure handle — are stealable. so a
-//! coroutine carrying live stack is only ever touched by one worker. that, not
-//! "nothing yields", is now what makes the `unsafe impl Send for SendCoroutine`
+//! a *suspended* coroutine holds live pith stack across the suspension. what
+//! that stack holds is handles and plain values: pith code owns nothing
+//! thread-affine, and the runtime frames that park (a channel block site,
+//! `green_await`, the reactor and blocking-pool waits) drop every lock and
+//! bracket before they suspend and derive nothing from the thread they parked
+//! on afterwards (see the accessor block above `current_task`). so a
+//! suspended coroutine may, in principle, resume on any worker.
+//!
+//! what the scheduler does with that is a policy. by default a task
+//! **pins**: the first worker to resume it becomes its `owner`, it is never
+//! stealable again, and every wake re-enqueues it onto the owner's private
+//! `pinned` queue, so a coroutine carrying live stack is only ever touched by
+//! one worker. with `PITH_GREEN_MIGRATE=1` a worker that wakes a task parked
+//! on another worker takes it over in the same CAS that claims it (see
+//! `claim_parked`), so a pair of tasks that talk to each other converge onto
+//! one worker instead of paying a cross-thread wake per message. either way a
+//! coroutine changes threads only while it is off-CPU and claimed by exactly
+//! one thread — fresh and stealable, or `Parked` and claimed by its waker —
+//! and that hand-over is what makes the `unsafe impl Send for SendCoroutine`
 //! sound; see the type doc.
 //!
 //! ## synchronization model
@@ -120,6 +131,7 @@ static WAKE_CROSS: AtomicU64 = AtomicU64::new(0);
 static WAKE_REACTOR: AtomicU64 = AtomicU64::new(0);
 static WAKE_FUTEX: AtomicU64 = AtomicU64::new(0);
 static WAKE_ABSORBED: AtomicU64 = AtomicU64::new(0);
+static WAKE_MIGRATED: AtomicU64 = AtomicU64::new(0);
 static PARKED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 fn stats_on() -> bool {
@@ -136,9 +148,10 @@ extern "C" fn dump_stats() {
     let reactor = WAKE_REACTOR.load(AtomicOrdering::Relaxed);
     let futex = WAKE_FUTEX.load(AtomicOrdering::Relaxed);
     let absorbed = WAKE_ABSORBED.load(AtomicOrdering::Relaxed);
+    let migrated = WAKE_MIGRATED.load(AtomicOrdering::Relaxed);
     eprintln!(
         "[green-stats] wakes: same-worker={same} cross-worker={cross} reactor={reactor} \
-         | futex-wakes={futex} absorbed={absorbed}"
+         migrated={migrated} | futex-wakes={futex} absorbed={absorbed}"
     );
     dump_contention();
 }
@@ -738,27 +751,32 @@ type TaskYielder = Yielder<(), ()>;
 ///
 /// P2 makes tasks suspend mid-run (a channel op parks the coroutine with live
 /// pith stack), so "nothing yields" is no longer the justification. what makes
-/// the manual `Send` sound now is **pinning** (see the module doc): a coroutine
-/// only ever *carries live stack* while it belongs to one worker. concretely —
+/// the manual `Send` sound is the hand-over discipline (see the pinning
+/// section of the module doc): a coroutine crosses a thread boundary only
+/// while it is off-CPU and held by exactly one thread, and nothing it holds
+/// is tied to the thread it last ran on. concretely —
 ///
 /// - a *fresh* task's coroutine has never resumed; the only captured state is
-///   `closure_handle: i64` (trivially `Send`). fresh tasks are the only ones the
-///   scheduler moves between threads (spawn hand-off, work-stealing), and moving
-///   a not-yet-started coroutine is sound.
-/// - once a task resumes it is pinned to its `owner` worker: it is never stolen,
-///   and every wake re-enqueues it onto the owner's private queue, so its
-///   coroutine — now possibly holding live, non-`Send` pith locals across a
-///   suspension — is only ever resumed and dropped on that one thread.
+///   `closure_handle: i64` (trivially `Send`). fresh tasks are stealable, and
+///   moving a not-yet-started coroutine is sound.
+/// - a *parked* task's coroutine sits in its sync block, in no queue, and the
+///   waker that wins the Parked -> Ready CAS is its only holder until it is
+///   enqueued. by default that waker sends it back to its owner worker; with
+///   migration on it may name the waking worker instead. what the stack holds
+///   across the park is pith handles and runtime values, none of them derived
+///   from the parking thread — the accessor block above `current_task` is the
+///   rule that keeps it so, and `tooling/check_tls_barriers.sh` checks the
+///   built archive for it.
 ///
-/// so the wrapper is moved across threads only while it is provably
-/// stack-empty; the invariant is enforced by the scheduler, not the type system.
+/// the invariant is enforced by the scheduler's claim protocol, not the type
+/// system.
 struct SendCoroutine(TaskCoroutine);
 
-// SAFETY: soundness rests on the pinning discipline documented on the type and
-// in the module header: only fresh (never-resumed, stack-empty, captures a
-// `Send` i64) coroutines are ever moved between threads; once a coroutine has
-// suspended with live stack it is pinned to its owner worker and never crosses a
-// thread boundary again.
+// SAFETY: a coroutine only ever changes threads while off-CPU and held by one
+// thread — fresh and stealable, or Parked and claimed by its waker through the
+// scheduling word's CAS — and nothing on a suspended stack is derived from the
+// thread it last ran on (see the type doc and the accessor block above
+// `current_task`).
 unsafe impl Send for SendCoroutine {}
 
 /// join channel between a task and whoever awaits it: the done flag plus the
@@ -945,6 +963,13 @@ struct Scheduler {
     sync: SyncArena,
     workers: Vec<Worker>,
     injector: Mutex<VecDeque<TaskId>>,
+    /// `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked on another
+    /// worker takes it over (see `claim_parked`). read once, here, so the
+    /// wake path pays one load to consult it.
+    migrate: bool,
+    /// either stats switch is on, so a claimed wake is categorized
+    /// (`note_wake`). folded into one flag here for the same reason.
+    wake_stats: bool,
 }
 
 /// the scheduler is built lazily on the first green spawn so a process that
@@ -1134,19 +1159,67 @@ pub(crate) fn wake(id: TaskId) {
     let Some(block) = sync_block(id) else {
         return;
     };
+    let Some(owner) = claim_parked(block) else {
+        return;
+    };
+    // a parked task always ran, so `owner` is set; fall back to the injector
+    // only defensively.
+    match owner {
+        Some(w) => enqueue_woken(w, id),
+        None => enqueue_fresh(id),
+    }
+}
+
+/// the Parked -> Ready claim both wake paths make, deciding in the same CAS
+/// which worker will resume the task. returns the worker to enqueue it on
+/// (`Some(None)` only in the defensive never-pinned case), or `None` when the
+/// task was not parked: still `Running` (the pending flag is set so the yield
+/// arm re-enqueues it), already `Ready`, or `Done`.
+///
+/// by default the task goes back to its owner, the first worker that ran it.
+/// with migration on (`PITH_GREEN_MIGRATE=1`, read once into the scheduler),
+/// a worker that wakes a task pinned to a different worker takes it: the
+/// owner bits are rewritten in the claiming CAS, so from the moment the task
+/// is `Ready` every reader of the word — the enqueue below, the resume that
+/// follows, the next wake — agrees on the new home. a pair of tasks that talk
+/// to each other converge onto one worker after the first exchange, and stay
+/// there: a wake from the same worker moves nothing. a waker that is not a
+/// worker (the reactor thread, `main`) has nowhere to take the task and
+/// leaves the owner alone.
+///
+/// this is only sound because nothing on the resumable path derives a value
+/// from the thread the task parked on — see the accessor block above
+/// `current_task`, and the pinning section of the module doc.
+#[inline]
+fn claim_parked(block: &SyncBlock) -> Option<Option<usize>> {
+    let sched = scheduler();
     let mut word = block.word.load(AtomicOrdering::Acquire);
-    let owner = loop {
+    loop {
         match word & S_STATE_MASK {
-            // parked with its coroutine put back: claim it and re-enqueue below.
+            // parked with its coroutine put back: claim it, naming its home.
             S_PARKED => {
-                let next = (word & S_OWNER_MASK) | S_READY;
+                let owner = word_owner(word);
+                let home = if sched.migrate {
+                    match (owner, current_worker()) {
+                        (Some(o), Some(w)) if w != o => Some(w),
+                        _ => owner,
+                    }
+                } else {
+                    owner
+                };
+                let next = home.map_or(S_READY, |w| owner_bits(w) | S_READY);
                 match block.word.compare_exchange_weak(
                     word,
                     next,
                     AtomicOrdering::AcqRel,
                     AtomicOrdering::Acquire,
                 ) {
-                    Ok(_) => break word_owner(word),
+                    Ok(_) => {
+                        if sched.wake_stats {
+                            note_wake(owner, home);
+                        }
+                        return Some(home);
+                    }
                     Err(current) => word = current,
                 }
             }
@@ -1160,32 +1233,43 @@ pub(crate) fn wake(id: TaskId) {
                     AtomicOrdering::AcqRel,
                     AtomicOrdering::Acquire,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return None,
                     Err(current) => word = current,
                 }
             }
             // already queued to re-check, or finished: nothing to do.
-            _ => return,
+            _ => return None,
         }
-    };
-    // profiling: categorize this wake by where the waker sits relative to the
-    // task's owner worker (read-only, gated).
-    if stats_on() {
-        let caller = current_worker();
-        match (caller, owner) {
-            (Some(w), Some(o)) if w == o => WAKE_SAME.fetch_add(1, AtomicOrdering::Relaxed),
-            (Some(_), Some(_)) => WAKE_CROSS.fetch_add(1, AtomicOrdering::Relaxed),
-            // waker is not a worker: the reactor thread or main. either way it
-            // must cross into a worker's queue.
-            _ => WAKE_REACTOR.fetch_add(1, AtomicOrdering::Relaxed),
-        };
     }
+}
 
-    // a parked task always ran, so `owner` is set; fall back to the injector
-    // only defensively.
-    match owner {
-        Some(w) => enqueue_woken(w, id),
-        None => enqueue_fresh(id),
+/// profiling: categorize a claimed wake by where the waker sits relative to
+/// the task's owner worker, and count a migration when the claim moved the
+/// task. read-only; the caller has checked that a stats switch is on.
+#[cold]
+#[inline(never)]
+fn note_wake(owner: Option<usize>, home: Option<usize>) {
+    let caller = current_worker();
+    let (green, perf) = match (caller, owner) {
+        (Some(w), Some(o)) if w == o => (&WAKE_SAME, &crate::PERF_GREEN_WAKES_SAME),
+        (Some(_), Some(_)) => (&WAKE_CROSS, &crate::PERF_GREEN_WAKES_CROSS),
+        // waker is not a worker: the reactor thread or main. either way it
+        // must cross into a worker's queue.
+        _ => (&WAKE_REACTOR, &crate::PERF_GREEN_WAKES_REACTOR),
+    };
+    // the green-stats counters are unconditional here (their own dump is
+    // registered when the scheduler is built); the perf counters go through
+    // the recording hook so their dump is registered even when nothing else
+    // in the program counted first.
+    green.fetch_add(1, AtomicOrdering::Relaxed);
+    if crate::perf_stats_enabled() {
+        crate::perf_record1(perf, 1);
+    }
+    if home != owner {
+        WAKE_MIGRATED.fetch_add(1, AtomicOrdering::Relaxed);
+        if crate::perf_stats_enabled() {
+            crate::perf_record1(&crate::PERF_GREEN_MIGRATIONS, 1);
+        }
     }
 }
 
@@ -1204,34 +1288,8 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
     let Some(block) = sync_block(id) else {
         return;
     };
-    let mut word = block.word.load(AtomicOrdering::Acquire);
-    let owner = loop {
-        match word & S_STATE_MASK {
-            S_PARKED => {
-                let next = (word & S_OWNER_MASK) | S_READY;
-                match block.word.compare_exchange_weak(
-                    word,
-                    next,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                ) {
-                    Ok(_) => break word_owner(word),
-                    Err(current) => word = current,
-                }
-            }
-            S_RUNNING => {
-                match block.word.compare_exchange_weak(
-                    word,
-                    word | S_WAKE_PENDING,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                ) {
-                    Ok(_) => return,
-                    Err(current) => word = current,
-                }
-            }
-            _ => return,
-        }
+    let Some(owner) = claim_parked(block) else {
+        return;
     };
     // the claim above made this thread the only one touching the handoff cell
     // until the task is enqueued (below) and resumed: a Parked task is in no
@@ -1358,8 +1416,20 @@ fn scheduler() -> &'static Scheduler {
             sync: SyncArena::new(),
             workers,
             injector: Mutex::new(VecDeque::new()),
+            migrate: migration_on(),
+            wake_stats: stats_on() || crate::perf_stats_enabled(),
         }
     })
+}
+
+/// `PITH_GREEN_MIGRATE=1` moves a parked task to the worker that wakes it
+/// instead of sending it back to the worker that first ran it. off by
+/// default: see the placement note in `docs/concurrency.md` for what it does
+/// to a pipeline and why it is a flag rather than the default.
+fn migration_on() -> bool {
+    std::env::var("PITH_GREEN_MIGRATE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
 }
 
 /// how many worker threads to run. defaults to `available_parallelism` (floor
@@ -1491,9 +1561,10 @@ fn enqueue_fresh(id: TaskId) {
 
 /// re-enqueue a *woken started* task onto its owner worker's pinned queue and
 /// wake the pool. this is the only path a task that has already resumed takes
-/// back into scheduling, and it always targets the owner — never the waker's
-/// worker — so a suspended coroutine only ever resumes on the thread that first
-/// ran it (see the pinning note). the pinned queue is not stolen from.
+/// back into scheduling, and it always targets the owner recorded in the
+/// task's word — which is the worker that first ran it, or, with migration
+/// on, the worker whose wake just claimed it (see `claim_parked`). the pinned
+/// queue is not stolen from.
 fn enqueue_woken(owner: usize, id: TaskId) {
     let sched = scheduler();
     {
@@ -1594,29 +1665,22 @@ fn note_notify() {
 
 /// debug-only invariant guard for a task pulled from a *stealable* source: a
 /// worker's own `local` queue, the global injector, or a peer's `local` on a
-/// steal. the pinning discipline the whole `SendCoroutine` soundness rests on
-/// (see the module doc) is exactly: only fresh, never-resumed tasks are ever
-/// moved between workers. a fresh task has no `owner` yet and sits `Ready`. if
-/// either were false here we would be about to run — possibly on a different
-/// worker than last time — a coroutine that may carry live pith stack, the
-/// unsound case the manual `Send` forbids. cheap, and compiled out in release.
+/// steal. only fresh, never-resumed tasks travel those queues: a fresh task
+/// has no `owner` yet and sits `Ready`. if either were false here, a started
+/// task's coroutine would be about to resume from a queue that is not its
+/// owner's — outside the claim protocol that hands a suspended coroutine
+/// between threads (a wake's Parked -> Ready CAS, see `claim_parked`). cheap,
+/// and compiled out in release.
 ///
-/// worth knowing before anyone relaxes this: the obvious win is to re-home a
-/// *parked* task to whichever worker keeps waking it, so a pair that talks to
-/// each other stops paying a cross-worker wake per message. the state machine
-/// allows it — a parked task's coroutine is back in its block, in no queue,
-/// and the waker that wins the Parked -> Ready CAS can name a new owner in
-/// that same CAS. it was tried, it is fast, and the first attempt was unsound
-/// for a reason that had nothing to do with the coroutine stack, which
-/// migrates fine: this file's own rust frames held thread-local cell addresses
-/// across a suspend (see the accessor block above `current_task` for the
-/// mechanism and the rule that now prevents it). the pith compiler was never
-/// the hazard — a `threadlocal` global lowers to a call, and `CURRENT_TLS` is
-/// per-task — so with the runtime compiled for the executable it lives in and
-/// its address-taking reads behind calls, nothing on the resumable path
-/// derives a value from the thread it parked on. `pith_green_cross_thread_probe`
-/// forces the cross-thread resume by hand, and `tests/cross_thread_resume.rs`
-/// runs it against the shipped archive; that is the check to keep green.
+/// history worth keeping: re-homing a parked task to the worker that wakes it
+/// (now `PITH_GREEN_MIGRATE=1`) was first tried before the runtime's own rust
+/// frames stopped holding thread-local addresses across a suspend, and it
+/// silently dropped channel messages. the coroutine stack was never the
+/// problem and neither was the pith compiler (a `threadlocal` global lowers
+/// to a call, and `CURRENT_TLS` is per-task); see the accessor block above
+/// `current_task` for what was, and `pith_green_cross_thread_probe` with
+/// `tests/cross_thread_resume.rs` for the check that keeps it fixed against
+/// the shipped archive.
 #[cfg(debug_assertions)]
 fn debug_assert_stealable(id: TaskId) {
     if let Some(block) = sync_block(id) {

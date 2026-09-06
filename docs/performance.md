@@ -129,6 +129,61 @@ reason to change the default.
 `PITH_GREEN_WORKERS=1` remains the right answer for a process that is known to
 be handoff-bound and not compute-bound, which is why the flag exists.
 
+### moving a woken task to its waker (`PITH_GREEN_MIGRATE=1`, 2026-09-06)
+
+the placement cliff has a fix that keeps the worker count: a worker that
+wakes a task parked on another worker takes it over, in the same CAS that
+claims the task. a pair that talk to each other converge onto one worker
+after their first exchange, and a task that never waits is never moved. it
+ships behind `PITH_GREEN_MIGRATE=1`, default off, and this is what it does on
+the handoff benchmarks. interleaved rounds, off then on then the 1-worker
+reference within each round, medians, all on the same 2-core box:
+
+| 2026-09-06, medians of 7 | flag off | flag on | 1 worker |
+|---|---:|---:|---:|
+| chan_fanout, 1m msgs | 93 ms (bimodal: 69, 71, 92-94) | **43 ms** (42-43) | 42 ms |
+| task_pingpong, 200k rounds | 48 ms | 48 ms | — |
+| green_fanout, 300k spawn+await | 220 ms | 213 ms | — |
+
+a second set of 5 rounds after the flag-off path was tightened read the same
+way (fan-out 87 ms bimodal against 41 ms flat, fan-out at 1 worker 40 ms,
+spawn-and-await 220 against 212) and caught the ping-pong cliff that the
+first set had missed: two of the five flag-off runs landed split and took
+413 ms, the other three 49-50; the five flag-on runs read 48, 49, 49, 49, 49.
+
+`PITH_PERF_STATS=1` now reports the wake breakdown, and it is the whole
+explanation. with the flag off the fan-out made 105,268 cross-worker wakes
+in one run and 8,988 in another (the count is as bimodal as the time); with
+the flag on it made 3 and 6, each one a migration, and the rest of the
+~8,000 wakes stayed on one worker. the ping-pong's 400,001 wakes were all
+same-worker in the runs that were counted, which is the arrangement the flag
+produces every time rather than some of the time. the spawn-and-await
+fan-out has no handoff to fix and moves within noise.
+
+the flag-off path costs nothing: `chan_fanout` under callgrind reads
+536.6M instructions against 534.5M for the runtime before the change
+(+0.39%), and 536.8M with the flag on, so the program does the same work
+either way and the whole difference is where the wakes land.
+
+it is not the default, and the reason is a measurement rather than a
+worry. every benchmark above is handoff-shaped, and the rule that collapses
+a pipeline onto one worker is the same rule that pulls parallel work onto
+one worker when it synchronizes: a pinned task is never stolen, so once a
+compute task has been moved next to the task that woke it, nothing spreads
+it back out. `bench/cpu_parallel_sync` is that shape, eight compute tasks
+that report to a collector after each chunk, and it says so:
+
+| 2026-09-06, medians of 5 | 1 worker | 2 workers, flag off | 2 workers, flag on |
+|---|---:|---:|---:|
+| cpu_parallel_sync, 200 chunks of 20k | 448 ms | **259 ms** (247-305) | 337 ms (230-402) |
+
+`PITH_PERF_STATS=1` shows about 280 migrations a run with the flag on, each
+one a compute task landing on the collector's worker. so the flag wins the
+handoff benchmarks outright and gives back a third of the 2-worker speedup
+on this one. the way to have both is to let an idle worker take a `Ready`
+task off a peer's pinned queue, which the runtime is now built to allow;
+until that exists the default stays put.
+
 ### a note on how these are measured
 
 the cross-language harnesses interleave: one round runs every language once,

@@ -61,6 +61,7 @@ cases=(
   "tests/leaks/leak_channel_shared_tasks PITH_GREEN=0"
   tests/leaks/leak_channel_tuple_payload
   tests/leaks/leak_channel_recv_nested_if_let
+  tests/leaks/leak_cross_module_struct_return
   "tests/leaks/leak_optional_tuple_return SHAPE=1"
   "tests/leaks/leak_optional_tuple_return SHAPE=2"
   "tests/leaks/leak_optional_tuple_return SHAPE=3"

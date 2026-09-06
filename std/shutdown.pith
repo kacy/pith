@@ -22,7 +22,7 @@
 ## - **listeners.** a server registers its listening fd here. `request()` calls
 ##   `shutdown(2)` on each, which both stops new connections and wakes the
 ##   waiting accept loop immediately — no polling for the flag. the loop still
-##   closes its own listener, so nothing closes an fd another task is using.
+##   closes its own listener, so the close stays with the loop that owns it.
 ## - **in-flight work.** a server calls `enter()` on its accept loop, the moment
 ##   a connection is accepted, and the task it hands that connection to calls
 ##   `leave()` when it is done — so `drain()` knows when the last one is out.
@@ -92,10 +92,10 @@ pub fn requested() -> Bool:
 ## `shutdown(2)` rather than `close(2)`, for two reasons. it wakes an accept loop
 ## whichever way that loop is waiting — a green task parked on the epoll reactor
 ## sees a hangup, and a plain thread blocked inside `accept` (which is what
-## `listen()` called straight from `main` is) gets an error back, where a close
-## would have left it blocked indefinitely. and the fd stays valid, so the accept
-## loop that owns the listener still closes it itself, exactly once, on its own
-## way out — nothing closes an fd another task is mid-syscall on.
+## `listen()` called straight from `main` is) gets an error back. a close from
+## here would wake it too, but the fd stays valid this way, so the accept loop
+## that owns the listener still closes it itself, exactly once, on its own way
+## out, and this registry stays the one place that decides who closes.
 ##
 ## idempotent: the flag re-sets and a second shutdown of the same socket is a
 ## harmless no-op.
@@ -145,8 +145,8 @@ fn take_listener(fd: Int) -> Bool:
     return found
 
 ## close a registered listener, exactly once, and unregister it. a second call
-## is a no-op rather than a second `close(2)` — closing an fd twice risks closing
-## whatever unrelated socket the kernel handed that number to in between.
+## is a no-op: the registration says which of a drain and a normal teardown owns
+## the close, so the two never disagree about whether the listener is gone.
 pub fn close_listener(fd: Int):
     if take_listener(fd):
         tcp_close(fd)
@@ -447,7 +447,7 @@ test "request stops every registered listener without closing it":
     request()
     assert(requested())
     # the fds stay registered and valid: each accept loop closes its own
-    # listener on the way out, so nothing closes an fd another task is using.
+    # listener on the way out.
     assert_eq(listeners(), 2)
     close_listener(first)
     close_listener(second)

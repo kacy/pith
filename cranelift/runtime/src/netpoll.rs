@@ -344,7 +344,23 @@ fn nudge(reactor: &Reactor) {
 /// task (the caller checks `green::current_task`); `task` is that task's slab id.
 ///
 /// `timeout_ms < 0` means wait forever (no deadline registered).
-pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i64 {
+///
+/// `live` says whether the handle behind `fd` is still open. it is asked once
+/// the waiter is registered and before the task parks, which closes the last
+/// gap in the close teardown: a close that lands before the registration runs
+/// `on_close` on an empty list and would leave this task parked with nobody to
+/// wake it. a closer marks the handle dead before it calls `on_close`, and the
+/// waiter registers before it asks, so one of the two always sees the other —
+/// either `on_close` finds the waiter, or the waiter finds the handle dead and
+/// resolves itself here. a raw fd, which nothing closes underneath, answers
+/// true.
+pub(crate) fn wait_io(
+    fd: RawFd,
+    read: bool,
+    timeout_ms: i64,
+    task: usize,
+    live: &dyn Fn() -> bool,
+) -> i64 {
     ensure_started();
     let reactor = reactor();
     let interest = if read { Interest::Read } else { Interest::Write };
@@ -390,6 +406,13 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i6
     };
     if should_nudge {
         nudge(reactor);
+    }
+    if !live() {
+        // every waiter on this fd waits on the same dead handle — the number
+        // cannot have moved on while this call holds it — so the ordinary close
+        // teardown resolves them all, this one included; the wake it queues
+        // for us is caught by the park below.
+        on_close(fd);
     }
 
     // suspend the coroutine back to the worker. `green::wake` (from the reactor)

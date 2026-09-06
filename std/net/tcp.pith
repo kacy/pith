@@ -1,7 +1,9 @@
 # std.net.tcp — TCP networking
 #
 # TCP client and server functionality. All I/O is blocking — use spawn for concurrency.
-# Connections are represented as plain Int file descriptors.
+# Connections are represented as Int handles: the socket's descriptor number
+# stamped with a generation, so a closed handle fails every later call rather
+# than reaching whatever socket the kernel gives that number to next.
 #
 #   from std.net.tcp import connect, read, write_all, close
 #
@@ -99,11 +101,9 @@ test "an accept loop keeps going while the run is short":
 # ===============================================================
 
 # Reads up to max_bytes from a connection.
-# Returns the data read or fails on error (e.g., connection closed).
-#
-# fd must be a socket. reading a descriptor that is not one stops the process
-# with a diagnostic rather than returning an error, because the usual cause is a
-# connection closed while something still held its number — see close().
+# Returns the data read or fails on error: the connection closed, a read
+# deadline reached, or fd closed by another task — before this call, which
+# fails at once, or during it, which returns it with the same failure.
 pub fn read(fd: Int, max_bytes: Int) -> String!:
     return tcp_read(fd, max_bytes)
 
@@ -116,8 +116,7 @@ pub fn read(fd: Int, max_bytes: Int) -> String!:
 # drops the tail silently, and the peer waits for bytes that will never come.
 # reach for write_all() unless you have a reason to handle the count yourself.
 #
-# as with read(), fd must be a socket: a write to a descriptor that is not one
-# would overwrite whatever file inherited the number, so it stops the process.
+# a write on a closed handle fails, as read() does.
 pub fn write(fd: Int, data: String) -> Int!:
     return tcp_write(fd, data)
 
@@ -171,10 +170,12 @@ pub fn set_timeout(fd: Int, ms: Int):
 
 # Closes a TCP connection.
 #
-# close only after every task that reads or writes fd has finished. the kernel
-# gives the freed number to the next file the process opens, so a read arriving
-# late lands on that file instead; read() and write() stop the process when they
-# can see that happen.
+# safe to call from any task, and safe to call twice: a second close is a no-op.
+# a task still inside a call on fd — parked in a read, an accept on a listener,
+# or a wait — is returned from it with an error, and every later call on the
+# handle fails. the descriptor itself is released once no call is inside on it,
+# so its number is never handed to a new connection while one is; see "closing
+# a connection another task is using" in docs/concurrency.md.
 pub fn close(fd: Int):
     tcp_close(fd)
 

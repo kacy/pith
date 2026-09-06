@@ -46,12 +46,12 @@ did before, and `SIGTERM` keeps its default disposition of killing the process.
    the in-flight connections and any subsystem flushes to finish.
 5. `listen` returns.
 
-step 3 uses `shutdown(2)` rather than `close(2)` deliberately. closing an fd does
-not wake a call already blocked on it, and `listen()` called straight from `main`
-runs its accept on a plain thread rather than a green task, so a close would
-leave it blocked indefinitely. `shutdown(2)` wakes both shapes, and because it
-leaves the descriptor valid, the accept loop still closes its own listener —
-nothing closes an fd another task is mid-syscall on.
+step 3 uses `shutdown(2)` rather than `close(2)` deliberately. a close from
+the signal task would also wake the accept loop (see "closing a connection
+another task is using" in docs/concurrency.md), but `shutdown(2)` leaves the
+listener open, so the accept loop still closes its own listener on its way
+out and the registry stays the one place that says which of a drain and a
+normal teardown owns that close.
 
 ## a waiting task does not hold a worker
 

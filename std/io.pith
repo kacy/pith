@@ -725,7 +725,9 @@ pub fn write_n_bytes(writer: ByteBuffer, data: Bytes, count: Int) -> Int!:
 pub fn connect(host: String, port: Int) -> TcpStream!:
     return tcp_stream_connect(host, port)
 
-# wrap an existing file descriptor as a tcp stream.
+# wrap a connection handle from std.net.tcp (or one of the tcp builtins) as a
+# tcp stream. the handle names a socket pith opened; any other number is a
+# stale handle, and every call on the stream fails.
 pub fn from_fd(fd: Int) -> TcpStream:
     return tcp_stream_from_fd(fd)
 

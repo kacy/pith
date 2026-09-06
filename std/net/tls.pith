@@ -3351,12 +3351,11 @@ impl Conn:
     # report whether the kernel accepted it.
     #
     # a graceful shutdown needs to wake a task blocked reading a connection the
-    # peer is not going to close, and closing the fd does not do that — a
-    # blocking read already waiting on it stays waiting. shutdown(2) does, and it
-    # leaves the descriptor valid, so the owner still closes it exactly once on
-    # its own way out. the tls session state is left alone: the buffered read
-    # side may still have plaintext in it, and the writer may still have a final
-    # record to flush.
+    # peer is not going to close. shutdown(2) does that and leaves the handle
+    # open, so the blocked read sees end-of-stream rather than an error and the
+    # owner still closes on its own way out. the tls session state is left
+    # alone: the buffered read side may still have plaintext in it, and the
+    # writer may still have a final record to flush.
     fn shutdown_transport() -> Bool:
         if not native_conn_has(self.handle):
             return false

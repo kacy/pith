@@ -97,7 +97,7 @@ fn spawn_scrape(fd: Int):
 # this serves forever, as it always did.
 pub fn serve(host: String, port: Int) -> Int!:
     # registering transfers the close to std.shutdown, so a drain and a normal
-    # teardown cannot both close the same fd number.
+    # teardown agree on which of them closes the listener.
     fd := shutdown.register_listener(tcp_listen(host, port)!)
     # close the listener if the accept loop ever gives up: a listening socket
     # nobody accepts from still passes a tcp health check, so leaving it open is

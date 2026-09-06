@@ -322,9 +322,10 @@ impl Connection:
 
     # stop the transport in both directions without closing it, so a reader
     # blocked on it — or about to call into it — sees end-of-stream while the
-    # descriptor number stays reserved. closing instead would free the number for
-    # the next open in this process, and a reader that had not stopped yet would
-    # then read whatever landed on it.
+    # connection stays open for the reader to notice and stop on. closing would
+    # be safe too, since a call on a closed handle fails rather than reaching
+    # whatever takes the number, but a reader that ends on a plain end-of-stream
+    # is easier to reason about than one that ends on an error.
     fn shutdown_transport():
         if self.live:
             if self.plaintext:
@@ -812,8 +813,9 @@ fn list_remove_int(items: List[Int], target: Int) -> List[Int]:
 # whole connection down; a protocol error additionally sends a GOAWAY naming the
 # fault before failing every waiting stream so their request() calls unblock.
 fn reader_loop(client: Client):
-    # tell close() we have stopped, on every exit from here. until this fires the
-    # transport descriptor must not be released: see Connection.shutdown_transport.
+    # tell close() we have stopped, on every exit from here. close() waits for it
+    # so the transport is released with nothing reading: see
+    # Connection.shutdown_transport.
     defer client.reader_done.close()
     # park until the client promotes. through the inline phase the inline call
     # owns the socket, so the reader must not read a single frame. close() before
@@ -1751,11 +1753,10 @@ impl Client:
         send_goaway(self, frames.ERROR_NO_ERROR)
         self.outbound.close()
         await self.writer
-        # stop the reader before the descriptor goes away. shutdown ends its
-        # current and next read without freeing the fd number; waiting for the
-        # done-signal means no task can still be reading when close() frees it,
-        # which would otherwise hand the reader whatever file or socket the
-        # process opened onto that number next.
+        # stop the reader before the transport goes away. shutdown ends its
+        # current and next read, and waiting for the done-signal means the
+        # reader has left on its own terms before close() retires the handle,
+        # rather than being returned by the close with an error.
         self.conn.shutdown_transport()
         self.reader_done.recv()
         self.conn.close()

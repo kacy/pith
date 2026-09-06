@@ -25,10 +25,22 @@ use std::os::unix::io::RawFd;
 ///
 /// `task` is the caller's green slab id, unused here: with no reactor there is
 /// nobody to hand the task to, so we park the worker on `poll` instead of
-/// suspending the coroutine.
-pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, _task: usize) -> i64 {
+/// suspending the coroutine. `live` is asked after the wait, as the linux
+/// `poll` branch asks it: a handle closed while the wait was inside reports an
+/// error rather than a readiness.
+pub(crate) fn wait_io(
+    fd: RawFd,
+    read: bool,
+    timeout_ms: i64,
+    _task: usize,
+    live: &dyn Fn() -> bool,
+) -> i64 {
     let events = if read { libc::POLLIN } else { libc::POLLOUT };
-    crate::fdio::poll_wait(fd as i64, events, timeout_ms)
+    let ready = crate::fdio::poll_wait_any_fd(fd as i64, events, timeout_ms);
+    if ready == 1 && !live() {
+        return -1;
+    }
+    ready
 }
 
 /// sleep for `ms` milliseconds. `task` is the caller's green slab id, unused

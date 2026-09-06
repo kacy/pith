@@ -324,11 +324,10 @@ impl ServerConn:
     # stop the underlying socket in both directions without closing it, waking the
     # reader task blocked on it.
     #
-    # the drain needs this and a close will not do: a peer holding an idle — or
-    # endlessly streaming — connection open is exactly the case, and closing an fd
-    # does not wake a read already blocked on it. shutdown(2) does, and it leaves
-    # the descriptor valid so the connection's own close still runs exactly once.
-    # offline connections have no socket, so this is a no-op for them.
+    # the drain uses this rather than a close so that the reader ends on a plain
+    # end-of-stream and the connection's own close still runs where it always
+    # did, on the way out of the serve loop. offline connections have no socket,
+    # so this is a no-op for them.
     fn shutdown_transport():
         if self.transport == TRANSPORT_TCP:
             tcp_shutdown(self.fd)
@@ -481,10 +480,10 @@ impl Server:
     # stop the socket, unless this connection has already wound down.
     #
     # the test and the syscall are one step under the stream-table lock because
-    # `closed` is set under that same lock, and the connection's own close(2)
-    # strictly follows it: shutting an fd number down after its owner closed it
-    # would land on whatever socket the kernel handed that number to next. the
-    # syscall does not block, so it is safe to hold the lock across it.
+    # `closed` is set under that same lock, and the connection's own close
+    # strictly follows it; a shutdown after the close would be refused as a
+    # stale handle, but there is no reason to make one. the syscall does not
+    # block, so it is safe to hold the lock across it.
     fn shutdown_transport_if_live():
         self.mu.lock()
         if self.closed.load() == 0:

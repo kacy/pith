@@ -150,6 +150,42 @@ the current concurrency story is strong enough for:
 - shared mutable state behind a `Mutex`, `AtomicInt`, or `Semaphore`
 - fan-out that fails as a unit, with `concurrent.group`
 
+## closing a connection another task is using
+
+a socket or a child's pipe is an `Int` in the language, but the number is a
+handle rather than the descriptor: the descriptor's number stamped with a
+generation that changes every time the number is opened, the same shape a
+task handle has. the runtime keeps one word per descriptor number holding
+that generation, whether the handle is open, and how many calls are inside
+on it. every fd call (read, write, accept, wait, set_timeout, shutdown,
+close) resolves the handle against that word first and fails with an
+ordinary error when it is stale. it also holds the word for the length of
+its syscall, parks included, so the number cannot be closed and handed to
+another connection while the call is in flight.
+
+that makes closing from another task safe. `tcp.close` on a handle nobody is
+inside on closes the descriptor at once. on one with a call still inside, it
+marks the handle dead, shuts the socket down in both directions so a call
+blocked in the kernel returns, wakes every task parked on it in the reactor,
+and leaves the `close(2)` itself to the last call out. the interrupted call
+reports an error on both backends, whether it was a read, a write, an accept
+on a listener, or a `wait_readable`, and every call after it fails the same
+way. a second `close` of the same handle is a no-op. a number the kernel
+reissues arrives as a different handle, so a closed `Int` kept around by
+mistake can never name the connection that took its number.
+
+the one thing a close cannot hurry is a read on a child's pipe blocked in
+the kernel under `PITH_GREEN=0`. a pipe has no `shutdown`, so that read
+returns when the child writes or exits, and the descriptor is closed then;
+the green backend wakes it through the reactor immediately. the handle is
+dead to every other call from the moment of the close either way.
+
+the `tcp_shutdown` builtin is still the way to stop a loop without taking
+its socket away: the accept loop or reader keeps its handle, sees its call
+fail, and closes on its own way out. `std.shutdown` does this with a
+registered listener and the http/2 client does it with its reader task. it
+is a choice about where the close lives, not a safety requirement.
+
 ## sharing between tasks
 
 a spawned task runs for real alongside its parent, whether the backend

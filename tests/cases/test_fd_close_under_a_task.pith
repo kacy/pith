@@ -1,0 +1,111 @@
+# closing an fd-backed handle while another task still holds it.
+#
+# the kernel hands a closed descriptor's number to the next socket or pipe the
+# process opens, so a task still holding the old number used to talk to
+# whatever took it: a read landed on the new connection's bytes and a write
+# went over them. the handle the language holds now carries a generation and
+# a user count (`fd_handle` in the runtime), so the same program gets an error
+# on the stale handle instead, and the number is not reused while a call is
+# still inside on it.
+#
+# every case here runs identically on both backends: a green task parked in
+# the reactor is woken by the close, and an os thread blocked in the kernel is
+# returned by the shutdown the close runs first. both report the interrupted
+# call as an error, and every later call on the handle fails the same way.
+#
+# the sequence is deterministic rather than a race won by timing. the reader
+# is given long enough to be inside its call before the close, and the number
+# is reissued by opening the next socket right after the close: the kernel
+# always picks the lowest free number, so the next socket takes the one just
+# freed, which is what "closed handle reissued" checks.
+
+import std.net.tcp as tcp
+import std.os.process as process
+
+PORT := 50961
+LISTENER_PORT := 50963
+
+# long enough for a spawned task to be inside its read before the close lands.
+SETTLE_MS := 200
+
+# a bound on the reads the new connection makes at the end, so a wrong answer
+# is a failed read rather than a hang.
+READ_TIMEOUT_MS := 2000
+
+# a task parked in a read while another task closes the connection.
+fn parked_reader(fd: Int) -> Bool:
+    return tcp.read(fd, 64).is_err
+
+# a task parked in an accept while another task closes the listener.
+fn parked_acceptor(listener: Int) -> Bool:
+    return tcp.accept(listener).is_err
+
+# a task parked reading a child's stdout while another task closes the process.
+fn parked_pipe_reader(child: process.Process) -> Bool:
+    return child.stdout().read(64).is_err
+
+fn a_connection_closed_under_a_parked_read() -> Bool!:
+    listener := tcp.listen("127.0.0.1", PORT)!
+    client_a := tcp.connect("127.0.0.1", PORT)!
+    server_a := tcp.accept(listener)!
+    reader := spawn parked_reader(server_a)
+    sleep(SETTLE_MS)
+    tcp.close(server_a)
+    print("parked read failed: {await reader}")
+
+    # the number just freed goes to the next socket opened. the handles must
+    # still differ, or the closed one would name the new connection.
+    client_b := tcp.connect("127.0.0.1", PORT)!
+    server_b := tcp.accept(listener)!
+    reissued := client_b == server_a or server_b == server_a
+    print("closed handle reissued: {reissued}")
+
+    # a late call on the closed handle, with the new connection's bytes in
+    # flight on the number it used to hold: an error, never those bytes.
+    tcp.set_timeout(client_b, READ_TIMEOUT_MS)
+    tcp.set_timeout(server_b, READ_TIMEOUT_MS)
+    tcp.write_all(server_b, "for the client")!
+    tcp.write_all(client_b, "for the server")!
+    print("late read on the closed handle failed: {tcp.read(server_a, 64).is_err}")
+    print("late write on the closed handle failed: {tcp.write(server_a, "x").is_err}")
+    # a second close of the closed handle must not close the socket that now
+    # holds its number; the reads below would fail if it did.
+    tcp.close(server_a)
+
+    # and the new connection still has both messages for their owners.
+    from_server := tcp.read(client_b, 64) catch "lost"
+    from_client := tcp.read(server_b, 64) catch "lost"
+    print("new connection intact: {from_server == "for the client" and from_client == "for the server"}")
+
+    tcp.close(client_a)
+    tcp.close(client_b)
+    tcp.close(server_b)
+    tcp.close(listener)
+    return true
+
+fn a_listener_closed_under_a_parked_accept() -> Bool!:
+    listener := tcp.listen("127.0.0.1", LISTENER_PORT)!
+    acceptor := spawn parked_acceptor(listener)
+    sleep(SETTLE_MS)
+    tcp.close(listener)
+    print("parked accept failed: {await acceptor}")
+    print("late accept on the closed listener failed: {tcp.accept(listener).is_err}")
+    return true
+
+fn a_process_closed_under_a_parked_pipe_read() -> Bool!:
+    # cat with nothing on its stdin says nothing on its stdout, so the reader
+    # parks; closing the process closes its stdin, which ends cat, and retires
+    # the stdout handle the reader is inside on.
+    child := process.command("cat").start()!
+    reader := spawn parked_pipe_reader(child)
+    sleep(SETTLE_MS)
+    child.close()
+    print("parked pipe read failed: {await reader}")
+    print("late pipe read on the closed process failed: {child.stdout().read(64).is_err}")
+    return true
+
+fn main() -> Int:
+    a_connection_closed_under_a_parked_read() catch false
+    a_listener_closed_under_a_parked_accept() catch false
+    a_process_closed_under_a_parked_pipe_read() catch false
+    return 0

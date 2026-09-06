@@ -18,6 +18,12 @@ pub mut ir_struct_field_lookup: Map[String, String] := {} # "Struct.field" -> fi
 pub mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field" -> field index string
 pub mut ir_struct_decl_nodes: Map[String, Int] := {} # struct name -> declaration node idx
 pub mut ir_struct_field_default_nodes: Map[String, Int] := {} # "Struct.field" -> default expr node idx
+# the drop method of every struct that implements `Drop`, keyed by the
+# struct's declaration node rather than its name: two modules may declare a
+# same-named struct, and the registry above keeps whichever was collected
+# last, so a name key could hand one struct's cleanup to the other. the
+# symbol is the method's flat ir name, prefixed for an imported module.
+pub mut ir_struct_drop_symbols: Map[Int, String] := {} # struct decl node idx -> drop method symbol
 
 ## strip type arguments: Box[Int] and Box share one layout.
 pub fn ir_struct_base_name(sname: String) -> String:
@@ -184,8 +190,8 @@ pub fn ir_enum_needs_dtor(ename: String) -> Bool:
                     return true
     return false
 
-# whether a struct holds anything reference counted, so every
-# construction site knows to attach the generated destructor. `raw_name`
+# whether a struct holds anything reference counted or implements `Drop`,
+# so every construction site knows to attach the generated destructor. `raw_name`
 # may be qualified or `struct:`-prefixed; it is reduced to the bare
 # name, which is also the memo key. a boxed enum answers from its
 # variant payloads instead of declared fields, since that is where its
@@ -220,9 +226,27 @@ pub fn ir_struct_needs_dtor(raw_name: String) -> Bool:
         if ir_rc_field_kind(ftype).len() > 0:
             needs = true
         i = i + 1
+    # a struct that implements `Drop` needs the destructor whether or not a
+    # field is counted: the generated body is where its drop method is called
+    # from, and without one nothing would run it (docs/ownership.md).
+    if ir_struct_drop_symbol(sname).len() > 0:
+        needs = true
     if needs:
         ir_dtor_memo.insert(sname, 1)
     return needs
+
+# the ir symbol of the `drop` method a struct's destructor calls, or "" for a
+# struct that does not implement `Drop`. answers through the declaration the
+# registry holds under the name, so it agrees with the layout and the
+# destructor body emitted for that name.
+pub fn ir_struct_drop_symbol(raw_name: String) -> String:
+    sname := ir_struct_base_name(raw_name)
+    if not ir_struct_decl_nodes.contains_key(sname):
+        return ""
+    decl_idx := ir_struct_decl_nodes[sname]
+    if ir_struct_drop_symbols.contains_key(decl_idx):
+        return ir_struct_drop_symbols[decl_idx]
+    return ""
 
 # rc kind of a struct FIELD by its recorded type: like ir_rc_kind plus
 # nested structs (a field holding a dtor-bearing struct is releasable)

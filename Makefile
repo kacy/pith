@@ -1176,6 +1176,7 @@ MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_channel_in_map
 
 MEMCHECK_CASES := \
+	tests/cases/test_drop_hook \
 	tests/cases/test_optional_struct_value_release \
 	tests/cases/test_optional_tuple_return_ownership \
 	tests/cases/test_generic_optional_return_passthrough \
@@ -1490,7 +1491,7 @@ cli-regressions-only:
 	closed_out=$$(./target/release/pith lint --json "$$tmpdir/lint_closed.pith" 2>/dev/null); \
 	handoff_out=$$(./target/release/pith lint --json "$$tmpdir/lint_handoff.pith" 2>/dev/null); \
 	set -e; \
-	case "$$open_out" in *'"code":"E307"'*) pass=$$((pass+1)); echo "ok   lint unclosed resource";; *) echo "FAIL lint unclosed resource"; fail=$$((fail+1));; esac; \
+	case "$$open_out" in *'"code":"E307"'*) echo "FAIL lint drop type exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint drop type exempt";; esac; \
 	case "$$closed_out" in *'"code":"E307"'*) echo "FAIL lint deferred close exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint deferred close exempt";; esac; \
 	case "$$handoff_out" in *'"code":"E307"'*) echo "FAIL lint handed-off resource exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint handed-off resource exempt";; esac; \
 	printf 'mut items: List[Int] := []\n\nfn helper() -> Int:\n    mut items: List[Int] := [7]\n    return items.len()\n\nfn main():\n    print("{helper()}")\n' > "$$tmpdir/lint_shadow.pith"; \

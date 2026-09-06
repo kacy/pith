@@ -533,10 +533,11 @@ fn lint_shadowed_globals(idx: Int):
 # E307: a resource built locally and never closed
 # ---------------------------------------------------------------
 #
-# reference counting reclaims a value's memory; it does not give back the
-# registry slot, socket or fd behind a handle. std's rule is that whoever
-# builds a resource closes it, and until this rule nothing said so when a
-# caller forgot (docs/destructors_roadmap.md has the survey and the plan).
+# reference counting reclaims a value's memory; it gives back the registry
+# slot, socket or fd behind a handle only for a type that implements Drop.
+# for the rest std's rule is that whoever builds a resource closes it, and
+# until this rule nothing said so when a caller forgot
+# (docs/destructors_roadmap.md has the survey and the plan).
 #
 # the rule is deliberately narrow, because a false positive on a resource
 # that is closed somewhere the linter cannot see is worse than no rule at
@@ -561,12 +562,19 @@ fn lint_shadowed_globals(idx: Int):
 
 # the label to name in the diagnostic, or "" when this call does not build
 # a resource the caller has to close.
+#
+# the list is empty for now. it held the three std.net.tls config builders,
+# and a tls config implements Drop: a config built and never closed gives
+# its registry slot back when the last value naming it goes away
+# (docs/ownership.md, "destructors"), so the shape this rule reported is no
+# longer a leak. the rule stays for the std types that still close by hand
+# (docs/destructors_roadmap.md); each is added here as it is audited onto
+# the list rather than the destructor, under the bar set above.
 fn l_resource_ctor_label(module_path: String, fn_name: String) -> String:
-    if module_path != "std.net.tls":
+    if module_path.len() == 0 or fn_name.len() == 0:
         return ""
-    if fn_name != "client_config" and fn_name != "client_config_with_ca_file" and fn_name != "server_config":
-        return ""
-    return "tls." + fn_name + "()"
+    # no constructor qualifies today; see the note above.
+    return ""
 
 # the closers std spells. a receiver use of any of these is enough to
 # silence the rule for that binding, whatever the module.

@@ -1,0 +1,47 @@
+# a tls client config that is built and never closed.
+#
+# leak_tls_client_config is the annotated shape: build, use, close. this is
+# the same churn with every close() left out, which is what a request handler
+# that forgot the call, or took an error exit before it, looks like. a Config
+# implements Drop, so the compiler closes it when the last value naming it goes
+# away — at the end of each round here — and the registry stays flat. before
+# the hook a forgotten close pinned a slot per request for the life of the
+# process, which this case measures as growth on a compiler without it.
+#
+# the shapes are the ones a handler produces: a config bound and abandoned, a
+# config threaded through builder methods (each returns the same value, so the
+# builders add holders rather than configs), and one whose last holder is a
+# list that dies. the ca bundle is a small fixture, as in the annotated case.
+import leakprobe as probe
+import std.net.tls as tls
+
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+fn round(i: Int) -> Int:
+    plain := tls.client_config_with_ca_file(CA_PATH)
+    if plain.is_err:
+        return 0
+
+    built := tls.client_config_with_ca_file(CA_PATH)
+    if built.is_err:
+        return 0
+    cfg := built.ok.with_alpn(["h2", "http/1.1"]).enable_session_resumption()
+
+    held := tls.client_config_with_ca_file(CA_PATH)
+    if held.is_err:
+        return 0
+    holders := [held.ok, cfg]
+
+    return holders.len() + i % 2
+
+fn main():
+    rounds := probe.rounds() / 10
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

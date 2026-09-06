@@ -422,19 +422,24 @@ gaps, all bounded leaks rather than dangling pointers:
   copy and released at scope exit, and the channel frees at its last owner,
   releasing any values still queued by their payload tag. a value sent is
   owned by the channel until received; a receive hands it to the receiver.
-- **arc reclaims memory, but it does not run your cleanup.** closing a
-  file, rolling back a transaction, or releasing a lock is a side effect
-  arc knows nothing about, and the error path (`fail`, `!`) is exactly
-  where it is easy to forget. reach for `defer` (see [defer.md](defer.md)):
-  a deferred statement runs on every exit from its scope — fall-through,
-  `return`, `fail`, and `!` propagation alike — right before arc frees the
-  locals, so the cleanup still sees them. for cleanup that should happen
-  only when something went wrong — roll back a half-finished transaction,
-  delete a partial file — use `errdefer`, which runs on the error exits
-  and stays quiet on a normal return. `pith lint` reports the narrow case
-  where a resource is built locally, used in place and never closed
-  (E307). the full survey of what needs a manual close, and the plan for
-  whether a destructor hook should ever replace the convention, is in
+- **arc reclaims memory; it runs your cleanup only where a type asks for
+  it.** closing a file, rolling back a transaction, or releasing a lock is
+  a side effect arc knows nothing about, and the error path (`fail`, `!`)
+  is exactly where it is easy to forget. a struct can opt in with
+  `impl Drop` (see [destructors](#destructors) below): its `drop` method
+  then runs from the destructor the compiler already attaches, at the
+  moment the last value naming it goes away. for everything else, reach
+  for `defer` (see [defer.md](defer.md)): a deferred statement runs on
+  every exit from its scope — fall-through, `return`, `fail`, and `!`
+  propagation alike — right before arc frees the locals, so the cleanup
+  still sees them. for cleanup that should happen only when something
+  went wrong — roll back a half-finished transaction, delete a partial
+  file — use `errdefer`, which runs on the error exits and stays quiet on
+  a normal return. `defer` also answers a question a destructor cannot:
+  *when*. a deferred close runs at the end of the block; a drop runs
+  whenever the last holder lets go, which may be a task or a container
+  away. the survey of every std type that still needs a manual close, and
+  the order the rest are meant to move over in, is in
   [destructors_roadmap.md](destructors_roadmap.md).
 - **a result consumed with `catch` or `unwrap_or` can leak its ok
   value** when that value was freshly built (a returned tuple, a
@@ -525,6 +530,74 @@ gaps, all bounded leaks rather than dangling pointers:
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.
+
+## destructors
+
+a struct that implements `Drop` gets its `drop` method called when its
+last strong count drops, before the fields are released and the memory
+freed. a value that stands for something outside the heap, such as a
+registry slot or a handle into a table, can give that thing back this
+way without a caller having to remember to:
+
+```pith
+pub struct Config:
+    pub handle: Int
+
+impl Config:
+    fn close():
+        registry_drop(self.handle)      # a no-op on a handle already dropped
+
+impl Drop for Config:
+    fn drop():
+        self.close()
+```
+
+`Drop` is a language-level interface: nothing declares it and nothing is
+imported for it. the compiler recognizes the impl by name, and the rules
+it checks are E268:
+
+- only a struct can implement it, and only in the module that declares
+  the struct. the destructor is generated per declaration and spells the
+  method symbol from the declaring module, which is also what keeps two
+  modules' same-named structs from trading cleanup.
+- a generic struct cannot. its destructor is generated per instance from
+  the resolved field kinds, and there is no place in that body for a
+  method call yet. wrap the generic in a concrete struct if you need
+  both.
+- the impl declares exactly `fn drop()`, with no parameters and no
+  return value, and nothing else beside it. the runtime calls it with the
+  bare pointer and reads nothing back.
+
+what happens at the last release: the runtime notices the count reach
+zero, calls the struct's destructor pointer, and the generated body calls
+`drop` first, then releases the rc fields exactly as it always did. every
+field is still live while `drop` runs, so it can read them. the same body
+runs when a value dies inside a container, an optional, a struct field or
+a closure environment, because the destructor pointer sits in the object's
+header rather than on any binding. the cycle collector runs it too, for a
+struct freed as a member of a garbage cycle, on the collector's thread and
+in the collector's order. a `Drop` struct whose fields hold no counted
+values has no tracer, so it is a leaf to the collector and can never be a
+cycle member itself; the collector only reaches it through a member's
+field release, which is an ordinary release.
+
+two rules for a `drop` body. it may bind or pass `self`: the runtime runs
+the destructor under a guard count of one, so the retain and release a
+bind takes balance inside the body instead of re-entering the release at
+zero. it must not let `self` escape, though. storing it in a container or
+a global leaves a reference to memory that is freed the moment `drop`
+returns. and it should be idempotent with the type's explicit closer.
+std's rule is that whoever builds a resource closes it, and that rule
+stands: an explicit `close()` still says *when* the resource goes back,
+which matters for a server config a listener is still handshaking on,
+and the destructor covers the caller that forgot or took an error exit
+past the call. a closer backed by a map removal is idempotent for free,
+and that is the shape every `Drop` type in std has.
+
+`tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
+rebind, a list or a struct field dying, a value returned to a caller), and
+`tests/leaks/leak_tls_config_drop` pins that a tls config built and never
+closed no longer holds its registry slot.
 
 ## weak references
 

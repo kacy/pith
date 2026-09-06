@@ -119,6 +119,7 @@ cases=(
   tests/leaks/leak_json_decode_struct
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
+  tests/leaks/leak_tls_config_drop
   tests/leaks/leak_http_string_head_flood
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
 )

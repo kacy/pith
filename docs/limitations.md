@@ -159,10 +159,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   carrying type arguments — so a parameter that appears in no argument has
   nothing to fix it and the call is E222. the other is a generic owner:
   `impl Box[T]: fn map[U](...)` is E265. past those two a generic method
-  behaves exactly as a free generic function does, rough edges included.
-  a specialization publishes its owned locals untracked, so a body that
-  binds a heap value to a local leaks it per call while one that hands its
-  argument or a fresh value straight back does not.
+  behaves as a free generic function does: its body is typed against the
+  concrete types before it is emitted and releases its locals like a concrete
+  body (docs/generics.md).
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the
@@ -290,7 +289,10 @@ correctness story:
 - the ir is self-describing — calls carry an explicit return kind and field
   loads carry their type — and the cranelift consumer reads that metadata rather
   than guessing. the older inference path that caused a few cross-module bugs is
-  gone.
+  gone. a struct reached only through another module's return type takes its
+  kind from the checker's registry of declared types rather than the caller's
+  own module map, and `make validate-ir-contract-only` checks the emitted
+  contract over every corpus program in ci (docs/ir-contract.md).
 - memory reclamation is compiler-emitted reference counting (see the readme's
   memory section). closures are reference counted and freed like other heap
   values. the one structural gap that remains: strong reference cycles leak
@@ -353,7 +355,9 @@ correctness story:
   position, which take other paths to the discard.
 - the fresh-shell family is closed, inside generic bodies as well: a user
   function's returned `Some` owns its payload through `__opt_dtor_<kind>`,
-  and the transferring runtime getters (`env_opt` behind `os.get_env`, the
+  a tuple payload and an inner optional shell included, an optional handed
+  to a deeper optional (`x: Int?` into an `Int??`) gets its outer shell at
+  every widening site, and the transferring runtime getters (`env_opt` behind `os.get_env`, the
   string `get`, a channel receive) have the matching destructor attached at
   the call site, so every extraction spelling is flat on call subjects and
   bound locals alike. the borrowing getters (`m.get(k)`, `xs.first()`) keep
@@ -375,31 +379,25 @@ correctness story:
   streams — are fixed: each of those types closes and deregisters now. the
   E307 lint flags a locally built resource that is never closed and never
   handed off.
-- a channel is reclaimed once it is closed and drained, and costs 128 bytes for
-  the life of the process either way. `Channel[T](n)` allocates a fixed part of
-  about 416 bytes plus an eager ring of 16 bytes per slot, rounded up to a power
-  of two. closing and draining hands all of that back except a small permanent
-  stub, which keeps the park-path counter on a cache line of its own so ordinary
-  channel operations stay off a shared one. so the per-channel cost a process
-  carries forever fell from 4,512 bytes to 128 for a 256-slot channel, which is
-  a reduction rather than an elimination: a server opening one channel per
-  request still grows, 35 times more slowly. nothing in the language owns a
-  channel either — its rc kind is empty, so a handle in a local, a struct field,
-  a container or a `spawn` capture carries no count — and reclamation does not
-  depend on one, because a closed and drained channel is inert whoever is
-  holding it. two things it does not do: a channel closed with values still in
-  its ring is not reclaimed at all, since releasing those values needs an
-  element tag the ring does not carry yet, and a channel nobody closes is never
-  reclaimed. a send that passes its closed check just as a concurrent close
-  drains the channel can enqueue a value nobody will read: the send reports
-  success and the value is unobservable. that is a property of close rather
-  than of reclamation, and the same interleaving strands the value in the ring
-  without it. reclamation also costs the os-thread backend 15-35% of channel
-  throughput, which the green default does not pay (see #984). run with
+- a channel is a counted heap value like a list or a struct. a handle in a
+  local, a struct field, a container or a `spawn` capture carries a count, and
+  the last release frees the channel outright, draining and releasing any
+  values nobody received, so neither a channel that was closed with values in
+  its ring nor one that was never closed outlives its last holder. a server
+  opening one channel per request no longer grows (`leak_channel_lifecycle`
+  and `leak_channel_create_drop` pin it). `Channel[T](n)` still allocates a
+  fixed part of about 416 bytes plus an eager ring of 16 bytes per slot,
+  rounded up to a power of two, for as long as it lives. what remains: a send
+  that passes its closed check just as a concurrent close drains the channel
+  can enqueue a value nobody will read; the send reports success and the value
+  is unobservable. that is a property of close rather than of reclamation, and
+  the same interleaving strands the value in the ring without it. the
+  os-thread backend pays part of the reclamation cost in channel throughput
+  that the green default does not; the guard that carried most of it is gone,
+  and the measurements are in docs/channel_ownership.md. run with
   `PITH_PERF_STATS=1` to see
   `channels: new=N closed=C freed=F retained_bytes=B freed_bytes=D`. the
-  lifetime analysis, the options and what remains are in
-  docs/channel_ownership.md (issue #960).
+  lifetime analysis is in docs/channel_ownership.md (issues #960 and #984).
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests
@@ -438,8 +436,8 @@ opt-in. green beats the os-thread backend on every shape this repo measures: spa
 ~30x at comparable memory, and the channel fan-out benchmark by several times.
 on fan-out it beats zig and trails go and rust at the default worker count; the
 current numbers and their caveats are in docs/performance.md. the whole regression
-corpus, 380 cases at both worker counts, produces byte-identical output to the
-recorded goldens (`make verify-green-corpus`, run in ci). what follows is
+corpus, over 600 cases at both worker counts, produces byte-identical output to
+the recorded goldens (`make verify-green-corpus`, run in ci). what follows is
 what the new default still costs you, not a list of things blocking it.
 
 the structural cost is that a green worker runs many tasks, so a call with no
@@ -518,10 +516,10 @@ one caveat on the numbers themselves: every comparison in docs/performance.md
 and bench/README.md was measured on the same 2-core box. "green wins everywhere"
 is true there and unverified on wider hardware.
 
-of the two related ownership issues that were outstanding here, one remains.
-passing a bare `T!` or `T?` local as a call argument still leaks its payload —
-a bounded leak, where the caller-side cascade does not yet treat the argument
-as the borrow it now provably is. the double-extraction use-after-free is
+both ownership issues that were outstanding here are fixed. a bare `T!` or
+`T?` local passed as a call argument is borrowed by the callee, and the
+caller's cleanup stays the payload's owner (`leak_optional_shell_arg` and
+`leak_result_arg_borrow` pin it). the double-extraction use-after-free is
 fixed. `unwrap_or` and `.value()` both retain the payload they extract, so the
 result carries its own count — a bind transfers it, an argument position
 releases it after the call, an owned receiver is released after the member read

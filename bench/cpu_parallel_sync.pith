@@ -1,0 +1,70 @@
+# cpu_parallel_sync: the control the migration flag needs. eight tasks each do
+# a fixed amount of arithmetic in chunks and, between chunks, report their
+# partial to a collector task and wait for its acknowledgement. the work is
+# genuinely parallel; the synchronization is occasional but it is a real
+# handoff each time, so every chunk ends in a wake. if moving a woken task to
+# its waker's worker piles the compute tasks onto the collector's worker,
+# this loses its 2-worker speedup.
+#
+#   pith build cpu_parallel_sync.pith
+#   ./cpu_parallel_sync <chunks> <chunk_size>
+
+fn collector(req: Channel[Int], ack: Channel[Int], expected: Int) -> Int:
+    mut total := 0
+    mut seen := 0
+    while seen < expected:
+        if let v = req.recv():
+            total = (total + v) % 1000000007
+            seen = seen + 1
+            ack.send(1)
+        else:
+            break
+    return total
+
+fn mix(value: Int) -> Int:
+    mut x := (value * 1103515245 + 12345) % 2147483648
+    x = (x * 1103515245 + 12345) % 2147483648
+    return x
+
+fn worker(id: Int, req: Channel[Int], ack: Channel[Int], chunks: Int, chunk_size: Int) -> Int:
+    mut c := 0
+    mut partial := 0
+    while c < chunks:
+        mut i := 0
+        mut x := id * 7919 + c
+        while i < chunk_size:
+            x = mix(x)
+            i = i + 1
+        partial = (partial + x) % 1000000007
+        req.send(x)
+        ack.recv()
+        c = c + 1
+    return partial
+
+fn arg(i: Int, fallback: Int) -> Int:
+    argv := args()
+    if argv.len() > i:
+        parsed := parse_int(argv[i])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return fallback
+
+fn main() -> Int!:
+    chunks := arg(1, 200)
+    chunk_size := arg(2, 20000)
+    req := Channel[Int](8)
+    ack := Channel[Int](8)
+    start := time()
+    coll := spawn collector(req, ack, chunks * 8)
+    mut tasks: List[Task[Int]] := []
+    mut id := 0
+    while id < 8:
+        tasks.push(spawn worker(id, req, ack, chunks, chunk_size))
+        id = id + 1
+    mut checksum := 0
+    for t in tasks:
+        checksum = (checksum + await t) % 1000000007
+    total := await coll
+    elapsed := time() - start
+    print("cpu_parallel_sync chunks={chunks} chunk_size={chunk_size} elapsed_ms={elapsed} checksum={checksum} total={total}")
+    return 0

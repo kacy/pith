@@ -362,10 +362,8 @@ heap instead of blocking the worker, so a task sleeping out a backoff — or a
 `select` idling between probes — costs nothing but its own time. that reactor
 is also why the default is linux-only; see "which backend to use".
 
-where a task runs is decided once. a task pins to the worker that first runs it
-and stays there: the scheduler does not yet move a suspended task between
-workers (the runtime is now built so that it safely could — see the placement
-note in `docs/limitations.md`). that makes the placement a pair of communicating
+where a task runs is decided once, by default. a task pins to the worker that
+first runs it and stays there. that makes the placement a pair of communicating
 tasks happens to get a lasting property of the program, and the two cases cost
 very differently: colocated, each handoff is the userspace switch above; split
 across workers, each one is a park and a futex wake. a two-task ping-pong
@@ -379,6 +377,26 @@ spin narrows the split case rather than removing it — a pipeline that lands
 split is still the slower arrangement, and `PITH_GREEN_WORKERS=1` is worth
 trying for a workload that is one request/response chain rather than genuine
 fan-out.
+
+`PITH_GREEN_MIGRATE=1` replaces the luck with a rule: a worker that wakes a
+task parked on another worker takes it, so the woken task resumes where its
+waker is, and a pair that talk to each other converge onto one worker after
+their first exchange. the split cost goes away without pinning the pool to one
+worker: a task that never waits on anyone is never moved, so independent
+compute still spreads across the cores. on the channel fan-out benchmark it
+turns a bimodal ~93 ms into a flat ~43 ms, the same as the 1-worker figure,
+with cross-worker wakes going from thousands (up to ~105,000) to single
+digits, and it takes the split ping-pong from an occasional 413 ms run to a
+flat 48 (the numbers are in `docs/performance.md`). it is off by default for
+a measured reason: the rule collapses a coordinated pipeline onto whichever
+worker is busiest, which is the point, but the same rule pulls parallel work
+onto one worker when it synchronizes, since a pinned task is never stolen
+and nothing spreads it back out. eight compute tasks reporting to a
+collector (`bench/cpu_parallel_sync`) run 259 ms on two workers without the
+flag and 337 ms with it. the move itself is safe: the runtime is built so
+that a suspended task carries nothing tied to the thread it parked on (see
+the placement note in `docs/limitations.md`). what the default waits on is
+an idle worker being allowed to take a ready task off a peer's queue.
 
 a read deadline survives that translation. `tcp.set_timeout` stores the deadline
 on the socket itself, and the reactor wait is bounded by it: a read that reaches
@@ -515,11 +533,13 @@ socket holds its worker until it finishes, unless the binary was built with
 safe-points (`PITH_GREEN_PREEMPT=1`, below). code that coordinates already yields
 on its own and never needs it.
 
-and placement is luck. a task pins to the first worker that runs it, so whether
-two tasks that talk to each other end up sharing one is chance. on the channel
-fan-out benchmark that is the difference between ~46ms and ~130-170ms for the
-same program. `PITH_GREEN_WORKERS=1` takes the choice away and is often the
-fastest setting for a single pipeline.
+and placement is luck unless you ask otherwise. a task pins to the first worker
+that runs it, so whether two tasks that talk to each other end up sharing one
+is chance. on the channel fan-out benchmark that is the difference between
+~43 ms and ~93 ms for the same program. `PITH_GREEN_WORKERS=1` takes the
+choice away and is often the fastest setting for a single pipeline;
+`PITH_GREEN_MIGRATE=1` keeps every worker and moves a woken task to the worker
+that woke it instead (see "the green backend" above).
 
 there is one more reason the os-thread backend stays, which matters to this
 repo rather than to your program: it is the reference green gets checked
@@ -549,6 +569,8 @@ the rest of the rough edges:
   wakes at all, which is often the fastest setting for a single connection even
   though it uses one core; more workers only pay off when the work genuinely
   spreads across connections or cores. on the channel fan-out benchmark this is
-  the difference between ~46ms pinned and ~130-170ms when the pipeline splits
+  the difference between ~43 ms pinned and ~93 ms when the pipeline splits
   across two workers — placement is the biggest remaining cost on coordinated
-  shapes, and today it falls where first-resume luck puts it
+  shapes, and by default it falls where first-resume luck puts it.
+  `PITH_GREEN_MIGRATE=1` moves a woken task to its waker's worker and gets the
+  pinned figure at the default worker count

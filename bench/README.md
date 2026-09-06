@@ -450,6 +450,30 @@ zig's timing is by far the noisiest of the four — probably the plain
 feels like. the median is stable enough to compare, but read any single
 zig run with suspicion.
 
+## parallel compute with a coordinator (the control for task migration)
+
+`bench/cpu_parallel_sync.pith` is the shape every other concurrency bench
+here lacks: eight tasks do genuinely parallel arithmetic in chunks and,
+between chunks, report to one collector task and wait for its
+acknowledgement, so the work spreads across cores while every chunk still
+ends in a real handoff. it exists to measure `PITH_GREEN_MIGRATE=1`, which
+moves a woken task to the worker that woke it: on the fan-out and ping-pong
+benches that is a pure win, and on this one it pulls the compute tasks onto
+the collector's worker and gives part of the 2-worker speedup back. the
+checksum must match across arms.
+
+```
+pith build bench/cpu_parallel_sync.pith
+PITH_GREEN_WORKERS=1 ./bench/cpu_parallel_sync 200 20000
+PITH_GREEN_MIGRATE=0 ./bench/cpu_parallel_sync 200 20000
+PITH_GREEN_MIGRATE=1 ./bench/cpu_parallel_sync 200 20000
+```
+
+on 2026-09-06, medians of 5 interleaved rounds: 448 ms at 1 worker, 259 ms
+at 2 workers with the flag off (247-305), 337 ms with it on (230-402), with
+`PITH_PERF_STATS=1` showing ~280 migrations a run. that is why the flag is
+not the default; the numbers are in `docs/performance.md`.
+
 ## task churn benchmark (per-thread pools)
 
 `bench/task_churn.pith` runs one short task after another, each allocating

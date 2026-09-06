@@ -236,6 +236,10 @@ mut tt_names: Map[String, Int] := {}
 # reachable, so a name referenced inside module M can resolve to M's struct
 # instead of to whichever module registered the name into tt_names last.
 mut tt_qualified_names: Map[String, Int] := {}
+# every type a pith module declared, by bare name, whichever module declared
+# it; builtins never enter. the emitter asks this when a struct reached through
+# another module's return type is missing from its own per-module map (#1057).
+mut tt_declared_names: Map[String, Int] := {}
 
 # add a type to the table, return its id
 pub fn add_type_info(info: TypeInfo) -> Int:
@@ -255,9 +259,18 @@ pub fn register_type_name(name: String, tid: Int):
 # another module cannot hide it. the checker passes the module currently being
 # registered; builtins and the entry file use "" and are only global.
 pub fn register_qualified_type_name(module_path: String, name: String, tid: Int):
+    tt_declared_names.insert(name, tid)
     if module_path.len() == 0:
         return
     tt_qualified_names.insert(module_path + chr(9) + name, tid)
+
+# look up a type a pith module declared, by bare name; -1 for a builtin or an
+# unknown name. two modules declaring the same name answer the later one, which
+# is enough for the questions asked here (is it a struct at all).
+pub fn lookup_declared_type_id(name: String) -> Int:
+    if tt_declared_names.contains_key(name):
+        return tt_declared_names[name]
+    return -1
 
 # look up a type by name, returns -1 if not found
 pub fn lookup_type_id(name: String) -> Int:
@@ -464,6 +477,7 @@ pub fn initialize_type_table():
     tt_types = []
     tt_names = {}
     tt_qualified_names = {}
+    tt_declared_names = {}
     # primitives at known indices 0-14
     add_type_info(ti_primitive("Int"))
     register_type_name("Int", TID_INT)

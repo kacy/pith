@@ -7,7 +7,7 @@
 
 from ast import get_node, Node
 from checker import c_get_expr_type
-from types import get_type_info
+from types import get_type_info, lookup_declared_type_id
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
 
 # turn a type name as it was written into an emission kind, taking the
@@ -95,6 +95,15 @@ pub fn ir_retkind_with_state(type_name: String, type_aliases: Map[String, String
     if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore" or resolved == "AtomicInt":
         return "opaque:" + resolved
     if struct_names.contains_key(resolved):
+        return "struct:" + resolved
+    # a struct reached only through another module's return type, one this
+    # module never imports, is absent from the module's own map, which fills
+    # in emission order. the checker's type table knows every struct. without
+    # this the call line spelled the name bare, the contract check refused it,
+    # and ir_rc_kind saw nothing to release: every such returned struct leaked
+    # (#1057).
+    tid := lookup_declared_type_id(resolved)
+    if tid >= 0 and get_type_info(tid).kind == "struct":
         return "struct:" + resolved
     return resolved
 

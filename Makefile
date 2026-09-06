@@ -1313,6 +1313,25 @@ leak-check: build leak-check-only
 leak-check-only:
 	@bash tooling/leak_check.sh
 
+# --- IR contract over the corpus ---
+# every program with a main is emitted with --validate, which refuses a call
+# whose return kind is spelled bare, a repeated function name and the other
+# contract rules the driver checks. the generator files (no main) are skipped.
+validate-ir-contract-only:
+	@echo "--- IR contract (ir_driver --combined --validate) over the corpus ---"
+	@[ -x self-host/ir_driver ] || $(MAKE) --no-print-directory self-host-ir-driver
+	@mkdir -p .pith-build
+	@bad=0; n=0; \
+	for f in tests/cases/test_*.pith examples/*.pith; do \
+		grep -q "^fn main" "$$f" || continue; \
+		n=$$((n+1)); \
+		if ! ./self-host/ir_driver --combined --validate "$$f" > /dev/null 2> .pith-build/validate.err; then \
+			bad=$$((bad+1)); echo "VALIDATE FAIL $$f: $$(head -1 .pith-build/validate.err | cut -c1-160)"; \
+		fi; \
+	done; \
+	echo "validated $$n programs, $$bad failed"; \
+	[ $$bad -eq 0 ]
+
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output
 # (covered in logscan-check too) and gzip reads pith's

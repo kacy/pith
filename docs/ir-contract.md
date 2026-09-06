@@ -257,6 +257,16 @@ names the function and the offending line. these are covered by tests in
   of a runtime call disagrees with `runtime_functions.txt`. before the check,
   the destination register got a zero nobody wrote
 
+the driver checks the emitter's side of the same agreement before the consumer
+sees it: `ir_driver --combined --validate <file>` refuses a call whose return
+kind names a struct without the `struct:` prefix, a function defined more than
+once, and the other declaration rules the driver knows. `make
+validate-ir-contract-only` runs it over every corpus program with a `main`, and
+CI runs that target. it exists because a call to a function in another module
+that returns a struct defined in a third module used to spell the kind bare:
+the contract was violated in 22 corpus programs and, since the classifier saw
+nothing to release, every such returned struct leaked (#1057).
+
 known soft spots, where the consumer is quieter than it should be — these are the
 tightening targets, not settled behavior:
 

@@ -1,0 +1,21 @@
+# a struct handed back by a function in one module, defined in a second module
+# this file never imports. the call line's return kind came from the caller's
+# own struct map, which fills in module-emission order and never held Pair, so
+# the kind was spelled bare, the IR contract check refused it, and the rc
+# classifier saw nothing to release: every returned Pair and its strings were
+# stranded (issue #1057: 28 mb to 103 mb at 200k vs 800k rounds). the kind now
+# falls back to the checker's type table. the payload's text varies per round
+# so a retained copy cannot hide behind the string table.
+import leakprobe as probe
+import cross_module_struct_mid as mid
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        p := mid.one(i, probe.fresh_string(i))
+        acc = acc + p.name.len()
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

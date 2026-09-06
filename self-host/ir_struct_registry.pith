@@ -5,7 +5,7 @@
 # one module keeps that contract visible.
 
 from ast import Node, get_node
-from types import TypeInfo, get_type_info, get_type_name
+from types import TypeInfo, get_type_info, get_type_name, lookup_declared_type_id
 from checker import c_get_expr_type
 from ir_struct_layouts import ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_default_node_with_state
 from ir_decode_calls import ir_struct_has_default_fields_with_state
@@ -92,9 +92,20 @@ pub fn ir_rc_kind(type_hint: String) -> String:
     # is. getting this wrong is silent: the payload is stored without a count
     # and the enum's destructor skips it, so it dangles.
     dot := base.last_index_of(".")
+    mut bare := base
     if dot >= 0:
-        if ir_struct_names.contains_key(base.substring(dot + 1, base.len())):
+        bare = base.substring(dot + 1, base.len())
+        if ir_struct_names.contains_key(bare):
             return "struct"
+    # a struct this module never imports, reached through another module's
+    # return type, is absent from the module's own map (filled in emission
+    # order) but present in the checker's type table. without this the value
+    # a call handed back was classified as nothing to release and leaked
+    # (#1057). an enum is not a struct in that table, so the unboxed-enum
+    # rule above stays the arbiter for enums.
+    tid := lookup_declared_type_id(bare)
+    if tid >= 0 and get_type_info(tid).kind == "struct":
+        return "struct"
     return ""
 
 # every rc kind releases: strings via their header count, collections via

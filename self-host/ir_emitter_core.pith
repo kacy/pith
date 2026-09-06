@@ -53,7 +53,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
-from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
+from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_struct_drop_symbol, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
@@ -391,6 +391,7 @@ fn ir_reset_type_state():
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
     ir_struct_decl_nodes.clear()
+    ir_struct_drop_symbols.clear()
     ir_struct_field_default_nodes.clear()
     ir_impl_methods.clear()
     ir_impl_method_owner.clear()
@@ -2549,6 +2550,37 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
     ir_struct_names.insert(sname, variant_names.len())
     if emit_decl:
         ir_emit("struct " + sname + " " + variant_names.join(" "))
+
+# record the drop method of every `impl Drop for T` in a root, keyed by the
+# declaration node of the struct it names. the struct has to be declared in
+# the same root (the checker refuses anything else, E268), which is what lets
+# the symbol be spelled here: the method flattens to `T_drop` and takes the
+# module's prefix exactly as any other impl method does. the destructor
+# generated for T calls this symbol at its head, so a struct that names one
+# is released like any counted value and cleaned up like a closed one.
+fn ir_collect_drop_impls(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind != "impl_decl" or ir_impl_interface_base(node) != "Drop":
+            continue
+        target := ir_impl_target_type(node)
+        if target.len() == 0 or not ir_impl_defines_method(node, "drop"):
+            continue
+        decl_idx := ir_root_struct_decl_index(root_idx, target)
+        if decl_idx < 0:
+            continue
+        mut sym := target + "_drop"
+        if module_path.len() > 0:
+            sym = ir_import_impl_method_name(module_path, target, "drop")
+        ir_struct_drop_symbols.insert(decl_idx, sym)
+
+# the declaration node of the struct a root declares under `name`, or -1.
+fn ir_root_struct_decl_index(root_idx: Int, name: String) -> Int:
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
+        if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_declared_struct_name(cn) == name:
+            return item_idx
+    return 0 - 1
 
 fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool, module_path: String):
     for item_idx in ir_root_items(root_idx):
@@ -10096,6 +10128,15 @@ fn ir_emit_struct_walks(trace: Bool):
             if not ir_struct_needs_tracer(sname):
                 continue
         pr := ir_emit_rc_walk_header(ir_rc_walk_prefix(trace) + sname)
+        # a `Drop` struct's own cleanup runs first, while every field it holds
+        # is still live, so the method can read them. the runtime calls this
+        # body with the count already at zero and a guard count in its place
+        # (pith_struct_release), so the method sees an ordinary borrowed
+        # `self`. the tracer twin visits fields only; it never runs user code.
+        if not trace:
+            drop_sym := ir_struct_drop_symbol(sname)
+            if drop_sym.len() > 0:
+                ir_emit("call " + ir_reg().to_string() + " " + drop_sym + " unknown 1 " + pr.to_string())
         count := ir_struct_field_count(sname)
         mut i := 0
         while i < count:
@@ -10528,6 +10569,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
     ir_struct_decl_nodes.clear()
+    ir_struct_drop_symbols.clear()
     ir_impl_methods.clear()
     ir_impl_method_owner.clear()
     ir_interface_decl_index.clear()
@@ -10562,6 +10604,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
         ir_collect_struct_decls(ir_preloaded_import_roots[preload_i], false, ir_preloaded_import_paths[preload_i])
+        ir_collect_drop_impls(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
         preload_i = preload_i + 1
 
     mut impl_i := 0
@@ -10577,6 +10620,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
             ir_collect_enum_decl(node, true, ir_current_module_path)
         elif node.kind == "impl_decl":
             ir_collect_impl_method_signatures(node, "")
+    ir_collect_drop_impls(root_idx, "")
 
     ir_register_alias_structs(root_idx)
 

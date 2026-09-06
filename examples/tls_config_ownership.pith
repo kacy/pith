@@ -1,10 +1,12 @@
 # who closes a tls config
 #
 # a tls config is a handle into a registry that std.net.tls keeps for the life
-# of the process. whoever builds one closes it; nothing closes it for you. this
-# matters most on an https client, which builds a config per request — a config
-# that is never closed holds its slot until the program exits, so forgetting it
-# leaks once per request.
+# of the process. it gives that slot back on its own when the last value naming
+# it goes away — Config implements Drop, so a config bound in a request handler
+# and forgotten closes when the handler returns. what the destructor does not
+# decide is when, and that is what an explicit close() is still for: whoever
+# builds a config decides when its slot goes back, and the destructor is the
+# backstop for the path that forgot.
 #
 # the counterpart is that building one is cheap. trust anchors are the only
 # large thing a config holds, and they are parsed once per distinct bundle and
@@ -20,8 +22,9 @@ import std.net.tls as tls
 CA_PATH := "tests/live/fixtures/localhost-ca.crt"
 
 # one request's worth of config: build it, hand it to the connection, give it
-# back. defer is the point — the config goes back on every exit from here,
-# including the ones a failing handshake takes.
+# back. the defer says where — the config goes back on every exit from here,
+# including the ones a failing handshake takes — and without it the destructor
+# would close the config at the same exits, since nothing else holds it.
 fn one_request(label: String) -> String!:
     config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["h2"])
     defer config.close()
@@ -54,6 +57,15 @@ fn main():
     print("shared config is live")
     shared.close()
 
-    # closing twice is a no-op, so a failure path can close unconditionally.
+    # closing twice is a no-op, so a failure path can close unconditionally,
+    # and the destructor that runs when `shared` dies at the end of main is a
+    # third no-op on the same handle.
     shared.close()
+
+    # a config nobody closes. this one goes back when `forgotten` dies at the
+    # end of main; before the destructor it held its slot until the process
+    # exited, once per request on an https client.
+    forgotten := tls.client_config_with_ca_file(CA_PATH)
+    if forgotten.is_ok:
+        print("forgotten config will close itself")
     print("done")

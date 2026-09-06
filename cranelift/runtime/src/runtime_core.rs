@@ -2479,6 +2479,16 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
+        // a destructor may run user code: a `Drop` method that binds `self`
+        // or passes it along, which retains and releases the value. with the
+        // count sitting at zero, that release would come back through here
+        // and run the destructor a second time. so the body runs under a
+        // guard count of one, the same guard the cycle collector's teardown
+        // applies: every pair inside it balances back to one, and no release
+        // inside can reach zero. the value is freed below whatever the count
+        // reads afterwards; a `drop` that lets `self` escape leaves a
+        // dangling reference, which is documented rather than guarded.
+        strong.store(1, std::sync::atomic::Ordering::Relaxed);
         // panic-guard: calling a compiler-emitted struct destructor from its header slot.
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);

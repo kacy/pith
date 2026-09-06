@@ -43,7 +43,6 @@ mut native_server_cert_pem: Map[Int, String] := {}
 mut native_server_key_der: Map[Int, Bytes] := {}
 mut native_server_client_ca_pem: Map[Int, String] := {}
 mut native_server_client_ca_optional: Map[Int, Bool] := {}
-mut native_listener_config: Map[Int, Int] := {}
 
 # guards the whole config registry above, the two hook maps declared further
 # down, the handle counter, and the root bundle caches below. the registry is
@@ -273,7 +272,9 @@ mut native_session_mu := Mutex()
 
 # A reusable TLS configuration (roots, certificates, ALPN, verification hooks).
 # A config is a handle into a registry; build it, hand it to dial/listen as many
-# times as you like, and close it when done — see Config.close for the timing.
+# times as you like. it gives its slot back when the last value naming it goes
+# away (Config implements Drop), or earlier on close() — see Config.close for
+# when the timing matters.
 pub struct Config:
     pub handle: Int
 
@@ -383,9 +384,12 @@ struct ConfigHookContext:
     state: ConnectionState
     client_hello: ClientHelloInfo
 
-# internal callback result shared by tls config hooks.
+# internal callback result shared by tls config hooks. only the server config
+# selector fills selected_config; the verify hook leaves it none rather than
+# naming a config it did not choose — a Config built over a handle here would
+# close that handle's config when the result died.
 struct ConfigHookResult:
-    selected_config: Config
+    selected_config: Config?
     reason: String
 
 struct PeerIdentity:
@@ -409,17 +413,67 @@ struct ServerResumptionDecision:
 pub struct Listener:
     pub handle: Int
 
+# a listener holds the config it was opened with, not just its handle: the
+# accept loop's handshakes read the certificate and key through this entry, and
+# a config only closes itself (Config.drop) once nothing holds it, so the
+# listener's count is what keeps a config the caller stopped naming alive until
+# the listener closes. reading and dropping this map goes through
+# listener_config and drop_listener_config rather than the generic helpers: a
+# config released under native_config_mu would take the same lock again.
+# declared after Config because a global's type is resolved where it is written.
+mut native_listener_config: Map[Int, Config] := {}
+
+# the config a listener was opened with. fails once the listener is closed:
+# the registry entry is removed with the socket, and a handle is never reissued.
+fn listener_config(fd: Int) -> Config!:
+    native_config_mu.lock()
+    defer native_config_mu.unlock()
+    if native_listener_config.contains_key(fd):
+        return native_listener_config[fd]
+    fail "native tls listener not found"
+
+# record a listener's config. a stale entry under the same fd (a listener
+# whose socket was closed without release_listener_config, the number since
+# reissued by the kernel) is read out before the insert overwrites it, for the
+# reason drop_listener_config gives: its release must not happen under the lock.
+fn put_listener_config(fd: Int, config: Config):
+    native_config_mu.lock()
+    mut stale := config
+    if native_listener_config.contains_key(fd):
+        stale = native_listener_config[fd]
+    native_listener_config.insert(fd, config)
+    native_config_mu.unlock()
+    # `stale` drops its count at the return, off the lock; when there was no
+    # stale entry it is a second count on the config being stored and is
+    # harmless to drop.
+    return
+
+# forget a listener's config, reporting whether there was one to forget. the
+# local `held` is deliberate: it keeps a count of its own across the removal so
+# the map's release cannot be the config's last one — that would run
+# Config.drop, and with it Config.close, under the lock this function holds.
+# the count `held` took drops at the return, after the unlock.
+fn drop_listener_config(fd: Int) -> Bool:
+    native_config_mu.lock()
+    if not native_listener_config.contains_key(fd):
+        native_config_mu.unlock()
+        return false
+    held := native_listener_config[fd]
+    native_listener_config.remove(fd)
+    native_config_mu.unlock()
+    # a config handle is never negative, so this is true; the read is what
+    # makes `held` a use, and its count drops at this return, off the lock.
+    return held.handle >= 0
+
 # the config hooks, guarded by native_config_mu like the rest of the registry.
 mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
 mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
 
 # the value config_get falls back to when a config has no hook installed: it
 # approves the connection and selects nothing. the callers check first and only
-# reach this if the hook was removed in between, so the selected config is the
-# negative handle no config can have rather than 0, which in a server-only
-# program is a real server config the selector must not be able to land on.
+# reach this if the hook was removed in between.
 fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
-    return ConfigHookResult(Config(0 - 1), "")
+    return ConfigHookResult(none, "")
 
 # parse a root bundle, reusing the parse when the same pem text has been seen.
 #
@@ -882,7 +936,9 @@ fn select_server_config_for(config: Config, server_name: String, alpn_protocols:
     ctx := ConfigHookContext("select_server_config", empty_connection_state(), copy_client_hello_info(info))
     # application code again: called off the lock.
     result := selector(ctx)
-    selected := result.selected_config
+    if result.selected_config == none:
+        fail "tls config selector must return a server config"
+    selected := result.selected_config.value()
     if not is_native_server_config(selected):
         fail "tls config selector must return a server config"
     return selected
@@ -2921,11 +2977,11 @@ fn native_conn_request_key_update(handle: Int) -> Bool!:
 
 # create a client config using system certificate roots.
 #
-# the caller owns the returned config and should close() it once the connections
-# made from it have finished their handshakes. the system root bundle behind it
-# is read and parsed at most once per process and shared by every config, so
-# building one of these per request is cheap; leaving them unclosed is not,
-# because each one keeps a registry slot for the life of the process.
+# the caller owns the returned config. it closes itself when the last value
+# naming it goes away, and close() closes it earlier — once the connections made
+# from it have finished their handshakes. the system root bundle behind it is
+# read and parsed at most once per process and shared by every config, so
+# building one of these per request is cheap.
 #
 # caching the bundle means a process does not notice the system trust store
 # being updated underneath it — it keeps the roots it started with until it
@@ -2938,7 +2994,7 @@ pub fn client_config() -> Config!:
 
 # create a client config using a pem ca file.
 #
-# owned by the caller and closed by the caller, like client_config(). the file
+# owned by the caller, like client_config(), and closed the same way. the file
 # is read on every call; the parse of it is shared with every other config over
 # the same bundle.
 pub fn client_config_with_ca_file(path: String) -> Config!:
@@ -2990,7 +3046,7 @@ pub fn conn_from_handle(handle: Int) -> Conn:
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:
     if is_native_server_config(config):
         fd := tcp_listen(host, port)!
-        config_put(native_listener_config, fd, config.handle)
+        put_listener_config(fd, config)
         return Listener(fd)
     if is_native_config(config):
         fail "tls.listen needs a server config, not a client config (use tls.server_config)"
@@ -3038,7 +3094,7 @@ pub fn listener_from_handle(handle: Int) -> Listener:
 #
 # safe to call on a listener whose config is already gone; it is a no-op then.
 pub fn release_listener_config(listener: Listener):
-    config_drop(native_listener_config, listener.handle)
+    drop_listener_config(listener.handle)
 
 # how many server configs are open right now: one per server_config() that has
 # not been closed yet.
@@ -3143,28 +3199,30 @@ impl Config:
         return self
 
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
-        config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(Config(0), verify(ctx.state)))
+        config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(none, verify(ctx.state)))
         return self
 
     # give the config's registry slot back.
     #
-    # whoever built a config closes it; nothing closes one for you, and a config
-    # left open holds its slot until the process exits. an https client builds
-    # one per request, so that is a leak per request.
+    # the destructor calls this when the last value naming the config goes
+    # away, so a config nobody closes is not a leak any more. calling it by
+    # hand still says *when*: whoever built a config decides that, and the
+    # destructor only says "no later than the last reference".
     #
     # closing is safe as soon as the handshakes made from the config have
     # returned. a client config is read only while a handshake runs, and the
     # connection it produces keeps its own keys rather than a reference back
     # here.
     #
-    # a server config is the same rule read carefully. `listen` records the
-    # handle against the listening socket, but that is a borrow, not a transfer:
-    # Listener.close() gives back the borrow, and whoever called server_config()
-    # still closes the config. the borrow is what makes the timing matter. an
-    # accept loop hands each socket to its own task, and that task reads the
-    # certificate and the key out of this registry when its handshake reaches
-    # them — which can be a whole handshake timeout after the accept returned.
-    # so a server closes its config after the drain, never before it.
+    # a server config is the same rule read carefully. `listen` holds the
+    # config against the listening socket — a count of its own, so the config
+    # outlives a caller that stops naming it — and Listener.close() gives that
+    # count back; whoever called server_config() still decides when to close.
+    # the timing matters because an accept loop hands each socket to its own
+    # task, and that task reads the certificate and the key out of this
+    # registry when its handshake reaches them — which can be a whole
+    # handshake timeout after the accept returned. so a server closes its
+    # config after the drain, never before it.
     #
     # every map a config can write to is dropped here. missing one would move
     # the leak rather than fix it, so there is a test that walks all of them.
@@ -3187,6 +3245,18 @@ impl Config:
         config_drop(native_server_client_ca_optional, self.handle)
         return
 
+# a config gives its registry slot back when the last value naming it goes
+# away, the way a list frees its elements: the compiler calls drop from the
+# destructor it attaches to every Config it builds (docs/ownership.md). close
+# is idempotent, so a caller that closes explicitly — which is still the way to
+# say *when* the slot goes back — costs nothing extra here, and a caller that
+# forgets no longer leaks a slot per request. what this does not change is the
+# timing rule above: a config a listener or a connection still reads from is
+# held by that reader's own count and closes after it, not before.
+impl Drop for Config:
+    fn drop():
+        self.close()
+
 impl Listener:
     fn accept() -> Conn!:
         return self.handshake(self.accept_socket()!)!
@@ -3202,16 +3272,18 @@ impl Listener:
         fail "native tls listener not found"
 
     fn handshake(fd: Int) -> Conn!:
-        # config handles count up from 0, so a negative one means this listener
-        # has no config registered (it was never listened on, or it was closed).
-        config_handle := config_get(native_listener_config, self.handle, 0 - 1)
-        if config_handle < 0:
+        # the listener's own config, held by the registry entry listen() made.
+        # this used to rebuild a Config over the entry's handle, which was fine
+        # while a Config was only a number; now that a Config closes itself when
+        # its last holder lets go, a second box over a live handle would close
+        # the listener's config at the end of the first handshake.
+        config := listener_config(self.handle) catch:
             note_failed_handshake(fd)
             fail "native tls listener not found"
         # the socket belongs to this call, so every error exit has to close it:
         # once the handshake fails there is no Conn for the caller to close.
         errdefer note_failed_handshake(fd)
-        conn := native_server_handshake(TcpStream(fd), Config(config_handle))!
+        conn := native_server_handshake(TcpStream(fd), config)!
         # accept_socket set a short read deadline to bound the handshake against a
         # slow or silent client. clear it now that the handshake is done, so the
         # connection's application reads are not silently capped at that window —
@@ -3221,8 +3293,7 @@ impl Listener:
         return conn
 
     fn close():
-        if config_has(native_listener_config, self.handle):
-            config_drop(native_listener_config, self.handle)
+        if drop_listener_config(self.handle):
             tcp_close(self.handle)
             return
         return

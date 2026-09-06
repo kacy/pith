@@ -21,7 +21,9 @@ client_cfg := tls.client_config()!
 custom_cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!
 ```
 
-both are yours to close — see [who closes a config](#who-closes-a-config).
+both give their registry slot back when the last value naming them goes away,
+and both can be closed earlier by hand — see [who closes a
+config](#who-closes-a-config).
 
 server configs come from a certificate chain and a pkcs#8 private key:
 
@@ -32,10 +34,17 @@ server_cfg := tls.server_config("certs/server.crt", "certs/server.key")!
 ## who closes a config
 
 a config is a handle into a registry that `std.net.tls` keeps for the life of
-the process. **whoever builds a config closes it**, and nothing closes one for
-you. a config that is never closed keeps its registry slot until the program
-exits, so an https client that builds one per request and drops it leaks once
-per request.
+the process. `Config` implements `Drop` (docs/ownership.md, "destructors"), so
+the slot goes back on its own when the last value naming the config goes away:
+a config bound in a request handler and forgotten is closed when the handler
+returns, one held in a struct field when the struct dies, one in a list when
+the list does. an https client that builds a config per request and drops it
+no longer leaks anything.
+
+**whoever builds a config still decides when it closes.** `close()` is the
+explicit form, it is idempotent, and it is still the right call wherever the
+timing matters, because a destructor runs when the last holder lets go and
+says nothing about when that is:
 
 ```pith
 cfg := tls.client_config()!
@@ -47,20 +56,25 @@ closing after the connection is up is deliberate, not a trick. a client config
 is read only while the handshake runs — the roots to verify the peer chain, the
 alpn list to offer, the client certificate to present. once the handshake
 returns, the connection holds its own keys and never looks the config up again,
-so the config has no job left.
+so the config has no job left. without the `defer` the same config closes at
+the end of the enclosing function instead, which for a per-request handler is
+the same moment.
 
 a server config is the same rule with the timing spelled out. `tls.listen`
-records the config against the listening socket, but that is a borrow, not a
-transfer: `Listener.close()` gives the borrow back, and whoever called
-`server_config()` is still the one who closes the config.
+holds the config against the listening socket — a count of its own, so the
+config stays open while the listener does even if the caller stops naming
+it — and each handshake takes a count for as long as it is reading the
+certificate and key. `Listener.close()` and `release_listener_config` give the
+listener's count back; the config closes at the later of that and the caller's
+last reference, or when the caller closes it by hand.
 
 the timing is what makes a server different in practice. an accept loop hands
 each socket to its own task, and that task reads the certificate and the private
 key out of the registry when its own handshake reaches them — which can be a
 whole handshake timeout after the accept that spawned it returned, and which for
 a connection accepted just before the shutdown may not have happened at all yet.
-so a server gives the borrow back and closes its config once it has drained,
-never before:
+so a server gives the listener's count back and closes its config once it has
+drained, never before:
 
 ```pith
 cfg := tls.server_config("certs/server.crt", "certs/server.key")!
@@ -69,7 +83,7 @@ shutdown.register_listener(listener.handle)
 # ... accept, spawning a task per connection, until a shutdown is requested ...
 shutdown.close_listener(listener.handle)   # free the port, and only the port
 drained := shutdown.drain_default()
-tls.release_listener_config(listener)      # give the borrow back
+tls.release_listener_config(listener)      # give the listener's count back
 cfg.close()
 ```
 
@@ -79,12 +93,15 @@ deploy is waiting to bind that port and the drain can take the whole grace
 period. the listener's *binding* to the config goes last, because that binding
 is how a handshake finds the certificate — dropping it while a connection is
 still in the drain count is the same mistake as closing the config early, one
-step removed.
+step removed. a handshake that has already read the config out of the binding
+holds its own count and finishes either way; one that has not yet fails.
 
 either mistake corrupts nothing — a handle is never reissued, so a handshake
 that loses the race fails cleanly rather than reaching for another config's key
 — but both turn working connections into failed ones on the way out, which is a
-worse shutdown than the leak they were fixing.
+worse shutdown than the leak they were fixing. the last line of the example is
+optional now — `cfg` closes itself when the function returns — and is kept
+because it says where the slot goes back.
 
 the std servers do this for you: `App.listen_tls`, `http2.listen_h2_tls` and its
 streaming twin each build a config, serve on it, and close it after their drain,
@@ -96,7 +113,9 @@ certificate, and on a healthy process the number is flat.
 path can close unconditionally on its way out — as long as it is a path where
 nothing is still handshaking on it. that caveat is the whole reason a server
 closes after its drain rather than in a `defer`, which would fire on the paths
-that never drain too.
+that never drain too. the destructor has no such caveat: it cannot run while a
+listener or a handshake still holds the config, because each of those holds a
+count.
 
 the functions that build a config for you close it for you — `tls.dial`,
 `http.get` and friends, `http2.connect`. the `_with_config` variants never

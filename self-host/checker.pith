@@ -1764,6 +1764,9 @@ fn check_implementation_declaration(node: Node):
     if concrete_name == "":
         return
 
+    if method_start == 2 and iface_type_base_name(first_type_node) == "Drop":
+        check_drop_implementation(node, concrete_name, method_start)
+
     concrete_tid := lookup_type_id(concrete_name)
     if concrete_tid < 0:
         return
@@ -1813,6 +1816,67 @@ fn check_implementation_declaration(node: Node):
                     if is_impl_own_method(node, method_start, mn.value) == false:
                         report_error("E235", "impl of " + iface_base + " for " + concrete_name + " is missing method: " + mn.value)
     active_assoc_bindings = {}
+
+# `impl Drop for T` is the destructor hook (docs/ownership.md): the emitter
+# calls T's `drop` from the destructor it attaches at construction, so the
+# impl has to be a shape that destructor can call. T must be a struct the
+# current module declares — the destructor is generated per declaration and
+# spells the method symbol from the declaring module, a generic struct has
+# one destructor per instance with no place for the call, and an enum
+# releases tagged payloads rather than fields — and the impl must provide
+# exactly `fn drop()`: no parameters, no return, since the runtime hands the
+# body the bare pointer and reads nothing back. `Drop` is a language-level
+# interface, so no declaration of it is needed or looked for.
+fn check_drop_implementation(node: Node, concrete_name: String, method_start: Int):
+    prefix := "impl Drop for " + concrete_name + ": "
+    if has_generic_declaration(concrete_name):
+        report_error("E268", prefix + "a generic struct cannot implement Drop")
+        return
+    tid := lookup_type_id(concrete_name)
+    if tid < 0:
+        return
+    if get_type_info(tid).kind != "struct":
+        report_error("E268", prefix + "only a struct can implement Drop")
+        return
+    if module_declares_struct(concrete_name) == false:
+        report_error("E268", prefix + "Drop must be implemented in the module that declares the struct")
+        return
+    mut found := false
+    mut skip := method_start
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        mut cn := get_node(child)
+        if cn.kind == "pub":
+            cn = get_node(cn.children[0])
+        if cn.kind != "fn_decl":
+            continue
+        if cn.value != "drop":
+            report_error("E268", prefix + "the impl may only declare drop(), not '" + cn.value + "'")
+            continue
+        found = true
+        if declaration_has_generic_params(cn) or collect_function_param_types(cn).len() > 0:
+            report_error("E268", prefix + "drop() takes no parameters")
+        elif collect_function_return_type(cn) != TID_VOID:
+            report_error("E268", prefix + "drop() returns nothing")
+    if found == false:
+        report_error("E268", prefix + "the impl must declare fn drop()")
+
+# whether the module being checked declares a struct under `name` itself,
+# as opposed to seeing one through an import. walks the module's own root,
+# which snapshot_module_context recorded before the passes began.
+fn module_declares_struct(name: String) -> Bool:
+    if checker_module_roots.contains_key(current_checker_module_path) == false:
+        return false
+    root := get_node(checker_module_roots[current_checker_module_path])
+    for child in root.children:
+        mut cn := get_node(child)
+        if cn.kind == "pub":
+            cn = get_node(cn.children[0])
+        if (cn.kind == "struct_decl" or cn.kind == "struct") and cn.value == name:
+            return true
+    return false
 
 # an impl of an interface with associated types must bind every one of them.
 fn check_assoc_types_bound(iface_type_node: Node, concrete_name: String):

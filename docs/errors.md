@@ -557,11 +557,19 @@ warning[E306]: struct 'Node' holds a strong reference to itself through field 'n
 
 ### E307 — resource never closed (warning)
 
-a local binding holds a resource its caller owns — today that means a
-`std.net.tls` config — and nothing in the function closes it. reference counting
-reclaims the handle's memory but not the registry slot behind it, so the slot is
-held until the process exits with no other diagnostic. pair the build with a
-`defer` close (see [defer.md](defer.md)), or close it explicitly.
+a local binding holds a resource its caller owns and nothing in the function
+closes it. reference counting reclaims the handle's memory but not the registry
+slot behind it, so the slot is held until the process exits with no other
+diagnostic. pair the build with a `defer` close (see [defer.md](defer.md)), or
+close it explicitly.
+
+the constructor list is empty at the moment. it held the three `std.net.tls`
+config builders, and a tls config now implements `Drop` (docs/ownership.md,
+"destructors"): a config built and never closed gives its slot back when the
+last value naming it goes away, so the shape this rule reported is no longer a
+leak. the rule stays for the std types that still close by hand, which
+docs/destructors_roadmap.md lists; an entry is added when one of them is
+audited onto the list rather than the destructor.
 
 the rule is deliberately narrow, because a false positive on a resource that is
 closed elsewhere is worse than no rule. it reports only when every later mention
@@ -576,8 +584,10 @@ the constructor list is short on purpose. an entry has to be a call whose result
 the caller owns, on a type with no method that consumes the receiver instead of
 closing it — `bytes.ByteBuffer` is excluded for exactly that reason, since
 `take_bytes()` frees the buffer as it takes its contents. the survey behind the
-list, and the plan for what would replace the rule, are in
-[destructors_roadmap.md](destructors_roadmap.md).
+list is in [destructors_roadmap.md](destructors_roadmap.md).
+
+the message names the constructor, as it did for a tls config before the
+destructor:
 
 ```
 warning[E307]: 'config' is built by tls.client_config() and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope
@@ -618,6 +628,31 @@ error[E267]: 'grow' is instantiated at more than 64 distinct type sets; a generi
 not reported when the check is switched off (`PITH_CHECK_GENERIC_BODIES=off`
 or `silent`); the declaration is then left unchecked past the cap, as every
 generic body was before the check existed.
+
+### E268 — invalid Drop implementation
+
+`impl Drop for T` asks the compiler to call `T`'s `drop` method from the
+destructor it attaches to every `T` it builds, when the last value naming the
+struct goes away (see docs/ownership.md, "destructors"). the impl has to be a
+shape that destructor can call: `T` must be a struct, declared in the module
+the impl is written in, and not generic — the destructor is generated per
+declaration and spells the method symbol from the declaring module, and a
+generic struct's destructor is generated per instance with no place for the
+call. the impl must declare `fn drop()` with no parameters and no return
+value, since the runtime hands it the bare pointer and reads nothing back, and
+nothing else beside it.
+
+```
+error[E268]: impl Drop for Guard: a generic struct cannot implement Drop
+error[E268]: impl Drop for Shape: only a struct can implement Drop
+error[E268]: impl Drop for Slot: drop() takes no parameters
+error[E268]: impl Drop for Slot: the impl may only declare drop(), not 'close'
+error[E268]: impl Drop for Slot: the impl must declare fn drop()
+```
+
+`Drop` is a language-level interface: nothing declares it and nothing imports
+it. put the type's other methods in an `impl T:` block of their own, and have
+`drop` call the explicit closer so the two stay idempotent.
 
 before globals were given a storage namespace of their own, this compiled and
 miscompiled: the binding wrote the GLOBAL's slot, so the local and the global

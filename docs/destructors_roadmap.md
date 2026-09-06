@@ -13,9 +13,14 @@ to a `Config` goes away, which is the same missing feature behind several
 entries here."
 
 this page is the survey behind that sentence, an assessment of how close the
-emitter already is to running user cleanup, and a recommendation. it is a plan,
-not a description of what ships today: nothing here is implemented except the
-lint in stage 0. issue #925 tracks it.
+emitter was to running user cleanup, the recommendation made at the time, and
+the staged plan that came out of it. the hook exists now: a struct can
+`impl Drop`, its `drop` runs from the destructor the compiler already
+attaches, and `std.net.tls.Config` is the first std type on it (the mechanism
+is described in docs/ownership.md, "destructors"). the survey and the stage
+plan below are kept current, because every other type in the survey still
+closes by hand and the plan says in what order that changes. issue #925
+tracks it.
 
 ## the survey
 
@@ -26,13 +31,19 @@ skipped, and whether a second call is safe.
 
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
-| `Config` | `close()` | up to 14 module-global registry maps keyed by handle, pinned for process life; for a server config that includes the certificate pem and the private key der | safe |
+| `Config` | `close()`, or its destructor | nothing any more: `Config` implements `Drop`, so a config nobody closes gives its slots back when the last value naming it dies | safe |
 | `Conn` | `close()` | the `native_conn_states` entry (keys, ivs, transcript, sequence numbers), the handshake-pending flag, the socket fd, and the `close_notify` alert | safe |
 | `Listener` | `close()` | the listener-config entry and the listening socket | safe |
 
-handles are never reissued, so the maps only grow. std's own comment on
-`Config.close()` puts the cost plainly: an https client builds a config per
-request, so a forgotten close is a leak per request.
+handles are never reissued, so the maps only grow for the two types that
+still close by hand. a `Conn` and a `Listener` cannot carry the destructor yet
+because std rebuilds both from a bare handle — `conn_from_handle` and
+`listener_from_handle` are public, and the accept wrappers build a `Listener`
+over the caller's handle — so a destructor on either would close a live
+resource under the other box. `Config` had the same shape in two places (the
+listener's handshake rebuilt a `Config` over the registered handle, and the
+verify hook's result named handle 0) and lost both when it moved: the listener
+registry holds the config itself now, and the hook result carries an optional.
 
 ### io and files — `std/io.pith`
 
@@ -186,61 +197,71 @@ so the runtime hook a destructor needs already exists, is already per-object,
 and is already called from both the arc path and the collector path. adding a
 user-visible hook does not need new runtime plumbing.
 
-## what the machinery does not do yet
+## what the machinery did not do, and what changed
 
-five things, and they are the reason this page recommends what it does.
+five things, which were the reason the recommendation below was made. each is
+kept with what became of it.
 
-**the predicate answers "does this hold a counted field", not "does this need
-cleanup".** `ir_struct_needs_dtor` in `self-host/ir_struct_registry.pith` walks
-a struct's fields and returns true only when one of them is reference counted.
-every resource type in the survey above is `struct X: pub handle: Int`. not one
-of them gets a destructor emitted, and not one of them gets
-`pith_struct_set_dtor` called at construction. the predicate is also what feeds
-the cycle collector's child walk — an object with a null destructor slot is a
-leaf to the collector — so widening it moves more than it looks like it moves.
+**the predicate answered "does this hold a counted field", not "does this need
+cleanup".** `ir_struct_needs_dtor` in `self-host/ir_struct_registry.pith` walked
+a struct's fields and returned true only when one of them was reference counted.
+every resource type in the survey above is `struct X: pub handle: Int`, and not
+one of them got a destructor. it answers true for a `Drop` struct now, from a
+registry of drop methods keyed by declaration node, and the generated body
+calls the method before the field walk. the collector's child walk is
+unmoved: a tracer is registered only for a struct with traceable fields, so a
+`Drop` struct with none stays a leaf to the collector.
 
-**a handle wrapper is not the resource.** `Config` is one `Int`. std builds a
-second `Config` box over the same registry handle in `native_server_handshake`,
-and a second `Conn` box the same way. a destructor that closed the handle when
-its box died would close a live config out from under the box that still names
-it. the same shape recurs across roughly 45 handle-wrapper structs in std. this
-is not a compiler gap; it is an api shape, and no destructor design fixes it
-from the compiler side.
+**a handle wrapper is not the resource.** `Config` is one `Int`. std built a
+second `Config` box over the same registry handle in the listener's handshake,
+and builds a second `Conn` box the same way. a destructor that closes the
+handle when its box dies closes a live config out from under the box that
+still names it. the same shape recurs across roughly 45 handle-wrapper structs
+in std. this is not a compiler gap; it is an api shape, and no destructor
+design fixes it from the compiler side. it is fixed per type, by audit, as
+each type moves onto the hook: `Config` is done, and stage 2 below lists the
+rest.
 
-**generic instances are not covered.** a generic struct built by its base name —
-`Holder("x")` rather than `Holder[String]("x")` — takes an early return in
-`ir_attach_generic_construction_dtor` that registers no destructor at all
-(issue #917, measured at about 35 bytes per instance). a generic enum instance's
-destructor tests tag zero regardless of what its signature says, so it releases
-nothing unless the payload variant happens to be declared first (issue #918).
-and a generic function body's specialization empties the emitter's
-reference-counted-local list before emitting exit cleanup, so no scope-exit
-release runs inside one at all. a `Guard[T]` or a `Pool[T]` is exactly what
-someone writes when they want a resource wrapper, and it is exactly the shape
-all three gaps land on. today those gaps cost bytes. under a destructor hook
-they would cost an unclosed socket, silently.
+**generic instances were not covered.** a generic struct built by its base
+name — `Holder("x")` rather than `Holder[String]("x")` — registered no
+destructor at all (issue #917), a generic enum instance's destructor tested
+tag zero regardless of its signature (issue #918), and a generic function
+body's specialization emitted no scope-exit release. all three are closed: a
+generic body is typed against each set of concrete types before it is emitted
+(docs/generics.md), and a struct built inside one gets its destructor like the
+same line outside. what remains is narrower and is refused rather than
+silent: a generic struct cannot implement `Drop` (E268), because its destructor
+is generated per instance from the resolved field kinds and that body has no
+place for the method call yet. a `Guard[T]` wants a concrete wrapper around it
+until that lands.
 
-**the emitter's documented bounded leaks would change meaning.** a `T!` or `T?`
+**the emitter's documented bounded leaks change meaning.** a `T!` or `T?`
 local passed as an argument, a tuple-typed register the emitter cannot tie back
 to a literal, an ok value consumed by `catch` — the emitter deliberately does
 not release these, erring toward a leak rather than a double free. under arc
-that is a byte count. under a destructor hook it becomes "your cleanup did not
-run", and a feature added to make cleanup reliable would have made it less so.
+that is a byte count. under the hook it is also a `drop` that did not run.
+that is accepted, with the list in docs/ownership.md as the record of where:
+the shapes are rare, each is being closed on its own, and the alternative was
+to leave every forgotten close leaking so that the rare shape would not.
 
 **there is no type identity at a release site.** the header carries a
 destructor pointer and nothing else identifying. interfaces are fully
 monomorphized — there is no vtable anywhere in the tree, and the collector
-already uses the destructor pointer itself as a stand-in type key. so a `Drop`
-interface could not be dispatched dynamically from a release site; it would have
-to be resolved at construction and baked into the pointer, which is what the
-existing machinery does and is a workable design, but it makes `Drop` a
-compile-time marker rather than a runtime trait.
+already uses the destructor pointer itself as a stand-in type key. so `Drop`
+is not dispatched from a release site; it is resolved at construction and
+baked into the per-declaration destructor body, which is what the existing
+machinery always did. `Drop` is a compile-time marker: nothing declares the
+interface, the checker recognizes the impl by name and checks its shape
+(E268), and a generic bound on it would be meaningless.
 
 one more, smaller: the destructor is called with the raw pointer while the
-strong count is already zero. a user `fn drop(self)` compiled as an ordinary
-method would track `self` as a counted local and re-enter `pith_struct_release`
-at zero. the runtime's over-release guard catches that without crashing, but the
-body would have to be emitted with `self` excluded from the cleanup list.
+strong count is already zero, and a `drop` body that binds `self` retains and
+releases it, which at zero would re-enter the release and run the destructor
+again. `pith_struct_release` runs the destructor under a guard count of one,
+the same guard the collector's teardown applies, so the pairs inside the body
+balance and nothing inside it can reach zero; `self` is an ordinary borrowed
+parameter, in no cleanup list. a `drop` that lets `self` escape is documented
+as undefined rather than caught.
 
 ## the options
 
@@ -322,10 +343,17 @@ it is also sugar. it covers exactly the cases `defer` already covers, buying
 ergonomics and a name rather than a new guarantee, and it costs new syntax to do
 it. worth having after the diagnostic, not instead of it.
 
-## the recommendation
+## the recommendation, as made at the time
 
 **take option b now: keep `defer` as the convention and add the missing
 diagnostic. do not build a `Drop` hook against the current machinery.**
+
+that was the position when the machinery had the five gaps above. stage 1
+closed the generic gaps and the runtime guard closed the reentrancy one, which
+left the identity problem — std's own second boxes over a live handle — as the
+real prerequisite, and that one is per type. so the hook was built, and each
+type moves onto it as its audit is done. the reasoning below is kept because
+it is what decided the order.
 
 the reasoning is not that `Drop` is the wrong feature. it is that a `Drop` hook
 layered on today's destructor path would not run for the types people write when
@@ -354,10 +382,12 @@ the diagnostic makes the badly-written case visible.
 
 ## staged plan
 
-### stage 0 — a lint for a resource that is built and abandoned — done
+### stage 0 — a lint for a resource that is built and abandoned — done, now empty
 
 E307, in `self-host/linter.pith`. it reports a locally-built resource that is
-never closed and never handed off. deliberately narrow: the binding's
+never closed and never handed off. its constructor list held the three tls
+config builders and is empty now that `Config` closes itself; the rule stays
+for a type audited onto the list rather than the hook. deliberately narrow: the binding's
 initializer must be a call to a known resource constructor, reached through `!`
 and any chain of builder methods, and the name must be used *only* as the
 receiver of methods that do not close it. any other use — passed as an argument,
@@ -376,29 +406,51 @@ is unambiguous and whose types have no consuming method.
 
 effort: small — one lint pass, one error code, three smoke cases in the makefile.
 
-### stage 1 — repair the destructor machinery
+### stage 1 — repair the destructor machinery — done
 
-fix #917 (a generic struct instance emits no destructor), #918 (a generic enum
-instance's destructor tests the wrong tag), and the generic-function-body
-specialization that skips scope-exit cleanup entirely. these are measured leaks
-today and worth fixing on their own; they are also the floor under anything
-automatic. until all three are closed, no destructor hook can claim to run.
+#917 (a generic struct instance emitted no destructor), #918 (a generic enum
+instance's destructor tested the wrong tag), and the generic-function-body
+specialization that skipped scope-exit cleanup are closed; a generic body is
+typed per instantiation before it is emitted, and docs/ownership.md records
+the shapes that pin it.
 
-effort: medium. one emitter area, leak-gate cases for each, and each needs its
-regression pinned at both generic-enum declaration orders.
-
-### stage 2 — make std's resource types single-owner
+### stage 2 — make std's resource types single-owner — `Config` done
 
 stop reconstructing a wrapper struct from a raw handle, so that one live value
-names one live resource. audit all roughly 45 handle wrappers. the three
-registry leaks this survey found — the `io` buffered text and string
-registries, `websocket`'s six threadlocal maps, and grpc's streams never
-closing their underlying http/2 stream — are closed (issue #925): each of
-those types deregisters through a `close()` now. what remains here is the
-single-owner audit itself.
+names one live resource, then put the type on the hook. `std.net.tls.Config`
+is done: the listener registry holds the config rather than its handle, the
+hook result carries `Config?` rather than a box over handle 0, and
+`impl Drop for Config` calls `close()`. the three registry leaks this survey
+found — the `io` buffered text and string registries, `websocket`'s six
+threadlocal maps, and grpc's streams never closing their underlying http/2
+stream — are closed (issue #925): each of those types deregisters through a
+`close()` now, which is the half a destructor needs first.
 
-effort: large, and api-visible. this is the real prerequisite, and it is std
-work rather than compiler work.
+the rest, in the order they are worth doing, each with what its audit has to
+settle:
+
+- the `io` buffered text readers and writers, `StringReader`, `StringBuffer`
+  and `BytesCursor`: threadlocal registries, no public rebuild-from-handle,
+  so the audit is small. the one question is a value whose last holder dies
+  on another os thread than the one that built it — the destructor then
+  finds no entry, which is the same no-op an explicit `close()` on that
+  thread already is.
+- `websocket` sessions and grpc streams: single-owner from the caller's
+  side already; the audit is whether the server-side code rebuilds either
+  from a stored handle.
+- `tls.Conn`, `tls.Listener`, `http.ClientConn`, `http2.Connection` and the
+  database connections: each is rebuilt from a bare handle somewhere
+  (`conn_from_handle`, `listener_from_handle`, the drivers' stored `Int`
+  fields), and each closes a socket, which is the one closer that is not
+  idempotent. these need the rebuild sites replaced with a held value first,
+  and a close that records whether it won.
+- the types with no closer at all (`resilience.Limiter`, `Breaker`,
+  `crypto.jwks.Cache`, `web.session.Store`): built once at startup, so a
+  destructor buys little; they get a closer when something builds them per
+  request.
+
+effort: large in total and api-visible, done a type at a time. std work
+rather than compiler work.
 
 ### stage 3 — a scoped `with` block over `io.Closer`
 
@@ -409,15 +461,22 @@ it improves the common case without waiting on either.
 effort: medium — parser, checker conformance check, one emitter rewrite, docs
 and goldens.
 
-### stage 4 — a `Drop` marker, only if 1 through 3 land
+### stage 4 — a `Drop` marker — done for the compiler, ahead of stage 3
 
 resolved at construction and baked into the existing per-object destructor
-pointer, the way tracers already are. widen `ir_struct_needs_dtor`, splice the
-user call at the head of the generated destructor body, emit that body with
-`self` excluded from the cleanup list, and keep the tracer registration in step.
-decide explicitly what happens when the cycle collector runs one, and consider
-refusing to run a user `drop` from a collection sweep rather than running it in
-an order and on a thread the user did not choose.
+pointer, the way tracers already are: `ir_struct_needs_dtor` answers true for
+a `Drop` struct, the generated destructor calls the method at its head, the
+runtime runs the body under a guard count, and the tracer registration is
+unchanged because the method adds no edges. the checker refuses the shapes the
+destructor cannot call (E268): an enum, a generic struct, an impl outside the
+declaring module, or a `drop` with parameters or a return value.
 
-effort: large, and gated on all three stages above. this page's position is that
-it should not start until they are done.
+the collector question was decided the plain way: a `drop` runs wherever the
+release runs, the collector's sweep included. a `Drop` struct with no counted
+fields is a leaf, so the sweep only reaches it through a member's field
+release, which is an ordinary release on the collector's thread. refusing to
+run it there would trade a cleanup on an unchosen thread for no cleanup.
+
+what is left on the compiler side: a generic struct on the hook (the
+per-instance destructor needs the call spliced in), and the bounded leaks
+above, which are being closed one shape at a time.

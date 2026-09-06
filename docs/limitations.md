@@ -372,13 +372,26 @@ correctness story:
   issues #920 and #955). the lift that would readmit them is a content-hashing
   element flavor through both container runtimes — bytes first, whose `==`
   already compares by content.
-- several std types must be closed by hand and nothing enforces it. the survey,
-  the assessment of what a destructor hook would take, and the staged plan are
-  in docs/destructors_roadmap.md. the three registry leaks it found (issue
-  #925) — buffered text readers and writers, websocket sessions, and gRPC
-  streams — are fixed: each of those types closes and deregisters now. the
-  E307 lint flags a locally built resource that is never closed and never
-  handed off.
+- most std resource types must still be closed by hand. a struct can
+  implement `Drop` now (docs/ownership.md, "destructors"): its `drop` runs
+  from the destructor the compiler attaches, when the last value naming it
+  goes away, and `std.net.tls.Config` is the first std type on it — a config
+  built and never closed gives its registry slot back on its own. the rest of
+  the survey in docs/destructors_roadmap.md — the buffered text readers and
+  writers, websocket sessions, gRPC streams, tls connections and listeners,
+  files, processes and the database handles — still close by hand. for most
+  of them the reason is the same: std builds a second wrapper over the same
+  handle somewhere (`conn_from_handle`, `listener_from_handle`, a struct
+  rebuilt from a stored `Int`), and a destructor on such a type would close a
+  live resource out from under the other box. each moves over once it is made
+  single-owner, which is the roadmap's stage 2 and is std work rather than
+  compiler work; the buffered io types have no such rebuild and are simply
+  next in line. three
+  compiler-side gaps remain as well: a generic struct cannot implement `Drop`
+  (its destructor is generated per instance with no place for the call), the
+  bounded leaks listed under docs/ownership.md are now a missed `drop` as well
+  as a missed free, and a `drop` that lets `self` escape dangles rather than
+  being refused.
 - a channel is a counted heap value like a list or a struct. a handle in a
   local, a struct field, a container or a `spawn` capture carries a count, and
   the last release frees the channel outright, draining and releasing any
@@ -567,22 +580,17 @@ snapshot harder to take. a lock per series adds a lookup to the hot path.
 atomic counters are the obvious answer for a counter and no answer at all for a
 histogram, which updates seven values as one unit.
 
-a `std.net.tls` config that the caller builds is the caller's to close, and
-nothing in the language notices when one is not. the rule is now uniform inside
-std — whoever builds a config closes it, and `client_config()` shares one cached
-root bundle rather than handing out a copy — so an https request no longer leaks
-a config per request. what is left is that the language still does not close one
-for you: a program that builds its own config for `dial_with_config` and forgets
-`close()` holds a registry slot until it exits. the slot is small now, which
-makes it a slow leak rather than a fast one, which is arguably worse. `pith
-lint` now names the narrow case — a config built locally, used in place and
-never closed reports E307 — but a warning on one pattern is not the destructor
-that would run when the last reference to a `Config` goes away, which is the
-same missing feature behind several entries here.
-[docs/destructors_roadmap.md](destructors_roadmap.md) surveys every std type in
-the same position, measures how close the emitter's destructor machinery
-actually is, and says why the recommendation is the diagnostic rather than the
-destructor.
+a `std.net.tls` config closes itself when the last value naming it goes away:
+`Config` implements `Drop`, so a program that builds its own config for
+`dial_with_config` and forgets `close()` no longer holds a registry slot until
+it exits. what the destructor does not decide is *when*. it runs when the last
+holder lets go, which for a config a listener is still handshaking on is later
+than the caller may think and never earlier than is safe (the listener and each
+handshake hold a count), so a server that wants its certificate released at a
+particular point in its shutdown still closes by hand, and the E307 lint no
+longer reports a config that is built and left to the destructor. the other
+std types in the same position are listed under the backend section above and
+in [docs/destructors_roadmap.md](destructors_roadmap.md).
 
 the root bundle cache that made per-request configs cheap is capped at eight
 distinct bundles and never evicts. a process that trusts more than eight

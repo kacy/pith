@@ -1,0 +1,130 @@
+# a `Set[Bytes]` and a `Map[Bytes, V]` hash and compare their keys by
+# content. two values that share a prefix and a length are two entries, a
+# value built from a string and the same value assembled byte by byte in a
+# buffer are one entry, and the empty value is a key like any other. every
+# operation the string flavor has works the same way here, iteration hands
+# out fresh bytes objects, and `==` on the container is identity, as it is
+# for every container.
+import std.bytes as bytes
+
+struct Seen:
+    pub keys: Set[Bytes]
+    pub labels: Map[Bytes, String]
+
+fn assembled(text: String) -> Bytes:
+    buf := bytes.buffer()
+    mut i := 0
+    while i < text.len():
+        buf.write_byte(ord(text[i])) catch 0
+        i = i + 1
+    return buf.take_bytes()
+
+fn show(data: Bytes) -> String:
+    if data.len() == 0:
+        return "<empty>"
+    return data.to_string_utf8() catch "<invalid>"
+
+fn sorted_texts(items: List[Bytes]) -> List[String]:
+    mut out: List[String] := []
+    for item in items:
+        out.push(show(item))
+    return out.sort()
+
+fn count_members(members: Set[Bytes]) -> Int:
+    mut n := 0
+    for member in members:
+        n = n + member.len()
+    return n
+
+fn build_members() -> Set[Bytes]:
+    mut out: Set[Bytes] := {}
+    out.add(bytes.from_string_utf8("x"))
+    out.add(bytes.from_string_utf8("yy"))
+    return out
+
+fn holds[T](members: Set[T], wanted: T) -> Bool:
+    return members.contains(wanted)
+
+fn set_section():
+    abc := bytes.from_string_utf8("abc")
+    abd := bytes.from_string_utf8("abd")
+    mut s: Set[Bytes] := {}
+    print("empty: {s.is_empty()} {s.len()}")
+    s.add(abc)
+    s.add(abd)
+    s.add(abc)
+    print("prefix siblings: {s.len()}")
+    # the same content assembled byte by byte lands on the existing entry
+    s.add(assembled("abc"))
+    print("assembled twin: {s.len()} {s.contains(assembled("abc"))}")
+    print("prefix alone: {s.contains(bytes.from_string_utf8("ab"))}")
+    empty := bytes.empty()
+    s.add(empty)
+    print("empty key: {s.len()} {s.contains(bytes.empty())} {s.contains(assembled(""))}")
+    # iteration hands out fresh values; the order is the runtime's, so the
+    # members are sorted before printing
+    mut members: List[Bytes] := []
+    for member in s:
+        members.push(member)
+    print("members: {sorted_texts(members)}")
+    print("byte total: {count_members(s)}")
+    s.remove(assembled("abd"))
+    print("after remove: {s.len()} {s.contains(abd)} {s.contains(abc)}")
+    # a literal with elements, a set built by a callee, a generic search
+    lit: Set[Bytes] := {abc, assembled("abc"), abd}
+    print("literal: {lit.len()}")
+    built := build_members()
+    print("built: {built.len()} {holds(built, assembled("yy"))} {holds(built, abc)}")
+    # container equality is identity for every container
+    same := s
+    print("identity: {s == same} {s == lit}")
+    s.clear()
+    print("cleared: {s.len()} {s.is_empty()}")
+
+fn map_section():
+    mut m: Map[Bytes, String] := {}
+    key := bytes.from_string_utf8("key")
+    kex := bytes.from_string_utf8("kex")
+    m.insert(key, "first")
+    m[kex] = "second"
+    m[bytes.empty()] = "blank"
+    print("entries: {m.len()} {m.contains_key(assembled("key"))} {m.contains_key(bytes.from_string_utf8("ke"))}")
+    # the same content assembled another way overwrites, never duplicates
+    m.insert(assembled("key"), "replaced")
+    print("overwrite: {m.len()} {m[key]} {m[assembled("kex")]} {m[assembled("")]}")
+    if let found = m.get(assembled("key")):
+        print("get: {found}")
+    if let missing = m.get(assembled("nope")):
+        print("unexpected {missing}")
+    else:
+        print("get miss: none")
+    print("default: {m.get_default(kex, "?")} {m.get_default(assembled("zzz"), "?")}")
+    mut key_texts: List[String] := []
+    for k in m:
+        key_texts.push(show(k))
+    print("keys: {key_texts.sort()}")
+    print("keys(): {sorted_texts(m.keys())}")
+    print("values: {m.values().sort()}")
+    taken := m.take(assembled("kex"))
+    print("take: {taken} {m.len()} {m.contains_key(kex)}")
+    m.remove(bytes.empty())
+    print("remove: {m.len()} {m.contains_key(assembled(""))}")
+    m.clear()
+    print("cleared: {m.len()}")
+    # a literal with bytes keys, and a map of bytes values keyed by bytes
+    lit: Map[Bytes, Int] := {key: 1, assembled("key"): 2, kex: 3}
+    print("literal: {lit.len()} {lit[assembled("key")]} {lit[kex]}")
+    mut by: Map[Bytes, Bytes] := {}
+    by[key] = kex
+    print("bytes values: {show(by[assembled("key")])}")
+
+fn struct_section():
+    seen := Seen({}, {})
+    seen.keys.add(assembled("k"))
+    seen.labels.insert(bytes.from_string_utf8("k"), "kay")
+    print("fields: {seen.keys.contains(bytes.from_string_utf8("k"))} {seen.labels[assembled("k")]}")
+
+fn main():
+    set_section()
+    map_section()
+    struct_section()

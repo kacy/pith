@@ -7,8 +7,8 @@ STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,re
 BYTES_RETURNING_FUNCS := "term_read,bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat,secure_random_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_aes_256_gcm_seal,crypto_aes_256_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8,crypto_sign_rsa_pkcs1_sha256_pkcs8,crypto_sign_ed25519_pkcs8,crypto_sign_ecdsa_p256_sha256_pkcs8,crypto_sign_ecdsa_p256_sha256_asn1_pkcs8,crypto_sign_rsa_pss_sha384_pkcs8,crypto_sign_rsa_pss_sha512_pkcs8,crypto_sign_rsa_pkcs1_sha384_pkcs8,crypto_sign_rsa_pkcs1_sha512_pkcs8,crypto_sign_ecdsa_p384_sha384_asn1_pkcs8,crypto_blake2b,crypto_argon2id,zstd_compress,zstd_decompress"
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
-BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,send,try_send,close,is_closed,is_done"
-VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release,store"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_contains_bkey,map_is_empty,set_contains,set_contains_int,set_contains_bytes,set_is_empty,send,try_send,close,is_closed,is_done"
+VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_insert_bkey,map_remove,map_remove_ikey,map_remove_bkey,map_clear,set_add,set_add_int,set_add_bytes,set_remove,set_remove_int,set_remove_bytes,set_clear,detach,lock,unlock,done,wait,acquire,release,store"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,list_join_int,read_file,env,chr"
 
 # fallible builtins, grouped by how the ir carries their result (see the result
@@ -239,6 +239,10 @@ pub fn ir_runtime_call_name(name: String) -> String:
         return "pith_map_new_cstr_val"
     if name == "__map_new_int_str_val":
         return "pith_map_new_int_cstr_val"
+    if name == "__map_new_bytes":
+        return "pith_map_new_bytes"
+    if name == "__map_new_bytes_str_val":
+        return "pith_map_new_bytes_cstr_val"
     if name == "__cstring_retain":
         return "pith_cstring_retain"
     if name == "__cstring_release":
@@ -251,6 +255,10 @@ pub fn ir_runtime_call_name(name: String) -> String:
         return "pith_set_to_list_cstr"
     if name == "__set_to_list_int":
         return "pith_set_to_list_int_handle"
+    if name == "__set_new_bytes":
+        return "pith_set_new_bytes"
+    if name == "__set_to_list_bytes":
+        return "pith_set_to_list_bytes"
     if name == "__struct_alloc":
         return "pith_struct_alloc"
     if name == "__closure_set_env":
@@ -334,8 +342,20 @@ fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
         return "pith_list_last_opt"
     return mname
 
+# the key-flavor suffix a map method's runtime name carries: the int and
+# bytes flavors have their own entry points ("_ikey", "_bkey"), the string
+# flavor is the unsuffixed default. obj_type is "map_int", "map_bytes" or
+# "map" — the bytes flavor is a call-selection detail the caller reads off
+# the checked type (ir_bytes_keyed_type), never a tracked kind.
+fn ir_map_key_suffix(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "_ikey"
+    if obj_type == "map_bytes":
+        return "_bkey"
+    return ""
+
 fn ir_method_map_emit_name(mname: String, obj_type: String) -> String:
-    obj_is_map_int := obj_type == "map_int"
+    suffix := ir_map_key_suffix(obj_type)
     if mname == "len":
         return "map_len"
     if mname == "is_empty":
@@ -343,55 +363,46 @@ fn ir_method_map_emit_name(mname: String, obj_type: String) -> String:
     if mname == "clear":
         return "map_clear"
     if mname == "keys":
-        if obj_is_map_int:
-            return "map_keys_ikey"
-        return "map_keys"
+        return "map_keys" + suffix
     if mname == "values":
         return "map_values"
-    if mname == "contains_key" and obj_is_map_int:
-        return "map_contains_ikey"
+    if mname == "contains_key" and suffix.len() > 0:
+        return "map_contains" + suffix
     if mname == "insert":
-        if obj_is_map_int:
-            return "map_insert_ikey"
-        return "map_insert"
+        return "map_insert" + suffix
     if mname == "remove":
-        if obj_is_map_int:
-            return "map_remove_ikey"
-        return "map_remove"
+        return "map_remove" + suffix
     if mname == "take":
-        if obj_is_map_int:
-            return "map_take_ikey"
-        return "map_take"
+        return "map_take" + suffix
     if mname == "get_default":
-        if obj_is_map_int:
-            return "map_get_default_ikey"
-        return "map_get_default"
+        return "map_get_default" + suffix
     if mname == "get":
-        if obj_is_map_int:
-            return "map_get_ikey_opt"
-        return "map_get_opt"
+        return "map_get" + suffix + "_opt"
     return mname
 
+# the element-flavor suffix of a set method's runtime name, on the same
+# terms as ir_map_key_suffix.
+fn ir_set_elem_suffix(obj_type: String) -> String:
+    if obj_type == "set_int":
+        return "_int"
+    if obj_type == "set_bytes":
+        return "_bytes"
+    return ""
+
 fn ir_method_set_emit_name(mname: String, obj_type: String) -> String:
-    obj_is_set_int := obj_type == "set_int"
+    suffix := ir_set_elem_suffix(obj_type)
     if mname == "len":
         return "set_len"
     if mname == "add":
-        if obj_is_set_int:
-            return "set_add_int"
-        return "set_add"
+        return "set_add" + suffix
     if mname == "contains":
-        if obj_is_set_int:
-            return "set_contains_int"
-        return "set_contains"
+        return "set_contains" + suffix
     if mname == "is_empty":
         return "set_is_empty"
     if mname == "clear":
         return "set_clear"
     if mname == "remove":
-        if obj_is_set_int:
-            return "set_remove_int"
-        return "set_remove"
+        return "set_remove" + suffix
     return mname
 
 # the name a method call is emitted under, picked from the source method
@@ -407,8 +418,8 @@ pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_bool := obj_type == "bool"
     obj_is_float := obj_type == "float"
     obj_is_int := obj_type == "int"
-    obj_is_map := obj_type == "map" or obj_type == "map_int"
-    obj_is_set := obj_type == "set" or obj_type == "set_int"
+    obj_is_map := obj_type == "map" or obj_type == "map_int" or obj_type == "map_bytes"
+    obj_is_set := obj_type == "set" or obj_type == "set_int" or obj_type == "set_bytes"
     obj_is_list := obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
     obj_is_channel := obj_type == "channel" or obj_type.starts_with("channel:")
     obj_is_task := obj_type == "task" or obj_type.starts_with("task:")

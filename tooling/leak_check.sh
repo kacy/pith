@@ -39,6 +39,8 @@ cases=(
   tests/leaks/leak_fn_value_optional
   tests/leaks/leak_runtime_shell_dtor
   tests/leaks/leak_map_take_remove
+  tests/leaks/leak_bytes_key_churn
+  tests/leaks/leak_bytes_keyed_map_drop
   tests/leaks/leak_optional_over_tuple
   tests/leaks/leak_bare_none_binding
   "tests/leaks/leak_pool_thread_exit PITH_GREEN=0"

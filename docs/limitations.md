@@ -46,15 +46,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   a map key and a set element take no widening because the types that would
   need it no longer exist: `Set[T?]` and `Map[T?, V]` are rejected with
   E254, and so is every other unhashable element or key type — a container,
-  `Bytes`, a struct, an enum, a tuple, a function value, `Float`, `Bool`. a
-  set and a map hash int and string flavors only, and none of those values
-  is either — the containers used to fall back to a flavor anyway and read
+  a struct, an enum, a tuple, a function value, `Float`, `Bool`. a set and a
+  map hash int, string and bytes flavors only, and none of those values is
+  any of them — the containers used to fall back to a flavor anyway and read
   the value's word as a c-string, so distinct values collapsed into one
   entry and `contains` answered true for anything. a compile error replaced
-  that silent data loss; use a `List[T?]` or key by a string or integer
-  encoding instead. an optional map value stays legal, since only the key is
-  hashed. a list compares an element the way `==` compares it, which is why
-  its searches widen.
+  that silent data loss; use a `List[T?]` or key by a string, integer or
+  bytes encoding instead. an optional map value stays legal, since only the
+  key is hashed. a list compares an element the way `==` compares it, which
+  is why its searches widen.
 
   a parameter of a *generic function* widens like any other argument —
   `pick(x, 3)` against `fn pick[T](a: T, b: Int?)` builds `Some(3)`, in both
@@ -396,15 +396,26 @@ correctness story:
   bound locals alike. the borrowing getters (`m.get(k)`, `xs.first()`) keep
   destructor-less shells on purpose — their payload count stays with the
   container.
-- a `Set` element and a `Map` key hash int and string flavors only. any other
-  element or key type used to fall into a flavor anyway and read its value's
-  word as if it were that flavor: distinct optionals, lists and bytes
+- a `Set` element and a `Map` key hash int, string and bytes flavors only.
+  any other element or key type used to fall into a flavor anyway and read
+  its value's word as if it were that flavor: distinct optionals and lists
   collapsed into one entry through their allocation headers, a struct
   compared raw memory bytes, a plain enum stored nothing at all, and a float
   crashed the process. every such type is rejected at the checker now (E254,
-  issues #920 and #955). the lift that would readmit them is a content-hashing
-  element flavor through both container runtimes — bytes first, whose `==`
-  already compares by content.
+  issues #920 and #955). the bytes flavor is the content-hashing one: a
+  `Set[Bytes]` or a `Map[Bytes, V]` keeps its own copy of each key's content
+  and finds an entry by content, so a key built from a string and the same
+  bytes assembled in a buffer are one entry, and the container never holds a
+  count on the caller's bytes object. its `for` and `keys()` hand out fresh
+  bytes objects owned by the list they come in, as the string flavor's do.
+  a tuple of hashable elements or a struct of hashable fields is a different
+  design, not one more flavor: the runtime would have to hash and compare a
+  shell field by field with each field's own rule (a string field by
+  content, an int field by value, a nested bytes field by content), the
+  emitter would have to describe that shape to the constructor the way it
+  describes a closure's captured slots, and the stored copy would have to
+  carry a count on every counted field. the bytes flavor shares none of that
+  machinery with them.
 - most std resource types must still be closed by hand. a struct can
   implement `Drop` now (docs/ownership.md, "destructors"): its `drop` runs
   from the destructor the compiler attaches, when the last value naming it

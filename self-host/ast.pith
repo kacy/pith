@@ -18,10 +18,17 @@
 # literal's text, an operator. neither is checked, so a misspelled kind
 # silently matches nothing.
 #
-# line and col are the position of the LAST token that formed the node,
-# not the first, so a node spanning several tokens reports at its end.
-# that is the documented diagnostics limitation, and it is why anything
-# needing the declaration's own line searches the source text instead.
+# line and col are where the node STARTS for an expression, a type and a
+# pattern: the parser marks the construct's first token before it reads
+# anything and builds the node through that mark, so an error about a
+# whole expression puts its caret on the expression rather than on the
+# token that closed it.
+#
+# a declaration and a statement still carry the position of the LAST
+# token that formed them, since nodes are added after their tokens are
+# consumed. that is the remaining half of the documented diagnostics
+# limitation, and it is why anything needing a declaration's own line
+# searches the source text instead.
 #
 # type_args is the one reference to another node that is not a child: the
 # arena index of the "type_args" node holding the type arguments written at

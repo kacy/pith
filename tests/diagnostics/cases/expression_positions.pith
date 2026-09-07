@@ -1,0 +1,21 @@
+# every error below is about a whole expression, and the golden pins the
+# column its caret lands on: the token the expression starts at, not the
+# one that closed it. a node used to carry the position of its last
+# token, so each of these reported at a `)` or a `]`.
+
+struct Point:
+    pub x: Int
+
+fn takes_string(s: String) -> Int:
+    return s.len()
+
+fn main() -> Int:
+    called := takes_string()
+    sum := 1 + "two"
+    xs := [1, 2, 3]
+    at := xs["key"]
+    chained := "hello".trim().nosuch()
+    field := Point(x: 1).missing
+    mixed := 0 - takes_string(7) + "tail"
+    print("{called} {sum} {at} {chained} {field} {mixed}")
+    return 0

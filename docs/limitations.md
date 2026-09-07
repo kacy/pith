@@ -283,16 +283,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   those paths into `.pith/packages`, but nothing fetches over the network and
   there is no hosted index.
 - **no debugger** — runtime stack traces are thin and there is no stepping.
-- **a diagnostic points at its construct's last token** — columns are exact
-  now (a token's recorded position is where it starts, and the caret lands on
-  it), but a node's position is the position of the last token that formed it,
-  so an error about a whole expression points at its closing token rather than
-  its first.
-- **an error inside a string interpolation points at the string, not at the
-  expression** — the expression in `"{f(x)}"` is parsed as its own fragment, so
-  its tokens are stamped with the enclosing interpolation's position. the line
-  is right; the column is the string's rather than the expression's, because
-  the fragment's own columns are relative to the expression text.
+- **a declaration or a statement points at its last token** — an expression,
+  a type and a pattern each carry the position of the token they start at, so
+  an error about a call, a binary expression, an index or a method chain puts
+  its caret on the expression rather than on the token that closed it. a
+  declaration and a statement still carry the position of their last token, so
+  a warning about a function names the line its body ends on rather than the
+  line its `fn` is written on, and the language server finds a declaration's
+  own line by scanning the source for the declaring keyword instead of reading
+  the node.
 
 ## backend
 

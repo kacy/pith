@@ -9,10 +9,11 @@
 # as-is, because the text at the cursor is usually mid-edit and would
 # not parse.
 #
-# positions follow the ast convention: a node sits at its last token's
-# start, so a declaration's editor position comes from the same
-# declaration-line scan documentSymbol uses, falling back to the raw
-# node position when the scan finds nothing.
+# positions follow the ast convention: an expression sits at its first
+# token's start and a declaration at its last token's start, so a
+# declaration's editor position comes from the same declaration-line scan
+# documentSymbol uses, falling back to the raw node position when the
+# scan finds nothing.
 
 from checker import get_definition_of, c_get_expr_type
 from checker_methods import all_method_keys
@@ -89,8 +90,8 @@ fn decl_site(decl_idx: Int) -> Site:
 # the definition_of key under the cursor: the use node on the cursor's
 # line, in the cursor's file, whose column is nearest at or before the
 # cursor. call-node entries participate like any other key — a call
-# node sits at its last token, so the cursor resolves a call from its
-# closing token onward. -1 when the line holds no use.
+# node sits at its first token, so the cursor resolves a call from the
+# callee or the receiver onward. -1 when the line holds no use.
 # the identifier the cursor sits on, or "" when it sits on anything
 # else. pos_col is the 1-based byte column within the line.
 fn cursor_word(line_text: String, pos_col: Int) -> String:
@@ -112,8 +113,9 @@ fn use_node_at(path: String, pos: PithPos, word: String) -> Int:
     # first choice: a same-line entry whose target declaration is named
     # exactly what the cursor sits on. this is what makes the cursor on
     # a method name resolve the method — its use-def entry is keyed on
-    # the call node at the closing token, to the right of the cursor,
-    # while the receiver's entry sits to the left and used to win.
+    # the call node, which starts at the receiver rather than at the
+    # method name, so the column comparison below cannot tell the two
+    # apart on its own.
     if word != "":
         mut named := 0 - 1
         for use_idx in defs.keys():
@@ -261,12 +263,12 @@ fn valid_new_name(name: String) -> Bool:
 # identifier comes from the same declaration-line scan documentSymbol
 # uses; a binding node sits at its initializer's last token, so its
 # identifier is found by scanning the declaring line instead. a use
-# whose recorded token is not the identifier itself — a method or
-# module call's use-def entry is keyed on the call node at the call's
-# closing token — cannot be edited, and a rename that would touch the
-# other sites anyway breaks the program silently, so the empty list
-# comes back and the whole rename is refused. the same happens when
-# the declaration's identifier cannot be pinned to a line.
+# whose recorded token is not the identifier itself — a method call's
+# use-def entry is keyed on the call node, which starts at the receiver
+# rather than at the method name — cannot be edited, and a rename that
+# would touch the other sites anyway breaks the program silently, so the
+# empty list comes back and the whole rename is refused. the same happens
+# when the declaration's identifier cannot be pinned to a line.
 fn rename_sites(decl_idx: Int, name: String) -> List[Site]:
     defs := get_definition_of()
     mut sites: List[Site] := []

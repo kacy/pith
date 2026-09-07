@@ -15,11 +15,19 @@ pub struct PithSet {
     pub ptr: *mut (),
 }
 
-/// Set element type for the internal HashSet
+/// Set element type for the internal HashSet.
+///
+/// A string and a bytes element are both stored as an owned copy of their
+/// content, which is what makes membership a content question: two `Bytes`
+/// values built by different routes land in one entry when their bytes
+/// agree, exactly as two strings do. The two variants stay distinct so a
+/// set never mixes flavors, though the constructor's element tag is what
+/// keeps the entry points in their own flavor (see `require_flavor`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SetElement {
     Int(i64),
     String(Vec<u8>),
+    Bytes(Vec<u8>),
 }
 
 impl Hash for SetElement {
@@ -31,6 +39,10 @@ impl Hash for SetElement {
             }
             SetElement::String(bytes) => {
                 1u8.hash(state);
+                bytes.hash(state);
+            }
+            SetElement::Bytes(bytes) => {
+                2u8.hash(state);
                 bytes.hash(state);
             }
         }
@@ -45,15 +57,46 @@ pub struct SetImpl {
     rc: std::sync::atomic::AtomicU32,
     /// The actual hash set storing unique elements
     data: HashSet<SetElement>,
-    /// Type tag for elements (0=int, 1=string)
+    /// Type tag for elements (0=int, 1=string, 2=bytes)
     elem_type: ElemType,
 }
 
 /// Element type enumeration
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElemType {
     Int,
     String,
+    Bytes,
+}
+
+impl ElemType {
+    fn from_code(code: i32) -> ElemType {
+        match code {
+            1 => ElemType::String,
+            2 => ElemType::Bytes,
+            _ => ElemType::Int,
+        }
+    }
+}
+
+/// A bytes-flavored set reached through a string entry point, or the
+/// reverse, is an emitter defect: the string path would read the bytes
+/// handle's header as a c-string and the bytes path would read a string as
+/// a bytes object, and either way distinct values collapse into one entry
+/// in silence. That silent collapse is the bug E254 was introduced to stop
+/// (issues #920 and #955), so the mismatch fails loudly instead.
+fn require_flavor(actual: ElemType, wanted: ElemType, entry: &str) {
+    if actual == wanted || (actual != ElemType::Bytes && wanted != ElemType::Bytes) {
+        return;
+    }
+    eprintln!(
+        "pith runtime error: {} called on a set whose elements are {:?}, not {:?}",
+        entry, actual, wanted
+    );
+    // the flavor is fixed at construction, so a caller of the wrong flavor is a
+    // compiler bug with no answer that is not a wrong answer.
+    // panic-guard: a container reached through the wrong flavor's entry point.
+    std::process::exit(1);
 }
 
 impl SetImpl {
@@ -134,19 +177,14 @@ unsafe fn set_mut_from_handle<'a>(handle: i64) -> Option<&'a mut SetImpl> {
 /// Create a new empty set
 ///
 /// # Arguments
-/// * `elem_type` - 0 for int elements, 1 for string elements
+/// * `elem_type` - 0 for int elements, 1 for string elements, 2 for bytes
 /// * `elem_size` - Size of each element in bytes
 ///
 /// Elements are stored as owned copies (ints, or the set's own byte
 /// buffers), so there is nothing element-wise to retain or release.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_new(elem_type: i32, elem_size: i64) -> PithSet {
-    let etype = match elem_type {
-        1 => ElemType::String,
-        _ => ElemType::Int,
-    };
-
-    let set_impl = SetImpl::new(etype, elem_size as usize);
+    let set_impl = SetImpl::new(ElemType::from_code(elem_type), elem_size as usize);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
     handle_registry::register(ptr as *const (), HandleKind::Set);
@@ -376,10 +414,11 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
-    if !set_magic_ok(set_handle as *const ()) {
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
         let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
-    }
+    };
+    require_flavor(impl_ref.elem_type, ElemType::String, "set_to_list");
 
     let list = pith_set_to_list_string(PithSet {
         ptr: set_handle as *mut (),
@@ -430,13 +469,15 @@ pub unsafe extern "C" fn pith_set_new_int() -> i64 {
     pith_set_new_handle(0)
 }
 
+/// Create a set of `Bytes` elements, compared and hashed by content.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_new_bytes() -> i64 {
+    pith_set_new_handle(2)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
-    let etype = match elem_type {
-        1 => ElemType::String,
-        _ => ElemType::Int,
-    };
-    let set_impl = SetImpl::new(etype, 8);
+    let set_impl = SetImpl::new(ElemType::from_code(elem_type), 8);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed);
     handle_registry::register(ptr as *const (), HandleKind::Set);
@@ -460,6 +501,7 @@ pub unsafe extern "C" fn pith_set_add_cstr(set_handle: i64, elem: *const i8) -> 
     let Some(impl_ref) = set_mut_from_handle(set_handle) else {
         return 0;
     };
+    require_flavor(impl_ref.elem_type, ElemType::String, "set_add");
     let set_elem = cstr_to_set_element(elem);
     if impl_ref.insert(set_elem) {
         1
@@ -493,6 +535,7 @@ pub unsafe extern "C" fn pith_set_contains_cstr(set_handle: i64, elem: *const i8
     let Some(impl_ref) = set_ref_from_handle(set_handle) else {
         return 0;
     };
+    require_flavor(impl_ref.elem_type, ElemType::String, "set_contains");
     let set_elem = cstr_to_set_element(elem);
     if impl_ref.contains(&set_elem) {
         1
@@ -526,8 +569,99 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
     let Some(impl_ref) = set_mut_from_handle(set_handle) else {
         return;
     };
+    require_flavor(impl_ref.elem_type, ElemType::String, "set_remove");
     let set_elem = cstr_to_set_element(elem);
     impl_ref.remove(&set_elem);
+}
+
+// ---------------------------------------------------------------------------
+// Bytes-element variants: the content-hashing flavor
+// ---------------------------------------------------------------------------
+//
+// a `Bytes` element is stored the way a string element is: as the set's own
+// copy of the content. the handle the caller passes is only read, never
+// retained, so the caller keeps whatever count it holds on it, and a set
+// releases nothing element-wise when it frees. iteration hands out fresh
+// bytes objects the way string iteration hands out fresh strings, owned by
+// the list `pith_set_to_list_bytes` builds.
+
+/// The set element for a bytes handle, or `None` for a handle that is not a
+/// live bytes object. A null handle is the empty value, which `pith_bytes_eq`
+/// already treats as equal to an empty bytes object.
+unsafe fn bytes_to_set_element(handle: i64) -> Option<SetElement> {
+    if handle == 0 {
+        return Some(SetElement::Bytes(Vec::new()));
+    }
+    crate::bytes::pith_bytes_ref(handle).map(|b| SetElement::Bytes(b.data.clone()))
+}
+
+/// Insert a bytes element by content. Returns 1 if newly inserted, 0 if it
+/// was already present or the handle is not a bytes object.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_add_bytes(set_handle: i64, elem: i64) -> i64 {
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
+        return 0;
+    };
+    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_add_bytes");
+    let Some(set_elem) = bytes_to_set_element(elem) else {
+        return 0;
+    };
+    if impl_ref.insert(set_elem) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Check membership of a bytes element by content. Returns 1 if present.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_contains_bytes(set_handle: i64, elem: i64) -> i64 {
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
+        return 0;
+    };
+    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_contains_bytes");
+    let Some(set_elem) = bytes_to_set_element(elem) else {
+        return 0;
+    };
+    if impl_ref.contains(&set_elem) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Remove a bytes element by content.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_remove_bytes(set_handle: i64, elem: i64) {
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
+        return;
+    };
+    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_remove_bytes");
+    let Some(set_elem) = bytes_to_set_element(elem) else {
+        return;
+    };
+    impl_ref.remove(&set_elem);
+}
+
+/// Convert a bytes set handle to a list handle of fresh bytes objects. The
+/// list is bytes-tagged and owns each element, so releasing the list
+/// releases them; the set's own storage is untouched.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_to_list_bytes(set_handle: i64) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
+        let empty = pith_list_new(8, 0);
+        return empty.ptr as i64;
+    };
+    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_to_list_bytes");
+    let list = pith_list_new(8, 5);
+    for elem in impl_ref.iter() {
+        if let SetElement::Bytes(bytes) = elem {
+            let handle = crate::bytes::pith_bytes_from_vec(bytes.clone());
+            pith_list_push_value_owned(list, handle);
+        }
+    }
+    list.ptr as i64
 }
 
 /// Remove an integer element from the set.
@@ -615,6 +749,79 @@ mod tests {
             assert_eq!(pith_set_len_handle(handle), 0);
             assert_eq!(pith_set_is_empty_handle(handle), 1);
             pith_set_release(set);
+        }
+    }
+
+    /// A bytes set hashes and compares by content: two objects built by
+    /// different routes with the same bytes are one element, two values that
+    /// share a prefix and a length are two, and the empty value is a member
+    /// like any other. The set keeps copies, so the caller's count on each
+    /// handle is untouched by every operation.
+    #[test]
+    fn bytes_set_is_keyed_by_content() {
+        unsafe {
+            let set = pith_set_new_bytes();
+            let from_vec = crate::bytes::pith_bytes_from_vec(b"abc".to_vec());
+            let from_str = crate::bytes::pith_bytes_from_string_utf8(c"abc".as_ptr());
+            let sibling = crate::bytes::pith_bytes_from_vec(b"abd".to_vec());
+            let empty = crate::bytes::pith_bytes_from_vec(Vec::new());
+            assert_ne!(from_vec, from_str, "two distinct objects");
+
+            assert_eq!(pith_set_add_bytes(set, from_vec), 1);
+            assert_eq!(
+                pith_set_add_bytes(set, from_str),
+                0,
+                "same content, one entry"
+            );
+            assert_eq!(
+                pith_set_add_bytes(set, sibling),
+                1,
+                "shared prefix, distinct"
+            );
+            assert_eq!(pith_set_add_bytes(set, empty), 1);
+            assert_eq!(pith_set_len_handle(set), 3);
+
+            assert_eq!(pith_set_contains_bytes(set, from_str), 1);
+            assert_eq!(pith_set_contains_bytes(set, sibling), 1);
+            assert_eq!(pith_set_contains_bytes(set, empty), 1);
+            assert_eq!(
+                pith_set_contains_bytes(set, 0),
+                1,
+                "null is the empty value"
+            );
+            let absent = crate::bytes::pith_bytes_from_vec(b"ab".to_vec());
+            assert_eq!(
+                pith_set_contains_bytes(set, absent),
+                0,
+                "a prefix is not a member"
+            );
+
+            pith_set_remove_bytes(set, from_vec);
+            assert_eq!(
+                pith_set_contains_bytes(set, from_str),
+                0,
+                "removed by content"
+            );
+            assert_eq!(pith_set_len_handle(set), 2);
+
+            // the list of members owns fresh bytes objects, one per element
+            let list = pith_set_to_list_bytes(set);
+            let list_handle = crate::collections::list::PithList {
+                ptr: list as *mut (),
+            };
+            assert_eq!(crate::collections::list::pith_list_len(list_handle), 2);
+            let first = crate::collections::list::pith_list_get_value(list_handle, 0);
+            assert_ne!(first, sibling);
+            assert_ne!(first, empty);
+            assert!(crate::bytes::pith_bytes_ref(first).is_some());
+            crate::collections::list::pith_list_release_handle(list);
+
+            for h in [from_vec, from_str, sibling, empty, absent] {
+                let b = crate::bytes::pith_bytes_ref(h).expect("the set never took a count");
+                assert_eq!(b.rc.load(std::sync::atomic::Ordering::Relaxed), 1);
+                crate::bytes::pith_bytes_release(h);
+            }
+            pith_set_release_handle(set);
         }
     }
 }

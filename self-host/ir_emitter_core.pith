@@ -63,7 +63,7 @@ from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emi
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_list_element_tid, ir_function_return_kind
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_bytes_keyed_type, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_list_element_tid, ir_function_return_kind
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_handle_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_handle_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_handle_decode_specialization, ir_is_handle_decode_path_specialization, ir_is_handle_decode_text_path_specialization, ir_is_handle_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_handle_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_declared_callable_return_type_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
@@ -1228,7 +1228,7 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # `char_at` mint a fresh string, a channel receive hands the sent value's
 # count over — and those shells do transfer.
 fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
-    if emit_name == "map_get_opt" or emit_name == "map_get_ikey_opt":
+    if emit_name == "map_get_opt" or emit_name == "map_get_ikey_opt" or emit_name == "map_get_bkey_opt":
         return true
     if emit_name == "pith_list_get_opt":
         return true
@@ -2213,7 +2213,7 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
 # would free the value in between — that is the shape that made the first
 # attempt at this hand back a recycled handle.
 fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
-    return emit_name == "map_get_default" or emit_name == "map_get_default_ikey"
+    return emit_name == "map_get_default" or emit_name == "map_get_default_ikey" or emit_name == "map_get_default_bkey"
 
 # true for a builtin whose receiver relinquishes its own count into the
 # result: the value leaves the container and the container's count leaves
@@ -2222,7 +2222,7 @@ fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
 # keyed on the resolved emit name, like the retains-over-args list, so a
 # same-named method on another receiver keeps its own classification.
 fn ir_method_result_transfers_count(emit_name: String) -> Bool:
-    return emit_name == "map_take" or emit_name == "map_take_ikey"
+    return emit_name == "map_take" or emit_name == "map_take_ikey" or emit_name == "map_take_bkey"
 
 fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
     mut reg_i := 0
@@ -3026,12 +3026,23 @@ fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inne
     if vn.kind == "list" and vn.children.len() == 0:
         if ir_checked_type(val_idx).starts_with("list"):
             return ir_expr(val_idx)
-    empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), target_type)
+    empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), ir_bytes_keyed_target(val_idx, target_type))
     if empty_init_call.len() > 0:
         r := ir_reg()
         ir_emit_call0(r, empty_init_call, ir_normalize_collection_target(target_type))
         return r
     return ir_expr(val_idx)
+
+# the empty-init target with the literal's key flavor applied: "set" becomes
+# "set_bytes" and "map" or "map_str_val" becomes "map_bytes" or
+# "map_bytes_str_val" when the checker typed the literal at val_idx as
+# bytes-keyed. every other target passes through.
+fn ir_bytes_keyed_target(val_idx: Int, target_type: String) -> String:
+    if target_type == "set" or target_type == "map":
+        return ir_bytes_keyed_type(val_idx, target_type)
+    if target_type == "map_str_val" and ir_bytes_keyed_type(val_idx, "map") == "map_bytes":
+        return "map_bytes_str_val"
+    return target_type
 
 fn ir_checked_target_type(target_idx: Int, fallback_name: String) -> String:
     checked := ir_checked_type(target_idx)
@@ -3058,7 +3069,10 @@ fn ir_method_receiver_type(node: Node) -> String:
             return "channel:" + ir_type_from_tid(recv_info.inner)
         if recv_info.kind == "task" and recv_info.inner >= 0:
             return "task:" + ir_type_from_tid(recv_info.inner)
-        known := ir_type_from_tid(recv_tid)
+        # a bytes-keyed set or map dispatches to its own runtime entry
+        # points; the flavor rides on the receiver type only here, where
+        # the method name is picked, and is never a tracked kind
+        known := ir_bytes_keyed_type(node.children[0], ir_type_from_tid(recv_tid))
         if known.len() > 0:
             return ir_substitute_type_name(known)
     checked := ir_checked_type(node.children[0])
@@ -3291,7 +3305,7 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
             return ir_emit_display_map(part_r, ir_type_from_tid(part_info.key_type), ir_type_from_tid(part_info.value_type))
         if part_info.kind == "set":
             converted := ir_reg()
-            ir_emit_call1(converted, "__set_to_list", "list", part_r)
+            ir_emit_call1(converted, ir_for_iter_conversion_call(ir_bytes_keyed_type(expr_idx, "set")), "list", part_r)
             return ir_emit_display_list(converted, ir_type_from_tid(part_info.inner), true)
     if part_type.len() > 0 and ir_struct_names.contains_key(part_type):
         if not ir_boxed_enums.contains_key(part_type):
@@ -4682,7 +4696,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
 
-fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_target: String, val_inner: String):
+# store_name is the plain store for the literal's key flavor (map_insert,
+# map_insert_ikey, map_insert_bkey); the value's kind and ownership may
+# rewrite it into the kind-carrying or transferring variant below.
+fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_target: String, val_inner: String):
     if entry.kind != "entry" or entry.children.len() < 2:
         return
     k_r := ir_expr(entry.children[0])
@@ -4691,9 +4708,6 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_tar
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
     v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
-    mut store_name := "map_insert"
-    if has_int_keys:
-        store_name = "map_insert_ikey"
     # a heap value written straight into a literal is stored the same way one
     # written into `m[k]` is: the kind travels with it so the map owns what it
     # holds. without this `{k: inner}` left the map a bare handle whose only
@@ -4739,6 +4753,9 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     mut has_int_keys := ir_map_uses_int_keys(node)
     if ir_checked_type(idx) == "map_int":
         has_int_keys = true
+    # a bytes-keyed literal has no syntactic tell at all: only the checked
+    # type says so, and it picks the constructor and the store together
+    has_bytes_keys := ir_bytes_keyed_type(idx, "map") == "map_bytes"
     mut val_target := ""
     mut val_inner := ""
     tid := c_get_expr_type(idx)
@@ -4759,17 +4776,25 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
         entry0 := get_node(node.children[0])
         if entry0.kind == "entry" and entry0.children.len() >= 2:
             val_is_string = ir_infer_type(entry0.children[1]) == "string"
+    mut store_name := "map_insert"
     if has_int_keys:
+        store_name = "map_insert_ikey"
         if val_is_string:
             ir_emit_call0(map_r, "__map_new_int_str_val", "map_int")
         else:
             ir_emit_call0(map_r, "__map_new_int", "map_int")
+    elif has_bytes_keys:
+        store_name = "map_insert_bkey"
+        if val_is_string:
+            ir_emit_call0(map_r, "__map_new_bytes_str_val", "map")
+        else:
+            ir_emit_call0(map_r, "__map_new_bytes", "map")
     elif val_is_string:
         ir_emit_call0(map_r, "__map_new_str_val", "map")
     else:
         ir_emit_call0(map_r, "__map_new", "map")
     for child in node.children:
-        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child), val_target, val_inner)
+        ir_emit_map_entry_insert(map_r, store_name, get_node(child), val_target, val_inner)
     return map_r
 
 fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
@@ -4779,8 +4804,8 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
     mut literal_type := ir_literal_expr_type(node, "set")
     checked := ir_checked_type(idx)
     if checked == "set_int" or checked == "set":
-        literal_type = checked
-    ir_emit_call0(set_r, ir_set_new_name(literal_type), literal_type)
+        literal_type = ir_bytes_keyed_type(idx, checked)
+    ir_emit_call0(set_r, ir_set_new_name(literal_type), ir_normalize_collection_target(literal_type))
     for child in node.children:
         elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
@@ -4874,6 +4899,10 @@ fn ir_map_kind_store_name(emit_name: String, owned: Bool) -> String:
         if owned:
             return "map_insert_ikey_owned_kind"
         return "map_insert_ikey_kind"
+    if emit_name == "map_insert_bkey":
+        if owned:
+            return "map_insert_bkey_owned_kind"
+        return "map_insert_bkey_kind"
     return ""
 
 # true when a *borrowed* value sent down a channel needs a count added here
@@ -4932,6 +4961,8 @@ fn ir_owned_container_store_name(emit_name: String) -> String:
         return "pith_map_insert_cstr_owned"
     if emit_name == "map_insert_ikey":
         return "pith_map_insert_ikey_owned"
+    if emit_name == "map_insert_bkey":
+        return "pith_map_insert_bkey_owned"
     # insert is push with an index, and was the one container store left
     # without a transferring variant. for want of it the caller had to keep its
     # count on a fresh container — `xs.insert(0, {1, 2})` stranded the set,
@@ -6390,7 +6421,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     mut store_value_pos := 0 - 1
     if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
-    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value" or emit_name == "list_insert":
+    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "map_insert_bkey" or emit_name == "set" or emit_name == "pith_list_set_value" or emit_name == "list_insert":
         store_value_pos = 1
     # the name the call is emitted under. an owned value swaps in the store
     # that takes the caller's count; everything else keeps the plain store.
@@ -7349,9 +7380,13 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # In a T! function, propagate on miss instead of aborting. Callers
     # can `catch` or `unwrap_or` at their level. Outside T! context, the
     # strict variants keep aborting cleanly.
-    if ir_current_func_returns_result and ir_index_supports_propagate(obj_type):
-        return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, obj_type, value_type)
-    call_name := ir_index_get_call_name(obj_type)
+    # the runtime getter is picked by the key flavor as well as the kind: a
+    # bytes-keyed map has its own entry points, though it is tracked as a
+    # plain "map" everywhere else in this function
+    keyed_type := ir_bytes_keyed_type(node.children[0], obj_type)
+    if ir_current_func_returns_result and ir_index_supports_propagate(keyed_type):
+        return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, keyed_type, value_type)
+    call_name := ir_index_get_call_name(keyed_type)
     if obj_type == "string":
         ir_emit_call2(r, call_name, "string", obj_r, idx_r)
     elif obj_type == "bytes":
@@ -7384,7 +7419,7 @@ fn ir_release_owned_index_key(key_idx: Int, key_r: Int):
 fn ir_index_supports_propagate(obj_type: String) -> Bool:
     if obj_type == "map":
         return true
-    if obj_type == "map_int":
+    if obj_type == "map_int" or obj_type == "map_bytes":
         return true
     if obj_type == "list":
         return true
@@ -7441,6 +7476,8 @@ fn ir_index_get_opt_call_name(obj_type: String) -> String:
         return "map_get_opt"
     if obj_type == "map_int":
         return "map_get_ikey_opt"
+    if obj_type == "map_bytes":
+        return "map_get_bkey_opt"
     return "pith_list_get_opt"
 
 fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
@@ -7465,7 +7502,7 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # compensating retain here on top of the one the runtime store took,
     # because nothing told a tagged list from an untagged one.
     idx_store_kind := ir_rc_kind(value_type)
-    mut set_name := ir_index_set_call_name(obj_type)
+    mut set_name := ir_index_set_call_name(ir_bytes_keyed_type(target.children[0], obj_type))
     mut idx_borrowed := ir_expr_is_borrowed(value_idx)
     # a fresh optional shell is built right here by ir_emit_value_for_target,
     # so this frame is its only owner however the value itself classifies —
@@ -8786,20 +8823,23 @@ fn ir_emit_for_stmt(node: Node):
 fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     iter_type := ir_infer_type(node.children[0])
     mut iter_r := ir_expr(node.children[0])
-    item_kind := ir_for_iter_item_kind(iter_type)
+    # a bytes-keyed set or map converts through its own entry point and
+    # yields bytes items; it is released as the plain kind like any other
+    keyed_type := ir_bytes_keyed_type(node.children[0], iter_type)
+    item_kind := ir_for_iter_item_kind(keyed_type)
     # an owned iterable (a split result, a keys() list) dies when the
     # loop ends; a converted iterable is always a fresh container
     mut iter_release_kind := ""
     if not ir_expr_is_borrowed(node.children[0]):
         iter_release_kind = ir_rc_kind(iter_type)
-    conversion_call := ir_for_iter_conversion_call(iter_type)
+    conversion_call := ir_for_iter_conversion_call(keyed_type)
     if conversion_call.len() > 0:
         converted_r := ir_reg()
-        ir_emit_call1(converted_r, conversion_call, ir_for_iter_conversion_return_kind(iter_type), iter_r)
+        ir_emit_call1(converted_r, conversion_call, ir_for_iter_conversion_return_kind(keyed_type), iter_r)
         if iter_release_kind.len() > 0:
             ir_rc_release_reg(iter_r, iter_release_kind)
         iter_r = converted_r
-        iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(iter_type))
+        iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(keyed_type))
     fid := ir_for_count
     ir_for_count = ir_for_count + 1
     fi := "__for_idx_" + fid.to_string()

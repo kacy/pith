@@ -16,22 +16,28 @@ pub fn ir_map_uses_int_keys(node: Node) -> Bool:
     key_node := get_node(first_entry.children[0])
     return key_node.kind == "int_lit" or key_node.kind == "int"
 
-# the runtime constructor for a set literal of this type. only two flavors
-# exist, so anything that is not "set_int" builds a string set. the
-# constructor fixes the element type for the set's whole life, which is why
-# it has to be picked from the same literal_type as ir_set_add_name.
+# the runtime constructor for a set literal of this type. three flavors
+# exist — int, bytes, and the string default — so anything that is neither
+# "set_int" nor "set_bytes" builds a string set. the constructor fixes the
+# element type for the set's whole life, which is why it has to be picked
+# from the same literal_type as ir_set_add_name.
 pub fn ir_set_new_name(literal_type: String) -> String:
     if literal_type == "set_int":
         return "__set_new_int"
+    if literal_type == "set_bytes":
+        return "__set_new_bytes"
     return "__set_new"
 
 # the runtime insert matching ir_set_new_name's constructor. the two must
 # be picked from the same literal_type: the runtime reads set_add's element
 # as a cstring pointer, so calling it on an int-keyed set dereferences a raw
-# integer, and set_add_int on a string set silently inserts nothing.
+# integer, and set_add_int on a string set silently inserts nothing. the
+# bytes flavor refuses a mismatch loudly rather than misreading.
 pub fn ir_set_add_name(literal_type: String) -> String:
     if literal_type == "set_int":
         return "set_add_int"
+    if literal_type == "set_bytes":
+        return "set_add_bytes"
     return "set_add"
 
 # the recorded value type of the map a bare identifier names, or "" for
@@ -59,6 +65,8 @@ pub fn ir_index_get_call_name(obj_type: String) -> String:
         return "bytes_get_strict"
     if obj_type == "map_int":
         return "map_get_ikey_strict"
+    if obj_type == "map_bytes":
+        return "map_get_bkey_strict"
     if obj_type == "map":
         return "map_get_strict"
     return "__list_get_strict"
@@ -72,6 +80,8 @@ pub fn ir_index_get_call_name(obj_type: String) -> String:
 pub fn ir_index_set_call_name(obj_type: String) -> String:
     if obj_type == "map_int":
         return "map_insert_ikey"
+    if obj_type == "map_bytes":
+        return "map_insert_bkey"
     if obj_type == "map":
         return "map_insert"
     return "pith_list_set_value"
@@ -83,7 +93,7 @@ pub fn ir_index_set_call_name(obj_type: String) -> String:
 pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
     if item_kind == "char":
         return "char_at"
-    if item_kind == "string" or item_kind == "int":
+    if item_kind == "string" or item_kind == "int" or item_kind == "bytes":
         return "__list_get_unchecked"
     return "__list_get"
 
@@ -97,6 +107,8 @@ pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
         return "string"
     if item_kind == "int":
         return "int"
+    if item_kind == "bytes":
+        return "bytes"
     return "unknown"
 
 # what one step of `for x in it` yields for this iterable, "unknown" when
@@ -112,6 +124,8 @@ pub fn ir_for_iter_item_kind(iter_type: String) -> String:
         return "string"
     if iter_type == "map_int" or iter_type == "set_int":
         return "int"
+    if iter_type == "map_bytes" or iter_type == "set_bytes":
+        return "bytes"
     return "unknown"
 
 # the call that flattens a non-indexable iterable into a list the counted
@@ -125,20 +139,26 @@ pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
         return "map_keys"
     if iter_type == "map_int":
         return "map_keys_ikey"
+    if iter_type == "map_bytes":
+        return "map_keys_bkey"
     if iter_type == "set":
         return "__set_to_list"
     if iter_type == "set_int":
         return "__set_to_list_int"
+    if iter_type == "set_bytes":
+        return "__set_to_list_bytes"
     return ""
 
 # the ir kind of what ir_for_iter_conversion_call returns, "" exactly when
 # that helper returns no call. answer both from the same iter_type: the loop
 # reads the converted list's release kind off this, so a disagreement means
-# it releases the fresh list as the wrong kind or not at all.
+# it releases the fresh list as the wrong kind or not at all. the bytes
+# flavor's list is bytes-tagged at the runtime level and owns its elements;
+# "list" is its kind here, as it is for every tagged list but the string one.
 pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
     if iter_type == "map" or iter_type == "set":
         return "list_string"
-    if iter_type == "map_int" or iter_type == "set_int":
+    if iter_type == "map_int" or iter_type == "set_int" or iter_type == "map_bytes" or iter_type == "set_bytes":
         return "list"
     return ""
 
@@ -157,8 +177,9 @@ pub fn ir_for_len_call_name(item_kind: String) -> String:
 # way. the target decides, not the syntax: `{}` parses as a map literal but
 # builds a set when that is what the binding asked for, which is the only
 # thing that can tell the two apart when there are no elements to read.
-# target_type may be a composite (map_str_val, map_int_str_val) naming a map
-# that owns a count per stored string value; feed it through
+# target_type may be a composite (map_str_val, map_int_str_val,
+# map_bytes_str_val) naming a map that owns a count per stored string
+# value, or a bytes-keyed flavor (set_bytes, map_bytes); feed it through
 # ir_normalize_collection_target before using it as a ret kind.
 pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int, target_type: String) -> String:
     if child_count != 0:
@@ -168,21 +189,29 @@ pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int
             return "__set_new"
         if target_type == "set_int":
             return "__set_new_int"
+        if target_type == "set_bytes":
+            return "__set_new_bytes"
         if target_type == "map":
             return "__map_new"
         if target_type == "map_int":
             return "__map_new_int"
+        if target_type == "map_bytes":
+            return "__map_new_bytes"
         # composite targets from binds that know the value type: a map with
         # string values owns a count per value at the runtime level
         if target_type == "map_str_val":
             return "__map_new_str_val"
         if target_type == "map_int_str_val":
             return "__map_new_int_str_val"
+        if target_type == "map_bytes_str_val":
+            return "__map_new_bytes_str_val"
     if literal_kind == "set":
         if target_type == "set":
             return "__set_new"
         if target_type == "set_int":
             return "__set_new_int"
+        if target_type == "set_bytes":
+            return "__set_new_bytes"
     if literal_kind == "list":
         if target_type == "list_string":
             return "__list_new_str"
@@ -190,11 +219,14 @@ pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int
             return "__list_new"
     return ""
 
-# composite empty-init targets normalize back to the plain kind for
-# retkinds and type tracking
+# composite empty-init targets and the bytes-keyed flavors normalize back
+# to the plain kind for retkinds and type tracking: a bytes-keyed container
+# is a "set" or a "map" everywhere but at the call that names its flavor
 pub fn ir_normalize_collection_target(target_type: String) -> String:
-    if target_type == "map_str_val":
+    if target_type == "map_str_val" or target_type == "map_bytes_str_val" or target_type == "map_bytes":
         return "map"
     if target_type == "map_int_str_val":
         return "map_int"
+    if target_type == "set_bytes":
+        return "set"
     return target_type

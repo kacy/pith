@@ -206,6 +206,36 @@ pub fn ir_type_from_tid(tid: Int) -> String:
         return "closure"
     return ""
 
+# the bytes-keyed flavor of a set or map expression: "set_bytes" for a
+# `Set[Bytes]`, "map_bytes" for a `Map[Bytes, V]`, and obj_type unchanged
+# for everything else. the flavor is a call-selection detail, not a kind:
+# a bytes-keyed container is still tracked, retained and released as a
+# "set" or a "map", exactly as an int-keyed one is. it is read off the
+# checker's type at each operation that names a runtime entry point — a
+# method call, an index, a literal, a `for` — because those are the only
+# places where the string and bytes entry points differ, and the checked
+# type is the one source that survives generic substitution. a receiver the
+# checker left untyped keeps the string flavor, and the runtime refuses the
+# mismatch loudly rather than reading a bytes handle as a c-string.
+pub fn ir_bytes_keyed_type(expr_idx: Int, obj_type: String) -> String:
+    if obj_type != "set" and obj_type != "map":
+        return obj_type
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return obj_type
+    info := get_type_info(tid)
+    mut key_tid := 0 - 1
+    if info.kind == "set":
+        key_tid = info.inner
+    elif info.kind == "map":
+        key_tid = info.key_type
+    if key_tid < 0:
+        return obj_type
+    key_info := get_type_info(key_tid)
+    if key_info.kind == "primitive" and key_info.name == "Bytes":
+        return obj_type + "_bytes"
+    return obj_type
+
 # the kind of the elements of the list expression at expr_idx. this is
 # what picks the right list constructor and decides whether elements
 # are rc-tracked, so a wrong answer here leaks or over-releases.

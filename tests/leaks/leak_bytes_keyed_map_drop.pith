@@ -1,0 +1,38 @@
+# a whole `Map[Bytes, String]` and a whole `Set[Bytes]` built and dropped
+# per round: the empty literal, a literal with entries, a few stores under
+# fresh keys, an iteration, and then scope exit. the map owns one count per
+# string value and its own copy of each key, and both go with the map; the
+# keys() list and the `for` conversion own the fresh bytes they hand out and
+# free them with the list.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+    mut labels: Map[Bytes, String] := {}
+    labels.insert(bytes_from_string_utf8("a-{i}"), "one-{i}-payload")
+    labels[bytes_from_string_utf8("b-{i}")] = "two-{i}-payload"
+    labels.insert(bytes_from_string_utf8("a-{i}"), "three-{i}-payload")
+    for k in labels:
+        acc = acc + k.len()
+    for v in labels.values():
+        acc = acc + v.len()
+    lit: Map[Bytes, String] := {bytes_from_string_utf8("l-{i}"): "lit-{i}-payload"}
+    acc = acc + lit.len()
+    mut seen: Set[Bytes] := {bytes_from_string_utf8("s-{i}")}
+    seen.add(bytes_from_string_utf8("t-{i}"))
+    for member in seen:
+        acc = acc + member.len()
+    acc = acc + labels.len() + seen.len()
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

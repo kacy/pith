@@ -1285,7 +1285,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_fn_value_optional \
 	tests/cases/test_optional_arg_callee_spellings \
 	tests/cases/test_result_arg_callee_spellings \
-	tests/cases/test_tls_server_config_release
+	tests/cases/test_tls_server_config_release \
+	tests/cases/test_tls12_client_auth
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"
@@ -1705,7 +1706,7 @@ clean:
 # implementation, which a pith-to-pith test cannot show; test_tls_echo_live is
 # the in-process pith suite (echo, resumption, dynamic sni selection, mutual
 # tls, optional client auth) and asserts internally, so its golden is empty.
-TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live test_tls_echo_live test_tls_large_chain_live test_tls_aes256_openssl_live test_tls_p384_openssl_live test_tls12_aes256_openssl_live
+TLS_LIVE_INTEROP_CASES := test_tls12_openssl_live test_tls_resumption_openssl_live test_tls_echo_live test_tls_large_chain_live test_tls_aes256_openssl_live test_tls_p384_openssl_live test_tls12_aes256_openssl_live test_tls_client_auth_openssl_live
 
 tls-live-interop: build
 	@echo "--- tls live tests (openssl interop + in-process suite) ---"

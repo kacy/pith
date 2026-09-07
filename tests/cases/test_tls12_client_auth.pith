@@ -1,0 +1,113 @@
+# client-certificate authentication over the tls 1.2 fallback, pith to pith.
+#
+# two pith peers always agree on 1.3, so the client here is capped at 1.2 with
+# require_tls12(): without the cap the whole 1.2 CertificateRequest /
+# Certificate / CertificateVerify path would have no gate at all. each case
+# prints what the client got and what the server saw — whether it asked,
+# whether it verified, and the identity it ended up with — so a regression that
+# accepts an unverified peer or loses the identity shows up as changed output
+# rather than a still-passing echo.
+#
+# the refusals are the point of the file. a client that declines when the server
+# requires, a chain that does not reach the trust bundle, and an expired
+# certificate must each fail the handshake, and the server line names which
+# check refused it. the two rogue cases must fail in optional mode too, since a
+# certificate that is presented is always verified.
+#
+# the server reports through a channel rather than printing from its own task,
+# so the two lines of a case keep a fixed order.
+
+import std.net.tls as tls
+
+SERVER_CERT := "tests/live/fixtures/localhost.crt"
+SERVER_KEY := "tests/live/fixtures/localhost.key"
+SERVER_CA := "tests/live/fixtures/localhost-ca.crt"
+CLIENT_CA := "tests/live/fixtures/clientcert-ca.crt"
+RSA_CERT := "tests/live/fixtures/clientcert-rsa.crt"
+RSA_KEY := "tests/live/fixtures/clientcert-rsa.key"
+EC_CERT := "tests/live/fixtures/clientcert-ecdsa.crt"
+EC_KEY := "tests/live/fixtures/clientcert-ecdsa.key"
+ROGUE_CERT := "tests/live/fixtures/clientcert-rogue.crt"
+ROGUE_KEY := "tests/live/fixtures/clientcert-rogue.key"
+EXPIRED_CERT := "tests/live/fixtures/clientcert-expired.crt"
+EXPIRED_KEY := "tests/live/fixtures/clientcert-expired.key"
+
+fn or_dash(value: String) -> String:
+    if value == "":
+        return "-"
+    return value
+
+# the server half of one case: accept, echo, and report the peer identity the
+# handshake established — or the reason it refused the handshake.
+fn serve_one(label: String, listener: tls.Listener, out: Channel[String]):
+    r := listener.accept()
+    if r.is_err:
+        out.send(label + " server: refused (" + r.err + ")")
+        return
+    conn := r.ok
+    state := conn.state()
+    msg := conn.read(64) catch ""
+    conn.write_all("echo:" + msg) catch 0
+    conn.close()
+    out.send(label + " server: requested=" + state.client_auth_requested.to_string() + " verified=" + state.client_auth_verified.to_string() + " subject=" + or_dash(state.peer_common_name) + " issuer=" + or_dash(state.peer_issuer_common_name) + " chain=" + state.peer_certificate_count.to_string())
+
+fn run_case(label: String, port: Int, server_cfg: tls.Config, client_cfg: tls.Config):
+    listener_r := tls.listen("127.0.0.1", port, server_cfg)
+    if listener_r.is_err:
+        print(label + " client: listen-error")
+        return
+    listener := listener_r.ok
+    # capacity one, so the server task never blocks on a report main has not
+    # asked for yet.
+    out := Channel[String](1)
+    spawn serve_one(label, listener, out)
+    r := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)
+    if r.is_err:
+        print(label + " client: refused")
+    else:
+        conn := r.ok
+        wrote := conn.write_all("hi")
+        mut echoed := ""
+        if wrote.is_ok:
+            echoed = conn.read(64) catch ""
+        print(label + " client: " + conn.version_name() + " " + (echoed == "echo:hi").to_string())
+        conn.close()
+    if let line = out.recv():
+        print(line)
+    listener.close()
+    server_cfg.close()
+    client_cfg.close()
+
+fn require_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.require_client_ca_file(CLIENT_CA)
+
+fn request_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.request_client_ca_file(CLIENT_CA)
+
+fn plain_client() -> tls.Config!:
+    return tls.client_config_with_ca_file(SERVER_CA)!.require_tls12()
+
+fn client_with(cert: String, key: String) -> tls.Config!:
+    return tls.client_config_with_ca_file(SERVER_CA)!.require_tls12().with_client_certificate(cert, key)
+
+fn main() -> Int!:
+    # 1: the whole point — a required certificate, presented and verified, with
+    # the identity reaching the application through the connection state.
+    run_case("required-rsa", 50830, require_server()!, client_with(RSA_CERT, RSA_KEY)!)
+    # 2: an ecdsa client key signs the same transcript with the ecdsa scheme.
+    run_case("required-ecdsa", 50831, require_server()!, client_with(EC_CERT, EC_KEY)!)
+    # 3: optional mode, client declines: the handshake completes unauthenticated
+    # and the server sees no identity at all.
+    run_case("optional-none", 50832, request_server()!, plain_client()!)
+    # 4: required and the client declines — refused.
+    run_case("required-none", 50833, require_server()!, plain_client()!)
+    # 5: a well formed certificate whose chain does not reach the bundle.
+    run_case("required-rogue", 50834, require_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
+    # 6: correctly issued and correctly signed, but outside its validity window.
+    run_case("required-expired", 50835, require_server()!, client_with(EXPIRED_CERT, EXPIRED_KEY)!)
+    # 7: optional does not mean unchecked — a presented certificate is verified.
+    run_case("optional-rogue", 50836, request_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
+    # 8: a server that never asks gets no certificate, even from a client that
+    # holds one.
+    run_case("unrequested", 50837, tls.server_config(SERVER_CERT, SERVER_KEY)!, client_with(RSA_CERT, RSA_KEY)!)
+    return 0

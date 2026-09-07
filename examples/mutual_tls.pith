@@ -1,0 +1,130 @@
+# mutual tls: a server that requires a client certificate, and a client that
+# presents one.
+#
+# ordinary tls authenticates one side. the client checks the server's chain
+# against its trust bundle and then trusts whoever holds the private key behind
+# it; the server serves whoever connects. mutual tls closes the other half: the
+# server asks for a certificate too, verifies the chain the client sends against
+# a bundle of its own, and checks the client's signature over the handshake
+# transcript before the connection carries a byte of application data. what the
+# server gets out of it is an identity — the subject of a certificate one of its
+# own certificate authorities issued — instead of an ip address.
+#
+# these two peers negotiate tls 1.3, and the same three configurations work
+# unchanged over the 1.2 fallback — a `require_tls12()` on the client config
+# runs the whole file through the 1.2 handshake with the same output.
+#
+# three configurations appear below, and they are the three worth knowing:
+# required (a client without a certificate is refused), optional (a client
+# without one is served unauthenticated, and one with a bad certificate is still
+# refused), and the client side of both. everything runs in this process against
+# the repository's test fixtures, so the example needs no network and reads the
+# same on every machine.
+#
+# see docs/tls.md, "client auth modes".
+import std.net.tls as tls
+
+# the server's own certificate, and the bundle a client verifies it against.
+SERVER_CERT := "tests/live/fixtures/localhost.crt"
+SERVER_KEY := "tests/live/fixtures/localhost.key"
+SERVER_CA := "tests/live/fixtures/localhost-ca.crt"
+
+# the client's certificate, and the bundle the server verifies IT against. the
+# two bundles are unrelated on purpose: a server that trusts its own issuer for
+# client certificates would accept anything that issuer ever signed, including
+# every server certificate it minted.
+CLIENT_CA := "tests/live/fixtures/clientcert-ca.crt"
+CLIENT_CERT := "tests/live/fixtures/clientcert-rsa.crt"
+CLIENT_KEY := "tests/live/fixtures/clientcert-rsa.key"
+
+# a certificate from an issuer this server's bundle does not contain. it is
+# well formed and correctly signed — by the wrong authority.
+OTHER_CERT := "tests/live/fixtures/clientcert-rogue.crt"
+OTHER_KEY := "tests/live/fixtures/clientcert-rogue.key"
+
+PORT := 51840
+
+# the server side of one connection. the identity is read off the connection
+# state, which is where a verified peer shows up: peer_common_name is the
+# subject of the certificate the client proved it holds, and peer_certificates
+# is the chain behind it. an application authorizes on that name rather than on
+# anything the request body claims.
+fn serve(listener: tls.Listener, out: Channel[String]):
+    r := listener.accept()
+    if r.is_err:
+        # a failed handshake is the server refusing, and it is not an error the
+        # accept loop should die on: the next client is unaffected.
+        out.send("    server: refused the handshake")
+        return
+    conn := r.ok
+    state := conn.state()
+    mut who := "an unauthenticated client"
+    if state.client_auth_verified:
+        who = state.peer_common_name + " (issued by " + state.peer_issuer_common_name + ")"
+    request := conn.read(64) catch ""
+    conn.write_all("hello, " + who) catch 0
+    conn.close()
+    out.send("    server: " + request + " from " + who)
+
+# one exchange: stand the server up on `server_cfg`, dial it with `client_cfg`,
+# and report both halves.
+fn exchange(title: String, server_cfg: tls.Config, client_cfg: tls.Config):
+    print(title)
+    listener_r := tls.listen("127.0.0.1", PORT, server_cfg)
+    if listener_r.is_err:
+        print("    could not listen")
+        server_cfg.close()
+        client_cfg.close()
+        return
+    listener := listener_r.ok
+    out := Channel[String](1)
+    spawn serve(listener, out)
+
+    r := tls.dial_with_config("127.0.0.1", PORT, "localhost", client_cfg)
+    if r.is_err:
+        print("    client: refused while shaking hands (" + r.err + ")")
+    else:
+        conn := r.ok
+        # on tls 1.3 the server checks the client's certificate after the
+        # client's half of the handshake is done, so a refusal arrives on the
+        # first read rather than as a failed dial — as the server's alert when
+        # it gets there first, and as a closed socket when the reset beats it.
+        # on the 1.2 fallback the dial itself fails. either way the connection
+        # carries no application data, which is the part that matters.
+        mut answer := "the connection went nowhere"
+        wrote := conn.write_all("ping")
+        if wrote.is_ok:
+            read := conn.read(64)
+            if read.is_ok:
+                answer = read.ok
+            else:
+                answer = "refused after the handshake"
+        print("    client: " + answer)
+        conn.close()
+    if let line = out.recv():
+        print(line)
+    listener.close()
+    server_cfg.close()
+    client_cfg.close()
+
+# a server that will not talk to a client it cannot name.
+fn requiring_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.require_client_ca_file(CLIENT_CA)
+
+# a server that asks, and serves a client that has nothing to show. a
+# certificate that IS presented is verified either way — optional means the
+# client may decline, not that a bad certificate is waved through.
+fn requesting_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.request_client_ca_file(CLIENT_CA)
+
+# a client that presents a certificate when asked for one. the key is pkcs#8
+# pem, the same shape a server key takes.
+fn client_presenting(cert: String, key: String) -> tls.Config!:
+    return tls.client_config_with_ca_file(SERVER_CA)!.with_client_certificate(cert, key)
+
+fn main() -> Int!:
+    exchange("a required certificate, presented and verified:", requiring_server()!, client_presenting(CLIENT_CERT, CLIENT_KEY)!)
+    exchange("a required certificate the client does not have:", requiring_server()!, tls.client_config_with_ca_file(SERVER_CA)!)
+    exchange("an optional certificate the client declines:", requesting_server()!, tls.client_config_with_ca_file(SERVER_CA)!)
+    exchange("a certificate from an issuer the server does not trust:", requiring_server()!, client_presenting(OTHER_CERT, OTHER_KEY)!)
+    return 0

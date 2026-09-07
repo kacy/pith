@@ -350,6 +350,62 @@ there are three current server modes:
 in optional mode, a client may omit its certificate.
 if it does send one, pith verifies it against the configured ca bundle.
 
+a client presents one with `with_client_certificate(cert_path, key_path)`: a
+pem chain, leaf first, and a pkcs#8 pem key, the same pair a server config
+takes.
+
+```pith
+cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.with_client_certificate("certs/client.crt", "certs/client.key")!
+conn := tls.dial_with_config(host, 443, host, cfg)!
+```
+
+a client sends its certificate only when the server asks, and only when it can
+answer the request: the CertificateRequest names the key types and signature
+algorithms the server will take, and a client whose key fits neither declines
+with an empty certificate rather than aborting or signing with an algorithm the
+server did not offer. a server in optional mode serves that client
+unauthenticated; a server in required mode refuses it.
+
+both versions do this, with different wire shapes. tls 1.3 carries the
+client's Certificate and CertificateVerify inside the encrypted flight and signs
+a hashed transcript under a context string; the 1.2 fallback sends them in the
+clear before the cipher change and signs the raw transcript through
+ClientKeyExchange. an application sees the same thing either way.
+
+what the connection tells the application is on `ConnectionState`:
+`client_auth_requested` says this server asked, `client_auth_verified` says a
+certificate came back and verified, `peer_common_name` and
+`peer_issuer_common_name` are the subject and issuer of the leaf, and
+`peer_certificates` is the chain the client sent, summarized. a handler
+authorizes on the subject name: the client proved it holds that certificate's
+key by signing the handshake transcript with it.
+
+```pith
+state := conn.state()
+if not state.client_auth_verified:
+    return unauthorized()
+if not allowed(state.peer_common_name):
+    return forbidden()
+```
+
+`examples/mutual_tls.pith` runs a required, an optional and a refused exchange
+against the repository's fixture certificates.
+
+a client certificate is refused for the same reasons a server certificate is,
+and the alert says which: `unknown_ca` when the chain does not reach the
+configured bundle, `certificate_expired` when a certificate on it is outside
+its validity window, `bad_certificate` for anything else the chain check
+rejects, `illegal_parameter` when the signature algorithm does not match the
+key in the certificate or was not one the request advertised, and
+`decrypt_error` when the CertificateVerify signature does not check out. a
+client that declines a certificate the server requires gets
+`certificate_required` on 1.3 and `handshake_failure` on 1.2, the code rfc 5246
+names; 1.3 introduced the more specific one.
+
+a certificate that is presented is always verified, in optional mode too, and a
+presented certificate without a CertificateVerify is refused. a certificate is
+public; only the signature proves the client holds its key.
+
 ## the tls 1.2 fallback
 
 both the client and server negotiate tls 1.3 and, when a peer cannot speak 1.3,
@@ -384,7 +440,9 @@ hello's legacy_version must also be at least 0x0303, the value rfc 8446 froze
 it at), `handshake_failure` when the version was fine but no common cipher
 suite, signature algorithm, or required extension could be agreed,
 `no_application_protocol` for an alpn mismatch, `illegal_parameter` for an
-unusable key share, `decrypt_error` for a psk binder that does not validate
+unusable key share or a client signature algorithm that does not match its
+certificate, `unknown_ca` and `certificate_expired` for a client chain that
+does not verify, `decrypt_error` for a psk binder that does not validate
 against a recognized ticket (rfc 8446 §4.2.11.2 requires the abort), and
 `decode_error` / `record_overflow` / `unexpected_message` for malformed input.
 the 1.2 fallback engages only when the client actually offered tls 1.2 —
@@ -412,10 +470,10 @@ cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.require_tls13()
 offers only the fallback and never negotiates 1.3. the two are mutually
 exclusive; if both are set on one config, `require_tls12()` wins.
 
-what the 1.2 fallback does not do (v1): session resumption, renegotiation
-(refused), or client-certificate auth (the server refuses a 1.2
-CertificateRequest path). sni-based server config selection works on 1.2. rsa
-(≥2048-bit) and ecdsa (p-256) server certificates are both supported.
+what the 1.2 fallback does not do (v1): session resumption or renegotiation
+(refused). client-certificate auth, sni-based server config selection, and alpn
+all work on 1.2. rsa (≥2048-bit) and ecdsa (p-256) server certificates are both
+supported, for the server's own certificate and for a client's.
 
 ## conformance harnesses
 
@@ -441,5 +499,9 @@ openssl/go/rustls interop gates:
 ## current limits
 
 - the 1.2 fallback is ecdhe + aead only, with the caveats above
+- a server's CertificateRequest sends an empty certificate_authorities list on
+  both versions: it does not tell a client which issuers it trusts, so a client
+  holding several certificates has nothing to choose by. a client here presents
+  the one its config holds
 - config selection is the dynamic handshake hook today
 - the connection state exposes peer identity summaries, not full verified chains yet

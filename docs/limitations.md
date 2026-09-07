@@ -628,24 +628,65 @@ unsound — which is why both extraction spellings are on the cascade walk's
 whitelist, so a local that only ever extracts keeps its cascade and takes a
 fresh count each time rather than handing the same one out twice.
 
-sweeping std's shared globals for the same class of bug turned up three things
-that are questions of design rather than repairs, so they are recorded here
-instead of decided.
+sweeping std's shared globals for the same class of bug turned up one thing
+worth repairing and two that are questions of design rather than repairs, so
+the second pair is recorded here instead of decided.
 
-`std.metrics` is correct under concurrency and does not scale. one mutex covers
-all twelve registries (the module's thirteenth `mut` global is the mutex
-itself), so every counter increment, gauge set and histogram observation in the
-process serializes on it, and a metric written once per
-request is the normal case. measured on the 2-core box, one task manages 7.4M
-increments a second; two manage 3.7M between them, four 3.0M, eight 2.4M — the
-aggregate falls as tasks are added, which is what a single lock looks like. the
-absolute cost is still small next to a request, around 0.4 µs per increment at
-eight tasks, so nothing is on fire. it is the shape that will not hold if a
-process ever writes metrics faster than it serves requests. every way out costs
-something. sharding by metric name spreads the contention but makes a coherent
-snapshot harder to take. a lock per series adds a lookup to the hot path.
-atomic counters are the obvious answer for a counter and no answer at all for a
-histogram, which updates seven values as one unit.
+the repair was `std.metrics`, which used to be correct under concurrency and
+not scale: one mutex covered all twelve registries, so every counter increment,
+gauge set and histogram observation in the process serialized on it, and a
+metric written once per request is the normal case. it now writes without a
+lock. an instrument — the value `counter()`, `gauge()` or `histogram()` hands
+back — holds the atomic cells of its own series rather than a name to look up,
+so `inc`, `add` and `observe` compare-and-set those cells, `set` stores into
+one, and none of them goes near the registry. two tasks bumping the same
+counter contend for a cache line instead of for a mutex, and a task that loses
+a compare-and-set retries where it used to park. the registry directory is
+still guarded, because a map cannot be read while another thread inserts into
+it, but it is sharded over eight mutexes and only a lookup by name touches it,
+which is the path `std.net.http` walks once per label set per request.
+
+measured on the same 2-core box with `bench/metrics_contention`, every writer on
+one series, medians of 25 interleaved trials a cell, at one, two, four and eight
+tasks. a counter went from 7.8M, 5.6M, 5.5M and 4.2M increments a second to
+16.7M, 6.8M, 6.9M and 6.9M. a gauge set went from 10.3M, 7.7M, 7.3M and 5.0M to
+33.3M, 14.8M, 14.8M and 14.8M. a histogram observation went from 381k, 285k,
+276k and 275k to 5.3M, 1.3M, 1.3M and 1.3M, most of that last one because the
+buckets hold per-boundary counts now, so an observation moves one cell instead
+of walking ten. the whole request-shaped call with the lookup paid every time,
+`counter(name).labels(pairs).inc()`, went from 90k, 66k, 69k and 66k to 90k,
+93k, 92k and 90k.
+
+the aggregate stops falling as writers are added, which was the complaint. what
+is left is the step from one writer to two, and that is the cache line rather
+than a lock: it is there for the counter and the histogram, whose writes are
+compare-and-set retry loops, and gone for the gauge, whose write is a single
+store.
+
+two ways out were measured and dropped. striping a counter over several cells
+and summing them at scrape time buys nothing here, because pith cannot pad an
+`AtomicInt` to a cache line: two separately allocated cells written by two tasks
+ran within 8% of one cell written by both, which is the same line either way. a
+lock per series loses on the case that matters: the series every request writes
+is one series, and its writers queue on its lock exactly as they queued on the
+global one.
+
+what it costs is the process-wide snapshot. a scrape takes every shard lock in
+index order, copies the directory and lets them go, then reads the cells
+unlocked, so two series read microseconds apart need not describe the same
+instant. one histogram is still coherent, and coherent by construction rather
+than by exclusion: the exposition adds the per-boundary counts up as it walks
+the boundaries, so the cumulative numbers it prints are non-decreasing however
+stale each term is, and the `+Inf` bucket and the `_count` line are the same
+running total rather than two reads that have to agree. the order that does
+matter is that an observation publishes its sum, min and max before the bucket
+that makes it visible; `std/metrics.pith` has the scrape-during-writes test that
+fails if that is reversed, and `tests/cases/test_metrics_registry` pins the
+exposition byte for byte.
+
+the edge left on it is `reset()`. it clears the registry and leaves behind the
+cells instruments are already holding, so an instrument taken before a reset
+goes on writing to a series nothing can scrape. take a fresh one after.
 
 a `std.net.tls` config closes itself when the last value naming it goes away:
 `Config` implements `Drop`, so a program that builds its own config for

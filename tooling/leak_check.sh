@@ -128,6 +128,7 @@ cases=(
   tests/leaks/leak_tls12_client_auth
   tests/leaks/leak_tls_config_drop
   tests/leaks/leak_http_string_head_flood
+  tests/leaks/leak_metrics_scrape
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
 )
 

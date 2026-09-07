@@ -1,0 +1,76 @@
+# the deterministic single-task behaviour of every std.metrics instrument.
+#
+# the registry is lock-free on the write path: an instrument holds the atomic
+# cells of its series and inc/add/set/observe compare-and-set them. that buys
+# the concurrency behaviour the module exists for, and it also means the values
+# a scrape renders come from cells rather than from a map read under a lock, so
+# the whole exposition path is worth pinning byte for byte — including the
+# shapes that were only ever exercised by an assertion before: a reset, a
+# re-registration after one, a labelled series sharing its metric's boundaries,
+# an untouched histogram, and a fractional counter.
+#
+# it runs under valgrind in MEMCHECK_CASES because every instrument now carries
+# handles (an AtomicInt per cell, a List[AtomicInt] of buckets) that outlive the
+# call that made them.
+import std.metrics as metrics
+
+fn show(label: String, value: Float):
+    print("{label}={value}")
+
+fn dump(title: String):
+    print("--- {title} ---")
+    print(metrics.snapshot_text())
+
+fn main():
+    metrics.reset()
+
+    orders := metrics.counter("orders total").describe("orders accepted", "orders")
+    orders.inc()
+    orders.add(2.5)
+    orders.labels(["region", "eu"]).inc()
+    orders.labels(["region", "us"]).add(4.0)
+    # argument order must not matter: this is the eu series again
+    orders.labels(["region", "eu"]).inc()
+    show("orders", orders.value())
+    show("orders_eu", orders.labels(["region", "eu"]).value())
+    show("orders_us", orders.labels(["region", "us"]).value())
+
+    load := metrics.gauge("cpu load").describe("load average", "1")
+    load.set(0.75)
+    load.add(0.5)
+    load.add(0.0 - 0.25)
+    load.labels(["core", "0"]).set(3.0)
+    show("load", load.value())
+    show("load_core0", load.labels(["core", "0"]).value())
+
+    latency := metrics.histogram("request seconds").buckets([0.01, 0.1, 1.0])
+    latency.describe("request latency", "s")
+    latency.observe(0.005)
+    latency.observe(0.05)
+    latency.observe(2.0)
+    print("latency_count={latency.count()}")
+    show("latency_sum", latency.sum())
+    show("latency_min", latency.min())
+    show("latency_max", latency.max())
+
+    # a labelled series of the same metric picks up the boundaries registered
+    # for the bare name, not the defaults
+    per_route := metrics.histogram("request seconds").labels(["route", "/api"])
+    per_route.observe(0.5)
+    print("per_route_count={per_route.count()}")
+
+    # a histogram nobody observed renders a zero count and no min or max
+    metrics.histogram("idle_seconds")
+
+    dump("full")
+
+    for sample in metrics.snapshot():
+        print("sample {sample.name} {sample.kind} labels={sample.labels.len()} value={sample.value} sum={sample.sum} unit={sample.unit} bounds={sample.bucket_bounds.len()}")
+
+    metrics.reset()
+    print("after reset: [{metrics.snapshot_text()}]")
+    print("samples after reset: {metrics.snapshot().len()}")
+
+    # a name registered again after a reset starts from zero
+    metrics.counter("orders total").inc()
+    dump("reregistered")

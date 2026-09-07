@@ -1,0 +1,41 @@
+# a metric written and a scrape rendered on every round.
+#
+# both halves of std.metrics allocate now. a write resolves an instrument out
+# of the sharded registry, which builds a series key, hands back a struct
+# holding runtime handles (an AtomicInt per cell, and for a histogram a
+# List[AtomicInt] of buckets), and drops it again at the end of the round. a
+# scrape copies the whole directory into a fresh set of maps under the shard
+# locks, then builds one string per series line and joins them.
+#
+# the registry itself is fixed after the first round — the same four series,
+# the same label set — so nothing here should grow with the round count. a
+# resolve that retained a cell handle, a snapshot that kept its copy of the
+# directory alive, or a rendered line that outlived its join would all show up
+# as a peak that moves between 200k and 800k rounds.
+import leakprobe as probe
+import std.metrics as metrics
+
+fn round(i: Int) -> Int:
+    hits := metrics.counter("leak_hits_total")
+    hits.inc()
+    hits.labels(["route", "/api"]).add(2.0)
+
+    metrics.gauge("leak_level").set(i.to_float())
+    metrics.histogram("leak_latency_ms").observe(7.0)
+
+    return metrics.snapshot_text().len()
+
+fn main():
+    n := probe.rounds()
+    # the boundaries are registered once, before any observation, so the
+    # per-round work never touches the bucket-definition path
+    metrics.histogram("leak_latency_ms").buckets([1.0, 10.0, 100.0])
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

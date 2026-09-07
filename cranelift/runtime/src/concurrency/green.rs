@@ -245,6 +245,14 @@ pub extern "C" fn pith_green_maybe_yield() {
     // load when the collector flag is off.
     crate::cycle::mutator_gate();
 
+    // profiling: how often a safe-point took the slow path at all, so a run can
+    // be asked what preemption actually cost it rather than what it might. only
+    // reached when the monitor has set the flag, and one relaxed load when the
+    // perf counters are off.
+    if crate::perf_stats_enabled() {
+        crate::perf_record1(&crate::PERF_GREEN_PREEMPT_CHECKS, 1);
+    }
+
     // gate 1: are we inside a green task at all?
     let Some(id) = current_task() else {
         return;
@@ -278,6 +286,9 @@ pub extern "C" fn pith_green_maybe_yield() {
         return;
     };
     block.word.fetch_or(S_PREEMPT_PENDING, AtomicOrdering::AcqRel);
+    if crate::perf_stats_enabled() {
+        crate::perf_record1(&crate::PERF_GREEN_PREEMPTIONS, 1);
+    }
     park_current(id);
 }
 

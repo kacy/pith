@@ -743,16 +743,25 @@ fn runtime_func_ref(
         .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func)))
 }
 
-/// Whether this build should emit green-preemption safe-points. Off by default,
-/// because a flat loop pays a large relative cost for the per-iteration check and
-/// most programs never have a compute-only task that needs descheduling. Set
-/// `PITH_GREEN_PREEMPT` at build time to make compute-bound green tasks
-/// preemptible.
-fn green_preempt_enabled() -> bool {
-    matches!(
-        std::env::var("PITH_GREEN_PREEMPT").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
+/// Whether this build should emit green-preemption safe-points. On by default:
+/// green is the default backend, and without safe-points a task that loops on a
+/// value another task has to publish never gives up its worker, so it starves the
+/// tasks it is waiting for and the program hangs.
+///
+/// `PITH_GREEN_PREEMPT=0` is the escape hatch for a build that will never run
+/// green and does not want to pay for a check that cannot fire. The off spellings
+/// are as generous as `PITH_GREEN`'s, and for the same reason: someone reaching
+/// for the opt-out who writes `no` must not silently keep the safe-points.
+fn preempt_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("n")
     )
+}
+
+/// Read `PITH_GREEN_PREEMPT` and answer whether to emit the safe-points.
+fn green_preempt_enabled() -> bool {
+    preempt_from_env(std::env::var("PITH_GREEN_PREEMPT").ok().as_deref())
 }
 
 /// Emit a cooperative-preemption safe-point inline, just before a loop back-edge
@@ -894,14 +903,17 @@ pub fn compile_from_ir(
     let mut string_global_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    // green preemption safe-points are opt-in at compile time. a flat arithmetic
-    // loop pays a large relative cost for the inline flag check (its body is a
-    // couple of instructions, so the extra load+test+branch per iteration is a
-    // big fraction), and most programs have no compute-only task that would ever
-    // need descheduling. so the default codegen emits no check at all — exactly
-    // zero cost — and only a build that asks for preemption
-    // (`PITH_GREEN_PREEMPT=1`) inserts the safe-points. `None` here means
-    // "emit nothing"; `Some(flag)` carries the imported flag symbol.
+    // green preemption safe-points are emitted by default. green is the default
+    // backend, and a task that loops waiting on something another task must
+    // publish holds its worker until it is preempted — without a safe-point it
+    // never is, so it starves the task it is waiting for. the check costs
+    // +0.07% to +1.85% instructions across the benchmarks here and +0.52% on the
+    // compiler compiling itself; a flat arithmetic loop is the outlier at +86%
+    // instructions and about 2x wall, because six instructions of check land on a
+    // seven-instruction body and the call in them costs the loop its registers.
+    // `PITH_GREEN_PREEMPT=0` is the opt-out for a build that will never run
+    // green. `None` here means "emit nothing"; `Some(flag)` carries the imported
+    // flag symbol.
     let preempt_flag = if green_preempt_enabled() {
         Some(
             codegen
@@ -2893,6 +2905,21 @@ fn get_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_points_are_on_unless_the_build_asks_them_off() {
+        // unset, and anything that is not an off spelling, emits the check.
+        assert!(preempt_from_env(None));
+        assert!(preempt_from_env(Some("1")));
+        assert!(preempt_from_env(Some("")));
+        assert!(preempt_from_env(Some("please")));
+
+        // the opt-out is as generous as PITH_GREEN's, for the same reason: a
+        // build reaching for it must not silently keep the safe-points.
+        for off in ["0", "off", "false", "no", "n", " OFF ", "False"] {
+            assert!(!preempt_from_env(Some(off)), "{off} should turn them off");
+        }
+    }
 
     #[test]
     fn bits_wrapper_detection_matches_only_the_exact_shape() {

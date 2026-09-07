@@ -1,0 +1,37 @@
+# a degenerate compute-only loop: the worst case for a preemption safe-point.
+# the body is three arithmetic instructions, so the safe-point's load, test and
+# branch are most of what runs. nothing here yields, allocates or calls.
+#
+# the safe-point goes in unless the build says so, which is what the two arms
+# below are:
+#
+#   PITH_GREEN_PREEMPT=0 pith build bench/tight_loop.pith && ./bench/tight_loop
+#   PITH_GREEN_PREEMPT=1 pith build bench/tight_loop.pith && ./bench/tight_loop
+#
+# the checksum is a fixed function of the iteration count, so the two arms must
+# print the same one — that equality is what says they did the same work.
+
+fn iterations_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 200000000
+
+# the loop lives in its own function so that what main does around it — reading
+# an argument, formatting a checksum — cannot change the registers the loop gets
+# and move the number this benchmark exists to report.
+fn run(n: Int) -> Int:
+    mut sum := 0
+    mut i := 0
+    # a multiply and two adds. no division: an idiv is slow enough to hide the
+    # safe-point behind its latency, which would understate the cost. the sum
+    # stays under 2^63 for any n this is run with, so nothing overflows.
+    while i < n:
+        sum = sum + i * 3
+        i = i + 1
+    return sum
+
+fn main():
+    print("checksum={run(iterations_from_args())}")

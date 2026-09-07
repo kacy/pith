@@ -532,13 +532,58 @@ its worker runs sooner. a short on-CPU wait before the park keeps the common
 case from paying for two thread wakeups. calls from `main` are unaffected, since
 main is not a green task and takes the direct path.
 
-preemption is a build-time opt-in for the same reason it always was. safe-points
-are only emitted under `PITH_GREEN_PREEMPT=1`, so a compute-only task that never
-touches a channel or socket holds its worker until it finishes, where the kernel
-gives os threads that for free. turning safe-points on costs ~0% on real work
-(the event-ledger and std-pipeline benchmarks are within noise) and ~6% on a
-degenerate 200-million-iteration arithmetic loop, so the flag is cheap, but a
-build that will never run green should not pay for a check that cannot fire.
+preemption is on by default as of 2026-09-07, and what moved it was a hang rather
+than a benchmark. safe-points go in at every loop back-edge unless the build says
+`PITH_GREEN_PREEMPT=0`, so a compute-only task that never touches a channel or
+socket still gives its worker up. without them it does not, and the tasks sharing
+that worker never run: a std.metrics test looped on a total its writer tasks had
+to publish, starved the writers, and wedged about one run in four until it was
+rewritten (#1081, #1085). a loop waiting on another task to make progress is not
+an exotic thing to write, and when it hangs there is nothing in the failure that
+points at scheduling. `tests/green/starvation.pith` is that shape: 40 runs at one
+and at the default worker count all finished with safe-points, and 40 runs of the
+same program built `PITH_GREEN_PREEMPT=0` all sat there until a 10-second budget
+killed them.
+
+the check is one load of a process-global byte, a test, and a branch that is not
+taken, before each back-edge. it costs +0.07% instructions on the event ledger,
++0.19% on the channel fan-out under os threads, +0.36% on the catalog workload,
++0.52% on the compiler compiling itself and +1.85% on the std pipeline. the
+compiler is the largest program there and the one whose wall clock moved most:
+2.83 to 2.90 seconds, about +2.5% on medians of seven interleaved runs against a
+±1% null floor, which is more than its instruction count predicts and is the code
+being about one and a half percent bigger.
+
+two shapes pay more than that.
+
+a degenerate arithmetic loop pays the most, because the safe-point is six
+instructions and the body is seven. `bench/tight_loop` runs 200 million
+multiply-and-add iterations in 129 ms without safe-points and 259 ms with them:
++86% instructions and about twice the wall clock. the wall figure is worse than
+the instruction figure because the check contains a call, so the loop's values
+have to survive one — the allocator moves them into callee-saved registers and
+gives the function a frame it did not need. that is what the escape hatch is for.
+
+how bad that gets depends entirely on the body. put a division in the same loop
+and it reads +0.4%, because the safe-point disappears into the divider's latency;
+leave the loop inline in `main` next to a string format and it reads +33%,
+because the surrounding code had already cost it the registers. the ~6% this page
+used to quote is presumably one of those. the number above is the case with
+nothing in the body to hide behind, which is the one to plan against.
+
+the other is a green program that keeps a task on-CPU long enough for the monitor
+to notice. the request flag is process-global, so once it is set *every* running
+task calls into the runtime at its next back-edge, where the check that it is the
+task which actually overran sends almost all of them straight back. the channel
+fan-out at one worker makes 1.17 million of those slow-path calls in a 45 ms run
+and actually preempts three times, and pays about
++7% for it (42 ms to 45 ms). `PITH_PERF_STATS=1` now reports both numbers
+(`green preemption: safepoint_slow_path=… preempted=…`), and narrowing that gap —
+a per-worker request rather than one global byte — is the open work here.
+
+a build that will never run green can still decline all of it:
+`PITH_GREEN_PREEMPT=0` at build time (`off`, `false`, `no` and `n` work too, as
+they do for `PITH_GREEN`) emits no check at all.
 
 the reactor being linux-only is why the default is linux-only. it is epoll and
 eventfd; elsewhere the fallback has no reactor and a green task waiting on a

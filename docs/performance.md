@@ -184,6 +184,94 @@ on this one. the way to have both is to let an idle worker take a `Ready`
 task off a peer's pinned queue, which the runtime is now built to allow;
 until that exists the default stays put.
 
+### what preemption safe-points cost, now that they are on (2026-09-07)
+
+green tasks are preemptible in every build unless it says
+`PITH_GREEN_PREEMPT=0`. the backend puts a safe-point before each loop
+back-edge — load a process-global byte, test it, branch over a call — so a
+compute-only task cannot hold its worker forever. what follows is the bill,
+measured off against on with the same source and the same runtime, the two arms
+differing only in that environment variable at build time.
+
+instruction counts first, since a compile-time change is exactly the case where
+wall time on this box says whatever it likes. each row is one
+`tooling/callgrind_ab.sh` pair, `PITH_GREEN=0` unless the row says otherwise:
+
+| 2026-09-07, callgrind | safe-points off | on | delta | safe-points in the binary |
+|---|---:|---:|---:|---:|
+| event ledger, 200k events | 3,390,966,577 | 3,393,272,496 | +0.07% | 232 |
+| channel fan-out, 1m messages | 684,679,434 | 685,965,123 | +0.19% | 87 |
+| catalog workload, 200k iterations | 1,381,072,404 | 1,386,079,521 | +0.36% | 139 |
+| compiler compiling itself | 22,493,294,294 | 22,611,240,269 | +0.52% | 824 |
+| std pipeline, 200k records | 4,285,492,116 | 4,364,667,321 | +1.85% | 206 |
+| channel fan-out, 1m, under green | 554,038,479 | 604,481,604 | +9.10% | 87 |
+| tight loop, 200m iterations | 1,400,266,874 | 2,600,267,047 | +85.72% | 1 |
+
+the last column is the number of back-edges the build put a check on, counted
+out of the disassembly. it is also how the arms were checked for anything else
+moving: over the 875 functions the two tight-loop binaries share, the mnemonic
+histogram differs by 17 instructions in 2 functions — the six-instruction
+safe-point in the loop, and the register moves and frame the call it contains
+forces around it. the safe-point
+build links more of the runtime (the park path a safe-point can reach), which is
+why the function counts differ at all.
+
+wall clock on the three shapes where it means something, interleaved with the
+order rotated each round, each preceded by `tooling/null_ab.sh` on the off arm to
+fix the noise floor:
+
+| 2026-09-07, medians | off | on | delta | null floor |
+|---|---:|---:|---:|---:|
+| tight loop, 200m, 9 rounds | 129 ms | 259 ms | **+101%** | ±3.0% |
+| compiler compiling itself, 7 rounds | 2830 ms | 2901 ms | +2.5% | ±1.0% |
+| fan-out 1m, green, 1 worker, 7 rounds | 42 ms | 45 ms | +7.1% | ±2.4% |
+| fan-out 1m, green, 2 workers, 7 rounds | 87 ms | 88 ms | +1.1% | — |
+
+three of those rows need a word of explanation.
+
+the tight loop is the worst case and it doubles: six instructions of safe-point
+on a seven-instruction body, and the wall clock moves further than the
+instruction count because the check contains a call. the loop's values have to
+survive it, so the allocator puts them in callee-saved registers and gives the
+function a frame — visible in the disassembly as a `sub $0x20,%rsp` and three
+spills that the off arm does not have.
+
+how bad it gets depends on the body, which is why this benchmark is written the
+way it is. the first draft took the sum modulo a prime, and with the `idiv` in
+there the same a/b reads +0.4%: the safe-point disappears into the divider's
+latency. a second draft left the loop inline in `main` beside a string format,
+which had already cost it the registers, and read +33%. so the loop is a
+function of its own with nothing in the body but a multiply and two adds, and
+what it reports is the ceiling: no body can hide the check better than nothing
+at all can. `docs/limitations.md` used to put a degenerate
+loop at ~6%, which is presumably one of those softer arrangements; it does not
+reproduce on this one.
+
+the compiler moves further on the clock (+2.5%) than on instructions (+0.52%).
+the extra work is 824 not-taken branches in a binary that grew about 1.5%, so
+this is fetch and layout rather than arithmetic, and it is at the edge of what
+the null floor can resolve — but the on arm's fastest run (2836 ms) is still
+slower than the off arm's fastest (2761 ms), which a layout accident does not
+usually manage.
+
+the green fan-out is the only row where the safe-point does anything other than
+not fire, and it is the design's weak spot rather than the check's cost. the
+request flag is process-global: once the monitor sets it, every running task
+calls the runtime slow path at its next back-edge, where the check that it is the
+task which actually overran turns almost all of them away. `PITH_PERF_STATS=1`
+now counts both: at one worker that run makes 1,169,107 slow-path calls and
+preempts 3 times, and at two workers it makes 1,724,997 calls
+and 16 preemptions. a per-worker request would collapse that, and is the obvious
+next thing to do here. under callgrind the same run reads +9.1%, which overstates
+it: the monitor ticks on wall time while the program runs ~50x slower, so the
+flag is set for a far larger share of the program's back-edges than it would be
+natively.
+
+what the whole bill buys is that a task looping on a value another task has to
+publish can no longer wedge the process. `tests/green/starvation.pith` finished
+40 out of 40 runs with safe-points, at one and at the default worker count, and 0
+out of 40 without them.
+
 ### a note on how these are measured
 
 the cross-language harnesses interleave: one round runs every language once,

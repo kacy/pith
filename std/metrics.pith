@@ -1076,9 +1076,9 @@ fn sample_line_value(line: String) -> Int:
 # that counted an observation before publishing its min and max would render a
 # count with no extremes behind it, or with the empty sentinel.
 #
-# returns 1 when the metric is there and holds, 0 when it is not there at all,
-# -1 when it is there and broken.
-fn histogram_text_verdict(text: String, bare: String, extreme: String) -> Int:
+# returns the rendered count when the metric is there and holds, -1 when it is
+# there and broken, -2 when it is not in the text at all.
+fn histogram_text_count(text: String, bare: String, extreme: String) -> Int:
     bucket_prefix := bare + "_bucket" + chr(123)
     count_prefix := bare + "_count "
     mut previous := 0
@@ -1101,40 +1101,63 @@ fn histogram_text_verdict(text: String, bare: String, extreme: String) -> Int:
         elif line.starts_with(bare + "_max "):
             hi = line.substring(bare.len() + 5, line.len())
     if inf < 0 or counted < 0:
-        return 0
+        return 0 - 2
     if inf != counted:
         return 0 - 1
     if counted > 0 and extreme != "":
         if lo != extreme or hi != extreme:
             return 0 - 1
-    return 1
+    return counted
 
-fn scrape_until(stop: AtomicInt, bare: String, extreme: String) -> Int:
+# scrape and check until the series reaches `target`, or until the scrape
+# budget runs out.
+#
+# the budget is what keeps this test from wedging, and it is not paranoia. a
+# green task that spins without ever parking starves the tasks sharing its
+# worker: this loop takes no lock a writer holds and never waits on i/o, so on
+# a two-core box it can run two hundred thousand scrapes while the writers get
+# nowhere. an earlier version waited on a flag that the writers finishing had
+# to set, which meant the watcher was waiting on tasks it was itself starving —
+# about one run in four hung outright, on both backends. a healthy run here
+# takes fifty to a hundred and twenty scrapes, so a budget of two thousand
+# leaves the race intact and bounds the failure.
+fn scrape_while_written(target: Int, bare: String, extreme: String) -> Int:
     mut checked := 0
-    while stop.load() == 0:
-        verdict := histogram_text_verdict(snapshot_text(), bare, extreme)
-        if verdict < 0:
+    mut spins := 0
+    while spins < 2000:
+        seen := histogram_text_count(snapshot_text(), bare, extreme)
+        if seen == 0 - 1:
             return 0 - 1
-        checked = checked + verdict
+        if seen >= 0:
+            checked = checked + 1
+            if seen >= target:
+                return checked
+        spins = spins + 1
     return checked
 
 test "a scrape taken while a histogram is written is never incoherent":
     reset()
-    stop := AtomicInt(0)
-    watcher := spawn scrape_until(stop, "racing_ms", "7")
-    wa := spawn stress_histogram("racing ms", 4000)
-    wb := spawn stress_histogram("racing ms", 4000)
-    wc := spawn stress_histogram("racing ms", 4000)
+    per := 4000
+    # one observation before anything is spawned, so the watcher's first scrape
+    # finds the series populated whichever order the scheduler runs the four
+    # tasks in. what this test must not depend on is winning that race — it is
+    # here to check what a scrape sees, not who gets a worker first.
+    histogram("racing ms").observe(7.0)
+    target := 1 + per * 3
+    watcher := spawn scrape_while_written(target, "racing_ms", "7")
+    wa := spawn stress_histogram("racing ms", per)
+    wb := spawn stress_histogram("racing ms", per)
+    wc := spawn stress_histogram("racing ms", per)
     written := await wa + await wb + await wc
-    stop.store(1)
     checked := await watcher
-    assert_eq(written, 12000)
-    # -1 means a scrape came back with buckets that outran each other or a
-    # +Inf that disagreed with the count; 0 means the watcher never caught the
-    # series populated and proved nothing.
+    assert_eq(written, per * 3)
+    # -1 is a scrape whose buckets fell as the boundary rose, whose +Inf
+    # disagreed with its count, or whose non-zero count arrived with no min and
+    # max behind it. the seeded observation is what makes `checked` at least one
+    # without depending on the scheduler.
     assert(checked > 0)
-    assert_eq(histogram("racing ms").count(), 12000)
-    assert_eq(histogram_text_verdict(snapshot_text(), "racing_ms", "7"), 1)
+    assert_eq(histogram("racing ms").count(), target)
+    assert_eq(histogram_text_count(snapshot_text(), "racing_ms", "7"), target)
 
 fn stress_gauge(name: String, times: Int) -> Int:
     g := gauge(name)

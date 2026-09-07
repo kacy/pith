@@ -374,23 +374,32 @@ correctness story:
   a bare `none` written straight into a container store (`xs.push(none)`,
   `m[k] = none`) is a shell the caller built, so the store takes that count
   instead of adding one of its own, the same as a widened plain value.
-- a call result dropped at statement position is reclaimed when it is a result
-  box, an optional shell, a string, `bytes`, a struct, or a bare
-  `List`/`Map`/`Set`. a user function transfers its result out, and the
-  builtin producers hand back either a freshly built value (`keys()`,
-  `values()`, `split()`, the slice/sort copies) or a count taken over the
-  call itself (`get_default`, which the call site retains; `take`, which the
-  map relinquishes), so the discard releases a count that was the
-  statement's to drop. the discard drops the payload of a result box
-  without asking whether another owner holds the box, so a callee that
-  hands its parameter back (`forward(r)` at statement position, with `r`
-  a live local) empties `r`; the argument-position release above reads
-  the count first and the discard should too. what still strands: a
-  discarded void-method chain
-  (the chain's value is the receiver handed back, and freeing it would free
-  the container its owner still holds), a discarded closure result, and a
-  container dropped through a discarded `!` or `await` at statement
-  position, which take other paths to the discard.
+- a value dropped at statement position is released on the ownership of the
+  expression that produced it, not on the shape of the statement. a result
+  box, an optional shell, a string, `bytes`, a struct, a tuple, a closure, a
+  channel and a bare `List`/`Map`/`Set` all release. a user function transfers
+  its result out, and the builtin producers hand back either a freshly built
+  value (`keys()`, `values()`, `split()`, the slice/sort copies) or a count
+  taken over the call itself (`get_default`, which the call site retains;
+  `take`, which the map relinquishes), so the count the discard drops was the
+  statement's. a void builtin method hands its receiver back so chains work,
+  so the register a discarded chain leaves behind is the receiver's. the
+  classification reads the expression at the root of the chain: `mk(i).reverse()`
+  drops the list `mk` minted, and `xs.reverse()` leaves a live local's count
+  alone. `!` and `await` arrive by paths of their own and are classified where
+  they land — `!` frees the box it opened and hands the payload on with the
+  box's count, `await` hands over the count the task produced. the payload of
+  a discarded result box goes only when this frame's count is the box's last,
+  read through `pith_struct_strong_count` by the same per-signature helper the
+  argument-position release uses. before that, `forward(r)` at statement
+  position, with `r` a live local holding the same box, emptied `r`.
+  what still strands: a discarded `catch`, `select` or `match` releases only a
+  string, because the other kinds normalize their arms by paths of their own.
+  and the count-gated drop trades an over-release for a leak. a local the
+  cascade cannot take — any local handed to a callee that keeps or returns it
+  — releases the shell alone at cleanup, so a payload two owners hold is
+  reclaimed only if the last release reads the count. the argument release
+  reads it; that cleanup does not.
 - the fresh-shell family is closed, inside generic bodies as well: a user
   function's returned `Some` owns its payload through `__opt_dtor_<kind>`,
   a tuple payload and an inner optional shell included, an optional handed

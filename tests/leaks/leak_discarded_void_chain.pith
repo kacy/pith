@@ -1,0 +1,51 @@
+# a void builtin method hands its receiver back so chains work, and a
+# discarded chain used to strand that receiver: `mk(i).reverse()` built a
+# list, reversed it and then dropped the only count anything held on it. the
+# statement now reads the ownership of the expression at the root of the
+# chain, so a fresh receiver is released and a live local's is left alone.
+import leakprobe as probe
+
+struct Holder:
+    name: String
+    items: List[Int]
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn mkm(i: Int) -> Map[String, Int]:
+    mut m: Map[String, Int] := {}
+    m.insert("k-" + i.to_string(), i)
+    return m
+
+fn mks(i: Int) -> Set[Int]:
+    mut s: Set[Int] := {}
+    s.add(i)
+    return s
+
+fn mkh(i: Int) -> Holder:
+    return Holder("h-{i}", [i, i + 1])
+
+fn round(i: Int) -> Int:
+    mk(i).reverse()
+    mk(i).push(i)
+    mkm(i).clear()
+    mkm(i).remove("k-" + i.to_string())
+    mks(i).add(i + 1)
+    mkh(i).items.push(0)
+    "a,b,c".split(",").reverse()
+    mut xs: List[Int] := [3, 1, 2]
+    xs.reverse()
+    xs.push(i)
+    return xs[0]
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

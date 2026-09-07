@@ -1,0 +1,195 @@
+# every shape a value can take when a statement throws it away, with the
+# value read back after the discard. a wrong "owned" answer here is a use
+# after free that the leak gate and the goldens both miss unless something
+# reads the memory again, so each row prints what survived: the receiver of a
+# discarded void-method chain and its contents, a live local that shares a
+# result box with a discarded call, a closure that was not the one discarded,
+# and the values a `!` and an `await` left behind.
+#
+# every row is printed twice. the second copy is the annotated control: the
+# same statement written as a binding, which is the release path bindings
+# have always taken, and it is where the expected output comes from. the two
+# copies must agree line for line.
+
+struct Holder:
+    name: String
+    items: List[Int]
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn mkh(i: Int) -> Holder:
+    return Holder("h-{i}", [i, i + 1])
+
+fn mkfn(i: Int) -> fn(Int) -> Int:
+    add := fn(x: Int) -> Int:
+        return x + i
+    return add
+
+fn mkch(i: Int) -> Channel[Int]:
+    ch := Channel[Int](2)
+    ch.send(i)
+    return ch
+
+fn mkr(i: Int) -> List[Int]!:
+    return [i, i + 1, i + 2]
+
+fn mko(i: Int) -> (List[Int]?)!:
+    mut v: List[Int]? := [i, i + 1]
+    return v
+
+fn mkstr(i: Int) -> String!:
+    return "v-{i}"
+
+fn forward(x: String!) -> String!:
+    return x
+
+fn forward_list(x: List[Int]!) -> List[Int]!:
+    return x
+
+fn show_list(tag: String, xs: List[Int]):
+    print(tag + "=" + xs.len().to_string() + "," + xs[0].to_string() + "," + xs[xs.len() - 1].to_string())
+
+# a void builtin method hands its receiver back so chains work. a chain over a
+# fresh receiver is the statement's to drop; a chain over a live local, or over
+# a field, is not.
+fn void_chains(tag: String):
+    mk(1).reverse()
+    mkh(2).items.push(0)
+    mut xs: List[Int] := [3, 1, 2]
+    xs.reverse()
+    xs.push(7)
+    show_list(tag + "chain xs", xs)
+    mut m: Map[String, Int] := {}
+    m.insert("a", 5)
+    m.insert("b", 6)
+    m.remove("b")
+    print(tag + "chain m=" + m.len().to_string() + "," + m["a"].to_string())
+    mut h := mkh(9)
+    h.items.reverse()
+    h.items.push(4)
+    print(tag + "chain h=" + h.name + "," + h.items.len().to_string() + "," + h.items[0].to_string())
+
+fn control_void_chains(tag: String):
+    fresh := mk(1)
+    show_list(tag + "chain fresh", fresh)
+    mut held := mkh(2)
+    held.items.push(0)
+    mut xs: List[Int] := [3, 1, 2]
+    xs.reverse()
+    xs.push(7)
+    show_list(tag + "chain xs", xs)
+    mut m: Map[String, Int] := {}
+    m.insert("a", 5)
+    m.insert("b", 6)
+    m.remove("b")
+    print(tag + "chain m=" + m.len().to_string() + "," + m["a"].to_string())
+    mut h := mkh(9)
+    h.items.reverse()
+    h.items.push(4)
+    print(tag + "chain h=" + h.name + "," + h.items.len().to_string() + "," + h.items[0].to_string())
+
+# a callee that hands its parameter back leaves two owners on one box. the
+# discard drops the caller's count and leaves the payload with the live local.
+fn shared_box(tag: String):
+    r := mkstr(1)
+    forward(r)
+    print(tag + "shared r1=" + (r catch "gone"))
+    forward(r)
+    print(tag + "shared r2=" + (r catch "gone"))
+    rl := mkr(2)
+    forward_list(rl)
+    show_list(tag + "shared rl", rl catch [])
+
+fn control_shared_box(tag: String):
+    r := mkstr(1)
+    kept := forward(r)
+    print(tag + "shared r1=" + (r catch "gone"))
+    kept2 := forward(r)
+    print(tag + "shared r2=" + (r catch "gone"))
+    print(tag + "shared kept=" + (kept catch "gone") + "," + (kept2 catch "gone"))
+    rl := mkr(2)
+    keptl := forward_list(rl)
+    show_list(tag + "shared rl", rl catch [])
+    show_list(tag + "shared keptl", keptl catch [])
+
+fn handles(tag: String):
+    keep := mkfn(10)
+    mkfn(99)
+    print(tag + "closure=" + keep(5).to_string() + "," + keep(6).to_string())
+    kept_ch := mkch(3)
+    mkch(4)
+    if let v = kept_ch.recv():
+        print(tag + "channel=" + v.to_string())
+
+fn control_handles(tag: String):
+    keep := mkfn(10)
+    other := mkfn(99)
+    print(tag + "closure=" + keep(5).to_string() + "," + keep(6).to_string())
+    print(tag + "closure other=" + other(1).to_string())
+    kept_ch := mkch(3)
+    other_ch := mkch(4)
+    if let v = kept_ch.recv():
+        print(tag + "channel=" + v.to_string())
+    if let w = other_ch.recv():
+        print(tag + "channel other=" + w.to_string())
+
+fn through_try(tag: String) -> Int!:
+    mkr(1)!
+    mko(2)!
+    kept := mkr(3)!
+    show_list(tag + "try kept", kept)
+    return kept[0] + kept[2]
+
+fn control_through_try(tag: String) -> Int!:
+    first := mkr(1)!
+    show_list(tag + "try first", first)
+    maybe := mko(2)!
+    if let inner = maybe:
+        show_list(tag + "try maybe", inner)
+    kept := mkr(3)!
+    show_list(tag + "try kept", kept)
+    return kept[0] + kept[2]
+
+fn through_await(tag: String) -> Int:
+    t := spawn mk(1)
+    await t
+    t2 := spawn mk(4)
+    got := await t2
+    show_list(tag + "await got", got)
+    return got[0] + got[2]
+
+fn control_through_await(tag: String) -> Int:
+    t := spawn mk(1)
+    first := await t
+    show_list(tag + "await first", first)
+    t2 := spawn mk(4)
+    got := await t2
+    show_list(tag + "await got", got)
+    return got[0] + got[2]
+
+fn main():
+    void_chains("")
+    control_void_chains("control ")
+    shared_box("")
+    control_shared_box("control ")
+    handles("")
+    control_handles("control ")
+    print("try=" + (through_try("") catch 0).to_string())
+    print("control try=" + (control_through_try("control ") catch 0).to_string())
+    print("await=" + through_await("").to_string())
+    print("control await=" + control_through_await("control ").to_string())
+    # the same discards under churn: a count dropped once too often shows up
+    # as a corrupted read long before the loop ends
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        mk(i).reverse()
+        mkfn(i)
+        r := mkstr(i)
+        forward(r)
+        total = total + (r catch "").len()
+        t := spawn mk(i)
+        await t
+        i = i + 1
+    print("total=" + total.to_string())

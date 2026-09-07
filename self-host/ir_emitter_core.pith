@@ -3676,7 +3676,17 @@ fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
 fn ir_release_fresh_result_arg(expr_idx: Int, reg: Int):
     if not ir_expr_is_fresh_result_box(expr_idx):
         return
-    sig := ir_tuple_cascade_signature(c_get_expr_type(expr_idx))
+    ir_emit_result_box_release(reg, c_get_expr_type(expr_idx))
+
+# drop this frame's count on a result box, taking its payload with it only
+# when the count is the box's last. both places a frame holds a box it did not
+# bind — the argument release above and the statement-position discard — ask
+# the same question and cannot answer it from the callee's body, so they share
+# the emission: a signature with a heap slot goes through the per-signature
+# helper that reads the strong count, and an all-scalar signature has nothing
+# to drop and takes the plain shell release.
+fn ir_emit_result_box_release(reg: Int, tid: Int):
+    sig := ir_tuple_cascade_signature(tid)
     if sig == "00":
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
         return
@@ -6548,8 +6558,10 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             # the receiver's count must survive the call and travel with that
             # value — `sort_by_key(xs, key).reverse()` returns the reversed
             # list, and releasing the owned receiver here freed the very list
-            # being returned. a discarded void-method chain now leaks its
-            # receiver instead, which is the survivable direction.
+            # being returned. the count then belongs to whoever consumes the
+            # chain: a bind takes it, and a discarded chain drops it at the
+            # statement, where ir_discard_chain_root reads the receiver's own
+            # classification rather than the void call's.
             if not ir_is_void_method(emit_name):
                 ir_rc_release_reg(obj_r, recv_kind)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
@@ -7697,28 +7709,6 @@ fn ir_emit_release_result_error(result_r: Int, result_tid: Int):
         err_r := ir_emit_result_value_field(result_r, result_tid, "err")
         ir_rc_release_reg(err_r, err_kind)
 
-# fully release a discarded result: drop its live payload (the ok value or the
-# err value, depending on the tag) and then free the shell. a bare call
-# statement like `buf.write_byte(x)` leaves the result unowned, so without this
-# its box — and any heap payload — leaks. mirrors the ownership dance in catch.
-fn ir_emit_discard_result(result_r: Int, result_tid: Int):
-    cond_r := ir_emit_result_flag_field(result_r, "is_ok")
-    ok_l := ir_label()
-    err_l := ir_label()
-    done_l := ir_label()
-    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-    ir_emit_label(ok_l)
-    ok_kind := ir_rc_kind(ir_result_field_kind(result_tid, "ok"))
-    if ok_kind.len() > 0:
-        ok_r := ir_emit_result_value_field(result_r, result_tid, "ok")
-        ir_rc_release_reg(ok_r, ok_kind)
-    ir_emit("jmp " + done_l)
-    ir_emit_label(err_l)
-    ir_emit_release_result_error(result_r, result_tid)
-    ir_emit("jmp " + done_l)
-    ir_emit_label(done_l)
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
-
 fn ir_emit_catch_expr(node: Node) -> Int:
     # the pair fast path: a direct call to a pair-returning function delivers
     # (flag, payload) through the defer handshake and no box exists at all.
@@ -8493,13 +8483,27 @@ fn ir_stmt(idx: Int):
         if kind == "spawn":
             ir_emit_call1(ir_reg(), "pith_task_detach", "void", r)
             return
-        # a discarded result from a bare `foo()!`-less call owns its box: free
-        # its live payload and the shell, or both leak (this is what a bare
-        # `buf.write_byte(x)` did before).
-        if kind == "call" or kind == "method_call":
-            stmt_tid := c_get_expr_type(idx)
+        # the value a statement throws away is not always the expression's
+        # own. a void builtin method forces its retkind to void and hands the
+        # RECEIVER register back so chains work, so `mk(i).reverse()` leaves
+        # behind the list `mk` minted, and it is the receiver's ownership that
+        # decides whether this statement has a count to drop. walking to the
+        # root of the chain asks that question of the expression that really
+        # produced the register: `xs.reverse()` roots at a live local and is
+        # left alone, `mk(i).reverse()` roots at a call whose fresh container
+        # nothing else names. every classification below reads the root.
+        subject := ir_discard_chain_root(idx)
+        if ir_stmt_discards_owned_value(kind):
+            stmt_tid := c_get_expr_type(subject)
+            # a discarded result box carries its payload: the box has no
+            # destructor, so the payload is dropped explicitly or it leaks
+            # (this is what a bare `buf.write_byte(x)` did before). the drop
+            # is gated on the strong count for the same reason the argument
+            # release is — a callee that hands its parameter back
+            # (`forward(r)` with `r` a live local) leaves two owners on one
+            # box, and dropping the payload here emptied the local (#1075).
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
-                ir_emit_discard_result(r, stmt_tid)
+                ir_emit_result_box_release(r, stmt_tid)
                 return
             # a discarded optional result is a shell nothing will ever name,
             # and the caller holds a count on it either way: the callee
@@ -8510,42 +8514,36 @@ fn ir_stmt(idx: Int):
             # stranded the shell and the list inside it. the payload of a
             # destructor-less shell is the older leak docs/limitations.md
             # records and is not this release's to drop.
-            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(idx):
+            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "optional" and ir_optional_subject_is_owned(subject):
                 ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
                 return
-            # a discarded plain container result is a count nobody will ever
-            # release. a user function transfers its result out (the callee
-            # retains a returned borrow, transfers a fresh container), and
-            # the builtin container producers hand back either a freshly
-            # built list/map/set (keys(), values(), to_list(), split(), the
+            # a discarded heap result is a count nobody will ever release. a
+            # user function transfers its result out (the callee retains a
+            # returned borrow, transfers a fresh value), and the builtin
+            # container producers hand back either a freshly built
+            # list/map/set (keys(), values(), to_list(), split(), the
             # slice/sort copies, args()) or a count taken over the call
             # (get_default, which the call site retains; take, which the
             # map relinquishes) — the same classification every binding of
-            # these results already relies on. the one spelling whose
-            # register is NOT a count of its own is a void method's: its
-            # value is the receiver handed back for chaining, so that keeps
-            # its leak rather than freeing a container out from under its
-            # owner.
-            stmt_kind := ir_rc_kind(ir_infer_type(idx))
-            mut stmt_kind_discards := stmt_kind == "list" or stmt_kind == "map" or stmt_kind == "set"
-            # bytes and struct results ride the same rule: the producers
-            # transfer their count out exactly like the container ones,
-            # so a discarded `m.take(i)` on a Bytes- or struct-valued map
-            # (or any other discarded owned result of these kinds)
-            # stranded one count per statement.
-            if stmt_kind == "bytes" or ir_kind_is_struct_header(stmt_kind):
-                stmt_kind_discards = true
-            if stmt_kind_discards and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+            # these results already relies on. an optional shell that did not
+            # answer the question above lands here as the "tuple" kind and is
+            # settled on the ordinary ownership answer, which is how a shell
+            # a `!` handed out of a box it already freed gets released.
+            stmt_kind := ir_rc_kind(ir_infer_type(subject))
+            if ir_kind_discards_at_statement(stmt_kind) and not ir_expr_is_borrowed(subject):
                 ir_rc_release_reg(r, stmt_kind)
                 return
         # a discarded owned string result (a popped element, an unused
-        # fresh string) is garbage as soon as the statement ends. the
-        # receiver guard matters here too: `xs.reverse()` shares its name
-        # with String.reverse, the name-keyed inference calls its value a
-        # fresh string, and the release this used to emit was a cstring
-        # release aimed at a live list handle — an invalid free on any
-        # discarded void-method statement whose name a string method shares.
-        if ir_infer_type(idx) == "string" and not ir_expr_is_borrowed(idx) and not ir_discard_value_is_receiver(idx):
+        # fresh string) is garbage as soon as the statement ends. this runs
+        # for every statement-expression kind, the ones above included, so a
+        # discarded `catch` or `match` over a fresh string is released too.
+        # reading the chain root matters here as well: `xs.reverse()` shares
+        # its name with String.reverse, the name-keyed inference calls the
+        # chain's value a fresh string, and the release that used to be
+        # emitted was a cstring release aimed at a live list handle — an
+        # invalid free on any discarded void-method statement whose name a
+        # string method shares.
+        if ir_infer_type(subject) == "string" and not ir_expr_is_borrowed(subject):
             ir_string_release_reg(r)
         return
 
@@ -8590,6 +8588,49 @@ fn ir_discard_value_is_receiver(idx: Int) -> Bool:
     if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
         return false
     return ir_is_void_method(ir_method_emit_name(mname, recv_type))
+
+# the expression that really produced a discarded statement's register. a void
+# builtin method hands its receiver straight back, so `mk(i).reverse()` and
+# `mk(i)` leave the same register behind and have the same one count to drop.
+# walking down through the void links stops at the first expression that
+# minted or was handed the value, and that is the one every ownership
+# predicate here is asked about. a loop rather than one step because the walk
+# reads the tree, not the checker: a second link does not type today (a void
+# call's value is Void), and if that ever changes the register still comes
+# from the root. each step descends to a child, so the walk terminates.
+fn ir_discard_chain_root(idx: Int) -> Int:
+    mut cur := idx
+    while ir_discard_value_is_receiver(cur):
+        cur = get_node(cur).children[0]
+    return cur
+
+# the statement-expression kinds whose value arrives owned when the ownership
+# classification says so, and so has to be released here. a call and a method
+# call transfer their result out. a `!` frees the box it opened and hands the
+# payload on with the box's count, and an `await` hands over the count the
+# task's thread produced — both are the transfer ir_expr_is_borrowed already
+# reads them as, and both reached this discard without a release before.
+# `catch`, `select` and `match` are deliberately absent: they normalize their
+# arms to owned through paths of their own, and only the string release below
+# covers them today.
+fn ir_stmt_discards_owned_value(kind: String) -> Bool:
+    if kind == "call" or kind == "method_call":
+        return true
+    return kind == "try" or kind == "try_expr" or kind == "await"
+
+# the rc kinds a discarded statement value is the statement's to release. the
+# containers, `bytes` and a struct or tuple header were the first set; a
+# closure and a channel are here on the same terms, because the only way
+# either reaches a discarded statement is a call that transferred its count
+# out — a returned lambda, a returned fn-value, a constructed channel — and
+# nothing else names what it left behind. a string has its own release, which
+# runs for statement kinds this set does not cover.
+fn ir_kind_discards_at_statement(kind: String) -> Bool:
+    if kind == "list" or kind == "map" or kind == "set":
+        return true
+    if kind == "bytes" or kind == "closure" or kind == "channel":
+        return true
+    return ir_kind_is_struct_header(kind)
 
 fn ir_emit_if_stmt(node: Node):
     mut elif_indices: List[Int] := []

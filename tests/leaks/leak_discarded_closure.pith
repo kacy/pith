@@ -1,0 +1,51 @@
+# a call that hands back a closure and is discarded at statement position:
+# a returned lambda and a returned fn-value each carry a count of their own,
+# and nothing else names what the statement leaves behind. the environment
+# goes with the closure, so a captured string went the same way. a returned
+# channel is the other handle kind a call transfers out and the discard never
+# released, and it rides the same classification, so it is measured here too.
+import leakprobe as probe
+
+fn mkfn(i: Int) -> fn(Int) -> Int:
+    add := fn(x: Int) -> Int:
+        return x + i
+    return add
+
+fn mkfn_capturing(i: Int) -> fn() -> Int:
+    tag := "tag-" + i.to_string()
+    size := fn() -> Int:
+        return tag.len()
+    return size
+
+fn double(x: Int) -> Int:
+    return x + x
+
+fn mkch(i: Int) -> Channel[Int]:
+    ch := Channel[Int](2)
+    ch.send(i)
+    return ch
+
+fn pick(i: Int) -> fn(Int) -> Int:
+    if i < 0:
+        return double
+    return double
+
+fn round(i: Int) -> Int:
+    mkfn(i)
+    mkfn_capturing(i)
+    pick(i)
+    mkch(i)
+    keep := mkfn(i)
+    return keep(1)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

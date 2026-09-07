@@ -300,7 +300,17 @@ call          = "(" , [ arg_list ] , ")" ;
 (* `to_list[Counter, Int](c)`.                                            *)
 index         = "[" , expression , { "," , expression } , "]" ;
 field_access  = "." , ( IDENT | INT_LIT ) ;   (* `.name` or tuple `.0` *)
-method_call   = "." , IDENT , "(" , [ arg_list ] , ")" ;
+method_call   = "." , IDENT , [ type_args ] , "(" , [ arg_list ] , ")" ;
+
+(* a method's own type arguments, `x.describe[Int](v)`. the bracket after   *)
+(* `.name` is read as type_args, not as an index into a field, when all of  *)
+(* these hold: the token after its `]` is `(`; every token inside it can    *)
+(* appear in a type_expr; its first word is a type name (an IDENT starting  *)
+(* with an uppercase letter, or `fn`, with `(` allowed ahead of one); and   *)
+(* the receiver is not an import alias of the file. so `t.items[0](y)` and  *)
+(* `t.items[i](y)` stay an index followed by a call, and `json.decode[T](s)` *)
+(* stays a module function called with type arguments.                     *)
+type_args     = "[" , type_list , "]" ;
 
 arg_list      = arg , { "," , arg } ;
 

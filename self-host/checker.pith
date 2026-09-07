@@ -1138,7 +1138,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             method_node_idx = cn.children[0]
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
-            method_params := suppress_method_type_params(concrete_name, method_node_idx, cn)
+            method_params := suppress_method_type_params(concrete_name, cn)
             register_method_declaration_aliased(concrete_name, generic_alias, method_node_idx, cn, method_is_pub, interface_name != "")
             release_method_type_params(method_params)
             impl_method_modules.insert(method_node_idx, current_checker_module_path)
@@ -1155,20 +1155,22 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
 # returned, so lifting the suppression afterwards cannot drop a name the
 # enclosing impl block owns.
 #
-# a method type parameter on a generic owner is refused here rather than
-# registered: the owner's parameters are substituted per instantiation and the
-# method's per call site, and nothing downstream composes the two, so accepting
-# the shape would lower one substitution against the other's body.
-fn suppress_method_type_params(owner_name: String, method_idx: Int, method_node: Node) -> List[String]:
+# on a generic owner the two lists compose: the owner's parameters are fixed
+# by the receiver's instance and the method's by the call, and the body is
+# walked once per combination (c_check_specialization). the composition
+# substitutes by name, so a method parameter spelled like one of the owner's
+# would silently resolve to the owner's type everywhere it is written; that
+# spelling is refused (E265) rather than composed.
+fn suppress_method_type_params(owner_name: String, method_node: Node) -> List[String]:
     mut added: List[String] := []
     if declaration_has_generic_params(method_node) == false:
         return added
+    mut owner_params: List[String] := []
     if has_generic_declaration(owner_name):
-        report_error_at(first_generic_param_index(method_node), "E265", "generic method '" + method_node.value + "' on generic type '" + owner_name + "': a method may declare its own type parameters only on a non-generic type")
-    # suppress either way: with the shape refused the signature still has to
-    # resolve quietly, or every mention of the parameter stacks an E202 under
-    # the one error that explains the problem.
+        owner_params = collect_generic_parameter_names(get_node(get_generic_declaration_index(owner_name)))
     for name in collect_generic_parameter_names(method_node):
+        if owner_params.contains(name):
+            report_error_at(first_generic_param_index(method_node), "E265", "generic method '" + method_node.value + "' on generic type '" + owner_name + "' reuses its owner's type parameter name '" + name + "'; a method's own type parameters need names of their own")
         if suppress_unknown_type_for.contains_key(name) == false:
             suppress_unknown_type_for.insert(name, 1)
             added.push(name)
@@ -1176,7 +1178,7 @@ fn suppress_method_type_params(owner_name: String, method_idx: Int, method_node:
 
 # the declaration's first type-parameter node, which carries the position of
 # the bracket list — the fn_decl node itself is built after its body and points
-# past it. answers the declaration when it has no type parameters.
+# past it. answers -1 when the declaration has no type parameters.
 fn first_generic_param_index(node: Node) -> Int:
     for child in node.children:
         if get_node(child).kind == "generic_param":
@@ -1315,7 +1317,7 @@ fn fill_impl_defaults(node: Node):
             if owner >= 0:
                 provides_own = has_method_declaration(method_tid_key(owner, mn.value))
             if provides_own == false:
-                default_params := suppress_method_type_params(concrete_name, member, mn)
+                default_params := suppress_method_type_params(concrete_name, mn)
                 register_method_declaration_aliased(concrete_name, generic_alias, member, mn, true, true)
                 release_method_type_params(default_params)
 
@@ -4947,6 +4949,62 @@ fn collect_function_return_type_with_subst(node: Node, params: List[String], arg
                 return resolve_type_with_substitution_map(cn.children[0], params, args)
     return TID_VOID
 
+# the declaration key of a user-defined method on `dispatch_type`, or "" when
+# the type declares none by that name. the receiver's checked tid names the
+# exact declaration, so the tid key is tried first — two modules can declare
+# a same-named struct and only the tid can tell their methods apart. methods
+# on a generic struct are registered under the base name (e.g. "Iter"), so
+# the name-keyed fallback remains: the qualified name ("Iter[Int].next"),
+# then the base name. a name-keyed entry that belongs to a different
+# declaration of the same name must not answer for this receiver; refusing
+# it lets the caller's E209 name the type.
+fn user_method_declaration_key(dispatch_type: Int, method_name: String) -> String:
+    type_name := get_type_name(dispatch_type)
+    mut key := method_tid_key(dispatch_type, method_name)
+    if has_method_declaration(key) == false:
+        key = type_name + "." + method_name
+        if has_method_declaration(key) == false:
+            base_name := extract_base_type_name(type_name)
+            if base_name != type_name:
+                key = base_name + "." + method_name
+        owner := method_declaration_owner(key)
+        if owner >= 0 and owner != dispatch_type:
+            key = ""
+    if key.len() > 0 and has_method_declaration(key):
+        return key
+    return ""
+
+# the type-expression nodes written between the brackets of a method call
+# (`x.describe[Int, String](v)`), in order; empty when the call wrote none.
+fn method_call_type_arguments(node: Node) -> List[Int]:
+    mut empty: List[Int] := []
+    if node.type_args < 0:
+        return empty
+    return get_node(node.type_args).children
+
+# the type arguments a method call wrote, resolved against the method's own
+# parameters in declaration order: the explicit counterpart of
+# infer_method_type_arguments, and the method form of
+# check_generic_function_call_explicit. the count has to match the
+# declaration (E221), every written type has to resolve, and the bounds have
+# to hold; answers [] having reported otherwise.
+fn resolve_written_method_type_args(method_name: String, decl_idx: Int, method_params: List[String], written: List[Int]) -> List[Int]:
+    mut empty: List[Int] := []
+    if written.len() != method_params.len():
+        report_error("E221", method_name + " expects " + method_params.len().to_string() + " type arguments, got " + written.len().to_string())
+        return empty
+    mut tids: List[Int] := []
+    mut subst_map: Map[String, Int] := {}
+    for type_idx, i in written:
+        tid := resolve_type_implementation(type_idx)
+        if is_error_type(tid):
+            return empty
+        tids.push(tid)
+        subst_map.insert(method_params[i], tid)
+    if check_type_parameter_bounds(decl_idx, subst_map) == false:
+        return empty
+    return tids
+
 # a method-call node's value sometimes carries the leading dot of its
 # spelling (`.next`); resolution always wants the bare name.
 fn normalized_method_name(raw: String) -> String:
@@ -5267,6 +5325,27 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         dispatch_type = recv_info.inner
         recv_info = get_type_info(dispatch_type)
 
+    # type arguments written at the call (`x.describe[Int](v)`) belong to a
+    # user-declared method with type parameters of its own, and the method
+    # tables below know nothing of them. refuse every other target here, so a
+    # written list is never silently dropped on the floor by a table that
+    # happens to answer the name.
+    written_type_args := method_call_type_arguments(node)
+    if written_type_args.len() > 0:
+        generic_key := user_method_declaration_key(dispatch_type, method_name)
+        if generic_key.len() == 0:
+            # a field of closures indexed by a type-shaped expression (a
+            # constant, an enum variant) and called is the one shape the
+            # parser's rule reads as type arguments; name the way out.
+            if recv_info.fields.contains(method_name):
+                report_error("E209", "'" + method_name + "' is a field of " + get_type_name(receiver_type) + ", not a method; to index it and call the element, bind the element first or write (" + method_name + "[...])(...)")
+                return TID_ERR
+            report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "' that takes type arguments")
+            return TID_ERR
+        if declaration_has_generic_params(get_node(get_method_declaration_index(generic_key))) == false:
+            report_error("E221", method_name + " expects 0 type arguments, got " + written_type_args.len().to_string())
+            return TID_ERR
+
     tid_string := lookup_type_id("String")
     tid_bytes := lookup_type_id("Bytes")
     tid_int := lookup_type_id("Int")
@@ -5353,26 +5432,10 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 return receiver_type
             vi = vi + 1
 
-    # user-defined methods. the receiver's checked tid names the exact
-    # declaration, so the tid key is tried first — two modules can declare a
-    # same-named struct and only the tid can tell their methods apart.
-    # methods on a generic struct are registered under the base name (e.g.
-    # "Iter"), so the name-keyed fallback remains: the qualified name
-    # ("Iter[Int].next"), then the base name. a name-keyed entry that
-    # belongs to a different declaration of the same name must not answer
-    # for this receiver; refusing it lets the E209 below name the type.
+    # user-defined methods
     type_name := get_type_name(dispatch_type)
-    mut key := method_tid_key(dispatch_type, method_name)
-    if has_method_declaration(key) == false:
-        key = type_name + "." + method_name
-        if has_method_declaration(key) == false:
-            base_name := extract_base_type_name(type_name)
-            if base_name != type_name:
-                key = base_name + "." + method_name
-        owner := method_declaration_owner(key)
-        if owner >= 0 and owner != dispatch_type:
-            key = ""
-    if key.len() > 0 and has_method_declaration(key):
+    key := user_method_declaration_key(dispatch_type, method_name)
+    if key.len() > 0:
         record_definition(checker_current_node_index(), get_method_declaration_index(key))
         method_node := get_node(get_method_declaration_index(key))
         queue_dispatched_method(get_method_declaration_index(key), dispatch_type)
@@ -5401,21 +5464,32 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         # signature resolves. the types land in the expression cache and the
         # validation loop below reads them back rather than checking a second
         # time, which would report anything wrong inside an argument twice.
+        # a call that writes its type arguments (`x.run[Int](v)`) skips the
+        # inference: the written list is resolved and checked against the
+        # declaration instead, and the arguments are checked once, below.
         mut method_args_prechecked := false
         if declaration_has_generic_params(method_node):
             method_params := collect_generic_parameter_names(method_node)
-            mut method_arg_types: List[Int] := []
-            for ai in arg_indices:
-                method_arg_types.push(c_check_expr(argument_expression_index(ai), scope_id))
-            method_args_prechecked = true
-            method_type_args := infer_method_type_arguments(method_node, get_method_declaration_index(key), method_name, method_params, method_arg_types)
+            mut method_type_args: List[Int] := []
+            if written_type_args.len() > 0:
+                method_type_args = resolve_written_method_type_args(method_name, get_method_declaration_index(key), method_params, written_type_args)
+            else:
+                mut method_arg_types: List[Int] := []
+                for ai in arg_indices:
+                    method_arg_types.push(c_check_expr(argument_expression_index(ai), scope_id))
+                method_args_prechecked = true
+                method_type_args = infer_method_type_arguments(method_node, get_method_declaration_index(key), method_name, method_params, method_arg_types)
             if method_type_args.len() == 0:
                 return TID_ERR
             for mp in method_params:
                 struct_params.push(mp)
             for ma in method_type_args:
                 struct_args.push(ma)
-            record_generic_call_subst(method_type_args)
+            # the record the emitter reads is the whole specialization key:
+            # on a generic owner the receiver's instance arguments come first,
+            # then the method's own, so `Box[Int].map[String]` and
+            # `Box[String].map[String]` are two bodies.
+            record_generic_call_subst(owner_and_method_type_args(dispatch_type, method_type_args))
             queue_function_specialization(get_method_declaration_index(key), dispatch_type, method_type_args)
         param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
         ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
@@ -6113,9 +6187,11 @@ fn parse_integer_string(s: String) -> Int:
 # ---------------------------------------------------------------
 
 # true, having reported, when this index expression brackets a generic
-# method: `x.describe[Int]`. answers false for every other shape, including
-# an index into a field that happens to share a method's name, so the
-# ordinary index checking below is untouched.
+# method without calling it: `x.describe[Int]` on its own. the parser reads
+# `x.describe[Int](v)` as a method call carrying type arguments, so what
+# reaches here is the bracket list with no call after it. answers false for
+# every other shape, including an index into a field that happens to share a
+# method's name, so the ordinary index checking below is untouched.
 fn indexes_a_generic_method(node: Node, scope_id: Int) -> Bool:
     base := get_node(node.children[0])
     if base.kind != "field_access" or base.children.len() == 0:
@@ -6143,7 +6219,7 @@ fn indexes_a_generic_method(node: Node, scope_id: Int) -> Bool:
             return false
     if declaration_has_generic_params(get_node(get_method_declaration_index(key))) == false:
         return false
-    report_error("E209", get_type_name(recv_type) + "." + base.value + " is a generic method: its type arguments are inferred from the call's arguments and cannot be written at the call site")
+    report_error("E209", get_type_name(recv_type) + "." + base.value + " is a generic method: its type arguments go ahead of the call's parentheses, as in " + base.value + "[" + arg.value + "](...)")
     return true
 
 fn check_index_expression(node: Node, scope_id: Int) -> Int:
@@ -6152,11 +6228,10 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")
     if node.children.len() < 2:
         return TID_ERR
-    # `x.describe[Int](v)` parses as an index into `x.describe`, not as a call
-    # carrying type arguments: a method's own type parameters have no explicit
-    # spelling and are fixed by the argument types. name that here — checking
-    # the parts would report a missing field and an undefined variable, and
-    # neither reads as the real problem.
+    # `x.describe[Int]` with no call after it is an index into `x.describe`,
+    # which is a method, not a field. name that here — checking the parts
+    # would report a missing field and an undefined variable, and neither
+    # reads as the real problem.
     if indexes_a_generic_method(node, scope_id):
         return TID_ERR
     mut obj_type := c_check_expr(node.children[0], scope_id)
@@ -7433,6 +7508,16 @@ fn specialization_suffix(name: String, tids: List[Int]) -> String:
         names.push(get_type_name(t))
     return " in " + name + "[" + names.join(", ") + "]"
 
+# the type arguments of the receiver's generic instance, when `self_tid` is
+# one, followed by a generic method's own; the method's alone otherwise.
+fn owner_and_method_type_args(self_tid: Int, method_tids: List[Int]) -> List[Int]:
+    mut combined: List[Int] := []
+    if struct_instance_type_args.contains_key(self_tid):
+        combined = decode_tid_list(struct_instance_type_args[self_tid])
+    for t in method_tids:
+        combined.push(t)
+    return combined
+
 # record the type arguments settled for the generic call being checked,
 # keyed by the call node, for the emitter to read back.
 fn record_generic_call_subst(tids: List[Int]):
@@ -7518,41 +7603,76 @@ fn walk_specialized_body(decl_idx: Int, decl_node: Node, self_tid: Int, param_ty
         elif cn.kind == "body":
             check_function_body(child, fn_scope)
 
-## walk a generic function's body, or a generic method's on a concrete owner,
-## with its type parameters resolving to `concrete_tids`. `self_tid` is the
-## owner for a method and -1 for a free function. with `report` false nothing
-## is recorded: the emitter walks this way to have the expression types for
-## the body it is about to emit, after the check pass reported already.
+## walk a generic function's body, or a generic method's, with the method's
+## own type parameters resolving to `concrete_tids`. `self_tid` is the owner
+## for a method and -1 for a free function; when the owner is an instance of
+## a generic struct (`Box[Int].map[String]`) the struct's parameters and
+## associated types resolve to that instance's ahead of the method's own, so
+## the body is walked once per combination of the two lists. with `report`
+## false nothing is recorded: the emitter walks this way to have the
+## expression types for the body it is about to emit, after the check pass
+## reported already.
 pub fn c_check_specialization(decl_idx: Int, self_tid: Int, concrete_tids: List[Int], report: Bool):
     if decl_idx < 0:
         return
     decl_node := get_node(decl_idx)
     if decl_node.kind != "fn_decl":
         return
-    generic_params := collect_generic_parameter_names(decl_node)
-    if generic_params.len() != concrete_tids.len():
+    method_params := collect_generic_parameter_names(decl_node)
+    if method_params.len() != concrete_tids.len():
         return
     for t in concrete_tids:
         if t < 0 or is_error_type(t):
             return
+    mut params: List[String] := []
+    mut args: List[Int] := []
+    mut suffix := specialization_suffix(decl_node.value, concrete_tids)
+    mut assoc: Map[String, Int] := {}
+    if struct_instance_decl_idx.contains_key(self_tid) and struct_instance_base_name.contains_key(self_tid):
+        base := struct_instance_base_name[self_tid]
+        params = collect_generic_parameter_names(get_node(struct_instance_decl_idx[self_tid]))
+        args = decode_tid_list(struct_instance_type_args[self_tid])
+        if params.len() != args.len():
+            return
+        assoc = instance_assoc_bindings(base, params, args)
+        suffix = " in " + get_type_name(self_tid) + "." + suffix.substring(4, suffix.len())
+    for mp in method_params:
+        params.push(mp)
+    for t in concrete_tids:
+        args.push(t)
     mut prev_reporting := true
     if report == false:
         prev_reporting = checker_set_reporting(false)
     prev_module := enter_module_context(declaration_module(decl_idx))
-    prev_suffix := checker_set_message_suffix(specialization_suffix(decl_node.value, concrete_tids))
+    prev_suffix := checker_set_message_suffix(suffix)
+    saved_assoc := active_assoc_bindings
+    if assoc.len() > 0:
+        active_assoc_bindings = assoc
     saved_params := active_subst_params
     saved_args := active_subst_args
-    active_subst_params = generic_params
-    active_subst_args = concrete_tids
-    param_types := collect_function_param_types_with_subst(decl_node, generic_params, concrete_tids)
-    ret_type := collect_function_return_type_with_subst(decl_node, generic_params, concrete_tids)
+    active_subst_params = params
+    active_subst_args = args
+    param_types := collect_function_param_types_with_subst(decl_node, params, args)
+    ret_type := collect_function_return_type_with_subst(decl_node, params, args)
     walk_specialized_body(decl_idx, decl_node, self_tid, param_types, ret_type)
     active_subst_params = saved_params
     active_subst_args = saved_args
+    active_assoc_bindings = saved_assoc
     checker_set_message_suffix(prev_suffix)
     enter_module_context(prev_module)
     if report == false:
         checker_set_reporting(prev_reporting)
+
+# the associated-type bindings of `base`'s impl, resolved through one
+# instance's type arguments (`Item -> Int` on a `Holder[Int]`).
+fn instance_assoc_bindings(base: String, params: List[String], args: List[Int]) -> Map[String, Int]:
+    mut bindings: Map[String, Int] := {}
+    if type_assoc_names.contains_key(base):
+        for an in type_assoc_names[base].split(","):
+            bkey := base + "." + an
+            if assoc_type_binding_node.contains_key(bkey):
+                bindings.insert(an, resolve_type_with_substitution_map(assoc_type_binding_node[bkey], params, args))
+    return bindings
 
 ## walk a plain method of a generic struct against one instance of it, with
 ## the struct's type parameters and associated types resolving to the
@@ -7579,12 +7699,7 @@ pub fn c_check_method_specialization(method_idx: Int, inst_tid: Int, report: Boo
     prev_module := enter_module_context(declaration_module(method_idx))
     prev_suffix := checker_set_message_suffix(" in " + get_type_name(inst_tid) + "." + method_node.value)
     saved_assoc := active_assoc_bindings
-    active_assoc_bindings = {}
-    if type_assoc_names.contains_key(base):
-        for an in type_assoc_names[base].split(","):
-            bkey := base + "." + an
-            if assoc_type_binding_node.contains_key(bkey):
-                active_assoc_bindings.insert(an, resolve_type_with_substitution_map(assoc_type_binding_node[bkey], params, args))
+    active_assoc_bindings = instance_assoc_bindings(base, params, args)
     saved_params := active_subst_params
     saved_args := active_subst_args
     active_subst_params = params

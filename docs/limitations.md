@@ -153,15 +153,23 @@ something here that now works, the page is stale and a fix to it is welcome.
   method may declare more than one parameter, and bounds work in both
   spellings (`[T: Label]` and a `where` clause). interface members take
   type parameters too, in the abstract and the default form, and a call
-  across a module boundary specializes the same way. two things do not
-  work. type arguments cannot be written at the call site —
-  `x.describe[Int](v)` parses as an index into a field rather than a call
-  carrying type arguments — so a parameter that appears in no argument has
-  nothing to fix it and the call is E222. the other is a generic owner:
-  `impl Box[T]: fn map[U](...)` is E265. past those two a generic method
-  behaves as a free generic function does: its body is typed against the
-  concrete types before it is emitted and releases its locals like a concrete
-  body (docs/generics.md).
+  across a module boundary specializes the same way. the type arguments can
+  be written at the call, `x.describe[Int](v)`, which is how a parameter
+  that appears in no argument is fixed (`x.blank[Int]()`; the bare call is
+  E222). the parser reads the bracket after `.name` as type arguments only
+  when `(` follows it, its contents spell types, its first word starts with
+  an uppercase letter or is `fn`, and the receiver is not an import alias, so
+  `t.items[0](y)` stays an index into a field and `json.decode[Row](s)` a
+  module call; the shapes it misreads are a type-shaped index into a field
+  of closures, a SCREAMING_CASE constant or an enum variant,
+  `t.items[MAX](y)`, which the checker refuses with the repair named:
+  group the index, `(t.items[MAX])(y)` (docs/generics.md). a generic owner works too: `impl Box[T]:
+  fn map[U](f: fn(T) -> U) -> Box[U]` is specialized once per combination
+  of the receiver's instance arguments and the method's own, and its body is
+  checked per combination. the method's parameter names must differ from
+  the owner's (E265). a generic method behaves as a free generic function
+  does: its body is typed against the concrete types before it is emitted
+  and releases its locals like a concrete body (docs/generics.md).
 - **generic enums construct, infer, and match like any other enum** — a
   constructor with a payload argument infers its instance (`x :=
   Opt.Some(5)` is an `Opt[Int]`), an annotated binding supplies the

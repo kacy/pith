@@ -236,6 +236,12 @@ pub mut ir_generic_emitted_specializations: Map[String, Int] := {}
 ## A method's specialization takes a leading self parameter and emits inside
 ## its impl's context; nothing else about it differs from a free function's.
 pub mut ir_generic_method_owners: Map[String, String] := {}
+## How many type parameters the owner of each generic method declares, keyed
+## like ir_generic_method_owners; absent or 0 for a concrete owner. On a
+## generic owner a specialization's type arguments are the receiver
+## instance's followed by the method's own, and this count is where the two
+## lists meet.
+pub mut ir_generic_method_owner_param_counts: Map[String, Int] := {}
 
 ## file a generic declaration under its module-qualified name.
 pub fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
@@ -250,10 +256,21 @@ pub fn ir_is_generic_function_name(name: String) -> Bool:
     return ir_generic_decl_indices.contains_key(name)
 
 ## file a generic impl method under the symbol dispatch resolves it to.
-pub fn ir_record_generic_method_decl(method_idx: Int, full_name: String, impl_type: String, module_path: String):
+## `owner_param_count` is how many type parameters the impl target declares:
+## 0 for a concrete owner.
+pub fn ir_record_generic_method_decl(method_idx: Int, full_name: String, impl_type: String, module_path: String, owner_param_count: Int):
     ir_generic_decl_indices.insert(full_name, method_idx)
     ir_generic_decl_module_paths.insert(full_name, module_path)
     ir_generic_method_owners.insert(full_name, impl_type)
+    ir_generic_method_owner_param_counts.insert(full_name, owner_param_count)
+
+## how many of a generic declaration's type arguments belong to its owner's
+## instance: the owner's parameter count for a method on a generic struct,
+## 0 for a free function or a method on a concrete owner.
+pub fn ir_generic_owner_param_count(name: String) -> Int:
+    if ir_generic_method_owner_param_counts.contains_key(name):
+        return ir_generic_method_owner_param_counts[name]
+    return 0
 
 ## true when the name is a recorded generic impl method.
 pub fn ir_is_generic_method_name(name: String) -> Bool:
@@ -362,7 +379,7 @@ pub fn ir_queue_generic_specialization_for_tids(name: String, tids: List[Int], r
     key := name + chr(9) + "tids" + chr(9) + spellings.join(chr(9))
     if ir_generic_specialization_names.contains_key(key):
         return ir_generic_specialization_names[key]
-    spec_name := name + "__" + spellings.join("_")
+    spec_name := ir_generic_specialization_symbol(name, spellings)
     if ir_generic_specialization_by_symbol.contains_key(spec_name):
         return spec_name
     ir_generic_specialization_by_symbol.insert(spec_name, key)
@@ -375,6 +392,30 @@ pub fn ir_queue_generic_specialization_for_tids(name: String, tids: List[Int], r
     ir_generic_specialization_subst_tids.insert(key, parts.join(","))
     ir_func_returns.insert(spec_name, ret_type)
     return spec_name
+
+## the symbol of one specialization from its type-argument spellings. a free
+## function or a method on a concrete owner appends its arguments after a
+## double underscore (`first__int`, `Sink_echo__string`). a method on a
+## generic owner spells the owner's instance arguments where the
+## per-instance copies of its plain methods spell theirs, between the owner
+## and the method name, and its own after the method name as every
+## specialization does: `Box_int_map__string` is `Box[Int].map[String]`,
+## beside `Box_int_describe` for the plain `Box[Int].describe`. the two
+## lists never mix, so the symbol reads back as the pair it was built from.
+fn ir_generic_specialization_symbol(name: String, spellings: List[String]) -> String:
+    owner_count := ir_generic_owner_param_count(name)
+    if owner_count == 0 or owner_count >= spellings.len():
+        return name + "__" + spellings.join("_")
+    method_name := get_node(ir_generic_decl_indices[name]).value
+    owner_symbol := name.substring(0, name.len() - method_name.len() - 1)
+    mut owner_part: List[String] := []
+    mut method_part: List[String] := []
+    for spelling, i in spellings:
+        if i < owner_count:
+            owner_part.push(spelling)
+        else:
+            method_part.push(spelling)
+    return owner_symbol + "_" + owner_part.join("_") + "_" + method_name + "__" + method_part.join("_")
 
 ## the checker's type arguments recorded for a spec key, or an empty list.
 pub fn ir_decode_generic_spec_subst_tids(key: String) -> List[Int]:

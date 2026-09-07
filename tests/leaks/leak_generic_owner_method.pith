@@ -1,0 +1,49 @@
+# a generic method on a generic owner: `impl Box[T]: fn map[U](...)`. the body
+# is emitted once per combination of the owner's instance arguments and the
+# method's own, so the specialization's prologue and exit cleanup have to run
+# with both lists in force — a body that read only one of them would take the
+# wrong count for a `T`-typed field or a `U`-typed local. each call binds a
+# heap local of its own, builds an instance the caller owns, and hands it
+# back; the caller reads the result and lets it go. the churn covers both
+# owner instances the program builds and, on each, a written type argument
+# beside an inferred one.
+import leakprobe as probe
+
+struct Box[T]:
+    pub item: T
+
+impl Box:
+    # a heap local per call, and a new instance of the same generic returned
+    fn relabel[U](fresh: U) -> Box[U]:
+        note := "was " + self.item.to_string()
+        if note.len() == 0:
+            print("unreachable")
+        return Box(fresh)
+
+    # U appears in no argument, so every call writes it
+    fn blank[U]() -> Box[U]?:
+        return none
+
+fn churn_round(i: Int) -> Int:
+    ints := Box[Int](item: i)
+    words := Box[String](item: "w-" + i.to_string())
+    a := ints.relabel("s-" + i.to_string())
+    b := ints.relabel[List[String]](["l-" + i.to_string()])
+    c := words.relabel(i)
+    d := words.relabel[String]("t-" + i.to_string())
+    e := ints.blank[String]()
+    f := words.blank[List[Int]]()
+    mut total := a.item.len() + b.item.len() + c.item + d.item.len()
+    if e == none and f == none:
+        total = total + 1
+    return total
+
+fn main():
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + churn_round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

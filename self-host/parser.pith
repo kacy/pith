@@ -6,7 +6,7 @@
 # usage: import from parse_main.pith or call parse() directly
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot
-from ast import Node, add_node, add_leaf, get_node
+from ast import Node, add_node, add_node_with_type_args, add_leaf, get_node
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -18,6 +18,12 @@ mut recursion_depth := 0
 mut max_depth := 256
 mut parser_file_path := ""
 mut parser_diag_list: List[Diagnostic] := []
+# the module aliases this file's imports introduce (`import std.json` puts
+# `json` here, `import std.json as j` puts `j`). the postfix parser reads it
+# to tell `json.decode[T](s)`, a module function called with type arguments,
+# from `x.describe[T](v)`, a method called with them: see
+# method_type_args_follow.
+mut import_aliases: Map[String, Bool] := {}
 
 fn _cur_tok_kind() -> String:
     tc := tok_count()
@@ -57,6 +63,21 @@ fn _peek_ahead_kind(offset: Int) -> String:
             skipped = skipped + 1
         i = i + 1
     return tok_kind(tc - 1)
+
+fn _peek_ahead_value(offset: Int) -> String:
+    tc := tok_count()
+    if tc == 0:
+        return ""
+    mut i := current_token_position
+    mut skipped := 0
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            if skipped == offset:
+                return tok_value(i)
+            skipped = skipped + 1
+        i = i + 1
+    return tok_value(tc - 1)
 
 # -------------------------------------------------------------
 # position-aware AST helpers (must come after state declarations)
@@ -596,6 +617,24 @@ fn parse_postfix() -> Int:
                     for a in call_args:
                         children.push(a)
                     expr = add_node_with_position("method_call", name_tok.value, children)
+                elif check("lbracket") and method_type_args_follow(expr):
+                    # method call with written type arguments: expr.name[T](args).
+                    # the receiver and the arguments sit where every method call
+                    # keeps them; the types hang off the node's type_args slot.
+                    advance_token()
+                    mut types: List[Int] := [parse_type_expr()]
+                    while match_tok("comma"):
+                        types.push(parse_type_expr())
+                    expect("rbracket")
+                    type_args := add_node_with_position("type_args", "", types)
+                    expect("lparen")
+                    call_args := parse_arg_list()
+                    expect("rparen")
+                    mut children: List[Int] := [expr]
+                    for a in call_args:
+                        children.push(a)
+                    pos := get_current_position()
+                    expr = add_node_with_type_args("method_call", name_tok.value, children, type_args, pos.0, pos.1)
                 else:
                     # field access: expr.name
                     mut children: List[Int] := [expr]
@@ -622,6 +661,63 @@ fn parse_postfix() -> Int:
             has_postfix = false
 
     return expr
+
+# whether the `[` after `expr.name` opens a type-argument list rather than
+# an index. the two readings share their surface, so the rule is decided
+# here, once, from tokens alone: the bracket list is a type-argument list
+# when the token after its closing `]` is `(`, everything inside it is a
+# token a type expression can contain, its first word is a type name (an
+# identifier beginning with an uppercase letter, or `fn`; a `(` may group or
+# open a tuple type ahead of one), and the receiver is not a module alias.
+#
+# the corpus fixes the two shapes that have to keep their meaning. an index
+# into a field followed by a call, `x.items[0](y)` or `x.items[i](y)`, holds
+# a literal or a lowercase binding, and stays an index. a module function
+# called with type arguments, `json.decode[T](s)`, spells exactly what a
+# method call with them spells, and the alias table is what tells them
+# apart: an import alias as the receiver keeps the index-then-call shape
+# the module paths read. a constant used as an index into a field of
+# closures, `x.items[MAX](y)`, is the one shape this rule misreads; bind
+# the element first.
+fn method_type_args_follow(recv_idx: Int) -> Bool:
+    recv := get_node(recv_idx)
+    if recv.kind == "ident" and import_aliases.contains_key(recv.value):
+        return false
+    mut depth := 0
+    mut i := 0
+    mut first_word_seen := false
+    while true:
+        kind := _peek_ahead_kind(i)
+        if kind == "eof":
+            return false
+        if kind == "lbracket":
+            depth = depth + 1
+        elif kind == "rbracket":
+            depth = depth - 1
+            if depth == 0:
+                return first_word_seen and _peek_ahead_kind(i + 1) == "lparen"
+        elif i > 0 and first_word_seen == false and kind != "lparen":
+            # the first word inside the brackets: a type name or `fn`
+            if kind == "kw_fn":
+                first_word_seen = true
+            elif kind == "identifier" and identifier_names_a_type(_peek_ahead_value(i)):
+                first_word_seen = true
+            else:
+                return false
+        elif i > 0 and type_list_token(kind) == false:
+            return false
+        i = i + 1
+
+# the tokens a type expression is spelled from.
+fn type_list_token(kind: String) -> Bool:
+    return kind == "identifier" or kind == "dot" or kind == "comma" or kind == "lbracket" or kind == "rbracket" or kind == "lparen" or kind == "rparen" or kind == "question" or kind == "bang" or kind == "arrow" or kind == "kw_fn"
+
+# a type is spelled PascalCase, so its first byte is an uppercase letter.
+fn identifier_names_a_type(name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    c := ord(name[0])
+    return c >= 65 and c <= 90
 
 fn parse_call_expr(callee: Int) -> Int:
     advance_token()
@@ -1571,6 +1667,7 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     recursion_depth = 0
     parser_file_path = file_path
     parser_diag_list = []
+    import_aliases = {}
 
     # a lexer error token is a hard lexical error. surface every one up
     # front: statement recovery skips stray tokens to the next newline,
@@ -1651,10 +1748,15 @@ fn parse_import_decl() -> Int:
     advance_token()
     path := parse_dotted_path()
     mut parts: List[String] := [path]
+    mut alias := path
+    if path.contains("."):
+        alias = path.substring(path.last_index_of(".") + 1, path.len())
     if match_tok("kw_as"):
         alias_tok := expect("identifier")
         parts.push("as")
         parts.push(alias_tok.value)
+        alias = alias_tok.value
+    import_aliases.insert(alias, true)
 
     return add_leaf_with_position("import", parts.join(" "))
 

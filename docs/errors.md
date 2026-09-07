@@ -147,6 +147,14 @@ error[E209]: field 'z' not found on type 'Point'
         ^
 ```
 
+the same code covers a missing method, and a method call that writes type
+arguments on a name the receiver's type does not declare as a method with
+type parameters — a builtin such as `s.len[Int]()`, or a field.
+
+```
+error[E209]: String has no method 'len' that takes type arguments
+```
+
 ### E210 — not a struct type
 
 a field access or struct constructor was used on a non-struct type. the same
@@ -245,6 +253,14 @@ the rest. send a struct when one message should carry several fields.
 
 ```
 error[E221]: Channel expects 1 type argument, got 2
+```
+
+type arguments written at a method call, `x.describe[Int](v)`, count
+against the method's own bracket list the same way; a method that declares
+no type parameters expects zero.
+
+```
+error[E221]: describe expects 1 type arguments, got 2
 ```
 
 ### E222 — generic type inference failure
@@ -824,15 +840,18 @@ or fix the spelling.
 error[E264]: where clause names 'U', which is not a type parameter of 'f'
 ```
 
-### E265 — generic method on a generic type
+### E265 — generic method reuses its owner's type parameter name
 
-a method declared type parameters of its own on a type that already has
-some. the two substitutions would have to compose — the type's are fixed
-once per instantiation, the method's once per call site — and the
-specializer carries one at a time. move the method to a non-generic type,
-or drop its bracket list and let the type's parameters carry the varying
-part.
+a method of a generic type declared a type parameter with the same name as
+one of the type's own. the two lists compose by name — the type's parameters
+are fixed by the receiver's instance, the method's by the call — so a
+method parameter spelled `T` on a `Box[T]` would resolve to the box's `T`
+everywhere it is written, never to the call's type. give the method's
+parameter a name of its own.
+
+the code used to refuse every generic method on a generic type; that shape
+is supported now (docs/generics.md), and only the name clash is reported.
 
 ```
-error[E265]: generic method 'describe' on generic type 'Box': a method may declare its own type parameters only on a non-generic type
+error[E265]: generic method 'describe' on generic type 'Box' reuses its owner's type parameter name 'T'; a method's own type parameters need names of their own
 ```

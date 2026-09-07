@@ -1,0 +1,49 @@
+# fresh bytes keys inserted and removed per round, through a set and a
+# map. the container keeps its own copy of each key's content and never a
+# count on the caller's object, so a key built on the spot dies at the
+# operation that read it — a bound one at scope exit, a temporary right
+# after the call — and the entries themselves leave with `remove` and
+# `take`. every lookup spelling churns here: add, contains, remove, insert
+# by method and by index, get, get_default, contains_key, take, and the
+# keys() list, which owns the fresh bytes objects it hands out.
+import leakprobe as probe
+
+fn round(i: Int, keys: Set[Bytes], labels: Map[Bytes, String]) -> Int:
+    mut acc := 0
+    key := bytes_from_string_utf8("k-{i}")
+    keys.add(key)
+    keys.add(bytes_from_string_utf8("k-{i}"))
+    if keys.contains(bytes_from_string_utf8("k-{i}")):
+        acc = acc + 1
+    keys.remove(bytes_from_string_utf8("k-{i}"))
+    acc = acc + keys.len()
+
+    labels.insert(key, "v-{i}-payload")
+    labels[bytes_from_string_utf8("k-{i}")] = "w-{i}-payload"
+    if let found = labels.get(bytes_from_string_utf8("k-{i}")):
+        acc = acc + found.len()
+    acc = acc + labels.get_default(bytes_from_string_utf8("zz-{i}"), "?").len()
+    if labels.contains_key(key):
+        acc = acc + 1
+    for k in labels.keys():
+        acc = acc + k.len()
+    taken := labels.take(bytes_from_string_utf8("k-{i}"))
+    acc = acc + taken.len()
+    labels.insert(bytes_from_string_utf8("r-{i}"), "r-{i}-payload")
+    labels.remove(bytes_from_string_utf8("r-{i}"))
+    acc = acc + labels.len()
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut keys: Set[Bytes] := {}
+    mut labels: Map[Bytes, String] := {}
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i, keys, labels)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

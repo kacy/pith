@@ -87,6 +87,23 @@ the declaration and a reader would have to hunt for it.
 Collections are shared handles. If a function needs to mutate its own top-level
 container, start with `copy_list`, `copy_map`, or `copy_set`.
 
+A set element or a map key is an `Int`, a `String`, or `Bytes`; the checker
+rejects anything else (E254). A `Set[Bytes]` or `Map[Bytes, V]` compares its
+keys by content, so a key read off a socket and the same bytes built from a
+string find one entry, and the container keeps its own copy of each key
+rather than a count on your bytes value:
+
+```pith
+mut seen: Set[Bytes] := {}
+seen.add(bytes.from_string_utf8("abc"))
+print("{seen.contains(frame.slice(0, 3))}")   # true when the frame starts with abc
+
+mut names: Map[Bytes, String] := {}
+names[digest] = "release-1"
+for key in names:                             # fresh bytes values, in no fixed order
+    print("{key.len()}")
+```
+
 Struct fields can be updated in place. Structs are heap-allocated reference
 values, so a write through one handle is visible through every other handle
 to the same instance — useful for stateful iterators and small caches, and a

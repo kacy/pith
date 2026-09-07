@@ -1280,6 +1280,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_concurrent_group \
 	tests/cases/test_map_value_ownership \
 	tests/cases/test_map_take_remove_counts \
+	tests/cases/test_bytes_keyed_containers \
 	tests/cases/test_web_session_ownership \
 	tests/cases/test_fn_value_optional \
 	tests/cases/test_optional_arg_callee_spellings \

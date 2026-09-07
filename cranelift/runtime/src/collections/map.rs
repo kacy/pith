@@ -20,11 +20,17 @@ pub struct PithMap {
 
 /// Key type for the internal HashMap
 ///
-/// We support both integer and string keys
+/// Integer, string and bytes keys. A string key and a bytes key are both
+/// the map's own copy of the content, so a lookup is a content question:
+/// two `Bytes` values built by different routes find one entry when their
+/// bytes agree, exactly as two strings do. The variants stay distinct so a
+/// map never mixes flavors; the constructor's key tag is what keeps each
+/// entry point in its own flavor (see `require_key_flavor`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapKey {
     Int(i64),
     String(Vec<u8>), // Byte representation of the string
+    Bytes(Vec<u8>),  // The content of a Bytes value
 }
 
 impl Hash for MapKey {
@@ -38,6 +44,21 @@ impl Hash for MapKey {
                 1u8.hash(state); // Type tag for string
                 bytes.hash(state);
             }
+            MapKey::Bytes(bytes) => {
+                2u8.hash(state); // Type tag for bytes
+                bytes.hash(state);
+            }
+        }
+    }
+}
+
+impl MapKey {
+    /// The key as text, for traces and the strict-miss diagnostic.
+    fn display(&self) -> String {
+        match self {
+            MapKey::Int(n) => n.to_string(),
+            MapKey::String(b) => format!("{:?}", String::from_utf8_lossy(b)),
+            MapKey::Bytes(b) => format!("bytes{:?}", b),
         }
     }
 }
@@ -54,7 +75,7 @@ pub struct MapImpl {
     data: HashMap<MapKey, Vec<u8>>,
     /// Specialized storage for int-key maps with 8-byte scalar values
     int_values8: Option<HashMap<i64, i64>>,
-    /// Type tag for keys (0=int, 1=string)
+    /// Type tag for keys (0=int, 1=string, 2=bytes)
     key_type: KeyType,
     /// Size of values in bytes
     val_size: usize,
@@ -67,10 +88,41 @@ pub struct MapImpl {
 }
 
 /// Key type enumeration
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
     Int,
     String,
+    Bytes,
+}
+
+impl KeyType {
+    fn from_code(code: i32) -> KeyType {
+        match code {
+            1 => KeyType::String,
+            2 => KeyType::Bytes,
+            _ => KeyType::Int,
+        }
+    }
+}
+
+/// A bytes-keyed map reached through a string entry point, or the reverse,
+/// is an emitter defect: the string path would read the bytes handle's
+/// header as a c-string and the bytes path would read a string as a bytes
+/// object, and either way distinct keys collapse into one entry in silence.
+/// That silent collapse is the bug E254 was introduced to stop (issues #920
+/// and #955), so the mismatch fails loudly instead.
+fn require_key_flavor(actual: KeyType, wanted: KeyType, entry: &str) {
+    if actual == wanted || (actual != KeyType::Bytes && wanted != KeyType::Bytes) {
+        return;
+    }
+    eprintln!(
+        "pith runtime error: {} called on a map whose keys are {:?}, not {:?}",
+        entry, actual, wanted
+    );
+    // the flavor is fixed at construction, so a caller of the wrong flavor is a
+    // compiler bug with no answer that is not a wrong answer.
+    // panic-guard: a container reached through the wrong flavor's entry point.
+    std::process::exit(1);
 }
 
 impl MapImpl {
@@ -319,6 +371,19 @@ pub unsafe extern "C" fn pith_map_new_int_cstr_val() -> PithMap {
     pith_map_new(0, 8, 1)
 }
 
+/// Bytes-key map with 8-byte values it owns no counts on (Map[Bytes, Int]);
+/// a heap value kind is learned at the first kind-carrying store.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_new_bytes() -> PithMap {
+    pith_map_new(2, 8, 0)
+}
+
+/// Bytes-key map that owns cstring values (Map[Bytes, String]).
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_new_bytes_cstr_val() -> PithMap {
+    pith_map_new(2, 8, 1)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap: i64) -> PithMap {
     // the historical spelling: "heap" meant cstring, the only kind a map
@@ -338,12 +403,11 @@ pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap:
 /// map that owns no value counts. The tag codes are the element-tag codes
 /// `pith_list_new` uses.
 unsafe fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> PithMap {
-    let ktype = match key_type {
-        1 => KeyType::String,
-        _ => KeyType::Int,
-    };
-
-    let map_impl = MapImpl::new(ktype, val_size as usize, element_tag_from_code(val_tag));
+    let map_impl = MapImpl::new(
+        KeyType::from_code(key_type),
+        val_size as usize,
+        element_tag_from_code(val_tag),
+    );
     let boxed = Box::new(map_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
     handle_registry::register(ptr as *const (), HandleKind::Map);
@@ -609,9 +673,7 @@ pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
         return impl_ref.remove_int_value(key).unwrap_or(0);
     }
     match impl_ref.remove(&MapKey::Int(key)) {
-        Some(val) if val.len() >= 8 => {
-            i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
-        }
+        Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
         _ => 0,
     }
 }
@@ -625,11 +687,31 @@ pub unsafe extern "C" fn pith_map_take(map_handle: i64, key: *const i8) -> i64 {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return 0;
     };
-    let map_key = cstr_to_map_key(key);
-    match impl_ref.remove(&map_key) {
-        Some(val) if val.len() >= 8 => {
-            i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
-        }
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_take");
+    take_keyed(impl_ref, &cstr_to_map_key(key))
+}
+
+/// Bytes-keyed take: remove and transfer the value's count to the caller.
+///
+/// # Safety
+/// map_handle must be a valid map handle; key a bytes handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_take_bkey(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return 0;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_take_bkey");
+    let Some(map_key) = bytes_to_map_key(key) else {
+        return 0;
+    };
+    take_keyed(impl_ref, &map_key)
+}
+
+/// Remove an entry and hand its value's count to the caller: the map's
+/// count leaves with the value instead of being released here.
+unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &MapKey) -> i64 {
+    match impl_ref.remove(map_key) {
+        Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
         _ => 0,
     }
 }
@@ -690,6 +772,46 @@ unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
     }
     let bytes = std::slice::from_raw_parts(key as *const u8, len);
     MapKey::String(bytes.to_vec())
+}
+
+/// The map key for a bytes handle, or `None` for a handle that is not a
+/// live bytes object. A null handle is the empty value, which `pith_bytes_eq`
+/// already treats as equal to an empty bytes object. The handle is only
+/// read: the map keeps its own copy of the content and never a count on
+/// the caller's object.
+unsafe fn bytes_to_map_key(key: i64) -> Option<MapKey> {
+    if key == 0 {
+        return Some(MapKey::Bytes(Vec::new()));
+    }
+    crate::bytes::pith_bytes_ref(key).map(|b| MapKey::Bytes(b.data.clone()))
+}
+
+/// The stored word under `map_key`, or `None` on a miss.
+unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &MapKey) -> Option<i64> {
+    match impl_ref.get(map_key) {
+        Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
+            val_data[..8].try_into().unwrap_or([0u8; 8]),
+        )),
+        _ => None,
+    }
+}
+
+/// Drop the entry under `map_key`, releasing the map's count on its value.
+unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &MapKey) {
+    if let Some(old) = impl_ref.remove(map_key) {
+        impl_ref.release_value(&old);
+    }
+}
+
+/// Exit with the structured diagnostic for a strict miss: `m[k]` on a key
+/// the map does not hold.
+fn strict_miss(key_display: &str) -> ! {
+    eprintln!(
+        "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
+        key_display
+    );
+    // panic-guard: a missing key under strict indexing is a program bug with no value to return.
+    std::process::exit(1);
 }
 
 /// Insert an i64 value with a C-string key.
@@ -767,12 +889,7 @@ unsafe fn map_adopt_value_tag(map_handle: i64, val_tag: i64) -> bool {
     }
 }
 
-unsafe fn insert_cstr_inner(
-    map_handle: i64,
-    key: *const i8,
-    value: i64,
-    takes_caller_count: bool,
-) {
+unsafe fn insert_cstr_inner(map_handle: i64, key: *const i8, value: i64, takes_caller_count: bool) {
     if key.is_null() {
         return;
     }
@@ -780,21 +897,37 @@ unsafe fn insert_cstr_inner(
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
     crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
-    let map_key = cstr_to_map_key(key);
-    // the map retains the incoming value when it owns heap values, and
-    // drops its count on whatever that displaces. an owned value arrives
-    // with the caller's count, which the map keeps as its own.
+    insert_keyed(impl_ref, cstr_to_map_key(key), value, takes_caller_count);
+}
+
+unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_insert_bkey");
+    let Some(map_key) = bytes_to_map_key(key) else {
+        return;
+    };
+    insert_keyed(impl_ref, map_key, value, takes_caller_count);
+}
+
+/// Store `value` under `map_key`. the map retains the incoming value when it
+/// owns heap values, and drops its count on whatever that displaces. an owned
+/// value arrives with the caller's count, which the map keeps as its own.
+unsafe fn insert_keyed(
+    impl_ref: &mut MapImpl,
+    map_key: MapKey,
+    value: i64,
+    takes_caller_count: bool,
+) {
     if impl_ref.val_is_heap() {
         if !takes_caller_count {
             impl_ref.retain_value(value);
         }
         if map_trace_enabled() {
-            let kb = match &map_key {
-                MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
-                MapKey::Int(n) => n.to_string(),
-            };
-            eprintln!("map_ins {:?} -> {:p}", kb, value as *const i8);
+            eprintln!("map_ins {} -> {:p}", map_key.display(), value as *const i8);
         }
     }
     let val_bytes = value.to_le_bytes().to_vec();
@@ -817,23 +950,16 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
-
-    match impl_ref.get(&map_key) {
-        Some(val_data) if val_data.len() >= 8 => {
-            let v = i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]));
-            if impl_ref.val_is_heap() && map_trace_enabled() {
-                let kb = match &map_key {
-                    MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
-                    MapKey::Int(n) => n.to_string(),
-                };
-                eprintln!("map_get {:?} -> {:p}", kb, v as *const i8);
-            }
-            v
-        }
-        _ => 0,
+    let Some(v) = get_keyed(impl_ref, &map_key) else {
+        return 0;
+    };
+    if impl_ref.val_is_heap() && map_trace_enabled() {
+        eprintln!("map_get {} -> {:p}", map_key.display(), v as *const i8);
     }
+    v
 }
 
 /// Get an i64 value by C-string key, wrapped in an Optional tuple. Returns
@@ -851,14 +977,11 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) 
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return optional_tuple(false, 0);
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_opt");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_to_map_key(key);
-    match impl_ref.get(&map_key) {
-        Some(val_data) if val_data.len() >= 8 => optional_tuple(
-            true,
-            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
-        ),
-        _ => optional_tuple(false, 0),
+    match get_keyed(impl_ref, &cstr_to_map_key(key)) {
+        Some(v) => optional_tuple(true, v),
+        None => optional_tuple(false, 0),
     }
 }
 
@@ -882,24 +1005,12 @@ pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i
         // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
         std::process::exit(1);
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_strict");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
     let map_key = cstr_to_map_key(key);
-    match impl_ref.get(&map_key) {
-        Some(val_data) if val_data.len() >= 8 => {
-            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
-        }
-        _ => {
-            let key_display = match &map_key {
-                MapKey::String(b) => format!("{:?}", String::from_utf8_lossy(b)),
-                MapKey::Int(n) => n.to_string(),
-            };
-            eprintln!(
-                "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
-                key_display
-            );
-            // panic-guard: a missing key under strict indexing is a program bug with no value to return.
-            std::process::exit(1);
-        }
+    match get_keyed(impl_ref, &map_key) {
+        Some(v) => v,
+        None => strict_miss(&map_key.display()),
     }
 }
 
@@ -917,10 +1028,9 @@ pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8)
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_contains_key");
     crate::perf_stats!(PERF_MAP_STRING_CONTAINS += 1);
-    let map_key = cstr_to_map_key(key);
-
-    if impl_ref.contains_key(&map_key) {
+    if impl_ref.contains_key(&cstr_to_map_key(key)) {
         1
     } else {
         0
@@ -940,14 +1050,9 @@ pub unsafe extern "C" fn pith_map_get_default_cstr(
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return default;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_default");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_to_map_key(key);
-    match impl_ref.get(&map_key) {
-        Some(val_data) if val_data.len() >= 8 => {
-            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
-        }
-        _ => default,
-    }
+    get_keyed(impl_ref, &cstr_to_map_key(key)).unwrap_or(default)
 }
 
 /// Get value by integer key with a default if not found.
@@ -986,11 +1091,203 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_remove");
     crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
-    let map_key = cstr_to_map_key(key);
-    if let Some(old) = impl_ref.remove(&map_key) {
-        impl_ref.release_value(&old);
+    remove_keyed(impl_ref, &cstr_to_map_key(key));
+}
+
+// ---------------------------------------------------------------------------
+// Bytes-key variants: the content-hashing flavor
+// ---------------------------------------------------------------------------
+//
+// a `Bytes` key is stored the way a string key is: as the map's own copy of
+// the content. the handle the caller passes is only read, never retained,
+// so the caller keeps whatever count it holds on it, and a map releases
+// nothing key-wise when it frees. the value side is the same as every other
+// flavor: the map owns one count per stored heap value. `keys()` hands out
+// fresh bytes objects the way the string flavor hands out fresh strings,
+// owned by the list it builds.
+
+/// Insert a value under a bytes key.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a bytes handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_bkey(map_handle: i64, key: i64, value: i64) {
+    insert_bkey_inner(map_handle, key, value, false);
+}
+
+/// Insert a value the caller owns under a bytes key — see
+/// `pith_map_insert_cstr_owned`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a bytes handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_bkey_owned(map_handle: i64, key: i64, value: i64) {
+    insert_bkey_inner(map_handle, key, value, true);
+}
+
+/// Insert a borrowed value of a named heap kind under a bytes key — see
+/// `pith_map_insert_cstr_kind`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a bytes handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_bkey_kind(
+    map_handle: i64,
+    key: i64,
+    value: i64,
+    val_tag: i64,
+) {
+    let owns = map_adopt_value_tag(map_handle, val_tag);
+    if !owns {
+        retain_element(element_tag_from_code(val_tag as i32), value);
     }
+    insert_bkey_inner(map_handle, key, value, false);
+}
+
+/// Insert an owned value of a named heap kind under a bytes key — see
+/// `pith_map_insert_cstr_owned_kind`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a bytes handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_insert_bkey_owned_kind(
+    map_handle: i64,
+    key: i64,
+    value: i64,
+    val_tag: i64,
+) {
+    map_adopt_value_tag(map_handle, val_tag);
+    insert_bkey_inner(map_handle, key, value, true);
+}
+
+/// Get a value by bytes key. Returns 0 if the key is not found.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return 0;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey");
+    bytes_to_map_key(key)
+        .and_then(|map_key| get_keyed(impl_ref, &map_key))
+        .unwrap_or(0)
+}
+
+/// Get a value by bytes key, wrapped in an Optional tuple — see
+/// `pith_map_get_cstr_opt`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_bkey_opt(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return optional_tuple(false, 0);
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_opt");
+    let found = bytes_to_map_key(key).and_then(|map_key| get_keyed(impl_ref, &map_key));
+    match found {
+        Some(v) => optional_tuple(true, v),
+        None => optional_tuple(false, 0),
+    }
+}
+
+/// Get a value by bytes key, exiting with a diagnostic on a miss — the
+/// strict path for `m[k]`, see `pith_map_get_cstr_strict`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_bkey_strict(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_strict");
+    let Some(map_key) = bytes_to_map_key(key) else {
+        strict_miss("<not a bytes value>");
+    };
+    match get_keyed(impl_ref, &map_key) {
+        Some(v) => v,
+        None => strict_miss(&map_key.display()),
+    }
+}
+
+/// Check if a bytes key exists in the map. Returns 1 if present, 0 otherwise.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_contains_bkey(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return 0;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_contains_bkey");
+    match bytes_to_map_key(key) {
+        Some(map_key) if impl_ref.contains_key(&map_key) => 1,
+        _ => 0,
+    }
+}
+
+/// Get value by bytes key with a default if not found.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_default_bkey(map_handle: i64, key: i64, default: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return default;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_default_bkey");
+    bytes_to_map_key(key)
+        .and_then(|map_key| get_keyed(impl_ref, &map_key))
+        .unwrap_or(default)
+}
+
+/// Remove an entry by bytes key.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_remove_bkey");
+    if let Some(map_key) = bytes_to_map_key(key) {
+        remove_keyed(impl_ref, &map_key);
+    }
+}
+
+/// Return all bytes keys as a bytes-tagged list of fresh bytes objects the
+/// list owns — the counterpart to `pith_map_keys_cstr`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_keys_bkey(map_handle: i64) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
+
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        let empty = pith_list_new(8, 0);
+        return empty.ptr as i64;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_keys_bkey");
+    let list = pith_list_new(8, 5);
+    for key in impl_ref.keys() {
+        if let MapKey::Bytes(bytes) = key {
+            pith_list_push_value_owned(list, crate::bytes::pith_bytes_from_vec(bytes));
+        }
+    }
+    list.ptr as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1530,7 @@ pub unsafe extern "C" fn pith_display_map(handle: i64, key_kind: i64, val_kind: 
                 let key_text = match k {
                     MapKey::Int(n) => n.to_string(),
                     MapKey::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    MapKey::Bytes(_) => k.display(),
                 };
                 let raw = if val.len() >= 8 {
                     i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
@@ -1285,6 +1583,7 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_keys");
     // string-tagged: the list owns the freshly copied key strings
     let list = pith_list_new(8, 1);
 
@@ -1715,6 +2014,103 @@ mod tests {
             crate::runtime_core::pith_struct_weak_release(value);
             crate::cycle::force_enabled_for_tests(false);
             crate::cycle::reset_for_tests();
+        }
+    }
+
+    /// A bytes-keyed map finds an entry by the key's content: a key built
+    /// from a string and one built from a byte vector are one entry, two keys
+    /// that share a prefix and a length are two, the empty key is an entry
+    /// like any other, and the map's own copy of each key means the caller's
+    /// count on the handle is untouched. The value side keeps the string
+    /// contract: one count per stored value, dropped on overwrite, remove and
+    /// free, transferred by take.
+    #[test]
+    fn bytes_keyed_map_is_keyed_by_content() {
+        unsafe {
+            let map = pith_map_new_bytes_cstr_val().ptr as i64;
+            let from_vec = crate::bytes::pith_bytes_from_vec(b"key".to_vec());
+            let from_str = crate::bytes::pith_bytes_from_string_utf8(c"key".as_ptr());
+            let sibling = crate::bytes::pith_bytes_from_vec(b"kex".to_vec());
+            let empty = crate::bytes::pith_bytes_from_vec(Vec::new());
+
+            let v1 = crate::pith_copy_bytes_to_cstring(b"one");
+            let v2 = crate::pith_copy_bytes_to_cstring(b"two");
+            let v3 = crate::pith_copy_bytes_to_cstring(b"three");
+            pith_map_insert_bkey(map, from_vec, v1 as i64);
+            pith_map_insert_bkey(map, sibling, v2 as i64);
+            pith_map_insert_bkey(map, empty, v3 as i64);
+            assert_eq!(pith_map_len_handle(map), 3);
+            assert_eq!(
+                pith_map_get_bkey(map, from_str) as *mut i8,
+                v1,
+                "found by content"
+            );
+            assert_eq!(
+                pith_map_get_bkey(map, sibling) as *mut i8,
+                v2,
+                "shared prefix, distinct"
+            );
+            assert_eq!(
+                pith_map_get_bkey(map, 0) as *mut i8,
+                v3,
+                "null is the empty key"
+            );
+            assert_eq!(pith_map_contains_bkey(map, from_str), 1);
+            assert_eq!(pith_map_get_default_bkey(map, from_str, 7) as *mut i8, v1);
+            let absent = crate::bytes::pith_bytes_from_vec(b"ke".to_vec());
+            assert_eq!(
+                pith_map_contains_bkey(map, absent),
+                0,
+                "a prefix is not a key"
+            );
+            assert_eq!(pith_map_get_default_bkey(map, absent, 7), 7);
+
+            // the map holds one count per value; overwriting through the other
+            // spelling of the same key releases the displaced value
+            assert_eq!(crate::cstring_refcount_for_tests(v1), Some(2));
+            let v4 = crate::pith_copy_bytes_to_cstring(b"four");
+            pith_map_insert_bkey_owned(map, from_str, v4 as i64);
+            assert_eq!(pith_map_len_handle(map), 3, "same key, one entry");
+            assert_eq!(crate::cstring_refcount_for_tests(v1), Some(1), "displaced");
+            assert_eq!(
+                crate::cstring_refcount_for_tests(v4),
+                Some(1),
+                "owned: transferred"
+            );
+
+            // keys() hands out fresh bytes objects the list owns
+            let list = pith_map_keys_bkey(map);
+            let list_handle = crate::collections::list::PithList {
+                ptr: list as *mut (),
+            };
+            assert_eq!(crate::collections::list::pith_list_len(list_handle), 3);
+            let first = crate::collections::list::pith_list_get_value(list_handle, 0);
+            assert!(crate::bytes::pith_bytes_ref(first).is_some());
+            assert!(first != from_vec && first != sibling && first != empty);
+            crate::collections::list::pith_list_release_handle(list);
+
+            // take transfers the value's count; remove releases it
+            let taken = pith_map_take_bkey(map, sibling) as *mut i8;
+            assert_eq!(taken, v2);
+            assert_eq!(
+                crate::cstring_refcount_for_tests(v2),
+                Some(2),
+                "count came with it"
+            );
+            crate::pith_cstring_release(v2);
+            pith_map_remove_bkey(map, from_vec);
+            assert_eq!(pith_map_contains_bkey(map, from_str), 0);
+            assert_eq!(pith_map_len_handle(map), 1);
+
+            for h in [from_vec, from_str, sibling, empty, absent] {
+                let b = crate::bytes::pith_bytes_ref(h).expect("the map never took a count");
+                assert_eq!(b.rc.load(std::sync::atomic::Ordering::Relaxed), 1);
+                crate::bytes::pith_bytes_release(h);
+            }
+            for v in [v1, v2, v3] {
+                crate::pith_cstring_release(v);
+            }
+            pith_map_release_handle(map);
         }
     }
 }

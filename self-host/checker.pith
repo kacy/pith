@@ -606,17 +606,18 @@ fn resolve_generic_type_from_node(node: Node) -> Int:
         type_args.push(resolve_type_implementation(child))
     return resolve_generic_type(base, type_args)
 
-# a set element and a map key are hashed, and the containers hash exactly two
-# flavors: int and string. an int-family element takes the int flavor and a
-# String the string flavor; every other type used to fall into one of the two
-# anyway and misbehaved silently — the string flavor read whatever the value's
-# word pointed at as a c-string, so distinct lists and bytes collapsed into
-# one entry through their allocation headers, a struct compared raw memory
-# bytes, a plain enum inserted nothing at all, and a float crashed the
-# process. the phrase names what was written so the message reads back the
-# source ("an optional", "a list", "Bytes"), and "" means the type is
-# hashable — or not yet concrete: a generic parameter passes here and is
-# judged again at each instantiation, where it has a concrete type.
+# a set element and a map key are hashed, and the containers hash exactly
+# three flavors: int, string and bytes. an int-family element takes the int
+# flavor, a String the string flavor and Bytes the bytes flavor, which hashes
+# and compares the value's content; every other type used to fall into the
+# string flavor anyway and misbehaved silently — it read whatever the value's
+# word pointed at as a c-string, so distinct lists collapsed into one entry
+# through their allocation headers, a struct compared raw memory bytes, a
+# plain enum inserted nothing at all, and a float crashed the process. the
+# phrase names what was written so the message reads back the source ("an
+# optional", "a list", "Float"), and "" means the type is hashable — or not
+# yet concrete: a generic parameter passes here and is judged again at each
+# instantiation, where it has a concrete type.
 fn unhashable_component_phrase(tid: Int) -> String:
     if tid < 0:
         return ""
@@ -640,8 +641,6 @@ fn unhashable_component_phrase(tid: Int) -> String:
     if info.kind == "result":
         return "a result"
     if info.kind == "primitive":
-        if info.name == "Bytes":
-            return "Bytes"
         if info.name == "Float":
             return "Float"
         if info.name == "Bool":
@@ -656,7 +655,7 @@ fn reject_unhashable_component(node_idx: Int, tid: Int, position: String) -> Boo
     phrase := unhashable_component_phrase(tid)
     if phrase.len() == 0:
         return false
-    mut msg := phrase + " cannot be " + position + "; a set element and a map key hash int and string flavors only"
+    mut msg := phrase + " cannot be " + position + "; a set element and a map key hash int, string and bytes flavors only"
     if get_type_info(tid).kind == "optional":
         msg = "an optional cannot be " + position + "; store List[T?] or key by the payload instead"
     if node_idx >= 0:
@@ -5863,9 +5862,9 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         return TID_ERR
     if method == "add":
         # `add` stores, but there is nothing to widen into: an unhashable
-        # element type — an optional, a container, Bytes, a struct — is
-        # rejected outright (E254), since a set hashes int and string
-        # flavors only and none of those values is either.
+        # element type — an optional, a container, a struct — is rejected
+        # outright (E254), since a set hashes int, string and bytes flavors
+        # only and none of those values is any of them.
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
     if method == "len":
@@ -6043,8 +6042,8 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
 # a search position may only widen where the search compares structurally. a
 # list's does — an optional element compares by tag and payload, so the shell
 # built here finds the equal element it names. a map key and a set element
-# never reach this question: the containers hash int and string flavors only,
-# so Set[T?], Map[T?, V] and every other unhashable element or key type are
+# never reach this question: the containers hash int, string and bytes
+# flavors only, so Set[T?], Map[T?, V] and every other unhashable element or key type are
 # rejected as types (E254) before any store or search could ask for widening.
 fn check_widened_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)

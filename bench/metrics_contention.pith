@@ -1,0 +1,110 @@
+# metrics_contention — what std.metrics throughput does as writers are added.
+#
+#   pith build bench/metrics_contention.pith
+#   ./bench/metrics_contention <trials> <ops per trial> <tasks> <mode>
+#
+# every trial does the same total number of writes, split evenly across `tasks`
+# tasks, all of them writing the SAME series — the shape a request handler has,
+# where one counter is bumped by every concurrent request. holding the total
+# fixed makes the printed rate comparable across task counts directly: a
+# registry that scales prints the same rate or better as tasks are added, and a
+# registry that serializes prints a falling one.
+#
+# modes:
+#   counter    c.inc() on a counter resolved once per task
+#   gauge      g.set() on a gauge resolved once per task
+#   histogram  h.observe() on a histogram resolved once per task
+#   labels     metrics.counter(name).labels(pairs).inc(), resolved per write —
+#              the std.net.http pattern, which pays the registry lookup too
+#
+# it prints "<trial> <ms> <ops>" per trial, and runs every trial inside one
+# process on purpose: a process-per-trial loop measures its own launch cadence
+# as much as the thing under test.
+import std.metrics as metrics
+
+COUNTER_NAME := "bench_hits_total"
+GAUGE_NAME := "bench_level"
+HISTOGRAM_NAME := "bench_latency_ms"
+LABELED_NAME := "bench_labeled_total"
+
+fn count_worker(n: Int) -> Int:
+    c := metrics.counter(COUNTER_NAME)
+    mut i := 0
+    while i < n:
+        c.inc()
+        i = i + 1
+    return n
+
+fn gauge_worker(n: Int) -> Int:
+    g := metrics.gauge(GAUGE_NAME)
+    mut i := 0
+    while i < n:
+        g.set(i.to_float())
+        i = i + 1
+    return n
+
+fn histogram_worker(n: Int) -> Int:
+    h := metrics.histogram(HISTOGRAM_NAME)
+    mut i := 0
+    while i < n:
+        h.observe(7.0)
+        i = i + 1
+    return n
+
+fn labeled_worker(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        metrics.counter(LABELED_NAME).labels(["route", "/api", "method", "GET"]).inc()
+        i = i + 1
+    return n
+
+fn run_worker(mode: String, n: Int) -> Int:
+    if mode == "gauge":
+        return gauge_worker(n)
+    if mode == "histogram":
+        return histogram_worker(n)
+    if mode == "labels":
+        return labeled_worker(n)
+    return count_worker(n)
+
+# one trial: `tasks` writers share `ops` writes to one series, timed end to end.
+fn trial(mode: String, ops: Int, tasks: Int) -> Int:
+    per := ops / tasks
+    start := time()
+    mut running: List[Task[Int]] := []
+    mut t := 0
+    while t < tasks:
+        running.push(spawn run_worker(mode, per))
+        t = t + 1
+    mut done := 0
+    for task in running:
+        done = done + await task
+    elapsed := time() - start
+    if done != per * tasks:
+        print("MISMATCH done={done} expected={per * tasks}")
+    return elapsed
+
+fn positive_arg(argv: List[String], index: Int, fallback: Int) -> Int:
+    if argv.len() <= index:
+        return fallback
+    parsed := parse_int(argv[index])
+    if parsed.is_ok and parsed.ok > 0:
+        return parsed.ok
+    return fallback
+
+fn main() -> Int!:
+    argv := args()
+    trials := positive_arg(argv, 1, 9)
+    ops := positive_arg(argv, 2, 400000)
+    tasks := positive_arg(argv, 3, 1)
+    mut mode := "counter"
+    if argv.len() > 4:
+        mode = argv[4]
+
+    per := ops / tasks
+    mut i := 0
+    while i < trials:
+        ms := trial(mode, ops, tasks)
+        print("{i} {ms} {per * tasks}")
+        i = i + 1
+    return 0

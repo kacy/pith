@@ -1286,7 +1286,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_optional_arg_callee_spellings \
 	tests/cases/test_result_arg_callee_spellings \
 	tests/cases/test_tls_server_config_release \
-	tests/cases/test_tls12_client_auth
+	tests/cases/test_tls12_client_auth \
+	tests/cases/test_metrics_registry
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

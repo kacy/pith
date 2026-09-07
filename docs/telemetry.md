@@ -63,9 +63,28 @@ latency.observe(0.234)
 instrument bound to that label set. each distinct set accumulates on its own, so
 the two `orders_total` lines above are separate series that render under one
 `# TYPE` line. `buckets([...])` sets a histogram's boundaries (choose them before
-the first observation; the default is a 1..5000 ladder). `describe(help, unit)`
-attaches a `# HELP` line and feeds the OTLP description and unit. whole-number
-values still render cleanly — a count reads `5`, not `5.0`.
+the first observation; the default is a 1..5000 ladder) and hands back the
+instrument to record into, since the boundaries decide how many bucket cells
+the series has. `describe(help, unit)` attaches a `# HELP` line and feeds the
+OTLP description and unit. whole-number values still render cleanly — a count
+reads `5`, not `5.0`.
+
+recording is lock-free. an instrument is a handle onto the atomic cells of one
+series, resolved when you create it, so `inc`, `add`, `set` and `observe`
+compare-and-set those cells and take no lock at all; the name-to-cells registry
+behind them is sharded across eight mutexes and is touched only when you look a
+metric up by name. so an instrument is safe to keep in a global and write from
+every task, and it is equally fine to resolve one per request the way the std
+clients do.
+
+a scrape is coherent per series rather than process-wide. within one histogram
+the buckets never outrun the count and the `+Inf` bucket always equals it, which
+is the property prometheus needs; two different series, though, may have been
+read microseconds apart and need not describe the same instant.
+
+`reset()` is for tests and short-lived tools. it clears the registry and leaves
+behind the cells that instruments already hold, so an instrument taken before a
+reset goes on writing to a series nothing can scrape. take a fresh one after.
 
 the std clients register these on your behalf:
 

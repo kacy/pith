@@ -5,6 +5,9 @@ This directory is for regression and negative test fixtures.
 - `live/` contains opt-in loopback socket smoke tests
 - `invalid/` contains checker-invalid programs and expected error codes
 - `invalid_parse/` contains parser-invalid programs and expected error codes
+- `diagnostics/` contains programs whose rendered diagnostics, caret line
+  included, are frozen as text, so a diagnostic that moves to another column
+  is caught where a code comparison would pass
 - `leaks/` contains the ownership shapes the leak gate measures
 - `green/` contains green-runtime scheduling and preemption tests
 - `lsp/` contains language-server transcript cases and their expected frames

@@ -138,9 +138,20 @@ mut indent_stack: List[Int] := [0]
 mut group_depth := 0
 mut pending_dedents := 0
 
-# pending tokens from string interpolation
+# pending tokens from string interpolation.
+#
+# the queue is filled while the whole interpolated string is scanned and
+# drained afterwards, one token per next_token() call, so a drained token
+# that took the scanner's current position reported the character after
+# the closing quote — which is what put every diagnostic inside an
+# interpolation at the string's column rather than the expression's. the
+# position each piece was cut from is recorded here with it.
 mut pending_token_kinds: List[String] := []
 mut pending_token_values: List[String] := []
+mut pending_token_lines: List[Int] := []
+mut pending_token_cols: List[Int] := []
+mut pending_token_offsets: List[Int] := []
+mut pending_token_lens: List[Int] := []
 
 # ---------------------------------------------------------------
 # lexer core
@@ -268,13 +279,26 @@ fn next_token():
         emit("dedent", "")
         return
 
-    # step 2: drain pending interpolation tokens
+    # step 2: drain pending interpolation tokens. each carries the
+    # position it was cut from, so it reports where it sits in the source
+    # rather than where the scanner ended up after the whole string.
     if pending_token_kinds.len() > 0:
         kind := pending_token_kinds[0]
         value := pending_token_values[0]
+        token_start_line = pending_token_lines[0]
+        token_start_column = pending_token_cols[0]
+        token_start_offset = pending_token_offsets[0]
+        length := pending_token_lens[0]
         pending_token_kinds.remove(0)
         pending_token_values.remove(0)
+        pending_token_lines.remove(0)
+        pending_token_cols.remove(0)
+        pending_token_offsets.remove(0)
+        pending_token_lens.remove(0)
         emit(kind, value)
+        # emit() measures a lexeme from where the scanner is now, which
+        # for a queued piece is past the whole string
+        current_token_len = length
         return
 
     # step 3: handle EOF
@@ -695,12 +719,17 @@ fn scan_string():
 
     emit("string_start", string_start_value)
 
-# the raw text between {} keeps the backslash-escapes it needed to sit
-# inside the surrounding string literal: `\"` for a string argument's
-# quotes and `\\` for a literal backslash. undo those so the expression
-# re-lexes as real code — without this, `f(\"x\", 1)` re-lexes as a
-# single string argument and the call looks like it has one argument.
-fn unescape_interp_expr(text: String) -> String:
+## the raw text between {} keeps the backslash-escapes it needed to sit
+## inside the surrounding string literal: `\"` for a string argument's
+## quotes and `\\` for a literal backslash. undo those so the expression
+## re-lexes as real code — without this, `f(\"x\", 1)` re-lexes as a
+## single string argument and the call looks like it has one argument.
+##
+## the parser calls this, rather than the scan below doing it, because
+## the parser is what maps a fragment token's offset back to the source:
+## one escape is two source characters and one fragment character, and
+## the raw text is what says where those pairs are.
+pub fn unescape_interp_expr(text: String) -> String:
     mut out := ""
     mut i := 0
     while i < text.len():
@@ -718,6 +747,16 @@ fn unescape_interp_expr(text: String) -> String:
             i = i + 1
     return out
 
+# queue one piece of an interpolated string with the source span it was
+# cut from: `line`/`column` are 1-based and name its first character.
+fn queue_interpolation_token(kind: String, value: String, line: Int, column: Int, offset: Int, length: Int):
+    pending_token_kinds.push(kind)
+    pending_token_values.push(value)
+    pending_token_lines.push(line)
+    pending_token_cols.push(column)
+    pending_token_offsets.push(offset)
+    pending_token_lens.push(length)
+
 fn scan_interpolation_parts():
     while current_position < source.len():
         if not is_lbrace(source_char(current_position)):
@@ -730,6 +769,10 @@ fn scan_interpolation_parts():
         # scan expression inside {}
         mut brace_depth := 1
         expression_start := current_position
+        # current_column counts the characters consumed on this line, so
+        # the character after the brace sits one past it
+        expression_line := current_line
+        expression_column := current_column + 1
         mut found_expr_end := false
         while current_position < source.len():
             if found_expr_end:
@@ -756,10 +799,12 @@ fn scan_interpolation_parts():
                 current_position = current_position + 1
                 current_column = current_column + 1
 
-        expr_text := unescape_interp_expr(source.substring(expression_start, current_position))
+        # the raw text, escapes and all: the parser undoes them, because
+        # it is the only place that can walk a token's offset in the
+        # unescaped fragment back to the source character it came from
+        expr_text := source.substring(expression_start, current_position)
         if expr_text.len() > 0:
-            pending_token_kinds.push("interpolation_expr")
-            pending_token_values.push(expr_text)
+            queue_interpolation_token("interpolation_expr", expr_text, expression_line, expression_column, expression_start, expr_text.len())
 
         if current_position >= source.len():
             return
@@ -770,6 +815,8 @@ fn scan_interpolation_parts():
 
         # scan string content after the }
         middle_start := current_position
+        middle_line := current_line
+        middle_column := current_column + 1
         mut found_middle_end := false
         while current_position < source.len():
             if found_middle_end:
@@ -802,16 +849,15 @@ fn scan_interpolation_parts():
             end_text := source.substring(middle_start, current_position)
             current_position = current_position + 1
             current_column = current_column + 1
-            pending_token_kinds.push("string_end")
-            pending_token_values.push(end_text)
+            queue_interpolation_token("string_end", end_text, middle_line, middle_column, middle_start, end_text.len())
             return
 
         if is_newline_char(source_char(current_position)):
             return
 
         # another { — emit string_mid and continue
-        pending_token_kinds.push("string_mid")
-        pending_token_values.push(source.substring(middle_start, current_position))
+        mid_text := source.substring(middle_start, current_position)
+        queue_interpolation_token("string_mid", mid_text, middle_line, middle_column, middle_start, mid_text.len())
 
 fn scan_operator():
     character := advance()
@@ -1004,6 +1050,10 @@ pub fn init_lexer(src: String):
     group_depth = 0
     pending_token_kinds = []
     pending_token_values = []
+    pending_token_lines = []
+    pending_token_cols = []
+    pending_token_offsets = []
+    pending_token_lens = []
     pending_dedents = 0
     token_start_line = 1
     token_start_column = 1

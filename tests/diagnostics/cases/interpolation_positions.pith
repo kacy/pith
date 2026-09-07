@@ -1,0 +1,23 @@
+# an error inside a string interpolation is about an expression the
+# lexer cut out of the string and the parser re-lexed as its own
+# fragment. the golden pins the column each caret lands on: the position
+# the offending expression occupies in the line as written, not the
+# string's own column, which is where all of these used to report.
+
+fn takes_string(s: String) -> Int:
+    return s.len()
+
+fn join_two(a: String, b: String) -> String:
+    return a + b
+
+fn main() -> Int:
+    inline := "sum {1 + "two"} tail"
+    nested := "nested {join_two("x", 7)} tail"
+    escaped := "escaped {join_two(\"x\", 7)} tail"
+    chained := "chain {"x".trim().nosuch()} tail"
+    twice := "{takes_string(1)} and {takes_string(2)}"
+    wrapped := join_two(
+        "first",
+        "wrapped {1 + "two"} tail")
+    print("{inline} {nested} {escaped} {chained} {twice} {wrapped}")
+    return 0

@@ -438,9 +438,9 @@ are diagnostic latency only.
 - definition and references only know what the checker recorded:
   local bindings, function calls, user method calls, generic calls,
   and module-qualified calls. a method or module call is keyed on its
-  call node, which sits at the call's last token — the cursor
-  resolves such a call from its closing token, while the cursor on
-  the method name itself resolves the receiver.
+  call node, which sits at the call's first token — the cursor
+  resolves such a call from the receiver onward, while the cursor on
+  the method name itself resolves the method by name.
 - a local binding's declaration node is its initializer's last token,
   so definition and the includeDeclaration entry point at the
   initializer on the binding line, not at the name.
@@ -467,8 +467,11 @@ are diagnostic latency only.
 - one document is analyzed per debounce — the most recently changed
   one — though diagnostics for other open documents that fall out of
   that run are published too.
-- hover positions are approximate at expression granularity: an ast
-  node records the position of the last token that formed it.
+- hover positions are approximate at expression granularity: an
+  expression node records the position of the token it starts at, and
+  the answer comes from the node whose start is nearest at or before
+  the cursor. a call starts at its callee or receiver, so hovering
+  there answers the call's type rather than the receiver's own.
 - semantic tokens never consult the checker, so an identifier's class
   comes from its shape alone; there is no delta or range variant, and
   no token modifiers.

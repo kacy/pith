@@ -113,6 +113,11 @@ cases=(
   tests/leaks/leak_none_lowering
   tests/leaks/leak_optional_arg
   tests/leaks/leak_discarded_spawn
+  tests/leaks/leak_discarded_void_chain
+  tests/leaks/leak_discarded_closure
+  tests/leaks/leak_discarded_try_value
+  tests/leaks/leak_discarded_await_value
+  tests/leaks/leak_discarded_shared_result
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_local
   tests/leaks/leak_weak_capture_cycle

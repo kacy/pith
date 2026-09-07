@@ -1,0 +1,44 @@
+# a heap value discarded through `!` at statement position. the `!` frees the
+# box it opened and hands the ok payload on with the box's count, so a
+# discarded `mkr(i)!` leaves a container, a `Bytes`, a struct or an optional
+# shell with a count nothing else names — a path to the discard that the
+# call-shaped classification never covered.
+import leakprobe as probe
+
+struct Holder:
+    name: String
+    items: List[Int]
+
+fn mkr(i: Int) -> List[Int]!:
+    return [i, i + 1, i + 2]
+
+fn mkb(i: Int) -> Bytes!:
+    mut b: Bytes := bytes_from_string_utf8("payload-{i}")
+    return b
+
+fn mkh(i: Int) -> Holder!:
+    return Holder("h-" + i.to_string(), [i])
+
+fn mko(i: Int) -> (List[Int]?)!:
+    mut v: List[Int]? := [i, i + 1]
+    return v
+
+fn round(i: Int) -> Int!:
+    mkr(i)!
+    mkb(i)!
+    mkh(i)!
+    mko(i)!
+    got := mkr(i)!
+    return got[0]
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + (round(i) catch 0)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

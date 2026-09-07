@@ -122,9 +122,10 @@ pub fn ir_is_bool_returning_method(meth: String) -> Bool:
 # whether a method leaves no value of its own. asked with the lowered emit
 # name. the emitter forces the call's retkind to "void" and then hands the
 # RECEIVER register back as the expression's value, so `xs.reverse()`
-# evaluates to xs and chains; for the same reason it skips the release of
-# an owned receiver, which trades a leak on a discarded chain for not
-# freeing the value the chain returns.
+# evaluates to xs and chains; for the same reason it skips the release of an
+# owned receiver, and the consumer of the chain drops that count instead —
+# a discarded chain at statement position through the receiver's own
+# classification.
 pub fn ir_is_void_method(meth: String) -> Bool:
     return ir_csv_contains(VOID_METHODS, meth)
 

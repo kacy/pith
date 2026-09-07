@@ -1,0 +1,49 @@
+# a result box handed back by the callee it was passed to and then discarded.
+# `forward(r)` as a bare statement leaves two owners on one box, and the
+# discard used to drop the payload without asking whether anyone else held it
+# (#1075), emptying the caller's own live `r`. the drop is gated on the strong
+# count now, so the statement releases the box and leaves the payload with the
+# owner that still has a reference to it — and the last release, the caller's
+# argument release, is the one that reclaims it.
+#
+# this case is a guard rather than a growth proof: main's defect here is an
+# over-release, which moves no peak. tests/cases/test_discarded_value_shapes
+# is where the value is read back after the discard.
+import leakprobe as probe
+
+fn mk(i: Int) -> String!:
+    return "v-{i}"
+
+fn mkl(i: Int) -> List[Int]!:
+    return [i, i + 1, i + 2]
+
+fn forward_s(x: String!) -> String!:
+    return x
+
+fn forward_l(x: List[Int]!) -> List[Int]!:
+    return x
+
+fn shares_string(r: String!) -> Int:
+    forward_s(r)
+    s := r catch ""
+    return s.len()
+
+fn shares_list(r: List[Int]!) -> Int:
+    forward_l(r)
+    xs := r catch []
+    return xs.len()
+
+fn round(i: Int) -> Int:
+    return shares_string(mk(i)) + shares_list(mkl(i))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

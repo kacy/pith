@@ -1,0 +1,42 @@
+# a heap value discarded through `await` at statement position. pith_await
+# hands the single awaiter the count the task's thread produced, so a bare
+# `await t` that is never bound drops the only reference to what the task
+# built — another path to the discard that the call-shaped classification
+# never covered.
+import leakprobe as probe
+
+struct Holder:
+    name: String
+    items: List[Int]
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn mkh(i: Int) -> Holder:
+    return Holder("h-" + i.to_string(), [i])
+
+fn mkr(i: Int) -> List[Int]!:
+    return [i, i + 1]
+
+fn round(i: Int) -> Int:
+    t := spawn mk(i)
+    await t
+    th := spawn mkh(i)
+    await th
+    tr := spawn mkr(i)
+    await tr
+    t2 := spawn mk(i)
+    got := await t2
+    return got[0]
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

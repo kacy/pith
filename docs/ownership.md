@@ -164,10 +164,14 @@ call arguments:
 
 lambdas and function values:
 
-- a lambda's return transfers like a function return: borrowed
-  strings are retained on the way out (`ir_closure_return_kinds`
-  records what a closure returns so call sites treat the result as
-  owned)
+- a lambda's return transfers like a function return: a borrowed value
+  of any rc kind (a string, a captured optional shell or result box, a
+  struct, a container) is retained on the way out.
+  `ir_closure_return_kinds` records what a closure returns so call sites
+  treat the result as owned. the expression-bodied form used to retain a
+  string only, so `fn() => x` over a captured shell handed the
+  environment's own count to a caller that released it, and the next
+  call read freed memory.
 - naming a function as a value mints a closure. `f := shout` and
   `xs.map(shout)` both lower to `closure_ref`, which allocates with a
   count of one, so the expression is owned the same way a lambda
@@ -492,9 +496,34 @@ gaps, all bounded leaks rather than dangling pointers:
   `show(xs.get(0))`, two shapes the walk read as safe.
   `tests/cases/test_optional_arg_callee_spellings` reads back every keep
   and extract spelling, same-module, cross-module and through a generic
-  receiver, under valgrind with the freelist off. results in argument
-  position, and tuple-typed registers the emitter cannot tie back to a
-  literal, still strand their box.
+  receiver, under valgrind with the freelist off.
+  a fresh RESULT in that position (`take(r())` against `fn take(x: Int!)`,
+  a method call, an `await` of a task returning `T!`) follows the same
+  convention. a result parameter is a borrow of the box, and every way a
+  callee can keep it or take its payload takes a count of its own: a
+  struct construction, a field assignment, a container store, a lambda
+  capture, a bind and a returned parameter retain the box (a channel
+  cannot carry a result, so a send is not a spelling);
+  `catch` and `unwrap_or` retain the payload they hand out; `!` and a
+  `.ok`/`.err` read hand out a borrow the escape site retains; a `match`
+  binding on a result is an uncounted alias of the box, and its escape
+  retains the box. so the caller drops its one count right after the call
+  without reading the callee. what differs is the box itself: a result box
+  carries no destructor (its payload leaves with the count when an owned
+  box is opened, and the shell frees as three slots), so a plain release
+  would strand a heap payload the callee only read, and the payload
+  cascade would empty a box the callee kept. so the release asks the
+  runtime whether the caller's count is the box's last
+  (`pith_struct_strong_count`) and drops the live payload only then, in a
+  per-signature helper (`__result_arg_release_<ok><err>`); the box is
+  released either way. a signature with no heap slot at all takes the
+  plain release (a bare `Int!` is not one: its error is a string). a box
+  the callee kept survives on the keeper's count with its payload intact,
+  and what happens to it from there is what has always happened to a
+  kept result (see the entry below on results bound to a name). `tests/cases/test_result_arg_callee_spellings`
+  reads back every spelling under valgrind with the freelist off.
+  tuple-typed registers the emitter cannot tie back to a literal still
+  strand their box.
 - **a collection literal the checker cannot type builds an untagged
   container.** `[]` and `{}` have no type of their own and take one from
   context. an annotated bind, a `return`, a struct constructor, an

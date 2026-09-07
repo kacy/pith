@@ -1011,6 +1011,22 @@ mod tests {
     }
 
     #[test]
+    fn strong_count_follows_retain_and_release() {
+        unsafe {
+            assert_eq!(pith_struct_strong_count(0), 0);
+            assert_eq!(pith_struct_strong_count(12345), 0);
+            let s = pith_struct_alloc(3);
+            assert_eq!(pith_struct_strong_count(s), 1);
+            pith_struct_retain(s);
+            assert_eq!(pith_struct_strong_count(s), 2);
+            pith_struct_release(s);
+            assert_eq!(pith_struct_strong_count(s), 1);
+            pith_struct_release(s); // fully freed
+            assert_eq!(pith_struct_strong_count(s), 0); // magic scrubbed
+        }
+    }
+
+    #[test]
     fn weak_load_on_a_dead_or_invalid_pointer_is_none() {
         unsafe {
             assert_eq!(pith_struct_weak_load(0), 0);
@@ -2474,6 +2490,25 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
         struct_strong(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The number of strong owners this struct has right now; 0 for a pointer
+/// that is not a live struct. A caller that holds one count and reads 1 is
+/// the sole owner: nobody else can retain a value they have no reference
+/// to, so the answer stays true until the caller itself hands the value on.
+/// A caller that reads more than 1 may already be stale (another owner may
+/// release in the meantime), which is the safe direction for the one use
+/// this has: deciding whether a destructor-less box's payload may be
+/// dropped explicitly before the box is released.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
+    match struct_base(ptr) {
+        Some(base) => struct_strong(base).load(std::sync::atomic::Ordering::Acquire) as i64,
+        None => 0,
     }
 }
 

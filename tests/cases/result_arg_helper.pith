@@ -1,0 +1,65 @@
+# helper module for test_result_arg_callee_spellings: the callee sits in
+# another module, so the caller's emitter never sees its body. every function
+# keeps or extracts its result parameter in one of the ways the same-module
+# twins in the test do.
+
+pub struct Keep:
+    pub r: String!
+    pub n: Int!
+
+## keep both boxes in a struct.
+pub fn build(x: String!, n: Int!) -> Keep:
+    return Keep(x, n)
+
+## keep the box in a field of an existing struct.
+pub fn store(k: Keep, x: String!):
+    k.r = x
+
+## keep the box in a list.
+pub fn push_text(xs: List[String!], x: String!):
+    xs.push(x)
+
+## hand the parameter back.
+pub fn forward(x: String!) -> String!:
+    return x
+
+## hand the scalar-payload parameter back.
+pub fn forward_int(x: Int!) -> Int!:
+    return x
+
+## extract with `!` and build a new string from the payload.
+pub fn tried(x: String!) -> String!:
+    v := x!
+    return v + "+helper"
+
+## extract with `!` and read a scalar off the payload.
+pub fn tried_len(x: String!) -> Int!:
+    return x!.len()
+
+## extract with `catch`.
+pub fn caught(x: String!) -> String:
+    return x catch "helper-default"
+
+## extract a scalar payload with `catch`.
+pub fn caught_int(x: Int!) -> Int:
+    return x catch (0 - 1)
+
+## extract with `unwrap_or`.
+pub fn defaulted(x: String!) -> String:
+    return x.unwrap_or("helper-unwrap")
+
+## read the payload in place through `.ok`.
+pub fn peek(x: String!) -> Int:
+    if x.is_err:
+        return 0
+    return x.ok.len()
+
+## read the error in place through `.err`.
+pub fn err_text(x: String!) -> String:
+    if x.is_ok:
+        return "ok"
+    return x.err
+
+## capture the box in a closure.
+pub fn capture(x: String!) -> fn() -> String:
+    return fn() => x catch "helper-captured-err"

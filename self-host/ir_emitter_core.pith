@@ -159,6 +159,7 @@ mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
+mut ir_result_arg_release_sigs: List[String] := [] # (ok,err) payload signatures needing a result-argument release helper
 # set when some optional in this module wraps a genuine tuple, which needs the
 # shell to release its payload. one walk serves every such shell: the payload
 # already carries its own destructor for its elements, so the shell's job is
@@ -387,6 +388,7 @@ fn ir_reset_type_state():
     ir_tuple_dtor_sigs = []
     ir_optional_tuple_dtor_needed = false
     ir_tuple_cascade_sigs = []
+    ir_result_arg_release_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -1679,6 +1681,9 @@ fn ir_optional_tuple_payload_kind(tid: Int) -> String:
 fn ir_tuple_cascade_helper_name(sig: String) -> String:
     return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
 
+fn ir_result_arg_release_helper_name(sig: String) -> String:
+    return "__result_arg_release_" + sig + "_m" + ir_module_count.to_string()
+
 # release a tracked local at cleanup / reassignment. a cascade-eligible tuple
 # local additionally drops its owned payload before the shell is freed; every
 # other local keeps the plain shell/handle release.
@@ -1750,6 +1755,62 @@ fn ir_emit_tuple_cascade_helpers():
         ok_l := ir_label()
         err_l := ir_label()
         rel_l := ir_label()
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(ok_l)
+        if ok_kind.len() > 0:
+            ok_r := ir_reg()
+            ir_emit("field " + ok_r.to_string() + " " + pr.to_string() + " 8 unknown ok")
+            ir_rc_release_reg(ok_r, ok_kind)
+            ir_emit("sstore " + pr.to_string() + " 1 " + zero_r.to_string())
+        ir_emit("jmp " + rel_l)
+        ir_emit_label(err_l)
+        if err_kind.len() > 0:
+            err_r := ir_reg()
+            ir_emit("field " + err_r.to_string() + " " + pr.to_string() + " 16 unknown err")
+            ir_rc_release_reg(err_r, err_kind)
+            ir_emit("sstore " + pr.to_string() + " 2 " + zero_r.to_string())
+        ir_emit("jmp " + rel_l)
+        ir_emit_label(rel_l)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(done_l)
+        ir_emit_zero_ret_endfunc()
+
+# one helper per (ok, err) payload signature a fresh result argument of this
+# module carries (ir_release_fresh_result_arg). the body is the cascade
+# helper's, gated on ownership: the live payload is released and its slot
+# zeroed only when the box's strong count is exactly the one this frame holds,
+# and the box is released either way. a callee that kept the box (a field
+# store, a returned parameter, a capture) leaves it above one, and the box
+# then survives on the keeper's count with its payload intact. a null box
+# short-circuits to a no-op like the cascade's.
+fn ir_emit_result_arg_release_helpers():
+    for sig in ir_result_arg_release_sigs:
+        ok_kind := ir_tuple_dtor_code_kind(sig[0])
+        err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
+        pr := ir_emit_rc_walk_header(ir_result_arg_release_helper_name(sig))
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        live_r := ir_reg()
+        ir_emit("neq " + live_r.to_string() + " " + pr.to_string() + " " + zero_r.to_string())
+        live_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
+        ir_emit_label(live_l)
+        count_r := ir_reg()
+        ir_emit_call1(count_r, "pith_struct_strong_count", "int", pr)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        sole_r := ir_reg()
+        ir_emit("eq " + sole_r.to_string() + " " + count_r.to_string() + " " + one_r.to_string())
+        drop_l := ir_label()
+        rel_l := ir_label()
+        ir_emit("brif " + sole_r.to_string() + " " + drop_l + " " + rel_l)
+        ir_emit_label(drop_l)
+        flag_r := ir_reg()
+        ir_emit("field " + flag_r.to_string() + " " + pr.to_string() + " 0 bool is_ok")
+        ok_l := ir_label()
+        err_l := ir_label()
         ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
         ir_emit_label(ok_l)
         if ok_kind.len() > 0:
@@ -2130,8 +2191,9 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
             ir_release_owned_operand(expr_idx, reg, ir_infer_type(expr_idx))
         # a fresh optional shell handed to a method dies with the call the
         # same way it does for a plain function. `obj.take(maybe(i))` leaked
-        # its shell per call.
+        # its shell per call. a fresh result box is released on the same terms.
         ir_release_fresh_optional_arg(expr_idx, reg)
+        ir_release_fresh_result_arg(expr_idx, reg)
 
 # true for a builtin whose result may BE one of its arguments rather than a
 # value the receiver keeps a count for. `get_default` is the only one: it
@@ -2181,6 +2243,7 @@ fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
         # not touch (above), but the wrapper itself is a fresh shell this
         # caller built, and the fresh-optional release knows how to drop it.
         ir_release_fresh_optional_arg(expr_idx, arg_regs[reg_i])
+        ir_release_fresh_result_arg(expr_idx, arg_regs[reg_i])
         reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
@@ -3553,6 +3616,67 @@ fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
     if not ir_expr_is_fresh_optional_shell(expr_idx):
         return
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
+
+# a fresh result box written straight into a call argument — `take(r())`
+# against `fn take(x: Int!)` — dies with the call it fed on the same terms as
+# the optional above: a result parameter is a borrow of the box, and every way
+# a callee can keep it or take its payload takes a count of its own. a struct
+# construction, a field assignment, a container store, a lambda capture, a
+# bind and a returned parameter retain the box (a channel cannot carry a
+# result, so a send is not a spelling); `!` hands
+# out a borrow the escape site retains, `catch` and `unwrap_or` retain the
+# payload they hand out (a string payload stays a borrow that the escape site
+# retains), a `.ok`/`.err` read is a borrow, and a match binding on a result
+# is an uncounted alias of the box whose escape retains the box. so once the
+# call returns the caller's count is the only one it has to drop, whatever the
+# callee is, and no callee body is read.
+#
+# what differs from the optional is that a result box carries no destructor
+# (see ir_emit_result_tuple and the take-ok convention in ir_emit_try_expr):
+# its payload count is owned by the box and dropped by whoever frees the box.
+# a plain shell release would therefore reclaim the three slots and strand a
+# heap payload the callee only read, while the cascade helper — which drops
+# the payload unconditionally and nulls the slot — would empty a box the
+# callee kept (`store(h, r())`, `show(forward(r()))`), the wrong answer the
+# optional release already had to give up. so an rc-payload signature goes
+# through ir_emit_result_arg_release_helpers: the helper drops the live
+# payload only when this frame's count is the box's last, and releases the
+# box either way. a scalar signature has nothing to drop and takes the plain
+# release. the count read is exact in the one direction that matters: a
+# caller holding one count that reads 1 is the sole owner, and nothing can
+# retain a box it has no reference to; a stale reading above 1 (another
+# thread releasing a kept box concurrently) falls back to the plain release
+# and leaves the payload with the box, which is the pre-existing bounded leak
+# of a kept destructor-less result, never a dangling pointer.
+fn ir_release_fresh_result_arg(expr_idx: Int, reg: Int):
+    if not ir_expr_is_fresh_result_box(expr_idx):
+        return
+    sig := ir_tuple_cascade_signature(c_get_expr_type(expr_idx))
+    if sig == "00":
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
+        return
+    if not ir_result_arg_release_sigs.contains(sig):
+        ir_result_arg_release_sigs.push(sig)
+    ir_emit_call1(ir_reg(), ir_result_arg_release_helper_name(sig), "void", reg)
+
+# true when an expression's register is a result box nothing but this frame
+# names: a call, method call or await whose checked type is a result. the
+# callee (or task) transferred its one count on the box with the return, the
+# same shape ir_extraction_operand_class reads as owned. a `.value()` the
+# emitter could not count hands back an inner box it took no count on and
+# stays out, exactly as it does for the optional predicate.
+fn ir_expr_is_fresh_result_box(expr_idx: Int) -> Bool:
+    if expr_idx < 0:
+        return false
+    en := get_node(expr_idx)
+    if en.kind != "call" and en.kind != "method_call" and en.kind != "await":
+        return false
+    if ir_value_extraction_is_uncounted(expr_idx):
+        return false
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return false
+    return get_type_info(tid).kind == "result"
 
 # --- the four "is this a fresh temporary?" predicates -----------------------
 #
@@ -6490,12 +6614,19 @@ fn ir_emit_lambda_params(params: List[String]):
         ir_emit("param " + param)
 
 # a lambda's returned value transfers to the caller, like any function
-# return: a borrowed string (a field read, a parameter) takes a count
-# on the way out, so the caller's release is balanced.
+# return: a borrowed value (a field read, a parameter, a captured name) takes
+# a count on the way out, so the caller's release is balanced. every rc kind
+# takes it, the same as ir_emit_return_value does for a `return` statement.
+# this used to retain a string only, so `fn() => x` over a captured optional
+# shell, result box, struct or container handed the caller the environment's
+# own count: the caller released it as the fresh value a call result is, and
+# the next call of the closure read freed memory (a released optional
+# argument, `show(c())` twice, was the first shape to reach valgrind).
 fn ir_emit_lambda_expr_return(expr_idx: Int):
     br := ir_expr(expr_idx)
-    if ir_infer_type(expr_idx) == "string" and ir_expr_is_borrowed(expr_idx):
-        ir_rc_retain_reg(br, "string")
+    ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_idx)))
+    if ret_kind.len() > 0 and ir_expr_is_borrowed(expr_idx):
+        ir_rc_retain_reg(br, ret_kind)
     ir_emit("ret " + br.to_string())
 
 fn ir_emit_lambda_body_value(body_idx: Int):
@@ -10759,6 +10890,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_tuple_walks(false)
     ir_emit_tuple_walks(true)
     ir_emit_tuple_cascade_helpers()
+    ir_emit_result_arg_release_helpers()
     ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair
     # list covers the tuple and generic-instance twins too.

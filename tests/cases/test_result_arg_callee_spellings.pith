@@ -1,0 +1,452 @@
+# a fresh result written straight into an argument — `f(mk(i))` against
+# `fn f(x: String!)` — is released by the caller as soon as the call returns,
+# without reading the callee's body. that is only sound if every way a callee
+# can keep or extract its result parameter takes a count of its own. each
+# block below is one such spelling: a struct construction, a field
+# assignment, a list push, a map insert, an index assignment, a closure
+# capture, a spawned task, a bind, a list and a tuple literal
+# element, a return of the parameter, a widening into an optional, `!`,
+# `catch`, a `catch:` block, `unwrap_or`, a `match`, `.ok`/`.err` reads, and
+# the same through a module boundary and a generic receiver. the kept value is
+# read back after the caller's release, so a callee that did not take its own
+# count reads freed memory here, and a release that dropped the payload of a
+# box the callee kept prints an empty string. the expected output was derived
+# from the annotated controls at the end (`v: String! := ...` then `f(v)`),
+# which have always been reclaimed normally. runs under valgrind with the
+# freelist off (MEMCHECK_CASES).
+import result_arg_helper as helper
+
+struct Holder:
+    pub r: String!
+    pub n: Int!
+
+struct Failure:
+    pub code: Int
+    pub text: String
+
+struct Box[T]:
+    pub v: T
+
+impl Box:
+    fn peek(x: T!) -> Int:
+        if x.is_err:
+            return 0
+        return 1
+
+    fn keep(x: T!) -> T!:
+        return x
+
+    fn extract(x: T!) -> T:
+        return x catch self.v
+
+struct Taker:
+    n: Int
+
+impl Taker:
+    fn build(x: String!) -> Holder:
+        return Holder(x, mk_int(self.n))
+
+    fn read(x: String!) -> Int:
+        return (x catch "").len() + self.n
+
+    fn tried(x: String!) -> Int!:
+        return x!.len() + self.n
+
+fn mk(i: Int) -> String!:
+    if i < 0:
+        fail "e{i}"
+    return "s{i}"
+
+fn mk_int(i: Int) -> Int!:
+    if i < 0:
+        fail "e{i}"
+    return i
+
+fn mk_typed(i: Int) -> Int!Failure:
+    if i < 0:
+        fail Failure(i, "typed{i}")
+    return i
+
+fn show(label: String, r: String!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_int(label: String, r: Int!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+# --- the callee keeps the whole box ---
+
+fn build(x: String!, n: Int!) -> Holder:
+    return Holder(x, n)
+
+fn build_named(x: String!) -> Holder:
+    return Holder(r: x, n: mk_int(0))
+
+fn store(h: Holder, x: String!):
+    h.r = x
+
+fn push(xs: List[String!], x: String!):
+    xs.push(x)
+
+fn insert(m: Map[String, String!], k: String, x: String!):
+    m.insert(k, x)
+
+fn index_store(m: Map[String, String!], k: String, x: String!):
+    m[k] = x
+
+fn capture(x: String!) -> fn() -> String:
+    return fn() => x catch "captured-err"
+
+fn read_later(x: String!) -> Int:
+    return (x catch "").len()
+
+fn spawned(x: String!) -> Int:
+    t := spawn read_later(x)
+    return await t
+
+fn bound(x: String!) -> String:
+    y := x
+    return y catch "bound-err"
+
+fn listed(x: String!) -> List[String!]:
+    return [x]
+
+fn paired(x: String!) -> (Int, String!):
+    return (1, x)
+
+fn forward(x: String!) -> String!:
+    return x
+
+fn forward_int(x: Int!) -> Int!:
+    return x
+
+fn deepen(x: (String!)?) -> Int:
+    if let inner = x:
+        if inner.is_ok:
+            return 2
+        return 1
+    return 0
+
+fn deeper(x: String!) -> Int:
+    return deepen(x)
+
+# --- the callee extracts the payload ---
+
+fn tried(x: String!) -> String!:
+    v := x!
+    return v + "+tried"
+
+fn tried_len(x: String!) -> Int!:
+    return x!.len()
+
+fn tried_int(x: Int!) -> Int!:
+    return x! + 100
+
+fn caught(x: String!) -> String:
+    return x catch "caught-err"
+
+fn caught_block(x: String!) -> String:
+    v := x catch:
+        return "caught-block-err"
+    return v + "+block"
+
+fn defaulted(x: String!) -> String:
+    return x.unwrap_or("defaulted")
+
+fn matched(x: String!) -> String:
+    match x:
+        v if v.is_ok => v.ok
+        v => "matched-" + v.err
+
+fn matched_forward(x: String!) -> String!:
+    match x:
+        v => v
+
+fn read_ok(x: String!) -> String:
+    if x.is_err:
+        return "read-err"
+    return x.ok
+
+fn read_err(x: String!) -> String:
+    if x.is_ok:
+        return "read-ok"
+    return x.err
+
+fn probed(x: String!) -> Int:
+    if x.is_err:
+        return 0
+    return 1
+
+fn typed_code(x: Int!Failure) -> Int:
+    if x.is_err:
+        return x.err.code
+    return x.ok
+
+fn typed_text(x: Int!Failure) -> String:
+    if x.is_err:
+        return x.err.text
+    return "typed-ok"
+
+fn typed_forward(x: Int!Failure) -> Int!Failure:
+    return x
+
+fn relay_store(xs: List[String!], x: String!):
+    push(xs, x)
+
+fn relay_read(x: String!) -> String:
+    return caught(x)
+
+fn capture_box(x: String!) -> fn() -> String!:
+    return fn() => x
+
+fn gpeek[T](x: T!) -> Int:
+    if x.is_err:
+        return 0
+    return 1
+
+fn gforward[T](x: T!) -> T!:
+    return x
+
+fn mk_pair(i: Int) -> (Int, String)!:
+    if i < 0:
+        fail "e{i}"
+    return (i, "p{i}")
+
+fn mk_opt(i: Int) -> (String?)!:
+    if i < 0:
+        fail "e{i}"
+    v: String? := "o{i}"
+    return v
+
+fn pair_text(x: (Int, String)!) -> String:
+    if x.is_err:
+        return x.err
+    v := x catch (0, "")
+    return v.1 + "/" + v.0.to_string()
+
+fn pair_tried(x: (Int, String)!) -> String!:
+    v := x!
+    return v.1 + "/" + v.0.to_string()
+
+fn pair_forward(x: (Int, String)!) -> (Int, String)!:
+    return x
+
+fn opt_text(x: (String?)!) -> String:
+    v := x catch none
+    return v.unwrap_or("opt-none")
+
+fn apply(f: fn(String!) -> String, x: String!) -> String:
+    return f(x)
+
+fn main():
+    # keep spellings, each fed an ok and an err result
+    h1 := build(mk(1), mk_int(1))
+    show("build.r", h1.r)
+    show_int("build.n", h1.n)
+    h2 := build(mk(0 - 2), mk_int(0 - 2))
+    show("build.err", h2.r)
+    show_int("build.err.n", h2.n)
+    h4 := build_named(mk(4))
+    show("build_named", h4.r)
+
+    h5 := Holder(mk(50), mk_int(50))
+    store(h5, mk(5))
+    show("store.ok", h5.r)
+    store(h5, mk(0 - 5))
+    show("store.err", h5.r)
+
+    xs: List[String!] := []
+    push(xs, mk(6))
+    push(xs, mk(0 - 6))
+    show("push.0", xs[0])
+    show("push.1", xs[1])
+
+    m: Map[String, String!] := {}
+    insert(m, "a", mk(7))
+    insert(m, "b", mk(0 - 7))
+    index_store(m, "d", mk(8))
+    index_store(m, "e", mk(0 - 8))
+    show("insert.a", m["a"])
+    show("insert.b", m["b"])
+    show("index.d", m["d"])
+    show("index.e", m["e"])
+
+    c1 := capture(mk(10))
+    c2 := capture(mk(0 - 10))
+    print("capture {c1()} {c2()}")
+
+    print("spawned {spawned(mk(11))} {spawned(mk(0 - 11))}")
+    print("bound {bound(mk(12))} {bound(mk(0 - 12))}")
+
+    l1 := listed(mk(13))
+    show("listed.0", l1[0])
+    l2 := listed(mk(0 - 13))
+    show("listed.err", l2[0])
+
+    p1 := paired(mk(14))
+    show("paired", p1.1)
+    p2 := paired(mk(0 - 14))
+    show("paired.err", p2.1)
+
+    show("forward", forward(mk(15)))
+    show("forward.err", forward(mk(0 - 15)))
+    show_int("forward_int", forward_int(mk_int(15)))
+    show_int("forward_int.err", forward_int(mk_int(0 - 15)))
+    f1 := forward(mk(16))
+    show("forward.bound", f1)
+    print("forward.tried {forward(mk(16)) catch "x"} {forward(mk(0 - 16)) catch "forward-err"}")
+
+    print("deeper {deeper(mk(17))} {deeper(mk(0 - 17))}")
+
+    # extraction spellings
+    show("tried", tried(mk(18)))
+    show("tried.err", tried(mk(0 - 18)))
+    show_int("tried_len", tried_len(mk(18)))
+    show_int("tried_len.err", tried_len(mk(0 - 18)))
+    show_int("tried_int", tried_int(mk_int(18)))
+    show_int("tried_int.err", tried_int(mk_int(0 - 18)))
+    print("caught {caught(mk(19))} {caught(mk(0 - 19))}")
+    print("caught_block {caught_block(mk(20))} {caught_block(mk(0 - 20))}")
+    print("defaulted {defaulted(mk(21))} {defaulted(mk(0 - 21))}")
+    print("matched {matched(mk(22))} {matched(mk(0 - 22))}")
+    show("matched_forward", matched_forward(mk(23)))
+    show("matched_forward.err", matched_forward(mk(0 - 23)))
+    print("read_ok {read_ok(mk(24))} {read_ok(mk(0 - 24))}")
+    print("read_err {read_err(mk(25))} {read_err(mk(0 - 25))}")
+    print("probed {probed(mk(26))} {probed(mk(0 - 26))}")
+    print("typed {typed_code(mk_typed(27))} {typed_code(mk_typed(0 - 27))} {typed_text(mk_typed(27))} {typed_text(mk_typed(0 - 27))}")
+    tf := typed_forward(mk_typed(0 - 28))
+    print("typed_forward {tf.is_err} {tf.err.code} {tf.err.text} {typed_code(typed_forward(mk_typed(28)))}")
+
+    # relays, a captured box handed back, a generic function, tuple and optional
+    # payloads, a closure callee, a fn-value parameter, a spawned call
+    rxs: List[String!] := []
+    relay_store(rxs, mk(51))
+    relay_store(rxs, mk(0 - 51))
+    show("relay_store.0", rxs[0])
+    show("relay_store.1", rxs[1])
+    print("relay_read {relay_read(mk(52))} {relay_read(mk(0 - 52))}")
+    cb1 := capture_box(mk(53))
+    cb2 := capture_box(mk(0 - 53))
+    show("capture_box", cb1())
+    show("capture_box.again", cb1())
+    show("capture_box.err", cb2())
+    print("gpeek {gpeek(mk(54))} {gpeek(mk(0 - 54))} {gpeek(mk_int(54))} {gpeek(mk(0 - 54))}")
+    show("gforward", gforward(mk(55)))
+    show_int("gforward.int", gforward(mk_int(55)))
+    show("gforward.err", gforward(mk(0 - 55)))
+    print("pair {pair_text(mk_pair(56))} {pair_text(mk_pair(0 - 56))} {pair_text(pair_forward(mk_pair(56)))}")
+    show("pair.tried", pair_tried(mk_pair(56)))
+    show("pair.tried.err", pair_tried(mk_pair(0 - 56)))
+    pf := pair_forward(mk_pair(57))
+    print("pair.kept {pf.ok.0} {pf.ok.1} {pair_text(pf)} {pair_text(pair_forward(pf))} {pf.ok.1}")
+    print("opt {opt_text(mk_opt(58))} {opt_text(mk_opt(0 - 58))}")
+    cl := fn(x: String!) -> String => x catch "closure-err"
+    print("closure {cl(mk(59))} {cl(mk(0 - 59))} {apply(cl, mk(60))} {apply(cl, mk(0 - 60))} {apply(caught, mk(61))}")
+    ts := spawn read_later(mk(62))
+    print("spawn.arg {await ts}")
+
+    # a fresh result written straight into a container store or a literal is
+    # taken by the store, not released after it
+    sxs: List[String!] := []
+    sxs.push(mk(63))
+    sxs.push(mk(0 - 63))
+    sm: Map[String, String!] := {}
+    sm.insert("a", mk(64))
+    sm["b"] = mk(0 - 64)
+    lit := [mk(65), mk(0 - 65)]
+    show("store.push.0", sxs[0])
+    show("store.push.1", sxs[1])
+    show("store.insert", sm["a"])
+    show("store.index", sm["b"])
+    show("store.lit.0", lit[0])
+    show("store.lit.1", lit[1])
+    print("interp {mk(66) catch "d"} {mk(0 - 66) catch "interp-err"}")
+
+    # a box another owner still holds: the caller's release must free only its
+    # own count. a parameter handed back by `forward` is the box the local
+    # still owns, and a match alias that escapes is the same box.
+    kept_local: String! := mk(30)
+    show("forward.local", forward(kept_local))
+    show("forward.local.kept", kept_local)
+    print("caught.local {caught(forward(kept_local))} {helper.peek(forward(kept_local))} {probed(matched_forward(kept_local))}")
+    show("forward.local.kept2", kept_local)
+    kept_err: String! := mk(0 - 31)
+    show("forward.local.err", forward(kept_err))
+    show("forward.local.err.kept", kept_err)
+
+    # an awaited result in argument position
+    t32 := spawn mk(32)
+    print("awaited {caught(await t32)}")
+    t33 := spawn mk(33)
+    show("awaited.forward", forward(await t33))
+
+    # methods on a plain receiver
+    t := Taker(3)
+    th := t.build(mk(34))
+    show("method.build", th.r)
+    th2 := t.build(mk(0 - 34))
+    show("method.build.err", th2.r)
+    print("method.read {t.read(mk(35))} {t.read(mk(0 - 35))}")
+    show_int("method.tried", t.tried(mk(36)))
+    show_int("method.tried.err", t.tried(mk(0 - 36)))
+
+    # methods on a generic receiver
+    bi := Box[Int](100)
+    bs := Box[String]("fallback")
+    print("generic.peek {bi.peek(mk_int(37))} {bi.peek(mk_int(0 - 37))} {bs.peek(mk(37))} {bs.peek(mk(0 - 37))}")
+    show_int("generic.keep", bi.keep(mk_int(38)))
+    show("generic.keep.str", bs.keep(mk(38)))
+    show("generic.keep.err", bs.keep(mk(0 - 38)))
+    kept := bs.keep(mk(39))
+    show("generic.keep.bound", kept)
+    print("generic.extract {bi.extract(mk_int(40))} {bi.extract(mk_int(0 - 40))} {bs.extract(mk(40))} {bs.extract(mk(0 - 40))}")
+
+    # the callee in another module
+    hk := helper.build(mk(41), mk_int(41))
+    show("helper.build", hk.r)
+    show_int("helper.build.n", hk.n)
+    helper.store(hk, mk(42))
+    show("helper.store", hk.r)
+    helper.store(hk, mk(0 - 42))
+    show("helper.store.err", hk.r)
+    hxs: List[String!] := []
+    helper.push_text(hxs, mk(43))
+    helper.push_text(hxs, mk(0 - 43))
+    show("helper.push.0", hxs[0])
+    show("helper.push.1", hxs[1])
+    show("helper.forward", helper.forward(mk(44)))
+    show("helper.forward.err", helper.forward(mk(0 - 44)))
+    show_int("helper.forward_int", helper.forward_int(mk_int(44)))
+    show("helper.tried", helper.tried(mk(45)))
+    show("helper.tried.err", helper.tried(mk(0 - 45)))
+    show_int("helper.tried_len", helper.tried_len(mk(45)))
+    print("helper.caught {helper.caught(mk(46))} {helper.caught(mk(0 - 46))}")
+    print("helper.caught_int {helper.caught_int(mk_int(46))} {helper.caught_int(mk_int(0 - 46))}")
+    print("helper.defaulted {helper.defaulted(mk(47))} {helper.defaulted(mk(0 - 47))}")
+    print("helper.peek {helper.peek(mk(48))} {helper.peek(mk(0 - 48))}")
+    print("helper.err_text {helper.err_text(mk(49))} {helper.err_text(mk(0 - 49))}")
+    hc1 := helper.capture(mk(50))
+    hc2 := helper.capture(mk(0 - 50))
+    print("helper.capture {hc1()} {hc2()}")
+
+    # the annotated controls the expected output was derived from
+    v1: String! := mk(1)
+    n1: Int! := mk_int(1)
+    ch1 := build(v1, n1)
+    show("control.build", ch1.r)
+    show_int("control.build.n", ch1.n)
+    v2: String! := mk(0 - 2)
+    print("control.caught {caught(v1)} {caught(v2)}")
+    print("control.matched {matched(v1)} {matched(v2)}")
+    show("control.tried", tried(v1))
+    show("control.tried.err", tried(v2))
+    show("control.forward", forward(v1))
+    cc := capture(v1)
+    print("control.capture {cc()}")
+    print("control.helper {helper.caught(v1)} {helper.peek(v1)} {bs.extract(v1)} {helper.err_text(v2)}")

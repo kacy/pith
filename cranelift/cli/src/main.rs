@@ -68,8 +68,13 @@ fn run_cli() {
                 std::process::exit(1);
             }
             // `--filter <substr>` (or `--filter=<substr>`) runs only the tests
-            // whose name contains the substring. it reaches the test binary
-            // through the environment, which the subprocess inherits.
+            // whose name contains the substring; `--tag`/`--exclude-tag` select
+            // and exclude by the labels a `test` block carries, and repeat to
+            // name more than one; `--json` reports one record per result rather
+            // than prose. every one of them reaches the test binary through the
+            // environment, which the subprocess inherits.
+            let mut selected_tags: Vec<String> = Vec::new();
+            let mut excluded_tags: Vec<String> = Vec::new();
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "--filter" && i + 1 < args.len() {
@@ -78,9 +83,30 @@ fn run_cli() {
                 } else if let Some(f) = args[i].strip_prefix("--filter=") {
                     env::set_var("PITH_TEST_FILTER", f);
                     i += 1;
+                } else if args[i] == "--tag" && i + 1 < args.len() {
+                    selected_tags.push(args[i + 1].clone());
+                    i += 2;
+                } else if let Some(t) = args[i].strip_prefix("--tag=") {
+                    selected_tags.push(t.to_string());
+                    i += 1;
+                } else if args[i] == "--exclude-tag" && i + 1 < args.len() {
+                    excluded_tags.push(args[i + 1].clone());
+                    i += 2;
+                } else if let Some(t) = args[i].strip_prefix("--exclude-tag=") {
+                    excluded_tags.push(t.to_string());
+                    i += 1;
+                } else if args[i] == "--json" {
+                    env::set_var("PITH_TEST_JSON", "1");
+                    i += 1;
                 } else {
                     i += 1;
                 }
+            }
+            if !selected_tags.is_empty() {
+                env::set_var("PITH_TEST_TAGS", selected_tags.join(","));
+            }
+            if !excluded_tags.is_empty() {
+                env::set_var("PITH_TEST_EXCLUDE_TAGS", excluded_tags.join(","));
             }
             test_file(&args[2]);
         }
@@ -132,7 +158,8 @@ fn print_usage() {
     println!("  build <file.pith>    Compile .pith file to native binary");
     println!("  build-ir <file.ir> <out>  Compile combined IR text to a native binary");
     println!("  run <file.pith>      Compile and run immediately");
-    println!("  test <file.pith> [--filter <substr>]  Compile and run tests");
+    println!("  test <file.pith>     Compile and run tests");
+    println!("      [--filter <substr>] [--tag <name>] [--exclude-tag <name>] [--json]");
     println!("  check <file.pith>    Type-check without generating code");
     println!("  fmt [args...]      Format source files");
     println!("  lint [args...]     Lint source files");

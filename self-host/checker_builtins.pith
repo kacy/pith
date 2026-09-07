@@ -52,6 +52,11 @@ pub fn register_builtin_types(scope_id: Int):
     # what makes one inside a `test` block fail the block.
     define_builtin_function("set_test_failed", create_function_type([TID_BOOL], TID_VOID))
 
+    # std.testing prints a check or a table row through this rather than
+    # print(), so one place decides what a result looks like: prose for a
+    # person, one json record per result under `pith test --json`.
+    define_builtin_function("report_test_case", create_function_type([TID_STRING, TID_BOOL, TID_STRING], TID_VOID))
+
     int_to_void := create_function_type([TID_INT], TID_VOID)
     define_builtin_function("exit", int_to_void)
     define_builtin_function("sleep", int_to_void)
@@ -275,6 +280,7 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("args", [], list_string)
     fix_builtin_binding("assert", [tid_bool], tid_void)
     fix_builtin_binding("set_test_failed", [tid_bool], tid_void)
+    fix_builtin_binding("report_test_case", [tid_string, tid_bool, tid_string], tid_void)
     fix_builtin_binding("exit", [tid_int], tid_void)
     fix_builtin_binding("sleep", [tid_int], tid_void)
     fix_builtin_binding("random_seed", [tid_int], tid_void)

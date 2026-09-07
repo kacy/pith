@@ -215,7 +215,7 @@ non-trivial pith look like."
 |---|---|
 | `pith run <file>` | compile and run |
 | `pith build <file>` | compile to a native binary |
-| `pith test <file>` | run `test` blocks; `--filter <substr>` selects |
+| `pith test <file>` | run `test` blocks; `--filter <substr>` and `--tag <name>` select, `--json` reports records |
 | `pith check <file>` | type check; `--json` for machine output |
 | `pith fmt <file>` | format; `--check` to verify |
 | `pith lint <file>` | conventions; `--json` available |

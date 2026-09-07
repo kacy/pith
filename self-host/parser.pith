@@ -2004,14 +2004,34 @@ fn merge_generic_param_bounds(gp_idx: Int, extra: List[Int]) -> Int:
         merged.push(e)
     return add_node_with_position("generic_param", gp.value, merged)
 
+# tags on a test block: `test "name" [slow, network]:`. the labels are
+# identifiers in the bracketed list shape the language already spells
+# everywhere else, and they land on a `test_tags` child holding them joined by
+# commas. the body stays a child found by kind, so every walker that looks for
+# it — checker, printer, emitter, linter — is unaffected by a test that carries
+# tags.
+fn parse_test_tags() -> Int:
+    expect("lbracket")
+    mut names: List[String] := []
+    names.push(expect("identifier").value)
+    while match_tok("comma"):
+        names.push(expect("identifier").value)
+    expect("rbracket")
+    return add_node_with_position("test_tags", names.join(","), [])
+
 fn parse_test_decl() -> Int:
     advance_token()
     name_tok := expect("string_lit")
+    mut tags := 0 - 1
+    if check("lbracket"):
+        tags = parse_test_tags()
     expect("colon")
     body := parse_block()
     mut body_children: List[Int] := [body]
     mut children: List[Int] := []
     children.push(add_node_with_position("body", "", body_children))
+    if tags >= 0:
+        children.push(tags)
     return add_node_with_position("test_decl", name_tok.value, children)
 
 fn parse_param_list() -> List[Int]:

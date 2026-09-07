@@ -236,9 +236,11 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **testing** — `test` blocks are discovered and run by `pith test` (with
   `--filter`), and `std/testing` adds assertions, a `with_temp_dir` fixture
   helper, and `each` for parameterized cases: a labeled row reports as its own
-  result and is reachable on its own as `--filter "test name / row label"`.
-  still missing are tags, benchmarks, and machine-readable output for ci. the
-  project's own suite is golden-snapshot based (see `tests/`).
+  result and is reachable on its own as `--filter "test name / row label"`. a
+  test carries tags — `test "name" [slow, database]:` — which `--tag` and
+  `--exclude-tag` select and exclude, and `--json` reports the run as one json
+  record per result for ci. benchmarks are still missing. the project's own
+  suite is golden-snapshot based (see `tests/`).
 - **plaintext http/2 needs an explicit listener** — over tls, `web.listen_tls`
   offers alpn `["h2", "http/1.1"]` and serves whichever the client picks. there
   is no such negotiation without tls, so plaintext http/2 means calling

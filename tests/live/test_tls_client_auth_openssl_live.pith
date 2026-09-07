@@ -1,0 +1,217 @@
+# mutual tls against openssl, in both directions and on both versions.
+#
+# openssl is the oracle a pith-to-pith test cannot be: two pith peers share the
+# same encoder, the same transcript bookkeeping and the same idea of which
+# signature scheme goes where, so they agree even when both are wrong. here a
+# pith server is driven by `openssl s_client` presenting a certificate, and a
+# pith client presents one to `openssl s_server -Verify`. the refusals matter as
+# much as the acceptances: each one names the alert openssl received, which is
+# the only way to check from outside that the right rfc code went on the wire.
+#
+# every case runs on tls 1.3 and on the tls 1.2 fallback, because the two
+# handshakes carry client authentication differently — 1.3 signs a hashed
+# transcript under a context string inside the encrypted flight, 1.2 signs the
+# raw transcript in the clear before the cipher change.
+
+import std.net.tls as tls
+import std.os.process as process
+import std.time as time
+
+SERVER_CERT := "tests/live/fixtures/localhost.crt"
+SERVER_KEY := "tests/live/fixtures/localhost.key"
+SERVER_CA := "tests/live/fixtures/localhost-ca.crt"
+CLIENT_CA := "tests/live/fixtures/clientcert-ca.crt"
+RSA_CERT := "tests/live/fixtures/clientcert-rsa.crt"
+RSA_KEY := "tests/live/fixtures/clientcert-rsa.key"
+EC_CERT := "tests/live/fixtures/clientcert-ecdsa.crt"
+EC_KEY := "tests/live/fixtures/clientcert-ecdsa.key"
+ROGUE_CERT := "tests/live/fixtures/clientcert-rogue.crt"
+ROGUE_KEY := "tests/live/fixtures/clientcert-rogue.key"
+EXPIRED_CERT := "tests/live/fixtures/clientcert-expired.crt"
+EXPIRED_KEY := "tests/live/fixtures/clientcert-expired.key"
+
+# what openssl reports when it reads a fatal alert, reduced to the rfc name so
+# the expected output does not depend on openssl's error-string formatting.
+fn alert_in(out: String) -> String:
+    if out.contains("unknown ca"):
+        return "unknown_ca"
+    if out.contains("certificate expired"):
+        return "certificate_expired"
+    if out.contains("handshake failure"):
+        return "handshake_failure"
+    if out.contains("decrypt error"):
+        return "decrypt_error"
+    if out.contains("illegal parameter"):
+        return "illegal_parameter"
+    if out.contains("bad certificate"):
+        return "bad_certificate"
+    if out.contains("certificate required"):
+        return "certificate_required"
+    if out.contains("unexpected message"):
+        return "unexpected_message"
+    if out.contains("alert"):
+        return "other-alert"
+    return "no-alert"
+
+fn or_dash(value: String) -> String:
+    if value == "":
+        return "-"
+    return value
+
+# the pith server half: accept one connection, echo, and report the identity it
+# verified — or the reason it refused.
+fn serve_one(listener: tls.Listener, out: Channel[String]):
+    r := listener.accept()
+    if r.is_err:
+        out.send("server refused")
+        return
+    conn := r.ok
+    state := conn.state()
+    msg := conn.read(64) catch ""
+    conn.write_all("echo:" + msg.trim() + "\n") catch 0
+    conn.close()
+    out.send("server " + state.version.to_string() + " verified=" + state.client_auth_verified.to_string() + " subject=" + or_dash(state.peer_common_name))
+
+# one `openssl s_client` run against a pith server that wants a certificate.
+# `cert_args` is the certificate the client presents, empty when it presents
+# none; `version_flag` pins the version so both handshakes get their own case.
+fn openssl_client_case(label: String, port: Int, server_cfg: tls.Config, version_flag: String, cert_args: String):
+    listener_r := tls.listen("127.0.0.1", port, server_cfg)
+    if listener_r.is_err:
+        print(label + ": listen-error")
+        server_cfg.close()
+        return
+    listener := listener_r.ok
+    out := Channel[String](1)
+    spawn serve_one(listener, out)
+    command := "printf 'hi\\n' | openssl s_client -connect 127.0.0.1:" + port.to_string() + " -servername localhost -CAfile " + SERVER_CA + " " + version_flag + " " + cert_args + " -quiet 2>&1"
+    # run through a shell for the pipe and the stderr merge, but with the
+    # task-aware runner: output_shell would block the whole scheduler and the
+    # server task beside it.
+    result := process.command("sh").arg("-c").arg(command).output()
+    mut text := ""
+    if result.is_ok:
+        text = result.ok.stdout + result.ok.stderr
+    mut verdict := "no-connection"
+    if text.contains("echo:hi"):
+        verdict = "accepted"
+    else:
+        verdict = "refused " + alert_in(text)
+    mut reported := "server silent"
+    if let line = out.recv():
+        reported = line
+    print(label + ": " + verdict + " / " + reported)
+    listener.close()
+    server_cfg.close()
+
+# one pith client against `openssl s_server`. -Verify requires a client
+# certificate and refuses a client that has none; -verify asks for one and
+# accepts a client that declines. -verify_return_error is what makes either of
+# them mean anything: without it s_server's verify callback accepts a chain it
+# could not verify, and every negative case here would pass.
+fn openssl_server_case(label: String, port: Int, verify_flag: String, depth: String, version_flag: String, client_cfg: tls.Config):
+    # spawned as openssl itself rather than through a shell: the shell would be
+    # what kill() reaches, and the server would outlive the case and answer the
+    # next one from the port it never gave back.
+    args := ["s_server", "-accept", port.to_string(), "-cert", SERVER_CERT, "-key", SERVER_KEY, "-CAfile", CLIENT_CA, verify_flag, depth, "-verify_return_error", version_flag, "-www", "-quiet"]
+    proc_r := process.command("openssl").args(args).start()
+    if proc_r.is_err:
+        print(label + ": openssl-unavailable")
+        client_cfg.close()
+        return
+    proc := proc_r.ok
+    mut verdict := "no-connection"
+    mut last_error := ""
+    mut attempt := 0
+    while attempt < 30 and verdict == "no-connection":
+        r := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)
+        if r.is_ok:
+            conn := r.ok
+            version := conn.version_name()
+            mut body := ""
+            mut failure := "no answer"
+            wrote := conn.write_all("GET / HTTP/1.0\r\n\r\n")
+            if wrote.is_ok:
+                read := conn.read(32)
+                if read.is_ok:
+                    body = read.ok
+                else:
+                    failure = read.err
+            else:
+                failure = wrote.err
+            conn.close()
+            if body.starts_with("HTTP"):
+                verdict = "accepted " + version
+            else:
+                # tls 1.3 verifies the client certificate after the client's
+                # handshake has finished, so its refusal arrives as an alert on
+                # the first read rather than as a failed dial.
+                verdict = "refused after handshake (" + failure + ")"
+        else:
+            last_error = r.err
+            # a refusal is the expected answer in the negative cases; give the
+            # server a few attempts to come up before believing one, then
+            # report the alert the client was given.
+            if attempt >= 8:
+                verdict = "refused (" + last_error + ")"
+        attempt = attempt + 1
+        time.delay(60)
+    print(label + ": " + verdict)
+    client_cfg.close()
+    proc.kill()
+    proc.wait()
+
+fn require_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.require_client_ca_file(CLIENT_CA)
+
+fn request_server() -> tls.Config!:
+    return tls.server_config(SERVER_CERT, SERVER_KEY)!.request_client_ca_file(CLIENT_CA)
+
+fn client_with(cert: String, key: String, only12: Bool) -> tls.Config!:
+    cfg := tls.client_config_with_ca_file(SERVER_CA)!.with_client_certificate(cert, key)!
+    if only12:
+        return cfg.require_tls12()
+    return cfg.require_tls13()
+
+fn plain_client(only12: Bool) -> tls.Config!:
+    cfg := tls.client_config_with_ca_file(SERVER_CA)!
+    if only12:
+        return cfg.require_tls12()
+    return cfg.require_tls13()
+
+fn main() -> Int!:
+    rsa_args := "-cert " + RSA_CERT + " -key " + RSA_KEY
+    ec_args := "-cert " + EC_CERT + " -key " + EC_KEY
+    rogue_args := "-cert " + ROGUE_CERT + " -key " + ROGUE_KEY
+    expired_args := "-cert " + EXPIRED_CERT + " -key " + EXPIRED_KEY
+
+    # openssl client -> pith server, tls 1.2: present, decline, and the two
+    # chains a trust bundle must refuse.
+    openssl_client_case("openssl->pith 1.2 rsa", 44560, require_server()!, "-tls1_2", rsa_args)
+    openssl_client_case("openssl->pith 1.2 ecdsa", 44561, require_server()!, "-tls1_2", ec_args)
+    openssl_client_case("openssl->pith 1.2 none-required", 44562, require_server()!, "-tls1_2", "")
+    openssl_client_case("openssl->pith 1.2 none-optional", 44563, request_server()!, "-tls1_2", "")
+    openssl_client_case("openssl->pith 1.2 rogue", 44564, require_server()!, "-tls1_2", rogue_args)
+    openssl_client_case("openssl->pith 1.2 expired", 44565, require_server()!, "-tls1_2", expired_args)
+
+    # the same six on tls 1.3, which already had client authentication: the 1.2
+    # answers have to match these.
+    openssl_client_case("openssl->pith 1.3 rsa", 44566, require_server()!, "-tls1_3", rsa_args)
+    openssl_client_case("openssl->pith 1.3 ecdsa", 44567, require_server()!, "-tls1_3", ec_args)
+    openssl_client_case("openssl->pith 1.3 none-required", 44568, require_server()!, "-tls1_3", "")
+    openssl_client_case("openssl->pith 1.3 none-optional", 44569, request_server()!, "-tls1_3", "")
+    openssl_client_case("openssl->pith 1.3 rogue", 44570, require_server()!, "-tls1_3", rogue_args)
+    openssl_client_case("openssl->pith 1.3 expired", 44571, require_server()!, "-tls1_3", expired_args)
+
+    # pith client -> openssl server.
+    openssl_server_case("pith->openssl 1.2 rsa", 44572, "-Verify", "1", "-tls1_2", client_with(RSA_CERT, RSA_KEY, true)!)
+    openssl_server_case("pith->openssl 1.2 ecdsa", 44573, "-Verify", "1", "-tls1_2", client_with(EC_CERT, EC_KEY, true)!)
+    openssl_server_case("pith->openssl 1.2 none-required", 44574, "-Verify", "1", "-tls1_2", plain_client(true)!)
+    openssl_server_case("pith->openssl 1.2 none-optional", 44575, "-verify", "1", "-tls1_2", plain_client(true)!)
+    openssl_server_case("pith->openssl 1.2 rogue", 44576, "-Verify", "1", "-tls1_2", client_with(ROGUE_CERT, ROGUE_KEY, true)!)
+    openssl_server_case("pith->openssl 1.3 rsa", 44577, "-Verify", "1", "-tls1_3", client_with(RSA_CERT, RSA_KEY, false)!)
+    openssl_server_case("pith->openssl 1.3 ecdsa", 44578, "-Verify", "1", "-tls1_3", client_with(EC_CERT, EC_KEY, false)!)
+    openssl_server_case("pith->openssl 1.3 none-required", 44579, "-Verify", "1", "-tls1_3", plain_client(false)!)
+    openssl_server_case("pith->openssl 1.3 none-optional", 44580, "-verify", "1", "-tls1_3", plain_client(false)!)
+    openssl_server_case("pith->openssl 1.3 rogue", 44581, "-Verify", "1", "-tls1_3", client_with(ROGUE_CERT, ROGUE_KEY, false)!)
+    return 0

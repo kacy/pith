@@ -159,13 +159,16 @@ ALERT_BAD_RECORD_MAC := 20
 ALERT_RECORD_OVERFLOW := 22
 ALERT_HANDSHAKE_FAILURE := 40
 ALERT_BAD_CERTIFICATE := 42
+ALERT_CERTIFICATE_EXPIRED := 45
 ALERT_ILLEGAL_PARAMETER := 47
+ALERT_UNKNOWN_CA := 48
 ALERT_DECODE_ERROR := 50
 ALERT_DECRYPT_ERROR := 51
 ALERT_PROTOCOL_VERSION := 70
 ALERT_NO_APPLICATION_PROTOCOL := 120
 ALERT_INAPPROPRIATE_FALLBACK := 86
 ALERT_MISSING_EXTENSION := 109
+ALERT_CERTIFICATE_REQUIRED := 116
 ALERT_NO_RENEGOTIATION := 100
 ALERT_UNSUPPORTED_EXTENSION := 110
 
@@ -819,15 +822,31 @@ fn verify_certificate_chain(certs: List[x509.Certificate], config: Config, serve
         fail result.reason
     return true
 
-fn verify_client_certificate_chain(certs: List[x509.Certificate], config: Config) -> Bool!:
+# verify a client chain against the bundle this server config trusts. answers
+# the empty string when it verifies and the reason it did not otherwise, so the
+# caller can send the alert that names the failure instead of one code for every
+# way a chain can be wrong.
+fn verify_client_certificate_chain(certs: List[x509.Certificate], config: Config) -> String!:
     ca_pem := config_get(native_server_client_ca_pem, config.handle, "")
     if ca_pem == "":
         fail "native tls client ca config not found"
     roots := x509.parse_pem_chain(ca_pem)!
     result := x509.verify_client_chain(certs, roots)
     if not result.ok:
-        fail result.reason
-    return true
+        return result.reason
+    return ""
+
+# the alert a failed client-chain verification earns. rfc 5246 §7.2.2 and rfc
+# 8446 §6.2 give the two failures a trust bundle actually produces their own
+# codes — an issuer the bundle does not contain, and a certificate outside its
+# validity window — and a peer that is told which one it was can fix it without
+# a packet capture. every other reason is a bad certificate.
+fn client_certificate_alert(reason: String) -> Int:
+    if reason == x509.EXPIRED_REASON:
+        return ALERT_CERTIFICATE_EXPIRED
+    if reason == x509.UNTRUSTED_ISSUER_REASON:
+        return ALERT_UNKNOWN_CA
+    return ALERT_BAD_CERTIFICATE
 
 fn select_alpn_protocol(config: Config, offered: List[String]) -> String!:
     protocols := config_alpn_protocols(config)
@@ -1264,7 +1283,7 @@ fn native_fail_alert(record: tls13.Record) -> Bool!:
     if alert.is_ok:
         if alert.ok.level == 1 and alert.ok.description != tls13.ALERT_CLOSE_NOTIFY:
             return false
-        fail "tls alert " + alert.ok.description.to_string()
+        fail "tls alert " + tls13.alert_description_name(alert.ok.description)
     fail "tls alert"
 
 # whether the client offered a given extension type. this stack's client hello
@@ -1321,6 +1340,11 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0, binder)!
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
             transcript := bytes.buffer()
+            # the handshake below reads and rewrites this buffer and keeps
+            # nothing that points into it — every hash and key it derives is
+            # taken by copy — so the buffer dies with this call. without the
+            # free it died with the process instead, once per connection.
+            defer transcript.free()
             transcript.write(client_hello)!
             return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, p384pair, cached_session, true, cache_key, transcript)
     # a non-resumption hello offers the TLS 1.2 fallback unless the config is
@@ -1337,6 +1361,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
         client_hello = tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, bytes.empty(), 0, bytes.empty())!
     native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
     transcript := bytes.buffer()
+    defer transcript.free()
     transcript.write(client_hello)!
     return native_client_handshake_after_client_hello(stream, server_name, config, client_random, session_id, keypair, p256pair, p384pair, cached_session, offering_psk, cache_key, transcript)
 
@@ -1440,7 +1465,8 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
 # The TLS 1.2 client handshake, reached from after_client_hello when the server
 # negotiated 1.2. The ClientHello (in `transcript`) and the ServerHello (in
 # `server_hello_message`) have already been exchanged; this drives the rest:
-# Certificate, ServerKeyExchange, ServerHelloDone → ClientKeyExchange,
+# Certificate, ServerKeyExchange, an optional CertificateRequest,
+# ServerHelloDone → [Certificate,] ClientKeyExchange, [CertificateVerify,]
 # ChangeCipherSpec, Finished → server ChangeCipherSpec, Finished.
 # scan an accumulating 1.2 server flight: report whether ServerHelloDone has
 # arrived, and refuse any message type that has no place in the flight now
@@ -1547,6 +1573,9 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     mut ske_curve := 0
     mut ske_point := bytes.empty()
     mut have_ske := false
+    mut client_cert_requested := false
+    mut cert_request_types: List[Int] := []
+    mut cert_request_schemes: List[Int] := []
     for message in messages:
         if message.message_type == tls12.TLS12_CERTIFICATE:
             ders := tls12.parse_certificate_message(message.body) catch:
@@ -1584,7 +1613,13 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
             ske_point = ske.public_point
             have_ske = true
         elif message.message_type == tls12.TLS12_CERTIFICATE_REQUEST:
-            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client certificate authentication is not supported")
+            if client_cert_requested:
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 server sent two certificate requests")
+            request := tls12.parse_certificate_request(message.body) catch:
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 certificate request")
+            client_cert_requested = true
+            cert_request_types = request.certificate_types
+            cert_request_schemes = request.signature_schemes
         elif message.message_type == tls12.TLS12_SERVER_HELLO_DONE:
             if message.body.len() != 0:
                 fail refuse_with(stream, ALERT_DECODE_ERROR, "tls 1.2 server hello done must be empty")
@@ -1614,10 +1649,36 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     keypair.close()
     p256pair.close()
 
-    # ClientKeyExchange, then derive the keys over the transcript so far.
+    # the client flight: the Certificate the server asked for (ours, or an empty
+    # one when we have nothing it will take), ClientKeyExchange, and — when we
+    # presented a certificate — the CertificateVerify that proves we hold its
+    # key. then derive the keys over the transcript so far.
+    client_flight := bytes.buffer()
+    defer client_flight.free()
+    mut presenting_certificate := false
+    if client_cert_requested:
+        presenting_certificate = tls12_client_certificate_usable(config, cert_request_types, cert_request_schemes)
+        mut client_certificate_body := tls12.encode_certificate_message([])!
+        if presenting_certificate:
+            client_certificate_body = tls12.encode_certificate_message(native_config_client_cert_chain(config)!)!
+        client_certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, client_certificate_body)!
+        client_flight.write(client_certificate)!
+        transcript.write(client_certificate)!
     cke_message := tls13.encode_handshake(tls12.TLS12_CLIENT_KEY_EXCHANGE, tls12.encode_client_key_exchange(client_point)!)!
-    native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, cke_message)!)!
+    client_flight.write(cke_message)!
     transcript.write(cke_message)!
+    # rfc 5246 §7.4.8: the 1.2 CertificateVerify signs the raw handshake
+    # transcript through ClientKeyExchange, with the hash the chosen scheme
+    # names — no context string and no pre-hash, unlike 1.3. the extended master
+    # secret hashes the same bytes, which is why the message is built here and
+    # appended to the transcript only after the key schedule has run.
+    mut client_certificate_verify := bytes.empty()
+    if presenting_certificate:
+        client_scheme := select_server_signature_scheme(client_key_is_ecdsa(config)!, false, cert_request_schemes)
+        client_signature := sign_with_client_scheme(config, client_scheme, transcript.bytes())!
+        client_certificate_verify = tls13.encode_certificate_verify(client_scheme, client_signature)!
+        client_flight.write(client_certificate_verify)!
+    write_plaintext_flight(stream, client_flight.bytes())!
     session_hash := tls12.handshake_hash_for_suite(cipher, transcript.bytes())
     mut master := bytes.empty()
     if hello.extended_master_secret:
@@ -1625,9 +1686,11 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     else:
         master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
     keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
+    if presenting_certificate:
+        transcript.write(client_certificate_verify)!
 
     # ChangeCipherSpec, then the encrypted client Finished over the transcript
-    # through ClientKeyExchange.
+    # through the flight just sent.
     send_change_cipher_spec(stream)!
     client_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "client finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.client_write_key, keys.client_write_iv, 0, TLS_CONTENT_HANDSHAKE, client_finished)!)!
@@ -1978,6 +2041,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     client_app_keys := traffic_keys_for_cipher(server_hello.cipher_suite, client_app_secret)!
 
     client_flight := bytes.buffer()
+    defer client_flight.free()
     if client_cert_requested:
         append_client_certificate_flight(config, server_hello.cipher_suite, transcript_buf, client_flight, client_cert_usable, client_cert_request_schemes)!
     client_verify := tls13.finished_verify_data_for_cipher(server_hello.cipher_suite, client_hs_secret, transcript_buf.bytes())!
@@ -2102,10 +2166,56 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
         return tls12.NAMED_CURVE_SECP384R1
     return 0
 
+# The signature schemes a 1.2 CertificateRequest advertises, in the same order
+# the 1.3 path offers them. RFC 5246 §7.4.8 binds the client's
+# CertificateVerify to this list, so it is also what the server accepts back.
+# Both families are offered because 1.2 takes either: RFC 8446 §4.2.3 applies
+# the PSS schemes to 1.2 signatures, and the PKCS#1 codes remain legal there.
+fn tls12_client_auth_schemes() -> List[Int]:
+    return [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512]
+
+# Report whether the client's 1.2 flight is complete. It ends at
+# ClientKeyExchange, unless the client presented a certificate — then the
+# CertificateVerify proving it holds the key follows. Reading past this point
+# would block on a ChangeCipherSpec that is a record of its own, so the read
+# loop needs to know exactly when the client has stopped talking handshake.
+# A Certificate that does not parse counts as empty; the strict walk that
+# follows refuses it with decode_error rather than hanging here.
+fn tls12_client_flight_complete(messages: List[tls13.HandshakeMessage]) -> Bool:
+    mut have_key_exchange := false
+    mut have_certificate_verify := false
+    mut presented_certificate := false
+    for message in messages:
+        if message.message_type == tls12.TLS12_CERTIFICATE:
+            certs := tls12.parse_certificate_message(message.body) catch []
+            presented_certificate = certs.len() > 0
+        elif message.message_type == tls12.TLS12_CLIENT_KEY_EXCHANGE:
+            have_key_exchange = true
+        elif message.message_type == tls12.TLS12_CERTIFICATE_VERIFY:
+            have_certificate_verify = true
+    if not have_key_exchange:
+        return false
+    return have_certificate_verify or not presented_certificate
+
+# Whether this client can answer a 1.2 CertificateRequest: it must hold a
+# certificate, the request must accept that key's certificate type, and it must
+# advertise a signature scheme the key can produce. A client that fails any of
+# the three sends an empty Certificate and declines (rfc 5246 §7.4.6) rather
+# than aborting or signing with an algorithm the server never asked for.
+fn tls12_client_certificate_usable(config: Config, certificate_types: List[Int], schemes: List[Int]) -> Bool:
+    if not config_has_client_certificate(config):
+        return false
+    is_ecdsa := client_key_is_ecdsa(config) catch false
+    if not certificate_types.contains(tls12.certificate_type_for_scheme(is_ecdsa)):
+        return false
+    return select_server_signature_scheme(is_ecdsa, false, schemes) != 0
+
 # The TLS 1.2 server handshake, reached when a client did not offer 1.3 but
 # offered a suite we can serve. Sends ServerHello (with the downgrade sentinel),
-# Certificate, ServerKeyExchange, ServerHelloDone; reads ClientKeyExchange,
-# ChangeCipherSpec, Finished; then sends its own ChangeCipherSpec and Finished.
+# Certificate, ServerKeyExchange, an optional CertificateRequest, and
+# ServerHelloDone; reads the client's Certificate, ClientKeyExchange and
+# CertificateVerify, then its ChangeCipherSpec and Finished; then sends its own
+# ChangeCipherSpec and Finished.
 fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello_message: tls13.HandshakeMessage, lenient: tls13.LenientClientHello) -> Conn!:
     # extended master secret is negotiated whenever the client offers it (the
     # ServerHello only advertises an EMS extension the client sent); a client
@@ -2172,30 +2282,45 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
         fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "client does not accept this server's signature algorithm")
     ske_sig := sign_with_scheme(handshake_config, ske_scheme, signed_data)!
     server_key_exchange := tls13.encode_handshake(tls12.TLS12_SERVER_KEY_EXCHANGE, tls12.encode_server_key_exchange(curve, keypair.public_key, ske_sig.scheme, ske_sig.signature)!)!
+    # client authentication is the same policy the 1.3 path reads off the
+    # config: request_client_ca_file asks and accepts a client that declines,
+    # require_client_ca_file asks and refuses one that does.
+    client_cert_requested := config_requests_client_certificate(handshake_config)
+    client_cert_required := config_requires_client_certificate(handshake_config)
+    request_schemes := tls12_client_auth_schemes()
+    mut certificate_request := bytes.empty()
+    if client_cert_requested:
+        certificate_request = tls13.encode_handshake(tls12.TLS12_CERTIFICATE_REQUEST, tls12.encode_certificate_request([tls12.TLS12_CERT_TYPE_ECDSA_SIGN, tls12.TLS12_CERT_TYPE_RSA_SIGN], request_schemes)!)!
     server_done := tls13.encode_handshake(tls12.TLS12_SERVER_HELLO_DONE, bytes.empty())!
 
     transcript := bytes.buffer()
+    defer transcript.free()
     transcript.write(tls13.encode_handshake(client_hello_message.message_type, client_hello_message.body)!)!
     transcript.write(server_hello)!
     transcript.write(certificate)!
     transcript.write(server_key_exchange)!
-    transcript.write(server_done)!
 
     flight := bytes.buffer()
     flight.write(server_hello)!
     flight.write(certificate)!
     flight.write(server_key_exchange)!
+    if client_cert_requested:
+        transcript.write(certificate_request)!
+        flight.write(certificate_request)!
+    transcript.write(server_done)!
     flight.write(server_done)!
     write_plaintext_flight(stream, flight.bytes())!
     flight.free()
 
-    # ClientKeyExchange (plaintext handshake).
-    # the ClientKeyExchange may be fragmented across handshake records;
-    # accumulate until the message completes, with the flight cap as the bound.
+    # the client's plaintext flight: an optional Certificate, then
+    # ClientKeyExchange, then a CertificateVerify when it presented one. any of
+    # them may be fragmented across handshake records, so accumulate until the
+    # flight is complete, with the flight cap as the bound.
     cke_buf := bytes.buffer()
     defer cke_buf.free()
     mut cke_messages: List[tls13.HandshakeMessage] := []
-    while cke_messages.len() == 0:
+    mut client_flight_complete := false
+    while not client_flight_complete:
         cke_record := native_read_record(stream)!
         if cke_record.content_type == TLS_CONTENT_ALERT:
             if not native_fail_alert(cke_record)!:
@@ -2208,13 +2333,89 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
         if cke_buf.len() > TLS_MAX_HANDSHAKE_FLIGHT:
             fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client key exchange is too large")
         cke_messages = tls13.decode_handshakes_prefix(cke_buf.bytes())
+        client_flight_complete = tls12_client_flight_complete(cke_messages)
     if tls13.handshakes_encoded_len(cke_messages) != cke_buf.len():
         fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client key exchange record")
-    if cke_messages[0].message_type != tls12.TLS12_CLIENT_KEY_EXCHANGE:
+
+    # walk the flight in order. the Certificate and ClientKeyExchange go into
+    # the transcript as they arrive; the CertificateVerify is held back, because
+    # it signs — and the extended master secret hashes — the transcript up to
+    # and including ClientKeyExchange (rfc 5246 §7.4.8, rfc 7627 §3).
+    mut client_certs: List[x509.Certificate] := []
+    mut client_cert_message_seen := false
+    mut client_key_exchange_seen := false
+    mut client_point := bytes.empty()
+    mut certificate_verify_body := bytes.empty()
+    mut certificate_verify_seen := false
+    for message in cke_messages:
+        if message.message_type == tls12.TLS12_CERTIFICATE:
+            if not client_cert_requested:
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "client sent a tls 1.2 certificate this server did not request")
+            if client_cert_message_seen or client_key_exchange_seen:
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 client certificate is out of order")
+            ders := tls12.parse_certificate_message(message.body) catch:
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client certificate message")
+            for der in ders:
+                cert := x509.parse_der(der) catch:
+                    fail refuse_with(stream, ALERT_BAD_CERTIFICATE, "malformed tls 1.2 client certificate")
+                client_certs.push(cert)
+            client_cert_message_seen = true
+            transcript.write(tls13.encode_handshake(message.message_type, message.body)!)!
+        elif message.message_type == tls12.TLS12_CLIENT_KEY_EXCHANGE:
+            if client_key_exchange_seen:
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 client sent two key exchanges")
+            client_point = tls12.parse_client_key_exchange(message.body) catch:
+                fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client key exchange")
+            client_key_exchange_seen = true
+            transcript.write(tls13.encode_handshake(message.message_type, message.body)!)!
+        elif message.message_type == tls12.TLS12_CERTIFICATE_VERIFY:
+            if not client_key_exchange_seen or certificate_verify_seen:
+                fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "tls 1.2 certificate verify is out of order")
+            certificate_verify_body = message.body
+            certificate_verify_seen = true
+        else:
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "unexpected tls 1.2 client handshake message")
+    if not client_key_exchange_seen:
         fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "expected tls 1.2 client key exchange")
-    client_point := tls12.parse_client_key_exchange(cke_messages[0].body) catch:
-        fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client key exchange")
-    transcript.write(tls13.encode_handshake(cke_messages[0].message_type, cke_messages[0].body)!)!
+
+    # the client's identity, established before any key is derived from its share.
+    mut peer := empty_peer_identity()
+    mut client_cert_verified := false
+    if certificate_verify_seen and client_certs.len() == 0:
+        fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "client sent a tls 1.2 certificate verify without a certificate")
+    if client_certs.len() > 0:
+        # a certificate is public, so presenting one proves nothing on its own:
+        # only CertificateVerify proves the client holds the matching key.
+        # without this check, optional client auth would record an identity read
+        # off a certificate the client never proved it owns.
+        if not certificate_verify_seen:
+            fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "client presented a tls 1.2 certificate without a certificate verify")
+        reason := verify_client_certificate_chain(client_certs, handshake_config) catch:
+            fail refuse_with(stream, ALERT_BAD_CERTIFICATE, "tls 1.2 client certificate verification failed")
+        if reason != "":
+            fail refuse_with(stream, client_certificate_alert(reason), "tls 1.2 client certificate verification failed: " + reason)
+        cv := tls13.parse_certificate_verify(certificate_verify_body) catch:
+            fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls 1.2 client certificate verify")
+        # rfc 5246 §7.4.8 binds the client to the algorithms the
+        # CertificateRequest advertised, and the key in the certificate must be
+        # able to produce the one it chose.
+        if not request_schemes.contains(cv.signature_scheme):
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls 1.2 client signed with a scheme this server did not request")
+        if not scheme_matches_certificate_key(cv.signature_scheme, client_certs[0].public_key_algorithm):
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls client signature scheme does not match the certificate key type")
+        # unlike 1.3 there is no context string and no pre-hash: the 1.2
+        # CertificateVerify signs the raw handshake transcript, which is exactly
+        # what the buffer holds now.
+        if not (tls13.verify_certificate_signature(client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
+            fail refuse_with(stream, ALERT_DECRYPT_ERROR, "tls 1.2 client certificate verify failed")
+        peer = peer_identity_from_certificates(client_certs)
+        client_cert_verified = true
+    elif client_cert_required:
+        # rfc 5246 §7.4.6: a 1.2 server that requires the certificate answers an
+        # empty one with a fatal handshake_failure rather than continuing
+        # unauthenticated. (certificate_required is a 1.3 code point; a 1.2 peer
+        # would not recognise it.)
+        fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 client did not present the required certificate")
 
     pre_master := keypair.shared_secret(client_point)!
     keypair.close()
@@ -2225,6 +2426,11 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     else:
         master = tls12.classic_master_secret_for_suite(cipher, pre_master, client_random, server_random)!
     keys := tls12.key_block_for_suite(cipher, master, server_random, client_random)!
+    # the CertificateVerify joins the transcript only now: the master secret's
+    # session hash covers the flight through ClientKeyExchange, while the
+    # Finished covers everything, this message included.
+    if certificate_verify_seen:
+        transcript.write(tls13.encode_handshake(tls12.TLS12_CERTIFICATE_VERIFY, certificate_verify_body)!)!
 
     # read the client's ChangeCipherSpec and encrypted Finished, then verify it.
     client_finished := read_tls12_peer_finished(stream, cipher, keys.client_write_key, keys.client_write_iv, bytes.empty(), bytes.empty(), 0)!
@@ -2239,8 +2445,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     server_finished := tls13.encode_handshake(tls12.TLS12_FINISHED, tls12_finished_bytes(cipher, master, "server finished", transcript)!)!
     native_write_all(stream, seal_conn_record(TLS_VERSION_12, cipher, keys.server_write_key, keys.server_write_iv, 0, TLS_CONTENT_HANDSHAKE, server_finished)!)!
 
-    peer := empty_peer_identity()
-    state := connection_state_from_peer(TLS_VERSION_12, cipher, selected_alpn, false, peer, false, false)
+    state := connection_state_from_peer(TLS_VERSION_12, cipher, selected_alpn, false, peer, client_cert_requested, client_cert_verified)
     run_verify_connection_hook(handshake_config, state)!
     client_keys := tls13.TrafficKeys(keys.client_write_key, keys.client_write_iv)
     server_keys := tls13.TrafficKeys(keys.server_write_key, keys.server_write_iv)
@@ -2317,14 +2522,8 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             offered_tls12 = lenient_hello.supported_versions.contains(TLS_VERSION_12)
         if not offered_tls12 or not config_offers_tls12(config):
             fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "client did not offer a tls version this server speaks")
-        # the 1.2 fallback does not implement client-certificate authentication,
-        # so a config that requests or requires it must never drop to a path
-        # that ignores it — that would authenticate nobody. such a client is
-        # refused instead. the version itself was acceptable, so this and the
-        # no-common-suite refusal below are handshake failures, not version ones.
-        wants_client_auth := config_requires_client_certificate(config) or config_requests_client_certificate(config)
-        if wants_client_auth:
-            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "tls 1.2 fallback is unavailable with client authentication")
+        # the version itself was acceptable, so the no-common-suite refusal
+        # below is a handshake failure, not a version one.
         if select_tls12_suite(lenient_hello.cipher_suites, server_key_is_ecdsa(config) catch false) == 0:
             fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "no supported tls 1.2 cipher suite offered")
         return native_server_handshake_tls12(stream, config, client_messages[0], lenient_hello)
@@ -2462,6 +2661,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         send_change_cipher_spec(stream)!
 
     transcript := bytes.buffer()
+    defer transcript.free()
     if hrr_prefix.len() > 0:
         transcript.write(hrr_prefix)!
     transcript_append(transcript, client_messages[0])!
@@ -2479,6 +2679,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     encrypted_extensions := tls13.encode_encrypted_extensions_with_alpn(selected_alpn)!
     transcript.write(encrypted_extensions)!
     server_flight := bytes.buffer()
+    defer server_flight.free()
     server_flight.write(encrypted_extensions)!
     client_cert_requested := config_requests_client_certificate(handshake_config)
     client_cert_required := config_requires_client_certificate(handshake_config)
@@ -2595,10 +2796,10 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 client_certs = certificates_from_message(client_cert_msg) catch:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate")
                 if client_certs.len() > 0:
-                    verified := verify_client_certificate_chain(client_certs, handshake_config) catch:
+                    reason := verify_client_certificate_chain(client_certs, handshake_config) catch:
                         fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_BAD_CERTIFICATE, "tls client certificate verification failed")
-                    if not verified:
-                        fail "tls client certificate verification failed"
+                    if reason != "":
+                        fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, client_certificate_alert(reason), "tls client certificate verification failed: " + reason)
                     peer = peer_identity_from_certificates(client_certs)
                 client_cert_seen = true
                 transcript_append(transcript, message)!
@@ -2614,10 +2815,15 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 client_cert_verify_seen = true
                 transcript_append(transcript, message)!
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
-                if client_cert_required and not did_resume and (client_certs.len() == 0 or not client_cert_verify_seen):
-                    # a resumed session presents no certificate: its
+                if client_cert_required and not did_resume and client_certs.len() == 0:
+                    # rfc 8446 §4.4.2.4 names the alert for a client that
+                    # declined a certificate this server requires, and a peer
+                    # told "certificate_required" knows what to fix. a resumed
+                    # session presents no certificate and is exempt: its
                     # authentication is the original handshake's, which this
                     # ticket is bound to (rfc 8446 §2.2).
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_CERTIFICATE_REQUIRED, "client did not present the required certificate")
+                if client_cert_required and not did_resume and not client_cert_verify_seen:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client finished arrived before client certificate verification")
                 # a certificate is public, so presenting one proves nothing on
                 # its own — only CertificateVerify proves the client holds the
@@ -2656,6 +2862,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
 
 fn record_bytes(record: tls13.Record) -> Bytes!:
     out := bytes.buffer_with_capacity(record.payload.len() + 5)
+    # every record read on a 1.3 connection passes through here, so a buffer
+    # left behind is a leak per record rather than per connection.
+    defer out.free()
     write_u8(out, record.content_type)!
     write_u16_be(out, 771)!
     write_u16_be(out, record.payload.len())!
@@ -3406,6 +3615,7 @@ impl Conn:
         if size <= 0:
             size = 4096
         out := bytes.buffer_with_capacity(size)
+        defer out.free()
         mut chunk := self.read_bytes(size)!
         while not chunk.is_empty():
             out.write(chunk)!
@@ -3664,6 +3874,91 @@ test "server signature scheme selection honours the client's offer and version":
     assert_eq(select_server_signature_scheme(true, true, [TLS_SIG_RSA_PSS_RSAE_SHA256]), 0)
     # an empty offer (a 1.2 client omitting the extension) takes the top choice.
     assert_eq(select_server_signature_scheme(false, false, []), TLS_SIG_RSA_PSS_RSAE_SHA256)
+
+test "a tls 1.2 certificate verify signature is bound to the transcript it signed":
+    # the 1.2 CertificateVerify signs the raw handshake transcript, so a
+    # signature is only good for the transcript it was made over. these are the
+    # two answers the server's check has to give: yes for the real transcript,
+    # no for a signature over any other bytes or a signature that has been
+    # touched. the key and certificate are the repository's client fixtures, so
+    # this runs the real rsa path end to end without a network.
+    cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-rsa.crt", "tests/live/fixtures/clientcert-rsa.key")!
+    leaf := x509.parse_der(native_config_client_cert_chain(cfg)![0])!
+    transcript := bytes.from_string_utf8("a handshake transcript through client key exchange")
+    other := bytes.from_string_utf8("a handshake transcript through client key exchangE")
+    signed := sign_with_client_scheme(cfg, TLS_SIG_RSA_PSS_RSAE_SHA256, transcript)!
+
+    assert(tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, transcript, signed)!)
+    # a signature over a different transcript is what a replayed or relayed
+    # CertificateVerify looks like from the server's side.
+    assert(not tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, other, signed)!)
+    # and a signature with one byte changed.
+    tampered := bytes.concat(bytes.slice(signed, 0, signed.len() - 1), bytes.from_string_utf8("!"))
+    assert(not tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, transcript, tampered)!)
+
+    # an rsa certificate cannot answer an ecdsa code point, whatever the
+    # signature bytes say — the check that stops a client naming a scheme its
+    # key could never have produced.
+    assert(not scheme_matches_certificate_key(TLS_SIG_ECDSA_SECP256R1_SHA256, leaf.public_key_algorithm))
+    assert(scheme_matches_certificate_key(TLS_SIG_RSA_PSS_RSAE_SHA256, leaf.public_key_algorithm))
+    # the schemes a 1.2 CertificateRequest advertises are the only ones the
+    # server accepts back; secp384r1 is not among them.
+    assert(tls12_client_auth_schemes().contains(TLS_SIG_RSA_PSS_RSAE_SHA256))
+    assert(not tls12_client_auth_schemes().contains(tls13.SIG_ECDSA_SECP384R1_SHA384))
+    cfg.close()
+
+test "a tls 1.2 client answers only a certificate request its key can satisfy":
+    # declining is a message, not an error: a client that cannot satisfy the
+    # request sends an empty certificate (rfc 5246 §7.4.6) instead of aborting
+    # or signing with something the server never asked for.
+    rsa_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-rsa.crt", "tests/live/fixtures/clientcert-rsa.key")!
+    ec_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-ecdsa.crt", "tests/live/fixtures/clientcert-ecdsa.key")!
+    bare_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!
+    both_types := [tls12.TLS12_CERT_TYPE_ECDSA_SIGN, tls12.TLS12_CERT_TYPE_RSA_SIGN]
+
+    assert(tls12_client_certificate_usable(rsa_cfg, both_types, tls12_client_auth_schemes()))
+    assert(tls12_client_certificate_usable(ec_cfg, both_types, tls12_client_auth_schemes()))
+    # no certificate at all.
+    assert(not tls12_client_certificate_usable(bare_cfg, both_types, tls12_client_auth_schemes()))
+    # a request that takes ecdsa keys only, answered by an rsa client.
+    assert(not tls12_client_certificate_usable(rsa_cfg, [tls12.TLS12_CERT_TYPE_ECDSA_SIGN], tls12_client_auth_schemes()))
+    # the certificate type fits but no advertised scheme does.
+    assert(not tls12_client_certificate_usable(ec_cfg, both_types, [TLS_SIG_RSA_PSS_RSAE_SHA256]))
+    rsa_cfg.close()
+    ec_cfg.close()
+    bare_cfg.close()
+
+test "the tls 1.2 client flight ends at key exchange unless a certificate needs proving":
+    # the server has to know when the client has stopped talking handshake,
+    # because the next record is a ChangeCipherSpec it must not wait for.
+    key_exchange := tls13.encode_handshake(tls12.TLS12_CLIENT_KEY_EXCHANGE, tls12.encode_client_key_exchange(bytes.from_string_utf8("0123456789abcdef0123456789abcdef"))!)!
+    empty_certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message([])!)!
+    real_certificate := tls13.encode_handshake(tls12.TLS12_CERTIFICATE, tls12.encode_certificate_message([x509.parse_pem(read_file("tests/live/fixtures/clientcert-rsa.crt")!)!.der])!)!
+    certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, bytes.from_string_utf8("signature"))!
+
+    assert(not tls12_client_flight_complete(tls13.decode_handshakes(empty_certificate)!))
+    assert(tls12_client_flight_complete(tls13.decode_handshakes(bytes.concat(empty_certificate, key_exchange))!))
+    # a client that presented a certificate still owes a CertificateVerify.
+    assert(not tls12_client_flight_complete(tls13.decode_handshakes(bytes.concat(real_certificate, key_exchange))!))
+    assert(tls12_client_flight_complete(tls13.decode_handshakes(bytes.concat(bytes.concat(real_certificate, key_exchange), certificate_verify))!))
+
+test "a refused client chain answers with the alert that names the failure":
+    # rfc 5246 §7.2.2 has codes for the two failures a trust bundle produces;
+    # collapsing them into bad_certificate makes an operator guess.
+    assert_eq(client_certificate_alert(x509.UNTRUSTED_ISSUER_REASON), ALERT_UNKNOWN_CA)
+    assert_eq(client_certificate_alert(x509.EXPIRED_REASON), ALERT_CERTIFICATE_EXPIRED)
+    assert_eq(client_certificate_alert("something else entirely"), ALERT_BAD_CERTIFICATE)
+
+    # and the bundle really does produce those two reasons: the rogue leaf is
+    # correctly signed by a ca this server does not trust, and the expired leaf
+    # is correctly signed by one it does.
+    roots := x509.parse_pem_chain(read_file("tests/live/fixtures/clientcert-ca.crt")!)!
+    rogue := x509.parse_pem(read_file("tests/live/fixtures/clientcert-rogue.crt")!)!
+    expired := x509.parse_pem(read_file("tests/live/fixtures/clientcert-expired.crt")!)!
+    good := x509.parse_pem(read_file("tests/live/fixtures/clientcert-rsa.crt")!)!
+    assert_eq(x509.verify_client_chain([rogue], roots).reason, x509.UNTRUSTED_ISSUER_REASON)
+    assert_eq(x509.verify_client_chain([expired], roots).reason, x509.EXPIRED_REASON)
+    assert(x509.verify_client_chain([good], roots).ok)
 
 test "tls resumable session lookup drops expired entries and refreshes lru":
     native_client_session_cache = {}

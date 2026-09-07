@@ -142,9 +142,9 @@ open defects. the ones to know before you start:
 
 - a strong reference cycle with no `weak` edge leaks. an opt-in
   trial-deletion collector exists behind `PITH_CYCLE_GC`, off by default.
-- tls 1.2 is a fallback: ecdhe with aead suites only, no resumption, no
-  client certificates. 1.3 is the full implementation, and
-  `require_tls13()` refuses the fallback.
+- tls 1.2 is a fallback: ecdhe with aead suites only, and no session
+  resumption. client certificates work on both versions. 1.3 is the full
+  implementation, and `require_tls13()` refuses the fallback.
 - no package registry. dependencies are local paths in `pith.toml`,
   with `lock` and `install` but nothing that fetches.
 - no debugger. the language server answers a syntax error from the

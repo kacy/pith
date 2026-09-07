@@ -799,7 +799,12 @@ fn validity_contains(cert: Certificate, now_ms: Int) -> Bool:
         return false
     return true
 
-EXPIRED_REASON := "certificate is expired or not yet valid"
+## The reason a chain carrying a certificate outside its validity window is
+## refused. Named so a caller can answer the peer with the alert that says
+## which failure it was rather than a generic one.
+pub EXPIRED_REASON := "certificate is expired or not yet valid"
+## The reason a chain that never reaches a trusted root is refused.
+pub UNTRUSTED_ISSUER_REASON := "certificate issuer is not trusted"
 EKU_REASON := "certificate is not valid for tls server authentication"
 NAME_CONSTRAINT_REASON := "certificate name is outside a ca name constraint"
 KEY_USAGE_REASON := "certificate issuer is not permitted to sign certificates"
@@ -899,7 +904,7 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
         else:
             root_result := find_issuer_in_roots(current, trusted_roots)
             if root_result.is_err:
-                return VerificationResult(false, hostname_ok, false, false, false, "certificate issuer is not trusted")
+                return VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
             root := root_result.ok
             # the trust anchor is rejected once it falls outside its window.
             if not validity_contains(root, now_ms):

@@ -227,8 +227,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   aes-256-gcm and chacha20-poly1305), negotiating the highest a peer supports
   and refusing anything below 1.2 — the same posture as go's crypto/tls and
   rustls. `require_tls13()` locks a config to 1.3. the 1.2 fallback supports
-  rsa (≥2048-bit) and ecdsa (p-256) server certificates; it does not yet do
-  session resumption, renegotiation, or client-certificate auth.
+  rsa (≥2048-bit) and ecdsa (p-256) certificates, for the server's own and for
+  a client's: client-certificate auth works on 1.2 with the same config surface
+  1.3 uses (`with_client_certificate`, `request_client_ca_file`,
+  `require_client_ca_file`), and the verified identity reaches an application
+  through the same `ConnectionState` fields. the fallback still does not do
+  session resumption or renegotiation.
 - **testing** — `test` blocks are discovered and run by `pith test` (with
   `--filter`), and `std/testing` adds assertions, a `with_temp_dir` fixture
   helper, and `each` for parameterized cases: a labeled row reports as its own

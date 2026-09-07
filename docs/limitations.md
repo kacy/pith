@@ -337,8 +337,19 @@ correctness story:
   per call, and it dropped a payload two shells shared: `show(forward(v))`
   emptied `v`, and `show(xs.get(0))` freed the list's element.
   `test_optional_arg_callee_spellings` reads back every keep and extract
-  spelling under valgrind. a result in argument position (`f(r())`) still
-  strands its box.
+  spelling under valgrind.
+- a fresh result written straight into an argument (`f(r())` against
+  `fn f(x: Int!)`, `obj.take(r())`, `mod.f(r())`, `f(await t)`) is released
+  by the caller as soon as the call returns on the same terms: a result
+  parameter is a borrow, and every way a callee can keep the box or take
+  its payload retains (see docs/ownership.md). a result box has no
+  destructor, so the release drops a heap payload only when the caller's
+  count is the box's last, which it reads from the runtime rather than
+  from the callee's body; a box the callee kept (`store(h, r())`,
+  `show(forward(r()))`) survives with its payload on the keeper's count.
+  `test_result_arg_callee_spellings` reads back every keep and extract
+  spelling under valgrind. before this the box and its payload leaked on
+  every such call.
 - a heap local inside a *generic function body* follows the same release
   rules as one in a concrete body: the body is typed against each set of
   concrete types before it is emitted, so escapes, stores and returns are
@@ -365,7 +376,12 @@ correctness story:
   `values()`, `split()`, the slice/sort copies) or a count taken over the
   call itself (`get_default`, which the call site retains; `take`, which the
   map relinquishes), so the discard releases a count that was the
-  statement's to drop. what still strands: a discarded void-method chain
+  statement's to drop. the discard drops the payload of a result box
+  without asking whether another owner holds the box, so a callee that
+  hands its parameter back (`forward(r)` at statement position, with `r`
+  a live local) empties `r`; the argument-position release above reads
+  the count first and the discard should too. what still strands: a
+  discarded void-method chain
   (the chain's value is the receiver handed back, and freeing it would free
   the container its owner still holds), a discarded closure result, and a
   container dropped through a discarded `!` or `await` at statement

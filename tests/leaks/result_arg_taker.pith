@@ -1,0 +1,22 @@
+# helper module for leak_result_arg_box: callees in another module, whose
+# bodies the caller's emitter never sees. each takes a result parameter and
+# extracts from it or reads it in place.
+
+## extract a scalar payload with `catch`.
+pub fn take_int(r: Int!) -> Int:
+    return r catch 0
+
+## extract with `!` and read a scalar off the payload.
+pub fn try_str(r: String!) -> Int!:
+    return r!.len()
+
+## extract with `catch` into a local.
+pub fn catch_str(r: String!) -> Int:
+    v := r catch "fallback"
+    return v.len()
+
+## read the flag in place.
+pub fn peek(r: String!) -> Int:
+    if r.is_err:
+        return 0
+    return 1

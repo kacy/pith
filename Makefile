@@ -1283,6 +1283,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_web_session_ownership \
 	tests/cases/test_fn_value_optional \
 	tests/cases/test_optional_arg_callee_spellings \
+	tests/cases/test_result_arg_callee_spellings \
 	tests/cases/test_tls_server_config_release
 
 memcheck: build

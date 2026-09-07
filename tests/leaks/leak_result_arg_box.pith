@@ -1,0 +1,102 @@
+# a fresh result written straight into an argument — `take(r(i))` against
+# `fn take(x: Int!)` — is a box nothing else names. the caller used to strand
+# its three-slot box on every call, and the payload with it, because the
+# owned-argument release keeps the tuple kind excluded (it cannot tell a
+# result box from a tuple literal). the caller now releases the box right
+# after the call returns without reading the callee: a result parameter is a
+# borrow, and a callee that keeps or extracts takes its own count. a heap
+# payload the callee only read goes with the box when this frame's count was
+# the box's last, which the release checks rather than assumes.
+import leakprobe as probe
+import result_arg_taker as taker
+
+struct Reader:
+    n: Int
+
+impl Reader:
+    fn take(r: Int!) -> Int:
+        return (r catch 0) + self.n
+
+    fn try_str(r: String!) -> Int!:
+        return r!.len() + self.n
+
+struct Box[T]:
+    pub v: T
+
+impl Box:
+    fn peek(r: T!) -> Int:
+        if r.is_err:
+            return 0
+        return 1
+
+struct Failure:
+    code: Int
+    text: String
+
+fn mk_int(i: Int) -> Int!:
+    if i % 7 == 0:
+        fail "err-{i}"
+    return i
+
+fn mk_str(i: Int) -> String!:
+    if i % 7 == 0:
+        fail "err-{i}-payload"
+    return "value-{i}-payload"
+
+fn mk_typed(i: Int) -> Int!Failure:
+    if i % 7 == 0:
+        fail Failure(i, "typed-err-{i}")
+    return i
+
+fn take_int(r: Int!) -> Int:
+    return r catch 0
+
+fn try_int(r: Int!) -> Int!:
+    return r! + 1
+
+fn try_str(r: String!) -> Int!:
+    return r!.len()
+
+fn catch_str(r: String!) -> Int:
+    v := r catch "fallback"
+    return v.len()
+
+fn peek_typed(r: Int!Failure) -> Int:
+    if r.is_err:
+        return r.err.code
+    return r.ok
+
+fn churn_round(i: Int, reader: Reader, bi: Box[Int], bs: Box[String]) -> Int:
+    mut acc := 0
+    # same-module callees: a catch reader, a `!` extractor, a scalar and a
+    # string payload, a typed error
+    acc = acc + take_int(mk_int(i))
+    acc = acc + (try_int(mk_int(i)) catch 0)
+    acc = acc + (try_str(mk_str(i)) catch 0)
+    acc = acc + catch_str(mk_str(i))
+    acc = acc + peek_typed(mk_typed(i))
+    # method arguments, on a plain and on a generic receiver
+    acc = acc + reader.take(mk_int(i))
+    acc = acc + (reader.try_str(mk_str(i)) catch 0)
+    acc = acc + bi.peek(mk_int(i))
+    acc = acc + bs.peek(mk_str(i))
+    # a callee in another module
+    acc = acc + taker.take_int(mk_int(i))
+    acc = acc + (taker.try_str(mk_str(i)) catch 0)
+    acc = acc + taker.catch_str(mk_str(i))
+    acc = acc + taker.peek(mk_str(i))
+    return acc
+
+fn main():
+    n := probe.rounds()
+    reader := Reader(1)
+    bi := Box[Int](0)
+    bs := Box[String]("fallback")
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        acc = acc + churn_round(i, reader, bi, bs)
+        i = i + 1
+    print("{probe.peak_kb()}")
+    if acc < 0:
+        print("impossible")

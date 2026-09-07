@@ -55,6 +55,10 @@ pub fn silence_output():
     silent = true
     counts_mu.unlock()
 
+# a result is printed through the runner rather than with print(), so the shape
+# of a check or a table row is decided in the same place the shape of a test's
+# own result is: prose for a terminal, one json record per result under
+# `pith test --json`.
 fn record_pass(name: String):
     counts_mu.lock()
     pass_count = pass_count + 1
@@ -62,7 +66,7 @@ fn record_pass(name: String):
     counts_mu.unlock()
     if quiet:
         return
-    print("  ok   " + name)
+    report_test_case(name, true, "")
 
 fn record_fail(name: String, detail: String):
     counts_mu.lock()
@@ -75,7 +79,7 @@ fn record_fail(name: String, detail: String):
     set_test_failed(true)
     if quiet:
         return
-    print("  FAIL " + name + " -- " + detail)
+    report_test_case(name, false, detail)
 
 # assert that two values are equal.
 pub fn assert_eq[T](got: T, want: T):
@@ -337,7 +341,7 @@ fn name_case_failure(name: String, detail: String):
     counts_mu.unlock()
     if quiet:
         return
-    print("  FAIL " + name + " -- " + detail)
+    report_test_case(name, false, detail)
 
 # print summary
 pub fn done():

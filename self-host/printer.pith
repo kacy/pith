@@ -240,7 +240,12 @@ fn print_type_alias(idx: Int, indent: Int):
 
 fn print_test_decl(idx: Int, indent: Int):
     node := get_node(idx)
-    print_line(indent, "test " + node.value)
+    mut header := "test " + node.value
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "test_tags":
+            header = header + " [" + c.value + "]"
+    print_line(indent, header)
     for child in node.children:
         c := get_node(child)
         if c.kind == "body":

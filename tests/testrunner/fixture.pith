@@ -1,0 +1,30 @@
+# the fixture behind the test runner's own goldens. it holds one of everything
+# the runner has to report: a test that passes, one that fails on a built-in
+# assertion (so the record carries a message and a position), one that skips,
+# one table of labeled rows, tags on a single test and on a parameterized one,
+# and a test carrying two tags. tooling/test_runner_goldens.sh runs it several
+# ways and compares every line against tests/testrunner/expected/.
+#
+# it is meant to fail: three of its tests do not pass, and the goldens pin what
+# the runner says about them.
+
+from std.testing import case, each
+
+test "arithmetic holds" [fast]:
+    assert_eq(1 + 1, 2)
+
+test "a failing assertion names both sides" [fast]:
+    assert_eq(2 + 2, 5)
+
+test "a skipped test says why" [slow, network]:
+    skip_test("no network here")
+
+test "rows report one by one" [table]:
+    each([
+        case("alpha", 1),
+        case("beta", 2),
+        case("gamma", 0),
+], fn(n: Int) => n > 0)
+
+test "an untagged test still runs":
+    assert(true)

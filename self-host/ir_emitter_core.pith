@@ -324,6 +324,9 @@ mut ir_all_module_paths: List[String] := []
 mut ir_current_module_path := ""
 mut ir_emit_tests := false
 mut ir_emitting_test_func := false
+# the source file a test build was asked for, reported with every result
+# and used as the file of a failing assertion's position.
+mut ir_test_source_file := ""
 
 # the modules the next emit_ir's module imports directly, as parallel
 # lists of ast root index and resolved module path. their strings are
@@ -358,6 +361,14 @@ pub fn set_current_module_path(path: String):
 # so only the module actually being tested is emitted with it true.
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
+
+# the path of the file under test, as it was named on the command line.
+# a test build reports it with every result record and names it as the
+# file of an assertion that failed, so a reader of the machine-readable
+# output has the source without guessing. set once per build: emit_ir
+# does not clear it.
+pub fn set_test_source_file(path: String):
+    ir_test_source_file = path
 
 fn ir_reset_local_state():
     ir_builder_reset()
@@ -4099,11 +4110,30 @@ fn ir_assert_eq_operand_type(node: Node, child_idx: Int) -> String:
         expr_idx = child_node.children[0]
     return ir_infer_type(expr_idx)
 
-fn ir_emit_test_assert(arg_regs: List[Int]) -> Int:
+# tell the runner where an assertion that is about to fail sits. only a test
+# build emits this, and only on the failing branch, so an ordinary program's ir
+# is untouched and a passing assertion costs nothing. the position reaches the
+# machine-readable record; without it a failure names a message and no place.
+fn ir_emit_test_fail_site(node: Node):
+    if not ir_emit_tests:
+        return
+    # a call node is positioned where its callee starts, which is where every
+    # diagnostic in this compiler points and where a reader of the record
+    # expects to look.
+    file_r := ir_reg()
+    ir_emit("strref " + file_r.to_string() + " " + ir_str(ir_test_source_file))
+    line_r := ir_reg()
+    ir_emit("iconst " + line_r.to_string() + " " + node.line.to_string())
+    col_r := ir_reg()
+    ir_emit("iconst " + col_r.to_string() + " " + node.col.to_string())
+    ir_emit_call3(ir_reg(), "pith_test_fail_site", "unknown", file_r, line_r, col_r)
+
+fn ir_emit_test_assert(node: Node, arg_regs: List[Int]) -> Int:
     ok_l := ir_label()
     fail_l := ir_label()
     ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
     ir_emit_label(fail_l)
+    ir_emit_test_fail_site(node)
     assert_r := ir_reg()
     ir_emit_call1(assert_r, "assert", "unknown", arg_regs[0])
     ir_test_assert_fail()
@@ -4174,6 +4204,7 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
     else:
         ir_emit("brif " + cmp_r.to_string() + " " + fail_l + " " + ok_l)
     ir_emit_label(fail_l)
+    ir_emit_test_fail_site(node)
     kind_r := ir_reg()
     ir_emit("iconst " + kind_r.to_string() + " " + ir_assert_eq_kind_code(kind).to_string())
     mut reporter := "pith_assert_ne_fail"
@@ -4664,7 +4695,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     # mean the same thing on both paths. a module that declares its own function
     # by one of these names keeps it — ir_is_declared_callable is that check.
     if callee.name == "assert" and arg_regs.len() >= 1 and not ir_is_declared_callable("assert"):
-        return ir_emit_test_assert(arg_regs)
+        return ir_emit_test_assert(node, arg_regs)
     if callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
         return ir_emit_test_assert_eq(node, arg_regs, true)
     if callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
@@ -9787,6 +9818,15 @@ fn ir_collect_test_decls(root_idx: Int) -> List[Int]:
             tests.push(item_idx)
     return tests
 
+# the tags a test block carries, comma-joined, or "" for an untagged test.
+# the parser puts them on a `test_tags` child so the body stays the child
+# every other walker finds by kind.
+fn ir_test_decl_tags(idx: Int) -> String:
+    for child in get_node(idx).children:
+        if get_node(child).kind == "test_tags":
+            return get_node(child).value
+    return ""
+
 fn ir_emit_test_func(idx: Int, ordinal: Int):
     body_idx := ir_find_body(idx)
     ir_prepare_func_emission("int")
@@ -9815,13 +9855,22 @@ fn ir_emit_test_main(root_idx: Int):
     # normal main prelude carries is emitted here instead.
     ir_emit_call0(ir_reg(), ir_cc_register_fn_name(), "int")
 
+    # every result carries the file it came from, which the runner cannot work
+    # out on its own: the binary it runs has no idea what it was built from.
+    file_r := ir_reg()
+    ir_emit("strref " + file_r.to_string() + " " + ir_str(ir_test_source_file))
+    ir_emit_call1(ir_reg(), "pith_test_set_file", "int", file_r)
+
     for test_idx, i in tests:
         name_r := ir_reg()
         ir_emit("strref " + name_r.to_string() + " " + ir_str(get_node(test_idx).value))
+        tags_r := ir_reg()
+        ir_emit("strref " + tags_r.to_string() + " " + ir_str(ir_test_decl_tags(test_idx)))
 
-        # skip tests filtered out by PITH_TEST_FILTER before doing any work
+        # skip tests filtered out by PITH_TEST_FILTER, or by the tags this run
+        # selected or excluded, before doing any work
         run_r := ir_reg()
-        ir_emit_call1(run_r, "pith_test_should_run", "int", name_r)
+        ir_emit_call2(run_r, "pith_test_should_run", "int", name_r, tags_r)
         run_l := ir_label()
         skip_l := ir_label()
         ir_emit("brif " + run_r.to_string() + " " + run_l + " " + skip_l)
@@ -11011,8 +11060,10 @@ pub fn emit_ir(root_idx: Int) -> String:
     # would see, so intern them here — before the table is emitted — for the test
     # main's per-test report line.
     if ir_emit_tests:
+        _file_id := ir_str(ir_test_source_file)
         for test_idx in ir_collect_test_decls(root_idx):
             _name_id := ir_str(get_node(test_idx).value)
+            _tags_id := ir_str(ir_test_decl_tags(test_idx))
     ir_emit_string_table()
 
     # collect aliases first so both type and callable metadata can resolve

@@ -238,6 +238,107 @@ handy when you drive the tests through a wrapper script. one row of a
 table-driven test is reachable the same way — see [selecting one
 row](#selecting-one-row).
 
+## tagging tests
+
+a test can carry labels, and a run can select or exclude them. the labels are
+identifiers in brackets between the name and the colon:
+
+```pith
+test "reads rows from the live database" [slow, database]:
+    ...
+```
+
+that is the bracketed list the language spells everywhere else, so a tagged
+test brings in no new punctuation and nothing to quote. a tag is a name rather
+than a string because it is used as one: a run asks for it and it is either
+there or it is not. matching text is what `--filter` is for.
+
+`--tag` runs only the tests carrying that label, `--exclude-tag` runs
+everything but them, and either can be passed more than once:
+
+```
+$ pith test std/sql.pith --tag slow
+$ pith test std/sql.pith --exclude-tag slow --exclude-tag database
+```
+
+with no `--tag` every test qualifies. with a selection a test needs one of the
+selected labels, so two `--tag`s are a union. an excluded label removes a test
+either way, so exclusion wins over selection when a test carries both.
+
+tags and `--filter` compose as one conjunction: the tags say which tests the
+run is about, the filter picks a name out of those. `--tag slow --filter
+scramble` runs the slow tests whose name contains scramble and nothing else.
+neither widens the other, and a test the tags excluded is not reachable by
+naming it in a filter.
+
+a tag on a test that holds a table covers the whole table. selecting the tag
+runs every row, and one row is still reachable on its own through `--filter`,
+exactly as it was before the test was tagged.
+
+a run that names a tag no test in the file carries says so and fails:
+
+```
+$ pith test std/sql.pith --tag databse
+
+0 passed, 0 failed, 12 filtered out
+no test carries the tag "databse"
+```
+
+a mistyped tag would otherwise be a green run of nothing, which is the one
+failure a CI step cannot catch by itself. `--exclude-tag` is held to the same
+rule: excluding a label nothing carries means the invocation is not doing what
+it says.
+
+## machine-readable output
+
+`--json` reports the run as one json object per line instead of prose. three of
+the lines that run prints:
+
+```
+$ pith test tests/testrunner/fixture.pith --json
+{"type":"test","name":"arithmetic holds","file":"tests/testrunner/fixture.pith","tags":["fast"],"outcome":"passed","duration_ms":0,"message":null,"position":null}
+{"type":"case","name":"[3] gamma","test":"rows report one by one","file":"tests/testrunner/fixture.pith","tags":["table"],"outcome":"failed","message":"the case did not hold"}
+{"type":"summary","passed":2,"failed":2,"skipped":1,"filtered_out":0,"unmatched_tags":[]}
+```
+
+a `test` record carries the test's name, the file it came from, its tags, its
+outcome — `passed`, `failed`, `skipped` or `filtered` — and how long it took in
+milliseconds. a failed one also carries the assertion's message and the
+position it failed at; a skipped one carries the reason. a `case` record is one
+row of a table or one `std.testing` check, and names the test it belongs to as
+well as itself, because a row labeled `[3] gamma` says nothing on its own. the
+run ends with one `summary` record holding the tally and any tag the run named
+that nothing carries.
+
+it is json lines rather than one json document because a run is a stream
+written by more than one process: the child prints its own rows and its own
+skip, the parent prints the verdict once the child is gone, and a test that
+crashes still leaves every record written before it. a document has to be
+closed by whoever opened it, which a process that died cannot do, and buffering
+the whole run to close it would throw away the streaming the fork-per-test
+design is built on. every reader already handles a line at a time — `jq` reads
+it without a flag, and so does anything that loops over lines:
+
+```
+$ pith test std/sql.pith --json | jq -r 'select(.outcome == "failed" and .position)
+    | "\(.position.file):\(.position.line): \(.name): \(.message)"'
+```
+
+the position is where a built-in assertion in the file under test failed. only
+the module being tested is compiled with those positions in it, so an assertion
+that fails inside an imported helper reports its message and a null position. a
+`std.testing` check reports its own message, which already names both sides, and
+no position.
+
+a test's own output is not a record. what a test prints still goes to stdout
+where it printed it, and a failing built-in assertion still prints its message
+to stderr, so a reader takes the lines that parse as json and leaves the rest.
+
+`--json`, `--tag` and `--exclude-tag` also read from the environment
+(`PITH_TEST_JSON`, `PITH_TEST_TAGS`, `PITH_TEST_EXCLUDE_TAGS`) the way
+`--filter` reads `PITH_TEST_FILTER`. a wrapper script that drives the tests
+sets those and needs to know nothing about the flags.
+
 ## std.testing
 
 `std.testing` is a helper library for a different shape of test: a standalone
@@ -289,6 +390,14 @@ other kinds of test, all wired through the `Makefile`:
 - **crash sites** — `make check-no-panics` scans the rust sources for anything
   that can stop the process and fails on any site that is not justified in
   place. see below.
+- **the runner's own output** — `make test-runner-goldens` runs
+  `tests/testrunner/fixture.pith` eleven ways and compares every line against
+  `tests/testrunner/expected/`. the json records are a contract with whatever
+  reads them, so they are pinned line for line rather than grepped: a record
+  that quietly drops a field still passes a grep and breaks every reader.
+  durations vary, so `"duration_ms":<n>` is rewritten to `"duration_ms":<ms>`
+  before the comparison — the field stays pinned present and well-formed, only
+  its value is dropped.
 
 ## the crash guard
 
@@ -365,9 +474,10 @@ that keeps filling up looks exactly like a leak.
 
 ## on the roadmap
 
-a few things are not here yet: tagging tests, benchmarks, and machine-readable
-output for CI. skipping has since landed — see `skip_test` above, which is what
-lets the live suites fold in and skip themselves when their service is not
-reachable. the leak gate covers a curated set of ownership shapes rather than
+one thing is not here yet: benchmarks. tagging, machine-readable output and
+skipping have all landed — see [tagging tests](#tagging-tests),
+[machine-readable output](#machine-readable-output) and `skip_test` above, the
+last of which is what lets the live suites fold in and skip themselves when
+their service is not reachable. the leak gate covers a curated set of ownership shapes rather than
 every program; a case is added as the last step of fixing a shape, not the
 first, which is why the gate reads as a list of leaks that no longer happen.

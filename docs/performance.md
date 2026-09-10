@@ -272,6 +272,65 @@ publish can no longer wedge the process. `tests/green/starvation.pith` finished
 40 out of 40 runs with safe-points, at one and at the default worker count, and 0
 out of 40 without them.
 
+### the compiler stopped splitting strings on every generic lookup (2026-09-10)
+
+the profile taken for the std pass (#1097) put `pith_string_split_to_list` at 13.1
+percent self and 31.6 percent inclusive of a self-compile, and both callers
+were the compiler's own code. `checker_resolve_generic_declaration_key` is
+asked, for a base name, which key `generic_declaration_map` holds it under
+from the module being checked. its first two probes are map lookups; when
+both miss, which is the common case since most names are not generics, it
+walked every `module<TAB>name<TAB>source` entry the whole program's
+from-imports had produced and split each one on the tab to compare the first
+two fields. 8,838 calls, about 1,000 entries each, 2.1 million splits: 34.4
+percent of the compile inside one function. `ir_csv_contains` in the
+emitter answers whether a builtin is in one of fourteen comma-joined tables
+(the float-returning builtins, the void methods, the fallible builtins by
+result shape), and did it by splitting the table into a fresh list per
+question, 106,406 times.
+
+both places now build the answer once. the checker keeps the entry lists
+as they are (the lsp snapshot carries them, and two `starts_with` scans read
+them) and adds an index over them: the named entries under
+`module<TAB>name`, the wildcard entries under `module`, each holding its
+sources in entry order, so a lookup is two map probes and the loop only runs
+over the handful of sources that import that exact name. the index is
+appended at the two push sites and rebuilt from the lists on a snapshot
+restore. the emitter turns each table into a `Map[String, Bool]` the first
+time any table is asked, and the comma-joined strings stay as the record.
+what is emitted does not change: `tooling/ir_compare.sh` over the corpus
+reads identical raw as well as normalized, and the bootstrap seed reached
+its fixed point.
+
+instruction counts through `tooling/callgrind_ab.sh`. the whole-run rows are
+the trunk's driver against this one, each compiling the same tree; the
+per-function rows are a before-and-after pair of the driver built from the
+same base with `PITH_KEEP_SYMBOLS=1`, inclusive figures:
+
+| 2026-09-10, callgrind | before | after | delta |
+|---|---:|---:|---:|
+| compiler compiling itself, whole run | 22,640,305,204 | 12,495,999,868 | −44.8% |
+| `checker_resolve_generic_declaration_key`, inclusive | 7,791,228,580 (34.4%) | 74,819,569 (0.60%) | −99.0% |
+| the eleven `ir_metadata` predicates over `ir_csv_contains`, inclusive | 2,483,092,479 (11.0%) | 39,608,789 (0.32%) | −98.4% |
+| `pith_string_split_to_list`, self | 2,971,980,003 (13.1%) | 48,562,103 (0.39%) | −98.4% |
+| `examples/web_login.pith`, whole run | 19,830,250,211 | 17,111,351,847 | −13.7% |
+| `examples/generics.pith`, whole run | 103,235,367 | 88,646,810 | −14.1% |
+
+what is left of `resolve_generic_declaration_key` is its fast path: a
+module-qualified key built by `module_symbol_prefix`, which concatenates a
+character at a time, and the map probes. the next compiler items in the
+profile after this are `ir_runtime_call_name` (1.1 percent, a chain of
+string comparisons per call lowered) and `from_import_source_module` (0.5
+percent, the remaining `starts_with` scan over the same entry lists).
+
+wall clock as the cross-check, the two drivers interleaved on the
+self-compile after a discarded warm-up, medians of seven: 6027 ms before,
+3767 ms after (−37.5%); a second pair of three rounds later that
+afternoon read 6453 ms against 3619 ms. the absolute figures are about
+twice the 2830 ms the safe-point section reports for the same compile;
+the two runs are not comparable, and the paired delta is the figure this
+row exists for.
+
 ### a note on how these are measured
 
 the cross-language harnesses interleave: one round runs every language once,

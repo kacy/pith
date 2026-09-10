@@ -19,60 +19,105 @@ RESULT_BOOL_FUNCS := "write_file,append_file,write_file_bytes,append_file_bytes"
 RESULT_STRING_FUNCS := "read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err"
 RESULT_BYTES_FUNCS := "term_read,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_aes_256_gcm_seal,crypto_aes_256_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8,crypto_sign_rsa_pkcs1_sha256_pkcs8,crypto_sign_ed25519_pkcs8,crypto_sign_ecdsa_p256_sha256_pkcs8,crypto_sign_ecdsa_p256_sha256_asn1_pkcs8,crypto_sign_rsa_pss_sha384_pkcs8,crypto_sign_rsa_pss_sha512_pkcs8,crypto_sign_rsa_pkcs1_sha384_pkcs8,crypto_sign_rsa_pkcs1_sha512_pkcs8,crypto_sign_ecdsa_p384_sha384_asn1_pkcs8,crypto_blake2b,crypto_argon2id,zstd_compress,zstd_decompress"
 
-fn ir_csv_contains(csv: String, name: String) -> Bool:
-    if name.len() == 0:
-        return false
-    items := csv.split(",")
-    for item in items:
-        if item == name:
-            return true
-    return false
+# the tables above as sets, one per table, built the first time any of them
+# is asked and read by key from then on. the comma-joined strings stay the
+# record because they read as lists; the sets exist because the questions
+# below are asked for every call and method the emitter lowers, and
+# splitting a table into a fresh list per question was 8 percent of a
+# self-compile.
+mut ir_metadata_sets_built := false
+mut float_returning_funcs: Map[String, Bool] := {}
+mut bool_returning_funcs: Map[String, Bool] := {}
+mut int_returning_funcs: Map[String, Bool] := {}
+mut string_returning_funcs: Map[String, Bool] := {}
+mut bytes_returning_funcs: Map[String, Bool] := {}
+mut list_returning_funcs: Map[String, Bool] := {}
+mut list_string_returning_funcs: Map[String, Bool] := {}
+mut bool_returning_methods: Map[String, Bool] := {}
+mut void_methods: Map[String, Bool] := {}
+mut string_returning_methods: Map[String, Bool] := {}
+mut result_int_funcs: Map[String, Bool] := {}
+mut result_bool_funcs: Map[String, Bool] := {}
+mut result_string_funcs: Map[String, Bool] := {}
+mut result_bytes_funcs: Map[String, Bool] := {}
+
+fn ir_csv_set(csv: String) -> Map[String, Bool]:
+    mut members: Map[String, Bool] := {}
+    for item in csv.split(","):
+        members.insert(item, true)
+    return members
+
+fn ir_build_metadata_sets():
+    if ir_metadata_sets_built:
+        return
+    ir_metadata_sets_built = true
+    float_returning_funcs = ir_csv_set(FLOAT_RETURNING_FUNCS)
+    bool_returning_funcs = ir_csv_set(BOOL_RETURNING_FUNCS)
+    int_returning_funcs = ir_csv_set(INT_RETURNING_FUNCS)
+    string_returning_funcs = ir_csv_set(STRING_RETURNING_FUNCS)
+    bytes_returning_funcs = ir_csv_set(BYTES_RETURNING_FUNCS)
+    list_returning_funcs = ir_csv_set(LIST_RETURNING_FUNCS)
+    list_string_returning_funcs = ir_csv_set(LIST_STRING_RETURNING_FUNCS)
+    bool_returning_methods = ir_csv_set(BOOL_RETURNING_METHODS)
+    void_methods = ir_csv_set(VOID_METHODS)
+    string_returning_methods = ir_csv_set(STRING_RETURNING_METHODS)
+    result_int_funcs = ir_csv_set(RESULT_INT_FUNCS)
+    result_bool_funcs = ir_csv_set(RESULT_BOOL_FUNCS)
+    result_string_funcs = ir_csv_set(RESULT_STRING_FUNCS)
+    result_bytes_funcs = ir_csv_set(RESULT_BYTES_FUNCS)
 
 # the builtins the emitter types as returning a float. this table and the
 # six below stand in for the declarations a builtin never has: ir_infer_type
 # falls back to them when the checker supplied no type for the call. a name
 # in none of them types as "", i.e. unknown.
 pub fn ir_is_float_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(FLOAT_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return float_returning_funcs.contains_key(fname)
 
 # the builtins the emitter types as returning a bool. several are
 # did-it-work calls (os_set_env, fs_remove_tree, the crypto verifiers):
 # they report failure as a plain false and are absent from
 # RESULT_BOOL_FUNCS, so nothing here goes through the result abi.
 pub fn ir_is_bool_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(BOOL_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return bool_returning_funcs.contains_key(fname)
 
 # the builtins the emitter types as returning an int. the fixed-width
 # conversions (Int8 through UInt64, float_to_bits) live here too: the ir
 # has no narrower integer type, so they are ordinary int-returning calls.
 pub fn ir_is_int_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(INT_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return int_returning_funcs.contains_key(fname)
 
 # the builtins the emitter types as returning a string. a few names are
 # also in RESULT_STRING_FUNCS (read_file, exec_output); those two tables do
 # different jobs — the fallible one decides how the result is carried, this
 # one names the type of the value inside it.
 pub fn ir_is_string_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(STRING_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return string_returning_funcs.contains_key(fname)
 
 # the builtins the emitter types as returning bytes. most entries are also
 # in RESULT_BYTES_FUNCS, so the call itself yields a result — what this
 # table describes is the payload type, not the shape of the return.
 pub fn ir_is_bytes_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(BYTES_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return bytes_returning_funcs.contains_key(fname)
 
 # the builtins whose result the emitter types as the generic "list".
 # keeping these apart from the list-of-string table is how the element kind
 # survives into method lowering: a "list_string" receiver sorts with
 # list_sort_strings_copy, a plain "list" with list_sort_copy.
 pub fn ir_is_list_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(LIST_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return list_returning_funcs.contains_key(fname)
 
 # the builtins whose result the emitter types as "list_string" rather than
 # plain "list" — the counterpart to ir_is_list_returning_func, which
 # explains why the two are separate tables.
 pub fn ir_is_list_string_returning_func(fname: String) -> Bool:
-    return ir_csv_contains(LIST_STRING_RETURNING_FUNCS, fname)
+    ir_build_metadata_sets()
+    return list_string_returning_funcs.contains_key(fname)
 
 # whether a bare name is one of the builtins the seven tables above type.
 # lambda capture analysis is the caller: an identifier naming a builtin is
@@ -85,17 +130,18 @@ pub fn ir_is_known_returning_func(fname: String) -> Bool:
 # the ir retkind of a fallible builtin's result. the match order is preserved
 # from the original hand-written chain so every function's retkind is unchanged.
 pub fn ir_builtin_result_retkind(name: String) -> String:
+    ir_build_metadata_sets()
     if name == "parse_int":
         return "tuple"
-    if ir_csv_contains(RESULT_INT_FUNCS, name):
+    if result_int_funcs.contains_key(name):
         return "result_int"
-    if ir_csv_contains(RESULT_BOOL_FUNCS, name):
+    if result_bool_funcs.contains_key(name):
         return "result_bool"
     if name == "parse_float":
         return "float"
-    if ir_csv_contains(RESULT_STRING_FUNCS, name):
+    if result_string_funcs.contains_key(name):
         return "string"
-    if ir_csv_contains(RESULT_BYTES_FUNCS, name):
+    if result_bytes_funcs.contains_key(name):
         return "bytes"
     return ""
 
@@ -117,7 +163,8 @@ pub fn ir_builtin_result_ok_kind(name: String) -> String:
 # it is asked once with the source name and once with the lowered emit
 # name, and neither query rewrites the other's form.
 pub fn ir_is_bool_returning_method(meth: String) -> Bool:
-    return ir_csv_contains(BOOL_RETURNING_METHODS, meth)
+    ir_build_metadata_sets()
+    return bool_returning_methods.contains_key(meth)
 
 # whether a method leaves no value of its own. asked with the lowered emit
 # name. the emitter forces the call's retkind to "void" and then hands the
@@ -127,7 +174,8 @@ pub fn ir_is_bool_returning_method(meth: String) -> Bool:
 # a discarded chain at statement position through the receiver's own
 # classification.
 pub fn ir_is_void_method(meth: String) -> Bool:
-    return ir_csv_contains(VOID_METHODS, meth)
+    ir_build_metadata_sets()
+    return void_methods.contains_key(meth)
 
 # whether a method returns a string. only type inference asks, and only
 # once the checker has failed to type the call. the table is keyed by
@@ -135,7 +183,8 @@ pub fn ir_is_void_method(meth: String) -> Bool:
 # that name: `reverse` here is String.reverse, not List.reverse, which is
 # a void method.
 pub fn ir_is_string_returning_method(meth: String) -> Bool:
-    return ir_csv_contains(STRING_RETURNING_METHODS, meth)
+    ir_build_metadata_sets()
+    return string_returning_methods.contains_key(meth)
 
 # the runtime symbol a builtin is emitted under, or `name` unchanged when
 # nothing here claims it — which is how a user function passes through. the

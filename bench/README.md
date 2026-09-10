@@ -719,6 +719,23 @@ counts a fixed set of messy paths. each prints a checksum, and the
 instruction-count comparison is `tooling/callgrind_ab.sh` over a binary
 built before the change and one built after it, by the same compiler.
 
+a fourth isolates the runtime's typed json decode, the largest runtime
+row of that profile:
+
+```
+pith build bench/json_decode_shapes.pith
+./bench/json_decode_shapes small 4 20000    # three-field struct, 4-byte strings
+./bench/json_decode_shapes wide 32 20000    # twenty-field struct, 32-byte strings
+./bench/json_decode_shapes nested 4 2000    # a struct with a nested struct (node pool)
+./bench/json_decode_shapes list 32 400      # an array of 32 small objects (node pool)
+```
+
+`json_decode_shapes` decodes one struct shape per run; `size` is the
+string value width for the flat shapes and the element count for the
+list. the flat shapes take the runtime's single-pass fill, the nested
+and list shapes parse into the node pool first, so the two pairs answer
+different questions.
+
 ## zstd codec benchmark (pure-pith encoder and decoder)
 
 `bench/zstd_codec.pith` times the pure-pith zstd codec

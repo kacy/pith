@@ -1,0 +1,56 @@
+# the single-pass flat decoder minting strings a struct must own.
+#
+# `pith_json_fill_struct` writes each string field as a fresh counted
+# cstring into a pre-allocated struct, and its key lookup was rewritten to
+# match keys in place instead of splitting the spec per key. a lookup that
+# lands a value in the wrong slot, a repeated key whose first string is
+# overwritten without a release, or an error result whose message nobody
+# drops moves the peak between the two round counts. a round decodes a
+# flat struct with string fields four ways: keys in declaration order,
+# reversed, with a repeated key next to an unknown one, and a document
+# that fails on a wrong type after a string was already minted.
+#
+# a struct with a nested struct field is not in the round: that shape
+# parses into the node pool, and on the unmodified trunk the pool strands
+# the strings it parsed (about 60 bytes a round), which this case is not
+# about.
+import leakprobe as probe
+import std.json as json
+import std.bytes as bytes
+
+pub struct Flat:
+    pub id: Int
+    pub name: String
+    pub region: String
+    pub active: Bool
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn round(i: Int) -> Int:
+    ordered := obj(q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("n" + i.to_string()) + "," + q("region") + ":" + q("west") + "," + q("active") + ":true")
+    reversed := obj(q("active") + ":false," + q("region") + ":" + q("east") + "," + q("name") + ":" + q("r" + i.to_string()) + "," + q("id") + ":" + i.to_string())
+    repeated := obj(q("id") + ":1," + q("name") + ":" + q("first") + "," + q("extra") + ":" + q("skip") + "," + q("name") + ":" + q("second") + "," + q("region") + ":" + q("x") + "," + q("active") + ":true")
+    failing := obj(q("name") + ":" + q("only") + "," + q("id") + ":" + q("bad"))
+    a := json.decode[Flat](bytes.from_string_utf8(ordered)) catch Flat(0, "", "", false)
+    b := json.decode_text[Flat](reversed) catch Flat(0, "", "", false)
+    c := json.decode_text[Flat](repeated) catch Flat(0, "", "", false)
+    e := json.decode_text[Flat](failing)
+    mut v := a.id + a.name.len() + b.id + b.region.len() + c.name.len()
+    if e.is_err:
+        v = v + e.err.message.len()
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

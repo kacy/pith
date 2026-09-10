@@ -1,0 +1,187 @@
+# the single-pass flat decoder (`pith_json_fill_struct`) over every shape
+# it sees and every way it can fail. valgrind-gated in MEMCHECK_CASES.
+#
+# the decoder matches keys against a packed field spec and fills a
+# pre-allocated struct in place; a rewrite of that lookup has to keep the
+# decoded values, the mask that names the first missing field, the -1 that
+# turns a wrong type or malformed input into the generic message, and the
+# ownership of every string it mints. so: a small struct, a wide one with
+# keys in declaration order and in reverse, nested and list shapes for the
+# pool path next to it, unknown keys of every scalar kind, a repeated key,
+# whitespace, escapes, saturating ints, and each error in turn.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Small:
+    pub id: Int
+    pub name: String
+    pub active: Bool
+
+struct Wide:
+    pub f01: Int
+    pub f02: String
+    pub f03: Bool
+    pub f04: Int
+    pub f05: String
+    pub f06: Int
+    pub f07: Int
+    pub f08: String
+    pub f09: Bool
+    pub f10: Int
+    pub f11: String
+    pub f12: Int
+    pub f13: Int
+    pub f14: String
+    pub f15: Bool
+    pub f16: Int
+    pub f17: String
+    pub f18: Int
+    pub f19: Int
+    pub f20: String
+
+struct Inner:
+    pub city: String
+    pub zip: Int
+
+struct Nested:
+    pub name: String
+    pub addr: Inner
+    pub score: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn show_small(label: String, r: Small!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + r.ok.id.to_string() + " " + q(r.ok.name) + " " + r.ok.active.to_string())
+
+fn wide_field(i: Int) -> String:
+    if i % 3 == 2:
+        return q("w" + i.to_string())
+    if i % 6 == 3:
+        if i == 9:
+            return "false"
+        return "true"
+    return (i * 11).to_string()
+
+fn wide_doc(reverse: Bool) -> String:
+    mut s := ""
+    mut n := 1
+    while n <= 20:
+        mut i := n
+        if reverse:
+            i = 21 - n
+        if n > 1:
+            s = s + ","
+        key := "f" + (i / 10).to_string() + (i % 10).to_string()
+        s = s + q(key) + ":" + wide_field(i)
+        n = n + 1
+    return obj(s)
+
+fn show_wide(label: String, r: Wide!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    w := r.ok
+    ints := w.f01 + w.f04 + w.f06 + w.f07 + w.f10 + w.f12 + w.f13 + w.f16 + w.f18 + w.f19
+    strs := w.f02 + "|" + w.f05 + "|" + w.f08 + "|" + w.f11 + "|" + w.f14 + "|" + w.f17 + "|" + w.f20
+    print(label + " ok: ints=" + ints.to_string() + " strs=" + strs + " bools=" + w.f03.to_string() + "," + w.f09.to_string() + "," + w.f15.to_string() + " f19=" + w.f19.to_string())
+
+fn main() -> Int:
+    dq := chr(34)
+    bs := chr(92)
+    small := obj(q("id") + ":7," + q("name") + ":" + q("alice") + "," + q("active") + ":true")
+    show_small("small_bytes", json.decode[Small](bytes.from_string_utf8(small)))
+    show_small("small_text", json.decode_text[Small](small))
+
+    # keys in any order resolve to the same slots
+    reordered := obj(q("active") + ":false," + q("name") + ":" + q("bob") + "," + q("id") + ":-12")
+    show_small("reordered", json.decode_text[Small](reordered))
+
+    # whitespace between every token
+    spaced := " " + chr(123) + " " + q("id") + " : 3 , " + q("name") + " : " + q("c d") + " , " + q("active") + " : true " + chr(125) + " "
+    show_small("spaced", json.decode_text[Small](spaced))
+
+    # unknown keys of every scalar kind are skipped wherever they sit
+    extras := obj(q("zz") + ":" + q("first") + "," + q("id") + ":1," + q("n") + ":-5," + q("name") + ":" + q("x") + "," + q("t") + ":true," + q("f") + ":false," + q("nil") + ":null," + q("active") + ":false," + q("tail") + ":9")
+    show_small("extras", json.decode_text[Small](extras))
+
+    # a repeated key: the last value wins
+    dup := obj(q("id") + ":1," + q("name") + ":" + q("one") + "," + q("id") + ":2," + q("name") + ":" + q("two") + "," + q("active") + ":true," + q("active") + ":false")
+    show_small("duplicate", json.decode_text[Small](dup))
+
+    # escapes end at the right quote; the bytes are kept as written
+    escaped := obj(q("id") + ":4," + q("name") + ":" + dq + "a" + bs + dq + "b" + bs + bs + "c" + bs + "nd" + dq + "," + q("active") + ":true")
+    show_small("escaped", json.decode_text[Small](escaped))
+
+    # an empty string value, and an int past 64 bits saturates
+    edge := obj(q("id") + ":99999999999999999999999," + q("name") + ":" + q("") + "," + q("active") + ":false")
+    show_small("edge", json.decode_text[Small](edge))
+
+    # the wide struct, in declaration order and reversed
+    show_wide("wide", json.decode_text[Wide](wide_doc(false)))
+    show_wide("wide_reversed", json.decode_text[Wide](wide_doc(true)))
+
+    # nested and list shapes take the node-pool path next to the flat one
+    inner := obj(q("city") + ":" + q("paris") + "," + q("zip") + ":75001")
+    nested := obj(q("name") + ":" + q("nina") + "," + q("addr") + ":" + inner + "," + q("score") + ":42")
+    nr := json.decode_text[Nested](nested)
+    if nr.is_err:
+        print("nested err: " + nr.err.message)
+    else:
+        print("nested ok: " + nr.ok.name + " " + nr.ok.addr.city + " " + nr.ok.addr.zip.to_string() + " " + nr.ok.score.to_string())
+    mut items := "["
+    mut i := 0
+    while i < 4:
+        if i > 0:
+            items = items + ","
+        items = items + obj(q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("item" + i.to_string()) + "," + q("active") + ":" + (i % 2 == 0).to_string())
+        i = i + 1
+    items = items + "]"
+    root := json.parse(items)
+    mut list_out := "list ok:"
+    mut k := 0
+    while k < json.array_len(root):
+        item := json.decode_object[Small](json.array_get(root, k)) catch Small(0 - 1, "", false)
+        list_out = list_out + " " + item.id.to_string() + "/" + item.name + "/" + item.active.to_string()
+        k = k + 1
+    print(list_out)
+
+    # errors: a missing field names the first missing one in declaration order
+    show_small("missing_one", json.decode_text[Small](obj(q("id") + ":1," + q("active") + ":true")))
+    show_small("missing_two", json.decode_text[Small](obj(q("name") + ":" + q("x"))))
+    show_small("missing_all", json.decode_text[Small](obj("")))
+    show_wide("wide_missing", json.decode_text[Wide](obj(q("f01") + ":1," + q("f20") + ":" + q("z"))))
+
+    # errors: a wrong type for a field
+    show_small("wrong_int", json.decode_text[Small](obj(q("id") + ":" + q("7") + "," + q("name") + ":" + q("a") + "," + q("active") + ":true")))
+    show_small("wrong_string", json.decode_text[Small](obj(q("id") + ":7," + q("name") + ":7," + q("active") + ":true")))
+    show_small("wrong_bool", json.decode_text[Small](obj(q("id") + ":7," + q("name") + ":" + q("a") + "," + q("active") + ":" + q("yes"))))
+    show_small("wrong_null", json.decode_text[Small](obj(q("id") + ":null," + q("name") + ":" + q("a") + "," + q("active") + ":true")))
+
+    # errors: malformed input
+    show_small("empty_input", json.decode_text[Small](""))
+    show_small("not_object", json.decode_text[Small]("[1,2]"))
+    show_small("truncated", json.decode_text[Small](chr(123) + q("id") + ":7," + q("name") + ":" + q("a")))
+    show_small("unterminated", json.decode_text[Small](chr(123) + q("id") + ":7," + q("name") + ":" + dq + "abc"))
+    show_small("bare_key", json.decode_text[Small](chr(123) + "id:7" + chr(125)))
+    show_small("no_colon", json.decode_text[Small](chr(123) + q("id") + " 7" + chr(125)))
+    show_small("trailing_comma", json.decode_text[Small](obj(q("id") + ":7," + q("name") + ":" + q("a") + "," + q("active") + ":true,")))
+    show_small("bad_extra", json.decode_text[Small](obj(q("id") + ":7," + q("junk") + ":?," + q("name") + ":" + q("a") + "," + q("active") + ":true")))
+
+    # churn: many decodes whose strings are kept, so the destructor path runs
+    mut total := 0
+    mut n := 0
+    while n < 200:
+        r := json.decode_text[Small](obj(q("id") + ":" + n.to_string() + "," + q("name") + ":" + q("user-" + n.to_string()) + "," + q("active") + ":true")) catch Small(0, "", false)
+        w := json.decode_text[Wide](wide_doc(n % 2 == 1)) catch Wide(0 - 1, "", false, 0, "", 0, 0, "", false, 0, "", 0, 0, "", false, 0, "", 0, 0, "")
+        total = total + r.id + r.name.len() + w.f19 + w.f20.len()
+        n = n + 1
+    print("churn " + total.to_string())
+    return 0

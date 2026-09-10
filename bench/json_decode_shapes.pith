@@ -1,0 +1,184 @@
+# typed json decoding, one struct shape at a time.
+#
+# four shapes: a small flat struct (three fields), a wide flat struct
+# (twenty fields), a struct with a nested struct, and an array of small
+# objects decoded element by element. the flat shapes take the single-pass
+# runtime fill (`pith_json_fill_struct`); the nested and list shapes parse
+# into the node pool first. `size` scales the string values of the flat
+# shapes and the element count of the list, so a per-call cost can be
+# read against the bytes it had to look at.
+#
+#   pith build bench/json_decode_shapes.pith
+#   ./bench/json_decode_shapes <shape> <size> <rounds>
+#
+# shape is one of small, wide, nested, list. every decoded value feeds the
+# checksum, so an arm that decoded a field differently cannot look fast.
+#
+# the profile that motivated this (docs/performance.md, 2026-09-10) put a
+# third of catalog_workload's instructions in the runtime fill, most of it
+# splitting the field spec byte by byte for every key.
+import std.json as json
+import std.bytes as bytes
+
+struct Small:
+    pub id: Int
+    pub name: String
+    pub active: Bool
+
+struct Wide:
+    pub f01: Int
+    pub f02: String
+    pub f03: Bool
+    pub f04: Int
+    pub f05: String
+    pub f06: Int
+    pub f07: Int
+    pub f08: String
+    pub f09: Bool
+    pub f10: Int
+    pub f11: String
+    pub f12: Int
+    pub f13: Int
+    pub f14: String
+    pub f15: Bool
+    pub f16: Int
+    pub f17: String
+    pub f18: Int
+    pub f19: Int
+    pub f20: String
+
+struct Inner:
+    pub city: String
+    pub zip: Int
+
+struct Nested:
+    pub name: String
+    pub addr: Inner
+    pub score: Int
+
+fn arg_or(index: Int, fallback: String) -> String:
+    argv := args()
+    if argv.len() > index:
+        return argv[index]
+    return fallback
+
+fn int_arg_or(index: Int, fallback: Int) -> Int:
+    parsed := parse_int(arg_or(index, ""))
+    if parsed.is_ok and parsed.ok > 0:
+        return parsed.ok
+    return fallback
+
+fn text_of(width: Int) -> String:
+    mut s := ""
+    mut i := 0
+    while i < width:
+        s = s + chr(97 + i % 26)
+        i = i + 1
+    return s
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn small_doc(width: Int) -> String:
+    return chr(123) + q("id") + ":7," + q("name") + ":" + q(text_of(width)) + "," + q("active") + ":true" + chr(125)
+
+fn wide_doc(width: Int) -> String:
+    text := q(text_of(width))
+    mut s := chr(123)
+    mut i := 1
+    while i <= 20:
+        if i > 1:
+            s = s + ","
+        key := "f" + (i / 10).to_string() + (i % 10).to_string()
+        s = s + q(key) + ":"
+        if i % 3 == 2:
+            s = s + text
+        elif i % 6 == 3:
+            s = s + "true"
+        else:
+            s = s + (i * 11).to_string()
+        i = i + 1
+    return s + chr(125)
+
+fn nested_doc(width: Int) -> String:
+    inner := chr(123) + q("city") + ":" + q(text_of(width)) + "," + q("zip") + ":75001" + chr(125)
+    return chr(123) + q("name") + ":" + q(text_of(width)) + "," + q("addr") + ":" + inner + "," + q("score") + ":42" + chr(125)
+
+fn list_doc(count: Int) -> String:
+    mut s := "["
+    mut i := 0
+    while i < count:
+        if i > 0:
+            s = s + ","
+        s = s + chr(123) + q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("item" + i.to_string()) + "," + q("active") + ":false" + chr(125)
+        i = i + 1
+    return s + "]"
+
+fn small_sum(doc: Bytes) -> Int:
+    r := json.decode[Small](doc) catch Small(0 - 1, "", false)
+    mut v := r.id + r.name.len()
+    if r.active:
+        v = v + 1
+    return v
+
+fn wide_sum(doc: Bytes) -> Int:
+    r := json.decode[Wide](doc) catch Wide(0 - 1, "", false, 0, "", 0, 0, "", false, 0, "", 0, 0, "", false, 0, "", 0, 0, "")
+    mut v := r.f01 + r.f04 + r.f06 + r.f07 + r.f10 + r.f12 + r.f13 + r.f16 + r.f18 + r.f19
+    v = v + r.f02.len() + r.f05.len() + r.f08.len() + r.f11.len() + r.f14.len() + r.f17.len() + r.f20.len()
+    if r.f03:
+        v = v + 1
+    if r.f09:
+        v = v + 1
+    if r.f15:
+        v = v + 1
+    return v
+
+fn nested_sum(doc: Bytes) -> Int:
+    r := json.decode[Nested](doc) catch Nested("", Inner("", 0), 0 - 1)
+    return r.name.len() + r.addr.city.len() + r.addr.zip + r.score
+
+fn list_sum(doc: String) -> Int:
+    mark := json.pool_mark_node_id()
+    root := json.parse(doc)
+    n := json.array_len(root)
+    mut v := 0
+    mut i := 0
+    while i < n:
+        item := json.decode_object[Small](json.array_get(root, i)) catch Small(0 - 1, "", false)
+        v = v + item.id + item.name.len()
+        i = i + 1
+    json.pool_restore(mark, 0)
+    return v
+
+fn main() -> Int:
+    shape := arg_or(1, "small")
+    size := int_arg_or(2, 8)
+    rounds := int_arg_or(3, 20000)
+    mut total := 0
+    mut i := 0
+    if shape == "small":
+        doc := bytes.from_string_utf8(small_doc(size))
+        while i < rounds:
+            total = total + small_sum(doc)
+            i = i + 1
+    elif shape == "wide":
+        doc := bytes.from_string_utf8(wide_doc(size))
+        while i < rounds:
+            total = total + wide_sum(doc)
+            i = i + 1
+    elif shape == "nested":
+        doc := bytes.from_string_utf8(nested_doc(size))
+        while i < rounds:
+            total = total + nested_sum(doc)
+            i = i + 1
+    elif shape == "list":
+        doc := list_doc(size)
+        while i < rounds:
+            total = total + list_sum(doc)
+            i = i + 1
+    else:
+        print("unknown shape: " + shape)
+        return 1
+    print("shape=" + shape + " size=" + size.to_string() + " rounds=" + rounds.to_string())
+    print("checksum=" + total.to_string())
+    return 0

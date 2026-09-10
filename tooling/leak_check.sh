@@ -43,6 +43,7 @@ cases=(
   tests/leaks/leak_bytes_keyed_map_drop
   tests/leaks/leak_optional_over_tuple
   tests/leaks/leak_bare_none_binding
+  tests/leaks/leak_env_overlay
   "tests/leaks/leak_pool_thread_exit PITH_GREEN=0"
   "tests/leaks/leak_pool_adoption PITH_GREEN=0"
   tests/leaks/leak_io_text_registry

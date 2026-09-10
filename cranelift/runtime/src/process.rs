@@ -194,6 +194,9 @@ unsafe fn pith_build_command(
 ) -> Option<Command> {
     let program_text = pith_required_cstring(program)?;
     let mut command = Command::new(program_text);
+    // before the per-command overrides below, so an override the caller named
+    // wins over what the program set process-wide.
+    crate::env_overlay::apply(&mut command);
 
     for arg in pith_string_list_to_vec(argv) {
         command.arg(arg);
@@ -222,7 +225,9 @@ pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
     let Some(cmd_str) = cstr_str(cmd) else {
         return 0;
     };
-    match Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    crate::env_overlay::apply(&mut command);
+    match command
         .arg("-lc")
         .arg(cmd_str)
         .stdin(Stdio::piped())

@@ -473,15 +473,23 @@ correctness story:
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests
   (`tests/cases/test_xmod_float.pith` and friends).
-- `os.set_env` after tasks have started is a libc-level race. glibc's `setenv`
-  and `getenv` are not synchronized against each other, and the runtime's own
-  pool threads read the environment behind your back — `getaddrinfo` on the
-  dns pool consults `RES_OPTIONS` and friends on every lookup. rust's internal
-  env lock only covers rust-side accesses, so a `set_env` concurrent with a
-  dial can crash in libc. set environment variables before spawning tasks. the
-  candidate fixes (snapshot the environment at startup, or make late `set_env`
-  write to an overlay that child processes inherit) both change observable
-  semantics, so this is documented rather than decided for now.
+- `os.set_env` and `os.unset_env` no longer write to libc's environment.
+  calling `setenv` once a process has more than one thread is not safe: it
+  reallocates and compacts the `char **` that `getenv` walks, under a lock
+  `getenv` does not take. the runtime always has readers it does not control —
+  `getaddrinfo` on the dns pool consults `RES_OPTIONS` and friends, `execvp` in
+  a spawning child reads `PATH` — and rust's internal env lock covers only
+  rust-side accesses. so the two calls record their effect in an overlay the
+  runtime owns. `env.get` and `os.get_env` read the overlay first and the
+  process environment second, and a child process gets the overlay merged into
+  its environment at spawn, before any per-command `env` override, so an
+  override the caller named still wins. only names the program itself wrote are
+  answered from the overlay, so a variable something outside the runtime
+  changed is still read from libc. the cost is on the write side: a c library
+  reading the real environment inside this process does not see a variable the
+  program set, whenever it was set. `RES_OPTIONS` set from pith no longer
+  reaches the resolver, for instance; it has to be in the environment the
+  process starts with.
 - closing an fd-backed handle from another task is safe, but a pipe read
   blocked in the kernel holds the number. a socket or a child's pipe reaches
   the language as a handle that carries a generation and a user count rather

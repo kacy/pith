@@ -749,7 +749,9 @@ pub unsafe extern "C" fn pith_crypto_argon2id(
 #[no_mangle]
 pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+    // through the overlay, so a program that sets SSL_CERT_FILE from pith is
+    // still heard: `set_env` no longer writes to libc (see `env_overlay`).
+    if let Some(path) = crate::env_overlay::get("SSL_CERT_FILE") {
         candidates.push(path);
     }
     candidates.extend([

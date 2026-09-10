@@ -1201,6 +1201,7 @@ verify-osthread-corpus-only:
 # otherwise the flip would quietly stop testing the code they were written for.
 MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
+	tests/cases/test_env_overlay \
 	tests/cases/test_channel_fanout_ownership \
 	tests/cases/test_channel_try_send_ownership \
 	tests/cases/test_channel_in_struct_field tests/cases/test_channel_in_list \
@@ -1208,6 +1209,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
+	tests/cases/test_env_overlay \
 	tests/cases/test_optional_struct_value_release \
 	tests/cases/test_optional_tuple_return_ownership \
 	tests/cases/test_generic_optional_return_passthrough \

@@ -109,6 +109,7 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
     }
 
     let mut cmd = Command::new(parts[0]);
+    crate::env_overlay::apply(&mut cmd);
     if parts.len() > 1 {
         cmd.args(&parts[1..]);
     }

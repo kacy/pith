@@ -699,6 +699,26 @@ three caveats matter when reading this benchmark:
 - the pith version keeps the config setup local, so the benchmark times the
   csv/url/path/gzip/hash/fs pipeline rather than config parsing.
 
+## std hotspot micro-benchmarks (2026-09-10)
+
+three small programs isolate the std functions a callgrind profile of the
+workloads above put at the top (docs/performance.md, "std profiling pass"),
+so a change to one of them can be measured on its own before it is read off
+the whole workload:
+
+```
+pith build bench/http_head_read.pith && ./bench/http_head_read 20000
+pith build bench/csv_encode.pith && ./bench/csv_encode 5000 10
+pith build bench/path_clean_count.pith && ./bench/path_clean_count 20000
+```
+
+`http_head_read` feeds a stream of keepalive requests through
+`std.net.http`'s request reader from a bytes cursor, with no socket;
+`csv_encode` encodes std_pipeline's ten-column rows; `path_clean_count`
+counts a fixed set of messy paths. each prints a checksum, and the
+instruction-count comparison is `tooling/callgrind_ab.sh` over a binary
+built before the change and one built after it, by the same compiler.
+
 ## zstd codec benchmark (pure-pith encoder and decoder)
 
 `bench/zstd_codec.pith` times the pure-pith zstd codec

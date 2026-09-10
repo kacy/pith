@@ -538,6 +538,30 @@ into callee-saved registers and the function grows a frame. Every other
 program measured here pays between +0.07% and +1.85% instructions; the table
 is in `docs/performance.md`.
 
+## substring search (the runtime's `contains` and `index_of`)
+
+`bench/substring_search.pith` calls `contains` and `index_of` over haystacks
+of 12, 80 and 4000 bytes with the needle at the start, in the middle, at the
+end, or absent, and folds every answer into one checksum. Three needles run
+over each cell: `comma`, one byte with no other occurrence in the filler,
+which is the csv and path shape; `word`, seven bytes whose first byte is
+common in the filler; and `repeat`, a haystack of one repeated byte against a
+needle that differs from it only in its last byte, the adversarial case for a
+search that jumps between occurrences of the first byte. It exists because
+the runtime used to compare the needle at every position of the haystack, and
+that made `pith_cstring_contains` a tenth of the std pipeline (#1099).
+
+```
+pith build bench/substring_search.pith
+./bench/substring_search                  # every cell, 2000 rounds
+./bench/substring_search 500 long-absent  # one cell
+./bench/substring_search 2000 all comma   # one needle over every cell
+```
+
+The per-cell instruction counts of the old search, the `memchr` search that
+replaced it, and the libc `memmem` alternative it was measured against are in
+`docs/performance.md`.
+
 ## measuring: instruction counts over wall time
 
 Wall time on a shared two-core box drifts by more than most effects under

@@ -158,46 +158,37 @@ pub unsafe extern "C" fn pith_fnv1a(s: *const i8) -> i64 {
     hash as i64
 }
 
+/// Byte offset of the first occurrence of needle in haystack, or -1. An
+/// empty needle is found at 0.
+///
+/// # Safety
+/// Both arguments must be null or valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *const i8) -> i64 {
     let (Some(h_bytes), Some(n_bytes)) = (cstr_bytes(haystack), cstr_bytes(needle)) else {
         return -1;
     };
-    let h_len = h_bytes.len();
-    let n_len = n_bytes.len();
-    if n_len == 0 {
-        return 0;
+    match crate::substring::find(h_bytes, n_bytes) {
+        Some(at) => at as i64,
+        None => -1,
     }
-    if h_len < n_len {
-        return -1;
-    }
-    for i in 0..=(h_len.saturating_sub(n_len)) {
-        if &h_bytes[i..i + n_len] == n_bytes {
-            return i as i64;
-        }
-    }
-    -1
 }
 
+/// 1 when needle occurs in haystack, else 0. An empty needle is contained
+/// in every string.
+///
+/// # Safety
+/// Both arguments must be null or valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_contains(haystack: *const i8, needle: *const i8) -> i64 {
     let (Some(h_bytes), Some(n_bytes)) = (cstr_bytes(haystack), cstr_bytes(needle)) else {
         return 0;
     };
-    let h_len = h_bytes.len();
-    let n_len = n_bytes.len();
-    if n_len == 0 {
-        return 1;
+    if crate::substring::find(h_bytes, n_bytes).is_some() {
+        1
+    } else {
+        0
     }
-    if n_len > h_len {
-        return 0;
-    }
-    for i in 0..=(h_len - n_len) {
-        if &h_bytes[i..i + n_len] == n_bytes {
-            return 1;
-        }
-    }
-    0
 }
 
 #[no_mangle]
@@ -341,5 +332,50 @@ mod tests {
             assert_eq!(pith_cstring_contains(ptr, b"x\0".as_ptr() as *const i8), 0);
             assert_eq!(pith_is_dir(ptr as i64), 0);
         }
+    }
+
+    fn index_of(haystack: &str, needle: &str) -> i64 {
+        let h = std::ffi::CString::new(haystack).unwrap();
+        let n = std::ffi::CString::new(needle).unwrap();
+        unsafe { pith_cstring_index_of(h.as_ptr(), n.as_ptr()) }
+    }
+
+    fn contains(haystack: &str, needle: &str) -> i64 {
+        let h = std::ffi::CString::new(haystack).unwrap();
+        let n = std::ffi::CString::new(needle).unwrap();
+        unsafe { pith_cstring_contains(h.as_ptr(), n.as_ptr()) }
+    }
+
+    #[test]
+    fn index_of_and_contains_edge_cases() {
+        // empty needle: found at 0, contained in everything
+        assert_eq!(index_of("", ""), 0);
+        assert_eq!(index_of("abc", ""), 0);
+        assert_eq!(contains("", ""), 1);
+        assert_eq!(contains("abc", ""), 1);
+        // needle longer than the haystack
+        assert_eq!(index_of("", "a"), -1);
+        assert_eq!(index_of("ab", "abc"), -1);
+        assert_eq!(contains("ab", "abc"), 0);
+        // needle at either end
+        assert_eq!(index_of("needle in a haystack", "needle"), 0);
+        assert_eq!(index_of("a haystack ends in a needle", "needle"), 21);
+        assert_eq!(index_of("abc", "abc"), 0);
+        assert_eq!(index_of("abc", "c"), 2);
+        assert_eq!(contains("abc", "c"), 1);
+        // repeated first bytes
+        assert_eq!(index_of("aaaaaaab", "ab"), 6);
+        assert_eq!(index_of("aaaaaaaa", "ab"), -1);
+        assert_eq!(index_of("aaaa", "aa"), 0);
+        assert_eq!(contains("aaaaaaaa", "ab"), 0);
+        // a needle sharing a prefix with an earlier non-match
+        assert_eq!(index_of("abcabd", "abd"), 3);
+        assert_eq!(index_of("ababac", "abac"), 2);
+        assert_eq!(index_of("ababab", "abac"), -1);
+        assert_eq!(contains("xxabcxxabcdxx", "abcd"), 1);
+        // bytes above 0x7f, offsets in bytes
+        assert_eq!(index_of("héllo wörld", "ö"), 8);
+        assert_eq!(index_of("héllo wörld", "wörld"), 7);
+        assert_eq!(contains("héllo wörld", "ü"), 0);
     }
 }

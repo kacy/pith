@@ -1,0 +1,71 @@
+-- empty needle
+[] [] index_of=0 last_index_of=0 contains=true
+[abc] [] index_of=0 last_index_of=3 contains=true
+[abc] split [] -> 1 parts: abc
+[] split [] -> 0 parts: 
+[abc] replace [] -> [x] = [abc]
+-- needle longer than haystack
+[] [a] index_of=-1 last_index_of=-1 contains=false
+[ab] [abc] index_of=-1 last_index_of=-1 contains=false
+[ab] split [abc] -> 1 parts: ab
+[ab] replace [abc] -> [x] = [ab]
+-- needle at either end
+[needle in a haystack] [needle] index_of=0 last_index_of=0 contains=true
+[a haystack ends in a needle] [needle] index_of=21 last_index_of=21 contains=true
+[x] [x] index_of=0 last_index_of=0 contains=true
+[abc] [abc] index_of=0 last_index_of=0 contains=true
+[abc] [c] index_of=2 last_index_of=2 contains=true
+[abc] [a] index_of=0 last_index_of=0 contains=true
+[,a,b,] split [,] -> 2 parts: a|b
+[abcXYabc] split [abc] -> 1 parts: XY
+[abcXYabc] replace [abc] -> [-] = [-XY-]
+[abc] replace [abc] -> [] = []
+-- repeated first bytes
+[aaaaaaab] [ab] index_of=6 last_index_of=6 contains=true
+[aaaaaaaa] [ab] index_of=-1 last_index_of=-1 contains=false
+[aaaa] [aa] index_of=0 last_index_of=2 contains=true
+[aaaaaab] [aaaaaab] index_of=0 last_index_of=0 contains=true
+[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab] [aaaaaab] index_of=34 last_index_of=34 contains=true
+[aaXaaXaa] split [aa] -> 2 parts: X|X
+[a,,b,,,c] split [,] -> 3 parts: a|b|c
+[aaaaaaab] replace [ab] -> [!] = [aaaaaa!]
+[aaaa] replace [a] -> [bb] = [bbbbbbbb]
+[aaaa] replace [aa] -> [b] = [bb]
+[abab] replace [aba] -> [X] = [Xb]
+-- shared prefix with an earlier non-match
+[abcabd] [abd] index_of=3 last_index_of=3 contains=true
+[ababac] [abac] index_of=2 last_index_of=2 contains=true
+[ababab] [abac] index_of=-1 last_index_of=-1 contains=false
+[xxabcxxabcdxx] [abcd] index_of=7 last_index_of=7 contains=true
+[the quick brown fox] [brown fox jumps] index_of=-1 last_index_of=-1 contains=false
+[abcabdabcabd] split [abd] -> 2 parts: abc|abc
+[abcabdabcabd] replace [abd] -> [_] = [abc_abc_]
+[ababac] replace [abac] -> [Y] = [abY]
+-- bytes above 0x7f
+[héllo wörld] [ö] index_of=8 last_index_of=8 contains=true
+[héllo wörld] [wörld] index_of=7 last_index_of=7 contains=true
+[héllo wörld] [é] index_of=1 last_index_of=1 contains=true
+[héllo wörld] [ü] index_of=-1 last_index_of=-1 contains=false
+[日本語のテキスト] [テキスト] index_of=12 last_index_of=12 contains=true
+[日本語のテキスト] [語の] index_of=6 last_index_of=6 contains=true
+[日本語のテキスト] split [の] -> 2 parts: 日本語|テキスト
+[héllo wörld] replace [ö] -> [oe] = [héllo woerld]
+[日本語のテキスト] replace [の] -> [ no ] = [日本語 no テキスト]
+-- prefix and suffix
+[abc] starts_with [] = true
+[abc] starts_with [ab] = true
+[abc] starts_with [abc] = true
+[abc] starts_with [abcd] = false
+[abc] starts_with [bc] = false
+[abc] ends_with [] = true
+[abc] ends_with [bc] = true
+[abc] ends_with [abc] = true
+[abc] ends_with [zabc] = false
+[abc] ends_with [ab] = false
+-- the csv and path shapes
+[user 17, region north] [,] index_of=7 last_index_of=7 contains=true
+[user 17 region north] [,] index_of=-1 last_index_of=-1 contains=false
+[data//north/./users/../users/17.json] [/] index_of=4 last_index_of=28 contains=true
+[data//north/./users/../users/17.json] split [/] -> 7 parts: data|north|.|users|..|users|17.json
+[https://example.com/api/north/users/17?score=3] split [://] -> 2 parts: https|example.com/api/north/users/17?score=3
+[say "hi" to "them"] replace ["] -> [""] = [say ""hi"" to ""them""]

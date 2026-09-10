@@ -1,0 +1,41 @@
+# set_env writes into a table the runtime owns rather than into libc's
+# environment (see cranelift/runtime/src/env_overlay.rs), so it allocates where
+# it used to hand the string to setenv, and get_env allocates a copy of whatever
+# the table holds. neither may accumulate: the key set here is bounded at eight
+# names, so a program that rewrites and re-reads them forever must park at a
+# fixed working set. a per-set or per-get leak grows the peak with the round
+# count instead.
+#
+# the unset half matters as much as the set half: the tombstone replaces the
+# entry rather than adding one, and the read that follows it must not mint a
+# value for a name that has none.
+import leakprobe as probe
+import std.os as os
+
+fn round(i: Int) -> Int:
+    key := "PITH_LEAK_ENV_{i % 8}"
+    os.set_env(key, "value-{i}-with-a-payload-worth-measuring")
+
+    mut acc := 0
+    if let value = os.get_env(key):
+        acc = acc + value.len()
+
+    os.unset_env(key)
+    if os.get_env(key) == none:
+        acc = acc + 1
+
+    # a name nothing ever wrote: the fall-through to the process environment,
+    # which must not allocate anything it keeps either.
+    acc = acc + os.get_env("PITH_LEAK_ENV_NEVER_SET").unwrap_or("").len()
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

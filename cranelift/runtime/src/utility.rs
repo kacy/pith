@@ -58,6 +58,7 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
         return std::ptr::null_mut();
     }
     let mut command = std::process::Command::new(parts[0]);
+    crate::env_overlay::apply(&mut command);
     command.args(&parts[1..]);
     match crate::process::command_output(command) {
         Some(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),

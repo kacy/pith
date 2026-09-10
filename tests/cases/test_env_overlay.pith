@@ -1,0 +1,73 @@
+# the environment a program sees is the runtime's overlay, not libc's.
+#
+# `set_env` no longer calls `setenv`, which is not safe to call once a process
+# has more than one thread, so the semantics that used to come from libc have to
+# be pinned here instead: a name the program wrote must read back from any task
+# and reach a child process, a name it unset must read back absent and be gone
+# from the child, and a name it never wrote must still come from the process
+# environment.
+#
+# the ordering is forced with channels rather than sleeps: `late_reader` reports
+# that it is running before main writes the variable it reads, so "set after
+# tasks have started" is what is actually under test, and the printed lines are
+# in a fixed order however the tasks are scheduled.
+
+import std.os as os
+import std.os.process as process
+
+fn read_var(name: String) -> String:
+    return os.get_env(name).unwrap_or("ABSENT")
+
+# reads a variable main wrote before this task existed.
+fn early_reader() -> String:
+    return read_var("PITH_ENV_CASE_EARLY")
+
+# announces itself, then reads a variable main writes while it is already
+# running.
+fn late_reader(started: Channel[Int], gate: Channel[Int]) -> String:
+    started.send(1)
+    gate.recv()
+    return read_var("PITH_ENV_CASE_LATE") + "/" + read_var("PITH_ENV_CASE_GONE")
+
+# runs `sh -c` and returns its stdout. the variable is read unquoted with a
+# leading marker so an absent one is distinguishable from an empty one and no
+# shell quoting is needed.
+fn child_reads(name: String) -> String!:
+    out := process.command("sh").args(["-c", "printf %s mark$" + name]).output()!
+    return out.stdout
+
+fn main() -> Int!:
+    # a name the program never wrote falls through to the process environment,
+    # where it is not set either.
+    print("never_set: " + read_var("PITH_ENV_CASE_NEVER"))
+
+    # set before any task exists, read by a task.
+    os.set_env("PITH_ENV_CASE_EARLY", "before-tasks")
+    print("early_in_task: " + await spawn early_reader())
+
+    # set while a task is already running, read by the setter and by that task.
+    started := Channel[Int](1)
+    gate := Channel[Int](1)
+    late := spawn late_reader(started, gate)
+    started.recv()
+
+    os.set_env("PITH_ENV_CASE_LATE", "after-tasks")
+    os.set_env("PITH_ENV_CASE_GONE", "temporary")
+    os.unset_env("PITH_ENV_CASE_GONE")
+    print("late_in_setter: " + read_var("PITH_ENV_CASE_LATE"))
+    print("gone_in_setter: " + read_var("PITH_ENV_CASE_GONE"))
+
+    gate.send(1)
+    print("late_in_task: " + await late)
+
+    # a child inherits what the program set and does not inherit what it unset.
+    print("child_early: " + child_reads("PITH_ENV_CASE_EARLY")!)
+    print("child_late: " + child_reads("PITH_ENV_CASE_LATE")!)
+    print("child_gone: " + child_reads("PITH_ENV_CASE_GONE")!)
+    print("child_never: " + child_reads("PITH_ENV_CASE_NEVER")!)
+
+    # an empty value is a value, not an absence.
+    os.set_env("PITH_ENV_CASE_EMPTY", "")
+    print("empty_present: " + (os.get_env("PITH_ENV_CASE_EMPTY") != none).to_string())
+    print("empty_value: [" + read_var("PITH_ENV_CASE_EMPTY") + "]")
+    return 0

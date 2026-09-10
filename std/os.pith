@@ -22,14 +22,24 @@ pub fn home_dir() -> String:
     return os_home_dir()
 
 # read an environment variable. returns none when the variable is not set.
+# answers from what this program set, and from the environment it was started
+# with for anything it did not.
 pub fn get_env(name: String) -> String?:
     return env.get(name)
 
-# set an environment variable.
+# set an environment variable for this program and the processes it spawns.
+#
+# this records the value in the runtime rather than calling libc's `setenv`,
+# which is not safe to call once a process has more than one thread. `get_env`
+# and a child process see it; a c library reading the real environment inside
+# this process does not. see docs/limitations.md.
 pub fn set_env(name: String, value: String) -> Bool:
     return os_set_env(name, value)
 
-# remove an environment variable.
+# remove an environment variable for this program and the processes it spawns.
+#
+# the counterpart to `set_env`, with the same reach: the name reads back as
+# none here and is absent from a child's environment.
 pub fn unset_env(name: String) -> Bool:
     return os_unset_env(name)
 

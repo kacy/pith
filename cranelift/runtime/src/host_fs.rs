@@ -464,7 +464,7 @@ pub extern "C" fn pith_file_close(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
     if let Some(name_str) = cstr_str(name) {
-        if let Ok(var) = std::env::var(name_str) {
+        if let Some(var) = crate::env_overlay::get(name_str) {
             return crate::pith_copy_bytes_to_cstring(var.as_bytes());
         }
     }
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_env_opt(name: *const i8) -> i64 {
     if let Some(name_str) = cstr_str(name) {
-        if let Ok(var) = std::env::var(name_str) {
+        if let Some(var) = crate::env_overlay::get(name_str) {
             let cstr = crate::pith_copy_bytes_to_cstring(var.as_bytes());
             return optional_tuple(true, cstr as i64);
         }
@@ -520,28 +520,46 @@ pub unsafe extern "C" fn pith_os_temp_dir() -> *const i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_home_dir() -> *const i8 {
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = crate::env_overlay::get("HOME") {
         return crate::pith_strdup_string(&home);
     }
-    if let Ok(home) = std::env::var("USERPROFILE") {
+    if let Some(home) = crate::env_overlay::get("USERPROFILE") {
         return crate::pith_strdup_string(&home);
     }
     std::ptr::null()
 }
 
+/// Set an environment variable as the program sees it.
+///
+/// This records the value in the runtime's overlay (see `env_overlay`) rather
+/// than calling `setenv`, which is not safe once the process has more than one
+/// thread. `pith_env`, `pith_env_opt` and every child process spawned from here
+/// read the overlay; a C library reading the real environment in this process
+/// does not.
+///
+/// # Safety
+/// name and value must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i64 {
     if let (Some(name_str), Some(value_str)) = (cstr_str(name), cstr_str(value)) {
-        std::env::set_var(name_str, value_str);
+        crate::env_overlay::set(name_str, value_str);
         return 1;
     }
     0
 }
 
+/// Remove an environment variable as the program sees it.
+///
+/// The counterpart to `pith_os_set_env`: it records a tombstone in the overlay
+/// rather than calling `unsetenv`, so the name reads back absent here and is
+/// removed from a child's environment at spawn.
+///
+/// # Safety
+/// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_unset_env(name: *const i8) -> i64 {
     if let Some(name_str) = cstr_str(name) {
-        std::env::remove_var(name_str);
+        crate::env_overlay::unset(name_str);
         return 1;
     }
     0

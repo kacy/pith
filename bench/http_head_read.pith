@@ -1,0 +1,65 @@
+# http request-head reading, isolated from the socket.
+#
+# a stream of keepalive requests — the same 64-byte GET the sequential
+# latency probe sends — sits in one bytes cursor, and a buffered reader
+# over it is fed to std.net.http's request reader once per request. what
+# is timed is exactly the head scan the server does per request: finding
+# the blank line, bounding the head, and handing the rest of the stream
+# on to the next request. the checksum folds the head length and the
+# method of every request, so an arm that mis-framed a request cannot
+# look fast.
+#
+#   pith build bench/http_head_read.pith
+#   ./bench/http_head_read <requests>
+#
+# the profile that motivated this (docs/performance.md, 2026-09-10)
+# read the head one byte at a time through the buffered reader, which
+# put 56% of the server's instructions in that loop.
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn requests_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 20000
+
+fn build_stream(count: Int) -> Bytes!:
+    crlf := chr(13) + chr(10)
+    out := bytes.buffer()
+    defer out.free()
+    mut i := 0
+    while i < count:
+        # the id varies so no two heads are byte-identical
+        out.write_string_utf8("GET /item?id=" + (12345 + i % 1000).to_string() + " HTTP/1.1" + crlf)!
+        out.write_string_utf8("Host: x" + crlf)!
+        out.write_string_utf8("Connection: keep-alive" + crlf)!
+        out.write_string_utf8(crlf)!
+        i = i + 1
+    return out.take_bytes()
+
+fn main() -> Int!:
+    count := requests_from_args()
+    stream := build_stream(count)!
+    # the server's reader is chunked at the tcp read size; a cursor chunked
+    # the same way exercises the same fill-and-scan path
+    reader := io.bytes_reader(stream).buffered_chunked(4096)
+    defer reader.free()
+    start := time()
+    mut checksum := 0
+    mut read := 0
+    while read < count:
+        req := http.read_request_buffered_bytes(reader)!
+        if req.head.is_empty():
+            break
+        checksum = checksum + req.head.len() + req.method_text.len()
+        read = read + 1
+    elapsed := time() - start
+    print("http head read benchmark")
+    print("requests=" + read.to_string())
+    print("elapsed_ms=" + elapsed.to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

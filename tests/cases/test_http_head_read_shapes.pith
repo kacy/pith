@@ -1,0 +1,65 @@
+# the request head reader over a buffered bytes reader, byte for byte.
+#
+# the head used to be read one byte at a time; it is now found by the
+# reader's bounded read_until, which scans its own cache and keeps what
+# follows for the body and for the next request. every shape that path
+# has to get right is pinned here against the byte-at-a-time output:
+# pipelined keepalive requests, a body after the head, heads that end
+# exactly on a chunk boundary and heads that straddle one, a stream that
+# ends mid-head, an empty stream, and a head past the size limit. the
+# expected file was generated from the byte-at-a-time reader.
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn crlf() -> String:
+    return chr(13) + chr(10)
+
+fn describe(label: String, result: HttpRequestBytes!):
+    if result.is_err:
+        print(label + ": err=" + result.err)
+        return
+    req := result.ok
+    print(label + ": head=" + req.head.len().to_string() + " body=" + req.body.len().to_string() + " method=" + req.method_text + " path=" + req.path_text + " query=" + req.query_text)
+
+fn read_all(label: String, raw: String, chunk: Int):
+    reader := io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(chunk)
+    mut i := 0
+    while i < 4:
+        result := http.read_request_buffered_bytes(reader)
+        describe(label + " chunk=" + chunk.to_string() + " req=" + i.to_string(), result)
+        if result.is_err:
+            break
+        if result.ok.head.is_empty():
+            break
+        i = i + 1
+    reader.free()
+
+fn main() -> Int:
+    get := "GET /item?id=7 HTTP/1.1" + crlf() + "Host: x" + crlf() + crlf()
+    post := "POST /submit HTTP/1.1" + crlf() + "Content-Length: 5" + crlf() + crlf() + "hello"
+    # two keepalive requests, one with a body, on one stream, at chunk sizes
+    # below, at and above the head length
+    stream := get + post + get
+    read_all("pipelined", stream, 1)
+    read_all("pipelined", stream, 3)
+    read_all("pipelined", stream, get.len())
+    read_all("pipelined", stream, 64)
+    read_all("pipelined", stream, 4096)
+    # the blank line straddles a chunk boundary in every way it can
+    read_all("straddle", get, get.len() - 1)
+    read_all("straddle", get, get.len() - 2)
+    read_all("straddle", get, get.len() - 3)
+    # a stream that ends inside the head yields what arrived
+    read_all("truncated", "GET /partial HTTP/1.1" + crlf() + "Host:", 8)
+    # an empty stream yields the empty request that ends a connection
+    read_all("empty", "", 8)
+    # a head past the size limit is refused with the header limit error,
+    # whether the blank line ever arrives or not
+    mut big := "x"
+    while big.len() < http.MAX_HEADER_BYTES + 16:
+        big = big + big
+    read_all("oversize", "GET / HTTP/1.1" + crlf() + "X-Big: " + big + crlf() + crlf(), 64)
+    read_all("oversize", "GET / HTTP/1.1" + crlf() + "X-Big: " + big + crlf() + crlf(), 100000)
+    read_all("endless", "GET / HTTP/1.1" + crlf() + "X-Big: " + big, 4096)
+    return 0

@@ -1920,6 +1920,18 @@ fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: B
 fn buffered_bytes_reader_read_until_including_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
     return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, true, 0)
 
+# the failure a bounded read_until reports once the accumulated bytes pass
+# its cap without the separator arriving. a caller that bounds a protocol
+# element this way (an http request head) tests for it with
+# is_read_until_limit_error to answer with the protocol's own limit error,
+# and lets any other failure — a dropped socket, a deadline — through.
+READ_UNTIL_LIMIT_PREFIX := "read_until exceeded "
+
+## true when `message` is the failure a bounded read_until reports once
+## the accumulated bytes pass its cap without the separator arriving.
+pub fn is_read_until_limit_error(message: String) -> Bool:
+    return message.starts_with(READ_UNTIL_LIMIT_PREFIX)
+
 # `cap` bounds the bytes accumulated before the separator is found: a
 # positive value fails a peer that floods without ever sending it, 0 or
 # less leaves the read unbounded (what the two wrappers above pass).
@@ -1930,9 +1942,12 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
         return bytes.empty()
 
     buf := bytes.buffer()
+    # the buffer is a handle with no destructor: the cap failure below and
+    # a failed fill both have to give it back by hand
+    errdefer buf.free()
     while true:
         if cap > 0 and buf.len() > cap:
-            fail "read_until exceeded {cap} bytes without the separator"
+            fail READ_UNTIL_LIMIT_PREFIX + "{cap} bytes without the separator"
         mut cached := buffered_bytes_reader_cache_get(reader.handle)
         sep_pos := find_bytes_sep(cached, sep)
         if sep_pos >= 0:

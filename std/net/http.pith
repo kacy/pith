@@ -1883,33 +1883,30 @@ fn find_request_head_end(raw: Bytes) -> Int:
     return find_request_head_end_from(raw, 0)
 
 fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
-    # a rolling four-byte window finds the blank line without copying the
-    # accumulated head per byte (the old scan rebuilt the buffer's bytes
-    # on every iteration — quadratic allocation per request)
-    buf := bytes.buffer_with_capacity(1024)
-    errdefer buf.free()
-    mut w1 := 0
-    mut w2 := 0
-    mut w3 := 0
-    mut w4 := 0
-    while true:
-        chunk := reader.read_bytes(1)!
-        if chunk.is_empty():
-            # take_bytes frees the buffer; on an empty head it yields empty bytes,
-            # the same value the old early return produced.
-            return buf.take_bytes()
-        buf.write(chunk)!
-        # refuse a head that grows past the limit rather than buffering it forever
-        # (an endless head is a slowloris / memory-exhaustion vector).
-        if buf.len() > MAX_HEADER_BYTES:
+    # the head ends at the first blank line. the buffered reader finds it
+    # inside its own cache and keeps whatever follows for the body, so the
+    # head arrives in one call. the loop this replaces asked the reader for
+    # one byte at a time, and each byte paid the reader's registry lookups,
+    # its lock, a fresh buffer and a slice: 56% of the server's instructions
+    # per request (docs/performance.md, 2026-09-10). the cap refuses a head
+    # that grows past the limit rather than buffering it forever (an endless
+    # head is a slowloris / memory-exhaustion vector).
+    head := reader.read_until_bytes_including_bounded(head_terminator(), MAX_HEADER_BYTES)
+    if head.is_err:
+        # the reader reports its cap in its own words; any other failure — a
+        # dropped socket, a deadline — passes through unchanged
+        if io.is_read_until_limit_error(head.err):
             fail HEADER_LIMIT_MESSAGE
-        w1 = w2
-        w2 = w3
-        w3 = w4
-        w4 = chunk[0]
-        if w1 == 13 and w2 == 10 and w3 == 13 and w4 == 10:
-            return buf.take_bytes()
-    return bytes.empty()
+        fail head.err
+    # a head whose blank line sits inside the chunk that crossed the cap
+    # still has to respect the limit
+    if head.ok.len() > MAX_HEADER_BYTES:
+        fail HEADER_LIMIT_MESSAGE
+    return head.ok
+
+# the blank line that ends a request head, as bytes.
+fn head_terminator() -> Bytes:
+    return bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
 
 fn stream_request_body_buffered(head_bytes: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
     if request_body_is_chunked(head_bytes)!:

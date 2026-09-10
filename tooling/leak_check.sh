@@ -137,6 +137,7 @@ cases=(
   tests/leaks/leak_http_string_head_flood
   tests/leaks/leak_http_head_read
   tests/leaks/leak_csv_encode
+  tests/leaks/leak_path_clean_count
   tests/leaks/leak_metrics_scrape
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
 )

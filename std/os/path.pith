@@ -54,18 +54,6 @@ fn cleaned_parts(path: String) -> List[String]:
             out.push(part)
     return out
 
-fn clean_count_segment(stack: List[String], part: String, absolute: Bool) -> List[String]:
-    if part == "" or part == ".":
-        return stack
-    if part == "..":
-        if stack.len() > 0 and stack[stack.len() - 1] != "..":
-            return without_last_segment(stack)
-        if not absolute:
-            stack.push("..")
-        return stack
-    stack.push(part)
-    return stack
-
 # true when the path starts at the filesystem root.
 pub fn is_abs(path: String) -> Bool:
     return path.starts_with("/")
@@ -130,23 +118,33 @@ pub fn parts(path: String) -> List[String]:
 
 # returns the number of normalized non-empty path segments.
 pub fn clean_part_count(path: String) -> Int:
-    # cache the length once instead of re-reading it in every loop condition.
+    # counts what clean() would keep without building it. the stack clean()
+    # walks is, at every step, some ".." entries a relative path could not
+    # climb past followed by the real segments, so two counters describe it
+    # and no segment is copied out. the version this replaces built a list
+    # of substrings and dropped it, nine allocations per path (11% of
+    # std_pipeline's instructions, docs/performance.md 2026-09-10).
     n := path.len()
     if n == 0:
         return 0
     absolute := path.starts_with("/")
-    mut stack: List[String] := []
+    mut depth := 0
+    mut climbs := 0
     mut start := 0
     mut i := 0
-    while i < n:
-        if path[i] == "/":
-            if i > start:
-                stack = clean_count_segment(stack, path.substring(start, i), absolute)
+    while i <= n:
+        if i == n or path[i] == "/":
+            seg_len := i - start
+            if seg_len == 2 and path[start] == "." and path[start + 1] == ".":
+                if depth > 0:
+                    depth = depth - 1
+                elif not absolute:
+                    climbs = climbs + 1
+            elif seg_len > 0 and not (seg_len == 1 and path[start] == "."):
+                depth = depth + 1
             start = i + 1
         i = i + 1
-    if start < n:
-        stack = clean_count_segment(stack, path.substring(start, n), absolute)
-    return stack.len()
+    return depth + climbs
 
 # ===============================================================
 # Path Components
@@ -276,6 +274,12 @@ test "join and clean normalize path segments":
     assert_eq(clean_part_count("/tmp/../var/"), 1)
     assert_eq(clean_part_count("data//north/./users/../users/0.json"), 4)
     assert_eq(clean_part_count("/"), 0)
+    # a relative path keeps the ".." it cannot climb past; an absolute one drops it
+    assert_eq(clean_part_count("../../escape/../still/../../up"), 4)
+    assert_eq(clean_part_count("/../root/./sees/no/parent"), 4)
+    assert_eq(clean_part_count("a/../.."), 1)
+    assert_eq(clean_part_count("/a/../.."), 0)
+    assert_eq(clean_part_count("trailing/slashes///"), 2)
 
 test "path components split names":
     assert_eq(dir("/tmp/pith/main.pith"), "/tmp/pith")

@@ -47,6 +47,7 @@ cases=(
   "tests/leaks/leak_pool_thread_exit PITH_GREEN=0"
   "tests/leaks/leak_pool_adoption PITH_GREEN=0"
   tests/leaks/leak_io_text_registry
+  tests/leaks/leak_string_buffer_build
   tests/leaks/leak_websocket_session
   tests/leaks/leak_returned_shell_dtor
   tests/leaks/leak_weak_if_let_shell

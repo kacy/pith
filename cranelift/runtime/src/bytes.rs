@@ -526,6 +526,32 @@ pub unsafe extern "C" fn pith_byte_buffer_bytes(handle: i64) -> i64 {
     pith_bytes_from_vec(buffer.data.clone())
 }
 
+/// Copy the accumulated bytes into a fresh pith string, verbatim.
+///
+/// This is the byte buffer as string storage: `std.io`'s StringBuffer
+/// appends each write's bytes with `pith_byte_buffer_write_string_utf8`
+/// and reads the whole thing back through here. A pith string carries
+/// whatever bytes were put into it (`chr(200)` is a one-byte string that
+/// is not UTF-8, and its header length lets it hold a NUL), so the read
+/// back must not validate: `pith_bytes_to_string_utf8` would refuse
+/// content the writer accepted. It is also one copy and no intermediate
+/// bytes object, where `pith_byte_buffer_bytes` followed by a decode is
+/// two. The buffer is left as it was; the string is independent of it.
+///
+/// # Safety
+/// handle must be a valid PithByteBuffer or garbage (returns an empty
+/// string for garbage).
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_string(handle: i64) -> *mut i8 {
+    let Some(buffer) = pith_byte_buffer_mut(handle) else {
+        return crate::pith_cstring_empty();
+    };
+    if buffer.data.is_empty() {
+        return crate::pith_cstring_empty();
+    }
+    crate::pith_copy_bytes_to_cstring(&buffer.data)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_len(handle: i64) -> i64 {
     let Some(buffer) = pith_byte_buffer_mut(handle) else {
@@ -644,6 +670,32 @@ mod tests {
             assert_eq!(pith_byte_buffer_set(12345, 0, 1), 0);
             assert_eq!(pith_byte_buffer_bytes(12345), 0);
             pith_byte_buffer_clear(12345);
+            assert_eq!(crate::string::pith_cstring_len(pith_byte_buffer_string(12345)), 0);
+        }
+    }
+
+    #[test]
+    fn byte_buffer_string_copies_every_byte_verbatim() {
+        unsafe {
+            let buffer = pith_byte_buffer_new();
+            // not utf-8, and a NUL in the middle: the string must carry both
+            let raw = pith_bytes_from_vec(vec![0xC8, 0xFF, 0x00, b'z']);
+            assert_eq!(pith_byte_buffer_write(buffer, raw), 4);
+            let text = pith_byte_buffer_string(buffer);
+            assert_eq!(crate::string::pith_cstring_len(text), 4);
+            let copied = std::slice::from_raw_parts(text as *const u8, 4);
+            assert_eq!(copied, &[0xC8, 0xFF, 0x00, b'z']);
+            // the buffer is untouched and a later write does not reach the copy
+            assert_eq!(pith_byte_buffer_len(buffer), 4);
+            assert_eq!(pith_byte_buffer_write(buffer, raw), 4);
+            assert_eq!(crate::string::pith_cstring_len(text), 4);
+            crate::pith_cstring_release(text);
+            pith_bytes_release(raw);
+            pith_byte_buffer_free(buffer);
+            // an empty buffer reads back as the empty string
+            let empty = pith_byte_buffer_new();
+            assert_eq!(crate::string::pith_cstring_len(pith_byte_buffer_string(empty)), 0);
+            pith_byte_buffer_free(empty);
         }
     }
 }

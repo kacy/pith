@@ -53,7 +53,7 @@ registry holds the config itself now, and the hook result carries an optional.
 | `TcpStream` | `close()` | the socket fd and its reactor registration | safe |
 | `Process` | `close()` | the process-handle entry, up to three pipe fds, and the child goes unreaped | safe |
 | `BufferedBytesReader` / `BufferedBytesWriter` | `free()` | four threadlocal map entries each, including the cached `Bytes` | safe |
-| `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | `close()` | the type's threadlocal registry entries — two to six map entries each, including any cached text | safe |
+| `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | `close()` | the type's threadlocal registry entries — one to six map entries each, including any cached text; for `StringBuffer` also the runtime byte buffer the entry owns, which holds the accumulated text | safe |
 
 the last row used to read "none": those registries had no removal path at all,
 so a keep-alive server on the buffered text path accumulated entries for the

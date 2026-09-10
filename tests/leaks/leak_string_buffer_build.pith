@@ -1,0 +1,39 @@
+# a string buffer's storage is one runtime byte buffer owned by the io
+# registry, freed by close() and by nothing else: the buffer is not a
+# refcounted value, so a close that forgot to free it, or a snapshot that
+# was not released, would grow the process per round. this churns the
+# whole life of one buffer per round: create, write past the point where
+# the storage has doubled a few times, snapshot twice, clear, write again,
+# snapshot, close.
+#
+# valgrind does not see the registry half of this: a stranded entry stays
+# reachable from the threadlocal map and reads as "still reachable".
+import leakprobe as probe
+import std.io as io
+
+fn round(i: Int) -> Int:
+    buf := io.string_buffer()
+    mut k := 0
+    while k < 40:
+        buf.write("piece-{i}-{k};") catch 0
+        k = k + 1
+    early := buf.string()
+    buf.write_line("tail") catch 0
+    late := buf.string()
+    buf.clear()
+    buf.write("again-{i}") catch 0
+    again := buf.string()
+    buf.close()
+    return early.len() + late.len() + again.len()
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    if total < 0:
+        print("never")
+    print("{kb}")

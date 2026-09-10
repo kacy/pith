@@ -32,8 +32,8 @@ the language:
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
 | catalog workload, 200k requests | **~70 ms** (was ~92) | ~386 ms | ~68 ms | — |
-| grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
-| grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
+| grpc unary echo, sequential, 16 B | **4459 calls/s**, p50 219 µs (was 4022) | 4017, p50 233 µs | 2995, p50 325 µs | — |
+| grpc unary echo, conc=8, 16 B | 10598 calls/s, p50 707 µs (was 7560) | 15935, p50 454 µs | 11952, p50 615 µs | — |
 | http server under wrk, 60 s | 17.3k req/s, rss flat (~2.5 b/req); was 14.2-14.4k | 27.1k req/s (regime-dependent, see below) | — | — |
 | http sequential latency, 1 connection, p50 | 135µs | 93µs | — | — |
 | event_ledger, 200k events | **259 ms (0.68x go)**; was 339-344 | 380 ms | 104 ms | 121 ms |
@@ -487,6 +487,20 @@ under green 179 vs 184, metrics contention 477 vs 474. all within the
 box's run-to-run spread; none moved. (those absolute figures were taken
 under load; the quiet-box figures for the same programs are the ones in
 the tables at the top of this document.)
+
+the grpc sweep (`bench/grpc/run.sh`, 20000 calls per cell, three rounds):
+sequential 16 B pith 4459 calls/s at p50 219 µs against go 4017 (p50 233)
+and rust 2995 (p50 325); sequential 1 KiB pith 4025 (p50 240), go 4078, rust
+2776; 8 concurrent over one connection, 16 B, pith 10598 (p50 707 µs), go
+15935 (p50 454), rust 11952 (p50 615); 1 KiB concurrent pith 9315, go
+13784, rust 10367. the sequential rows reproduce the 2026-08 figures with
+the usual few percent of drift on the comparators; the concurrent row moved
+in pith's favor, 7560 to 10598 calls/s (56% to 67% of grpc-go) with the
+comparators up 15-19%, so about half of that is the box. the third round
+read every client's throughput at half its value while every median
+latency held, which is the launch-cadence artefact the http section
+describes; the rows above are from the first round, and the medians agree
+across all three.
 
 wall clock on the quiet box afterwards, comparators reproducing their
 published figures: event ledger 339-344 → 259 ms, catalog workload ~92 →

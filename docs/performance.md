@@ -10,12 +10,12 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 the short version, all on the same 2-core machine, rerun 2026-08-08,
-reconfirmed 2026-08-11, rerun 2026-08-22, and reconfirmed 2026-08-23 after the
-module-call leak fix (#901) and the concurrent http server (#902) landed —
-every row within run-to-run noise of the day before, comparators reproducing
-their figures (on 2026-08-08 the one mover was a weak-reference leak, found
-and fixed on the rerun, in cyclic_graph below; 2026-08-22 moved catalog and
-chan_fanout in pith's favor and corrected the http row, below). the
+reconfirmed 2026-08-11, rerun 2026-08-22, reconfirmed 2026-08-23 after the
+module-call leak fix (#901) and the concurrent http server (#902) landed, and
+rerun in full on 2026-09-10 at the end of a night of std and runtime work
+(the section "the night of 2026-09-10" below has every program by instruction
+count; the rows here are the wall-clock medians of that rerun, comparators
+reproducing their figures to within a few percent). the
 concurrency rows are the green backend, which is the default on linux; rows
 marked `PITH_GREEN=0` are the os-thread opt-out, kept for contrast. the go,
 rust and zig columns double as canaries — they are the same programs as in the
@@ -24,20 +24,20 @@ the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **90-95 ms** (bimodal: 13/15 runs 96-100, 2/15 runs 59-66) | ~71 ms | 66-69 ms | 203-245 ms |
+| chan_fanout, 1m msgs | **65 ms** (2026-09-10, all 9 rounds in the fast mode; earlier reruns bimodal, 96-100 / 59-66) | ~72 ms | 59-69 ms | 203-297 ms |
 | chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
 | 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
 | 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
 
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| catalog workload, 200k requests | **~92 ms** | ~376 ms | ~68 ms | — |
+| catalog workload, 200k requests | **~70 ms** (was ~92) | ~386 ms | ~68 ms | — |
 | grpc unary echo, sequential, 16 B | **4022 calls/s** | 3711 | 2716 | — |
 | grpc unary echo, conc=8, 16 B | 7560 calls/s | 13434 | 10937 | — |
-| http server under wrk, 60 s | 14.2-14.4k req/s, rss flat (~3 b/req) | 21-32k req/s (regime-dependent, see below) | — | — |
-| http sequential latency, 1 connection, p50 | 135-162µs | 93µs | — | — |
-| event_ledger, 200k events | **339-344 ms (0.85x go)** | 404-406 ms | 105 ms | 127-131 ms |
-| std_pipeline, 50k records | 439-448 ms (1.78x go) | 249 ms | 134 ms | — |
+| http server under wrk, 60 s | 17.3k req/s, rss flat (~2.5 b/req); was 14.2-14.4k | 27.1k req/s (regime-dependent, see below) | — | — |
+| http sequential latency, 1 connection, p50 | 135µs | 93µs | — | — |
+| event_ledger, 200k events | **259 ms (0.68x go)**; was 339-344 | 380 ms | 104 ms | 121 ms |
+| std_pipeline, 50k records | 344 ms (1.37x go); was 439-448 | 251 ms | 139 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
 to ~27 ms at flat memory — the argument-ownership fixes took a per-call
@@ -423,6 +423,78 @@ the compiler searches source text with the same primitives, so its output was
 checked too: the ir driver linked against the new runtime emits byte-identical
 ir for `bench/std_pipeline.pith` (1,088,812 bytes) and for its own source
 (5,119,821 bytes).
+
+### the night of 2026-09-10, measured end to end
+
+the sections above record each change on its own program. this one is the
+whole suite run once, at the end, so the night's gains can be read off one
+table and nothing hides behind the program it was measured on. arm A is the
+compiler and runtime at the start of the night (`0fe497c0`, before #1093),
+arm B the tip after #1107 (`099e7e62`); every bench program's current source
+was compiled by both compilers inside their own trees and run under
+callgrind; stdout and checksums agree between arms on every row.
+
+| 2026-09-10, callgrind | start of the night | tip | delta |
+|---|---:|---:|---:|
+| event ledger, 200k events | 3,390,962,001 | 2,695,935,191 | −20.5% |
+| std pipeline, 50k records | 4,282,530,140 | 3,414,323,685 | −20.3% |
+| catalog workload, 200k iterations | 1,381,071,924 | 963,273,765 | −30.3% |
+| http request head read, 20k requests | 8,803,504,445 | 2,099,721,126 | −76.2% |
+| csv encode, 5000 rows × 10 | 1,437,606,575 | 847,752,217 | −41.0% |
+| path clean count, 20k rounds | 1,942,443,996 | 556,783,020 | −71.3% |
+| substring search, 36 cells × 2000 | 4,700,683,879 | 855,542,295 | −81.8% |
+| json decode, small struct | 41,769,731 | 32,787,957 | −21.5% |
+| json decode, wide struct | 560,059,104 | 201,137,570 | −64.1% |
+| json decode, nested struct | 1,059,907,351 | 8,408,038 | −99.2% |
+| json decode, list of structs (node pool, #1110) | 4,380,580,768 | 4,383,020,015 | +0.06% |
+| generic sort, int keys, random, n=10000 | 15,500,810,052 | 61,569,224 | −99.6% |
+| generic sort, string keys, random, n=10000 | 6,189,870,344 | 69,972,683 | −98.9% |
+| generic sort, string keys, reverse, n=10000 | 71,970,843 | 58,173,248 | −19.2% |
+| cyclic graph, 200k rings | 238,070,249 | 239,270,441 | +0.5% |
+| closure calls | 1,244,274,560 | 1,278,274,713 | +2.7% |
+| task churn, `PITH_GREEN=0` | 264,189,819 | 272,262,357 | +3.1% |
+| zstd codec (time-budgeted, reps vary) | 2,147,354,569 | 2,264,680,854 | +5.5% |
+| tight loop, 200m iterations | 1,400,262,583 | 2,600,262,853 | +85.7% |
+
+| compile time, `ir_driver --combined` | start of the night | tip | delta |
+|---|---:|---:|---:|
+| the compiler compiling itself (own sources) | 22,460,437,212 | 11,749,822,655 | −47.7% |
+| `examples/web_login.pith` (identical input) | 19,660,438,914 | 16,178,617,675 | −17.7% |
+| `examples/generics.pith` (identical input) | 101,987,392 | 85,684,942 | −16.0% |
+
+the rows that went up are one change, and it is not a regression from this
+work: arm A predates the preemption safe-point default (#1088, "what
+preemption safe-points cost" above). rebuilding the tip with
+`PITH_GREEN_PREEMPT=0` puts closure calls at −0.00%, task churn at +0.02%
+and the zstd codec at −0.23% against arm A, so those three rows are the
+safe-point check and nothing else; the tight loop is its documented worst
+case. the generic sort reverse row is the old insertion sort's best case (a
+run it recognized and the merge sort does not yet, #1096).
+
+what the cuts are, by row: the three workloads share the typed decode's
+field lookup (#1104), the `memmem` substring search (#1103) and the csv and
+path helpers (#1097); the http head read is one bounded `read_until` in
+place of a byte loop (#1097); the nested decode fills the sub-struct in
+place instead of parsing it into the node pool (#1107); the sorts are the
+positions-sorting merge sort with a key cache (#1094); the compiler stopped
+splitting strings on every generic lookup (#1101).
+
+the threaded programs are not comparable under callgrind and were timed
+instead, interleaved A then B, two warmups and seven trials, medians: chan
+fanout green 212 vs 221 ms and os threads 522 vs 530, green fanout 502 vs
+486, task pingpong 55 vs 51, cpu parallel sync 1245 vs 1233, task churn
+under green 179 vs 184, metrics contention 477 vs 474. all within the
+box's run-to-run spread; none moved. (those absolute figures were taken
+under load; the quiet-box figures for the same programs are the ones in
+the tables at the top of this document.)
+
+wall clock on the quiet box afterwards, comparators reproducing their
+published figures: event ledger 339-344 → 259 ms, catalog workload ~92 →
+~70 ms, std pipeline 439-448 → 344 ms, http throughput 14.2-14.4k → 17.3k
+req/s at a flat rss, sequential p50 135 µs. the generic sort runner's
+per-sort speedups at the tip, same binary legacy vs current, medians of 5:
+int keys 8.9× at n=100, 123× at 1000, 1146× at 10000 (random); string keys
+2.4×, 38×, 253×; string reverse 0.4×, 0.5×, 2.3×.
 
 ### a note on how these are measured
 

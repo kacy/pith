@@ -1,0 +1,112 @@
+# the generic sorts in std.collections and std.algo run one stable merge sort
+# over cached keys. this covers the shapes a sort rewrite gets wrong: the
+# degenerate sizes, an input that is already ordered and one that is exactly
+# reversed, duplicate-heavy input, ties resolved by input position rather than
+# by the key, a comparator and a key function that capture a variable, and the
+# input list left alone with an alias to it still reading the original order.
+#
+# in the memcheck set: the sort moves elements between the input, a position
+# buffer and the result, so a retain or release out of place here is a leak or
+# a double free rather than a wrong answer.
+import std.collections as collections
+import std.algo as algo
+
+struct Rec:
+    tag: String
+    key: Int
+
+fn tags(items: List[Rec]) -> String:
+    mut parts: List[String] := []
+    for r in items:
+        parts.push(r.tag)
+    return parts.join(",")
+
+fn by_key(left: Rec, right: Rec) -> Bool:
+    return left.key < right.key
+
+fn rec_key(r: Rec) -> Int:
+    return r.key
+
+# a deterministic permutation, so "random" means the same thing every run.
+fn scrambled(n: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut state := 12345
+    mut i := 0
+    while i < n:
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.push(state % 1000)
+        i = i + 1
+    return out
+
+fn is_sorted(list: List[Int]) -> Bool:
+    mut i := 1
+    while i < list.len():
+        if list[i] < list[i - 1]:
+            return false
+        i = i + 1
+    return true
+
+fn int_sum(list: List[Int]) -> Int:
+    mut total := 0
+    for v in list:
+        total = total + v
+    return total
+
+fn main():
+    # degenerate sizes
+    empty: List[Rec] := []
+    print("empty {collections.sorted_by(empty, by_key).len()} {collections.sort_by_key(empty, rec_key).len()} {algo.sort_by_key(empty, fn(r: Rec) => r.tag).len()}")
+    one := [Rec("solo", 7)]
+    print("one {tags(collections.sorted_by(one, by_key))} {tags(collections.sort_by_key(one, rec_key))} {tags(algo.sort_by_key(one, fn(r: Rec) => r.tag))}")
+
+    # ties broken by input position, checked by identity rather than by key.
+    # every record here has key 1, so only the tag says which order came out.
+    ties := [Rec("a", 1), Rec("b", 1), Rec("c", 1), Rec("d", 1), Rec("e", 1)]
+    print("ties_less {tags(collections.sorted_by(ties, by_key))}")
+    print("ties_key {tags(collections.sort_by_key(ties, rec_key))}")
+    print("ties_alias {tags(collections.sort_by(ties, by_key))}")
+
+    # equal string keys, distinct records: same question on the algo side.
+    same_name := [Rec("first", 1), Rec("second", 2), Rec("third", 3), Rec("fourth", 4)]
+    print("algo_ties {tags(algo.sort_by_key(same_name, fn(r: Rec) => "same"))}")
+    # sort_by_key_desc sorts ascending and then reverses, so equal keys come
+    # back in reverse input order. that is observable and deliberate.
+    print("algo_ties_desc {tags(algo.sort_by_key_desc(same_name, fn(r: Rec) => "same"))}")
+
+    # already sorted, reverse sorted, duplicate-heavy
+    ordered := [Rec("p", 1), Rec("q", 2), Rec("r", 3), Rec("s", 4)]
+    print("ordered {tags(collections.sort_by_key(ordered, rec_key))}")
+    backward := [Rec("s", 4), Rec("r", 3), Rec("q", 2), Rec("p", 1)]
+    print("backward {tags(collections.sort_by_key(backward, rec_key))}")
+    dups := [Rec("a", 2), Rec("b", 1), Rec("c", 2), Rec("d", 1), Rec("e", 2), Rec("f", 1)]
+    print("dups {tags(collections.sort_by_key(dups, rec_key))}")
+
+    # the input is untouched and an alias to it still reads the original order
+    alias := dups
+    sorted_dups := collections.sort_by_key(dups, rec_key)
+    print("input {tags(dups)}")
+    print("alias {tags(alias)}")
+    print("result {tags(sorted_dups)}")
+
+    # a comparator and a key function that capture a variable
+    dir := -1
+    captured := collections.sorted_by(dups, fn(l: Rec, r: Rec) => l.key * dir < r.key * dir)
+    print("captured {tags(captured)}")
+    offset := 100
+    captured_key := collections.sort_by_key(backward, fn(r: Rec) => offset - r.key)
+    print("captured_key {tags(captured_key)}")
+
+    # a list holding the same reference more than once
+    shared := Rec("dup", 5)
+    twice := [shared, Rec("low", 1), shared]
+    print("twice {tags(collections.sort_by_key(twice, rec_key))}")
+
+    # a wider deterministic input: sortedness and the multiset are preserved
+    nums := scrambled(200)
+    ranked := collections.sort_by_key(nums, fn(v: Int) => v)
+    print("wide {ranked.len()} {is_sorted(ranked)} {int_sum(ranked) == int_sum(nums)} {is_sorted(nums)}")
+
+    # string keys through a custom comparator on the collections side
+    words := ["pear", "apple", "fig", "apple", "cherry"]
+    print("words {collections.sorted_by(words, fn(l: String, r: String) => l < r).join(",")}")
+    print("algo_words {algo.sort_by_key(words, fn(s: String) => s).join(",")}")

@@ -1,0 +1,163 @@
+# generic sort benchmark: the standard library's key-based sorts against the
+# selection and insertion sorts they replaced.
+#
+# both arms live in this one program so that a single build measures both and
+# nothing but the sort differs. `legacy_*` below is a verbatim copy of what
+# std.collections and std.algo held before the merge sort landed; `current`
+# calls the shipped functions. inputs come from a seeded 31-bit LCG, are built
+# once outside the timed section, and are identical for the two arms.
+#
+# the timed section covers what a caller actually pays for one call: copying,
+# key extraction and the sort. the result is consumed into a checksum that the
+# runner compares between arms, so an arm that skipped work or answered wrong
+# cannot look fast.
+#
+#   pith build bench/generic_sort.pith
+#   ./bench/generic_sort <arm> <dist> <key> <n> <rounds>
+#     arm   legacy | current
+#     dist  sorted | reverse | random | dups
+#     key   int | string
+#
+# bench/generic_sort_bench.sh drives the interleaved comparison.
+import std.algo as algo
+import std.collections as collections
+import std.time as time
+
+struct Row:
+    label: String
+    rank: Int
+
+# ---------------------------------------------------------------
+# the sorts as they stood before the rewrite
+# ---------------------------------------------------------------
+
+# std.collections.sort_by_key: selection sort, one key call per surviving
+# element per round.
+fn legacy_sort_by_key[T](items: List[T], key_fn: fn(T) -> Int) -> List[T]:
+    mut result: List[T] := []
+    mut used: Set[Int] := {}
+    while result.len() < items.len():
+        mut found := false
+        mut best_idx := 0
+        mut best_key := 0
+        for item, i in items:
+            if used.contains(i):
+                continue
+            item_key := key_fn(item)
+            if not found or item_key < best_key:
+                best_idx = i
+                best_key = item_key
+                found = true
+        if not found:
+            return result
+        result.push(items[best_idx])
+        used.add(best_idx)
+    return result
+
+# std.algo.sort_by_key: insertion sort, re-reading the key of every element it
+# probes.
+fn legacy_sort_by_key_string[T](items: List[T], key: fn(T) -> String) -> List[T]:
+    mut out: List[T] := []
+    for item in items:
+        item_key := key(item)
+        mut placed := false
+        mut i := 0
+        while i < out.len() and not placed:
+            if item_key < key(out[i]):
+                out.insert(i, item)
+                placed = true
+            i = i + 1
+        if not placed:
+            out.push(item)
+    return out
+
+# ---------------------------------------------------------------
+# input generation, outside the timed section
+# ---------------------------------------------------------------
+
+fn label_for(rank: Int) -> String:
+    # a key wide enough that comparing it costs more than comparing an Int,
+    # and left-padded so the string order matches the integer order.
+    padded := "0000000" + rank.to_string()
+    return "row-" + padded.substring(padded.len() - 7, padded.len())
+
+fn rows_for(dist: String, n: Int) -> List[Row]:
+    mut ranks: List[Int] := []
+    mut state := 2463534242
+    mut i := 0
+    while i < n:
+        if dist == "sorted":
+            ranks.push(i)
+        elif dist == "reverse":
+            ranks.push(n - i)
+        elif dist == "dups":
+            state = (state * 1103515245 + 12345) % 2147483648
+            ranks.push(state % 8)
+        else:
+            state = (state * 1103515245 + 12345) % 2147483648
+            ranks.push(state % 1000000)
+        i = i + 1
+    mut rows: List[Row] := []
+    for rank in ranks:
+        rows.push(Row(label_for(rank), rank))
+    return rows
+
+fn row_rank(r: Row) -> Int:
+    return r.rank
+
+fn row_label(r: Row) -> String:
+    return r.label
+
+# consume the whole result so nothing is optimized away and a wrong order
+# shows up as a different number.
+fn checksum(rows: List[Row]) -> Int:
+    mut total := 0
+    mut i := 0
+    for r in rows:
+        total = (total + (i + 1) * (r.rank + 1) + r.label.len()) % 1000000007
+        i = i + 1
+    return total
+
+fn arg_at(argv: List[String], at: Int, fallback: String) -> String:
+    if argv.len() > at:
+        return argv[at]
+    return fallback
+
+fn int_arg(argv: List[String], at: Int, fallback: Int) -> Int:
+    if argv.len() > at:
+        parsed := parse_int(argv[at])
+        if parsed.is_ok:
+            return parsed.ok
+    return fallback
+
+fn main():
+    argv := args()
+    arm := arg_at(argv, 1, "current")
+    dist := arg_at(argv, 2, "random")
+    key_kind := arg_at(argv, 3, "int")
+    n := int_arg(argv, 4, 1000)
+    rounds := int_arg(argv, 5, 5)
+
+    rows := rows_for(dist, n)
+
+    mut sum := 0
+    t0 := time.mono_nanos()
+    mut round := 0
+    while round < rounds:
+        if key_kind == "string":
+            if arm == "legacy":
+                sum = (sum + checksum(legacy_sort_by_key_string(rows, row_label))) % 1000000007
+            else:
+                sum = (sum + checksum(algo.sort_by_key(rows, row_label))) % 1000000007
+        else:
+            if arm == "legacy":
+                sum = (sum + checksum(legacy_sort_by_key(rows, row_rank))) % 1000000007
+            else:
+                sum = (sum + checksum(collections.sort_by_key(rows, row_rank))) % 1000000007
+        round = round + 1
+    elapsed_us := (time.mono_nanos() - t0) / 1000
+
+    mut per_op_us := elapsed_us
+    if rounds > 0:
+        per_op_us = elapsed_us / rounds
+    print("{arm} {dist} {key_kind} n={n} rounds={rounds} total_us={elapsed_us} per_op_us={per_op_us} checksum={sum}")

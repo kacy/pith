@@ -1,0 +1,51 @@
+# the generic sorts move heap-backed values between the caller's list, a key
+# cache and a fresh result list, and the position buffers they merge through
+# are swapped rather than reallocated. every one of those is a place to drop a
+# retain or a release, and neither shows up as a wrong answer.
+#
+# a round here sorts strings and structs by an integer key, by a string key,
+# and through a comparator, over an input that holds the same reference twice,
+# so a double-counted element and an under-counted one both move the peak.
+import leakprobe as probe
+import std.algo as algo
+import std.collections as collections
+
+struct Item:
+    name: String
+    rank: Int
+
+fn item_rank(it: Item) -> Int:
+    return it.rank
+
+fn item_name(it: Item) -> String:
+    return it.name
+
+fn by_rank(left: Item, right: Item) -> Bool:
+    return left.rank < right.rank
+
+fn churn_round(i: Int):
+    shared := Item("shared-{i}", 2)
+    items := [Item("gamma-{i}", 3), shared, Item("alpha-{i}", 1), shared]
+    ranked := collections.sort_by_key(items, item_rank)
+    named := algo.sort_by_key(items, item_name)
+    backward := algo.sort_by_key_desc(items, item_name)
+    compared := collections.sorted_by(items, by_rank)
+
+    # a captured key function, whose closure is itself counted
+    bias := i % 5
+    biased := collections.sort_by_key(items, fn(it: Item) => it.rank + bias)
+
+    # plain heap values, where the element and the key are the same object
+    words := ["delta-{i}", "beta", "alpha", "beta"]
+    sorted_words := algo.sort_by_key(words, fn(s: String) => s)
+    positions := collections.sorted_positions(words, fn(l: String, r: String) => l < r)
+    gathered := collections.gather_positions(words, positions)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

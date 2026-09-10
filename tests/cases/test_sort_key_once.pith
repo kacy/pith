@@ -1,0 +1,89 @@
+# the contract the key-based sorts now carry: the key function runs exactly
+# once per element, in input order, before any comparison happens. this is
+# observable through a key function with side effects, so it is asserted as an
+# exact count rather than a bound. the old selection and insertion sorts called
+# the key function O(n^2) times — 5050 times for the 100 elements below, and
+# 50005000 times at 10000.
+#
+# in the memcheck set: the key cache holds a value per element for the length
+# of the sort, and for a string key that value is heap-backed.
+import std.collections as collections
+import std.algo as algo
+
+struct Rec:
+    tag: String
+    key: Int
+
+mut int_key_calls := 0
+mut string_key_calls := 0
+mut call_order: List[String] := []
+
+fn counting_int_key(r: Rec) -> Int:
+    int_key_calls = int_key_calls + 1
+    call_order.push(r.tag)
+    return r.key
+
+fn counting_string_key(r: Rec) -> String:
+    string_key_calls = string_key_calls + 1
+    return r.tag
+
+fn tags(items: List[Rec]) -> String:
+    mut parts: List[String] := []
+    for r in items:
+        parts.push(r.tag)
+    return parts.join(",")
+
+fn build(n: Int) -> List[Rec]:
+    mut out: List[Rec] := []
+    mut i := 0
+    while i < n:
+        out.push(Rec("t{n - i}", n - i))
+        i = i + 1
+    return out
+
+fn main():
+    small := [Rec("c", 3), Rec("a", 1), Rec("b", 2), Rec("a2", 1)]
+
+    int_key_calls = 0
+    call_order.clear()
+    ranked := collections.sort_by_key(small, counting_int_key)
+    print("int_calls {int_key_calls} for {small.len()} elements")
+    order_seen := call_order.join(",")
+    print("int_order {order_seen}")
+    print("int_result {tags(ranked)}")
+
+    string_key_calls = 0
+    named := algo.sort_by_key(small, counting_string_key)
+    print("string_calls {string_key_calls} for {small.len()} elements")
+    print("string_result {tags(named)}")
+
+    string_key_calls = 0
+    backward := algo.sort_by_key_desc(small, counting_string_key)
+    print("desc_calls {string_key_calls} for {small.len()} elements")
+    print("desc_result {tags(backward)}")
+
+    # a size where the quadratic count is visibly different: 100 elements cost
+    # 5050 key calls under the old sorts and 100 under this one.
+    hundred := build(100)
+    int_key_calls = 0
+    call_order.clear()
+    big := collections.sort_by_key(hundred, counting_int_key)
+    print("hundred_calls {int_key_calls}")
+    print("hundred_first {big[0].tag} last {big[99].tag}")
+
+    string_key_calls = 0
+    big_named := algo.sort_by_key(hundred, counting_string_key)
+    print("hundred_string_calls {string_key_calls}")
+    print("hundred_string_first {big_named[0].tag}")
+
+    # degenerate sizes still call the key once per element and no more
+    empty: List[Rec] := []
+    int_key_calls = 0
+    string_key_calls = 0
+    empty_int := collections.sort_by_key(empty, counting_int_key)
+    empty_string := algo.sort_by_key(empty, counting_string_key)
+    print("empty_calls {int_key_calls} {string_key_calls} sizes {empty_int.len()} {empty_string.len()}")
+    one := [Rec("solo", 1)]
+    one_int := collections.sort_by_key(one, counting_int_key)
+    one_string := algo.sort_by_key(one, counting_string_key)
+    print("one_calls {int_key_calls} {string_key_calls} tags {tags(one_int)} {tags(one_string)}")

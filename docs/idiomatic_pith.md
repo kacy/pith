@@ -139,6 +139,48 @@ prod := Config(host: "example.com", port: 443, tls: true)
 Named fields work on generic structs too, whether the type argument is
 written out (`Box[Int](value: 5)`) or inferred (`Box(value: 5, label: "hi")`).
 
+## sorting
+
+`std.collections` holds the generic sorts. `sorted_by` (and its alias
+`sort_by`) takes a comparator, `sort_by_key` takes an integer key, and
+`std.algo.sort_by_key` takes a string key. All of them return a fresh list and
+leave the input alone, so an alias to the argument still reads the original
+order.
+
+```pith
+import std.algo as algo
+import std.collections as collections
+
+by_score := collections.sort_by_key(players, fn(p: Player) => p.score)
+by_name := algo.sort_by_key(players, fn(p: Player) => p.name)
+by_age := collections.sorted_by(players, fn(l: Player, r: Player) => l.age < r.age)
+```
+
+They are stable merge sorts, so elements that compare equal keep their input
+order. Sort on a secondary key first and a primary key second and you get a
+compound order. `algo.sort_by_key_desc` is the one exception worth knowing: it
+sorts ascending and then reverses, so equal keys come back in reverse input
+order rather than input order.
+
+The key-taking sorts call the key function exactly once per element, in input
+order, before any comparison happens, and sort against the cached keys. That
+matters twice over. An expensive key, one that formats a string or hashes a
+field, is paid for n times instead of n log n. And a key function with a side
+effect now runs exactly n times: earlier versions called it once per element
+per pass over the remaining input, so an effect that looked like one per
+element was really O(n^2) of them.
+
+The comparator in `sorted_by` carries no such promise. It runs O(n log n) times
+and the exact count is not part of the contract. It must be a strict order,
+meaning `less(x, x)` is false and `less(a, b)` and `less(b, a)` are never both
+true. Anything else gives an undefined result.
+
+When you want the permutation rather than the sorted list, `sorted_positions`
+returns the input positions in sorted order and `gather_positions` copies
+elements out in a given order. The other sorts are built on that pair. Use it
+directly to reorder two parallel lists by the same key, or when what you want
+is where an element moved rather than the element itself.
+
 ## errors and tests
 
 Use bare `T!` for simple string errors. Use `T!SomeError` when callers need to

@@ -53,6 +53,7 @@ cases=(
   tests/leaks/leak_match_call_subject
   tests/leaks/leak_discarded_container
   tests/leaks/leak_generic_builtin_result
+  tests/leaks/leak_sort_engine
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let
   tests/leaks/leak_lambda_locals

@@ -1,15 +1,31 @@
 # ir_tree_cache.pith - cached AST traversals for IR lowering
 
-from ast import get_node
+from ast import get_node, Node
 from ir_ast_helpers import ir_is_string_literal_kind, ir_unwrap_pub_child
 from ir_utils import ir_encode_int_list, ir_decode_int_list
 
 mut ir_root_items_cache: Map[Int, List[Int]] := {}
 mut ir_string_node_cache_roots: List[Int] := []
 mut ir_string_node_cache_values: List[String] := []
+mut ir_decode_call_cache: Map[Int, List[Int]] := {}
+
+# a call whose callee is `recv.decode[T]` or `recv.decode_text[T]`: the
+# shape of a typed json decode, noted for the string prepass, which has to
+# intern a decode target's packed field spec before the table is emitted.
+# the receiver is not resolved here — the prepass resolves the call's type
+# through the checker instead.
+fn ir_is_decode_call_node(node: Node) -> Bool:
+    if node.kind != "call" or node.children.len() == 0:
+        return false
+    callee := get_node(node.children[0])
+    if callee.kind != "index" or callee.children.len() < 2:
+        return false
+    base := get_node(callee.children[0])
+    return base.kind == "field_access" and (base.value == "decode" or base.value == "decode_text")
 
 fn ir_collect_string_nodes(idx: Int) -> List[Int]:
     mut string_nodes: List[Int] := []
+    mut decode_calls: List[Int] := []
     mut stack: List[Int] := [idx]
     while stack.len() > 0:
         current := stack[stack.len() - 1]
@@ -17,10 +33,21 @@ fn ir_collect_string_nodes(idx: Int) -> List[Int]:
         node := get_node(current)
         if ir_is_string_literal_kind(node.kind):
             string_nodes.push(current)
+        elif ir_is_decode_call_node(node):
+            decode_calls.push(current)
         kids := node.children
         for kid in kids:
             stack.push(kid)
+    ir_decode_call_cache.insert(idx, decode_calls)
     return string_nodes
+
+# every typed decode call under root_idx, from the same walk that finds the
+# string literals, so it costs nothing beyond that walk.
+pub fn ir_cached_decode_call_nodes(root_idx: Int) -> List[Int]:
+    _nodes := ir_cached_string_nodes(root_idx)
+    if ir_decode_call_cache.contains_key(root_idx):
+        return ir_decode_call_cache[root_idx]
+    return []
 
 # every string-literal node under root_idx, so the string table can be
 # interned before any function body is emitted. the whole subtree is walked

@@ -750,15 +750,16 @@ row of that profile:
 pith build bench/json_decode_shapes.pith
 ./bench/json_decode_shapes small 4 20000    # three-field struct, 4-byte strings
 ./bench/json_decode_shapes wide 32 20000    # twenty-field struct, 32-byte strings
-./bench/json_decode_shapes nested 4 2000    # a struct with a nested struct (node pool)
+./bench/json_decode_shapes nested 4 2000    # a struct with a nested struct (nested fill)
 ./bench/json_decode_shapes list 32 400      # an array of 32 small objects (node pool)
 ```
 
 `json_decode_shapes` decodes one struct shape per run; `size` is the
 string value width for the flat shapes and the element count for the
-list. the flat shapes take the runtime's single-pass fill, the nested
-and list shapes parse into the node pool first, so the two pairs answer
-different questions.
+list. the flat shapes take the runtime's single-pass fill and the
+nested shape its nested twin, which fills the sub-struct in place; the
+list shape parses into the node pool and decodes each element out of
+it, so it answers a different question.
 
 ## zstd codec benchmark (pure-pith encoder and decoder)
 

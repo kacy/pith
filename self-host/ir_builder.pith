@@ -113,6 +113,14 @@ pub fn ir_str(s: String) -> String:
     ir_string_indices.insert(cleaned, idx)
     return ir_string_symbol_name(idx)
 
+## true when `s` is already in the string table, so a strref to it will
+## resolve. a body that would reference a string the prepass did not
+## intern asks this first and takes another path when the answer is no,
+## because the table has been emitted by then and ir_str would add an
+## entry nothing ever writes out.
+pub fn ir_str_interned(s: String) -> Bool:
+    return ir_string_indices.contains_key(ir_strip_quotes(s))
+
 ## emit string table.
 pub fn ir_emit_string_table():
     for value, i in ir_strings:

@@ -1,0 +1,227 @@
+# the nested decoder (`pith_json_fill_struct_nested`) over every shape it
+# takes and every way it can fail, next to the shapes that stay on the
+# node-pool path. valgrind-gated in MEMCHECK_CASES.
+#
+# a struct with a struct field used to decode through the node pool, so
+# its values and its messages were the node parser's: escapes decoded,
+# a missing colon or comma or closing brace accepted, a float rejected
+# for an int, a repeated key read last-wins, and errors named by field
+# kind in declaration order, depth first, after any malformed byte. the
+# expected output was generated on the runtime before the nested filler
+# existed, so every line here is that behaviour pinned: a nested struct,
+# a doubly nested one, a repeated nested key, unknown keys holding
+# arrays and objects, the parser's lenient grammar, and each error in
+# turn. the list shapes and the optional nested field decode through
+# the node pool still and are pinned the same way.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Inner:
+    pub city: String
+    pub zip: Int
+
+struct Nested:
+    pub name: String
+    pub addr: Inner
+    pub score: Int
+
+struct Geo:
+    pub lat: Int
+    pub label: String
+    pub live: Bool
+
+struct Site:
+    pub code: String
+    pub geo: Geo
+
+struct Deep:
+    pub owner: String
+    pub site: Site
+    pub level: Int
+
+struct Maybe:
+    pub name: String
+    pub addr: Inner?
+
+struct Item:
+    pub id: Int
+    pub name: String
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn inner_doc(city: String, zip: Int) -> String:
+    return obj(q("city") + ":" + q(city) + "," + q("zip") + ":" + zip.to_string())
+
+fn nested_doc(name: String, addr: String, score: String) -> String:
+    return obj(q("name") + ":" + q(name) + "," + q("addr") + ":" + addr + "," + q("score") + ":" + score)
+
+fn show_nested(label: String, r: Nested!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + q(r.ok.name) + " " + q(r.ok.addr.city) + " " + r.ok.addr.zip.to_string() + " " + r.ok.score.to_string())
+
+fn show_deep(label: String, r: Deep!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    d := r.ok
+    print(label + " ok: " + d.owner + " " + d.site.code + " " + d.site.geo.lat.to_string() + " " + d.site.geo.label + " " + d.site.geo.live.to_string() + " " + d.level.to_string())
+
+fn show_maybe(label: String, r: Maybe!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    if let a = r.ok.addr:
+        print(label + " ok: " + r.ok.name + " some " + a.city + " " + a.zip.to_string())
+    else:
+        print(label + " ok: " + r.ok.name + " none")
+
+fn deep_doc(geo: String) -> String:
+    site := obj(q("code") + ":" + q("s1") + "," + q("geo") + ":" + geo)
+    return obj(q("owner") + ":" + q("olive") + "," + q("site") + ":" + site + "," + q("level") + ":3")
+
+fn main() -> Int:
+    dq := chr(34)
+    bs := chr(92)
+    paris := inner_doc("paris", 75001)
+
+    show_nested("nested_bytes", json.decode[Nested](bytes.from_string_utf8(nested_doc("nina", paris, "42"))))
+    show_nested("nested_text", json.decode_text[Nested](nested_doc("nina", paris, "42")))
+
+    # keys in any order at both levels
+    reordered := obj(q("score") + ":7," + q("addr") + ":" + obj(q("zip") + ":2," + q("city") + ":" + q("oslo")) + "," + q("name") + ":" + q("bob"))
+    show_nested("reordered", json.decode_text[Nested](reordered))
+
+    # whitespace between every token at both levels
+    spaced := " " + chr(123) + " " + q("name") + " : " + q("c d") + " , " + q("addr") + " : " + chr(123) + " " + q("city") + " : " + q("x y") + " , " + q("zip") + " : 5 " + chr(125) + " , " + q("score") + " : 3 " + chr(125) + " "
+    show_nested("spaced", json.decode_text[Nested](spaced))
+
+    # unknown keys of every kind, including arrays and objects, at both levels
+    junk := "[1," + obj(q("y") + ":null") + ",[true,[]]," + q("s") + "]"
+    extras_inner := obj(q("x") + ":" + junk + "," + q("city") + ":" + q("p") + "," + q("o") + ":" + obj(q("k") + ":" + obj("")) + "," + q("zip") + ":1")
+    extras := obj(q("zz") + ":" + q("first") + "," + q("name") + ":" + q("a") + "," + q("n") + ":-5," + q("addr") + ":" + extras_inner + "," + q("t") + ":true," + q("f") + ":false," + q("nil") + ":null," + q("score") + ":1," + q("tail") + ":9.5")
+    show_nested("extras", json.decode_text[Nested](extras))
+
+    # a repeated key: the last value wins, at both levels and for the struct itself
+    dup := obj(q("name") + ":" + q("one") + "," + q("addr") + ":" + inner_doc("a", 1) + "," + q("name") + ":" + q("two") + "," + q("addr") + ":" + obj(q("city") + ":" + q("b") + "," + q("city") + ":" + q("c") + "," + q("zip") + ":2") + "," + q("score") + ":1," + q("score") + ":2")
+    show_nested("duplicate", json.decode_text[Nested](dup))
+
+    # escapes are decoded, in values and in keys
+    escaped_name := dq + "a" + bs + dq + "b" + bs + bs + "c" + bs + "n" + bs + "u00e9" + bs + "ud83d" + bs + "ude00" + bs + "/" + dq
+    escaped := obj(q("name") + ":" + escaped_name + "," + dq + "ad" + bs + "u0064r" + dq + ":" + obj(q("city") + ":" + dq + "t" + bs + "tab" + dq + "," + q("zip") + ":1") + "," + q("score") + ":1")
+    show_nested("escaped", json.decode_text[Nested](escaped))
+
+    # the parser's grammar: a missing colon, a missing comma, a trailing comma, no closing braces
+    show_nested("no_colon", json.decode_text[Nested](obj(q("name") + " " + q("a") + "," + q("addr") + ":" + paris + "," + q("score") + ":1")))
+    show_nested("no_comma", json.decode_text[Nested](obj(q("name") + ":" + q("a") + " " + q("addr") + ":" + obj(q("city") + ":" + q("p") + " " + q("zip") + ":1") + " " + q("score") + ":1")))
+    show_nested("trailing_comma", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + obj(q("city") + ":" + q("p") + "," + q("zip") + ":1,") + "," + q("score") + ":1,")))
+    show_nested("unclosed", json.decode_text[Nested](chr(123) + q("name") + ":" + q("a") + "," + q("score") + ":1," + q("addr") + ":" + chr(123) + q("city") + ":" + q("p") + "," + q("zip") + ":1"))
+
+    # numbers: a sign, an int past 64 bits, a float where an int is expected
+    show_nested("signed", json.decode_text[Nested](nested_doc("a", inner_doc("p", 0 - 12), "+7")))
+    show_nested("big_int", json.decode_text[Nested](nested_doc("a", paris, "99999999999999999999")))
+    show_nested("float_int", json.decode_text[Nested](nested_doc("a", paris, "1.5")))
+    show_nested("float_in_nested", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + q("p") + "," + q("zip") + ":1e3"), "1")))
+
+    # doubly nested, in order and with the innermost object repeated
+    show_deep("deep", json.decode_text[Deep](deep_doc(obj(q("lat") + ":48," + q("label") + ":" + q("g") + "," + q("live") + ":true"))))
+    show_deep("deep_bytes", json.decode[Deep](bytes.from_string_utf8(deep_doc(obj(q("live") + ":false," + q("label") + ":" + q("h") + "," + q("lat") + ":-1")))))
+    dup_site := obj(q("code") + ":" + q("s0") + "," + q("geo") + ":" + obj(q("lat") + ":1," + q("label") + ":" + q("x") + "," + q("live") + ":true"))
+    dup_deep := obj(q("owner") + ":" + q("o") + "," + q("site") + ":" + dup_site + "," + q("site") + ":" + obj(q("code") + ":" + q("s2") + "," + q("geo") + ":" + obj(q("lat") + ":2," + q("label") + ":" + q("y") + "," + q("live") + ":false")) + "," + q("level") + ":9")
+    show_deep("deep_duplicate", json.decode_text[Deep](dup_deep))
+
+    # errors: a missing field at each level, named in declaration order
+    show_nested("missing_top", json.decode_text[Nested](obj(q("addr") + ":" + paris + "," + q("score") + ":1")))
+    show_nested("missing_nested_field", json.decode_text[Nested](nested_doc("a", obj(q("zip") + ":1"), "1")))
+    show_nested("missing_nested", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("score") + ":1")))
+    show_nested("missing_after_nested", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + paris)))
+    show_nested("nested_error_before_top", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + obj(q("zip") + ":1") + "," + q("score") + ":" + q("x"))))
+    show_nested("top_error_before_nested", json.decode_text[Nested](obj(q("name") + ":1," + q("addr") + ":" + obj(q("zip") + ":1") + "," + q("score") + ":1")))
+    show_nested("empty_nested", json.decode_text[Nested](nested_doc("a", obj(""), "1")))
+    show_deep("deep_missing", json.decode_text[Deep](deep_doc(obj(q("lat") + ":1," + q("live") + ":true"))))
+    show_deep("deep_wrong", json.decode_text[Deep](deep_doc(obj(q("lat") + ":1," + q("label") + ":" + q("g") + "," + q("live") + ":" + q("yes")))))
+
+    # errors: a wrong type for a field at each level, and for the struct itself
+    show_nested("wrong_string", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":7," + q("zip") + ":1"), "1")))
+    show_nested("wrong_int", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + q("p") + "," + q("zip") + ":" + q("1")), "1")))
+    show_nested("wrong_null", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":null," + q("zip") + ":1"), "1")))
+    show_nested("nested_int", json.decode_text[Nested](nested_doc("a", "5", "1")))
+    show_nested("nested_array", json.decode_text[Nested](nested_doc("a", "[" + paris + "]", "1")))
+    show_nested("nested_null", json.decode_text[Nested](nested_doc("a", "null", "1")))
+    show_nested("nested_string", json.decode_text[Nested](nested_doc("a", q("paris"), "1")))
+    show_nested("top_object", json.decode_text[Nested](obj(q("name") + ":" + paris + "," + q("addr") + ":" + paris + "," + q("score") + ":1")))
+    show_nested("dup_then_wrong", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + paris + "," + q("addr") + ":3," + q("score") + ":1")))
+    show_nested("wrong_then_dup", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":3," + q("addr") + ":" + paris + "," + q("score") + ":1")))
+
+    # errors: malformed input, anywhere in the document
+    show_nested("empty_input", json.decode_text[Nested](""))
+    show_nested("not_object", json.decode_text[Nested]("[1,2]"))
+    show_nested("malformed_sub", json.decode_text[Nested](nested_doc("a", chr(123) + q("city") + ":", "1")))
+    show_nested("bare_key_sub", json.decode_text[Nested](nested_doc("a", chr(123) + "city:" + q("p") + chr(125), "1")))
+    show_nested("unterminated", json.decode_text[Nested](nested_doc("a", chr(123) + q("city") + ":" + dq + "abc", "1")))
+    show_nested("bad_escape", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + dq + "a" + bs + "x" + dq + "," + q("zip") + ":1"), "1")))
+    show_nested("bad_unicode", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + dq + bs + "ud800" + dq + "," + q("zip") + ":1"), "1")))
+    show_nested("bad_literal", json.decode_text[Nested](nested_doc("a", paris, "truth")))
+    show_nested("bad_extra", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("junk") + ":?," + q("addr") + ":" + paris + "," + q("score") + ":1")))
+    show_nested("bad_extra_sub", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + q("p") + "," + q("j") + ":[1," + chr(125) + "," + q("zip") + ":1"), "1")))
+    show_nested("trailing_garbage", json.decode_text[Nested](nested_doc("a", paris, "1") + " x"))
+    show_nested("bad_utf8", json.decode[Nested](bytes.from_string_utf8(nested_doc("a", obj(q("city") + ":" + dq + chr(255) + dq + "," + q("zip") + ":1"), "1"))))
+
+    # an optional nested field, present and absent: the node-pool path
+    show_maybe("optional_present", json.decode_text[Maybe](obj(q("name") + ":" + q("m") + "," + q("addr") + ":" + paris)))
+    show_maybe("optional_absent", json.decode_text[Maybe](obj(q("name") + ":" + q("m"))))
+    show_maybe("optional_wrong", json.decode_text[Maybe](obj(q("name") + ":" + q("m") + "," + q("addr") + ":" + obj(q("city") + ":" + q("p")))))
+
+    # lists: a list of structs, a list of nested structs, an empty list,
+    # decoded element by element out of a parsed array
+    mut items := "["
+    mut i := 0
+    while i < 3:
+        if i > 0:
+            items = items + ","
+        items = items + obj(q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("item" + i.to_string()))
+        i = i + 1
+    items = items + "]"
+    root := json.parse(items)
+    mut list_out := "list ok:"
+    mut k := 0
+    while k < json.array_len(root):
+        item := json.decode_object[Item](json.array_get(root, k)) catch Item(0 - 1, "")
+        list_out = list_out + " " + item.id.to_string() + "/" + item.name
+        k = k + 1
+    print(list_out)
+    nested_items := "[" + nested_doc("n0", inner_doc("a", 1), "10") + "," + nested_doc("n1", inner_doc("b", 2), "11") + "," + nested_doc("n2", obj(q("zip") + ":3"), "12") + "]"
+    nroot := json.parse(nested_items)
+    mut nlist_out := "nested list:"
+    k = 0
+    while k < json.array_len(nroot):
+        r := json.decode_object[Nested](json.array_get(nroot, k))
+        if r.is_err:
+            nlist_out = nlist_out + " err(" + r.err.message + ")"
+        else:
+            nlist_out = nlist_out + " " + r.ok.name + "/" + r.ok.addr.city + "/" + r.ok.addr.zip.to_string() + "/" + r.ok.score.to_string()
+        k = k + 1
+    print(nlist_out)
+    eroot := json.parse("[]")
+    print("empty list: " + json.array_len(eroot).to_string())
+
+    # churn: many decodes whose strings are kept, so the destructor path runs
+    # at every depth, with a failing document in every third round
+    mut total := 0
+    mut n := 0
+    while n < 300:
+        mut geo := obj(q("lat") + ":" + n.to_string() + "," + q("label") + ":" + q("g" + n.to_string()) + "," + q("live") + ":true")
+        if n % 3 == 2:
+            geo = obj(q("lat") + ":" + n.to_string() + "," + q("live") + ":true")
+        d := json.decode_text[Deep](deep_doc(geo)) catch Deep("", Site("", Geo(0 - 1, "", false)), 0)
+        r := json.decode_text[Nested](nested_doc("user-" + n.to_string(), inner_doc("city-" + n.to_string(), n), n.to_string())) catch Nested("", Inner("", 0), 0)
+        total = total + d.site.geo.lat + d.site.geo.label.len() + r.addr.zip + r.addr.city.len() + r.name.len()
+        n = n + 1
+    print("churn " + total.to_string())
+    return 0

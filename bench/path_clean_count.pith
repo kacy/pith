@@ -1,0 +1,57 @@
+# std.os.path.clean_part_count over a fixed set of messy paths.
+#
+# the inputs mix the shapes the counter has to get right: repeated
+# separators, `.` segments, `..` that pops a real segment, `..` that
+# climbs past the start of a relative path and stays, `..` at the root
+# of an absolute path that vanishes, and trailing separators. every
+# path's count feeds the checksum, so an arm that counted differently
+# cannot look fast.
+#
+#   pith build bench/path_clean_count.pith
+#   ./bench/path_clean_count <rounds>
+#
+# the profile that motivated this (docs/performance.md, 2026-09-10) put
+# 11% of std_pipeline's instructions in this one function, most of it
+# building and dropping a list of substrings to count them.
+import std.os.path as path
+
+fn rounds_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 20000
+
+fn sample_paths() -> List[String]:
+    mut out: List[String] := []
+    out.push("data//north/./users/../users/123.json")
+    out.push("/var/log/../lib/./pith/build/")
+    out.push("../../escape/../still/../../up")
+    out.push("/../root/./sees/no/parent")
+    out.push("plain/relative/path")
+    out.push("a/b/c/d/e/f/g/h/../../../../x")
+    out.push("")
+    out.push("/")
+    out.push(".")
+    out.push("./only/dots/./././end/.")
+    out.push("trailing/slashes///")
+    out.push("/abs//double/../../../gone")
+    return out
+
+fn main() -> Int:
+    rounds := rounds_from_args()
+    paths := sample_paths()
+    start := time()
+    mut checksum := 0
+    mut round := 0
+    while round < rounds:
+        for p, i in paths:
+            checksum = checksum + path.clean_part_count(p) * (i + 1)
+        round = round + 1
+    elapsed := time() - start
+    print("path clean_part_count benchmark")
+    print("rounds=" + rounds.to_string())
+    print("elapsed_ms=" + elapsed.to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

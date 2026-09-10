@@ -1,0 +1,80 @@
+# csv encoding: the per-field quoting decision and the write behind it.
+#
+# encodes the same ten-column rows bench/std_pipeline.pith writes — ids,
+# names, regions, flags, numbers, a url, a date, a note with a comma in
+# it, a path — through std.csv's byte encoder, `rounds` times over a
+# fixed table built outside the timed section. the checksum is the
+# encoded byte count folded with a sample of the bytes, so an arm that
+# quoted differently or dropped a field cannot look fast.
+#
+#   pith build bench/csv_encode.pith
+#   ./bench/csv_encode <rows> <rounds>
+#
+# the profile that motivated this (docs/performance.md, 2026-09-10) put
+# 31% of std_pipeline's instructions in the encoder, and two thirds of
+# that in three substring searches per field asking whether it needs
+# quoting.
+import std.csv as csv
+
+fn arg_or(index: Int, fallback: Int) -> Int:
+    argv := args()
+    if argv.len() > index:
+        parsed := parse_int(argv[index])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return fallback
+
+fn region_for(i: Int) -> String:
+    r := i % 4
+    if r == 0:
+        return "north"
+    if r == 1:
+        return "south"
+    if r == 2:
+        return "east"
+    return "west"
+
+fn bool_text(value: Bool) -> String:
+    if value:
+        return "true"
+    return "false"
+
+fn make_rows(records: Int) -> List[List[String]]:
+    mut rows: List[List[String]] := []
+    rows.push(["id", "name", "region", "active", "score", "quota", "url", "joined", "note", "path"])
+    mut i := 0
+    while i < records:
+        region := region_for(i)
+        score := (i * 17 + 11) % 100
+        quota := (i * 13 + 7) % 50
+        note := "user " + i.to_string() + ", region " + region
+        url_text := "https://example.com/api/" + region + "/users/" + i.to_string() + "?score=" + score.to_string()
+        joined := "2026-" + ((i % 12) + 1).to_string() + "-" + ((i % 28) + 1).to_string()
+        user_path := "data//" + region + "/./users/../users/" + i.to_string() + ".json"
+        rows.push([i.to_string(), "user-" + i.to_string(), region, bool_text(i % 3 != 0), score.to_string(), quota.to_string(), url_text, joined, note, user_path])
+        i = i + 1
+    return rows
+
+fn main() -> Int:
+    records := arg_or(1, 5000)
+    rounds := arg_or(2, 10)
+    rows := make_rows(records)
+    start := time()
+    mut checksum := 0
+    mut round := 0
+    while round < rounds:
+        encoded := csv.encode_bytes(rows)
+        checksum = checksum + encoded.len()
+        # sample the bytes so the content, not only the length, is checked
+        mut i := round % 7
+        while i < encoded.len():
+            checksum = checksum + encoded[i]
+            i = i + 97
+        round = round + 1
+    elapsed := time() - start
+    print("csv encode benchmark")
+    print("rows=" + records.to_string())
+    print("rounds=" + rounds.to_string())
+    print("elapsed_ms=" + elapsed.to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

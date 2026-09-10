@@ -1,0 +1,59 @@
+# std.os.path.clean_part_count against clean() and parts(), path by path.
+#
+# the counter used to build the same segment stack clean() builds and
+# report its length; it now keeps two counters and copies nothing. this
+# pins every shape the two have to agree on: repeated separators, `.`,
+# `..` popping a real segment, `..` climbing past the start of a relative
+# path (kept) and past the root of an absolute one (dropped), trailing
+# separators, and a deterministic sweep of every 4-segment combination
+# drawn from a small alphabet, relative and absolute. each line carries
+# the count and whether it matches parts(path).len(). the expected file
+# was generated from the stack-building counter.
+import std.os.path as path
+
+fn show(p: String):
+    count := path.clean_part_count(p)
+    agree := count == path.parts(p).len()
+    print("[" + p + "] count=" + count.to_string() + " agrees=" + agree.to_string() + " clean=" + path.clean(p))
+
+fn main() -> Int:
+    show("")
+    show("/")
+    show(".")
+    show("..")
+    show("/..")
+    show("./")
+    show("//")
+    show("a")
+    show("/a")
+    show("a/")
+    show("a//b")
+    show("data//north/./users/../users/123.json")
+    show("/var/log/../lib/./pith/build/")
+    show("../../escape/../still/../../up")
+    show("/../root/./sees/no/parent")
+    show("a/b/c/d/e/f/g/h/../../../../x")
+    show("./only/dots/./././end/.")
+    show("trailing/slashes///")
+    show("/abs//double/../../../gone")
+    show("..a/.b./...")
+    show("a/../..")
+    show("/a/../..")
+    show("../a/../..")
+    # every 4-segment combination from the alphabet, relative and absolute
+    alphabet := ["a", "b", ".", "..", ""]
+    mut w := 0
+    while w < 625:
+        mut rel := ""
+        mut k := w
+        mut j := 0
+        while j < 4:
+            if j > 0:
+                rel = rel + "/"
+            rel = rel + alphabet[k % 5]
+            k = k / 5
+            j = j + 1
+        show(rel)
+        show("/" + rel)
+        w = w + 1
+    return 0

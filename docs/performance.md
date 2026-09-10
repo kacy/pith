@@ -302,6 +302,374 @@ nothing. an instruction count cannot see a memory-ordering stall, so the two
 instruments answer different questions and a barrier's cost still needs the
 timing protocol — but with the null floor established first.
 
+## std profiling pass (2026-09-10)
+
+a pass over the standard library where every target came from a profile
+rather than from reading the code for a pattern. the instrument is
+callgrind through `tooling/callgrind_ab.sh` with each program built under
+`PITH_KEEP_SYMBOLS=1`, so a cost lands on a function name and not an
+address, and the acceptance number for every change is an instruction
+count, not a wall clock. compiler and runtime were the trunk at
+`25d42d75` throughout; the before and after arms of every comparison
+were built by the same `self-host/ir_driver` against the unmodified and
+the modified `std/`.
+
+five workloads, chosen to cover the library's busy surfaces: json,
+collections and crypto (event_ledger); csv, url, path, gzip and hashing
+(std_pipeline); typed json decoding on a hot loop (catalog_workload); the
+http/1.1 server on one keepalive connection (http_server under the
+sequential probe); and the compiler compiling itself, the largest pith
+program there is. for each, the fifteen most expensive functions by self
+and by inclusive instruction count, each tagged as runtime (rust, the
+`pith_*` primitives, the allocator), std (`std_*`, pith) or the program's
+own. inclusive rows for the process entry chain are dropped.
+
+### event_ledger, 200000 events
+
+`./bench/event_ledger 200000`. total 3,393,922,717 Ir.
+
+by self cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 504,822,230 | 14.87 | `pith_json_fill_struct` | runtime |
+| 369,804,712 | 10.90 | `pith_string_split_to_list` | runtime |
+| 245,611,686 | 7.24 | `free` | runtime |
+| 177,293,973 | 5.22 | `__memcmp_avx2_movbe` | runtime |
+| 175,016,716 | 5.16 | `pith_runtime::runtime_core::struct_weak_drop` | runtime |
+| 165,612,328 | 4.88 | `pith_struct_alloc` | runtime |
+| 151,028,535 | 4.45 | `malloc` | runtime |
+| 115,600,132 | 3.41 | `pith_byte_buffer_write_string_utf8` | runtime |
+| 113,012,226 | 3.33 | `_int_malloc` | runtime |
+| 104,207,686 | 3.07 | `pith_struct_release` | runtime |
+| 102,648,922 | 3.02 | `pith_cstring_release` | runtime |
+| 98,600,000 | 2.91 | `std_bytes_ByteBuffer_write_string_utf8` | std |
+| 85,318,471 | 2.51 | `__memcpy_avx_unaligned_erms` | runtime |
+| 57,400,365 | 1.69 | `generate_events` | program |
+| 56,799,732 | 1.67 | `hashbrown::raw::inner::RawTable<T,A>::find` | runtime |
+
+by inclusive cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 1,520,936,638 | 44.81 | `parse_events` | program |
+| 1,080,749,223 | 31.84 | `generate_events` | program |
+| 690,542,760 | 20.35 | `pith_json_fill_struct` | runtime |
+| 623,944,009 | 18.38 | `analyze` | program |
+| 573,932,795 | 16.91 | `pith_string_split_to_list` | runtime |
+| 516,556,758 | 15.22 | `map_add_str` | program |
+| 418,413,079 | 12.33 | `std_bytes_ByteBuffer_write_string_utf8` | std |
+| 377,603,562 | 11.13 | `pith_struct_release` | runtime |
+| 360,952,624 | 10.64 | `__rustc::__rust_dealloc` | runtime |
+| 356,952,457 | 10.52 | `__rustc::__rdl_dealloc` | runtime |
+| 352,952,355 | 10.40 | `free` | runtime |
+| 277,370,502 | 8.17 | `__rustc::__rust_alloc` | runtime |
+| 273,569,804 | 8.06 | `__rustc::__rdl_alloc` | runtime |
+| 269,769,106 | 7.95 | `__rustc::__rdl_alloc` | runtime |
+| 245,300,500 | 7.23 | `pith_struct_alloc` | runtime |
+
+### std_pipeline, 50000 records
+
+`./bench/std_pipeline`. total 4,370,009,153 Ir.
+
+by self cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 458,901,276 | 10.50 | `pith_cstring_contains` | runtime |
+| 332,720,838 | 7.61 | `pith_bytes_get_strict` | runtime |
+| 294,828,020 | 6.75 | `pith_cstring_release` | runtime |
+| 255,397,367 | 5.84 | `free` | runtime |
+| 214,472,179 | 4.91 | `std_csv_csv_row_from_bytes` | std |
+| 182,465,421 | 4.18 | `__memcmp_avx2_movbe` | runtime |
+| 177,077,167 | 4.05 | `std_csv_fold_bytes__PipelineStats` | std |
+| 170,182,793 | 3.89 | `malloc` | runtime |
+| 123,688,931 | 2.83 | `_int_malloc` | runtime |
+| 113,112,521 | 2.59 | `pith_runtime::runtime_core::pith_alloc_cstring` | runtime |
+| 91,530,210 | 2.09 | `pith_bytes_len` | runtime |
+| 88,301,228 | 2.02 | `pith_runtime::runtime_core::struct_weak_drop` | runtime |
+| 84,096,282 | 1.92 | `pith_struct_alloc` | runtime |
+| 80,300,040 | 1.84 | `std_os_path_clean_part_count` | std |
+| 79,282,896 | 1.81 | `<core::hash::sip::Hasher<S> as core::hash::Hasher>::write` | runtime |
+
+by inclusive cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 2,131,291,108 | 48.77 | `std_csv_fold_bytes__PipelineStats` | std |
+| 1,359,146,350 | 31.10 | `std_csv_save_chunked` | std |
+| 1,359,146,344 | 31.10 | `std_csv_save_bytes_chunked` | std |
+| 1,359,144,798 | 31.10 | `std_csv_encode_bytes` | std |
+| 1,335,769,842 | 30.57 | `std_csv_encode_row_bytes_to` | std |
+| 916,428,851 | 20.97 | `__lambda_0` | program |
+| 914,128,805 | 20.92 | `transform_row` | program |
+| 713,480,587 | 16.33 | `make_rows` | program |
+| 689,567,843 | 15.78 | `std_csv_csv_row_from_bytes` | std |
+| 640,841,598 | 14.66 | `pith_cstring_contains` | runtime |
+| 506,750,512 | 11.60 | `pith_cstring_release` | runtime |
+| 465,450,489 | 10.65 | `std_os_path_clean_part_count` | std |
+| 411,733,350 | 9.42 | `pith_list_push_value` | runtime |
+| 370,011,155 | 8.47 | `__rustc::__rust_dealloc` | runtime |
+| 365,860,382 | 8.37 | `__rustc::__rdl_dealloc` | runtime |
+
+### catalog_workload, 4000 iterations
+
+`./bench/catalog_workload 4000`. total 43,282,141 Ir.
+
+by self cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 14,572,000 | 33.67 | `pith_json_fill_struct` | runtime |
+| 4,069,006 | 9.40 | `build_limited_id_sum_table` | program |
+| 4,037,964 | 9.33 | `pith_list_get_value_strict` | runtime |
+| 2,937,379 | 6.79 | `pith_struct_release` | runtime |
+| 1,222,184 | 2.82 | `pith_cstring_release` | runtime |
+| 968,000 | 2.24 | `pith_runtime::json::read_string_end` | runtime |
+| 962,120 | 2.22 | `pith_struct_retain` | runtime |
+| 752,272 | 1.74 | `free` | runtime |
+| 688,632 | 1.59 | `pith_runtime::collections::list::ListImpl::push_value` | runtime |
+| 672,000 | 1.55 | `pith_runtime::json::read_int` | runtime |
+| 652,000 | 1.51 | `search_checksum` | program |
+| 624,000 | 1.44 | `batch_checksum` | program |
+| 596,000 | 1.38 | `pith_cstring_eq` | runtime |
+| 578,346 | 1.34 | `pith_struct_alloc` | runtime |
+| 563,652 | 1.30 | `pith_list_push_value` | runtime |
+
+by inclusive cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 24,612,447 | 56.87 | `bench_batch` | program |
+| 24,532,677 | 56.68 | `batch_checksum` | program |
+| 18,068,000 | 41.74 | `pith_json_fill_struct` | runtime |
+| 15,366,275 | 35.50 | `init_catalog` | program |
+| 11,030,183 | 25.48 | `build_query_id_sums` | program |
+| 11,027,996 | 25.48 | `build_limited_id_sum_table` | program |
+| 5,182,615 | 11.97 | `pith_struct_release` | runtime |
+| 4,037,964 | 9.33 | `pith_list_get_value_strict` | runtime |
+| 2,164,000 | 5.00 | `search_checksum` | program |
+| 2,032,759 | 4.70 | `pith_cstring_release` | runtime |
+| 1,740,000 | 4.02 | `__dtor_BatchRequest` | program |
+| 1,448,244 | 3.35 | `pith_list_push_value` | runtime |
+| 1,243,124 | 2.87 | `pith_struct_alloc` | runtime |
+| 1,232,020 | 2.85 | `bench_search_wide` | program |
+| 1,180,020 | 2.73 | `bench_search_hot` | program |
+
+### http_server under the sequential probe, 2000 requests
+
+`./bench/http_server` driven by `bench/http_seq_latency.py <port> 2000`, dumped with `callgrind_control --dump` before the kill. total 1,026,531,527 Ir.
+
+by self cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 101,494,058 | 9.89 | `free` | runtime |
+| 83,161,436 | 8.10 | `core::hash::BuildHasher::hash_one` | runtime |
+| 65,864,960 | 6.42 | `malloc` | runtime |
+| 59,714,188 | 5.82 | `<core::hash::sip::Hasher<S> as core::hash::Hasher>::write` | runtime |
+| 41,347,788 | 4.03 | `pith_green_maybe_yield` | runtime |
+| 38,557,873 | 3.76 | `pith_runtime::runtime_core::struct_weak_drop` | runtime |
+| 36,721,334 | 3.58 | `pith_struct_alloc` | runtime |
+| 36,677,613 | 3.57 | `pith_tls_get_or_init` | runtime |
+| 25,307,607 | 2.47 | `pith_cstring_release` | runtime |
+| 24,679,065 | 2.40 | `pith_struct_release` | runtime |
+| 24,562,305 | 2.39 | `hashbrown::raw::inner::RawTable<T,A>::find` | runtime |
+| 24,352,650 | 2.37 | `pith_bytes_release` | runtime |
+| 19,040,000 | 1.85 | `pith_bytes_get_strict` | runtime |
+| 18,304,544 | 1.78 | `pith_runtime::bytes::pith_bytes_from_vec` | runtime |
+| 17,290,390 | 1.68 | `pith_mutex_unlock` | runtime |
+
+by inclusive cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 1,024,732,202 | 99.82 | `serve_client` | program |
+| 1,024,730,353 | 99.82 | `std_net_http_serve_connection_fd` | std |
+| 1,024,705,424 | 99.82 | `std_net_http_serve_connection` | std |
+| 861,801,890 | 83.95 | `std_net_http_read_request_buffered_bytes` | std |
+| 861,789,884 | 83.95 | `std_net_http_read_request_from_buffered_bytes` | std |
+| 666,099,754 | 64.89 | `std_net_http_read_request_head_buffered_bytes` | std |
+| 572,248,418 | 55.75 | `std_io_BufferedBytesReader_read_bytes` | std |
+| 571,480,412 | 55.67 | `std_io_buffered_bytes_reader_read` | std |
+| 570,712,406 | 55.60 | `std_io_buffered_bytes_reader_read_internal` | std |
+| 166,114,516 | 16.18 | `std_io_buffered_bytes_reader_consume` | std |
+| 142,875,624 | 13.92 | `core::hash::BuildHasher::hash_one` | runtime |
+| 141,523,374 | 13.79 | `std_net_http_build_http_request` | std |
+| 140,661,254 | 13.70 | `std_io_buffered_bytes_reader_cache_get` | std |
+| 139,108,798 | 13.55 | `pith_tls_get_or_init` | runtime |
+| 123,287,229 | 12.01 | `__rustc::__rust_dealloc` | runtime |
+
+### the compiler compiling itself
+
+`ir_driver --combined self-host/pith_main.pith`, the driver relinked from its own IR with `pith build-ir` so it keeps its symbols. total 22,610,437,376 Ir.
+
+by self cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 2,967,350,151 | 13.12 | `pith_string_split_to_list` | runtime |
+| 2,878,827,784 | 12.73 | `pith_cstring_release` | runtime |
+| 1,663,344,349 | 7.36 | `free` | runtime |
+| 1,409,162,612 | 6.23 | `__memcmp_avx2_movbe` | runtime |
+| 1,128,384,402 | 4.99 | `malloc` | runtime |
+| 719,417,792 | 3.18 | `pith_runtime::runtime_core::pith_alloc_cstring` | runtime |
+| 691,069,792 | 3.06 | `<core::hash::sip::Hasher<S> as core::hash::Hasher>::write` | runtime |
+| 635,573,362 | 2.81 | `core::hash::BuildHasher::hash_one` | runtime |
+| 519,390,097 | 2.30 | `pith_cstring_contains` | runtime |
+| 487,951,160 | 2.16 | `pith_cstring_retain` | runtime |
+| 474,888,276 | 2.10 | `_int_malloc` | runtime |
+| 466,680,480 | 2.06 | `pith_cstring_eq` | runtime |
+| 463,269,342 | 2.05 | `pith_runtime::collections::list::ListImpl::push_value` | runtime |
+| 421,048,298 | 1.86 | `pith_list_release` | runtime |
+| 348,430,997 | 1.54 | `__memcpy_avx_unaligned_erms` | runtime |
+
+by inclusive cost:
+
+| Ir | % | function | kind |
+|---:|---:|---|---|
+| 22,609,072,635 | 99.99 | `emit_combined_file` | program |
+| 19,830,722,260 | 87.71 | `ir_emitter_core_ir_block'2` | program |
+| 13,279,565,495 | 58.73 | `parse_and_check` | program |
+| 8,876,358,523 | 39.26 | `checker_c_run_module` | program |
+| 8,165,360,898 | 36.11 | `checker_check_function_body` | program |
+| 8,141,326,870 | 36.01 | `checker_c_check_all` | program |
+| 8,139,163,574 | 36.00 | `checker_check_top_level_declarations` | program |
+| 8,138,337,593 | 35.99 | `checker_check_declaration` | program |
+| 8,067,070,602 | 35.68 | `checker_check_block_statement` | program |
+| 8,065,908,000 | 35.67 | `checker_check_statement` | program |
+| 7,976,333,770 | 35.28 | `checker_c_check_expr` | program |
+| 7,969,614,090 | 35.25 | `checker_check_expression_implementation` | program |
+| 7,782,001,771 | 34.42 | `checker_resolve_generic_declaration_key` | program |
+| 7,666,039,832 | 33.90 | `driver_resolve_imports'2` | program |
+| 7,663,176,776 | 33.89 | `driver_resolve_import_list'2` | program |
+
+### what the profile says
+
+three std hotspots are large and bounded, and the rest of the picture is
+runtime or the program itself.
+
+**the http request head was read one byte at a time.** the server's
+inclusive tree puts 84% of a request under
+`read_request_buffered_bytes`, and 56% of the whole process under
+`buffered_bytes_reader_read_internal`: the head reader called
+`reader.read_bytes(1)` in a loop, and every one of those 64 calls per
+request paid the reader's registry lookups (a threadlocal map behind
+`pith_tls_get_or_init`, whose hashing is the `hash_one` and sip rows), a
+mutex, a fresh `ByteBuffer`, a slice of the cache and a `consume` that
+re-slices it. 128,001 `read_bytes` calls for 2,000 requests. the runtime
+rows under it are real, but the call shape that produces them is std's.
+
+**the csv encoder asked three substring questions per field.**
+`encode_row_bytes_to` is 31% of std_pipeline inclusive, and 15 of those
+points are `pith_cstring_contains`, called three times per field to
+decide whether it needs quoting (`,`, `"`, newline), plus two `chr()`
+strings built per field to search for and released again. the runtime's
+`contains` walks the haystack comparing a slice per position, so each call
+on a sixteen-byte field is ~460 instructions and the three of them ~1,400.
+1.4 million calls.
+
+**`path.clean_part_count` built the segment list it only needed the length
+of.** 11% of std_pipeline inclusive for 50,000 calls: per path a
+`substring` per segment, a stack list that `clean_count_segment` returned
+back and forth (nine `pith_list_release_handle` per path), and a fresh
+list from `without_last_segment` for every `..`.
+
+what was declined, and why:
+
+- event_ledger has one std row, `ByteBuffer.write_string_utf8` at 2.9%
+  self and 12.3% inclusive. the wrapper itself is thin; the cost is the
+  `Int!` result the compiler boxes for every fallible call: `pith_struct_alloc`
+  and `pith_struct_release` under it are 11.7% of the workload. that is
+  the result-type lowering, a compiler matter with the same shape at every
+  `T!` call site, and the wrapper's own `text.len()` test carries the
+  empty-write semantics. the rest of the workload is `pith_json_fill_struct`,
+  `pith_string_split_to_list` and the allocator.
+- catalog_workload has no std function in either list: its decode is the
+  runtime's `pith_json_fill_struct` (42% inclusive).
+- the compiler has no std function in the top fifteen either. its 32%
+  under `pith_string_split_to_list` is the compiler's own `.split` use, in
+  two functions: `checker_resolve_generic_declaration_key` (22% of the
+  compile, 1.9 million splits) and `ir_metadata_ir_csv_contains` (8.4%).
+  that is the next compiler pass, not a std one.
+- the hypothesis this pass was asked to test, that `s = s + chunk` loops
+  in `std/encoding.pith` and the per-nibble hex build in `std/hash.pith`
+  are hot, is not borne out on these workloads: no `std_hash_*` or
+  `std_encoding_*` function appears in any list. the hmac in event_ledger
+  and the sha256 in std_pipeline each run once over a summary of a few
+  hundred bytes. the byte-compare form of string indexing, `s[i] == "x"`
+  and `ord(s[i])`, is lowered by the emitter to a `pith_cstring_byte_at`
+  read and does not allocate; only `s[i]` used as a value does. they are
+  left alone, because a change nobody can measure has only a downside.
+- `csv_row_from_bytes` (16% of std_pipeline inclusive) is the next std
+  candidate: three `List[Int]` per row and a `pith_bytes_get_strict` call
+  per byte. `Row`'s fields are public, so its layout is an interface, and
+  it was left for a change that can take that on.
+- the runtime's `pith_cstring_contains` and `pith_cstring_index_of` compare
+  a slice at every position; a first-byte scan would make both an order of
+  magnitude cheaper for short needles and shows up in every workload here
+  (2.3% self of the compile). that is a runtime change and is noted for
+  one.
+
+### what changed, and by how much
+
+one commit per hotspot; instruction counts from `tooling/callgrind_ab.sh`,
+both arms built by the same compiler, checksums matching. the
+micro-benchmarks live in `bench/` next to the workloads.
+
+| hotspot | micro-benchmark | before | after | per operation | whole workload |
+|---|---|---:|---:|---|---|
+| http head read | `bench/http_head_read 20000` | 8,871,737,831 | 2,099,174,323 (−76.3%) | head read per request 333,050 → 23,300 Ir | http_server, 2000 sequential requests: 1,030,428,586 → 407,378,733 Ir (−60.5%; 515k → 204k per request) |
+| csv quoting decision | `bench/csv_encode 5000 10` | 1,441,314,484 | 881,419,663 (−38.8%) | quoting test per field ~1,730 → 666 Ir; `encode_row_bytes_to` per row 26,715 → 15,621 Ir | std_pipeline: 4,369,923,908 → 3,814,760,923 Ir (−12.7%) |
+| `path.clean_part_count` | `bench/path_clean_count 20000` | 1,961,084,704 | 556,782,410 (−71.6%) | per call 9,309 → 1,941 Ir (std_pipeline's paths) | std_pipeline: 3,814,222,835 → 3,451,254,104 Ir (−9.5%; −21.0% with the csv change) |
+
+http. `read_request_head_buffered_bytes` now asks the buffered reader
+for everything up to the blank line with
+`read_until_bytes_including_bounded(CRLFCRLF, MAX_HEADER_BYTES)`. the
+reader finds the terminator in its own cache and keeps what follows for
+the body and the next request, which is what the byte loop was doing by
+hand. the reader's cap failure is mapped back to `HEADER_LIMIT_MESSAGE`
+through a new `io.is_read_until_limit_error`, so the 431 response and the
+size-limit tests are unchanged, and any other failure passes through as
+before. the reader's `read_until` gained the `errdefer buf.free()` its cap
+path was missing. `tests/cases/test_http_head_read_shapes` pins pipelined
+requests, bodies, heads that straddle a chunk boundary every way they can,
+a truncated stream, an empty stream and oversize heads against the output
+of the byte-at-a-time reader; `tests/leaks/leak_http_head_read` is flat.
+the tls fallback's head reader has the same byte loop over a `tls.Conn`
+and was not in the profile; it is left for its own measurement.
+
+csv. `csv_field_needs_quoting` reads the field's bytes once in place
+(`ord(field[i])`, allocation-free) and replaces the three `contains` calls
+and their two `chr()` temporaries; the string encoder `encode_row` uses the
+same predicate. the leak case written for it found that `encode_bytes`
+returned `out.bytes()`, a copy, and never freed its `ByteBuffer`, so every
+call left a buffer registered for the life of the thread (125 bytes per
+small table); it now returns `take_bytes()`. `tests/cases/test_csv_encode_quoting`
+pins every trigger position and combination byte for byte against the
+three-search encoder.
+
+path. the segment stack `clean()` walks is, at every step, some `..`
+entries a relative path could not climb past followed by the real
+segments, so two counters describe it. `clean_part_count` keeps `depth`
+and `climbs`, reads the path's bytes in place and copies no segment out;
+`clean_count_segment` is gone. `tests/cases/test_path_clean_part_count`
+compares it with `clean()` and `parts()` over every four-segment
+combination from `{a, b, ., .., ""}`, relative and absolute, 1,273 paths.
+
+a note on the path micro-benchmark: its inputs are string literals, and a
+literal has no length header, so every `pith_cstring_byte_at` on it runs a
+`strlen` first (16% of the after arm). std_pipeline's paths are built at
+run time and carry the header. the per-call figure in the table is from
+std_pipeline for that reason.
+
+the wall clock agrees in direction and, as always on this box, is the
+cross-check and not the claim. interleaved, medians of 5 after a
+discarded warm-up, the box busier than on the days the tables above were
+taken: std_pipeline 941 ms before (810-953) and 727 ms after (719-817),
+-23%; the sequential probe's p50 against the two servers, 3,000 requests
+per trial, 174 us before (173-174) and 134 us after (133-136), -23%.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

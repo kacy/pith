@@ -1,0 +1,66 @@
+# the request head read through a buffered bytes reader's bounded read_until.
+#
+# the head reader used to pull one byte at a time; it now asks the reader for
+# everything up to the blank line, capped at the head limit. that moved the
+# per-request buffer, the slice of the reader's cache and the failure path
+# into the reader's read_until, whose buffer is a handle with no destructor
+# and has to be freed by hand on the cap failure. a round reads two keepalive
+# requests, one with a body, and drops the reader; a second, shorter loop
+# drives an over-limit head into the cap failure. a per-round leak in either
+# — a stranded read buffer, a cache slice kept twice — moves the peak
+# between the two round counts.
+import leakprobe as probe
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn crlf() -> String:
+    return chr(13) + chr(10)
+
+# the cursor and the buffered reader over it are both registry handles,
+# and each has to be closed by hand; only the reader's own state is under
+# test here
+fn round(stream: Bytes) -> Int:
+    cursor := io.bytes_reader(stream)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(64)
+    defer reader.free()
+    first := http.read_request_buffered_bytes(reader) catch:
+        return 0
+    second := http.read_request_buffered_bytes(reader) catch:
+        return 0
+    return first.head.len() + second.body.len()
+
+fn flood_round(stream: Bytes) -> Int:
+    cursor := io.bytes_reader(stream)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(4096)
+    defer reader.free()
+    result := http.read_request_buffered_bytes(reader)
+    if result.is_err:
+        return 0
+    return 1
+
+fn main():
+    get := "GET /item?id=7 HTTP/1.1" + crlf() + "Host: x" + crlf() + crlf()
+    post := "POST /submit HTTP/1.1" + crlf() + "Content-Length: 5" + crlf() + crlf() + "hello"
+    stream := bytes.from_string_utf8(get + post)
+    mut big := "x"
+    while big.len() < http.MAX_HEADER_BYTES + 16:
+        big = big + big
+    flood := bytes.from_string_utf8("GET / HTTP/1.1" + crlf() + "X-Big: " + big + crlf() + crlf())
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(stream)
+        i = i + 1
+    # each flood round scans the whole cap, so its count is scaled down;
+    # a leaked read buffer is the size of the cap and shows at once
+    floods := n / 2000
+    i = 0
+    while i < floods:
+        total = total + flood_round(flood)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -1316,7 +1316,9 @@ MEMCHECK_CASES := \
 	tests/cases/test_tls_server_config_release \
 	tests/cases/test_tls12_client_auth \
 	tests/cases/test_metrics_registry \
-	tests/cases/test_sort_engine tests/cases/test_sort_key_once
+	tests/cases/test_sort_engine tests/cases/test_sort_key_once \
+	tests/cases/test_http_head_read_shapes tests/cases/test_csv_encode_quoting \
+	tests/cases/test_path_clean_part_count
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

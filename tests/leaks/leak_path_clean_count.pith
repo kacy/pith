@@ -1,0 +1,28 @@
+# std.os.path.clean_part_count after it stopped building a segment stack.
+#
+# the counter used to collect a list of substrings and drop it; it now
+# reads the path's bytes in place and keeps two counters. a per-call path
+# that stopped allocating is where a retain that a temporary's release
+# used to balance can go wrong, so a round counts a handful of paths that
+# cover every shape — repeated separators, `.`, `..` that pops, `..`
+# that climbs past a relative start, `..` at the root — and a leaked
+# substring or a stranded list moves the peak between the round counts.
+import leakprobe as probe
+import std.os.path as path
+
+fn round(i: Int) -> Int:
+    mut total := path.clean_part_count("data//north/./users/../users/" + i.to_string() + ".json")
+    total = total + path.clean_part_count("../../up/../still/../../out")
+    total = total + path.clean_part_count("/../root/./x/y/../z/")
+    total = total + path.clean_part_count("")
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

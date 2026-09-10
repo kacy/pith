@@ -73,6 +73,7 @@ pub mod terminal;
 pub mod runtime_core;
 pub mod string;
 pub mod string_list;
+pub mod substring;
 pub mod utility;
 
 pub use encoding::*;

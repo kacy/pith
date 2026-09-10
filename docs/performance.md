@@ -330,6 +330,99 @@ afternoon read 6453 ms against 3619 ms. the absolute figures are about
 twice the 2830 ms the safe-point section reports for the same compile;
 the two runs are not comparable, and the paired delta is the figure this
 row exists for.
+### the substring search (2026-09-10)
+
+`pith_cstring_contains` was 10.5 percent of the std pipeline by self
+instruction count, and `pith_string_split_to_list` 10.9 percent of the event
+ledger, because the runtime compared a needle-length slice at every position
+of the haystack: one `bcmp` call per byte, whether or not that byte could
+start a match. `index_of` and `replace` had the same loop. #1099 replaces all four with one search built on
+libc's `memmem`. the output is byte-identical: a golden generated from the old
+runtime over the awkward inputs (an empty needle, a needle longer than the
+haystack, a needle at either end, repeated first bytes, a needle sharing a
+prefix with an earlier non-match, bytes above 0x7f) reproduces under the new
+one, natively and under valgrind, and a randomized cross-check of the new
+search against the naive one over 4000 generated pairs agrees on every pair.
+one input that is not byte-identical is `"aaa".split("aa")`: the old loop kept
+scanning inside the delimiter it had just consumed and aborted the process on
+the second, overlapping match; it now returns `["a"]`.
+
+two searches were measured before one was chosen, both against the old loop on
+the same binaries: `memchr` for the needle's first byte followed by a compare
+of the rest, and `memmem`. instruction counts per call from
+`bench/substring_search.pith`, inclusive of the primitive, callgrind, needle
+`comma` (one byte, no other occurrence in the filler), `word` (seven bytes,
+first byte common in the filler) and `repeat` (a haystack of one byte against
+a needle that differs from it only at the end):
+
+| 2026-09-10, Ir per call | naive | memchr + compare | memmem |
+|---|---:|---:|---:|
+| comma, 12 bytes, at start / middle / end / absent | 98 / 248 / 428 / 430 | 153 / 153 / 153 / 129 | 115 / 115 / 115 / 114 |
+| comma, 80 bytes | 98 / 1,268 / 2,468 / 2,470 | 153 / 167 / 172 / 147 | 115 / 129 / 134 / 132 |
+| comma, 4000 bytes | 98 / 60,068 / 120,068 / 120,070 | 153 / 392 / 585 / 558 | 115 / 354 / 547 / 543 |
+| word, 12 bytes | 108 / 192 / 318 / 322 | 164 / 164 / 164 / 129 | 253 / 271 / 271 / 228 |
+| word, 80 bytes | 108 / 1,620 / 3,174 / 3,178 | 164 / 359 / 619 / 584 | 253 / 319 / 410 / 367 |
+| word, 4000 bytes | 108 / 84,836 / 169,606 / 169,610 | 164 / 12,872 / 25,650 / 25,615 | 253 / 4,347 / 8,434 / 8,389 |
+| repeat, 12 bytes | 108 / 192 / 318 / 322 | 164 / 294 / 489 / 493 | 253 / 289 / 343 / 316 |
+| repeat, 80 bytes | 108 / 1,768 / 3,356 / 3,402 | 164 / 2,659 / 5,099 / 5,137 | 253 / 909 / 1,575 / 1,540 |
+| repeat, 4000 bytes | 108 / 84,836 / 169,606 / 169,610 | 164 / 130,955 / 261,656 / 261,660 | 253 / 36,181 / 72,127 / 72,100 |
+
+the checksum of every cell matches across the three arms. reading it: the old
+loop is cheapest only when the needle is at position zero, and a needle 80
+bytes in already costs it 2,500 instructions. the two replacements are within
+40 instructions of each other on the one-byte shape the workloads have, and
+within 100 on a short haystack with a longer needle, where `memchr` wins.
+where they part is the long haystack and the adversarial one: a seven-byte
+needle absent from 4000 bytes costs `memmem` 8.4k instructions and the
+first-byte scan 25.6k, and a haystack made of the needle's first byte costs
+them 72k and 262k, since the first-byte scan then compares the needle at every
+position, exactly as the old loop did. `memmem` has no such cliff, and on the
+std pipeline as a whole it reads 0.57 percent fewer instructions than the
+first-byte scan (3,843,060,836 against 3,865,161,439), so it is the one that
+stays. what it leaves on the table is the fixed cost of a multi-byte needle
+in a short haystack, about 100 instructions a call; a first-byte scan for
+haystacks under a few dozen bytes would recover that if a profile ever shows
+it mattering.
+
+whole workloads, `tooling/callgrind_ab.sh`, the unmodified runtime against
+the new one:
+
+| 2026-09-10, callgrind | before | after | delta |
+|---|---:|---:|---:|
+| std pipeline, 50k records | 4,370,463,019 | 3,846,570,175 | -12.0% |
+| event ledger, 200k events | 3,392,821,275 | 2,919,539,338 | -13.9% |
+| substring search, 36 cells, 2000 rounds | 4,703,069,294 | 855,520,761 | -81.8% |
+
+in the std pipeline `pith_cstring_contains` goes from 458,901,276 instructions
+(10.50 percent, the figure in #1099) to 68,151,536 (1.77 percent), with
+`memmem` itself at 46,401,120; in the event ledger `pith_string_split_to_list`
+goes from 369,804,712 (10.90 percent) to 9,600,063. `__memcmp_avx2_movbe`,
+which the old loops called once per position, falls from 182,465,421 to
+450,186 in the pipeline and from 176,189,954 to 49,980,659 in the ledger. every
+other entry in each profile is unchanged to the instruction, which is what a
+change confined to one runtime function should look like.
+
+those rows were taken at 25d42d75, the base of the profile in #1099, before
+the std profiling pass above it in this file (#1097) merged. that pass took
+three `contains` calls per field out of the csv encoder at the call site, so
+on the merged tree the pipeline has far fewer searches left to speed up: the
+same pair reads 3,448,402,361 before and 3,412,266,260 after (-1.0%), while
+the event ledger, which #1097 did not touch, reads 3,392,817,605 to
+2,920,641,142 (-13.9%) as before.
+
+wall clock as a cross-check only, medians of 7 interleaved rounds after a
+discarded warm-up, on the shared 2-core box:
+
+| 2026-09-10, medians | before | after |
+|---|---:|---:|
+| std pipeline, 50k records | 487 ms | 412 ms |
+| event ledger, 200k events | 364 ms | 305 ms |
+| substring search, 36 cells, 2000 rounds | 485 ms | 198 ms |
+
+the compiler searches source text with the same primitives, so its output was
+checked too: the ir driver linked against the new runtime emits byte-identical
+ir for `bench/std_pipeline.pith` (1,088,812 bytes) and for its own source
+(5,119,821 bytes).
 
 ### a note on how these are measured
 

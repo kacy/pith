@@ -154,31 +154,28 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
     // string-tagged: the pushes retain and the free path cascades, so the
     // list is the sole owner of its parts
     let list = pith_list_new(8, 1);
+    let push_part = |part: &[u8]| {
+        // empty parts are dropped: "a,,b" splits to two parts, and a leading
+        // or trailing delimiter adds nothing
+        if part.is_empty() {
+            return;
+        }
+        let part_ptr = crate::pith_copy_bytes_to_cstring(part);
+        crate::collections::list::pith_list_push_value(list, part_ptr as i64);
+        crate::pith_cstring_release(part_ptr as *const i8);
+    };
+    // an empty delimiter never matches, so the whole string is one part.
+    // each delimiter is found from the end of the previous one, so a
+    // delimiter that overlaps itself ("aa" in "aaa") is consumed once and
+    // the search resumes after it.
     let mut start = 0;
-    for i in 0..=s_len {
-        let is_delim = if delim_len == 0 {
-            false
-        } else if i + delim_len <= s_len {
-            &s_slice[i..i + delim_len] == delim_slice
-        } else {
-            false
-        };
-
-        if is_delim || i == s_len {
-            let part_len = i - start;
-            if part_len > 0 {
-                let part_ptr = crate::pith_copy_bytes_to_cstring(&s_slice[start..i]);
-                crate::collections::list::pith_list_push_value(list, part_ptr as i64);
-                crate::pith_cstring_release(part_ptr as *const i8);
-            }
-
-            if delim_len > 0 {
-                start = i + delim_len;
-            } else {
-                start = i + 1;
-            }
+    if delim_len > 0 {
+        while let Some(at) = crate::substring::find_from(s_slice, delim_slice, start) {
+            push_part(&s_slice[start..at]);
+            start = at + delim_len;
         }
     }
+    push_part(&s_slice[start..]);
 
     list
 }
@@ -568,26 +565,17 @@ pub unsafe extern "C" fn pith_cstring_replace(
     }
 
     let mut result: Vec<u8> = Vec::with_capacity(s_len);
-    let mut i = 0;
-    // `i + from_len <= s_len`, not `i <= s_len - from_len`: the saturating
-    // form yields 0 when the needle is longer than the haystack, which let
-    // the empty-haystack case slice past the end.
-    while i + from_len <= s_len {
-        if &s_bytes[i..i + from_len] == from_bytes {
-            result.extend_from_slice(to_bytes);
-            i += from_len;
-        } else {
-            result.push(s_bytes[i]);
-            i += 1;
-        }
+    let mut copied = 0;
+    // each match is found from the end of the previous one, so matches never
+    // overlap and the bytes between them are copied in one piece.
+    while let Some(at) = crate::substring::find_from(s_bytes, from_bytes, copied) {
+        result.extend_from_slice(&s_bytes[copied..at]);
+        result.extend_from_slice(to_bytes);
+        copied = at + from_len;
     }
-    while i < s_len {
-        result.push(s_bytes[i]);
-        i += 1;
-    }
+    result.extend_from_slice(&s_bytes[copied..]);
 
-    let out_len = result.len();
-    crate::pith_copy_bytes_to_cstring(&result[..out_len])
+    crate::pith_copy_bytes_to_cstring(&result)
 }
 
 /// Check if a C string is empty (null or zero-length)
@@ -638,5 +626,94 @@ mod tests {
                 -1
             );
         }
+    }
+
+    fn replace(text: &str, from: &str, to: &str) -> String {
+        let t = std::ffi::CString::new(text).unwrap();
+        let f = std::ffi::CString::new(from).unwrap();
+        let o = std::ffi::CString::new(to).unwrap();
+        unsafe {
+            let out = pith_cstring_replace(t.as_ptr(), f.as_ptr(), o.as_ptr());
+            let text = String::from_utf8(cstr_bytes(out).unwrap().to_vec()).unwrap();
+            crate::pith_cstring_release(out);
+            text
+        }
+    }
+
+    fn split(text: &str, delim: &str) -> Vec<String> {
+        use crate::collections::list::{pith_list_get_value, pith_list_len, pith_list_release};
+        let t = std::ffi::CString::new(text).unwrap();
+        let d = std::ffi::CString::new(delim).unwrap();
+        unsafe {
+            let list = pith_string_split_to_list(t.as_ptr(), d.as_ptr());
+            let mut parts = Vec::new();
+            for i in 0..pith_list_len(list) {
+                let part = pith_list_get_value(list, i) as *const i8;
+                parts.push(String::from_utf8(cstr_bytes(part).unwrap().to_vec()).unwrap());
+            }
+            pith_list_release(list);
+            parts
+        }
+    }
+
+    #[test]
+    fn replace_edge_cases() {
+        // empty needle: the text is copied unchanged
+        assert_eq!(replace("abc", "", "x"), "abc");
+        assert_eq!(replace("", "", "x"), "");
+        // needle longer than the text
+        assert_eq!(replace("ab", "abc", "x"), "ab");
+        assert_eq!(replace("", "a", "x"), "");
+        // needle at either end, growing and shrinking
+        assert_eq!(replace("abcXYabc", "abc", "-"), "-XY-");
+        assert_eq!(replace("abc", "abc", ""), "");
+        assert_eq!(replace("abc", "c", "cccc"), "abcccc");
+        // repeated first bytes: matches are consumed left to right and
+        // never overlap
+        assert_eq!(replace("aaaaaaab", "ab", "!"), "aaaaaa!");
+        assert_eq!(replace("aaaa", "a", "bb"), "bbbbbbbb");
+        assert_eq!(replace("aaaa", "aa", "b"), "bb");
+        assert_eq!(replace("aaaaa", "aa", "b"), "bba");
+        assert_eq!(replace("abab", "aba", "X"), "Xb");
+        // a needle sharing a prefix with an earlier non-match
+        assert_eq!(replace("abcabdabcabd", "abd", "_"), "abc_abc_");
+        assert_eq!(replace("ababac", "abac", "Y"), "abY");
+        // bytes above 0x7f
+        assert_eq!(replace("héllo wörld", "ö", "oe"), "héllo woerld");
+    }
+
+    #[test]
+    fn split_edge_cases() {
+        let none: Vec<String> = Vec::new();
+        // an empty delimiter never matches, so the text is one part; an
+        // empty text has no parts at all
+        assert_eq!(split("abc", ""), vec!["abc"]);
+        assert_eq!(split("", ""), none);
+        assert_eq!(split("", ","), none);
+        // delimiter longer than the text
+        assert_eq!(split("ab", "abc"), vec!["ab"]);
+        // delimiters at either end and back to back add no empty parts
+        assert_eq!(split(",a,b,", ","), vec!["a", "b"]);
+        assert_eq!(split("a,,b,,,c", ","), vec!["a", "b", "c"]);
+        assert_eq!(split("abcXYabc", "abc"), vec!["XY"]);
+        assert_eq!(split("abc", "abc"), none);
+        // repeated first bytes
+        assert_eq!(split("aaXaaXaa", "aa"), vec!["X", "X"]);
+        assert_eq!(split("aaaaaaab", "ab"), vec!["aaaaaa"]);
+        // a self-overlapping delimiter is consumed once per match and the
+        // search resumes after it. the old loop kept scanning inside the
+        // match it had just consumed and crashed on the second one.
+        assert_eq!(split("aaa", "aa"), vec!["a"]);
+        assert_eq!(split("aaaa", "aa"), none);
+        assert_eq!(split("aaaaa", "aa"), vec!["a"]);
+        // a delimiter sharing a prefix with an earlier non-match
+        assert_eq!(split("abcabdabcabd", "abd"), vec!["abc", "abc"]);
+        // bytes above 0x7f
+        assert_eq!(split("日本語のテキスト", "の"), vec!["日本語", "テキスト"]);
+        // the path shape
+        assert_eq!(
+            split("data//north/./users/../users/17.json", "/"),
+            vec!["data", "north", ".", "users", "..", "users", "17.json"]
+        );
     }
 }

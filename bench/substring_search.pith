@@ -1,0 +1,138 @@
+# the runtime's substring search, on its own: `contains` and `index_of` over
+# haystacks of three lengths with the needle at the start, in the middle, at
+# the end, or absent. this is the shape behind #1099, where the naive search
+# made `pith_cstring_contains` a tenth of the std pipeline: a delimiter or a
+# quote looked for in a field, a scheme in a url, a separator in a path.
+#
+#   pith build bench/substring_search.pith
+#   ./bench/substring_search                  # every cell, 2000 rounds
+#   ./bench/substring_search 500 long-absent  # one cell, 500 rounds
+#   ./bench/substring_search 2000 all comma   # the one-byte needle only
+#
+# the cells are `<size>-<position>`: sizes short (12 bytes), medium (80) and
+# long (4000); positions start, middle, end and absent. two needles run over
+# every cell: `comma`, a single byte with no other occurrence in the filler,
+# which is the csv and path shape; and `word`, a seven-byte needle whose first
+# byte is common in the filler, so a search that jumps to the first byte has
+# to compare the rest at every one of them. a third needle, `repeat`, is the
+# adversarial case for a first-byte search: a haystack of one repeated byte
+# and a needle that shares all but its last byte with it, so every position
+# is a candidate and every candidate fails at the end of the needle.
+#
+# the checksum is a fixed function of the arguments: the two arms of an a/b
+# must print the same one.
+
+import std.time as time
+
+fn arg_at(argv: List[String], at: Int, fallback: String) -> String:
+    if argv.len() > at:
+        return argv[at]
+    return fallback
+
+fn int_arg(argv: List[String], at: Int, fallback: Int) -> Int:
+    if argv.len() > at:
+        parsed := parse_int(argv[at])
+        if parsed.is_ok:
+            return parsed.ok
+    return fallback
+
+# filler with no comma and no occurrence of "sitting", though its first byte
+# appears three times every 41 bytes.
+fn filler(len: Int) -> String:
+    pattern := "lorem ipsum dolor sit amet consectetur s "
+    mut out := ""
+    while out.len() < len:
+        out = out + pattern
+    return out.substring(0, len)
+
+fn size_of(size: String) -> Int:
+    if size == "short":
+        return 12
+    if size == "medium":
+        return 80
+    return 4000
+
+# a haystack of `len` bytes with `needle` placed at `pos`, or nowhere.
+fn haystack_for(len: Int, pos: String, needle: String) -> String:
+    if pos == "absent":
+        return filler(len)
+    gap := len - needle.len()
+    if pos == "start":
+        return needle + filler(gap)
+    if pos == "end":
+        return filler(gap) + needle
+    left := gap / 2
+    return filler(left) + needle + filler(gap - left)
+
+fn needle_for(kind: String) -> String:
+    if kind == "comma":
+        return ","
+    if kind == "repeat":
+        return "aaaaaab"
+    return "sitting"
+
+fn repeat_haystack(len: Int, pos: String) -> String:
+    if pos == "absent":
+        return "a".repeat(len)
+    gap := len - 7
+    if pos == "start":
+        return "aaaaaab" + "a".repeat(gap)
+    if pos == "end":
+        return "a".repeat(gap) + "aaaaaab"
+    left := gap / 2
+    return "a".repeat(left) + "aaaaaab" + "a".repeat(gap - left)
+
+struct Cell:
+    name: String
+    haystack: String
+    needle: String
+
+fn build_cells(only: String, needle_kind: String) -> List[Cell]:
+    sizes := ["short", "medium", "long"]
+    positions := ["start", "middle", "end", "absent"]
+    kinds := ["comma", "word", "repeat"]
+    mut cells: List[Cell] := []
+    for size in sizes:
+        for pos in positions:
+            name := size + "-" + pos
+            if only != "all" and only != name:
+                continue
+            for kind in kinds:
+                if needle_kind != "all" and needle_kind != kind:
+                    continue
+                needle := needle_for(kind)
+                if kind == "repeat":
+                    cells.push(Cell(name + "-" + kind, repeat_haystack(size_of(size), pos), needle))
+                else:
+                    cells.push(Cell(name + "-" + kind, haystack_for(size_of(size), pos, needle), needle))
+    return cells
+
+# one round over every cell: a contains and an index_of each, folded into
+# the checksum so neither call can be skipped.
+fn run(cells: List[Cell], rounds: Int) -> Int:
+    mut sum := 0
+    mut round := 0
+    while round < rounds:
+        for cell in cells:
+            if cell.haystack.contains(cell.needle):
+                sum = sum + 1
+            sum = (sum * 31 + cell.haystack.index_of(cell.needle) + 2) % 1000000007
+        round = round + 1
+    return sum
+
+fn main():
+    argv := args()
+    rounds := int_arg(argv, 1, 2000)
+    only := arg_at(argv, 2, "all")
+    needle_kind := arg_at(argv, 3, "all")
+    cells := build_cells(only, needle_kind)
+    calls := cells.len() * rounds * 2
+
+    t0 := time.mono_nanos()
+    sum := run(cells, rounds)
+    elapsed_ns := time.mono_nanos() - t0
+
+    mut per_call_ns := elapsed_ns
+    if calls > 0:
+        per_call_ns = elapsed_ns / calls
+    print("cells={cells.len()} rounds={rounds} calls={calls} total_us={elapsed_ns / 1000} per_call_ns={per_call_ns} checksum={sum}")

@@ -62,15 +62,23 @@ zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledge
 ```
 
 Latest measured results on this machine, 200000 events, median of 5
-interleaved trials (2026-08-16; the 2026-08-08 pith total was 570, the
-2026-07-29 total 618):
+interleaved trials (2026-09-10, after the night's std and runtime work; the
+2026-08-16 pith total was 351, the 2026-08-08 total 570, the 2026-07-29
+total 618):
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 120 | 175 | 53 | 0 | 351 |
-| go | 122 | 333 | 14 | 0 | 466 |
-| rust | 28 | 58 | 23 | 0 | 111 |
-| zig | 20 | 102 | 9 | 0 | 132 |
+| pith | 105 | 98 | 56 | 0 | 259 |
+| go | 48 | 315 | 14 | 0 | 380 |
+| rust | 25 | 55 | 22 | 0 | 104 |
+| zig | 18 | 93 | 9 | 0 | 121 |
+
+the 2026-08-16 row for reference: pith 120 / 175 / 53 / 0 / 351, go 122 /
+333 / 14 / 0 / 466. the comparators moved by their usual few percent; pith's
+`parse` fell 175 to 98 because the runtime's typed decode no longer splits
+its field spec per key (#1104) and the line split runs on `memmem` (#1103),
+and by instruction count the whole program is 20.5% cheaper than at the
+start of the night (3.39 G to 2.70 G Ir, same source, both compilers).
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
@@ -144,9 +152,13 @@ bench/http_bench.sh ./bench/http_server_go 8081 120
 
 It prints a per-10s RSS table and a summary line (requests, throughput, and
 RSS start / end / peak). On 60-second spaced runs (2026-08-22 and 23) the
-Pith server holds 14.2-14.4k req/s with ~3 bytes/request of RSS growth — flat
-— while the Go server reads 21k one day and 32k the next on the identical
-protocol, with ~6 mb of growth that reproduces. The earlier figures this
+Pith server held 14.2-14.4k req/s with ~3 bytes/request of RSS growth, which
+is flat, while the Go server read 21k one day and 32k the next on the
+identical protocol, with ~6 mb of growth that reproduces. On 2026-09-10, after the
+request head is read with one bounded `read_until` instead of a byte at a
+time (#1097), the same 60-second run reads 17.3k req/s for Pith (1.04m
+requests, 2.6 mb of growth, ~2.5 bytes/request) against 27.1k for Go, and
+the one-connection probe below holds p50 135 µs. The earlier figures this
 section carried (4648 req/s, "zero growth") were both wrong: the server was
 serial, and it was leaking ~64 bytes/request until #901, which a 30-second
 window could not see.
@@ -250,14 +262,18 @@ an actual in-memory service would avoid rescanning the full catalog on every
 request.
 
 latest measured results on this machine, using the median of 5 trials
-(2026-08-08, direct 200k-iteration runs interleaved):
+(2026-09-10, direct 200k-iteration runs interleaved, two warmups):
 
 | iterations | go total | pith total | ratio | rust total |
 |---|---:|---:|---:|---:|
-| `200000` | `~408 ms` | `~118 ms` | `0.29x` | `~70 ms` |
+| `200000` | `~386 ms` | `~70 ms` | `0.18x` | `~68 ms` |
 
-unchanged from the 2026-07-29 run (go `~436`, pith `~114`, rust `~80`) once
-the comparators are taken into account — all three moved together.
+the 2026-08-08 run read go `~408`, pith `~118`, rust `~70`, and 2026-07-29
+go `~436`, pith `~114`, rust `~80`. the comparators held, so the 118 to 70
+is pith's own: by instruction count the workload is 30% cheaper than at the
+start of 2026-09-10 (1.38 G to 0.96 G Ir), most of it the typed decode's
+field lookup (#1104). pith and rust are now within noise of each other on
+this workload.
 
 the earlier 1m-iteration medians, for the trend:
 
@@ -372,16 +388,21 @@ zig build-exe -O ReleaseFast -femit-bin=bench/chan_fanout_zig bench/chan_fanout.
 
 one million messages, median of 9 trials on this 2-core machine, run
 with nothing else on it. eight tasks on two cores is oversubscribed on
-purpose, and equally so for all four (measured 2026-07-26, after the
-green wake-path work described below):
+purpose, and equally so for all four (measured 2026-09-10; the 2026-07-26
+table it replaces read 438 / 171 / 75 / 135 / 135):
 
 | lang | ms | messages/sec | peak rss |
 |---|---:|---:|---:|
-| pith (`PITH_GREEN=0`, os threads) | 438 | 2.3 m | 3.0 mb |
-| pith (green, the linux default) | 171 | 5.8 m | 3.0 mb |
-| go | 75 | 13.3 m | 2.0 mb |
-| rust | 135 | 7.4 m | 2.4 mb |
-| zig | 135 | 7.4 m | 2.7 mb |
+| pith (`PITH_GREEN=0`, os threads) | 274 | 3.6 m | 3.0 mb |
+| pith (green, the linux default) | 65 | 15.4 m | 3.0 mb |
+| go | 72 | 13.9 m | 3.7 mb |
+| rust | 59 | 16.9 m | 2.4 mb |
+| zig | 297 | 3.4 m | 4.6 mb |
+
+the green row has been bimodal on every rerun since july (fast rounds near
+60-70 ms, slow rounds near 95-100, see docs/performance.md); all nine
+rounds of the 2026-09-10 run landed in the fast mode, so read 65 as the
+fast mode's figure, not as the end of the bimodality.
 
 the 2026-07-29 rerun (medians of 7, interleaved) held the same shape with
 the usual comparator drift: green ~133 (bimodal, best runs at ~69), green
@@ -662,19 +683,25 @@ oom killer starts taking builds out mid-run. go's default cache is on
 disk, which is what you want.
 
 latest measured results on this machine, using the median of 5 trials
-(totals rerun 2026-08-08; the phase breakdown below is from the 2026-07-21
-run and its shape still holds):
+(2026-09-10, direct runs interleaved, two warmups):
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `~319 ms` | `~145 ms` | `~480 ms` | `1.50x` | `3.31x` |
+| `50000` | `~251 ms` | `~139 ms` | `~344 ms` | `1.37x` | `2.47x` |
 
-pith fell from `~576 ms` on 2026-07-29 and closed the gap to go from `1.63x`
-to `1.50x`. this is the noisiest suite on this box — two of five interleaved
-rounds inflated all three languages together — so the medians are taken from
-the rounds where the comparators held their shape.
+pith read `~480 ms` (1.50x go) on 2026-08-08 and `~576 ms` (1.63x) on
+2026-07-29; the comparators reproduce their 2026-08-22 figures (go 249,
+rust 134). by instruction count the pipeline is 20% cheaper than at the
+start of 2026-09-10 (4.28 G to 3.41 G Ir): the csv quoting decision became
+one byte pass and `path.clean_part_count` two counters (#1097), and the
+runtime's substring search runs on `memmem` (#1103). the 2026-09-10 pith
+phases, run directly: csv write 171, csv read 2, transform 170, gzip + hash
+1, total 344. `transform` is now the whole gap to go (38 ms there). this is
+the noisiest suite on this box; the medians are taken from rounds where the
+comparators held their shape.
 
-phase breakdown from the same run:
+phase breakdown from the 2026-07-21 run, whose shape still holds for go and
+rust:
 
 | phase | go | rust | pith |
 |---|---:|---:|---:|
@@ -760,6 +787,24 @@ list. the flat shapes take the runtime's single-pass fill and the
 nested shape its nested twin, which fills the sub-struct in place; the
 list shape parses into the node pool and decodes each element out of
 it, so it answers a different question.
+
+the night's totals for these programs, each compiled by the compiler at the
+start of 2026-09-10 (`0fe497c0`) and by the tip (`099e7e62`, after #1107)
+from the same source, run under callgrind, outputs and checksums identical:
+
+| 2026-09-10, callgrind | start of the night | tip | delta |
+|---|---:|---:|---:|
+| http_head_read, 20000 requests | 8,803,504,445 | 2,099,721,126 | −76.2% |
+| csv_encode, 5000 rows × 10 | 1,437,606,575 | 847,752,217 | −41.0% |
+| path_clean_count, 20000 rounds | 1,942,443,996 | 556,783,020 | −71.3% |
+| substring_search, 36 cells × 2000 | 4,700,683,879 | 855,542,295 | −81.8% |
+| json_decode_shapes small 4 × 20000 | 41,769,731 | 32,787,957 | −21.5% |
+| json_decode_shapes wide 32 × 20000 | 560,059,104 | 201,137,570 | −64.1% |
+| json_decode_shapes nested 4 × 2000 | 1,059,907,351 | 8,408,038 | −99.2% |
+| json_decode_shapes list 32 × 400 | 4,380,580,768 | 4,383,020,015 | +0.06% |
+
+the list shape did not move because a list of structs still goes through
+the node pool by hand (#1110).
 
 ## zstd codec benchmark (pure-pith encoder and decoder)
 

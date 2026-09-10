@@ -469,50 +469,120 @@ pub fn filter_entries[K, V](items: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, 
             result.insert(key, value)
     return result
 
-# return a sorted copy using the provided less function.
-pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
+# ---------------------------------------------------------------
+# Sorting
+# ---------------------------------------------------------------
+
+# stable bottom-up merge sort that returns the *positions* of items in sorted
+# order rather than the elements themselves. std.algo imports this and builds
+# its string-keyed sorts on it, so there is one sort in the standard library
+# and not one per key type.
+#
+# sorting positions is what keeps the ownership cost down: a merge pass moves
+# nothing but an Int, so no element is retained or released while the sort
+# runs, and the caller pays exactly one retain per element when it gathers the
+# answer. the two position buffers are allocated once and swapped between
+# passes, so the scratch cost is O(n) for the whole sort rather than O(n) per
+# pass.
+#
+# ties keep their input order. a merge takes from the right run only when that
+# element sorts strictly before the head of the left run, and the left run is
+# always the earlier half of the input, so equal elements come out in the order
+# they went in.
+#
+# less(a, b) must be a strict order: less(x, x) false, and less(a, b) and
+# less(b, a) never both true. it runs O(n log n) times; the exact number is not
+# part of the contract.
+pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
+    n := items.len()
+    mut src: List[Int] := []
+    mut i := 0
+    while i < n:
+        src.push(i)
+        i = i + 1
+    if n < 2:
+        return src
+    mut dst: List[Int] := []
+    i = 0
+    while i < n:
+        dst.push(0)
+        i = i + 1
+    mut width := 1
+    while width < n:
+        mut lo := 0
+        while lo < n:
+            mid := min_int(lo + width, n)
+            hi := min_int(lo + width + width, n)
+            mut left := lo
+            mut right := mid
+            mut out := lo
+            while left < mid and right < hi:
+                # both positions are read once and reused for the store, so a
+                # merge step costs two index loads on src rather than four.
+                left_pos := src[left]
+                right_pos := src[right]
+                if less(items[right_pos], items[left_pos]):
+                    dst[out] = right_pos
+                    right = right + 1
+                else:
+                    dst[out] = left_pos
+                    left = left + 1
+                out = out + 1
+            while left < mid:
+                dst[out] = src[left]
+                left = left + 1
+                out = out + 1
+            while right < hi:
+                dst[out] = src[right]
+                right = right + 1
+                out = out + 1
+            lo = hi
+        # the pass just written becomes the next pass's input, and the buffer
+        # it read from becomes the next pass's scratch.
+        carry := src
+        src = dst
+        dst = carry
+        width = width + width
+    return src
+
+# gather items into a fresh list in the given position order. the companion to
+# sorted_positions: sorted_positions decides the order without touching an
+# element, and this is the single pass that copies them.
+pub fn gather_positions[T](items: List[T], order: List[Int]) -> List[T]:
     mut result: List[T] := []
-    mut used: Set[Int] := {}
-    while result.len() < items.len():
-        mut found := false
-        mut best_idx := 0
-        for item, i in items:
-            if used.contains(i):
-                continue
-            if not found or less(item, items[best_idx]):
-                best_idx = i
-                found = true
-        if not found:
-            return result
-        result.push(items[best_idx])
-        used.add(best_idx)
+    for pos in order:
+        result.push(items[pos])
     return result
+
+# return a sorted copy using the provided less function.
+#
+# the sort is stable: elements that compare equal keep their input order.
+# items is not modified.
+pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
+    return gather_positions(items, sorted_positions(items, less))
 
 # alias for sorted_by.
 pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
     return sorted_by(items, less)
 
 # return a sorted copy using an integer sort key.
+#
+# key_fn is called exactly once per element, in input order, before any
+# comparison happens; the sort then runs against the cached keys. a key
+# function with side effects therefore sees each element once and no more.
+# earlier versions called it once per element per pass over the remaining
+# input, which at 10000 elements meant 50005000 calls.
+#
+# the sort is stable: elements with equal keys keep their input order.
+# items is not modified.
 pub fn sort_by_key[T](items: List[T], key_fn: fn(T) -> Int) -> List[T]:
-    mut result: List[T] := []
-    mut used: Set[Int] := {}
-    while result.len() < items.len():
-        mut found := false
-        mut best_idx := 0
-        mut best_key := 0
-        for item, i in items:
-            if used.contains(i):
-                continue
-            item_key := key_fn(item)
-            if not found or item_key < best_key:
-                best_idx = i
-                best_key = item_key
-                found = true
-        if not found:
-            return result
-        result.push(items[best_idx])
-        used.add(best_idx)
-    return result
+    mut keys: List[Int] := []
+    for item in items:
+        keys.push(key_fn(item))
+    return gather_positions(items, sorted_positions(keys, int_less))
+
+fn int_less(left: Int, right: Int) -> Bool:
+    return left < right
 
 # return the item with the smallest integer key.
 pub fn min_by[T](items: List[T], key_fn: fn(T) -> Int) -> T!CollectionError:
@@ -760,6 +830,55 @@ test "collection ordering and search helpers keep stable results":
     assert_eq(count_where(items, fn(item: CollectionTestItem) => item.team == "blue"), 2)
     assert_eq(min_by(items, fn(item: CollectionTestItem) => item.score)!.name, "bob")
     assert_eq(max_by(items, fn(item: CollectionTestItem) => item.score)!.name, "alice")
+
+test "sorted_positions is a stable merge sort that leaves its input alone":
+    items := collection_test_items()
+
+    # every record here has the same score, so only the input position decides
+    # the order and the check is on identity rather than on the key.
+    tied := [CollectionTestItem("first", "red", 1), CollectionTestItem("second", "blue", 1), CollectionTestItem("third", "red", 1)]
+    assert_eq(collection_test_names(sorted_by(tied, fn(l: CollectionTestItem, r: CollectionTestItem) => l.score < r.score)), "first,second,third")
+    assert_eq(collection_test_names(sort_by_key(tied, fn(item: CollectionTestItem) => item.score)), "first,second,third")
+
+    # degenerate sizes
+    empty: List[CollectionTestItem] := []
+    assert_eq(sorted_by(empty, fn(l: CollectionTestItem, r: CollectionTestItem) => l.score < r.score).len(), 0)
+    assert_eq(sort_by_key(empty, fn(item: CollectionTestItem) => item.score).len(), 0)
+    one := [CollectionTestItem("solo", "red", 4)]
+    assert_eq(collection_test_names(sort_by_key(one, fn(item: CollectionTestItem) => item.score)), "solo")
+
+    # already ordered, exactly reversed, duplicate heavy
+    assert_eq(sort_by_key([1, 2, 3, 4], fn(v: Int) => v).join(","), "1,2,3,4")
+    assert_eq(sort_by_key([4, 3, 2, 1], fn(v: Int) => v).join(","), "1,2,3,4")
+    assert_eq(sort_by_key([2, 1, 2, 1, 2], fn(v: Int) => v).join(","), "1,1,2,2,2")
+
+    # the input and an alias to it still read the original order
+    source := [3, 1, 2]
+    alias := source
+    ordered := sort_by_key(source, fn(v: Int) => v)
+    assert_eq(source.join(","), "3,1,2")
+    assert_eq(alias.join(","), "3,1,2")
+    assert_eq(ordered.join(","), "1,2,3")
+
+    # a comparator that captures
+    dir := 0 - 1
+    assert_eq(sorted_by([1, 3, 2], fn(l: Int, r: Int) => l * dir < r * dir).join(","), "3,2,1")
+
+    # sizes that straddle the merge widths, so the odd tail of a pass is covered
+    mut wide: List[Int] := []
+    mut i := 0
+    while i < 37:
+        wide.push((i * 7) % 37)
+        i = i + 1
+    ranked := sort_by_key(wide, fn(v: Int) => v)
+    assert_eq(ranked.len(), 37)
+    assert_eq(ranked[0], 0)
+    assert_eq(ranked[36], 36)
+
+    # the positions and the gather that the sorts are built from
+    positions := sorted_positions(items, fn(l: CollectionTestItem, r: CollectionTestItem) => l.score < r.score)
+    assert_eq(positions.len(), 4)
+    assert_eq(collection_test_names(gather_positions(items, positions)), "bob,carol,dave,alice")
 
 test "collection string pipeline helpers compose":
     tokens := " hello there pith ".split(" ")

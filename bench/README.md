@@ -573,6 +573,48 @@ file. A compiler change that should be behaviour-neutral reproduces every
 hash; one that should touch a single shape changes exactly the files that
 have it. Capture before and after, then `diff`.
 
+## generic sort benchmark (std.collections and std.algo)
+
+`bench/generic_sort.pith` measures the standard library's key-based sorts
+against the selection and insertion sorts they replaced. Both arms live in the
+one program: `legacy` is a verbatim copy of the old bodies, `current` calls the
+shipped functions, so a single build measures both and nothing but the sort
+differs. Inputs come from a seeded 31-bit LCG and are built before the clock
+starts; the timed section covers what a caller pays for one call, which is the
+copy, the key extraction and the sort. Each arm folds its result into a
+checksum, and the runner fails if the two arms disagree.
+
+```
+pith build bench/generic_sort.pith
+bench/generic_sort_bench.sh
+TRIALS=9 SIZES="100 1000" bench/generic_sort_bench.sh
+```
+
+The sweep runs sizes 100, 1000 and 10000 over four distributions (sorted,
+reverse, random, many duplicates) and two key kinds (an integer field and a
+zero-padded string), interleaving the arms within each round and reporting the
+median with the observed spread.
+
+Two things are worth knowing before reading the table. The old
+`collections.sort_by_key` called the key function once per element per pass, so
+its cost is dominated by key calls rather than by comparisons, and the speedup
+there grows with n rather than settling. And the old `algo.sort_by_key` was an
+insertion sort that inserted before the first strictly greater element, which
+makes a descending input its best case: it probes exactly one element per
+insertion. That is the one cell the merge sort loses, at 100 and 1000 elements,
+before the insertion cost turns it around again at 10000.
+
+Wall clock on the two-core box moves around; instruction counts through
+`tooling/callgrind_ab.sh` are the number to quote for a per-operation claim.
+Running an arm with a round count of 0 gives the input generation on its own,
+which is identical in both arms and can be subtracted out.
+
+```
+tooling/callgrind_ab.sh \
+  legacy  './bench/generic_sort legacy random int 1000 20' \
+  current './bench/generic_sort current random int 1000 20'
+```
+
 ## std pipeline benchmark
 
 `bench/std_pipeline.*` is a batteries-included data pipeline benchmark. it

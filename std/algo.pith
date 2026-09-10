@@ -5,7 +5,7 @@
 #
 #   from std.algo import sort, sort_desc, sort_strings, binary_search, strcmp
 
-from std.collections import reversed, reversed_strings
+from std.collections import reversed, reversed_strings, sorted_positions
 
 # ===============================================================
 # Sorting
@@ -120,22 +120,44 @@ fn merge_strings(a: List[String], b: List[String]) -> List[String]:
 ## sort a list by a string key drawn from each element, ascending.
 ## ties keep their input order (the sort is stable), so sorting by a
 ## secondary key first gives a compound order.
+##
+## `key` is called exactly once per element, in input order, before any
+## comparison happens; the sort then runs against the cached keys. a key
+## function with side effects therefore sees each element once and no more.
+## the earlier insertion sort re-read the key of every element it probed,
+## which was O(n^2) calls.
+##
+## the sort itself is std.collections.sorted_positions, so this shares one
+## merge sort with the comparator-based and integer-keyed sorts there.
+## `items` is not modified.
 pub fn sort_by_key[T](items: List[T], key: fn(T) -> String) -> List[T]:
-    mut out: List[T] := []
+    mut keys: List[String] := []
     for item in items:
-        item_key := key(item)
-        mut placed := false
-        mut i := 0
-        while i < out.len() and not placed:
-            if item_key < key(out[i]):
-                out.insert(i, item)
-                placed = true
-            i = i + 1
-        if not placed:
-            out.push(item)
+        keys.push(key(item))
+    order := string_key_order(keys)
+    # the gather is written out here rather than calling
+    # std.collections.gather_positions: a generic body cannot call a generic
+    # function in another module — the specialization emits a call the compiler
+    # then fails to resolve at startup. string_key_order below is the same
+    # limitation worked around the other way, by putting the cross-module call
+    # in a body that is not itself generic.
+    mut out: List[T] := []
+    for pos in order:
+        out.push(items[pos])
     return out
 
+fn string_less(left: String, right: String) -> Bool:
+    return left < right
+
+fn string_key_order(keys: List[String]) -> List[Int]:
+    return sorted_positions(keys, string_less)
+
 ## sort by a string key, descending: the reverse of sort_by_key.
+##
+## this reverses a stable ascending sort rather than sorting on the reversed
+## comparison, so elements with equal keys come out in reverse input order.
+## that difference from sort_by_key is observable and is kept deliberately.
+## `key` is called exactly once per element, as in sort_by_key.
 pub fn sort_by_key_desc[T](items: List[T], key: fn(T) -> String) -> List[T]:
     # reverse works in place and returns nothing; returning its result
     # handed back whatever the call left in the register, which happened
@@ -170,6 +192,49 @@ test "algo sorts integers and strings":
     assert_eq(desc[0], 4)
     assert_eq(desc[3], 1)
     assert_eq(names.join(","), "ada,grace,linus")
+
+struct AlgoSortItem:
+    pub name: String
+    pub city: String
+
+fn algo_sort_names(items: List[AlgoSortItem]) -> String:
+    mut parts: List[String] := []
+    for item in items:
+        parts.push(item.city)
+    return parts.join(",")
+
+test "algo sort_by_key is stable and leaves its input alone":
+    # every record shares a key, so the city says which order came out.
+    tied := [AlgoSortItem("same", "oslo"), AlgoSortItem("same", "lima"), AlgoSortItem("same", "kiev")]
+    assert_eq(algo_sort_names(sort_by_key(tied, fn(x: AlgoSortItem) => x.name)), "oslo,lima,kiev")
+    # sort_by_key_desc reverses a stable ascending sort, so equal keys come back
+    # in reverse input order. that is deliberate and is checked here.
+    assert_eq(algo_sort_names(sort_by_key_desc(tied, fn(x: AlgoSortItem) => x.name)), "kiev,lima,oslo")
+
+    empty: List[AlgoSortItem] := []
+    assert_eq(sort_by_key(empty, fn(x: AlgoSortItem) => x.name).len(), 0)
+    one := [AlgoSortItem("solo", "rome")]
+    assert_eq(algo_sort_names(sort_by_key(one, fn(x: AlgoSortItem) => x.name)), "rome")
+
+    words := ["pear", "apple", "fig", "apple"]
+    assert_eq(sort_by_key(words, fn(s: String) => s).join(","), "apple,apple,fig,pear")
+    assert_eq(sort_by_key_desc(words, fn(s: String) => s).join(","), "pear,fig,apple,apple")
+    assert_eq(words.join(","), "pear,apple,fig,apple")
+
+    # a key function that captures
+    suffix := "-z"
+    assert_eq(sort_by_key(words, fn(s: String) => s + suffix).join(","), "apple,apple,fig,pear")
+
+    # a size that straddles the merge widths
+    mut wide: List[String] := []
+    mut i := 0
+    while i < 21:
+        wide.push("k{(i * 5) % 21}")
+        i = i + 1
+    ranked := sort_by_key(wide, fn(s: String) => s)
+    assert_eq(ranked.len(), 21)
+    assert_eq(ranked[0], "k0")
+    assert_eq(ranked[20], "k9")
 
 test "algo compares strings lexicographically":
     assert_eq(strcmp("ada", "ada"), 0)

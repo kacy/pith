@@ -41,6 +41,16 @@ mut module_export_entries: List[String] := []
 mut wildcard_imports: List[String] := []
 mut generic_named_import_entries: List[String] := []
 mut generic_wildcard_import_entries: List[String] := []
+# the two entry lists above, indexed for resolve_generic_declaration_key:
+# a named entry "module<TAB>name<TAB>source" is filed under "module<TAB>name"
+# and a wildcard entry "module<TAB>source" under "module", each key holding
+# its sources in entry order. the lists stay the record (the snapshot carries
+# them, and two starts_with scans read them); the index is rebuilt from them
+# whenever they are replaced wholesale. before this index every miss on a
+# name walked both lists and split each entry, and that walk was a fifth of
+# a self-compile.
+mut generic_named_import_sources: Map[String, List[String]] := {}
+mut generic_wildcard_import_sources: Map[String, List[String]] := {}
 mut current_checker_module_path: String := ""
 mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
@@ -243,6 +253,8 @@ pub fn initialize_checker(file_path: String):
     wildcard_imports = []
     generic_named_import_entries = []
     generic_wildcard_import_entries = []
+    generic_named_import_sources = {}
+    generic_wildcard_import_sources = {}
     current_checker_module_path = ""
     checked_module_paths = {}
     generic_inference_subst = {}
@@ -349,6 +361,8 @@ pub fn process_import_aliases(root_idx: Int):
                     if parts[1] == "*":
                         wildcard_imports.push(mod_path)
                         generic_wildcard_import_entries.push(current_checker_module_path + chr(9) + mod_path)
+                        if current_checker_module_path.len() > 0:
+                            index_wildcard_import_source(current_checker_module_path, mod_path)
                     else:
                         mut pi := 1
                         while pi < parts.len():
@@ -375,6 +389,8 @@ pub fn process_import_aliases(root_idx: Int):
                                     if declared == false:
                                         report_error_with_fix_at(child, "E246", "'" + imported_name + "' is not declared by module '" + mod_path + "'", "import it from the module that defines it")
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
+                                if current_checker_module_path.len() > 0:
+                                    index_named_import_source(current_checker_module_path + chr(9) + imported_name, mod_path)
                             pi = pi + 1
 
 # one type argument, spelled so the spelling names the type. get_type_name
@@ -1459,6 +1475,53 @@ fn generic_base_alias_key(name: String) -> String:
         return ""
     return qualified
 
+# file one named-import source under "module<TAB>name", after the sources
+# already there. the index maps mirror generic_named_import_entries and
+# generic_wildcard_import_entries; see the note at their declaration.
+fn index_named_import_source(key: String, source: String):
+    if generic_named_import_sources.contains_key(key):
+        mut sources := generic_named_import_sources[key]
+        sources.push(source)
+        generic_named_import_sources.insert(key, sources)
+    else:
+        generic_named_import_sources.insert(key, [source])
+
+# file one wildcard-import source under the importing module's path.
+fn index_wildcard_import_source(key: String, source: String):
+    if generic_wildcard_import_sources.contains_key(key):
+        mut sources := generic_wildcard_import_sources[key]
+        sources.push(source)
+        generic_wildcard_import_sources.insert(key, sources)
+    else:
+        generic_wildcard_import_sources.insert(key, [source])
+
+# rebuild both index maps from the entry lists, for the path that replaces
+# the lists wholesale (a snapshot restore). an entry with an empty field is
+# not indexed, which is what the split-based walk this replaced did with
+# it: split drops empty parts, so such an entry never had enough parts to
+# match. the only field that can be empty is the importing module's path,
+# for the main file.
+fn rebuild_generic_import_index():
+    generic_named_import_sources = {}
+    generic_wildcard_import_sources = {}
+    for entry in generic_named_import_entries:
+        parts := entry.split(chr(9))
+        if parts.len() >= 3:
+            index_named_import_source(parts[0] + chr(9) + parts[1], parts[2])
+    for entry in generic_wildcard_import_entries:
+        parts := entry.split(chr(9))
+        if parts.len() >= 2:
+            index_wildcard_import_source(parts[0], parts[1])
+
+# the key generic_declaration_map holds `name` under as seen from the module
+# being checked, or "" when no declaration is visible. the current module's
+# own declaration wins, then a bare one, then in order what the module's
+# named imports of that name and its wildcard imports bring in. the import
+# lookups are by index key, so a miss costs two map probes rather than a
+# walk of every import entry in the program. they are skipped for the main
+# file (module path ""): an entry whose module field is empty never
+# matched, because the split that used to read the entries drops empty
+# parts, and a main-file import resolves through the bare name instead.
 fn resolve_generic_declaration_key(name: String) -> String:
     if current_checker_module_path.len() > 0:
         current_key := module_generic_target_name(current_checker_module_path, name)
@@ -1466,20 +1529,21 @@ fn resolve_generic_declaration_key(name: String) -> String:
             return current_key
     if generic_declaration_map.contains_key(name):
         return name
-    for entry in generic_named_import_entries:
-        parts := entry.split(chr(9))
-        if parts.len() >= 3:
-            if parts[0] == current_checker_module_path and parts[1] == name:
-                imported_key := module_generic_target_name(parts[2], name)
-                if generic_declaration_map.contains_key(imported_key):
-                    return imported_key
-    for entry in generic_wildcard_import_entries:
-        parts := entry.split(chr(9))
-        if parts.len() >= 2:
-            if parts[0] == current_checker_module_path:
-                imported_key := module_generic_target_name(parts[1], name)
-                if generic_declaration_map.contains_key(imported_key):
-                    return imported_key
+    if current_checker_module_path.len() == 0:
+        return ""
+    named_key := current_checker_module_path + chr(9) + name
+    if generic_named_import_sources.contains_key(named_key):
+        named_sources := generic_named_import_sources[named_key]
+        for source in named_sources:
+            imported_key := module_generic_target_name(source, name)
+            if generic_declaration_map.contains_key(imported_key):
+                return imported_key
+    if generic_wildcard_import_sources.contains_key(current_checker_module_path):
+        wildcard_sources := generic_wildcard_import_sources[current_checker_module_path]
+        for source in wildcard_sources:
+            imported_key := module_generic_target_name(source, name)
+            if generic_declaration_map.contains_key(imported_key):
+                return imported_key
     return ""
 
 # whether `name` names a generic function or struct visible from the
@@ -7948,6 +8012,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     wildcard_imports = copy_list(s.wildcard_imports)
     generic_named_import_entries = copy_list(s.generic_named_import_entries)
     generic_wildcard_import_entries = copy_list(s.generic_wildcard_import_entries)
+    rebuild_generic_import_index()
     current_checker_module_path = s.current_checker_module_path
     checked_module_paths = copy_map(s.checked_module_paths)
     generic_inference_subst = copy_map(s.generic_inference_subst)

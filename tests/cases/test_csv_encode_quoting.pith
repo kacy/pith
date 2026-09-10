@@ -1,0 +1,53 @@
+# csv encoding's quoting decision, byte for byte.
+#
+# a field is quoted when it holds a comma, a double quote or a newline,
+# and a quote inside it is doubled. the decision used to be three
+# substring searches; it is now one pass over the field's bytes. every
+# shape the pass has to agree on is pinned here: each trigger alone, at
+# the start, the middle and the end of a field, combined, a carriage
+# return (not a trigger), multi-byte text whose bytes must not be read
+# as ascii, empty fields, spaces, and a row of nothing but triggers. the
+# expected file was generated from the three-search encoder.
+import std.bytes as bytes
+import std.csv as csv
+
+fn show(label: String, row: List[String]):
+    encoded := csv.encode_row(row)
+    # bytes, not text, so a stray control byte cannot hide
+    data := bytes.from_string_utf8(encoded)
+    mut i := 0
+    mut codes := ""
+    while i < data.len():
+        if i > 0:
+            codes = codes + " "
+        codes = codes + data[i].to_string()
+        i = i + 1
+    print(label + ": " + encoded.len().to_string() + " bytes [" + codes + "]")
+
+fn main() -> Int:
+    q := chr(34)
+    nl := chr(10)
+    cr := chr(13)
+    show("plain", ["id", "user-1", "north"])
+    show("comma-mid", ["a,b"])
+    show("comma-start", [",b"])
+    show("comma-end", ["a,"])
+    show("quote-mid", ["a" + q + "b"])
+    show("quote-only", [q])
+    show("quote-both-ends", [q + "x" + q])
+    show("newline-mid", ["a" + nl + "b"])
+    show("newline-end", ["a" + nl])
+    show("cr-only", ["a" + cr + "b"])
+    show("crlf", ["a" + cr + nl + "b"])
+    show("all-three", ["a," + q + nl])
+    show("empty-fields", ["", "", ""])
+    show("spaces", [" a ", "b c", "  "])
+    show("utf8", ["héllo", "日本", "ü,ö"])
+    show("long-clean", ["https://example.com/api/north/users/12345?score=42"])
+    show("mixed-row", ["1", "user 1, region north", q + "quoted" + q, "plain", ""])
+    show("only-triggers", [",", q, nl, "," + q + nl])
+    # the table encoder joins rows with a newline and quotes the same way
+    table := [["id", "note"], ["1", "a,b"], ["2", "plain"], ["3", "say " + q + "hi" + q]]
+    print("table: " + csv.encode(table).len().to_string() + " bytes")
+    print(csv.encode(table))
+    return 0

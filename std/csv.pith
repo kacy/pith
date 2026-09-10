@@ -239,12 +239,28 @@ fn csv_write_escaped_field(out: ByteBuffer, field: String) -> Int!:
     total = total + csv_write_string(out, escaped)!
     return total + out.write_byte(CSV_QUOTE)!
 
+# true when a field has to be quoted: it holds a comma, a quote or a
+# newline. one pass over the field's bytes, read in place. the three
+# substring searches this replaces walked the field three times through a
+# runtime search that compares slice by slice, and built two one-character
+# strings per field to search for; on a ten-column row that was two thirds
+# of the encoder's instructions (docs/performance.md, 2026-09-10).
+fn csv_field_needs_quoting(field: String) -> Bool:
+    n := field.len()
+    mut i := 0
+    while i < n:
+        b := ord(field[i])
+        if b == CSV_COMMA or b == CSV_QUOTE or b == CSV_LF:
+            return true
+        i = i + 1
+    return false
+
 fn encode_row_bytes_to(out: ByteBuffer, row: List[String]) -> Int!:
     mut total := 0
     for field, i in row:
         if i > 0:
             total = total + out.write_byte(CSV_COMMA)!
-        if field.contains(",") or field.contains(chr(CSV_QUOTE)) or field.contains(chr(CSV_LF)):
+        if csv_field_needs_quoting(field):
             total = total + csv_write_escaped_field(out, field)!
         else:
             total = total + csv_write_string(out, field)!
@@ -379,7 +395,10 @@ pub fn encode_bytes(rows: List[List[String]]) -> Bytes:
         encode_row_bytes_to(out, row)
         if i + 1 < rows.len():
             out.write_byte(CSV_LF)
-    return out.bytes()
+    # take_bytes hands the buffer's storage over and frees the buffer;
+    # bytes() would copy and leave the buffer registered for the life of
+    # the thread, which is what every call here used to do
+    return out.take_bytes()
 
 # write rows to a csv file.
 pub fn save(path: String, rows: List[List[String]]) -> Int!:
@@ -403,7 +422,7 @@ pub fn save_bytes_chunked(path: String, rows: List[List[String]], chunk_size: In
 pub fn encode_row(row: List[String]) -> String:
     mut fields: List[String] := []
     for field in row:
-        if field.contains(",") or field.contains(chr(34)) or field.contains(chr(10)):
+        if csv_field_needs_quoting(field):
             # quote the field: escape internal quotes by doubling them
             escaped := field.replace(chr(34), chr(34) + chr(34))
             fields.push(chr(34) + escaped + chr(34))

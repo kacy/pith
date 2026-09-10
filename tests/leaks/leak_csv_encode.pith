@@ -1,0 +1,32 @@
+# csv encoding after the quoting decision became one pass over the field.
+#
+# the encoder used to search each field three times and build two
+# one-character strings per field to search for; it now reads the field's
+# bytes in place. that took allocations out of the per-field path, and a
+# per-field path that stopped allocating is exactly where a retain that
+# used to be balanced by a temporary's release can go wrong. a round
+# encodes a small table whose fields cover every quoting shape — plain,
+# comma, quote, newline, empty — through both the string and the bytes
+# encoder, so a leaked field string or a stranded byte buffer moves the
+# peak between the two round counts.
+import leakprobe as probe
+import std.csv as csv
+
+fn round(i: Int, table: List[List[String]]) -> Int:
+    text := csv.encode(table)
+    data := csv.encode_bytes(table)
+    line := csv.encode_row(["row-{i}", "a,b", "plain"])
+    return text.len() + data.len() + line.len()
+
+fn main():
+    q := chr(34)
+    nl := chr(10)
+    table := [["id", "note", "flag"], ["1", "user 1, region north", "true"], ["2", "say " + q + "hi" + q, ""], ["3", "two" + nl + "lines", "x"]]
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i, table)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

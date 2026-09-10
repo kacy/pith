@@ -10,7 +10,7 @@
 
 from ast import Node, get_node, node_kind
 from ir_ast_helpers import ir_unwrap_pub_node
-from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
+from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
 from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name
@@ -20,8 +20,9 @@ from ir_ownership import ir_rc_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
 from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
-from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names
+from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names, ir_struct_needs_dtor
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
+from ir_tree_cache import ir_cached_decode_call_nodes, ir_root_items
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
@@ -1084,6 +1085,259 @@ fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# --- the nested fill path --------------------------------------------------
+#
+# a struct with a nested struct field used to parse into the node pool and
+# copy its fields out through the object accessors, at about five hundred
+# times the cost of the flat fill above (docs/performance.md, nested json
+# decoding). it now fills in place too: the lowering allocates the whole
+# tree of structs, each with its destructor and each sub-struct stored in
+# its parent's slot, and hands the runtime one spec that carries the
+# sub-struct's layout inside the field's entry, `o<name>(<sub-spec>)`.
+# the runtime recurses into the struct it reads out of the slot, so it
+# never allocates and never learns a destructor's address.
+#
+# the nested spec is a string the decode references with a strref, so
+# like the flat spec it has to be interned before any body is emitted.
+# a struct with a struct field is common in programs that never decode,
+# so the prepass interns a spec only for the structs the program's
+# decode calls target, resolved through the checker's type for each
+# call; a decode whose target is a type parameter (web.parse[T] and the
+# like) cannot be resolved there, so a program with one gets the spec of
+# every struct that has one. either way the specs are appended after
+# everything else the prepass interns, and a program that does not
+# decode gets the string table it always had.
+#
+# both the prepass and the decode build the spec from declarations, with
+# a struct field's written type name resolved through the one map the
+# prepass built (ir_json_nested_decls), so the two strings are the same
+# by construction. before taking this path the decode checks that the
+# declaration each written name resolved to is the one the checker's
+# type for that field points at, and that the spec is in the table, and
+# takes the node-pool path otherwise (a same-named struct in two
+# modules, an aliased or generic type, a target the prepass missed).
+
+# bare struct name -> declaration node index, over every root of the
+# program; a name declared more than once is left out so it resolves to
+# nothing rather than to the wrong one.
+pub mut ir_json_nested_decls: Map[String, Int] := {}
+
+fn ir_json_nested_decl_index(type_name: String) -> Int:
+    if ir_json_nested_decls.contains_key(type_name):
+        return ir_json_nested_decls[type_name]
+    return 0 - 1
+
+fn ir_json_is_struct_decl_kind(kind: String) -> Bool:
+    return kind == "struct_decl" or kind == "struct"
+
+fn ir_json_bare_decl_name(node: Node) -> String:
+    if node.value.contains("["):
+        return node.value.substring(0, node.value.index_of("["))
+    return node.value
+
+# the nested spec of a declaration: the flat spec's `<type><name>` entries
+# with a struct field written as `o<name>(<sub-spec>)`; parentheses, not
+# braces, because an IR string literal reads `}}` as one escaped brace
+# and a doubly nested spec ends in two. "" when a field is
+# neither a scalar nor a struct this map resolves, or the nesting runs
+# deeper than any real shape; such a struct has no nested spec and its
+# decode takes the node-pool path.
+pub fn ir_json_decode_nested_spec_from_decl(decl: Node, depth: Int) -> String:
+    if depth > 16:
+        return ""
+    mut spec := ""
+    mut first := true
+    for child in decl.children:
+        fnode := ir_unwrap_pub_node(child)
+        if fnode.kind == "field" and fnode.children.len() > 0:
+            if not first:
+                spec = spec + ","
+            first = false
+            fname := fnode.value.split(" ")[0]
+            type_node := get_node(fnode.children[0])
+            type_char := ir_json_type_name_char(type_node.value)
+            if type_char.len() > 0:
+                spec = spec + type_char + fname
+                continue
+            if type_node.kind != "type":
+                return ""
+            sub_idx := ir_json_nested_decl_index(type_node.value)
+            if sub_idx < 0:
+                return ""
+            sub_spec := ir_json_decode_nested_spec_from_decl(get_node(sub_idx), depth + 1)
+            if sub_spec.len() == 0:
+                return ""
+            spec = spec + "o" + fname + "(" + sub_spec + ")"
+    return spec
+
+fn ir_json_decl_has_struct_field(decl: Node) -> Bool:
+    for child in decl.children:
+        fnode := ir_unwrap_pub_node(child)
+        if fnode.kind == "field" and fnode.children.len() > 0:
+            type_node := get_node(fnode.children[0])
+            if type_node.kind == "type" and ir_json_type_name_char(type_node.value).len() == 0:
+                return true
+    return false
+
+fn ir_json_intern_nested_spec_of(decl_idx: Int):
+    node := get_node(decl_idx)
+    if ir_json_is_struct_decl_kind(node.kind) and ir_json_decl_has_struct_field(node):
+        spec := ir_json_decode_nested_spec_from_decl(node, 0)
+        if spec.len() > 0:
+            ir_str(spec)
+
+## the string prepass step for the nested fill: build the declaration map
+## over `roots`, then intern the nested spec of every struct a decode call
+## in the program targets, or of every struct that has one when a call's
+## target cannot be resolved before specialization. called after
+## everything else the prepass interns, so the strings it adds only ever
+## append to the table.
+pub fn ir_json_intern_nested_specs(roots: List[Int]):
+    ir_json_nested_decls = {}
+    mut ambiguous: List[String] := []
+    for root in roots:
+        for item_idx in ir_root_items(root):
+            node := get_node(item_idx)
+            if not ir_json_is_struct_decl_kind(node.kind):
+                continue
+            name := ir_json_bare_decl_name(node)
+            if ir_json_nested_decls.contains_key(name):
+                ambiguous.push(name)
+            else:
+                ir_json_nested_decls.insert(name, item_idx)
+    for name in ambiguous:
+        ir_json_nested_decls.remove(name)
+    mut targets: List[Int] := []
+    mut unresolved := false
+    for root in roots:
+        for call_idx in ir_cached_decode_call_nodes(root):
+            ret_tid := c_get_expr_type(call_idx)
+            mut resolved := false
+            if ret_tid >= 0:
+                ret_info := get_type_info(ret_tid)
+                if ret_info.kind == "result" and get_type_info(ret_info.inner).kind == "struct":
+                    # a struct target the map does not know by its bare name
+                    # gets no spec, and its decode takes the node-pool path
+                    resolved = true
+                    target_idx := ir_json_nested_decl_index(get_type_info(ret_info.inner).name)
+                    if target_idx >= 0:
+                        targets.push(target_idx)
+            if not resolved:
+                unresolved = true
+    if unresolved:
+        for root in roots:
+            for item_idx in ir_root_items(root):
+                ir_json_intern_nested_spec_of(item_idx)
+        return
+    for target_idx in targets:
+        ir_json_intern_nested_spec_of(target_idx)
+
+# the nested spec a decode of `target_info` hands the runtime, or "" when
+# the target does not take the nested fill: it must have a struct field,
+# be of the fill shape at every depth, and its spec must already be in
+# the string table.
+fn ir_json_decode_nested_spec_for(target_info: TypeInfo) -> String:
+    if not ir_struct_has_nested_decode_fields(target_info):
+        return ""
+    if not ir_json_decode_nested_fill_shape(target_info, 0):
+        return ""
+    spec := ir_json_decode_nested_spec_from_decl(get_node(ir_struct_decl_nodes[target_info.name]), 0)
+    if spec.len() == 0 or not ir_str_interned(spec):
+        return ""
+    return spec
+
+# true when the target is of the nested fill's shape: every field at
+# every depth is a required scalar or a struct of the same shape, the
+# declaration's fields line up with the checker's type, and each struct
+# field's written name resolves to the declaration its type points at.
+fn ir_json_decode_nested_fill_shape(target_info: TypeInfo, depth: Int) -> Bool:
+    if depth > 16:
+        return false
+    n := target_info.fields.len()
+    if n == 0 or n > 63:
+        return false
+    if not ir_struct_decl_nodes.contains_key(target_info.name):
+        return false
+    decl := get_node(ir_struct_decl_nodes[target_info.name])
+    mut i := 0
+    for child in decl.children:
+        fnode := ir_unwrap_pub_node(child)
+        if fnode.kind != "field":
+            continue
+        if fnode.children.len() == 0:
+            return false
+        if i >= n or i >= target_info.field_types.len():
+            return false
+        field_name := target_info.fields[i]
+        if fnode.value.split(" ")[0] != field_name:
+            return false
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        if ir_optional_inner_tid(field_tid) >= 0:
+            return false
+        if ir_struct_field_default_node(target_info.name, field_name) >= 0:
+            return false
+        type_node := get_node(fnode.children[0])
+        nested_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_tid >= 0:
+            if type_node.kind != "type":
+                return false
+            nested_info := get_type_info(nested_tid)
+            resolved := ir_json_nested_decl_index(type_node.value)
+            if resolved < 0 or not ir_struct_decl_nodes.contains_key(nested_info.name):
+                return false
+            if ir_struct_decl_nodes[nested_info.name] != resolved:
+                return false
+            if not ir_json_decode_nested_fill_shape(nested_info, depth + 1):
+                return false
+        elif ir_json_type_name_char(type_node.value).len() == 0 or ir_json_type_name_char(type_node.value) != ir_json_field_type_char(field_tid):
+            return false
+        i = i + 1
+    return i == n
+
+# allocate the struct tree the nested fill writes into: the struct, its
+# destructor when the type needs one, and each struct field's own tree
+# stored into its slot. the returned struct owns everything under it from
+# here on, so one release on any failure drops the whole tree.
+fn ir_emit_json_nested_alloc(target_info: TypeInfo) -> Int:
+    struct_r := ir_reg()
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + target_info.fields.len().to_string())
+    ir_emit_call1(struct_r, "__struct_alloc", "struct:" + target_info.name, count_r)
+    if ir_struct_needs_dtor(target_info.name):
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " __dtor_" + ir_struct_base_name(target_info.name))
+        ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + dtor_r.to_string())
+    for field_name, i in target_info.fields:
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        nested_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_tid >= 0:
+            sub_r := ir_emit_json_nested_alloc(get_type_info(nested_tid))
+            ir_emit("sstore " + struct_r.to_string() + " " + i.to_string() + " " + sub_r.to_string())
+    return struct_r
+
+# the nested fast path: allocate the tree, hand the runtime the input,
+# the nested spec and the root, and take the result box it returns. the
+# runtime releases the tree itself on any failure, so there is no branch
+# here; `check_utf8` is what a bytes input got from the node path, which
+# validated it before parsing.
+fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: String, check_utf8: Bool) -> Int:
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    struct_r := ir_emit_json_nested_alloc(target_info)
+    spec_r := ir_reg()
+    ir_emit("strref " + spec_r.to_string() + " " + ir_str(spec))
+    flag_r := ir_reg()
+    mut flag := 0
+    if check_utf8:
+        flag = 1
+    ir_emit("iconst " + flag_r.to_string() + " " + flag.to_string())
+    result_r := ir_reg()
+    ir_emit_call_text(result_r, "pith_json_fill_struct_nested", "tuple", 4, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string() + " " + flag_r.to_string())
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 ## emit the json decode map call sequence.
 pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     if ir_json_decode_all_required_scalar(target_info):
@@ -1261,6 +1515,20 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     has_optional_fields := ir_struct_has_optional_fields(target_info)
     has_default_fields := ir_struct_has_default_fields(target_info)
     has_nested_fields := ir_struct_has_nested_decode_fields(target_info)
+    # a nested shape of required scalars and structs fills in place, like
+    # the flat one below; anything else with a struct field parses into
+    # the node pool.
+    nested_spec := ir_json_decode_nested_spec_for(target_info)
+    if nested_spec.len() > 0:
+        mut fill_input_r := input_r
+        if text_input:
+            converted_r := ir_reg()
+            ir_emit_call1(converted_r, "std_bytes_from_string_utf8", "bytes", input_r)
+            fill_input_r = converted_r
+        fill_r := ir_emit_json_decode_fill_nested(fill_input_r, target_info, nested_spec, not text_input)
+        if owns_input:
+            ir_rc_release_reg(fill_input_r, "bytes")
+        return fill_r
     if has_nested_fields:
         temp_name := ir_new_temp_name("json_decode_nested")
         ir_var_types.insert(temp_name, "tuple")

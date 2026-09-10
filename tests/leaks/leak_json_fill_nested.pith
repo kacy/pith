@@ -1,0 +1,80 @@
+# typed json.decode of a struct with a nested struct field, the shape
+# leak_json_fill_struct leaves out.
+#
+# a struct whose field is itself a struct decodes through the runtime's
+# nested filler, which mints the strings of every level into a tree of
+# structs the lowering allocated ahead of the call. every string has to
+# end up owned by exactly the struct that holds it, at every depth, a
+# repeated nested key has to release what its first occurrence minted,
+# and an error part way down has to release what was already built.
+# before that filler existed this shape parsed into the node pool and
+# copied its scalars out, and the pool stranded what it parsed: on the
+# unmodified runtime this case read 84,128 kb at 200k rounds and
+# 327,872 kb at 800k, about 100 bytes per decode.
+#
+# a round decodes a struct with one nested field from bytes and from
+# text, a doubly nested one with a repeated nested key, and a document
+# that fails inside the sub-object after strings were minted at both
+# levels. a list of structs is not in the round: json.decode[T] has no
+# list field, so a list is decoded element by element out of a parsed
+# array, and the parse itself strands about 64 bytes a round with
+# nothing decoded at all (json.parse followed by pool_restore), which is
+# the pool's own defect and not this filler's.
+import leakprobe as probe
+import std.json as json
+import std.bytes as bytes
+
+pub struct Inner:
+    pub city: String
+    pub zip: Int
+
+pub struct Nested:
+    pub name: String
+    pub addr: Inner
+    pub score: Int
+
+pub struct Geo:
+    pub lat: Int
+    pub label: String
+
+pub struct Site:
+    pub code: String
+    pub geo: Geo
+
+pub struct Deep:
+    pub owner: String
+    pub site: Site
+    pub level: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn round(i: Int) -> Int:
+    inner := obj(q("city") + ":" + q("paris" + i.to_string()) + "," + q("zip") + ":" + i.to_string())
+    nested := obj(q("name") + ":" + q("n" + i.to_string()) + "," + q("addr") + ":" + inner + "," + q("score") + ":42")
+    geo := obj(q("lat") + ":" + i.to_string() + "," + q("label") + ":" + q("g" + i.to_string()))
+    site := obj(q("code") + ":" + q("s" + i.to_string()) + "," + q("geo") + ":" + geo)
+    deep := obj(q("owner") + ":" + q("o" + i.to_string()) + "," + q("site") + ":" + site + "," + q("site") + ":" + site + "," + q("level") + ":3")
+    failing := obj(q("name") + ":" + q("first") + "," + q("addr") + ":" + obj(q("city") + ":" + q("x") + "," + q("zip") + ":" + q("bad")) + "," + q("score") + ":1")
+    a := json.decode[Nested](bytes.from_string_utf8(nested)) catch Nested("", Inner("", 0), 0)
+    b := json.decode_text[Nested](nested) catch Nested("", Inner("", 0), 0)
+    c := json.decode_text[Deep](deep) catch Deep("", Site("", Geo(0, "")), 0)
+    e := json.decode_text[Nested](failing)
+    mut v := a.addr.city.len() + b.addr.zip + c.site.geo.label.len() + c.level
+    if e.is_err:
+        v = v + e.err.message.len()
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

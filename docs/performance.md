@@ -933,6 +933,105 @@ large frame, and three string allocations. that is linear in the bytes
 and the fields now; the next thing on this path is the node-pool decode
 beside it, not this function.
 
+## typed json decoding: the nested fill (2026-09-10)
+
+the flat fill above did not cover a struct with a nested struct field.
+`json.decode[T]` of such a struct parsed the whole document into
+std.json's node pool, read the fields back through the object
+accessors, recursed into a `decode_object` specialization for the
+sub-struct, and rolled the pool back. `bench/json_decode_shapes
+nested 4 2000` put that at 530,232 instructions per round against the
+flat shape's 4,400, and the pool stranded about 100 bytes per decode on
+top (tests/leaks/leak_json_fill_nested: 84,128 kb at 200k rounds,
+327,872 kb at 800k, on the runtime before this change).
+
+the before arm's profile is all node pool. 23% is `hash_one` and 14%
+the sip hasher: the pool's maps, keyed by node id and by
+`"handle:slot"` strings. 13% is `tls_globals_get` and 6%
+`pith_tls_get_or_init`, because every one of those maps is a
+thread-local looked up on each access. 8% is `pith_cstring_release`
+and 7% `free`, the slot keys and copied strings dying. reading the
+three fields is a rounding error.
+
+### what changed
+
+the nested shape fills in place too. the decode lowering
+(`ir_emit_json_decode_call`) allocates the whole tree of structs ahead
+of the call, each with its destructor attached and each sub-struct
+already stored in its parent's slot, and hands the runtime one spec
+that carries the sub-struct's layout inside the field's entry:
+`sname,oaddr(scity,izip),iscore`. `pith_json_fill_struct_nested` walks
+the object once, matches keys at a cursor the way the flat fill does,
+and on an `o` field recurses into the struct it reads out of the slot.
+it never allocates a struct and never learns a destructor's address; on
+any failure it releases the root and the destructors drop the rest.
+
+the values, the messages and the accepted grammar had to stay what
+this shape already had, which is the node parser's. the nested filler
+therefore mirrors that parser rather than the flat one: escapes are decoded (in keys too), a
+missing colon or comma is accepted, an object or array may run off the
+end of the input, a float is rejected for an int field, an int past the
+parser's overflow bound fails the whole parse, a repeated key reads
+last-wins, and the messages name the field's kind ("missing string
+field: city") in the parser's order: any malformed byte is "invalid
+json object" before a field is judged, then the fields in declaration
+order, depth first. tests/cases/test_json_fill_nested_shapes pins
+fifty-seven lines of that against output generated on the runtime
+before the change, under memcheck.
+
+the spec is a string a body references, so it has to be in the string
+table before any body is emitted, and the string prepass cannot see
+which struct a decode targets. it now notes every `x.decode[T]` call
+during the walk it already makes for string literals, resolves each
+call's type through the checker, and interns the nested spec for the
+targets it finds; a program with a decode whose target is a type
+parameter (`web.parse[T]`) gets the spec of every struct that has one.
+the specs are appended after everything else the prepass interns, so a
+program that does not decode keeps the string table it had, and the
+decode checks the spec is in the table before taking the path.
+
+### by how much
+
+same instrument as the flat fill: `tooling/callgrind_ab.sh`, the before
+arm the compiler and runtime at `a811e520` (what merged as #1104), the
+after arm this branch, both building the same bench source. per-round
+figures are the whole run divided by the rounds; the fill's own cost is
+the sum of its symbols (`pith_json_fill_struct_nested`,
+`nested_fill_object` at both depths, `nested_read_string`).
+
+| shape | size | per round, before → after | fill's own cost per decode | whole run |
+|---|---:|---|---|---|
+| nested (3 fields, one nested) | 4 | 530,232 → 4,206 | 2,548 | 1,060,463,011 → 8,412,319 (−99.2%) |
+| nested | 32 | 727,767 → 4,765 | 3,108 | 1,455,533,554 → 9,529,169 (−99.3%) |
+| nested | 256 | 2,306,515 → 9,613 | 7,588 | 4,613,029,890 → 19,225,972 (−99.6%) |
+| list (2000 / 400 / 50 rounds) | 4 / 32 / 256 | not this path | — | 2,753,685,378 / 4,382,866,397 / 4,470,290,609, unchanged to ±0.00% |
+
+the list shape decodes each element out of a parsed array with
+`decode_object`, which takes a node handle and cannot fill in place, so
+it is unchanged. the flat workloads are unchanged too: their decode
+targets have no struct field and never reach the new path.
+
+| workload | flat fill self, before → after | whole workload |
+|---|---|---|
+| catalog_workload 4000 | 4,216,000 → 4,216,000 | 34,825,418 → 34,825,331 Ir (−0.00%) |
+| event_ledger 200000 | 229,422,230 → 229,422,230 | 3,170,321,602 → 3,169,220,680 Ir (−0.03%) |
+
+the flat fill's source is untouched and its cost is the same to the
+instruction. an earlier cut of the nested filler shared the flat one's
+string scanner and moved the flat fill by a few thousand instructions
+through inlining alone, so the nested filler now scans with its own
+loop. checksums match across arms in every row.
+
+the leak case reads 3,004 kb at 200k rounds and 2,888 kb at 800k on this
+branch, against 84,128 and 327,872 before.
+
+what is left is a list of structs. `json.decode[T]` has no list field,
+so a list is decoded element by element out of a parsed array, and that
+parse strands about 64 bytes a round by itself: `json.parse` followed
+by `pool_restore`, with nothing decoded, read 6,000 kb at 50k rounds and
+15,456 kb at 200k. that is the pool's defect and the next thing on this
+path.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

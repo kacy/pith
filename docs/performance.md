@@ -729,6 +729,117 @@ taken: std_pipeline 941 ms before (810-953) and 727 ms after (719-817),
 -23%; the sequential probe's p50 against the two servers, 3,000 requests
 per trial, 174 us before (173-174) and 134 us after (133-136), -23%.
 
+## typed json decoding: the flat fill (2026-09-10)
+
+the largest runtime row left in the std profiling pass above was
+`pith_json_fill_struct`: 33.7% self of catalog_workload at 4000
+iterations and 14.9% self of event_ledger at 200000 events. it is the
+single-pass decoder behind `json.decode[T]` and `json.decode_text[T]`
+for a flat struct whose fields are all required scalars: the emitter
+hands it the object bytes, a pre-allocated struct, and one interned
+literal per struct type, the field spec `<type><name>,...` in slot
+order, and it fills the struct in place and returns a mask of the slots
+it wrote. same instrument as the pass above, both arms built by the
+same compiler at `f75f26a8`, the before arm linked against the
+unmodified runtime archive; the after arm's numbers include
+`read_key_end`, which is the key scan split out into its own symbol.
+
+reproduced first: 14,572,000 Ir self (33.66%) of 43,298,007 for
+catalog_workload, 3,643 per decode of a six-field struct;
+504,822,230 (14.88%) of 3,392,821,004 for event_ledger, 2,524 per
+decode of a four-field struct with one unknown key.
+
+### where the instructions went
+
+callgrind at instruction level (`--dump-instr=yes`, the hot blocks mapped
+back through `objdump`) split the 3,643 per catalog decode three ways.
+
+42% went to walking the spec for every key. the lookup was
+`spec.split(',')` per key with a slice compare per field, so a key in
+slot k walked the bytes of fields 1..k one at a time, through the
+iterator's closure, before it could compare anything: 166 spec bytes per
+six-key object, at about 8 instructions per byte. this is the part that
+is quadratic in the field count. a twenty-field struct paid 18,007 per
+decode in the fill alone, 82% of it here.
+
+28% went to scanning the key bytes. `read_string_end` inlined into the
+field loop came out as a loop carrying eight induction variables, 22
+instructions per key byte, against 4 or 5 for the same function called
+out of line on a string value.
+
+the rest is per-key glue, the value parsers and the string copies, which
+is the work the function exists to do. the spec's length was not a
+factor: `pith_cstring_len` on the literal is already a `strlen` call,
+recognized by the optimizer.
+
+### what changed
+
+the spec is not split. a key is compared in place against the field at
+a cursor, the field after the one that matched last, and only on a miss
+is the spec walked from the start, first byte inline before any memcmp.
+an encoder writes keys in declaration order, so the cursor hits on one
+compare and the spec is never walked; keys in any other order still
+resolve, one walk per out-of-order key. the key scan is its own
+`#[inline(never)]` function so it keeps the plain loop. the spec format
+and the emitter are untouched, and so is the mask contract with the
+caller.
+
+two ownership holes in the same function came out of the leak case
+written for it. a repeated key overwrote a string slot without releasing
+the first occurrence's string, which was then nobody's; it is released
+now. and the error struct `pith_json_decode_missing_error` builds for a
+missing field carried no destructor, so its message string was stranded
+on every failed decode; it now has one. neither changes any output.
+
+### by how much
+
+`bench/json_decode_shapes <shape> <size> <rounds>`: a three-field struct,
+a twenty-field struct, a struct with a nested struct, and an array of
+small objects decoded one element at a time. `size` is the string value
+width for the flat shapes and the element count for the list. per-call
+figures are the fill's self cost (plus the key scan, in the after arm)
+divided by the rounds; inclusive adds the string copies and the parsers
+it calls.
+
+| shape | size | fill per call, before → after | inclusive per call | whole run |
+|---|---:|---|---|---|
+| small (3 fields) | 4 | 1,168 → 542 (−53.6%) | 1,450 → 995 (−31.4%) | 41,891,869 → 32,791,847 (−21.7%) |
+| small | 32 | 1,168 → 542 | 1,755 → 1,272 (−27.5%) | 48,008,666 → 38,348,799 (−20.1%) |
+| small | 256 | 1,168 → 542 | 4,237 → 3,530 (−16.7%) | 97,786,964 → 83,646,801 (−14.5%) |
+| wide (20 fields) | 4 | 18,007 → 3,303 (−81.7%) | 24,215 → 6,459 (−73.3%) | 517,461,868 → 162,341,824 (−68.6%) |
+| wide | 32 | 18,007 → 3,303 | 26,350 → 8,398 (−68.1%) | 560,181,505 → 201,141,719 (−64.1%) |
+| wide | 256 | 18,007 → 3,303 | 43,724 → 24,204 (−44.6%) | 907,814,933 → 517,414,871 (−43.0%) |
+| nested (2000 rounds) | 4 / 32 / 256 | not this path | — | 1,060,420,752 / 1,455,612,979 / 4,613,063,408, unchanged to ±0.00% |
+| list (2000 / 400 / 50 rounds) | 4 / 32 / 256 | not this path | — | 2,753,795,870 / 4,383,023,336 / 4,470,490,540, unchanged to ±0.00% |
+
+the fill's own cost does not depend on the value width in either arm:
+the per-call column is the same at every size, and the inclusive column
+grows only by the scan and copy of the value. the nested and list shapes parse into the
+node pool and never reach this function; their rows are there to show
+that, and as a reminder of the gap: a nested three-field decode costs
+about 530,000 instructions against the flat shape's 1,000, which is the
+next thing to look at on this path.
+
+the workloads:
+
+| workload | fill self, before → after | per decode | whole workload |
+|---|---|---|---|
+| catalog_workload 4000 | 14,572,000 → 6,272,000 (−57.0%) | 3,643 → 1,568 | 43,297,608 → 34,825,924 Ir (−19.6%) |
+| event_ledger 200000 | 504,822,230 → 296,422,230 (−41.3%) | 2,524 → 1,482 | 3,392,820,888 → 3,169,220,724 Ir (−6.6%) |
+
+checksums and the hmac digest match across arms. the wall clock, as
+always here, is the cross-check and not the claim: interleaved, medians
+of 7 after a discarded warm-up, on a box another job was sharing,
+catalog_workload at 200000 iterations 231 ms before (104-237) and 203 ms
+after (77-215), −12%; event_ledger 743 ms before (618-956) and 731 ms
+after (602-898), −1.6%, with the ranges as wide as the effect.
+
+what is left in the 1,568: 86 per key for the key scan, about 175 per
+key for the in-place compare, the value parsers and the spills of a
+large frame, and three string allocations. that is linear in the bytes
+and the fields now; the next thing on this path is the node-pool decode
+beside it, not this function.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

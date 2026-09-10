@@ -130,6 +130,7 @@ cases=(
   tests/leaks/leak_widened_store
   tests/leaks/leak_arena_truncate
   tests/leaks/leak_json_decode_struct
+  tests/leaks/leak_json_fill_struct
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_tls12_client_auth

@@ -2,16 +2,23 @@
 #
 # `spinner` runs a tight arithmetic loop with no channel, await, or i/o — nothing
 # that yields cooperatively — and only stops once every reporter has checked in.
-# `report` bumps a shared atomic counter once. under a single worker
-# (PITH_GREEN_WORKERS=1) and WITHOUT preemption the spinner holds the only worker
-# forever: the reporters never run, the counter never reaches n, and the program
-# hangs. with preemption (a build compiled `PITH_GREEN_PREEMPT=1`, run under
-# `PITH_GREEN=1`) the spinner is descheduled at its loop back-edge, the worker
-# runs the reporters, and once the counter reaches n the spinner sees it and
-# returns.
+# `report` bumps a shared atomic counter once. without safe-points a spinner
+# holds its worker forever: the reporters never run, the counter never reaches n,
+# and the program hangs. with safe-points (the default, off only in a build made
+# with `PITH_GREEN_PREEMPT=0`) each spinner is descheduled at its loop back-edge,
+# the worker runs the reporters, and once the counter reaches n the spinners see
+# it and return.
+#
+# there is one spinner per worker the run could have, so the hang does not depend
+# on the worker count: at any count up to `SPINNERS` every worker is holding a
+# spinner and no reporter can be scheduled. that is the shape that wedged the
+# std.metrics scrape-during-writes test about one run in four — a watcher looping
+# on a value that the tasks it was starving had to publish.
 #
 # the printed total is the fixed counter value n, independent of scheduling, so
 # the output is byte-identical to the os-thread backend.
+
+SPINNERS := 8
 
 fn report(counter: AtomicInt):
     # bump the shared counter once. a compare-and-set retry keeps it correct even
@@ -35,14 +42,19 @@ fn spinner(counter: AtomicInt, target: Int) -> Int:
 fn main():
     n := 50
     counter := AtomicInt(0)
-    # spawn the compute hog first so the single worker picks it up first and would
-    # monopolize it without preemption.
-    hog := spawn spinner(counter, n)
+    # spawn the compute hogs first so every worker picks one up before it sees a
+    # reporter, and would monopolize it without preemption.
+    mut hogs: List[Task[Int]] := []
+    mut h := 0
+    while h < SPINNERS:
+        hogs.push(spawn spinner(counter, n))
+        h = h + 1
     mut i := 0
     while i < n:
         spawn report(counter)
         i = i + 1
-    # the hog returns only once the counter has reached n — i.e. once every
-    # reporter has run — so awaiting it is our join for the whole fan-out.
-    await hog
+    # a hog returns only once the counter has reached n — i.e. once every
+    # reporter has run — so awaiting them is our join for the whole fan-out.
+    for hog in hogs:
+        await hog
     print(counter.load().to_string())

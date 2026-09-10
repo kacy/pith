@@ -527,11 +527,11 @@ a tight loop is several times slower than it was — the run finishes sooner for
 everything else on that worker and later for itself. calls made from `main`,
 which is not a green task, take the direct path and are unaffected.
 
-preemption is the other thing the kernel used to hand you. os threads get it for
-free; under green a compute-only task that never touches a channel, await, or
-socket holds its worker until it finishes, unless the binary was built with
-safe-points (`PITH_GREEN_PREEMPT=1`, below). code that coordinates already yields
-on its own and never needs it.
+preemption is the other thing the kernel used to hand you, and green builds now
+emit it: a compute-only task that never touches a channel, await, or socket is
+descheduled at a loop back-edge instead of holding its worker until it finishes.
+`PITH_GREEN_PREEMPT=0` at build time takes the check back out (below). code that
+coordinates already yields on its own and never needs any of it.
 
 and placement is luck unless you ask otherwise. a task pins to the first worker
 that runs it, so whether two tasks that talk to each other end up sharing one
@@ -551,17 +551,20 @@ worth keeping around past the point where one of them is faster.
 the rest of the rough edges:
 
 - a compute-bound task that loops without ever touching a channel, await, or
-  socket can be preempted, but you opt in at build time. compile with
-  `PITH_GREEN_PREEMPT=1` and the backend puts a safe-point at every loop
-  back-edge; run that binary under green and a monitor thread makes a
-  task that has held its worker past its time slice yield, so its peers on the
-  same worker get to run. it is opt-in because that safe-point costs a bit on
-  every loop iteration — nothing measurable on real work, about 6% on a
-  degenerate arithmetic loop — and a build that never runs green would pay for
-  a check that can never fire. code that uses channels and sockets already
-  yields on its own and never needs this. one gap in this first version:
-  a task sitting inside a long native runtime call (a large file read, say) is
-  not preempted until it returns to pith code and hits the next back-edge
+  socket is preempted, and you get that without asking. the backend puts a
+  safe-point at every loop back-edge and a monitor thread makes a task that has
+  held its worker past its time slice yield, so its peers on the same worker get
+  to run. the check costs between +0.07% and +1.85% instructions on the
+  benchmarks in `docs/performance.md` and about +2.5% wall on the compiler
+  compiling itself; a flat arithmetic loop is the outlier and runs about twice as
+  long, because six instructions of check land on a seven-instruction body and
+  the call inside them costs the loop its registers. `PITH_GREEN_PREEMPT=0` at build
+  time emits no check at all, which is the right setting for a build that will
+  never run green or for a numeric kernel that would rather have the 50% back.
+  code that uses channels and sockets already yields on its own and never needs
+  this. one gap: a task sitting inside a long native runtime call (a large file
+  read, say) is not preempted until it returns to pith code and hits the next
+  back-edge
 - fewer workers means more locality: a task pins to the first worker that runs
   it and every later wake goes back to that one worker, never the whole pool, so
   a coordinated pipeline stays put and its handoffs stay in userspace. at

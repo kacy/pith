@@ -50,6 +50,13 @@ pub static PERF_GREEN_WAKES_SAME: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_WAKES_CROSS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_WAKES_REACTOR: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+// preemption safe-points. CHECKS counts the safe-points that took the slow path
+// — the monitor had set the request flag, so the task called into the runtime to
+// find out whether it was the one overrunning — and PREEMPTIONS the calls that
+// ended in a park. the gap between them is the cost of the flag being global:
+// one task overrunning wakes every running task at its next back-edge.
+pub static PERF_GREEN_PREEMPT_CHECKS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_GREEN_PREEMPTIONS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
@@ -282,6 +289,11 @@ pub fn dump_perf_stats() {
         PERF_GREEN_WAKES_CROSS.load(Ordering::Relaxed),
         PERF_GREEN_WAKES_REACTOR.load(Ordering::Relaxed),
         PERF_GREEN_MIGRATIONS.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  green preemption: safepoint_slow_path={} preempted={}",
+        PERF_GREEN_PREEMPT_CHECKS.load(Ordering::Relaxed),
+        PERF_GREEN_PREEMPTIONS.load(Ordering::Relaxed)
     );
     eprintln!(
         "  lists: new={} free={} live={}",

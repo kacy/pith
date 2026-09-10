@@ -510,6 +510,34 @@ about 7 ns against a 2 ns direct call, and construction dominates.
 pith build bench/closure_calls.pith && ./bench/closure_calls
 ```
 
+## tight loop (the preemption safe-point's worst case)
+
+`bench/tight_loop.pith` sums `i * 3` over 200 million iterations and prints
+a checksum. Nothing else: no allocation, no call, no channel. It exists to
+price the green preemption safe-point, which the backend puts before every
+loop back-edge, because this is the body the check is largest against — six
+instructions of safe-point on a seven-instruction body.
+
+Two things about how it is written, both of which move the number several
+fold. There is no division: an `idiv` is slow enough to hide the check behind
+its latency, and the same loop with one reads +0.4%. And the loop is a
+function of its own rather than the body of `main`, so that whatever main does
+around it cannot decide which registers the loop gets — inline beside a string
+format it reads +33% instead.
+
+```
+PITH_GREEN_PREEMPT=0 pith build bench/tight_loop.pith && ./bench/tight_loop
+PITH_GREEN_PREEMPT=1 pith build bench/tight_loop.pith && ./bench/tight_loop
+```
+
+On the two-core box, medians of 9 interleaved rounds: 129 ms without
+safe-points and 259 ms with them, against a ±3% null floor, and 1.400G
+against 2.600G instructions under callgrind. The clock moves further than the
+instruction count because the check contains a call, so the loop's values move
+into callee-saved registers and the function grows a frame. Every other
+program measured here pays between +0.07% and +1.85% instructions; the table
+is in `docs/performance.md`.
+
 ## measuring: instruction counts over wall time
 
 Wall time on a shared two-core box drifts by more than most effects under

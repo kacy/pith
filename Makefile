@@ -1049,29 +1049,41 @@ green-echo: build
 	fi
 
 # --- green-thread cooperative preemption (P5: the safe-point + monitor) ---
-# a compute-only task spins in a tight loop with no yield point while N reporter
-# tasks must each bump a shared counter. WITHOUT preemption the spinner holds its
-# worker forever and the reporters never run, so at a single worker
-# (PITH_GREEN_WORKERS=1) the program hangs. the green runs here compile with
-# PITH_GREEN_PREEMPT=1 so the backend inserts safe-points at loop back-edges; the
-# monitor then deschedules the overrunning spinner onto its worker's lowest-
-# priority queue and the reporters run. the os-thread run needs no safe-points, so
-# `off` compiles at the default (zero-overhead) setting. the printed total is the
-# fixed counter value, so all three runs are byte-identical. we run the green side
-# at BOTH one and the default worker count — the single-worker hang can only be
-# caught at one worker.
+# compute-only tasks spin in a tight loop with no yield point while N reporter
+# tasks must each bump a shared counter. without safe-points a spinner holds its
+# worker forever and the reporters never run, so the program hangs; the test
+# spawns one spinner per worker the run could have, so that holds at any worker
+# count. safe-points are emitted by default, so the green runs here need no flag:
+# the monitor deschedules the overrunning spinner onto its worker's lowest-
+# priority queue and the reporters run. the printed total is the fixed counter
+# value, so all three runs are byte-identical. we run the green side at BOTH one
+# and the default worker count.
+#
+# the last arm is the negative control. the same program built with
+# PITH_GREEN_PREEMPT=0 must NOT finish, or this target has stopped covering what
+# it exists for. it is pinned to one worker so the hang does not depend on how
+# many cores the runner has, and every arm has a timeout so a regression fails
+# the target instead of wedging the job.
 green-starvation: build
 	@echo "--- green-thread cooperative preemption (byte-identical off vs on, 1 and default workers) ---"
-	@off=$$(PITH_GREEN=0 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
-	on1=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
-	onN=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
-	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
+	@off=$$(timeout 60 env PITH_GREEN=0 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	on1=$$(timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	onN=$$(timeout 60 env PITH_GREEN=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ] && [ -n "$$off" ]; then \
 		echo "ok   identical output at 1 and default workers: $$on1"; \
 	else \
 		echo "FAIL output differs"; \
 		echo "  os-thread:        $$off"; \
 		echo "  green 1 worker:   $$on1"; \
 		echo "  green default:    $$onN"; \
+		exit 1; \
+	fi
+	@rc=0; timeout 20 env PITH_GREEN_PREEMPT=0 PITH_GREEN=1 PITH_GREEN_WORKERS=1 \
+		./target/release/pith run tests/green/starvation.pith >/dev/null 2>&1 || rc=$$?; \
+	if [ "$$rc" = 124 ]; then \
+		echo "ok   the same case does not finish when built PITH_GREEN_PREEMPT=0"; \
+	else \
+		echo "FAIL expected the no-safe-point build to hang (exit 124), got $$rc"; \
 		exit 1; \
 	fi
 

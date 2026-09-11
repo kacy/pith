@@ -24,19 +24,19 @@ the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **65 ms** (2026-09-10, all 9 rounds in the fast mode; earlier reruns bimodal, 96-100 / 59-66) | ~72 ms | 59-69 ms | 203-297 ms |
+| chan_fanout, 1m msgs | **65-72 ms** (2026-09-10 and 11, all rounds in the fast mode; earlier reruns bimodal, 96-100 / 59-66) | ~72 ms | 59-69 ms | 203-297 ms |
 | chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
 | 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
 | 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
 
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| catalog workload, 200k requests | **~70 ms** (was ~92) | ~386 ms | ~68 ms | — |
+| catalog workload, 200k requests | **~66 ms** (2026-09-11; ~70 the day before, ~92 in august) | ~372 ms | ~67 ms | — |
 | grpc unary echo, sequential, 16 B | **4459 calls/s**, p50 219 µs (was 4022) | 4017, p50 233 µs | 2995, p50 325 µs | — |
 | grpc unary echo, conc=8, 16 B | 10598 calls/s, p50 707 µs (was 7560) | 15935, p50 454 µs | 11952, p50 615 µs | — |
 | http server under wrk, 60 s | 17.3k req/s, rss flat (~2.5 b/req); was 14.2-14.4k | 27.1k req/s (regime-dependent, see below) | — | — |
 | http sequential latency, 1 connection, p50 | 135µs | 93µs | — | — |
-| event_ledger, 200k events | **259 ms (0.68x go)**; was 339-344 | 380 ms | 104 ms | 121 ms |
+| event_ledger, 200k events | **259-263 ms (0.68x go)**; was 339-344 | 380-384 ms | 104-105 ms | 121-131 ms |
 | std_pipeline, 50k records | 344 ms (1.37x go); was 439-448 | 251 ms | 139 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
@@ -540,6 +540,70 @@ req/s at a flat rss, sequential p50 135 µs. the generic sort runner's
 per-sort speedups at the tip, same binary legacy vs current, medians of 5:
 int keys 8.9× at n=100, 123× at 1000, 1146× at 10000 (random); string keys
 2.4×, 38×, 253×; string reverse 0.4×, 0.5×, 2.3×.
+
+### the follow-up pass (2026-09-11): hash kernels, StringBuffer, inlined subscripts
+
+the same suite run once more the next evening, arm A now the tip the table
+above was measured against (`099e7e62`) and arm B the tip after #1112
+(StringBuffer on a byte buffer), #1115 (fnv1a and crc32), #1119 (the sha
+kernels and adler32) and #1121 (the strict `bytes[i]` and `list[i]`
+subscripts inlined in the backend). same method: every bench program's
+current source compiled by both compilers in their own trees, callgrind,
+outputs and checksums identical on every row.
+
+| 2026-09-11, callgrind | before | after | delta |
+|---|---:|---:|---:|
+| sha256, Ir per byte over 4 MB (net of generating the input) | 1,164 | 282 | 4.1× |
+| sha1 | 763 | 262 | 2.9× |
+| sha512 | 797 | 152 | 5.3× |
+| crc32 | 260 | 47 | 5.5× |
+| fnv1a | 56 | 9.6 | 5.8× |
+| adler32 | 71 | 11 | 6.4× |
+| StringBuffer build, 100,000 × 8 B, whole program | 2,133,353,569 | 474,705,380 | −77.8% |
+| StringBuffer build, 10,000 × 200 B, whole program | 823,452,861 | 583,809,975 | −29.1% |
+| generic sort n=10,000, int keys random | 61,569,201 | 55,316,952 | −10.2% |
+| generic sort, string keys random / reverse | 69,972,578 / 58,173,222 | 63,700,401 / 54,158,047 | −9.0% / −6.9% |
+| catalog workload, 200k iterations | 963,273,676 | 924,090,265 | −4.1% |
+| std pipeline, 50k records | 3,413,663,688 | 3,284,210,648 | −3.8% |
+| http request head read, 20k requests | 2,092,811,954 | 2,027,154,009 | −3.1% |
+| event ledger, json decode shapes, closures, task churn, cyclic graph, tight loop, substring search, csv, path | | | 0.00% |
+
+the four rows from the generic sort down to the head read are the inlined
+subscripts showing up wherever a `list[i]` or `bytes[i]` sits in a hot
+loop; nothing else in std changed on those paths. the hash rows are
+`bench/hash_kernels` and the StringBuffer rows `bench/string_buffer`,
+both described in bench/README.md with their per-operation tables.
+
+compile time needed attributing. the suite read `web_login` at +1.6% and
+the compiler compiling itself at +2.8% by instruction count, the shape the
+old ir-contract note predicted for inlining `xs[i]`. the call counts said
+otherwise: the new compiler made 8% more lexer token reads and 26% more
+list pushes on the "identical" input, which inlining cannot do. the input
+was not identical: `std/hash.pith` grew from 541 to 1,036 lines and
+`std/io.pith` by 119 (the verbatim reference kernels and the StringBuffer
+tests kept as oracles), both inside `web_login`'s import closure, and the
+combined IR grew from 288,704 to 290,663 lines. the cross experiment, the
+new driver on the old std, reads 15,900,516,471 against the old driver's
+16,180,809,039 on the same std: the compiler is 1.7% faster, the source
+it compiles is larger. an identical-input compile comparison has to copy
+the std as well as the program.
+
+wall clock on the quiet box, comparators reproducing their figures: event
+ledger 263 ms (go 384, rust 105, zig 131), channel fan-out green 72 ms
+(go 72, rust 63), catalog workload 66 ms direct (go 372, rust 67), http
+sequential p50 134 µs. the grpc sweep's medians did not move (222 µs
+sequential against go's 234; 710 µs at 8 concurrent against 452), as
+expected for a steady-state client; five sweeps now show the pith client's
+8-concurrent throughput bimodal at an unchanged median (#1122).
+
+one harness finding, worth more than the numbers it spoiled: for about
+twenty seconds after the full `bench/generic_sort_bench.sh` sweep, the go
+and rust comparator binaries read 2× and 2.8× their quiet figures while
+the pith binary in the same probe reads its normal one. inside a chained
+run that inverts the catalog, pipeline and wrk ratios, and it did so on
+both passes before it was isolated (#1123). the rule in bench/README.md
+stands: a comparator that does not reproduce its published figure means
+the run is discarded, whatever pith reads.
 
 ### a note on how these are measured
 

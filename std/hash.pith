@@ -107,7 +107,269 @@ fn add64_5(a: Int, b: Int, c: Int, d: Int, e: Int) -> Int:
 fn word64_from_be(msg: List[Int], off: Int) -> Int:
     return bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.shl(msg[off], 56), bits.shl(msg[off + 1], 48)), bits.shl(msg[off + 2], 40)), bits.shl(msg[off + 3], 32)), bits.shl(msg[off + 4], 24)), bits.shl(msg[off + 5], 16)), bits.shl(msg[off + 6], 8)), msg[off + 7])
 
+# the padded tail of a message (fips 180-4 section 5.1): the input bytes
+# from `start` to the end, then the 0x80 terminator, zeros up to the length
+# field, and the length of the whole input in bits as a big-endian integer
+# filling the field. `block_size` is 64 or 128 and the result is one or
+# two whole blocks. the kernels hash every whole block straight out of the
+# input and only this tail through a List[Int], so the byte-at-a-time work
+# is bounded by two blocks however long the input is.
+fn sha_padded_tail(input: Bytes, start: Int, block_size: Int) -> List[Int]:
+    mut tail: List[Int] := []
+    n := input.len()
+    mut i := start
+    while i < n:
+        tail.push(input[i])
+        i = i + 1
+    tail.push(128)
+    # the length field is block_size / 8 bytes wide: eight for the 64-byte
+    # block, sixteen for the 128-byte one. zeros run up to the field, and
+    # the field's own high bytes beyond the eight the bit count occupies
+    # are zero as well.
+    while tail.len() % block_size != block_size - block_size / 8:
+        tail.push(0)
+    while tail.len() % block_size != block_size - 8:
+        tail.push(0)
+    bit_len := n * 8
+    tail.push(bits.mask8(bits.shr(bit_len, 56)))
+    tail.push(bits.mask8(bits.shr(bit_len, 48)))
+    tail.push(bits.mask8(bits.shr(bit_len, 40)))
+    tail.push(bits.mask8(bits.shr(bit_len, 32)))
+    tail.push(bits.mask8(bits.shr(bit_len, 24)))
+    tail.push(bits.mask8(bits.shr(bit_len, 16)))
+    tail.push(bits.mask8(bits.shr(bit_len, 8)))
+    tail.push(bits.mask8(bit_len))
+    return tail
+
+# a message schedule of `count` zero words, filled in place per block so
+# the kernels allocate one list per digest rather than one per block.
+fn zero_words(count: Int) -> List[Int]:
+    mut w: List[Int] := []
+    mut i := 0
+    while i < count:
+        w.push(0)
+        i = i + 1
+    return w
+
+# reverse the byte order of a 32-bit value: bytes_read_word reads little-
+# endian and the sha word order is big-endian. `value` is below 2^32.
+fn swap32(value: Int) -> Int:
+    return bits.bor(bits.bor(bits.shl(bits.band(value, 255), 24), bits.shl(bits.band(value, 65280), 8)), bits.bor(bits.band(bits.shr(value, 8), 65280), bits.shr(value, 24)))
+
+# reverse the byte order of a 64-bit value, for the same reason as swap32.
+# the result is the signed 64-bit reading of the big-endian bytes, which
+# is what word64_from_be produces for the tail.
+fn swap64(value: Int) -> Int:
+    low := bits.bor(bits.bor(bits.shl(bits.band(value, 255), 56), bits.shl(bits.band(value, 65280), 40)), bits.bor(bits.shl(bits.band(value, 16711680), 24), bits.shl(bits.band(value, 4278190080), 8)))
+    high := bits.bor(bits.bor(bits.band(bits.shr(value, 8), 4278190080), bits.band(bits.shr(value, 24), 16711680)), bits.bor(bits.band(bits.shr(value, 40), 65280), bits.shr(value, 56)))
+    return bits.bor(low, high)
+
+# fill w[0..16] with the sixteen big-endian 32-bit words of the 64-byte
+# block at `off` in `input`. bytes_read_word is called by name because it
+# lowers to one inlined eight-byte load where a per-byte subscript is a
+# runtime call; every caller has off + 64 <= input.len(), so the read
+# stays on that fast path and a pair of words is one load and two swaps.
+fn sha_load_words32(w: List[Int], input: Bytes, off: Int):
+    mut j := 0
+    while j < 16:
+        pair := bytes_read_word(input, off + j * 4, 8)
+        w[j] = swap32(bits.band(pair, 4294967295))
+        w[j + 1] = swap32(bits.shr(pair, 32))
+        j = j + 2
+
+# fill w[0..16] from the 64-byte block at `off` in a padded tail, whose
+# entries are byte values.
+fn sha_load_words32_tail(w: List[Int], tail: List[Int], off: Int):
+    mut j := 0
+    while j < 16:
+        at := off + j * 4
+        w[j] = tail[at] * 16777216 + tail[at + 1] * 65536 + tail[at + 2] * 256 + tail[at + 3]
+        j = j + 1
+
+# fill w[0..16] with the sixteen big-endian 64-bit words of the 128-byte
+# block at `off` in `input`; see sha_load_words32 for the read.
+fn sha_load_words64(w: List[Int], input: Bytes, off: Int):
+    mut j := 0
+    while j < 16:
+        w[j] = swap64(bytes_read_word(input, off + j * 8, 8))
+        j = j + 1
+
+# fill w[0..16] from the 128-byte block at `off` in a padded tail.
+fn sha_load_words64_tail(w: List[Int], tail: List[Int], off: Int):
+    mut j := 0
+    while j < 16:
+        w[j] = word64_from_be(tail, off + j * 8)
+        j = j + 1
+
+# the 32-bit sha-2 core behind sha-224 and sha-256. whole 64-byte blocks
+# are hashed straight out of `input`; the final partial block and the
+# padding go through sha_padded_tail. sha2_32_reference below is the
+# copy-everything-into-a-list definition this replaced, kept as the
+# oracle the randomized test compares against.
 fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+    mut h0 := ih0
+    mut h1 := ih1
+    mut h2 := ih2
+    mut h3 := ih3
+    mut h4 := ih4
+    mut h5 := ih5
+    mut h6 := ih6
+    mut h7 := ih7
+
+    n := input.len()
+    full := n - n % 64
+    tail := sha_padded_tail(input, full, 64)
+    total := full + tail.len()
+    w := zero_words(64)
+
+    mut block := 0
+    while block < total:
+        if block < full:
+            sha_load_words32(w, input, block)
+        else:
+            sha_load_words32_tail(w, tail, block - full)
+        # a 32-bit rotate right by k is spelled band(bor(shr(x, k), shl(x,
+        # 32 - k)), 2^32 - 1): the two-argument bits.* forms lower to single
+        # instructions, where bits.rotr32 and mask32 are calls. the sums are
+        # masked once at the end, which is the same value modulo 2^32.
+        mut i := 16
+        while i < 64:
+            x := w[i - 15]
+            s0 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(x, 7), bits.shl(x, 25)), bits.bor(bits.shr(x, 18), bits.shl(x, 14))), bits.shr(x, 3)), 4294967295)
+            y := w[i - 2]
+            s1 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(y, 17), bits.shl(y, 15)), bits.bor(bits.shr(y, 19), bits.shl(y, 13))), bits.shr(y, 10)), 4294967295)
+            w[i] = bits.band(w[i - 16] + s0 + w[i - 7] + s1, 4294967295)
+            i = i + 1
+
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+        mut f := h5
+        mut g := h6
+        mut h := h7
+
+        i = 0
+        while i < 64:
+            s1 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(e, 6), bits.shl(e, 26)), bits.bor(bits.shr(e, 11), bits.shl(e, 21))), bits.bor(bits.shr(e, 25), bits.shl(e, 7))), 4294967295)
+            ch := bits.xor(bits.band(e, f), bits.band(bits.xor(e, 4294967295), g))
+            temp1 := bits.band(h + s1 + ch + sha256_round_constants[i] + w[i], 4294967295)
+            s0 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(a, 2), bits.shl(a, 30)), bits.bor(bits.shr(a, 13), bits.shl(a, 19))), bits.bor(bits.shr(a, 22), bits.shl(a, 10))), 4294967295)
+            maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
+            temp2 := bits.band(s0 + maj, 4294967295)
+            h = g
+            g = f
+            f = e
+            e = bits.band(d + temp1, 4294967295)
+            d = c
+            c = b
+            b = a
+            a = bits.band(temp1 + temp2, 4294967295)
+            i = i + 1
+
+        h0 = bits.band(h0 + a, 4294967295)
+        h1 = bits.band(h1 + b, 4294967295)
+        h2 = bits.band(h2 + c, 4294967295)
+        h3 = bits.band(h3 + d, 4294967295)
+        h4 = bits.band(h4 + e, 4294967295)
+        h5 = bits.band(h5 + f, 4294967295)
+        h6 = bits.band(h6 + g, 4294967295)
+        h7 = bits.band(h7 + h, 4294967295)
+        block = block + 64
+
+    mut out := word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4) + word32_to_hex(h5) + word32_to_hex(h6)
+    if words > 7:
+        out = out + word32_to_hex(h7)
+    return out
+
+# the 64-bit sha-2 core behind sha-384 and sha-512, shaped like sha2_32
+# with 128-byte blocks and 80 rounds. sha2_64_reference below is the
+# definition this replaced, kept as the randomized test's oracle.
+fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+    mut h0 := ih0
+    mut h1 := ih1
+    mut h2 := ih2
+    mut h3 := ih3
+    mut h4 := ih4
+    mut h5 := ih5
+    mut h6 := ih6
+    mut h7 := ih7
+
+    n := input.len()
+    full := n - n % 128
+    tail := sha_padded_tail(input, full, 128)
+    total := full + tail.len()
+    w := zero_words(80)
+
+    mut block := 0
+    while block < total:
+        if block < full:
+            sha_load_words64(w, input, block)
+        else:
+            sha_load_words64_tail(w, tail, block - full)
+        # a 64-bit rotate right by k is spelled bor(shr(x, k), shl(x, 64 -
+        # k)), for the reason given in sha2_32; bits.shr is a logical shift,
+        # so it is right on the negative half of the range too. Int addition
+        # wraps at 64 bits, which is what bits.add64 relied on as well.
+        mut i := 16
+        while i < 80:
+            x := w[i - 15]
+            s0 := bits.xor(bits.xor(bits.bor(bits.shr(x, 1), bits.shl(x, 63)), bits.bor(bits.shr(x, 8), bits.shl(x, 56))), bits.shr(x, 7))
+            y := w[i - 2]
+            s1 := bits.xor(bits.xor(bits.bor(bits.shr(y, 19), bits.shl(y, 45)), bits.bor(bits.shr(y, 61), bits.shl(y, 3))), bits.shr(y, 6))
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1
+            i = i + 1
+
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+        mut f := h5
+        mut g := h6
+        mut h := h7
+
+        i = 0
+        while i < 80:
+            s1 := bits.xor(bits.xor(bits.bor(bits.shr(e, 14), bits.shl(e, 50)), bits.bor(bits.shr(e, 18), bits.shl(e, 46))), bits.bor(bits.shr(e, 41), bits.shl(e, 23)))
+            ch := bits.xor(bits.band(e, f), bits.band(bits.xor(e, -1), g))
+            temp1 := h + s1 + ch + sha512_round_constants[i] + w[i]
+            s0 := bits.xor(bits.xor(bits.bor(bits.shr(a, 28), bits.shl(a, 36)), bits.bor(bits.shr(a, 34), bits.shl(a, 30))), bits.bor(bits.shr(a, 39), bits.shl(a, 25)))
+            maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
+            temp2 := s0 + maj
+            h = g
+            g = f
+            f = e
+            e = d + temp1
+            d = c
+            c = b
+            b = a
+            a = temp1 + temp2
+            i = i + 1
+
+        h0 = h0 + a
+        h1 = h1 + b
+        h2 = h2 + c
+        h3 = h3 + d
+        h4 = h4 + e
+        h5 = h5 + f
+        h6 = h6 + g
+        h7 = h7 + h
+        block = block + 128
+
+    mut out := word64_to_hex(h0) + word64_to_hex(h1) + word64_to_hex(h2) + word64_to_hex(h3) + word64_to_hex(h4) + word64_to_hex(h5)
+    if words > 6:
+        out = out + word64_to_hex(h6)
+    if words > 7:
+        out = out + word64_to_hex(h7)
+    return out
+
+# the copy-everything-into-a-list sha2_32 this module shipped before the
+# kernels read the input directly, kept verbatim so the randomized test
+# has an independent definition to agree with. not part of the module's
+# surface.
+fn sha2_32_reference(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2
@@ -194,7 +456,10 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
         out = out + word32_to_hex(h7)
     return out
 
-fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+# the copy-everything-into-a-list sha2_64 this module shipped before the
+# kernels read the input directly, kept verbatim as the randomized test's
+# oracle. not part of the module's surface.
+fn sha2_64_reference(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2
@@ -432,6 +697,81 @@ pub fn sha1(input: Bytes) -> String:
     mut h3 := 271733878
     mut h4 := 3285377520
 
+    # whole blocks are hashed straight out of the input and only the
+    # padded tail goes through a list, as in sha2_32. sha1_reference below
+    # is the definition this replaced, kept as the randomized test's oracle.
+    n := input.len()
+    full := n - n % 64
+    tail := sha_padded_tail(input, full, 64)
+    total := full + tail.len()
+    w := zero_words(80)
+
+    mut block := 0
+    while block < total:
+        if block < full:
+            sha_load_words32(w, input, block)
+        else:
+            sha_load_words32_tail(w, tail, block - full)
+
+        # a 32-bit rotate left by k is spelled band(bor(shl(x, k), shr(x,
+        # 32 - k)), 2^32 - 1), for the reason given in sha2_32.
+        mut i := 16
+        while i < 80:
+            x := bits.xor(bits.xor(bits.xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16])
+            w[i] = bits.band(bits.bor(bits.shl(x, 1), bits.shr(x, 31)), 4294967295)
+            i = i + 1
+
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+
+        i = 0
+        while i < 80:
+            mut f := 0
+            mut k := 0
+
+            if i < 20:
+                f = bits.bor(bits.band(b, c), bits.band(bits.xor(b, 4294967295), d))
+                k = K0
+            elif i < 40:
+                f = bits.xor(bits.xor(b, c), d)
+                k = K1
+            elif i < 60:
+                f = bits.bor(bits.bor(bits.band(b, c), bits.band(b, d)), bits.band(c, d))
+                k = K2
+            else:
+                f = bits.xor(bits.xor(b, c), d)
+                k = K3
+
+            temp := bits.band(bits.band(bits.bor(bits.shl(a, 5), bits.shr(a, 27)), 4294967295) + f + e + k + w[i], 4294967295)
+            e = d
+            d = c
+            c = bits.band(bits.bor(bits.shl(b, 30), bits.shr(b, 2)), 4294967295)
+            b = a
+            a = temp
+            i = i + 1
+
+        h0 = bits.band(h0 + a, 4294967295)
+        h1 = bits.band(h1 + b, 4294967295)
+        h2 = bits.band(h2 + c, 4294967295)
+        h3 = bits.band(h3 + d, 4294967295)
+        h4 = bits.band(h4 + e, 4294967295)
+        block = block + 64
+
+    return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4)
+
+# the copy-everything-into-a-list sha-1 this module shipped before the
+# kernel read the input directly, kept verbatim as the randomized test's
+# oracle. not part of the module's surface.
+fn sha1_reference(input: Bytes) -> String:
+    mut h0 := 1732584193
+    mut h1 := 4023233417
+    mut h2 := 2562383102
+    mut h3 := 271733878
+    mut h4 := 3285377520
+
     mut msg: List[Int] := []
     mut i := 0
     while i < input.len():
@@ -603,4 +943,93 @@ test "fnv1a word loop agrees with the byte-at-a-time definition":
         data := buf.take_bytes()
         assert_eq(data.len(), want)
         assert_eq(fnv1a(data), fnv1a_reference(data))
+        trial = trial + 1
+
+# `want` bytes of xorshift64 content seeded from `seed`, for the randomized
+# kernel cross-checks below: the low byte of each step is the next byte.
+fn sha_test_content(seed: Int, want: Int) -> Bytes:
+    buf := bytes.buffer()
+    mut state := bits.xor(88172645463325252, seed * 2654435761)
+    mut filled := 0
+    while filled < want:
+        state = bits.xor(state, bits.shl(state, 13))
+        state = bits.xor(state, bits.shr(state, 7))
+        state = bits.xor(state, bits.shl(state, 17))
+        buf.write_byte(bits.band(state, 255)) catch 0
+        filled = filled + 1
+    return buf.take_bytes()
+
+# the length of the randomized trial `trial`: every length from 0 to 200
+# comes up about fifteen times in 3,000 trials, which covers every
+# padding case (a tail of 55, 56, 63, 64, 111, 112, 127 and 128 bytes both
+# fits and spills into a second block) and every word offset, and one
+# trial in ten runs to 1,200 bytes for many whole blocks.
+fn sha_test_length(trial: Int) -> Int:
+    if trial % 10 == 9:
+        return 201 + trial % 1000
+    return trial % 201
+
+# one million 'a' bytes, the long fips 180-4 vector.
+fn million_a() -> Bytes:
+    buf := bytes.buffer()
+    mut i := 0
+    while i < 125000:
+        buf.write_word(7016996765293437281, 8)
+        i = i + 1
+    return buf.take_bytes()
+
+test "sha256 and sha224 match the fips 180-4 vectors":
+    two_blocks := bytes.from_string_utf8("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+    assert_eq(sha256(bytes.empty()), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_eq(sha256_string("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_eq(sha256(two_blocks), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    assert_eq(sha256(million_a()), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+    assert_eq(sha224(bytes.empty()), "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f")
+    assert_eq(sha224_string("abc"), "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7")
+    assert_eq(sha224(two_blocks), "75388b16512776cc5dba5da1fd890150b0c6455cb4f58b1952522525")
+
+test "sha512 and sha384 match the fips 180-4 vectors":
+    two_blocks := bytes.from_string_utf8("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")
+    assert_eq(sha512(bytes.empty()), "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+    assert_eq(sha512(two_blocks), "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")
+    assert_eq(sha512(million_a()), "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+    assert_eq(sha384(bytes.empty()), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+    assert_eq(sha384(two_blocks), "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039")
+
+test "sha1 matches the fips 180-4 vectors":
+    assert_eq(sha1(bytes.empty()), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    assert_eq(sha1_string("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    assert_eq(sha1_string("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    assert_eq(sha1(million_a()), "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+
+# random content at the lengths sha_test_length describes, checked against
+# the copy-into-a-list definition with both the sha-256 and the sha-224
+# initial values (the same literals sha256 and sha224 pass).
+test "sha2_32 agrees with the copy-into-a-list definition":
+    mut trial := 0
+    while trial < 3000:
+        want := sha_test_length(trial)
+        data := sha_test_content(trial, want)
+        assert_eq(data.len(), want)
+        assert_eq(sha256(data), sha2_32_reference(data, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8))
+        assert_eq(sha224(data), sha2_32_reference(data, 3238371032, 914150663, 812702999, 4144912697, 4290775857, 1750603025, 1694076839, 3204075428, 7))
+        trial = trial + 1
+
+test "sha2_64 agrees with the copy-into-a-list definition":
+    mut trial := 0
+    while trial < 3000:
+        want := sha_test_length(trial)
+        data := sha_test_content(trial, want)
+        assert_eq(data.len(), want)
+        assert_eq(sha512(data), sha2_64_reference(data, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8))
+        assert_eq(sha384(data), sha2_64_reference(data, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6))
+        trial = trial + 1
+
+test "sha1 agrees with the copy-into-a-list definition":
+    mut trial := 0
+    while trial < 3000:
+        want := sha_test_length(trial)
+        data := sha_test_content(trial, want)
+        assert_eq(data.len(), want)
+        assert_eq(sha1(data), sha1_reference(data))
         trial = trial + 1

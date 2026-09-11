@@ -842,6 +842,41 @@ from the same source, run under callgrind, outputs and checksums identical:
 the list shape did not move because a list of structs still goes through
 the node pool by hand (#1110).
 
+## hash kernels (std.hash and std.checksum, per byte)
+
+`bench/hash_kernels.pith` runs one kernel over a few megabytes of fixed
+xorshift content, so a change to a kernel can be measured on its own:
+
+```
+pith build bench/hash_kernels.pith
+./bench/hash_kernels sha256 4       # one of sha1 sha224 sha256 sha384 sha512 fnv1a crc32 adler32
+./bench/hash_kernels none 4         # generation only
+```
+
+run the kernel arm and the `none` arm under callgrind; the difference
+divided by the byte count is the kernel's cost per byte. the digest line
+must agree between a binary built before a change and one built after it.
+
+instructions per byte over 4 MB, hash arm minus the `none` arm, digests
+identical across the two columns. the first column is `e80078d0`, after
+#1115 made fnv1a and crc32 word- and table-driven; the second is after the
+sha kernels stopped copying the input into a list and adler32 stopped
+reducing per byte (#1116):
+
+| kernel | before | after |
+|---|---:|---:|
+| `hash.sha1` | 762.6 | 328.7 |
+| `hash.sha224` / `hash.sha256` | 1164.0 | 353.3 |
+| `hash.sha384` / `hash.sha512` | 796.5 | 201.5 |
+| `hash.fnv1a` | 9.6 | 9.6 |
+| `checksum.crc32` | 60.0 | 60.0 |
+| `checksum.adler32` | 47.0 | 11.0 |
+
+what remains in the sha kernels is mostly the strict `w[i]` and
+round-constant `List[Int]` reads, about 140 of the 353 in sha-256; those
+are runtime calls today and the first section of #1116 is about inlining
+them.
+
 ## zstd codec benchmark (pure-pith encoder and decoder)
 
 `bench/zstd_codec.pith` times the pure-pith zstd codec

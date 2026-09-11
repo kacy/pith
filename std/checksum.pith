@@ -69,8 +69,59 @@ pub fn adler32(data: Bytes) -> Int:
     mut b := 0
     n := data.len()
     mut pos := 0
-    # the length is read once and the byte comes through bytes_get, for the
-    # reason given at crc32
+    # the two modulos are deferred: a and b accumulate over a run of up to
+    # 5552 bytes (zlib's NMAX) and are reduced once per run, which is the
+    # same result because both are sums modulo 65521. zlib chose 5552 as
+    # the longest run whose sums fit 32 bits; Int is 64 bits here, so the
+    # bound is loose: a run starts with a and b below 65521, a grows by at
+    # most 255 per byte, to under 2^21, and b by at most that a per byte,
+    # to under 2^33. within a run the bytes come eight at a time through
+    # bytes_read_word, which lowers to one inlined load where a per-byte
+    # subscript is a runtime call (see crc32); the run's tail of fewer than
+    # eight bytes goes one at a time. adler32_reference below is the
+    # byte-at-a-time, modulo-per-byte definition the randomized test
+    # compares against.
+    while pos < n:
+        mut run_end := pos + 5552
+        if run_end > n:
+            run_end = n
+        words_end := run_end - (run_end - pos) % 8
+        while pos < words_end:
+            word := bytes_read_word(data, pos, 8)
+            a = a + bits.band(word, 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 8), 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 16), 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 24), 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 32), 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 40), 255)
+            b = b + a
+            a = a + bits.band(bits.shr(word, 48), 255)
+            b = b + a
+            a = a + bits.shr(word, 56)
+            b = b + a
+            pos = pos + 8
+        while pos < run_end:
+            a = a + bytes_get(data, pos)
+            b = b + a
+            pos = pos + 1
+        a = a % 65521
+        b = b % 65521
+    return bits.bor(bits.shl(b, 16), a)
+
+# the byte-at-a-time adler-32 with a modulo per byte that this module
+# shipped before the deferred reduction, kept verbatim so the randomized
+# test has an independent definition to agree with. not part of the
+# module's surface.
+fn adler32_reference(data: Bytes) -> Int:
+    mut a := 1
+    mut b := 0
+    n := data.len()
+    mut pos := 0
     while pos < n:
         a = (a + bytes_get(data, pos)) % 65521
         b = (b + a) % 65521
@@ -109,4 +160,34 @@ test "table-driven crc32 agrees with the bit-at-a-time definition":
         data := buf.take_bytes()
         assert_eq(data.len(), want)
         assert_eq(crc32(data), crc32_reference(data))
+        trial = trial + 1
+
+# random content at random lengths, checked against the modulo-per-byte
+# definition: every length from 0 to 40 several times over, so the
+# eight-byte loop's boundary is hit at every offset, a spread of longer
+# inputs, and lengths just around one and two 5552-byte runs so the
+# deferred reduction is exercised at its boundary.
+test "deferred-modulo adler32 agrees with the modulo-per-byte definition":
+    mut state := 88172645463325252
+    mut trial := 0
+    while trial < 3000:
+        buf := bytes.buffer()
+        mut want := trial % 41
+        if trial % 10 == 9:
+            want = 41 + trial % 1000
+        if trial % 100 == 50:
+            want = 5540 + trial % 25
+        if trial % 100 == 75:
+            want = 11090 + trial % 30
+        mut filled := 0
+        while filled < want:
+            # xorshift64: the low byte of each step is the next content byte
+            state = bits.xor(state, bits.shl(state, 13))
+            state = bits.xor(state, bits.shr(state, 7))
+            state = bits.xor(state, bits.shl(state, 17))
+            buf.write_byte(bits.band(state, 255))!
+            filled = filled + 1
+        data := buf.take_bytes()
+        assert_eq(data.len(), want)
+        assert_eq(adler32(data), adler32_reference(data))
         trial = trial + 1

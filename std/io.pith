@@ -27,9 +27,14 @@ threadlocal mut next_string_reader_handle: Int := 1
 threadlocal mut string_reader_data: Map[Int, String] := {}
 threadlocal mut string_reader_offsets: Map[Int, Int] := {}
 
+# a string buffer is a handle onto one growable byte buffer (the runtime's
+# byte buffer, the same storage std.bytes builds on). each write appends its
+# bytes in place and the storage doubles as it fills, so building a string
+# of n bytes copies O(n) bytes in total; string() copies the whole content
+# out once per call. the map owns the byte buffer: the entry's removal on
+# close() is what frees it.
 threadlocal mut next_string_buffer_handle: Int := 1
-threadlocal mut string_buffer_parts: Map[Int, List[String]] := {}
-threadlocal mut string_buffer_lengths: Map[Int, Int] := {}
+threadlocal mut string_buffer_stores: Map[Int, Int] := {}
 
 threadlocal mut next_bytes_reader_handle: Int := 1
 threadlocal mut bytes_reader_data: Map[Int, Bytes] := {}
@@ -240,9 +245,11 @@ impl Writer for StringBuffer:
         return string_buffer_write(self, data)
 
 impl Closer for StringBuffer:
-    # drop the buffer's registry entries, discarding the accumulated text —
-    # read string() first. a write or clear after close leaves the buffer
-    # closed and reports nothing written; a second close is a no-op.
+    # free the buffer's storage and drop its registry entry, discarding the
+    # accumulated text: read string() first. strings string() already
+    # returned are copies and stay valid. a write or clear after close
+    # leaves the buffer closed and reports nothing written; a second close
+    # is a no-op.
     fn close():
         close_string_buffer_state(self.handle)
 
@@ -551,23 +558,19 @@ fn close_process(process: Process):
 fn empty_string_parts() -> List[String]:
     return []
 
-fn string_buffer_chunks(buf: StringBuffer) -> List[String]:
-    if string_buffer_parts.contains_key(buf.handle):
-        return string_buffer_parts[buf.handle]
-    return empty_string_parts()
-
 fn string_buffer_len(buf: StringBuffer) -> Int:
-    if string_buffer_lengths.contains_key(buf.handle):
-        return string_buffer_lengths[buf.handle]
-    return 0
+    if not string_buffer_stores.contains_key(buf.handle):
+        return 0
+    return byte_buffer_len(string_buffer_stores[buf.handle])
 
+# the accumulated text as a fresh string: one copy of the storage, taken
+# verbatim (the buffer holds whatever bytes were written, valid utf-8 or
+# not, so nothing is decoded). the copy is what keeps an earlier snapshot
+# unchanged when the buffer is written to, cleared or closed afterwards.
 fn string_buffer_string(buf: StringBuffer) -> String:
-    parts := string_buffer_chunks(buf)
-    if parts.len() == 0:
+    if not string_buffer_stores.contains_key(buf.handle):
         return ""
-    if parts.len() == 1:
-        return parts[0]
-    return parts.join("")
+    return byte_buffer_string(string_buffer_stores[buf.handle])
 
 fn string_buffer_write_line(buf: StringBuffer, data: String) -> Int!:
     wrote := string_buffer_write_internal(buf, data)
@@ -580,29 +583,11 @@ fn string_buffer_write_line(buf: StringBuffer, data: String) -> Int!:
 
 fn string_buffer_reset(buf: StringBuffer):
     # see string_buffer_write_internal: clearing a closed buffer must not
-    # re-register it.
-    if not string_buffer_parts.contains_key(buf.handle):
+    # re-register it. the storage keeps its capacity, so a buffer that is
+    # cleared and refilled in a loop stops allocating after the first fill.
+    if not string_buffer_stores.contains_key(buf.handle):
         return
-    string_buffer_parts.insert(buf.handle, empty_string_parts())
-    string_buffer_lengths.insert(buf.handle, 0)
-
-fn string_buffer_append_chunk(buf: StringBuffer, data: String):
-    parts := string_buffer_chunks(buf)
-    parts.push(data)
-    string_buffer_parts.insert(buf.handle, parts)
-    string_buffer_lengths.insert(buf.handle, string_buffer_len(buf) + data.len())
-
-fn string_buffer_compact(buf: StringBuffer):
-    parts := string_buffer_chunks(buf)
-    if parts.len() <= 1:
-        return
-    joined := parts.join("")
-    string_buffer_parts.insert(buf.handle, [joined])
-    string_buffer_lengths.insert(buf.handle, joined.len())
-
-fn string_buffer_maybe_compact(buf: StringBuffer):
-    if string_buffer_chunks(buf).len() >= 32:
-        string_buffer_compact(buf)
+    byte_buffer_clear(string_buffer_stores[buf.handle])
 
 fn string_buffer_clear(buf: StringBuffer):
     string_buffer_reset(buf)
@@ -942,8 +927,7 @@ fn allocate_string_reader_handle(data: String) -> Int:
 fn allocate_string_buffer_handle() -> Int:
     handle := next_string_buffer_handle
     next_string_buffer_handle = next_string_buffer_handle + 1
-    string_buffer_parts.insert(handle, empty_string_parts())
-    string_buffer_lengths.insert(handle, 0)
+    string_buffer_stores.insert(handle, byte_buffer_new())
     return handle
 
 fn allocate_bytes_reader_handle(data: Bytes) -> Int:
@@ -1070,8 +1054,10 @@ fn close_string_reader_state(handle: Int):
     string_reader_offsets.remove(handle)
 
 fn close_string_buffer_state(handle: Int):
-    string_buffer_parts.remove(handle)
-    string_buffer_lengths.remove(handle)
+    if not string_buffer_stores.contains_key(handle):
+        return
+    byte_buffer_free(string_buffer_stores[handle])
+    string_buffer_stores.remove(handle)
 
 fn close_bytes_cursor_state(handle: Int):
     bytes_reader_data.remove(handle)
@@ -1503,12 +1489,12 @@ fn string_buffer_write_internal(buf: StringBuffer, data: String) -> Int!:
     if data.len() == 0:
         return 0
     # a closed buffer stays closed: writing must not re-create the registry
-    # entries close() removed, so it reports nothing written instead.
-    if not string_buffer_parts.contains_key(buf.handle):
+    # entry close() removed, so it reports nothing written instead.
+    if not string_buffer_stores.contains_key(buf.handle):
         return 0
-    string_buffer_append_chunk(buf, data)
-    string_buffer_maybe_compact(buf)
-    return data.len()
+    # the bytes go straight into the storage; nothing is allocated for the
+    # write itself, and the builtin answers with the count it appended.
+    return byte_buffer_write_string_utf8(string_buffer_stores[buf.handle], data)
 
 fn bytes_after_write(data: Bytes, wrote: Int) -> Bytes:
     if wrote >= data.len():
@@ -3444,3 +3430,136 @@ test "io buffered text readers and writers deregister on close":
     writer.close()
     assert_eq(target.string(), "abcdef")
     target.close()
+
+test "io string buffer counts and keeps every write":
+    buf := string_buffer()
+    assert_eq(buf.write("")!, 0)
+    assert(buf.is_empty())
+    assert_eq(buf.string(), "")
+    assert_eq(buf.write_line("")!, 1)
+    assert_eq(buf.string(), chr(10))
+    assert_eq(buf.write_line("row")!, 4)
+    assert_eq(buf.newline()!, 1)
+    assert_eq(buf.string(), chr(10) + "row" + chr(10) + chr(10))
+    assert_eq(buf.len(), 6)
+    buf.close()
+
+test "io string buffer joins mixed chunk sizes in order":
+    buf := string_buffer()
+    mut expected := ""
+    mut i := 0
+    while i < 300:
+        piece := "x".repeat(i % 7) + i.to_string() + "|"
+        assert_eq(buf.write(piece)!, piece.len())
+        expected = expected + piece
+        i = i + 1
+    assert_eq(buf.len(), expected.len())
+    assert_eq(buf.string(), expected)
+    buf.close()
+
+test "io string buffer keeps multi-byte and arbitrary byte content":
+    buf := string_buffer()
+    assert_eq(buf.write("héllo ")!, 7)
+    assert_eq(buf.write("wörld ")!, 7)
+    assert_eq(buf.write("日本語")!, 9)
+    assert_eq(buf.string(), "héllo wörld 日本語")
+    assert_eq(buf.len(), 23)
+    # a string holds whatever bytes were put into it, valid utf-8 or not,
+    # and so must the buffer: nothing on the way in or out may decode.
+    raw := chr(200) + chr(255) + chr(0) + "z"
+    assert_eq(buf.write(raw)!, 4)
+    got := buf.string()
+    assert_eq(got.len(), 27)
+    assert_eq(got, "héllo wörld 日本語" + raw)
+    assert_eq(ord(got[23]), 200)
+    assert_eq(ord(got[24]), 255)
+    assert_eq(ord(got[25]), 0)
+    buf.close()
+
+test "io string buffer aliases share one buffer":
+    first := string_buffer()
+    second := first
+    assert_eq(first.write("ab")!, 2)
+    assert_eq(second.write("cd")!, 2)
+    assert_eq(first.string(), "abcd")
+    assert_eq(second.string(), "abcd")
+    assert_eq(second.len(), 4)
+    second.clear()
+    assert(first.is_empty())
+    first.close()
+    assert_eq(second.write("z")!, 0)
+    assert_eq(second.string(), "")
+
+test "io string buffer snapshots stay unchanged after later writes":
+    buf := string_buffer()
+    mut i := 0
+    while i < 40:
+        buf.write("ab")!
+        i = i + 1
+    early := buf.string()
+    assert_eq(early.len(), 80)
+    buf.write("Z")!
+    assert_eq(early, "ab".repeat(40))
+    assert_eq(buf.string(), "ab".repeat(40) + "Z")
+    later := buf.string()
+    buf.clear()
+    assert_eq(later, "ab".repeat(40) + "Z")
+    assert_eq(early, "ab".repeat(40))
+    buf.write("fresh")!
+    assert_eq(buf.string(), "fresh")
+    last_snapshot := buf.string()
+    buf.close()
+    assert_eq(last_snapshot, "fresh")
+    assert_eq(later.len(), 81)
+    assert_eq(early.len(), 80)
+
+test "io string buffer resets and is reused":
+    buf := string_buffer()
+    mut round := 0
+    while round < 5:
+        mut i := 0
+        while i < 100:
+            buf.write("chunk-{round}-{i};")!
+            i = i + 1
+        assert(buf.string().starts_with("chunk-{round}-0;chunk-{round}-1;"))
+        assert(buf.string().ends_with("chunk-{round}-99;"))
+        buf.clear()
+        assert(buf.is_empty())
+        assert_eq(buf.string(), "")
+        round = round + 1
+    buf.close()
+
+test "io string buffer close frees and stays closed":
+    buf := string_buffer()
+    buf.write("kept")!
+    kept := buf.string()
+    buf.close()
+    assert_eq(kept, "kept")
+    assert_eq(buf.write("more")!, 0)
+    assert_eq(buf.write_line("more")!, 0)
+    assert_eq(buf.string(), "")
+    assert_eq(buf.len(), 0)
+    assert(buf.is_empty())
+    # clearing a closed buffer must not re-register it
+    buf.clear()
+    assert_eq(buf.write("again")!, 0)
+    buf.close()
+    buf.close()
+    assert_eq(buf.string(), "")
+
+test "io string buffer survives repeated create, write and close cycles":
+    mut total := 0
+    mut cycle := 0
+    while cycle < 200:
+        buf := string_buffer()
+        mut i := 0
+        while i < 33:
+            buf.write("c{cycle}.{i} ")!
+            i = i + 1
+        out := buf.string()
+        buf.close()
+        assert(out.starts_with("c{cycle}.0 "))
+        assert(out.ends_with("c{cycle}.32 "))
+        total = total + out.len()
+        cycle = cycle + 1
+    assert(total > 200 * 33 * 4)

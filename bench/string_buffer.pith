@@ -1,0 +1,248 @@
+# string buffer benchmark: std.io's StringBuffer against the chunk-list
+# storage it replaced.
+#
+# both arms live in this one program so that a single build measures both and
+# nothing but the buffer's storage differs. `legacy_*` below is a verbatim copy
+# of what std.io held before the byte-buffer storage landed: every write pushed
+# onto a List[String], and once the list reached 32 chunks the whole list was
+# joined back into one chunk. `current` calls the shipped StringBuffer. inputs
+# come from a seeded 31-bit LCG, are built once outside the timed section, and
+# are identical for the two arms.
+#
+# two workloads:
+#
+#   build     append n chunks, then take string() once and close. the timed
+#             section covers the appends, the one materialization and the
+#             close; the last round's string is hashed in full after the
+#             clock stops, so the checksum covers the output without the
+#             hash's own per-byte cost sitting in the measurement.
+#   snapshot  append n chunks and take string() after every k of them, then
+#             once more at the end. every snapshot is a fresh copy of the
+#             whole prefix in either arm, so this workload's cost has a term
+#             the buffer cannot remove; it is here to show what a snapshot
+#             costs, not to claim linear total cost.
+#
+#   pith build bench/string_buffer.pith
+#   ./bench/string_buffer <arm> <workload> <n> <chunk> <rounds> [k]
+#     arm       legacy | current
+#     workload  build | snapshot
+#     n         appends per round
+#     chunk     bytes per append
+#     rounds    repetitions of the whole workload inside the timed section
+#     k         appends between snapshots (snapshot workload, default 100)
+#
+# bench/string_buffer_bench.sh drives the interleaved comparison.
+import std.bytes as bytes
+import std.fs as fs
+import std.hash as hash
+import std.io as io
+import std.time as time
+
+# ---------------------------------------------------------------
+# the buffer as it stood before the rewrite
+# ---------------------------------------------------------------
+
+struct LegacyStringBuffer:
+    handle: Int
+
+threadlocal mut legacy_next_string_buffer_handle: Int := 1
+threadlocal mut legacy_string_buffer_parts: Map[Int, List[String]] := {}
+threadlocal mut legacy_string_buffer_lengths: Map[Int, Int] := {}
+
+fn legacy_empty_string_parts() -> List[String]:
+    return []
+
+fn legacy_string_buffer() -> LegacyStringBuffer:
+    handle := legacy_next_string_buffer_handle
+    legacy_next_string_buffer_handle = legacy_next_string_buffer_handle + 1
+    legacy_string_buffer_parts.insert(handle, legacy_empty_string_parts())
+    legacy_string_buffer_lengths.insert(handle, 0)
+    return LegacyStringBuffer(handle)
+
+fn legacy_string_buffer_chunks(buf: LegacyStringBuffer) -> List[String]:
+    if legacy_string_buffer_parts.contains_key(buf.handle):
+        return legacy_string_buffer_parts[buf.handle]
+    return legacy_empty_string_parts()
+
+fn legacy_string_buffer_len(buf: LegacyStringBuffer) -> Int:
+    if legacy_string_buffer_lengths.contains_key(buf.handle):
+        return legacy_string_buffer_lengths[buf.handle]
+    return 0
+
+fn legacy_string_buffer_string(buf: LegacyStringBuffer) -> String:
+    parts := legacy_string_buffer_chunks(buf)
+    if parts.len() == 0:
+        return ""
+    if parts.len() == 1:
+        return parts[0]
+    return parts.join("")
+
+fn legacy_string_buffer_append_chunk(buf: LegacyStringBuffer, data: String):
+    parts := legacy_string_buffer_chunks(buf)
+    parts.push(data)
+    legacy_string_buffer_parts.insert(buf.handle, parts)
+    legacy_string_buffer_lengths.insert(buf.handle, legacy_string_buffer_len(buf) + data.len())
+
+fn legacy_string_buffer_compact(buf: LegacyStringBuffer):
+    parts := legacy_string_buffer_chunks(buf)
+    if parts.len() <= 1:
+        return
+    joined := parts.join("")
+    legacy_string_buffer_parts.insert(buf.handle, [joined])
+    legacy_string_buffer_lengths.insert(buf.handle, joined.len())
+
+fn legacy_string_buffer_maybe_compact(buf: LegacyStringBuffer):
+    if legacy_string_buffer_chunks(buf).len() >= 32:
+        legacy_string_buffer_compact(buf)
+
+fn legacy_string_buffer_write(buf: LegacyStringBuffer, data: String) -> Int!:
+    if data.len() == 0:
+        return 0
+    if not legacy_string_buffer_parts.contains_key(buf.handle):
+        return 0
+    legacy_string_buffer_append_chunk(buf, data)
+    legacy_string_buffer_maybe_compact(buf)
+    return data.len()
+
+fn legacy_close_string_buffer(buf: LegacyStringBuffer):
+    legacy_string_buffer_parts.remove(buf.handle)
+    legacy_string_buffer_lengths.remove(buf.handle)
+
+# ---------------------------------------------------------------
+# input generation, outside the timed section
+# ---------------------------------------------------------------
+
+fn chunks_for(n: Int, chunk: Int) -> List[String]:
+    mut out: List[String] := []
+    mut state := 2463534242
+    mut i := 0
+    while i < n:
+        piece := bytes.buffer_with_capacity(chunk)
+        mut j := 0
+        while j < chunk:
+            state = (state * 1103515245 + 12345) % 2147483648
+            piece.write_byte(97 + state % 26) catch 0
+            j = j + 1
+        out.push(piece.take_bytes().to_string_utf8() catch "")
+        i = i + 1
+    return out
+
+# ---------------------------------------------------------------
+# the workloads
+# ---------------------------------------------------------------
+
+# fold a snapshot into the running checksum without walking it: the walk
+# would cost as much as the copy under test and hide it.
+fn fold_snapshot(sum: Int, snap: String) -> Int:
+    mut last := 0
+    if snap.len() > 0:
+        last = ord(snap[snap.len() - 1])
+    return (sum * 31 + snap.len() * 7 + last) % 1000000007
+
+fn legacy_build(chunks: List[String]) -> String:
+    buf := legacy_string_buffer()
+    for piece in chunks:
+        legacy_string_buffer_write(buf, piece) catch 0
+    out := legacy_string_buffer_string(buf)
+    legacy_close_string_buffer(buf)
+    return out
+
+fn current_build(chunks: List[String]) -> String:
+    buf := io.string_buffer()
+    for piece in chunks:
+        buf.write(piece) catch 0
+    out := buf.string()
+    buf.close()
+    return out
+
+fn legacy_snapshot(chunks: List[String], every: Int) -> Int:
+    buf := legacy_string_buffer()
+    mut sum := 0
+    mut i := 0
+    for piece in chunks:
+        legacy_string_buffer_write(buf, piece) catch 0
+        i = i + 1
+        if i % every == 0:
+            sum = fold_snapshot(sum, legacy_string_buffer_string(buf))
+    sum = fold_snapshot(sum, legacy_string_buffer_string(buf))
+    legacy_close_string_buffer(buf)
+    return sum
+
+fn current_snapshot(chunks: List[String], every: Int) -> Int:
+    buf := io.string_buffer()
+    mut sum := 0
+    mut i := 0
+    for piece in chunks:
+        buf.write(piece) catch 0
+        i = i + 1
+        if i % every == 0:
+            sum = fold_snapshot(sum, buf.string())
+    sum = fold_snapshot(sum, buf.string())
+    buf.close()
+    return sum
+
+# the process high-water resident set in kilobytes, read after the timed
+# section: there is no GNU time on every box, and the number is the same.
+fn peak_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+fn arg_at(argv: List[String], at: Int, fallback: String) -> String:
+    if argv.len() > at:
+        return argv[at]
+    return fallback
+
+fn int_arg(argv: List[String], at: Int, fallback: Int) -> Int:
+    if argv.len() > at:
+        parsed := parse_int(argv[at])
+        if parsed.is_ok:
+            return parsed.ok
+    return fallback
+
+fn main():
+    argv := args()
+    arm := arg_at(argv, 1, "current")
+    workload := arg_at(argv, 2, "build")
+    n := int_arg(argv, 3, 10000)
+    chunk := int_arg(argv, 4, 8)
+    rounds := int_arg(argv, 5, 1)
+    mut every := int_arg(argv, 6, 100)
+    if every <= 0:
+        every = 1
+
+    chunks := chunks_for(n, chunk)
+
+    mut sum := 0
+    mut last_out := ""
+    t0 := time.mono_nanos()
+    mut round := 0
+    while round < rounds:
+        if workload == "snapshot":
+            if arm == "legacy":
+                sum = (sum + legacy_snapshot(chunks, every)) % 1000000007
+            else:
+                sum = (sum + current_snapshot(chunks, every)) % 1000000007
+        else:
+            if arm == "legacy":
+                last_out = legacy_build(chunks)
+            else:
+                last_out = current_build(chunks)
+            sum = fold_snapshot(sum, last_out)
+        round = round + 1
+    elapsed_us := (time.mono_nanos() - t0) / 1000
+    # the whole of the last output is hashed once the clock has stopped, so
+    # an arm that dropped or reordered a chunk cannot look fast; every round
+    # builds the same string, so one full hash covers them all.
+    sum = (sum + hash.fnv1a_string(last_out) % 1000000007) % 1000000007
+
+    mut per_op_us := elapsed_us
+    if rounds > 0:
+        per_op_us = elapsed_us / rounds
+    rss := peak_kb()
+    print("{arm} {workload} n={n} chunk={chunk} rounds={rounds} every={every} total_us={elapsed_us} per_op_us={per_op_us} peak_kb={rss} checksum={sum}")

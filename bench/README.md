@@ -660,6 +660,42 @@ tooling/callgrind_ab.sh \
   current './bench/generic_sort current random int 1000 20'
 ```
 
+## string buffer benchmark (std.io)
+
+`bench/string_buffer.pith` measures `std.io`'s `StringBuffer` against the
+chunk-list storage it replaced. Both arms live in the one program: `legacy` is
+a verbatim copy of the old bodies (a `List[String]` per buffer, joined back
+into one chunk every 32 writes), `current` calls the shipped buffer, so a
+single build measures both and nothing but the storage differs. The chunks
+come from a seeded 31-bit LCG and are built before the clock starts.
+
+```
+pith build bench/string_buffer.pith
+bench/string_buffer_bench.sh
+SIZES="1000 10000" CHUNKS=8 bench/string_buffer_bench.sh
+WORKLOADS=snapshot EVERY=50 bench/string_buffer_bench.sh
+```
+
+Two workloads. `build` appends n chunks, takes `string()` once and closes the
+buffer, and hashes the whole result; that is the shape a builder or an encoder
+has, and the one the storage change is about. `snapshot` takes `string()`
+every k appends (default 100) as well as at the end; every snapshot is a
+fresh copy of the whole prefix in either arm, so its total is not linear in n
+for either arm, and the table reports it as what it is rather than as a
+buffer cost. Each run prints its peak resident set alongside the time.
+
+The old storage copied the whole prefix at every compaction, about
+s·n²/62 bytes over n appends of s bytes; instruction counts for one arm at
+1,000, 10,000 and 100,000 appends show whether that term is present. With a
+round count of 0 the program does the input generation alone, which is
+identical in both arms and can be subtracted out.
+
+```
+tooling/callgrind_ab.sh \
+  legacy  './bench/string_buffer legacy build 10000 8 1' \
+  current './bench/string_buffer current build 10000 8 1'
+```
+
 ## std pipeline benchmark
 
 `bench/std_pipeline.*` is a batteries-included data pipeline benchmark. it

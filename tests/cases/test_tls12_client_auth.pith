@@ -93,21 +93,21 @@ fn client_with(cert: String, key: String) -> tls.Config!:
 fn main() -> Int!:
     # 1: the whole point — a required certificate, presented and verified, with
     # the identity reaching the application through the connection state.
-    run_case("required-rsa", 50830, require_server()!, client_with(RSA_CERT, RSA_KEY)!)
+    run_case("required-rsa", 20830, require_server()!, client_with(RSA_CERT, RSA_KEY)!)
     # 2: an ecdsa client key signs the same transcript with the ecdsa scheme.
-    run_case("required-ecdsa", 50831, require_server()!, client_with(EC_CERT, EC_KEY)!)
+    run_case("required-ecdsa", 20831, require_server()!, client_with(EC_CERT, EC_KEY)!)
     # 3: optional mode, client declines: the handshake completes unauthenticated
     # and the server sees no identity at all.
-    run_case("optional-none", 50832, request_server()!, plain_client()!)
+    run_case("optional-none", 20832, request_server()!, plain_client()!)
     # 4: required and the client declines — refused.
-    run_case("required-none", 50833, require_server()!, plain_client()!)
+    run_case("required-none", 20833, require_server()!, plain_client()!)
     # 5: a well formed certificate whose chain does not reach the bundle.
-    run_case("required-rogue", 50834, require_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
+    run_case("required-rogue", 20834, require_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
     # 6: correctly issued and correctly signed, but outside its validity window.
-    run_case("required-expired", 50835, require_server()!, client_with(EXPIRED_CERT, EXPIRED_KEY)!)
+    run_case("required-expired", 20835, require_server()!, client_with(EXPIRED_CERT, EXPIRED_KEY)!)
     # 7: optional does not mean unchecked — a presented certificate is verified.
-    run_case("optional-rogue", 50836, request_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
+    run_case("optional-rogue", 20836, request_server()!, client_with(ROGUE_CERT, ROGUE_KEY)!)
     # 8: a server that never asks gets no certificate, even from a client that
     # holds one.
-    run_case("unrequested", 50837, tls.server_config(SERVER_CERT, SERVER_KEY)!, client_with(RSA_CERT, RSA_KEY)!)
+    run_case("unrequested", 20837, tls.server_config(SERVER_CERT, SERVER_KEY)!, client_with(RSA_CERT, RSA_KEY)!)
     return 0

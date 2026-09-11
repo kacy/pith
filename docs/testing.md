@@ -372,7 +372,14 @@ other kinds of test, all wired through the `Makefile`:
 
 - **golden output** — a program under `tests/cases/` whose stdout is compared
   against `tests/expected/<name>.txt`. good for end-to-end behavior. run with
-  `make run-regressions`.
+  `make run-regressions`. a failing case prints its exit status, a diff of the
+  expected and actual stdout, and its stderr, each cut to 60 lines. a case that
+  listens on a socket uses a fixed port in the 20xxx range, outside linux's
+  ephemeral range (32768-60999). the kernel assigns ephemeral ports to outgoing
+  connections, and a client socket that closes first holds its port in
+  TIME_WAIT for a minute; a listen on that number fails with EADDRINUSE until
+  it expires, even with SO_REUSEADDR set. `make check-test-ports` enforces the
+  rule.
 - **rejected programs** — files under `tests/invalid/` (and `tests/invalid_parse/`)
   that must fail to compile, guarding error messages and negative cases. run with
   `make check-invalid`.

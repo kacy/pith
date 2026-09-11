@@ -1,5 +1,10 @@
-.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only check-bootstrap-seed smoke-bootstrap-seed test clean
+.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck leak-check leak-check-only check-bootstrap-seed smoke-bootstrap-seed test clean
 
+
+# prints a bounded account of a failed regression case: exit status, the
+# expected/actual diff, and stderr. the corpus gates used to say only
+# `FAIL <name>`, which left a ci-only failure (#1092) with nothing to go on.
+EXPLAIN_CASE_FAILURE := sh tooling/explain_case_failure.sh
 
 # scratch paths for the bootstrap seed checks; both are removed by their targets
 SEED_CHECK_TMP := target/seed-check.ir
@@ -67,6 +72,12 @@ build:
 
 check-no-panics:
 	bash tooling/check_no_panics.sh
+
+# a regression case must listen outside linux's ephemeral port range, or a
+# client socket some earlier program (or the ci runner) dialed out from can
+# hold its number in TIME_WAIT and turn its listen into EADDRINUSE (#1092).
+check-test-ports:
+	sh tooling/check_test_ports.sh
 
 # no frame in the runtime may hold a thread-local's address, or a green task
 # resumed on another worker reads the wrong thread's cell. this audits the
@@ -302,16 +313,18 @@ run-regressions: build run-regressions-only
 run-regressions-only:
 	@echo "--- regression cases (Cranelift backend) ---"
 	@pass=0; fail=0; \
+	out=$$(mktemp); err=$$(mktemp); trap 'rm -f "$$out" "$$err"' EXIT; \
 	for f in $(FAST_REGRESSION_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
-		actual=$$(timeout 60 ./target/release/pith run "tests/cases/$$name.pith" 2>/dev/null); \
+		timeout 60 ./target/release/pith run "tests/cases/$$name.pith" >"$$out" 2>"$$err"; rc=$$?; \
 		expected=$$(cat "$$f"); \
-		if [ "$$actual" = "$$expected" ]; then \
+		if [ "$$(cat "$$out")" = "$$expected" ]; then \
 			pass=$$((pass+1)); \
 			echo "ok   $$name"; \
 		else \
 			echo "FAIL $$name"; \
 			fail=$$((fail+1)); \
+			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
 		fi; \
 	done; \
 	for name in $(SLOW_NATIVE_REGRESSIONS); do \
@@ -321,19 +334,21 @@ run-regressions-only:
 			fail=$$((fail+1)); \
 			continue; \
 		fi; \
-		if timeout 120 ./target/release/pith build "tests/cases/$$name.pith" >/dev/null 2>/dev/null; then \
-			actual=$$(timeout 15 "./tests/cases/$$name" 2>/dev/null); \
+		if timeout 120 ./target/release/pith build "tests/cases/$$name.pith" >"$$out" 2>"$$err"; then \
+			timeout 15 "./tests/cases/$$name" >"$$out" 2>"$$err"; rc=$$?; \
 			expected=$$(cat "$$expected_file"); \
-			if [ "$$actual" = "$$expected" ]; then \
+			if [ "$$(cat "$$out")" = "$$expected" ]; then \
 				pass=$$((pass+1)); \
 				echo "ok   $$name"; \
 			else \
 				echo "FAIL $$name"; \
 				fail=$$((fail+1)); \
+				$(EXPLAIN_CASE_FAILURE) "$$expected_file" "$$out" "$$err" "$$rc"; \
 			fi; \
 		else \
-			echo "FAIL $$name"; \
+			echo "FAIL $$name (build)"; \
 			fail=$$((fail+1)); \
+			head -n 60 "$$err" | sed -e 's/^/  /'; \
 		fi; \
 	done; \
 	echo "$$pass passed, $$fail failed"; \
@@ -345,16 +360,18 @@ run-regressions-self: self-host run-regressions-self-only
 run-regressions-self-only:
 	@echo "--- regression cases (self-hosted compiler) ---"
 	@pass=0; fail=0; \
+	out=$$(mktemp); err=$$(mktemp); trap 'rm -f "$$out" "$$err"' EXIT; \
 	for f in $(REGRESSION_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
-		actual=$$(timeout 60 ./self-host/pith_main run "tests/cases/$$name.pith" 2>/dev/null); \
+		timeout 60 ./self-host/pith_main run "tests/cases/$$name.pith" >"$$out" 2>"$$err"; rc=$$?; \
 		expected=$$(cat "$$f"); \
-		if [ "$$actual" = "$$expected" ]; then \
+		if [ "$$(cat "$$out")" = "$$expected" ]; then \
 			pass=$$((pass+1)); \
 			echo "ok   $$name"; \
 		else \
 			echo "FAIL $$name"; \
 			fail=$$((fail+1)); \
+			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
 		fi; \
 	done; \
 	echo "$$pass passed, $$fail failed"; \
@@ -1146,20 +1163,25 @@ verify-green-corpus: build verify-green-corpus-only
 verify-green-corpus-only:
 	@echo "--- regression corpus under the green backend (default + 1 worker) ---"
 	@pass=0; fail=0; skip=0; \
+	out=$$(mktemp); err=$$(mktemp); trap 'rm -f "$$out" "$$err"' EXIT; \
 	for f in $(GREEN_CORPUS_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
 		src="tests/cases/$$name.pith"; \
 		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
 		expected=$$(cat "$$f"); \
-		gN=$$(timeout 60 env PITH_GREEN=1 ./target/release/pith run "$$src" 2>/dev/null); \
-		g1=$$(timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run "$$src" 2>/dev/null); \
-		if [ "$$gN" = "$$expected" ] && [ "$$g1" = "$$expected" ]; then \
-			pass=$$((pass+1)); \
-		elif [ "$$gN" != "$$expected" ]; then \
+		timeout 60 env PITH_GREEN=1 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		if [ "$$(cat "$$out")" != "$$expected" ]; then \
 			echo "FAIL $$name (green default workers)"; fail=$$((fail+1)); \
-		else \
-			echo "FAIL $$name (green 1 worker)"; fail=$$((fail+1)); \
+			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
+			continue; \
 		fi; \
+		timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		if [ "$$(cat "$$out")" != "$$expected" ]; then \
+			echo "FAIL $$name (green 1 worker)"; fail=$$((fail+1)); \
+			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
+			continue; \
+		fi; \
+		pass=$$((pass+1)); \
 	done; \
 	echo "$$pass passed, $$fail failed, $$skip without a source"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
@@ -1170,16 +1192,18 @@ verify-osthread-corpus: build verify-osthread-corpus-only
 verify-osthread-corpus-only:
 	@echo "--- regression corpus under the os-thread backend (PITH_GREEN=0) ---"
 	@pass=0; fail=0; skip=0; \
+	out=$$(mktemp); err=$$(mktemp); trap 'rm -f "$$out" "$$err"' EXIT; \
 	for f in $(GREEN_CORPUS_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
 		src="tests/cases/$$name.pith"; \
 		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
 		expected=$$(cat "$$f"); \
-		actual=$$(timeout 60 env PITH_GREEN=0 ./target/release/pith run "$$src" 2>/dev/null); \
-		if [ "$$actual" = "$$expected" ]; then \
+		timeout 60 env PITH_GREEN=0 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		if [ "$$(cat "$$out")" = "$$expected" ]; then \
 			pass=$$((pass+1)); \
 		else \
 			echo "FAIL $$name (os threads)"; fail=$$((fail+1)); \
+			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
 		fi; \
 	done; \
 	echo "$$pass passed, $$fail failed, $$skip without a source"; \

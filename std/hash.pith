@@ -166,9 +166,10 @@ fn swap64(value: Int) -> Int:
 
 # fill w[0..16] with the sixteen big-endian 32-bit words of the 64-byte
 # block at `off` in `input`. bytes_read_word is called by name because it
-# lowers to one inlined eight-byte load where a per-byte subscript is a
-# runtime call; every caller has off + 64 <= input.len(), so the read
-# stays on that fast path and a pair of words is one load and two swaps.
+# lowers to one inlined eight-byte load, where a per-byte subscript would
+# be eight inlined reads each proving the handle; every caller has
+# off + 64 <= input.len(), so the read stays on that fast path and a pair
+# of words is one load and two swaps.
 fn sha_load_words32(w: List[Int], input: Bytes, off: Int):
     mut j := 0
     while j < 16:

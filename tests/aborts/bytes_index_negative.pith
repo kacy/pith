@@ -1,0 +1,13 @@
+# `data[i]` with a negative index aborts with the bytes out-of-bounds
+# diagnostic. the line before the read proves the program ran up to it.
+import std.bytes as bytes
+
+fn main():
+    buf := bytes.buffer()
+    buf.write_byte(7) catch 0
+    buf.write_byte(9) catch 0
+    data := buf.take_bytes()
+    mut i := 1
+    print("before:{data[i]}")
+    i = i - 2
+    print("after:{data[i]}")

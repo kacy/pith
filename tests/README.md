@@ -2,6 +2,9 @@ This directory is for regression and negative test fixtures.
 
 - `cases/` contains deterministic regression programs
 - `expected/` contains expected output snapshots for `cases/`
+- `aborts/` contains programs that are meant to die, with the diagnostic and
+  exit status each one dies with frozen in `aborts/expected/`; the `.ir` cases
+  there are hand-written combined ir for the failure modes source cannot reach
 - `live/` contains opt-in loopback socket smoke tests
 - `invalid/` contains checker-invalid programs and expected error codes
 - `invalid_parse/` contains parser-invalid programs and expected error codes

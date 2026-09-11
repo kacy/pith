@@ -71,6 +71,9 @@ pub const LIST_IMPL_TYPE_TAG_OFFSET: i32 = std::mem::offset_of!(ListImpl, type_t
 /// The Primitive tag's discriminant, for the codegen fast path: primitive
 /// elements carry no counts, so an in-bounds store needs no retain/release.
 pub const LIST_TYPE_TAG_PRIMITIVE: i32 = ListTypeTag::Primitive as i32;
+/// The alignment `list_ref` requires of a handle before it reads the magic
+/// word; the codegen's strict `xs[i]` fast path applies the same test.
+pub const LIST_HANDLE_ALIGN: i64 = std::mem::align_of::<ListImpl>() as i64;
 
 impl ListImpl {
     fn new(elem_size: usize, type_tag: ListTypeTag) -> Self {

@@ -1,0 +1,24 @@
+; `data[i]` on a bytes value that has already been released. the last
+; release scrubs the magic word, which is what makes a stale handle fail
+; the handle check instead of reading through it; this pins that the
+; subscript reports it as an invalid handle. the value is read and printed
+; from before the release so the read cannot be confused with an
+; out-of-range index.
+string m0s0 "before:"
+string m0s1 "hi"
+func main 0 void
+strref 1 m0s1
+call 2 bytes_from_string_utf8 bytes 1 1
+iconst 3 0
+call 4 bytes_get_strict int 2 2 3
+strref 5 m0s0
+call 6 int_to_string string 1 4
+concat 7 5 6
+call 8 pith_print_cstr unknown 1 7
+call 9 pith_bytes_release void 1 2
+call 10 bytes_get_strict int 2 2 3
+call 11 int_to_string string 1 10
+call 12 pith_print_cstr unknown 1 11
+iconst 13 0
+ret 13
+endfunc

@@ -1,0 +1,15 @@
+; `data[i]` on a handle that is a stray integer. 12345 is not 8-aligned, so
+; the runtime rejects it before reading through it; the inline fast path
+; must do the same rather than dereference it.
+string m0s0 "before"
+func main 0 void
+strref 1 m0s0
+call 2 pith_print_cstr unknown 1 1
+iconst 3 12345
+iconst 4 0
+call 5 bytes_get_strict int 2 3 4
+call 6 int_to_string string 1 5
+call 7 pith_print_cstr unknown 1 6
+iconst 8 0
+ret 8
+endfunc

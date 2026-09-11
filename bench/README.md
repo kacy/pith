@@ -872,10 +872,15 @@ reducing per byte (#1116):
 | `checksum.crc32` | 60.0 | 60.0 |
 | `checksum.adler32` | 47.0 | 11.0 |
 
-what remains in the sha kernels is mostly the strict `w[i]` and
-round-constant `List[Int]` reads, about 140 of the 353 in sha-256; those
-are runtime calls today and the first section of #1116 is about inlining
-them.
+what remained in the sha kernels after that was mostly the strict `w[i]`
+and round-constant `List[Int]` reads, about 140 of the 353 in sha-256,
+which were runtime calls. the first section of #1116 gave `xs[i]` and
+`bytes[i]` an inline fast path in the ir consumer (the runtime call stays
+as the slow path, so a bad index aborts as before); on the same kernels,
+same std, old backend against new: `hash.sha1` 328.7 → 262.0,
+`hash.sha256` 353.3 → 281.6, `checksum.crc32` 60.0 → 47.0 (its table read
+is a list subscript), `checksum.adler32` 11.0 → 11.0 (it reads through
+`bytes_read_word` and `bytes_get`, both already inline). digests identical.
 
 ## zstd codec benchmark (pure-pith encoder and decoder)
 

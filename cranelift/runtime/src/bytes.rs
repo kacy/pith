@@ -4,7 +4,8 @@ use std::io::Read;
 pub(crate) struct PithBytes {
     // data_ptr and data_len must stay at offsets 0 and 8: the codegen
     // inlines bytes indexing against this layout (ir_consumer.rs), so the
-    // magic word lives at the end.
+    // magic word lives at the end. The strict `bytes[i]` fast path also
+    // reads the magic word, through BYTES_MAGIC_OFFSET below.
     pub(crate) data_ptr: *const u8,
     pub(crate) data_len: usize,
     pub(crate) data: Vec<u8>,
@@ -13,7 +14,15 @@ pub(crate) struct PithBytes {
 }
 
 /// Magic word for PithBytes ("PBYT")
-pub(crate) const BYTES_MAGIC: u32 = 0x50425954;
+pub const BYTES_MAGIC: u32 = 0x50425954;
+
+/// Layout facts the codegen's inlined `bytes[i]` fast path reads directly,
+/// so the two cannot drift apart: the data pointer, the length, the magic
+/// word, and the alignment `pith_bytes_ref` requires of a handle.
+pub const BYTES_DATA_PTR_OFFSET: i32 = std::mem::offset_of!(PithBytes, data_ptr) as i32;
+pub const BYTES_DATA_LEN_OFFSET: i32 = std::mem::offset_of!(PithBytes, data_len) as i32;
+pub const BYTES_MAGIC_OFFSET: i32 = std::mem::offset_of!(PithBytes, magic) as i32;
+pub const BYTES_HANDLE_ALIGN: i64 = std::mem::align_of::<PithBytes>() as i64;
 
 /// Magic word for PithByteBuffer ("PBUF")
 const BYTE_BUFFER_MAGIC: u32 = 0x50425546;

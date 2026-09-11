@@ -49,14 +49,14 @@ fn run_case(label: String, port: Int, server_cfg: tls.Config, client_cfg: tls.Co
 
 fn main() -> Int!:
     # 1: a 1.2-capped client and a normal server negotiate 1.2 and exchange data.
-    run_case("rsa", 50810, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
+    run_case("rsa", 20810, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
     # 2: an ECDSA server serves an ECDHE-ECDSA suite over 1.2.
-    run_case("ecdsa", 50811, tls.server_config(EC_CERT, EC_KEY)!, tls.client_config_with_ca_file(EC_CA)!.require_tls12())
+    run_case("ecdsa", 20811, tls.server_config(EC_CERT, EC_KEY)!, tls.client_config_with_ca_file(EC_CA)!.require_tls12())
     # 3: a server requiring client certs refuses the fallback (no mTLS bypass).
-    run_case("mtls-required", 50812, tls.server_config(RSA_CERT, RSA_KEY)!.require_client_ca_file(RSA_CA)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
+    run_case("mtls-required", 20812, tls.server_config(RSA_CERT, RSA_KEY)!.require_client_ca_file(RSA_CA)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12())
     # 4: a client-side verify-connection hook runs on the 1.2 path and rejects,
     # failing the dial (proves the hook is not bypassed on the fallback).
-    run_case("verify-hook", 50813, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_verify_connection(reject_hook))
+    run_case("verify-hook", 20813, tls.server_config(RSA_CERT, RSA_KEY)!, tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_verify_connection(reject_hook))
     # 5: ALPN is negotiated over 1.2.
-    run_case("alpn", 50814, tls.server_config(RSA_CERT, RSA_KEY)!.with_alpn(["h2"]), tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_alpn(["h2"]))
+    run_case("alpn", 20814, tls.server_config(RSA_CERT, RSA_KEY)!.with_alpn(["h2"]), tls.client_config_with_ca_file(RSA_CA)!.require_tls12().with_alpn(["h2"]))
     return 0

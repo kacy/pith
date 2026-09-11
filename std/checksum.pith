@@ -1,9 +1,52 @@
 # std.checksum — small checksum helpers
 
 import std.bits as bits
+import std.bytes as bytes
+
+# the crc-32 lookup table: for each byte value, the remainder of shifting
+# it through the reflected polynomial 0xEDB88320 eight times. one entry
+# per byte value, so the per-byte step below is a table read and a shift.
+fn crc32_build_table() -> List[Int]:
+    mut table: List[Int] := []
+    mut value := 0
+    while value < 256:
+        mut crc := value
+        mut i := 0
+        while i < 8:
+            if bits.band(crc, 1) == 1:
+                crc = bits.xor(bits.shr(crc, 1), 3988292384)
+            else:
+                crc = bits.shr(crc, 1)
+            i = i + 1
+        table.push(crc)
+        value = value + 1
+    return table
+
+# built when the module loads. module initializers run on the main thread
+# before main's body, so every task that checksums reads a complete table.
+crc32_table: List[Int] := crc32_build_table()
 
 # compute the standard crc-32 checksum used by gzip and zip.
 pub fn crc32(data: Bytes) -> Int:
+    mut crc := 4294967295
+    n := data.len()
+    mut pos := 0
+    # table-driven: one lookup per byte instead of eight conditional shifts,
+    # which cost about 260 instructions per byte. the length is read once,
+    # and the byte comes through the bytes_get builtin, which lowers to an
+    # inlined load where the subscript is a runtime call; the loop bound
+    # keeps the index in range, so the two never differ here.
+    # crc32_reference below is the bit-at-a-time definition, kept as the
+    # oracle the randomized test compares against.
+    while pos < n:
+        crc = bits.xor(crc32_table[bits.band(bits.xor(crc, bytes_get(data, pos)), 255)], bits.shr(crc, 8))
+        pos = pos + 1
+    return bits.xor(crc, 4294967295)
+
+# the bit-at-a-time crc-32 this module shipped before the table, kept
+# verbatim so the randomized test has an independent definition to agree
+# with. not part of the module's surface.
+fn crc32_reference(data: Bytes) -> Int:
     mut crc := 4294967295
     mut pos := 0
     while pos < data.len():
@@ -24,9 +67,12 @@ pub fn crc32(data: Bytes) -> Int:
 pub fn adler32(data: Bytes) -> Int:
     mut a := 1
     mut b := 0
+    n := data.len()
     mut pos := 0
-    while pos < data.len():
-        a = (a + data[pos]) % 65521
+    # the length is read once and the byte comes through bytes_get, for the
+    # reason given at crc32
+    while pos < n:
+        a = (a + bytes_get(data, pos)) % 65521
         b = (b + a) % 65521
         pos = pos + 1
     return bits.bor(bits.shl(b, 16), a)
@@ -40,3 +86,27 @@ test "adler32 matches common vectors":
     assert_eq(adler32(bytes_from_string_utf8("")), 1)
     assert_eq(adler32(bytes_from_string_utf8("hello")), 103547413)
     assert_eq(adler32(bytes_from_string_utf8("123456789")), 152961502)
+
+# random content at random lengths, checked against the bit-at-a-time
+# definition: every length from 0 to 40 several times over, plus a spread
+# of longer inputs.
+test "table-driven crc32 agrees with the bit-at-a-time definition":
+    mut state := 88172645463325252
+    mut trial := 0
+    while trial < 3000:
+        buf := bytes.buffer()
+        mut want := trial % 41
+        if trial % 10 == 9:
+            want = 41 + trial % 1000
+        mut filled := 0
+        while filled < want:
+            # xorshift64: the low byte of each step is the next content byte
+            state = bits.xor(state, bits.shl(state, 13))
+            state = bits.xor(state, bits.shr(state, 7))
+            state = bits.xor(state, bits.shl(state, 17))
+            buf.write_byte(bits.band(state, 255))!
+            filled = filled + 1
+        data := buf.take_bytes()
+        assert_eq(data.len(), want)
+        assert_eq(crc32(data), crc32_reference(data))
+        trial = trial + 1

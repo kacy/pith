@@ -358,8 +358,43 @@ pub fn sha384_hex(input: Bytes) -> String:
 pub fn sha384_string(input: String) -> String:
     return sha384(bytes.from_string_utf8(input))
 
-## hash bytes with fnv-1a.
+## hash bytes with fnv-1a (the 32-bit variant: offset basis 2166136261,
+## prime 16777619).
 pub fn fnv1a(input: Bytes) -> Int:
+    mut h := 2166136261
+    n := input.len()
+    full := n - n % 8
+    mut i := 0
+    # eight bytes per read, the eight steps spelled out. the byte-at-a-time
+    # form cost about 56 instructions per byte: a runtime call for the
+    # length and one for the indexed byte on every iteration, a call into
+    # the mask32 wrapper, and the loop's own overhead. bytes_read_word
+    # lowers to one inlined load, and bits.band/bits.xor on two arguments
+    # lower to single instructions, so a step is an xor, a multiply and a
+    # mask. the multiply cannot overflow: h stays under 2^32 and the prime
+    # is under 2^24. the tail of fewer than eight bytes goes one at a time.
+    # fnv1a_reference below is the byte-at-a-time definition, kept as the
+    # oracle the randomized test compares against.
+    while i < full:
+        word := bytes_read_word(input, i, 8)
+        h = bits.band(bits.xor(h, bits.band(word, 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 8), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 16), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 24), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 32), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 40), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.band(bits.shr(word, 48), 255)) * 16777619, 4294967295)
+        h = bits.band(bits.xor(h, bits.shr(word, 56)) * 16777619, 4294967295)
+        i = i + 8
+    while i < n:
+        h = bits.band(bits.xor(h, input[i]) * 16777619, 4294967295)
+        i = i + 1
+    return h
+
+# the byte-at-a-time fnv-1a this module shipped before the word loop, kept
+# verbatim so the randomized test has an independent definition to agree
+# with. not part of the module's surface.
+fn fnv1a_reference(input: Bytes) -> Int:
     mut h := 2166136261
     mut i := 0
     while i < input.len():
@@ -539,3 +574,33 @@ test "fnv1a hashes bytes and strings":
 
     assert_eq(fnv1a(data), 1335831723)
     assert_eq(fnv1a_string("hello"), 1335831723)
+    assert_eq(fnv1a(bytes.empty()), 2166136261)
+    assert_eq(fnv1a_string(""), 2166136261)
+    # the fnv test vectors: "a" and "foobar" from the reference implementation
+    assert_eq(fnv1a_string("a"), 3826002220)
+    assert_eq(fnv1a_string("foobar"), 3214735720)
+
+# random content at random lengths, checked against the byte-at-a-time
+# definition. every length from 0 to 40 is covered several times so the
+# word loop's boundary (a multiple of eight, then the tail) is hit at every
+# offset, and a spread of longer inputs covers many full words.
+test "fnv1a word loop agrees with the byte-at-a-time definition":
+    mut state := 88172645463325252
+    mut trial := 0
+    while trial < 3000:
+        buf := bytes.buffer()
+        mut want := trial % 41
+        if trial % 10 == 9:
+            want = 41 + trial % 1000
+        mut filled := 0
+        while filled < want:
+            # xorshift64: the low byte of each step is the next content byte
+            state = bits.xor(state, bits.shl(state, 13))
+            state = bits.xor(state, bits.shr(state, 7))
+            state = bits.xor(state, bits.shl(state, 17))
+            buf.write_byte(bits.band(state, 255))!
+            filled = filled + 1
+        data := buf.take_bytes()
+        assert_eq(data.len(), want)
+        assert_eq(fnv1a(data), fnv1a_reference(data))
+        trial = trial + 1

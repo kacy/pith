@@ -11,9 +11,14 @@
 use crate::{CodeGen, CompileError};
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
+use pith_runtime::bytes::{
+    BYTES_DATA_LEN_OFFSET, BYTES_DATA_PTR_OFFSET, BYTES_HANDLE_ALIGN, BYTES_MAGIC,
+    BYTES_MAGIC_OFFSET,
+};
 use pith_runtime::collections::list::{
-    LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET,
-    LIST_IMPL_VALUES8_PTR_OFFSET, LIST_MAGIC, LIST_TYPE_TAG_PRIMITIVE,
+    LIST_HANDLE_ALIGN, LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET,
+    LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET, LIST_MAGIC,
+    LIST_TYPE_TAG_PRIMITIVE,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -539,6 +544,237 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]
+}
+
+/// `brif` that carries `a` and `b` to `taken` and nothing to `fallthrough`.
+/// The strict-index fast paths route every failed check to one slow block,
+/// marked cold, that receives the handle and index as block parameters: the
+/// runtime call's operands are then the slow block's own values, the moves
+/// that feed them sit in the cold edge blocks, and the fast path is laid out
+/// as one fall-through sequence.
+#[cfg(pith_cranelift_new_api)]
+fn brif_with_two_i64_args(
+    builder: &mut FunctionBuilder<'_>,
+    cond: Value,
+    taken: Block,
+    a: Value,
+    b: Value,
+    fallthrough: Block,
+) {
+    builder.ins().brif(
+        cond,
+        taken,
+        &[
+            cranelift::codegen::ir::instructions::BlockArg::Value(a),
+            cranelift::codegen::ir::instructions::BlockArg::Value(b),
+        ],
+        fallthrough,
+        &[],
+    );
+}
+
+#[cfg(not(pith_cranelift_new_api))]
+fn brif_with_two_i64_args(
+    builder: &mut FunctionBuilder<'_>,
+    cond: Value,
+    taken: Block,
+    a: Value,
+    b: Value,
+    fallthrough: Block,
+) {
+    builder.ins().brif(cond, taken, &[a, b], fallthrough, &[]);
+}
+
+/// Branch to `slow(handle, index)` unless `handle` is a pointer the
+/// runtime's magic-checked accessor would accept: non-null, aligned as the
+/// runtime struct requires, and carrying `magic` at `magic_offset`. This is
+/// `plausibly_aligned` plus the magic compare, in that order, so a null or
+/// misaligned handle is rejected before anything is read through it,
+/// exactly as the runtime does. On return the builder sits in a fresh block
+/// where the handle is known good.
+fn branch_if_not_magic_handle(
+    builder: &mut FunctionBuilder<'_>,
+    handle: Value,
+    index: Value,
+    align: i64,
+    magic_offset: i32,
+    magic: u32,
+    slow: Block,
+) {
+    // null and misalignment in one compare: rotating the low s bits to the
+    // top (s = log2 align) turns an aligned non-null handle into a value in
+    // 1..2^(64-s), null into 0, and a misaligned handle into a value with a
+    // top bit set. Subtracting one then puts exactly the good handles below
+    // 2^(64-s) - 1 as unsigned values.
+    debug_assert!((align as u64).is_power_of_two());
+    let shift = align.trailing_zeros() as i64;
+    let rotated = builder.ins().rotr_imm(handle, shift);
+    let rotated_m1 = builder.ins().iadd_imm(rotated, -1);
+    let good_limit = ((1u64 << (64 - shift)) - 1) as i64;
+    let handle_bad = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        rotated_m1,
+        good_limit,
+    );
+    let check_magic = builder.create_block();
+    brif_with_two_i64_args(builder, handle_bad, slow, handle, index, check_magic);
+    builder.switch_to_block(check_magic);
+
+    let word = builder
+        .ins()
+        .load(types::I32, MemFlags::new(), handle, magic_offset);
+    let magic_bad = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, word, magic as i64);
+    let good = builder.create_block();
+    brif_with_two_i64_args(builder, magic_bad, slow, handle, index, good);
+    builder.switch_to_block(good);
+}
+
+/// The shared tail of the strict fast paths: `slow` calls `fallback` on the
+/// handle and index it was handed and joins `done` with the result, and the
+/// builder is left in `done` with the merged value.
+fn finish_strict_fast_path(
+    builder: &mut FunctionBuilder<'_>,
+    slow: Block,
+    done: Block,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    builder.switch_to_block(slow);
+    let params = builder.block_params(slow);
+    let (handle, index) = (params[0], params[1]);
+    let call = builder.ins().call(fallback, &[handle, index]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+/// Inline `bytes[i]`, the strict form that aborts instead of answering
+/// zero, as a magic check, one bounds compare and one byte load. The fast
+/// path accepts exactly the inputs `pith_bytes_get_strict` accepts: a
+/// handle `pith_bytes_ref` would take (non-null, aligned, magic intact) and
+/// an index in `0..len`, the sign and bound folded into one unsigned
+/// compare. Everything else jumps to `fallback`, the runtime function
+/// itself, which re-runs its own checks in its own order and prints the
+/// same diagnostic and exit code it always has; so the failure modes are
+/// byte-identical and the fast path only changes the cost of a read that
+/// was going to succeed.
+fn inline_bytes_get_strict(
+    builder: &mut FunctionBuilder<'_>,
+    bytes: Value,
+    index: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    branch_if_not_magic_handle(
+        builder,
+        bytes,
+        index,
+        BYTES_HANDLE_ALIGN,
+        BYTES_MAGIC_OFFSET,
+        BYTES_MAGIC,
+        slow,
+    );
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        bytes,
+        BYTES_DATA_LEN_OFFSET,
+    );
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let read = builder.create_block();
+    brif_with_two_i64_args(builder, out_of_bounds, slow, bytes, index, read);
+    builder.switch_to_block(read);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        bytes,
+        BYTES_DATA_PTR_OFFSET,
+    );
+    let elem_addr = builder.ins().iadd(data_ptr, index);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), elem_addr, 0);
+    let value = builder.ins().uextend(types::I64, byte);
+    jump_with_i64_arg(builder, done, value);
+
+    finish_strict_fast_path(builder, slow, done, fallback)
+}
+
+/// Inline `xs[i]` (`pith_list_get_value_strict`, the form that aborts on a
+/// bad index) the same way as `inline_bytes_get_strict`: the fast path
+/// accepts exactly what the runtime accepts and everything else calls the
+/// runtime function, which produces the diagnostic. The checks are the
+/// handle test `list_ref` performs (non-null, aligned, magic intact; the
+/// magic is scrubbed when a list is freed, so a stale handle fails here),
+/// the element size the runtime insists on, and one unsigned compare
+/// against the 8-byte storage length for both `i < 0` and `i >= len`. A
+/// list whose elements are not 8 bytes wide keeps that length at zero, so
+/// the size check is also what keeps the compare honest for it. The data
+/// pointer needs no null test: a non-empty 8-byte list always has one.
+fn inline_list_get_value_strict(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    index: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    branch_if_not_magic_handle(builder, list, index, LIST_HANDLE_ALIGN, 0, LIST_MAGIC, slow);
+
+    let elem_size = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_ELEM_SIZE_OFFSET,
+    );
+    let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
+    let check_bounds = builder.create_block();
+    brif_with_two_i64_args(builder, not_eight, slow, list, index, check_bounds);
+    builder.switch_to_block(check_bounds);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_LEN_OFFSET,
+    );
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let read = builder.create_block();
+    brif_with_two_i64_args(builder, out_of_bounds, slow, list, index, read);
+    builder.switch_to_block(read);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        list,
+        LIST_IMPL_VALUES8_PTR_OFFSET,
+    );
+    let byte_offset = builder.ins().ishl_imm(index, 3);
+    let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), elem_addr, 0);
+    jump_with_i64_arg(builder, done, value);
+
+    finish_strict_fast_path(builder, slow, done, fallback)
 }
 
 /// Inline bytes.read_word for the common case — a count of 1..=8 with a
@@ -2096,6 +2332,26 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
+                    // `bytes[i]`: the same fast path, with the runtime's
+                    // strict getter as the fallback so a failing read still
+                    // aborts with its diagnostic.
+                    if fname == "bytes_get_strict" && args.len() == 2 && !name_is_shadowed {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "bytes_get_strict",
+                        )?;
+                        let inlined =
+                            inline_bytes_get_strict(&mut builder, args[0], args[1], fallback);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
                     if fname == "bytes_read_word" && args.len() == 3 && !name_is_shadowed {
                         let fallback = runtime_func_ref(
                             codegen,
@@ -2156,6 +2412,48 @@ fn compile_ir_function(
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                         struct_regs.remove(&reg);
+                        continue;
+                    }
+                    // `xs[i]`: inline the in-bounds read and leave every
+                    // failure to the runtime's strict getter. the register
+                    // bookkeeping below is the generic call path's, keyed on
+                    // the retkind, since the element can be of any kind.
+                    if fname == "pith_list_get_value_strict"
+                        && args.len() == 2
+                        && !name_is_shadowed
+                        && retkind != "result_int"
+                        && retkind != "result_bool"
+                    {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_list_get_value_strict",
+                        )?;
+                        let inlined =
+                            inline_list_get_value_strict(&mut builder, args[0], args[1], fallback);
+                        regs.insert(reg, inlined);
+                        if retkind == "string" {
+                            string_regs.insert(reg);
+                        } else {
+                            string_regs.remove(&reg);
+                        }
+                        if retkind == "bytes" {
+                            bytes_regs.insert(reg);
+                        } else {
+                            bytes_regs.remove(&reg);
+                        }
+                        if retkind == "float" {
+                            float_regs.insert(reg);
+                        } else {
+                            float_regs.remove(&reg);
+                        }
+                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                            struct_regs.insert(reg, struct_name.to_string());
+                        } else {
+                            struct_regs.remove(&reg);
+                        }
                         continue;
                     }
                     if (fname == "pith_list_get_value" || fname == "pith_list_get_value_unchecked")

@@ -225,21 +225,24 @@ into the emitter later.
   struct.
 
 these are distinct from genuine code-generation choices that belong in the back
-end regardless: the consumer inlines `bytes_get`, `byte_at`, `string_len`, and
-`pith_list_get_value(_unchecked)` as fast paths (a header read instead of a call),
-falling back to the runtime helper. inlining is the back end's job; the *name
-rewrites and type dispatch* above are not.
+end regardless: the consumer inlines `bytes_get`, `bytes_get_strict`, `byte_at`,
+`string_len`, `pith_list_get_value(_unchecked)` and `pith_list_get_value_strict`
+as fast paths (a header read instead of a call), falling back to the runtime
+helper. inlining is the back end's job; the *name rewrites and type dispatch*
+above are not.
 
-`pith_list_get_value_strict` — what `xs[i]` actually lowers to, and the single
-hottest call in the language — is deliberately **not** inlined. it looks like the
-obvious next candidate and it has been measured: an inline fast path removes about
-30% of all instructions executed and half of all memory references when
-type-checking the self-hosted compiler, and still comes out 1-3% *slower* on wall
-clock. the shared runtime function is a hot micro-kernel that stays resident in
-L1i with perfectly trained branches, and spreading it across thousands of call
-sites costs more in instruction fetch and branch-predictor pressure than the call
-saves. trimming the shared kernel instead was worth 11%. do not re-litigate this
-without an interleaved A/B on a real workload — the instruction count will lie.
+the two strict getters, what `bytes[i]` and `xs[i]` lower to, keep their abort
+semantics through the fallback: the inline path performs the runtime's own
+handle test (non-null, aligned, magic word intact), the element-size check for
+lists, and one unsigned bounds compare, and anything that fails any of them
+calls the runtime function, which re-runs its checks and prints the diagnostic
+it always printed. `tests/aborts` pins those diagnostics and exit codes. an
+earlier attempt at inlining `xs[i]` (august 2026) removed 30% of the
+instructions of a self-hosted type-check and still measured 1-3% slower on wall
+clock, so the shape here was accepted only after an interleaved A/B of
+`pith_main check self-host/pith_main.pith` came out neutral (21 pairs, medians
+within 0.6%); a change to this fast path needs that measurement again, not an
+instruction count.
 
 ## the robustness contract
 

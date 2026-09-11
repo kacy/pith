@@ -424,6 +424,37 @@ checked too: the ir driver linked against the new runtime emits byte-identical
 ir for `bench/std_pipeline.pith` (1,088,812 bytes) and for its own source
 (5,119,821 bytes).
 
+### the strict subscripts inlined (2026-09-11)
+
+`bytes[i]` lowers to `bytes_get_strict` and `xs[i]` on a `List[Int]` to
+`pith_list_get_value_strict`. until the first item of #1116 both were runtime
+calls: 17 and 28 instructions in the callee plus five at the call site. the
+non-strict `bytes_get` and `pith_list_get_value_unchecked` had inline fast
+paths, and the std kernels had started calling `bytes_get` by name to reach
+one (`std/checksum.pith`). the ir consumer now inlines the strict pair too.
+the inline path makes the checks the runtime makes (a non-null, aligned
+handle with its magic word intact, an 8-byte element for lists, the index in
+range) and calls the runtime function as its slow path, so every failure
+still prints the diagnostic it printed before; `tests/aborts` pins those
+against goldens generated from the previous compiler. per element on a 2 MB
+probe, subscript loop minus the same loop without the read: `bytes[i]` 22 →
+17, `xs[i]` 33 → 18. per byte over 4 MB, hash arm minus a no-hash arm,
+old backend against new on the same std: `checksum.crc32` 60 → 47 (its
+table read is a list subscript); on the e80078d0 sha kernels, which copied
+the input into a list and read it back by subscript, `hash.sha1` 762.6 →
+654.4 and `hash.sha256` 1164.0 → 1020.0; on the #1119 kernels, which hash
+straight out of the input and keep `w[i]` and the round constants as list
+subscripts, `hash.sha1` 328.7 → 262.0 and `hash.sha256` 353.3 → 281.6. the
+by-name `bytes_get` in crc32 and adler32's tail stays: with the subscript
+crc32 measures 51 per byte, the four extra instructions being the handle
+proof the strict form makes and the plain builtin skips. whole programs that
+hash a few hundred bytes once do not move:
+`bench/event_ledger 200000` is 2,698,639,580 → 2,698,573,602 instructions.
+the compiler, the heaviest user of `xs[i]`, was checked on wall clock as the
+ir contract asks (an earlier inline attempt had been slower there): 21
+interleaved pairs of `pith_main check self-host/pith_main.pith`, medians
+0.854 s before and 0.849 s after.
+
 ### the night of 2026-09-10, measured end to end
 
 the sections above record each change on its own program. this one is the

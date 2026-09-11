@@ -1,0 +1,23 @@
+; `xs[i]` on a list that has already been released. freeing a list scrubs
+; its magic word, which is what makes a stale handle fail the handle check
+; instead of reading through it; this pins that the subscript reports it as
+; an invalid handle. the list is built, filled and printed from before the
+; release so the read cannot be confused with an out-of-range index.
+string m0s0 "before:"
+func main 0 void
+call 1 pith_list_new_default list 0
+iconst 2 7
+call 3 pith_list_push_value void 2 1 2
+iconst 4 0
+call 5 pith_list_get_value_strict int 2 1 4
+strref 6 m0s0
+call 7 int_to_string string 1 5
+concat 8 6 7
+call 9 pith_print_cstr unknown 1 8
+call 10 pith_list_release_handle void 1 1
+call 11 pith_list_get_value_strict int 2 1 4
+call 12 int_to_string string 1 11
+call 13 pith_print_cstr unknown 1 12
+iconst 14 0
+ret 14
+endfunc

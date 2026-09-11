@@ -1,0 +1,12 @@
+# `data[i]` one past the end aborts with the bytes out-of-bounds diagnostic.
+import std.bytes as bytes
+
+fn main():
+    buf := bytes.buffer()
+    buf.write_byte(7) catch 0
+    buf.write_byte(9) catch 0
+    data := buf.take_bytes()
+    mut i := 1
+    print("before:{data[i]}")
+    i = i + 1
+    print("after:{data[i]}")

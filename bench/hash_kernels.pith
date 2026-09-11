@@ -1,0 +1,58 @@
+# hash_kernels: one std.hash or std.checksum kernel over a few megabytes
+# of deterministic content, so a change to a kernel can be measured on its
+# own under callgrind: run the kernel arm and the `none` arm, and the
+# difference divided by the byte count is the kernel's cost per byte. the
+# content is xorshift64 output written eight bytes at a time, the same in
+# every run, so the digest line doubles as the correctness check between a
+# binary built before a change and one built after it.
+#
+#   pith build bench/hash_kernels.pith
+#   ./bench/hash_kernels sha256 4      # sha-256 over 4 MB
+#   ./bench/hash_kernels none 4        # generation only
+
+import std.bytes as bytes
+import std.bits as bits
+import std.hash as hash
+import std.checksum as checksum
+
+fn main():
+    argv := args()
+    mut kernel := "sha256"
+    mut mb := 4
+    if argv.len() > 1:
+        kernel = argv[1]
+    if argv.len() > 2:
+        mb = parse_int(argv[2]) catch mb
+    total := mb * 1048576
+    buf := bytes.buffer()
+    mut state := 88172645463325252
+    mut filled := 0
+    while filled < total:
+        state = bits.xor(state, bits.shl(state, 13))
+        state = bits.xor(state, bits.shr(state, 7))
+        state = bits.xor(state, bits.shl(state, 17))
+        buf.write_word(state, 8)
+        filled = filled + 8
+    data := buf.take_bytes()
+    print("len=" + data.len().to_string())
+    if kernel == "none":
+        print("digest=none")
+    elif kernel == "sha1":
+        print("digest=" + hash.sha1(data))
+    elif kernel == "sha224":
+        print("digest=" + hash.sha224(data))
+    elif kernel == "sha256":
+        print("digest=" + hash.sha256(data))
+    elif kernel == "sha384":
+        print("digest=" + hash.sha384(data))
+    elif kernel == "sha512":
+        print("digest=" + hash.sha512(data))
+    elif kernel == "fnv1a":
+        print("digest=" + hash.fnv1a(data).to_string())
+    elif kernel == "crc32":
+        print("digest=" + checksum.crc32(data).to_string())
+    elif kernel == "adler32":
+        print("digest=" + checksum.adler32(data).to_string())
+    else:
+        print("unknown kernel " + kernel + "; one of none sha1 sha224 sha256 sha384 sha512 fnv1a crc32 adler32")
+        exit(2)

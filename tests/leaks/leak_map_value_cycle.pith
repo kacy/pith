@@ -1,0 +1,41 @@
+# a map holding a struct whose field points back at the map: a strong ring
+# through the map's VALUE side, built and dropped every round.
+#
+# neither edge is weak, so ARC alone can never reclaim one and the peak grows
+# by a ring per round with the collector off. that is the falsifier, and it is
+# the whole point of the case: the collector only reaches these rings through
+# `cycle_map_children`, so a map that stopped reporting the values it owns a
+# count on would look exactly like a map with no cycles in it, and nothing
+# else here would notice. the gate runs this with PITH_CYCLE_GC=1 (see the
+# per-case env in leak_check.sh), where the peak stays flat.
+#
+# the forced collection every few thousand rounds keeps each pass small and
+# the peak deterministic; the suspect threshold alone would also trigger
+# passes, but on its own schedule.
+import leakprobe as probe
+import std.concurrent as concurrent
+
+struct Holder:
+    value: Int
+    mut back: Map[String, Holder]?
+
+fn build_ring(seed: Int) -> Int:
+    mut m: Map[String, Holder] := {}
+    h := Holder(value: seed, back: none)
+    m.insert("self", h)
+    h.back = m
+    return m.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + build_ring(i)
+        if i % 5000 == 0:
+            concurrent.gc_collect()
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

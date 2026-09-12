@@ -1,0 +1,19 @@
+; a bytes-keyed map reached through a string entry point. the string path
+; would read the bytes handle's header as a c-string, so distinct keys would
+; collapse into one entry in silence; that silent collapse is what E254 exists
+; to stop. E254 catches it in the checker, which is why safe pith source cannot
+; express this case and why it is combined text ir instead: this is the runtime
+; half of the same guard, and nothing else reaches it.
+string m0s0 "before"
+string m0s1 "k"
+func main 0 void
+strref 1 m0s0
+call 2 pith_print_cstr unknown 1 1
+call 3 pith_map_new_bytes int 0
+strref 4 m0s1
+call 5 map_contains_key int 2 3 4
+call 6 int_to_string string 1 5
+call 7 pith_print_cstr unknown 1 6
+iconst 8 0
+ret 8
+endfunc

@@ -8,7 +8,8 @@ use crate::collections::list::{
 };
 use crate::handle_registry::{self, HandleKind};
 use crate::runtime_core::optional_tuple;
-use hashbrown::HashMap;
+use hashbrown::hash_map::EntryRef;
+use hashbrown::{Equivalent, HashMap};
 use std::hash::{Hash, Hasher};
 /// FFI-compatible map handle
 #[repr(C)]
@@ -48,6 +49,80 @@ impl Hash for MapKey {
                 2u8.hash(state); // Type tag for bytes
                 bytes.hash(state);
             }
+        }
+    }
+}
+
+/// A key the caller already holds the bytes of: the probe form of `MapKey`.
+///
+/// Every lookup, membership test, removal and overwrite asks a question about
+/// content the caller is already holding — the c-string it passed, or the
+/// buffer inside its bytes object — so none of them needs the map's own copy.
+/// Only an insert that misses does, and `From<&KeyRef> for MapKey` is the one
+/// place that copy is made.
+///
+/// The `Hash` impl below has to write exactly the bytes `MapKey`'s writes for
+/// the same content: the same tag byte, then the same slice hashing. A `Vec<u8>`
+/// and a `&[u8]` hash identically (length prefix, then the bytes), which is
+/// what makes the two agree. If they ever stopped agreeing the failure would
+/// not be a crash: every string-keyed map in every program would start missing
+/// keys it holds. `key_ref_hashes_like_map_key` in this file's tests pins it.
+#[derive(Clone, Copy, Debug)]
+pub enum KeyRef<'a> {
+    Int(i64),
+    Str(&'a [u8]),
+    Bytes(&'a [u8]),
+}
+
+impl Hash for KeyRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match *self {
+            KeyRef::Int(n) => {
+                0u8.hash(state); // Type tag for int
+                n.hash(state);
+            }
+            KeyRef::Str(bytes) => {
+                1u8.hash(state); // Type tag for string
+                bytes.hash(state);
+            }
+            KeyRef::Bytes(bytes) => {
+                2u8.hash(state); // Type tag for bytes
+                bytes.hash(state);
+            }
+        }
+    }
+}
+
+impl Equivalent<MapKey> for KeyRef<'_> {
+    fn equivalent(&self, key: &MapKey) -> bool {
+        match (*self, key) {
+            (KeyRef::Int(a), MapKey::Int(b)) => a == *b,
+            (KeyRef::Str(a), MapKey::String(b)) => a == b.as_slice(),
+            (KeyRef::Bytes(a), MapKey::Bytes(b)) => a == b.as_slice(),
+            _ => false,
+        }
+    }
+}
+
+/// The map's own copy of a borrowed key. The single `to_vec` in the map's
+/// key path, reached only when an insert misses.
+impl From<&KeyRef<'_>> for MapKey {
+    fn from(key: &KeyRef<'_>) -> MapKey {
+        match *key {
+            KeyRef::Int(n) => MapKey::Int(n),
+            KeyRef::Str(bytes) => MapKey::String(bytes.to_vec()),
+            KeyRef::Bytes(bytes) => MapKey::Bytes(bytes.to_vec()),
+        }
+    }
+}
+
+impl KeyRef<'_> {
+    /// The key as text, for traces and the strict-miss diagnostic.
+    fn display(&self) -> String {
+        match *self {
+            KeyRef::Int(n) => n.to_string(),
+            KeyRef::Str(b) => format!("{:?}", String::from_utf8_lossy(b)),
+            KeyRef::Bytes(b) => format!("bytes{:?}", b),
         }
     }
 }
@@ -185,19 +260,31 @@ impl MapImpl {
         }
     }
 
-    fn insert(&mut self, key: MapKey, value: Vec<u8>) -> Option<Vec<u8>> {
-        self.data.insert(key, value)
+    /// Store `value` under a borrowed key, returning whatever it displaced.
+    ///
+    /// The probe runs against the caller's bytes; the map materialises its own
+    /// copy of the key only on the vacant arm, so an overwrite of a key the map
+    /// already holds allocates nothing for the key. An occupied entry keeps the
+    /// key it already has, exactly as `HashMap::insert` does.
+    fn insert(&mut self, key: &KeyRef<'_>, value: Vec<u8>) -> Option<Vec<u8>> {
+        match self.data.entry_ref(key) {
+            EntryRef::Occupied(mut entry) => Some(entry.insert(value)),
+            EntryRef::Vacant(entry) => {
+                entry.insert(value);
+                None
+            }
+        }
     }
 
-    fn get(&self, key: &MapKey) -> Option<&Vec<u8>> {
+    fn get(&self, key: &KeyRef<'_>) -> Option<&Vec<u8>> {
         self.data.get(key)
     }
 
-    fn remove(&mut self, key: &MapKey) -> Option<Vec<u8>> {
+    fn remove(&mut self, key: &KeyRef<'_>) -> Option<Vec<u8>> {
         self.data.remove(key)
     }
 
-    fn contains_key(&self, key: &MapKey) -> bool {
+    fn contains_key(&self, key: &KeyRef<'_>) -> bool {
         self.data.contains_key(key)
     }
 
@@ -480,7 +567,7 @@ pub unsafe extern "C" fn pith_map_insert_int(
 
     // Retain before insert, release the displaced value after: `m[k] = m[k]`
     // must not drop the last count before the new one is taken.
-    if let Some(old) = impl_ref.insert(MapKey::Int(key), val_vec) {
+    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), val_vec) {
         impl_ref.release_value(&old);
     }
 }
@@ -672,7 +759,7 @@ pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
     if impl_ref.uses_int_values8() {
         return impl_ref.remove_int_value(key).unwrap_or(0);
     }
-    match impl_ref.remove(&MapKey::Int(key)) {
+    match impl_ref.remove(&KeyRef::Int(key)) {
         Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
         _ => 0,
     }
@@ -688,7 +775,7 @@ pub unsafe extern "C" fn pith_map_take(map_handle: i64, key: *const i8) -> i64 {
         return 0;
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_take");
-    take_keyed(impl_ref, &cstr_to_map_key(key))
+    take_keyed(impl_ref, &cstr_key_ref(key))
 }
 
 /// Bytes-keyed take: remove and transfer the value's count to the caller.
@@ -701,7 +788,7 @@ pub unsafe extern "C" fn pith_map_take_bkey(map_handle: i64, key: i64) -> i64 {
         return 0;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_take_bkey");
-    let Some(map_key) = bytes_to_map_key(key) else {
+    let Some(map_key) = bytes_key_ref(key) else {
         return 0;
     };
     take_keyed(impl_ref, &map_key)
@@ -709,7 +796,7 @@ pub unsafe extern "C" fn pith_map_take_bkey(map_handle: i64, key: i64) -> i64 {
 
 /// Remove an entry and hand its value's count to the caller: the map's
 /// count leaves with the value instead of being released here.
-unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &MapKey) -> i64 {
+unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
     match impl_ref.remove(map_key) {
         Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
         _ => 0,
@@ -763,31 +850,34 @@ fn map_trace_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("PITH_MAP_TRACE").is_ok())
 }
 
-unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
+/// Borrow a c-string key: walk it for its length and hand back the caller's
+/// own bytes. Nothing is copied, so the borrow is only good for the length of
+/// the call that took it.
+unsafe fn cstr_key_ref<'a>(key: *const i8) -> KeyRef<'a> {
     let mut len = 0usize;
     let mut p = key;
     while *p != 0 {
         len += 1;
         p = p.add(1);
     }
-    let bytes = std::slice::from_raw_parts(key as *const u8, len);
-    MapKey::String(bytes.to_vec())
+    KeyRef::Str(std::slice::from_raw_parts(key as *const u8, len))
 }
 
-/// The map key for a bytes handle, or `None` for a handle that is not a
-/// live bytes object. A null handle is the empty value, which `pith_bytes_eq`
-/// already treats as equal to an empty bytes object. The handle is only
-/// read: the map keeps its own copy of the content and never a count on
-/// the caller's object.
-unsafe fn bytes_to_map_key(key: i64) -> Option<MapKey> {
+/// Borrow a bytes handle's buffer as a key, or `None` for a handle that is not
+/// a live bytes object. A null handle is the empty value, which `pith_bytes_eq`
+/// already treats as equal to an empty bytes object. The handle is only read:
+/// the map keeps its own copy of the content and never a count on the caller's
+/// object, and the caller's object is alive for the whole of the entry point
+/// that borrowed it, so the borrow must not outlive that call.
+unsafe fn bytes_key_ref<'a>(key: i64) -> Option<KeyRef<'a>> {
     if key == 0 {
-        return Some(MapKey::Bytes(Vec::new()));
+        return Some(KeyRef::Bytes(&[]));
     }
-    crate::bytes::pith_bytes_ref(key).map(|b| MapKey::Bytes(b.data.clone()))
+    crate::bytes::pith_bytes_ref(key).map(|b| KeyRef::Bytes(b.data.as_slice()))
 }
 
 /// The stored word under `map_key`, or `None` on a miss.
-unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &MapKey) -> Option<i64> {
+unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
     match impl_ref.get(map_key) {
         Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
             val_data[..8].try_into().unwrap_or([0u8; 8]),
@@ -797,7 +887,7 @@ unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &MapKey) -> Option<i64> {
 }
 
 /// Drop the entry under `map_key`, releasing the map's count on its value.
-unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &MapKey) {
+unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) {
     if let Some(old) = impl_ref.remove(map_key) {
         impl_ref.release_value(&old);
     }
@@ -899,7 +989,7 @@ unsafe fn insert_cstr_inner(map_handle: i64, key: *const i8, value: i64, takes_c
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
     crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
-    insert_keyed(impl_ref, cstr_to_map_key(key), value, takes_caller_count);
+    insert_keyed(impl_ref, &cstr_key_ref(key), value, takes_caller_count);
 }
 
 unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
@@ -907,10 +997,10 @@ unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
         return;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_insert_bkey");
-    let Some(map_key) = bytes_to_map_key(key) else {
+    let Some(map_key) = bytes_key_ref(key) else {
         return;
     };
-    insert_keyed(impl_ref, map_key, value, takes_caller_count);
+    insert_keyed(impl_ref, &map_key, value, takes_caller_count);
 }
 
 /// Store `value` under `map_key`. the map retains the incoming value when it
@@ -918,7 +1008,7 @@ unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
 /// value arrives with the caller's count, which the map keeps as its own.
 unsafe fn insert_keyed(
     impl_ref: &mut MapImpl,
-    map_key: MapKey,
+    map_key: &KeyRef<'_>,
     value: i64,
     takes_caller_count: bool,
 ) {
@@ -952,7 +1042,7 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_get");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_to_map_key(key);
+    let map_key = cstr_key_ref(key);
     let Some(v) = get_keyed(impl_ref, &map_key) else {
         return 0;
     };
@@ -979,7 +1069,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) 
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_opt");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    match get_keyed(impl_ref, &cstr_to_map_key(key)) {
+    match get_keyed(impl_ref, &cstr_key_ref(key)) {
         Some(v) => optional_tuple(true, v),
         None => optional_tuple(false, 0),
     }
@@ -1007,7 +1097,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_strict");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_to_map_key(key);
+    let map_key = cstr_key_ref(key);
     match get_keyed(impl_ref, &map_key) {
         Some(v) => v,
         None => strict_miss(&map_key.display()),
@@ -1030,7 +1120,7 @@ pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8)
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_contains_key");
     crate::perf_stats!(PERF_MAP_STRING_CONTAINS += 1);
-    if impl_ref.contains_key(&cstr_to_map_key(key)) {
+    if impl_ref.contains_key(&cstr_key_ref(key)) {
         1
     } else {
         0
@@ -1052,7 +1142,7 @@ pub unsafe extern "C" fn pith_map_get_default_cstr(
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_default");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    get_keyed(impl_ref, &cstr_to_map_key(key)).unwrap_or(default)
+    get_keyed(impl_ref, &cstr_key_ref(key)).unwrap_or(default)
 }
 
 /// Get value by integer key with a default if not found.
@@ -1067,7 +1157,7 @@ pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, de
         impl_ref.get_int_value(key).unwrap_or(default)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        let map_key = MapKey::Int(key);
+        let map_key = KeyRef::Int(key);
         match impl_ref.get(&map_key) {
             Some(val_data) if val_data.len() >= 8 => {
                 i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
@@ -1093,7 +1183,7 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_remove");
     crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
-    remove_keyed(impl_ref, &cstr_to_map_key(key));
+    remove_keyed(impl_ref, &cstr_key_ref(key));
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1266,7 @@ pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
         return 0;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey");
-    bytes_to_map_key(key)
+    bytes_key_ref(key)
         .and_then(|map_key| get_keyed(impl_ref, &map_key))
         .unwrap_or(0)
 }
@@ -1192,7 +1282,7 @@ pub unsafe extern "C" fn pith_map_get_bkey_opt(map_handle: i64, key: i64) -> i64
         return optional_tuple(false, 0);
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_opt");
-    let found = bytes_to_map_key(key).and_then(|map_key| get_keyed(impl_ref, &map_key));
+    let found = bytes_key_ref(key).and_then(|map_key| get_keyed(impl_ref, &map_key));
     match found {
         Some(v) => optional_tuple(true, v),
         None => optional_tuple(false, 0),
@@ -1212,7 +1302,7 @@ pub unsafe extern "C" fn pith_map_get_bkey_strict(map_handle: i64, key: i64) -> 
         std::process::exit(1);
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_strict");
-    let Some(map_key) = bytes_to_map_key(key) else {
+    let Some(map_key) = bytes_key_ref(key) else {
         strict_miss("<not a bytes value>");
     };
     match get_keyed(impl_ref, &map_key) {
@@ -1231,7 +1321,7 @@ pub unsafe extern "C" fn pith_map_contains_bkey(map_handle: i64, key: i64) -> i6
         return 0;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_contains_bkey");
-    match bytes_to_map_key(key) {
+    match bytes_key_ref(key) {
         Some(map_key) if impl_ref.contains_key(&map_key) => 1,
         _ => 0,
     }
@@ -1247,7 +1337,7 @@ pub unsafe extern "C" fn pith_map_get_default_bkey(map_handle: i64, key: i64, de
         return default;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_default_bkey");
-    bytes_to_map_key(key)
+    bytes_key_ref(key)
         .and_then(|map_key| get_keyed(impl_ref, &map_key))
         .unwrap_or(default)
 }
@@ -1262,7 +1352,7 @@ pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
         return;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_remove_bkey");
-    if let Some(map_key) = bytes_to_map_key(key) {
+    if let Some(map_key) = bytes_key_ref(key) {
         remove_keyed(impl_ref, &map_key);
     }
 }
@@ -1363,7 +1453,7 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
             impl_ref.retain_value(value);
         }
         let val_bytes = value.to_le_bytes().to_vec();
-        if let Some(old) = impl_ref.insert(MapKey::Int(key), val_bytes) {
+        if let Some(old) = impl_ref.insert(&KeyRef::Int(key), val_bytes) {
             impl_ref.release_value(&old);
         }
     }
@@ -1385,7 +1475,7 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
         impl_ref.get_int_value(key).unwrap_or(0)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&MapKey::Int(key)) {
+        match impl_ref.get(&KeyRef::Int(key)) {
             Some(val_data) if val_data.len() >= 8 => {
                 i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
             }
@@ -1413,7 +1503,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64
         }
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&MapKey::Int(key)) {
+        match impl_ref.get(&KeyRef::Int(key)) {
             Some(val_data) if val_data.len() >= 8 => optional_tuple(
                 true,
                 i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
@@ -1441,7 +1531,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
         impl_ref.get_int_value(key)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&MapKey::Int(key)) {
+        match impl_ref.get(&KeyRef::Int(key)) {
             Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
                 val_data[..8].try_into().unwrap_or([0u8; 8]),
             )),
@@ -1477,7 +1567,7 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
         impl_ref.contains_int_key(key)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_CONTAINS, 1);
-        impl_ref.contains_key(&MapKey::Int(key))
+        impl_ref.contains_key(&KeyRef::Int(key))
     };
 
     if contains {
@@ -1502,7 +1592,7 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
         impl_ref.remove_int_value(key);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
-        if let Some(old) = impl_ref.remove(&MapKey::Int(key)) {
+        if let Some(old) = impl_ref.remove(&KeyRef::Int(key)) {
             impl_ref.release_value(&old);
         }
     }
@@ -2110,6 +2200,362 @@ mod tests {
             for v in [v1, v2, v3] {
                 crate::pith_cstring_release(v);
             }
+            pith_map_release_handle(map);
+        }
+    }
+
+    // --- the borrowed-key contract -----------------------------------------
+
+    /// The inputs the hash-equality proof runs over. A key that is empty, one
+    /// byte, or a single ascii word is the ordinary case; the rest are the ones
+    /// a naive "hash the bytes" would get wrong. A zero byte cannot reach a
+    /// c-string key, but it can reach a bytes key, and the two `KeyRef` arms
+    /// share the impl, so it is covered here where it can be.
+    fn hash_probe_inputs() -> Vec<Vec<u8>> {
+        vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"region".to_vec(),
+            b"user-1000-region".to_vec(),
+            // a prefix and the same bytes with more after them: the length has
+            // to enter the hash, or these two collide.
+            b"abc".to_vec(),
+            // embedded zero bytes (bytes keys can hold them)
+            vec![0u8],
+            vec![b'a', 0, b'b'],
+            vec![0, 0, 0, 0],
+            // multi-byte utf-8
+            "\u{e9}".as_bytes().to_vec(),
+            "\u{65e5}\u{672c}\u{8a9e}".as_bytes().to_vec(),
+            "\u{1f600}".as_bytes().to_vec(),
+            // long: past every small-buffer boundary in sight
+            vec![b'x'; 255],
+            vec![b'y'; 4096],
+            // the same width as an int key's payload, in case a tag were ever
+            // dropped
+            vec![0u8; 8],
+        ]
+    }
+
+    fn hash_with(state: &std::collections::hash_map::RandomState, value: &impl Hash) -> u64 {
+        use std::hash::BuildHasher;
+        let mut hasher = state.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The one that would fail silently.
+    ///
+    /// `KeyRef` is what every probe hashes and `MapKey` is what the table
+    /// stores, so if the two ever wrote different bytes for the same content
+    /// the table would stop finding keys it holds: no crash, no diagnostic,
+    /// just every string-keyed map in every program missing entries. This
+    /// asserts the two agree under the map's own hasher, for every shape in
+    /// `hash_probe_inputs`, and that the tag keeps the three flavors apart.
+    #[test]
+    fn key_ref_hashes_like_map_key() {
+        let state = std::collections::hash_map::RandomState::new();
+        for bytes in hash_probe_inputs() {
+            assert_eq!(
+                hash_with(&state, &KeyRef::Str(&bytes)),
+                hash_with(&state, &MapKey::String(bytes.clone())),
+                "string flavor, {} bytes",
+                bytes.len()
+            );
+            assert_eq!(
+                hash_with(&state, &KeyRef::Bytes(&bytes)),
+                hash_with(&state, &MapKey::Bytes(bytes.clone())),
+                "bytes flavor, {} bytes",
+                bytes.len()
+            );
+            // and the tag has to keep the flavors apart, or a Map[Bytes, V]
+            // and a Map[String, V] would share entries
+            assert_ne!(
+                hash_with(&state, &KeyRef::Str(&bytes)),
+                hash_with(&state, &KeyRef::Bytes(&bytes)),
+                "flavors must not collide, {} bytes",
+                bytes.len()
+            );
+            assert!(KeyRef::Str(&bytes).equivalent(&MapKey::String(bytes.clone())));
+            assert!(KeyRef::Bytes(&bytes).equivalent(&MapKey::Bytes(bytes.clone())));
+            assert!(!KeyRef::Str(&bytes).equivalent(&MapKey::Bytes(bytes.clone())));
+            assert!(!KeyRef::Bytes(&bytes).equivalent(&MapKey::String(bytes.clone())));
+            assert_eq!(
+                MapKey::from(&KeyRef::Str(&bytes)),
+                MapKey::String(bytes.clone())
+            );
+            assert_eq!(
+                MapKey::from(&KeyRef::Bytes(&bytes)),
+                MapKey::Bytes(bytes.clone())
+            );
+        }
+        // a prefix must not hash like the longer key it is a prefix of
+        assert_ne!(
+            hash_with(&state, &KeyRef::Str(b"ab")),
+            hash_with(&state, &KeyRef::Str(b"abc"))
+        );
+        for n in [i64::MIN, -1, 0, 1, 255, i64::MAX] {
+            assert_eq!(
+                hash_with(&state, &KeyRef::Int(n)),
+                hash_with(&state, &MapKey::Int(n)),
+                "int flavor, {n}"
+            );
+            assert!(KeyRef::Int(n).equivalent(&MapKey::Int(n)));
+        }
+    }
+
+    /// The same claim through the table rather than the hasher: a key stored
+    /// as `MapKey` is found by the `KeyRef` for the same content.
+    #[test]
+    fn a_stored_key_is_found_by_its_borrowed_form() {
+        for bytes in hash_probe_inputs() {
+            let mut table: HashMap<MapKey, Vec<u8>> = HashMap::new();
+            table.insert(MapKey::String(bytes.clone()), vec![1]);
+            table.insert(MapKey::Bytes(bytes.clone()), vec![2]);
+            assert_eq!(table.get(&KeyRef::Str(&bytes)), Some(&vec![1]));
+            assert_eq!(table.get(&KeyRef::Bytes(&bytes)), Some(&vec![2]));
+        }
+    }
+
+    /// A c-string key one byte longer than the one already stored must not
+    /// find it. The borrowed probe carries its own length, and this is the
+    /// shape a length mistake in `cstr_key_ref` would show up as.
+    #[test]
+    fn a_borrowed_cstr_key_carries_its_length() {
+        unsafe {
+            let map = pith_map_new_default().ptr as i64;
+            let ab = b"ab\0".as_ptr() as *const i8;
+            let abc = b"abc\0".as_ptr() as *const i8;
+            let empty = b"\0".as_ptr() as *const i8;
+            pith_map_insert_cstr(map, ab, 1);
+            assert_eq!(pith_map_contains_cstr(map, ab), 1);
+            assert_eq!(pith_map_contains_cstr(map, abc), 0);
+            assert_eq!(pith_map_contains_cstr(map, empty), 0);
+            pith_map_insert_cstr(map, empty, 7);
+            assert_eq!(pith_map_get_cstr(map, empty), 7);
+            assert_eq!(pith_map_len_handle(map), 2);
+            pith_map_release_handle(map);
+        }
+    }
+
+    // --- allocation counts -------------------------------------------------
+    //
+    // what the borrowed probes buy, stated as the only number that can show
+    // it: an operation on a key the map already holds allocates nothing for
+    // the key. The value box each insert still makes is called out where it is
+    // counted rather than folded into a total, because removing it is a
+    // separate change.
+
+    use crate::collections::alloc_probe::allocations_during;
+
+    #[test]
+    fn string_key_hits_allocate_nothing_for_the_key() {
+        unsafe {
+            let map = pith_map_new_default().ptr as i64;
+            let key = b"user-1000-region\0".as_ptr() as *const i8;
+            let absent = b"user-1001-region\0".as_ptr() as *const i8;
+            pith_map_insert_cstr(map, key, 1);
+
+            assert_eq!(allocations_during(|| { pith_map_get_cstr(map, key); }), 0);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_cstr_strict(map, key);
+                }),
+                0
+            );
+            // `.get(k)` returns an Optional tuple, and that tuple is a heap
+            // allocation by construction. It is the caller's value, not a copy
+            // of the key, so the claim here is that it is the ONLY allocation:
+            // one warm-up call to get the struct pool past its own setup, then
+            // exactly one per call, hit or miss.
+            pith_map_get_cstr_opt(map, key);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_cstr_opt(map, key);
+                }),
+                1
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_cstr_opt(map, absent);
+                }),
+                1
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_default_cstr(map, key, 0);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_cstr(map, key);
+                }),
+                0
+            );
+            // a miss probes and allocates nothing either
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_cstr(map, absent);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_cstr(map, absent);
+                }),
+                0
+            );
+            // an overwrite of a key the map holds: one allocation, and it is
+            // the value box, not the key
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_cstr(map, key, 2);
+                }),
+                1
+            );
+            assert_eq!(pith_map_get_cstr(map, key), 2);
+            // a remove of a key the map holds frees, and allocates nothing
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_remove_cstr(map, key);
+                }),
+                0
+            );
+            assert_eq!(pith_map_len_handle(map), 0);
+
+            pith_map_release_handle(map);
+        }
+    }
+
+    #[test]
+    fn a_new_string_key_allocates_the_key_once() {
+        unsafe {
+            let map = pith_map_new_default().ptr as i64;
+            // insert one first, so the table is past its initial allocation
+            // and the count below is the entry's own cost
+            pith_map_insert_cstr(map, b"seed\0".as_ptr() as *const i8, 0);
+            let fresh = b"a-key-the-map-has-never-seen\0".as_ptr() as *const i8;
+            // the key copy plus the value box, one each
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_cstr(map, fresh, 5);
+                }),
+                2
+            );
+            assert_eq!(pith_map_get_cstr(map, fresh), 5);
+            pith_map_release_handle(map);
+        }
+    }
+
+    #[test]
+    fn bytes_key_hits_allocate_nothing_for_the_key() {
+        unsafe {
+            let map = pith_map_new_bytes().ptr as i64;
+            let key = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
+            let absent = crate::bytes::pith_bytes_from_vec(b"user-1001-region".to_vec());
+            pith_map_insert_bkey(map, key, 1);
+
+            assert_eq!(allocations_during(|| { pith_map_get_bkey(map, key); }), 0);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_bkey_strict(map, key);
+                }),
+                0
+            );
+            // as in the string test: the Optional tuple is the one allocation,
+            // and it is the returned value rather than a copy of the key
+            pith_map_get_bkey_opt(map, key);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_bkey_opt(map, key);
+                }),
+                1
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_bkey_opt(map, absent);
+                }),
+                1
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_get_default_bkey(map, key, 0);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_bkey(map, key);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_bkey(map, absent);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_bkey(map, key, 2);
+                }),
+                1
+            );
+            assert_eq!(pith_map_get_bkey(map, key), 2);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_remove_bkey(map, key);
+                }),
+                0
+            );
+            assert_eq!(pith_map_len_handle(map), 0);
+
+            crate::bytes::pith_bytes_release(key);
+            crate::bytes::pith_bytes_release(absent);
+            pith_map_release_handle(map);
+        }
+    }
+
+    /// An int-keyed map that cannot use the scalar fast path (this one owns
+    /// heap values) goes through the shared table, so it gets the same
+    /// treatment.
+    #[test]
+    fn int_key_hits_allocate_nothing_for_the_key() {
+        unsafe {
+            let map = pith_map_new_int_cstr_val().ptr as i64;
+            let s = crate::pith_copy_bytes_to_cstring(b"value");
+            pith_map_insert_ikey(map, 7, s as i64);
+
+            assert_eq!(allocations_during(|| { pith_map_get_ikey(map, 7); }), 0);
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_ikey(map, 7);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_contains_ikey(map, 8);
+                }),
+                0
+            );
+            // the value box again, and nothing for the key
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_ikey(map, 7, s as i64);
+                }),
+                1
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_remove_ikey(map, 7);
+                }),
+                0
+            );
+
+            crate::pith_cstring_release(s);
             pith_map_release_handle(map);
         }
     }

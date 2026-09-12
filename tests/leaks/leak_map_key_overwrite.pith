@@ -1,0 +1,47 @@
+# overwriting a key the map already holds, in a loop, for every key flavor.
+#
+# an overwrite probes with the caller's own bytes and swaps the value in
+# place: the map keeps the key it already had, and the caller's copy is
+# never taken. the counts that move are the value's — the new one retained,
+# the displaced one released — and this is the loop that catches an
+# overwrite that dropped the new value's count, or kept the old one, or
+# started leaking the key it declined to store.
+import leakprobe as probe
+
+fn round(
+    i: Int,
+    smap: Map[String, String],
+    bmap: Map[Bytes, String],
+    imap: Map[Int, String],
+    counts: Map[String, Int]
+) -> Int:
+    # a fresh value under the same four keys every round
+    value := "payload-{i}-and-some-more"
+    smap.insert("stable", value)
+    smap["stable"] = value          # the same value again, over itself
+    bmap.insert(bytes_from_string_utf8("stable"), value)
+    bmap[bytes_from_string_utf8("stable")] = value
+    imap.insert(7, value)
+    imap[7] = value
+    # the event ledger's shape: contains, strict get, insert of a hit
+    if counts.contains_key("stable"):
+        counts.insert("stable", counts["stable"] + 1)
+    else:
+        counts.insert("stable", 1)
+    return smap.len() + bmap.len() + imap.len() + counts.len()
+
+fn main():
+    n := probe.rounds()
+    mut smap: Map[String, String] := {}
+    mut bmap: Map[Bytes, String] := {}
+    mut imap: Map[Int, String] := {}
+    mut counts: Map[String, Int] := {}
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i, smap, bmap, imap, counts)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

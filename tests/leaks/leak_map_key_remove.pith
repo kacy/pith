@@ -1,0 +1,58 @@
+# inserting a fresh key and taking it back out again, in a loop, for every
+# key flavor and for sets as well as maps.
+#
+# a removal probes with the caller's bytes and hands back the map's own copy
+# of the key to be dropped with the entry. Nothing about the key survives the
+# round, so a removal that dropped the entry but not the key it stored — or
+# released the value twice on the way out — moves the peak here.
+import leakprobe as probe
+
+fn round(
+    i: Int,
+    smap: Map[String, String],
+    bmap: Map[Bytes, String],
+    imap: Map[Int, String],
+    names: Set[String],
+    blobs: Set[Bytes]
+) -> Int:
+    key := "key-{i}-with-some-length"
+    bkey := bytes_from_string_utf8(key)
+    value := "payload-{i}-and-some-more"
+
+    smap.insert(key, value)
+    bmap.insert(bkey, value)
+    imap.insert(i, value)
+    names.add(key)
+    blobs.add(bkey)
+
+    mut acc := 0
+    if smap.contains_key(key):
+        acc = acc + smap[key].len()
+    if names.contains(key):
+        acc = acc + 1
+    if blobs.contains(bkey):
+        acc = acc + 1
+
+    smap.remove(key)
+    bmap.remove(bkey)
+    imap.remove(i)
+    names.remove(key)
+    blobs.remove(bkey)
+    return acc + smap.len() + bmap.len() + imap.len() + names.len() + blobs.len()
+
+fn main():
+    n := probe.rounds()
+    mut smap: Map[String, String] := {}
+    mut bmap: Map[Bytes, String] := {}
+    mut imap: Map[Int, String] := {}
+    mut names: Set[String] := {}
+    mut blobs: Set[Bytes] := {}
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i, smap, bmap, imap, names, blobs)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

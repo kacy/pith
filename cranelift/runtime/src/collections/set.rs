@@ -4,7 +4,8 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::handle_registry::{self, HandleKind};
-use hashbrown::HashSet;
+use hashbrown::hash_map::EntryRef;
+use hashbrown::{Equivalent, HashMap};
 use std::hash::{Hash, Hasher};
 
 /// FFI-compatible set handle
@@ -49,14 +50,79 @@ impl Hash for SetElement {
     }
 }
 
+/// An element the caller already holds the bytes of: the probe form of
+/// `SetElement`.
+///
+/// A membership test, a removal, and an add of an element the set already
+/// holds are all questions about content the caller is holding already, so
+/// none of them needs the set's own copy. Only an add that misses does, and
+/// `From<&ElemRef> for SetElement` is the one place that copy is made.
+///
+/// As with `KeyRef` in `map.rs`, the `Hash` impl has to write exactly the
+/// bytes `SetElement`'s writes for the same content, or a set silently stops
+/// finding elements it holds. `elem_ref_hashes_like_set_element` pins it.
+#[derive(Clone, Copy, Debug)]
+pub enum ElemRef<'a> {
+    Int(i64),
+    Str(&'a [u8]),
+    Bytes(&'a [u8]),
+}
+
+impl Hash for ElemRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match *self {
+            ElemRef::Int(n) => {
+                0u8.hash(state);
+                n.hash(state);
+            }
+            ElemRef::Str(bytes) => {
+                1u8.hash(state);
+                bytes.hash(state);
+            }
+            ElemRef::Bytes(bytes) => {
+                2u8.hash(state);
+                bytes.hash(state);
+            }
+        }
+    }
+}
+
+impl Equivalent<SetElement> for ElemRef<'_> {
+    fn equivalent(&self, elem: &SetElement) -> bool {
+        match (*self, elem) {
+            (ElemRef::Int(a), SetElement::Int(b)) => a == *b,
+            (ElemRef::Str(a), SetElement::String(b)) => a == b.as_slice(),
+            (ElemRef::Bytes(a), SetElement::Bytes(b)) => a == b.as_slice(),
+            _ => false,
+        }
+    }
+}
+
+/// The set's own copy of a borrowed element. The single `to_vec` in the set's
+/// element path, reached only when an add misses.
+impl From<&ElemRef<'_>> for SetElement {
+    fn from(elem: &ElemRef<'_>) -> SetElement {
+        match *elem {
+            ElemRef::Int(n) => SetElement::Int(n),
+            ElemRef::Str(bytes) => SetElement::String(bytes.to_vec()),
+            ElemRef::Bytes(bytes) => SetElement::Bytes(bytes.to_vec()),
+        }
+    }
+}
+
 /// Internal set implementation using idiomatic Rust
 pub struct SetImpl {
     /// Magic word for the fast validity check (see set_magic_ok)
     magic: u32,
     /// Shared-handle refcount (see ListImpl.rc)
     rc: std::sync::atomic::AtomicU32,
-    /// The actual hash set storing unique elements
-    data: HashSet<SetElement>,
+    /// The actual hash table storing unique elements.
+    ///
+    /// A map with unit values rather than a `HashSet` because only the map has
+    /// `entry_ref`: it probes with the caller's own bytes and builds the set's
+    /// copy of the element only when the add misses. `HashSet` is that same
+    /// table with the values fixed at `()`, so this costs nothing per element.
+    data: HashMap<SetElement, ()>,
     /// Type tag for elements (0=int, 1=string, 2=bytes)
     elem_type: ElemType,
 }
@@ -104,7 +170,7 @@ impl SetImpl {
         SetImpl {
             magic: SET_MAGIC,
             rc: std::sync::atomic::AtomicU32::new(1),
-            data: HashSet::new(),
+            data: HashMap::new(),
             elem_type,
         }
     }
@@ -113,16 +179,27 @@ impl SetImpl {
         self.data.len()
     }
 
-    fn insert(&mut self, elem: SetElement) -> bool {
-        self.data.insert(elem)
+    /// Add a borrowed element, reporting whether it was new.
+    ///
+    /// The probe runs against the caller's own bytes; the set materialises its
+    /// own copy of the element only on the vacant arm, so adding an element the
+    /// set already holds allocates nothing.
+    fn insert(&mut self, elem: &ElemRef<'_>) -> bool {
+        match self.data.entry_ref(elem) {
+            EntryRef::Occupied(_) => false,
+            EntryRef::Vacant(entry) => {
+                entry.insert(());
+                true
+            }
+        }
     }
 
-    fn contains(&self, elem: &SetElement) -> bool {
-        self.data.contains(elem)
+    fn contains(&self, elem: &ElemRef<'_>) -> bool {
+        self.data.contains_key(elem)
     }
 
-    fn remove(&mut self, elem: &SetElement) -> bool {
-        self.data.remove(elem)
+    fn remove(&mut self, elem: &ElemRef<'_>) -> bool {
+        self.data.remove(elem).is_some()
     }
 
     fn clear(&mut self) {
@@ -130,7 +207,7 @@ impl SetImpl {
     }
 
     fn iter(&self) -> impl Iterator<Item = &SetElement> {
-        self.data.iter()
+        self.data.keys()
     }
 }
 
@@ -214,7 +291,7 @@ pub extern "C" fn pith_set_contains_int(set: PithSet, elem: i64) -> bool {
             return false;
         }
 
-        impl_ref.contains(&SetElement::Int(elem))
+        impl_ref.contains(&ElemRef::Int(elem))
     }
 }
 
@@ -235,7 +312,7 @@ pub unsafe extern "C" fn pith_set_remove_int(set: *mut PithSet, elem: i64) -> bo
         return false;
     }
 
-    impl_ref.remove(&SetElement::Int(elem))
+    impl_ref.remove(&ElemRef::Int(elem))
 }
 
 /// Clear all elements from set
@@ -446,15 +523,17 @@ pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
 // Handle-based C-string variants for Cranelift codegen
 // ---------------------------------------------------------------------------
 
-unsafe fn cstr_to_set_element(s: *const i8) -> SetElement {
+/// Borrow a c-string element: walk it for its length and hand back the
+/// caller's own bytes. Nothing is copied, so the borrow is only good for the
+/// length of the call that took it.
+unsafe fn cstr_elem_ref<'a>(s: *const i8) -> ElemRef<'a> {
     let mut len = 0usize;
     let mut p = s;
     while *p != 0 {
         len += 1;
         p = p.add(1);
     }
-    let bytes = std::slice::from_raw_parts(s as *const u8, len);
-    SetElement::String(bytes.to_vec())
+    ElemRef::Str(std::slice::from_raw_parts(s as *const u8, len))
 }
 
 /// Create a new string set (handle-based). Returns SetImpl pointer as i64.
@@ -502,8 +581,8 @@ pub unsafe extern "C" fn pith_set_add_cstr(set_handle: i64, elem: *const i8) -> 
         return 0;
     };
     require_flavor(impl_ref.elem_type, ElemType::String, "set_add");
-    let set_elem = cstr_to_set_element(elem);
-    if impl_ref.insert(set_elem) {
+    let set_elem = cstr_elem_ref(elem);
+    if impl_ref.insert(&set_elem) {
         1
     } else {
         0
@@ -519,7 +598,7 @@ pub unsafe extern "C" fn pith_set_add_int_handle(set_handle: i64, elem: i64) -> 
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return 0;
     }
-    if impl_ref.insert(SetElement::Int(elem)) {
+    if impl_ref.insert(&ElemRef::Int(elem)) {
         1
     } else {
         0
@@ -536,7 +615,7 @@ pub unsafe extern "C" fn pith_set_contains_cstr(set_handle: i64, elem: *const i8
         return 0;
     };
     require_flavor(impl_ref.elem_type, ElemType::String, "set_contains");
-    let set_elem = cstr_to_set_element(elem);
+    let set_elem = cstr_elem_ref(elem);
     if impl_ref.contains(&set_elem) {
         1
     } else {
@@ -553,7 +632,7 @@ pub unsafe extern "C" fn pith_set_contains_int_handle(set_handle: i64, elem: i64
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return 0;
     }
-    if impl_ref.contains(&SetElement::Int(elem)) {
+    if impl_ref.contains(&ElemRef::Int(elem)) {
         1
     } else {
         0
@@ -570,7 +649,7 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
         return;
     };
     require_flavor(impl_ref.elem_type, ElemType::String, "set_remove");
-    let set_elem = cstr_to_set_element(elem);
+    let set_elem = cstr_elem_ref(elem);
     impl_ref.remove(&set_elem);
 }
 
@@ -588,11 +667,13 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
 /// The set element for a bytes handle, or `None` for a handle that is not a
 /// live bytes object. A null handle is the empty value, which `pith_bytes_eq`
 /// already treats as equal to an empty bytes object.
-unsafe fn bytes_to_set_element(handle: i64) -> Option<SetElement> {
+/// The caller's bytes object is alive for the whole of the entry point that
+/// borrowed it, so the borrow must not outlive that call.
+unsafe fn bytes_elem_ref<'a>(handle: i64) -> Option<ElemRef<'a>> {
     if handle == 0 {
-        return Some(SetElement::Bytes(Vec::new()));
+        return Some(ElemRef::Bytes(&[]));
     }
-    crate::bytes::pith_bytes_ref(handle).map(|b| SetElement::Bytes(b.data.clone()))
+    crate::bytes::pith_bytes_ref(handle).map(|b| ElemRef::Bytes(b.data.as_slice()))
 }
 
 /// Insert a bytes element by content. Returns 1 if newly inserted, 0 if it
@@ -603,10 +684,10 @@ pub unsafe extern "C" fn pith_set_add_bytes(set_handle: i64, elem: i64) -> i64 {
         return 0;
     };
     require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_add_bytes");
-    let Some(set_elem) = bytes_to_set_element(elem) else {
+    let Some(set_elem) = bytes_elem_ref(elem) else {
         return 0;
     };
-    if impl_ref.insert(set_elem) {
+    if impl_ref.insert(&set_elem) {
         1
     } else {
         0
@@ -620,7 +701,7 @@ pub unsafe extern "C" fn pith_set_contains_bytes(set_handle: i64, elem: i64) -> 
         return 0;
     };
     require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_contains_bytes");
-    let Some(set_elem) = bytes_to_set_element(elem) else {
+    let Some(set_elem) = bytes_elem_ref(elem) else {
         return 0;
     };
     if impl_ref.contains(&set_elem) {
@@ -637,7 +718,7 @@ pub unsafe extern "C" fn pith_set_remove_bytes(set_handle: i64, elem: i64) {
         return;
     };
     require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_remove_bytes");
-    let Some(set_elem) = bytes_to_set_element(elem) else {
+    let Some(set_elem) = bytes_elem_ref(elem) else {
         return;
     };
     impl_ref.remove(&set_elem);
@@ -673,7 +754,7 @@ pub unsafe extern "C" fn pith_set_remove_int_handle(set_handle: i64, elem: i64) 
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return;
     }
-    impl_ref.remove(&SetElement::Int(elem));
+    impl_ref.remove(&ElemRef::Int(elem));
 }
 
 /// Clear all elements from set (handle-based).
@@ -821,6 +902,194 @@ mod tests {
                 assert_eq!(b.rc.load(std::sync::atomic::Ordering::Relaxed), 1);
                 crate::bytes::pith_bytes_release(h);
             }
+            pith_set_release_handle(set);
+        }
+    }
+
+    // --- the borrowed-element contract --------------------------------------
+
+    fn hash_probe_inputs() -> Vec<Vec<u8>> {
+        vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            b"user-1000-region".to_vec(),
+            vec![0u8],
+            vec![b'a', 0, b'b'],
+            vec![0, 0, 0, 0],
+            "\u{e9}".as_bytes().to_vec(),
+            "\u{65e5}\u{672c}\u{8a9e}".as_bytes().to_vec(),
+            "\u{1f600}".as_bytes().to_vec(),
+            vec![b'x'; 255],
+            vec![b'y'; 4096],
+            vec![0u8; 8],
+        ]
+    }
+
+    fn hash_with(state: &std::collections::hash_map::RandomState, value: &impl Hash) -> u64 {
+        use std::hash::BuildHasher;
+        let mut hasher = state.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The set's half of the silent hazard: `ElemRef` is what every probe
+    /// hashes and `SetElement` is what the table stores. If the two ever wrote
+    /// different bytes for the same content, every string set in every program
+    /// would stop finding elements it holds, with no diagnostic anywhere.
+    #[test]
+    fn elem_ref_hashes_like_set_element() {
+        let state = std::collections::hash_map::RandomState::new();
+        for bytes in hash_probe_inputs() {
+            assert_eq!(
+                hash_with(&state, &ElemRef::Str(&bytes)),
+                hash_with(&state, &SetElement::String(bytes.clone())),
+                "string flavor, {} bytes",
+                bytes.len()
+            );
+            assert_eq!(
+                hash_with(&state, &ElemRef::Bytes(&bytes)),
+                hash_with(&state, &SetElement::Bytes(bytes.clone())),
+                "bytes flavor, {} bytes",
+                bytes.len()
+            );
+            assert_ne!(
+                hash_with(&state, &ElemRef::Str(&bytes)),
+                hash_with(&state, &ElemRef::Bytes(&bytes)),
+                "flavors must not collide, {} bytes",
+                bytes.len()
+            );
+            assert!(ElemRef::Str(&bytes).equivalent(&SetElement::String(bytes.clone())));
+            assert!(ElemRef::Bytes(&bytes).equivalent(&SetElement::Bytes(bytes.clone())));
+            assert!(!ElemRef::Str(&bytes).equivalent(&SetElement::Bytes(bytes.clone())));
+            assert_eq!(
+                SetElement::from(&ElemRef::Str(&bytes)),
+                SetElement::String(bytes.clone())
+            );
+            assert_eq!(
+                SetElement::from(&ElemRef::Bytes(&bytes)),
+                SetElement::Bytes(bytes.clone())
+            );
+
+            // and through the table rather than the hasher
+            let mut table: HashMap<SetElement, ()> = HashMap::new();
+            table.insert(SetElement::String(bytes.clone()), ());
+            table.insert(SetElement::Bytes(bytes.clone()), ());
+            assert!(table.contains_key(&ElemRef::Str(&bytes)));
+            assert!(table.contains_key(&ElemRef::Bytes(&bytes)));
+        }
+        assert_ne!(
+            hash_with(&state, &ElemRef::Str(b"ab")),
+            hash_with(&state, &ElemRef::Str(b"abc"))
+        );
+        for n in [i64::MIN, -1, 0, 1, 255, i64::MAX] {
+            assert_eq!(
+                hash_with(&state, &ElemRef::Int(n)),
+                hash_with(&state, &SetElement::Int(n)),
+                "int flavor, {n}"
+            );
+            assert!(ElemRef::Int(n).equivalent(&SetElement::Int(n)));
+        }
+    }
+
+    #[test]
+    fn set_hits_allocate_nothing_for_the_element() {
+        use crate::collections::alloc_probe::allocations_during;
+        unsafe {
+            let set = pith_set_new_default();
+            let elem = b"user-1000-region\0".as_ptr() as *const i8;
+            let absent = b"user-1001-region\0".as_ptr() as *const i8;
+            pith_set_add_cstr(set, elem);
+
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_contains_cstr(set, elem);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_contains_cstr(set, absent);
+                }),
+                0
+            );
+            // adding what the set already holds reports "not new" and
+            // allocates nothing
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_set_add_cstr(set, elem), 0);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_remove_cstr(set, elem);
+                }),
+                0
+            );
+            assert_eq!(pith_set_len_handle(set), 0);
+
+            pith_set_release_handle(set);
+        }
+    }
+
+    #[test]
+    fn bytes_set_hits_allocate_nothing_for_the_element() {
+        use crate::collections::alloc_probe::allocations_during;
+        unsafe {
+            let set = pith_set_new_bytes();
+            let elem = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
+            let absent = crate::bytes::pith_bytes_from_vec(b"user-1001-region".to_vec());
+            pith_set_add_bytes(set, elem);
+
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_contains_bytes(set, elem);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_contains_bytes(set, absent);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_set_add_bytes(set, elem), 0);
+                }),
+                0
+            );
+            assert_eq!(
+                allocations_during(|| {
+                    pith_set_remove_bytes(set, elem);
+                }),
+                0
+            );
+            assert_eq!(pith_set_len_handle(set), 0);
+
+            crate::bytes::pith_bytes_release(elem);
+            crate::bytes::pith_bytes_release(absent);
+            pith_set_release_handle(set);
+        }
+    }
+
+    /// A fresh element costs exactly the one copy the set keeps.
+    #[test]
+    fn a_new_set_element_allocates_once() {
+        use crate::collections::alloc_probe::allocations_during;
+        unsafe {
+            let set = pith_set_new_default();
+            pith_set_add_cstr(set, b"seed\0".as_ptr() as *const i8);
+            let fresh = b"an-element-the-set-has-never-seen\0".as_ptr() as *const i8;
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_set_add_cstr(set, fresh), 1);
+                }),
+                1
+            );
+            assert_eq!(pith_set_contains_cstr(set, fresh), 1);
             pith_set_release_handle(set);
         }
     }

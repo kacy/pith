@@ -1,0 +1,50 @@
+# a whole map and a whole set built, filled, read back, and dropped per
+# round, for every key flavor.
+#
+# the create/insert/close loop: every key the containers made a copy of, and
+# every value they took a count on, has to go with them at scope exit. The
+# insert path is the only one that still copies a key, so this is where a
+# copy that outlives its entry would show up.
+import leakprobe as probe
+
+fn round(i: Int) -> Int:
+    mut acc := 0
+    mut smap: Map[String, String] := {}
+    mut bmap: Map[Bytes, String] := {}
+    mut counts: Map[String, Int] := {}
+    mut names: Set[String] := {}
+    mut blobs: Set[Bytes] := {}
+
+    mut k := 0
+    while k < 8:
+        key := "key-{i}-{k}-with-some-length"
+        smap.insert(key, "payload-{i}-{k}")
+        bmap.insert(bytes_from_string_utf8(key), "payload-{i}-{k}")
+        counts.insert(key, k)
+        names.add(key)
+        blobs.add(bytes_from_string_utf8(key))
+        # and the same key a second time, which must find the entry rather
+        # than adding one
+        names.add(key)
+        blobs.add(bytes_from_string_utf8(key))
+        counts.insert(key, k + 1)
+        k = k + 1
+
+    for key in smap.keys():
+        acc = acc + smap[key].len() + counts[key]
+    for v in bmap.values():
+        acc = acc + v.len()
+    acc = acc + names.len() + blobs.len() + smap.len() + bmap.len()
+    return acc
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

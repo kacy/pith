@@ -1,0 +1,98 @@
+# map_update — the event ledger's map update in isolation.
+#
+# `if m.contains_key(k): m.insert(k, m[k] + 1)` over a small pool of keys
+# repeated many times. The probe exists to be counted rather than timed:
+# under callgrind, the malloc and free call counts have to scale with the
+# number of distinct keys and not with the number of updates, because an
+# update of a key the map already holds has nothing to allocate.
+#
+# usage: map_update <flavor: string|int|bytes> <updates> <distinct keys>
+
+fn arg_text(i: Int, fallback: String) -> String:
+    argv := args()
+    if argv.len() > i:
+        return argv[i]
+    return fallback
+
+fn arg_int(i: Int, fallback: Int) -> Int:
+    argv := args()
+    if argv.len() > i:
+        parsed := parse_int(argv[i])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return fallback
+
+fn key_text(i: Int) -> String:
+    return "user-" + i.to_string() + "-region"
+
+fn run_string(updates: Int, distinct: Int) -> Int:
+    mut keys: List[String] := []
+    mut i := 0
+    while i < distinct:
+        keys.push(key_text(i))
+        i = i + 1
+    mut m: Map[String, Int] := {}
+    i = 0
+    while i < updates:
+        k := keys[i % distinct]
+        if m.contains_key(k):
+            m.insert(k, m[k] + 1)
+        else:
+            m.insert(k, 1)
+        i = i + 1
+    mut total := 0
+    for key in m.keys():
+        total = total + m[key]
+    return total
+
+fn run_bytes(updates: Int, distinct: Int) -> Int:
+    mut keys: List[Bytes] := []
+    mut i := 0
+    while i < distinct:
+        keys.push(bytes_from_string_utf8(key_text(i)))
+        i = i + 1
+    mut m: Map[Bytes, Int] := {}
+    i = 0
+    while i < updates:
+        k := keys[i % distinct]
+        if m.contains_key(k):
+            m.insert(k, m[k] + 1)
+        else:
+            m.insert(k, 1)
+        i = i + 1
+    mut total := 0
+    for key in m.keys():
+        total = total + m[key]
+    return total
+
+fn run_int(updates: Int, distinct: Int) -> Int:
+    mut m: Map[Int, Int] := {}
+    mut i := 0
+    while i < updates:
+        k := i % distinct
+        if m.contains_key(k):
+            m.insert(k, m[k] + 1)
+        else:
+            m.insert(k, 1)
+        i = i + 1
+    mut total := 0
+    for key in m.keys():
+        total = total + m[key]
+    return total
+
+fn main() -> Int:
+    flavor := arg_text(1, "string")
+    updates := arg_int(2, 200000)
+    distinct := arg_int(3, 64)
+
+    mut total := 0
+    if flavor == "int":
+        total = run_int(updates, distinct)
+    elif flavor == "bytes":
+        total = run_bytes(updates, distinct)
+    else:
+        total = run_string(updates, distinct)
+
+    print("map_update flavor=" + flavor + " updates=" + updates.to_string() + " distinct=" + distinct.to_string())
+    print("total=" + total.to_string())
+    return 0

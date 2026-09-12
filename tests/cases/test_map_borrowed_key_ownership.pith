@@ -1,0 +1,149 @@
+# the ownership contract around a map whose key probes are borrowed.
+#
+# a lookup, a membership test, a removal and an overwrite all run against the
+# caller's own bytes now; only an insert that misses makes the map's copy of
+# the key. None of that changes what the map owns on the value side, and this
+# case is what says so: every value shape a map can own — a string, a list, a
+# struct, and the same under bytes keys — goes through overwrite, remove,
+# take, clear, a destructor with live values still in the map, and the empty
+# map that learns its value kind from the first store.
+#
+# every value is read back after the point an over-release would have freed
+# it, with churn in between, so a handle handed back to the pool has already
+# been reused by the time it is read. Valgrind cannot see that class on its
+# own: a released handle comes back off the freelist reading as perfectly
+# valid memory holding somebody else's data. The printed values are what
+# catch it.
+
+struct Row:
+    name: String
+    score: Int
+
+# enough traffic that a slot freed too early is occupied by something else
+# before the read.
+fn churn():
+    mut i := 0
+    while i < 200:
+        mut junk: List[String] := []
+        junk.push("junk-{i}")
+        mut jm: Map[String, List[String]] := {}
+        jm.insert("j", junk)
+        i = i + 1
+
+# Map[String, String]: overwrite of a key the map holds, remove, take, clear.
+fn string_values():
+    mut m: Map[String, String] := {}
+    m.insert("alpha", "first-value")
+    m.insert("alpha", "second-value")     # overwrite, same key
+    m["alpha"] = "third-value"            # and again through the index
+    m.insert("beta", "beta-value")
+    m.insert("gamma", "gamma-value")
+    churn()
+    print("string overwrite: {m["alpha"]} {m.len()}")
+
+    taken := m.take("beta")
+    churn()
+    print("string take: {taken} {m.contains_key("beta")} {m.len()}")
+
+    m.remove("gamma")
+    churn()
+    print("string remove: {m.contains_key("gamma")} {m["alpha"]} {m.len()}")
+
+    m.clear()
+    print("string clear: {m.len()}")
+
+# Map[String, List[Int]]: the map owns a count on each stored list.
+fn list_values():
+    mut m: Map[String, List[Int]] := {}
+    mut built: List[Int] := []
+    built.push(1)
+    built.push(2)
+    m.insert("built", built)
+    m.insert("built", [7, 8, 9])          # overwrite drops the first list
+    m.insert("fresh", [4, 5])
+    churn()
+    print("list overwrite: {m["built"][2]} {m["fresh"][1]} {m.len()}")
+
+    m.remove("fresh")
+    churn()
+    print("list remove: {m["built"][0]} {m.len()}")
+
+    m.clear()
+    print("list clear: {m.len()}")
+
+# Map[String, Row]: a struct value, with the map outliving the local it was
+# built in.
+fn make_rows() -> Map[String, Row]:
+    mut m: Map[String, Row] := {}
+    local := Row("local", 10)
+    m.insert("r", local)
+    return m
+
+fn struct_values():
+    mut m := make_rows()
+    churn()
+    print("struct local: {m["r"].name} {m["r"].score}")
+
+    m.insert("r", Row("replaced", 20))    # overwrite drops the first row
+    m.insert("s", Row("second", 30))
+    churn()
+    print("struct overwrite: {m["r"].name} {m["s"].score} {m.len()}")
+
+    m.remove("s")
+    churn()
+    print("struct remove: {m["r"].name} {m.len()}")
+
+    # the destructor runs with a live value still in the map: no clear here
+    print("struct live at scope exit: {m.len()}")
+
+# Map[Bytes, String]: the same, through the content-keyed flavor. The map
+# keeps its own copy of each key's content and never a count on the caller's
+# bytes object, so a key built on the spot dies at the call that read it.
+fn bytes_keys():
+    mut m: Map[Bytes, String] := {}
+    key := bytes_from_string_utf8("alpha")
+    m.insert(key, "first-value")
+    m.insert(bytes_from_string_utf8("alpha"), "second-value")
+    m[bytes_from_string_utf8("alpha")] = "third-value"
+    m.insert(bytes_from_string_utf8("beta"), "beta-value")
+    churn()
+    print("bytes overwrite: {m[key]} {m.len()}")
+
+    taken := m.take(bytes_from_string_utf8("beta"))
+    churn()
+    print("bytes take: {taken} {m.contains_key(bytes_from_string_utf8("beta"))} {m.len()}")
+
+    m.remove(key)
+    churn()
+    print("bytes remove: {m.contains_key(bytes_from_string_utf8("alpha"))} {m.len()}")
+
+    mut seen: Set[Bytes] := {}
+    seen.add(key)
+    seen.add(bytes_from_string_utf8("alpha"))   # the same content, not new
+    seen.add(bytes_from_string_utf8("other"))
+    print("bytes set: {seen.len()} {seen.contains(bytes_from_string_utf8("alpha"))}")
+    seen.remove(bytes_from_string_utf8("alpha"))
+    print("bytes set remove: {seen.len()} {seen.contains(key)}")
+
+# an empty map the constructor could not type, learning its value kind from
+# the first store that carries one. The map has to own the list's count
+# afterwards, and drop it at scope exit.
+fn take_untyped(mut m: Map[String, List[Int]]) -> Int:
+    mut row: List[Int] := []
+    row.push(42)
+    m.insert("adopted", row)
+    m.insert("adopted", [43, 44])       # overwrite after adopting
+    return m["adopted"][1]
+
+fn adopt_value_kind():
+    mut m: Map[String, List[Int]] := {}
+    got := take_untyped(m)
+    churn()
+    print("adopted: {got} {m["adopted"][0]} {m.len()}")
+
+fn main():
+    string_values()
+    list_values()
+    struct_values()
+    bytes_keys()
+    adopt_value_kind()

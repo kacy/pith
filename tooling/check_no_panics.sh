@@ -114,6 +114,7 @@ FNR == 1 {
   }
   skip_brace = ""
   skip_from = 0
+  cfg_test_pending = 0
   pending = 0
 }
 
@@ -125,11 +126,26 @@ skip_brace != "" {
   next
 }
 
+# the line a #[cfg(test)] attribute applies to. an item with a body is skipped
+# to its closing brace; an item without one — `#[cfg(test)] mod x;`, a `use`, a
+# `const` — has nothing to skip past, so the attribute covers that line alone.
+# treating those as unclosed bodies used to swallow the rest of the file, and
+# reporting them as a failure kept a module declaration from being written that
+# way at all.
+cfg_test_pending {
+  cfg_test_pending = 0
+  if ($0 !~ /\{/ && $0 ~ /;[ \t]*$/) {
+    next
+  }
+  skip_brace = cfg_test_indent "}"
+  skip_from = FNR - 1
+  next
+}
+
 /^[ \t]*#\[cfg\(test\)\]$/ {
-  indent = $0
-  sub(/#.*$/, "", indent)
-  skip_brace = indent "}"
-  skip_from = FNR
+  cfg_test_indent = $0
+  sub(/#.*$/, "", cfg_test_indent)
+  cfg_test_pending = 1
   next
 }
 

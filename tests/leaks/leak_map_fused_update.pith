@@ -1,0 +1,51 @@
+# the fused map update, churned.
+#
+# `m.insert(k, m[k] + d)` and `m[k] = m[k] + d` lower to one runtime call that
+# reads the stored word, adds to it and writes it back in a single probe. The
+# call has to leave exactly what the pair it replaced left: no copy of the key
+# (the map already holds the key it is updating) and no count anywhere (an
+# integer-valued map owns none). This loop runs it for every key flavor,
+# beside a string-valued map whose update the recognizer declines, so a leak
+# on either path shows up as growth.
+import leakprobe as probe
+
+fn round(
+    i: Int,
+    smap: Map[String, Int],
+    bmap: Map[Bytes, Int],
+    imap: Map[Int, Int],
+    text: Map[String, String]
+) -> Int:
+    # the fused shapes, both spellings, all three key flavors
+    smap.insert("stable", smap["stable"] + 1)
+    smap["stable"] = smap["stable"] + 2
+    imap.insert(7, imap[7] + 1)
+    imap[7] = imap[7] + 2
+    key := bytes_from_string_utf8("stable")
+    bmap.insert(key, bmap[key] + 1)
+    bmap[key] = bmap[key] + 2
+    # a key built for the call: the runtime reads it and keeps nothing
+    bmap[bytes_from_string_utf8("stable")] = bmap[bytes_from_string_utf8("stable")] + 1
+    # the declined shape beside it: `+` on string values is concatenation, so
+    # this stays the read-then-store pair and the map owns what it is handed
+    text.insert("stable", "payload-{i}")
+    return smap.len() + bmap.len() + imap.len() + text.len()
+
+fn main():
+    n := probe.rounds()
+    mut smap: Map[String, Int] := {}
+    mut bmap: Map[Bytes, Int] := {}
+    mut imap: Map[Int, Int] := {}
+    mut text: Map[String, String] := {}
+    smap.insert("stable", 0)
+    imap.insert(7, 0)
+    bmap.insert(bytes_from_string_utf8("stable"), 0)
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i, smap, bmap, imap, text)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

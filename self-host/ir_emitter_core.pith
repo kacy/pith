@@ -70,7 +70,7 @@ from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_call
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_handle_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
-from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
+from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_map_upsert_add_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
 from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
 from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op, ir_compound_assignment_ir_op
 from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_emit_list_filter_loop, ir_emit_list_reduce_loop, ir_emit_list_is_empty, ir_emit_list_missing_index_result, ir_emit_list_index_search_loop, ir_emit_list_contains_from_index
@@ -6204,6 +6204,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
     #   2. type-directed builtins       Int.to_string, Result.*, Optional.*
     #   3. module-qualified call        mod.Struct(..) / mod.some_fn(..)
     #   4. general dispatch             impl methods, closure-typed fields
+    # the fused map update comes first, because it is a shape rather than a
+    # name: it only matches `m.insert(k, m[k] + d)` on an integer-valued map
+    # and declines everything else, including every other `insert`.
+    upsert_r := ir_try_emit_map_upsert_method(idx)
+    if upsert_r >= 0:
+        return upsert_r
     variant_r := ir_emit_variant_ctor_method(idx)
     if variant_r >= 0:
         return variant_r
@@ -7523,10 +7529,147 @@ fn ir_index_get_opt_call_name(obj_type: String) -> String:
         return "map_get_bkey_opt"
     return "pith_list_get_opt"
 
+# --- the fused map update ---
+#
+# `m[k] = m[k] + d` and `m.insert(k, m[k] + d)` are one update written as two
+# operations: a strict read of a slot and a store back into the same slot.
+# Each one hashes the key and probes the table for it, and the shape is
+# usually guarded by a `contains_key` that hashed it once more. The runtime
+# has an entry point that reads and writes in a single probe, so recognizing
+# the shape here takes an update from three hashes to two.
+#
+# The rewrite is only safe under conditions the recognizer checks:
+#
+#   * both map expressions and both key expressions have to be the same
+#     side-effect-free expression, so evaluating each once rather than twice
+#     cannot change what the program does. A call anywhere inside either is
+#     enough to say no.
+#   * the delta has to be side-effect-free too. The unfused form reads the
+#     old value before evaluating the delta and the fused form reads it
+#     after, so a delta that could write the same slot would see one answer
+#     in one form and another in the other.
+#   * the map's values have to be integers. The runtime adds the stored word
+#     with wrapping arithmetic, which is what the `add` instruction does, and
+#     an integer-valued map holds no reference counts, so no count changes
+#     hands on the fused path.
+#   * the enclosing function must not return a result. `m[k]` inside a `T!`
+#     function propagates a miss to the caller instead of aborting, and the
+#     fused entry point aborts, as the strict read it replaces does.
+#
+# an expression kind that can only read: nothing here calls anything, indexes
+# anything, or allocates. the list is deliberately short, because everything
+# it admits gets evaluated a different number of times than the program wrote.
+fn ir_pure_read_kind(kind: String) -> Bool:
+    if kind == "ident" or kind == "self":
+        return true
+    if kind == "int_lit" or kind == "int" or kind == "integer":
+        return true
+    if kind == "string_lit" or kind == "string" or kind == "str_lit":
+        return true
+    if kind == "field_access":
+        return true
+    return false
+
+# true when the expression reads and does nothing else, all the way down.
+fn ir_pure_read_expr(idx: Int) -> Bool:
+    node := get_node(idx)
+    if not ir_pure_read_kind(node.kind):
+        return false
+    for child in node.children:
+        if not ir_pure_read_expr(child):
+            return false
+    return true
+
+# true when the two expressions are the same pure read: same kinds, same
+# names, same shape. Two identical reads of the same names in the same scope
+# name the same thing, which is what lets the fused form evaluate one of them.
+fn ir_same_pure_read(a_idx: Int, b_idx: Int) -> Bool:
+    a := get_node(a_idx)
+    b := get_node(b_idx)
+    if a.kind != b.kind or a.value != b.value:
+        return false
+    if not ir_pure_read_kind(a.kind):
+        return false
+    if a.children.len() != b.children.len():
+        return false
+    mut i := 0
+    while i < a.children.len():
+        if not ir_same_pure_read(a.children[i], b.children[i]):
+            return false
+        i = i + 1
+    return true
+
+# the delta in a value expression of the form `m[k] + d`, where `m[k]` reads
+# the very slot being written, or -1 for any other shape.
+fn ir_upsert_delta_idx(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
+    value := get_node(value_idx)
+    if value.kind != "binary" or value.value != "add" or value.children.len() < 2:
+        return 0 - 1
+    read := get_node(value.children[0])
+    if read.kind != "index" or read.children.len() < 2:
+        return 0 - 1
+    if not ir_same_pure_read(read.children[0], map_idx):
+        return 0 - 1
+    if not ir_same_pure_read(read.children[1], key_idx):
+        return 0 - 1
+    if not ir_pure_read_expr(value.children[1]):
+        return 0 - 1
+    if ir_checked_index_type(value.children[0]) != "int":
+        return 0 - 1
+    return value.children[1]
+
+# emit the fused update, or -1 when this is not the shape. the register
+# handed back is the discarded result of a void-shaped call, which is what
+# every other store here returns.
+fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
+    if ir_current_func_returns_result:
+        return 0 - 1
+    mut obj_type := ir_checked_type(map_idx)
+    if obj_type.len() == 0:
+        obj_type = ir_infer_type(map_idx)
+    if obj_type != "map" and obj_type != "map_int":
+        return 0 - 1
+    if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx):
+        return 0 - 1
+    delta_idx := ir_upsert_delta_idx(map_idx, key_idx, value_idx)
+    if delta_idx < 0:
+        return 0 - 1
+    call_name := ir_map_upsert_add_call_name(ir_bytes_keyed_type(map_idx, obj_type))
+    map_r := ir_expr(map_idx)
+    key_r := ir_expr(key_idx)
+    delta_r := ir_expr(delta_idx)
+    r := ir_reg()
+    ir_emit_call3(r, call_name, "void", map_r, key_r, delta_r)
+    # the key is read and copied by the runtime, never kept, so a key built on
+    # the spot would die here — the same release the plain store does. a pure
+    # read is never owned, so this is a no-op today and stays for the day the
+    # recognizer admits a wider key.
+    ir_release_owned_index_key(key_idx, key_r)
+    return r
+
+# `m.insert(k, m[k] + d)` written as a method call. -1 for anything else.
+fn ir_try_emit_map_upsert_method(idx: Int) -> Int:
+    node := get_node(idx)
+    if ir_plain_method_name(node_value(idx)) != "insert":
+        return 0 - 1
+    if node.children.len() != 3:
+        return 0 - 1
+    # the arguments read through the accessor: a call site whose arguments the
+    # parser wrapped in `arg` nodes hands back the expression underneath, and
+    # the recognizer below only ever sees real expressions.
+    key_idx := ir_method_call_arg_expr(node, 0)
+    value_idx := ir_method_call_arg_expr(node, 1)
+    if key_idx < 0 or value_idx < 0:
+        return 0 - 1
+    return ir_try_emit_map_upsert_add(node.children[0], key_idx, value_idx)
+
 fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     target := get_node(target_idx)
     if target.kind != "index" or target.children.len() < 2:
         return false
+
+    if ir_try_emit_map_upsert_add(target.children[0], target.children[1], value_idx) >= 0:
+        return true
 
     obj_r := ir_expr(target.children[0])
     idx_r := ir_expr(target.children[1])

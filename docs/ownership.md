@@ -127,6 +127,13 @@ call arguments:
   at a container store, which is what stopped a tagged list counting its
   elements twice. see "container flavors" for why the store rather than
   the constructor
+- `m[k] = m[k] + d` and `m.insert(k, m[k] + d)` lower to one call that
+  reads, adds and writes the slot in a single probe
+  (`pith_map_upsert_add_cstr` and its `_ikey` and `_bkey` twins, chosen by
+  `ir_map_upsert_add_call_name`). it is not an exception to any of the
+  above: the emitter only reaches for it when the map's values are
+  integers, which is a map that owns no counts at all, and the runtime
+  exits loudly if it is ever handed a counted one
 - a channel send is a store into a counted container, so a borrowed value
   sent takes a count there (`ir_channel_send_needs_retain`). that count is
   consumed by whoever receives the value — the receive hands its optional

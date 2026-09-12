@@ -40,6 +40,7 @@ cases=(
   tests/leaks/leak_runtime_shell_dtor
   tests/leaks/leak_map_take_remove
   tests/leaks/leak_map_key_overwrite
+  tests/leaks/leak_map_fused_update
   tests/leaks/leak_map_key_remove
   tests/leaks/leak_map_key_lifecycle
   tests/leaks/leak_bytes_key_churn

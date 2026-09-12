@@ -138,16 +138,60 @@ impl MapKey {
     }
 }
 
+/// A stored value.
+///
+/// Everything a pith program puts in a map is one word: an int, a float's
+/// bits, or a handle to a string, list, map, set or struct. A map's value
+/// size is fixed at construction, so a map whose values are word-sized holds
+/// every one of them inline and allocates no box for any of them.
+///
+/// The wide arm exists for `pith_map_insert_int`, the only entry point that
+/// takes a value of some other size. No pith-level type reaches it: every
+/// map constructor in this file passes a value size of 8, and the emitter
+/// calls only those constructors. Keeping the arm costs nothing anyway,
+/// since the enum occupies the same 24 bytes the `Vec<u8>` it replaces did.
+enum MapVal {
+    Word(i64),
+    Wide(Box<[u8]>),
+}
+
+impl MapVal {
+    /// The stored form of a value handed over as raw bytes. The one place a
+    /// value's representation is chosen.
+    fn from_bytes(bytes: &[u8]) -> MapVal {
+        match <[u8; 8]>::try_from(bytes) {
+            Ok(word) => MapVal::Word(i64::from_le_bytes(word)),
+            Err(_) => MapVal::Wide(bytes.into()),
+        }
+    }
+
+    /// The word a stored value carries, or `None` when it is too short to
+    /// hold one. Lookups, takes, the values list, display and the collector
+    /// all ask through here, so one place decides what a stored value means
+    /// and the ownership calls below cannot disagree with the readers about
+    /// which values carry a count.
+    #[inline]
+    fn word(&self) -> Option<i64> {
+        match self {
+            MapVal::Word(word) => Some(*word),
+            MapVal::Wide(bytes) if bytes.len() >= 8 => {
+                Some(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            MapVal::Wide(_) => None,
+        }
+    }
+}
+
 /// Internal map implementation using idiomatic Rust
 ///
-/// Uses HashMap for O(1) lookups with Vec<u8> storage for values
+/// Uses HashMap for O(1) lookups; values live in the table itself.
 pub struct MapImpl {
     /// Magic word for the fast validity check (see map_magic_ok)
     magic: u32,
     /// Shared-handle refcount (see ListImpl.rc)
     rc: std::sync::atomic::AtomicU32,
     /// The actual hash map storing key -> value mappings
-    data: HashMap<MapKey, Vec<u8>>,
+    data: HashMap<MapKey, MapVal>,
     /// Specialized storage for int-key maps with 8-byte scalar values
     int_values8: Option<HashMap<i64, i64>>,
     /// Type tag for keys (0=int, 1=string, 2=bytes)
@@ -266,7 +310,7 @@ impl MapImpl {
     /// copy of the key only on the vacant arm, so an overwrite of a key the map
     /// already holds allocates nothing for the key. An occupied entry keeps the
     /// key it already has, exactly as `HashMap::insert` does.
-    fn insert(&mut self, key: &KeyRef<'_>, value: Vec<u8>) -> Option<Vec<u8>> {
+    fn insert(&mut self, key: &KeyRef<'_>, value: MapVal) -> Option<MapVal> {
         match self.data.entry_ref(key) {
             EntryRef::Occupied(mut entry) => Some(entry.insert(value)),
             EntryRef::Vacant(entry) => {
@@ -276,11 +320,11 @@ impl MapImpl {
         }
     }
 
-    fn get(&self, key: &KeyRef<'_>) -> Option<&Vec<u8>> {
+    fn get(&self, key: &KeyRef<'_>) -> Option<&MapVal> {
         self.data.get(key)
     }
 
-    fn remove(&mut self, key: &KeyRef<'_>) -> Option<Vec<u8>> {
+    fn remove(&mut self, key: &KeyRef<'_>) -> Option<MapVal> {
         self.data.remove(key)
     }
 
@@ -303,13 +347,13 @@ impl MapImpl {
         }
     }
 
-    fn values(&self) -> Vec<Vec<u8>> {
+    /// Every stored value as the word it carries, for the callers that hand
+    /// the values out. A value too short to carry one is skipped rather than
+    /// reported as zero, which is what the readers did with a short box.
+    fn value_words(&self) -> Vec<i64> {
         match &self.int_values8 {
-            Some(data) => data
-                .values()
-                .map(|value| value.to_le_bytes().to_vec())
-                .collect(),
-            None => self.data.values().cloned().collect(),
+            Some(data) => data.values().copied().collect(),
+            None => self.data.values().filter_map(MapVal::word).collect(),
         }
     }
 
@@ -352,13 +396,14 @@ impl MapImpl {
     /// locals, fields, and other containers).
     ///
     /// # Safety
-    /// `val` must be the raw storage of a value this map owned.
-    unsafe fn release_value(&self, val: &[u8]) {
-        if !self.val_is_heap() || val.len() < 8 {
+    /// `val` must be a value this map owned.
+    unsafe fn release_value(&self, val: &MapVal) {
+        if !self.val_is_heap() {
             return;
         }
-        let raw = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
-        release_element(self.val_tag, raw);
+        if let Some(raw) = val.word() {
+            release_element(self.val_tag, raw);
+        }
     }
 
     /// Take the map's count on a value being stored.
@@ -553,21 +598,23 @@ pub unsafe extern "C" fn pith_map_insert_int(
         return;
     }
     crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
-    let val_vec = val_slice.to_vec();
+    // the only caller that can supply a value that is not one word, so the
+    // only place a boxed value is built. A value size of 8 stores inline
+    // like every other entry point.
+    let stored = MapVal::from_bytes(val_slice);
 
     // The map owns one count per stored heap value, read out of the same
-    // eight bytes release_value drops it from.
+    // word release_value drops it from.
     // (the retain must stay gated on the value tag: magic-checking an
     // arbitrary integer dereferences value-16, which faults on values
     // that resemble unmapped addresses.)
-    if val_slice.len() >= 8 {
-        let raw = i64::from_le_bytes(val_slice[..8].try_into().unwrap_or([0u8; 8]));
+    if let Some(raw) = stored.word() {
         impl_ref.retain_value(raw);
     }
 
     // Retain before insert, release the displaced value after: `m[k] = m[k]`
     // must not drop the last count before the new one is taken.
-    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), val_vec) {
+    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), stored) {
         impl_ref.release_value(&old);
     }
 }
@@ -695,11 +742,9 @@ pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8))
         return;
     };
     for val in impl_ref.data.values() {
-        if val.len() >= 8 {
-            let raw = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
-            if raw != 0 {
-                f(raw, code);
-            }
+        match val.word() {
+            Some(raw) if raw != 0 => f(raw, code),
+            _ => {}
         }
     }
 }
@@ -759,10 +804,7 @@ pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
     if impl_ref.uses_int_values8() {
         return impl_ref.remove_int_value(key).unwrap_or(0);
     }
-    match impl_ref.remove(&KeyRef::Int(key)) {
-        Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
-        _ => 0,
-    }
+    take_keyed(impl_ref, &KeyRef::Int(key))
 }
 
 /// String-keyed take: remove and transfer the value's count to the caller.
@@ -797,10 +839,10 @@ pub unsafe extern "C" fn pith_map_take_bkey(map_handle: i64, key: i64) -> i64 {
 /// Remove an entry and hand its value's count to the caller: the map's
 /// count leaves with the value instead of being released here.
 unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
-    match impl_ref.remove(map_key) {
-        Some(val) if val.len() >= 8 => i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8])),
-        _ => 0,
-    }
+    impl_ref
+        .remove(map_key)
+        .and_then(|val| val.word())
+        .unwrap_or(0)
 }
 
 /// Retain a map handle: one more owner of this shared handle.
@@ -878,12 +920,7 @@ unsafe fn bytes_key_ref<'a>(key: i64) -> Option<KeyRef<'a>> {
 
 /// The stored word under `map_key`, or `None` on a miss.
 unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
-    match impl_ref.get(map_key) {
-        Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
-            val_data[..8].try_into().unwrap_or([0u8; 8]),
-        )),
-        _ => None,
-    }
+    impl_ref.get(map_key).and_then(|val| val.word())
 }
 
 /// Drop the entry under `map_key`, releasing the map's count on its value.
@@ -1020,8 +1057,7 @@ unsafe fn insert_keyed(
             eprintln!("map_ins {} -> {:p}", map_key.display(), value as *const i8);
         }
     }
-    let val_bytes = value.to_le_bytes().to_vec();
-    if let Some(old) = impl_ref.insert(map_key, val_bytes) {
+    if let Some(old) = impl_ref.insert(map_key, MapVal::Word(value)) {
         impl_ref.release_value(&old);
     }
 }
@@ -1157,13 +1193,7 @@ pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, de
         impl_ref.get_int_value(key).unwrap_or(default)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        let map_key = KeyRef::Int(key);
-        match impl_ref.get(&map_key) {
-            Some(val_data) if val_data.len() >= 8 => {
-                i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
-            }
-            _ => default,
-        }
+        get_keyed(impl_ref, &KeyRef::Int(key)).unwrap_or(default)
     }
 }
 
@@ -1452,8 +1482,7 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
         if !takes_caller_count {
             impl_ref.retain_value(value);
         }
-        let val_bytes = value.to_le_bytes().to_vec();
-        if let Some(old) = impl_ref.insert(&KeyRef::Int(key), val_bytes) {
+        if let Some(old) = impl_ref.insert(&KeyRef::Int(key), MapVal::Word(value)) {
             impl_ref.release_value(&old);
         }
     }
@@ -1475,12 +1504,7 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
         impl_ref.get_int_value(key).unwrap_or(0)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&KeyRef::Int(key)) {
-            Some(val_data) if val_data.len() >= 8 => {
-                i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
-            }
-            _ => 0,
-        }
+        get_keyed(impl_ref, &KeyRef::Int(key)).unwrap_or(0)
     }
 }
 
@@ -1503,12 +1527,9 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64
         }
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&KeyRef::Int(key)) {
-            Some(val_data) if val_data.len() >= 8 => optional_tuple(
-                true,
-                i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
-            ),
-            _ => optional_tuple(false, 0),
+        match get_keyed(impl_ref, &KeyRef::Int(key)) {
+            Some(v) => optional_tuple(true, v),
+            None => optional_tuple(false, 0),
         }
     }
 }
@@ -1531,12 +1552,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
         impl_ref.get_int_value(key)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match impl_ref.get(&KeyRef::Int(key)) {
-            Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
-                val_data[..8].try_into().unwrap_or([0u8; 8]),
-            )),
-            _ => None,
-        }
+        get_keyed(impl_ref, &KeyRef::Int(key))
     };
     match found {
         Some(v) => v,
@@ -1622,12 +1638,7 @@ pub unsafe extern "C" fn pith_display_map(handle: i64, key_kind: i64, val_kind: 
                     MapKey::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
                     MapKey::Bytes(_) => k.display(),
                 };
-                let raw = if val.len() >= 8 {
-                    i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
-                } else {
-                    0
-                };
-                entries.push((key_text, raw));
+                entries.push((key_text, val.word().unwrap_or(0)));
             }
             if key_kind == 0 {
                 entries.sort_by_key(|e| e.0.parse::<i64>().unwrap_or(0));
@@ -1764,11 +1775,8 @@ pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
     // under.
     let list = pith_list_new(8, impl_ref.val_tag as i32);
 
-    for val in impl_ref.values() {
-        if val.len() >= 8 {
-            let v = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
-            pith_list_push_value(list, v);
-        }
+    for v in impl_ref.value_words() {
+        pith_list_push_value(list, v);
     }
 
     list.ptr as i64
@@ -2341,11 +2349,9 @@ mod tests {
 
     // --- allocation counts -------------------------------------------------
     //
-    // what the borrowed probes buy, stated as the only number that can show
-    // it: an operation on a key the map already holds allocates nothing for
-    // the key. The value box each insert still makes is called out where it is
-    // counted rather than folded into a total, because removing it is a
-    // separate change.
+    // what the borrowed probes and the inline values buy, stated as the only
+    // number that can show it: an operation on a key the map already holds
+    // allocates nothing at all, and a new entry allocates once, for the key.
 
     use crate::collections::alloc_probe::allocations_during;
 
@@ -2407,13 +2413,14 @@ mod tests {
                 }),
                 0
             );
-            // an overwrite of a key the map holds: one allocation, and it is
-            // the value box, not the key
+            // an overwrite of a key the map holds: nothing for the key, which
+            // the map already has, and nothing for the value, which goes into
+            // the table itself
             assert_eq!(
                 allocations_during(|| {
                     pith_map_insert_cstr(map, key, 2);
                 }),
-                1
+                0
             );
             assert_eq!(pith_map_get_cstr(map, key), 2);
             // a remove of a key the map holds frees, and allocates nothing
@@ -2437,12 +2444,12 @@ mod tests {
             // and the count below is the entry's own cost
             pith_map_insert_cstr(map, b"seed\0".as_ptr() as *const i8, 0);
             let fresh = b"a-key-the-map-has-never-seen\0".as_ptr() as *const i8;
-            // the key copy plus the value box, one each
+            // the map's own copy of the key, and nothing else
             assert_eq!(
                 allocations_during(|| {
                     pith_map_insert_cstr(map, fresh, 5);
                 }),
-                2
+                1
             );
             assert_eq!(pith_map_get_cstr(map, fresh), 5);
             pith_map_release_handle(map);
@@ -2501,12 +2508,22 @@ mod tests {
                 allocations_during(|| {
                     pith_map_insert_bkey(map, key, 2);
                 }),
-                1
+                0
             );
             assert_eq!(pith_map_get_bkey(map, key), 2);
+            // a key the map has never seen: one allocation, the map's own
+            // copy of the content, and nothing for the value
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_bkey(map, absent, 9);
+                }),
+                1
+            );
+            assert_eq!(pith_map_get_bkey(map, absent), 9);
             assert_eq!(
                 allocations_during(|| {
                     pith_map_remove_bkey(map, key);
+                    pith_map_remove_bkey(map, absent);
                 }),
                 0
             );
@@ -2541,22 +2558,119 @@ mod tests {
                 }),
                 0
             );
-            // the value box again, and nothing for the key
+            // nothing for the key, nothing for the value
             assert_eq!(
                 allocations_during(|| {
                     pith_map_insert_ikey(map, 7, s as i64);
                 }),
-                1
+                0
+            );
+            // and an int key the map has never seen allocates nothing at all:
+            // there is no key content to copy and the value goes inline
+            assert_eq!(
+                allocations_during(|| {
+                    pith_map_insert_ikey(map, 8, s as i64);
+                }),
+                0
             );
             assert_eq!(
                 allocations_during(|| {
                     pith_map_remove_ikey(map, 7);
+                    pith_map_remove_ikey(map, 8);
                 }),
                 0
             );
 
             crate::pith_cstring_release(s);
             pith_map_release_handle(map);
+        }
+    }
+
+    // --- what the collector and the wide writer see -------------------------
+
+    /// The collector reaches a map's values only through `cycle_map_children`,
+    /// so a ring through a map's value side is collectable exactly when every
+    /// value the map owns a count on is reported there once. A value missing
+    /// from the report leaks its ring and nothing says so; a value reported
+    /// twice has its count dropped further than the map ever raised it.
+    #[test]
+    fn the_collector_sees_every_value_the_map_owns_exactly_once() {
+        unsafe {
+            // list values, because strings and primitives are not graph nodes
+            // and the collector is told nothing about them (cycle_child_code)
+            let map = pith_map_new_default().ptr as i64;
+            let mut stored: Vec<i64> = Vec::new();
+            for i in 0..8 {
+                let key = format!("key-{i}\0");
+                let value = one_element_list();
+                pith_map_insert_cstr_owned_kind(
+                    map,
+                    key.as_ptr() as *const i8,
+                    value,
+                    ListTypeTag::List as i64,
+                );
+                stored.push(value);
+            }
+
+            let mut seen: Vec<(i64, u8)> = Vec::new();
+            cycle_map_children(map, &mut |child, code| seen.push((child, code)));
+
+            assert_eq!(seen.len(), stored.len());
+            for value in &stored {
+                assert_eq!(seen.iter().filter(|(child, _)| child == value).count(), 1);
+            }
+            let code = crate::collections::list::cycle_child_code(ListTypeTag::List).unwrap();
+            assert!(seen.iter().all(|(_, reported)| *reported == code));
+
+            pith_map_release_handle(map);
+            for value in &stored {
+                assert!(!list_is_alive(*value));
+            }
+        }
+    }
+
+    /// `pith_map_insert_int` is the one writer that can hand a map a value
+    /// that is not a word, and a map constructed for one is the only way to
+    /// reach the boxed arm. Nothing the emitter produces gets here: every map
+    /// constructor above passes a value size of 8, and the emitter calls only
+    /// those. The arm is kept for the raw FFI, so it is tested through it.
+    #[test]
+    fn a_map_of_wide_values_reads_its_first_word_back() {
+        unsafe {
+            let mut map = pith_map_new(0, 16, 0);
+            let handle = map.ptr as i64;
+            let wide: [u8; 16] = [
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x08, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                0x01, 0x02,
+            ];
+            pith_map_insert_int(&mut map, 42, wide.as_ptr(), 16);
+            assert_eq!(pith_map_len(map), 1);
+            assert_eq!(
+                pith_map_get_ikey(handle, 42),
+                i64::from_le_bytes(wide[..8].try_into().unwrap())
+            );
+            // a value of the wrong size is still refused rather than stored
+            pith_map_insert_int(&mut map, 43, wide.as_ptr(), 8);
+            assert_eq!(pith_map_len(map), 1);
+            pith_map_release(map);
+        }
+    }
+
+    /// A value too short to carry a word reads back as absent, the way a
+    /// short box did. Only the raw FFI can build such a map.
+    #[test]
+    fn a_value_shorter_than_a_word_carries_none() {
+        unsafe {
+            let mut map = pith_map_new(0, 4, 0);
+            let handle = map.ptr as i64;
+            let narrow: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+            pith_map_insert_int(&mut map, 7, narrow.as_ptr(), 4);
+            assert_eq!(pith_map_len(map), 1);
+            assert_eq!(pith_map_get_ikey(handle, 7), 0);
+            // the Optional says absent rather than "present, zero"
+            let opt = pith_map_get_ikey_opt(handle, 7) as *const i64;
+            assert_eq!(*opt, 0);
+            pith_map_release(map);
         }
     }
 }

@@ -24,20 +24,20 @@ the language:
 
 | coordination | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| chan_fanout, 1m msgs | **65-72 ms** (2026-09-10 and 11, all rounds in the fast mode; earlier reruns bimodal, 96-100 / 59-66) | ~72 ms | 59-69 ms | 203-297 ms |
+| chan_fanout, 1m msgs | **65-72 ms** (2026-09-10, 11 and 13, all rounds in the fast mode; earlier reruns bimodal, 96-100 / 59-66) | ~72 ms | 59-69 ms | 203-297 ms |
 | chan_fanout, pinned to 1 worker | **~46 ms** | ~71 ms | — | — |
 | 20k spawn + join (batches of 64) | **~27 ms / 3.3 mb** | ~8 ms / 3.8 mb | — | — |
 | 20k spawn, `PITH_GREEN=0` | ~919 ms / 3.5 mb | — | — | — |
 
 | services and compute | pith | go | rust | zig |
 |---|---:|---:|---:|---:|
-| catalog workload, 200k requests | **~66 ms** (2026-09-11; ~70 the day before, ~92 in august) | ~372 ms | ~67 ms | — |
+| catalog workload, 200k requests | **~68 ms** (2026-09-13; ~92 in august) | ~367 ms | ~65 ms | — |
 | grpc unary echo, sequential, 16 B | **4459 calls/s**, p50 219 µs (was 4022) | 4017, p50 233 µs | 2995, p50 325 µs | — |
 | grpc unary echo, conc=8, 16 B | 10598 calls/s, p50 707 µs (was 7560) | 15935, p50 454 µs | 11952, p50 615 µs | — |
-| http server under wrk, 60 s | 17.3k req/s, rss flat (~2.5 b/req); was 14.2-14.4k | 27.1k req/s (regime-dependent, see below) | — | — |
+| http server under wrk, 60 s | 20.8k req/s, rss flat (~1.8 b/req) (2026-09-13); was 17.3k, and 14.2-14.4k in august | 20.9k req/s in the same run (regime-dependent, see below) | — | — |
 | http sequential latency, 1 connection, p50 | 135µs | 93µs | — | — |
-| event_ledger, 200k events | **259-263 ms (0.68x go)**; was 339-344 | 380-384 ms | 104-105 ms | 121-131 ms |
-| std_pipeline, 50k records | 344 ms (1.37x go); was 439-448 | 251 ms | 139 ms | — |
+| event_ledger, 200k events | **238 ms (0.61x go)** (2026-09-13); was 259-263, and 339-344 in august | 393 ms | 106 ms | 125 ms |
+| std_pipeline, 50k records | 312 ms (1.29x go) (2026-09-13); was 344, and 439-448 in august | 242 ms | 137 ms | — |
 
 what moved since july, with the canaries holding: **spawn/await halved**, 56 ms
 to ~27 ms at flat memory — the argument-ownership fixes took a per-call
@@ -604,6 +604,58 @@ run that inverts the catalog, pipeline and wrk ratios, and it did so on
 both passes before it was isolated (#1123). the rule in bench/README.md
 stands: a comparator that does not reproduce its published figure means
 the run is discarded, whatever pith reads.
+
+### the map pass (2026-09-13): borrowed keys, inline values, one probe per update
+
+Three changes to how a map stores and reaches its entries, measured against
+`19aceac7`, the tip the section above was written at. `#1126` probes with the
+caller's own key bytes and allocates a key only when a new entry is actually
+created, for sets as well as maps. `#1128` stores a word-sized value in the
+table instead of boxing it, which is the exemption int-keyed scalar maps
+already had, extended to every flavor. `#1129` fuses `m.insert(k, m[k] + d)`
+into a single probe, after a phase-scoped measurement showed the hasher at
+12.8% of the event ledger's analyze phase (#1127); the fused form is taken
+only when the map and key are the same side-effect-free read, the delta is
+side-effect-free, the values are integers, and the enclosing function does
+not return a result.
+
+| 2026-09-13, callgrind | before | after | delta |
+|---|---:|---:|---:|
+| map update, string keys, 20k updates over 64 keys | 28,373,869 | 11,761,225 | −58.6% |
+| map update, bytes keys | 26,275,158 | 9,874,948 | −62.4% |
+| map update, int keys | 6,148,579 | 4,505,198 | −26.7% |
+| event ledger, 200k events | 2,696,464,280 | 2,349,082,242 | −12.9% |
+| the compiler compiling itself | 12,081,548,037 | 11,514,442,954 | −4.7% |
+| `examples/web_login.pith` | 16,443,477,973 | 15,672,300,484 | −4.7% |
+| json decode, list of structs | 4,382,915,671 | 4,314,545,954 | −1.6% |
+| http request head read, 20k | 2,030,573,462 | 2,000,571,656 | −1.5% |
+| every other bench program | | | 0.00% |
+
+Allocations per update went from four to zero on string and bytes keys: three
+key copies and a value box, none of which the program asked for. At 64
+distinct keys the probe now allocates 523 times whether it performs 20,000
+updates or 80,000, so allocation no longer scales with update count at all.
+
+The compile-time rows were not the target. The compiler is itself a heavy
+string-keyed map user, so it picked up 4.7% without anyone aiming at it, and
+this time the input was identical in both arms (the std sources did not
+change), so the comparison means what it says.
+
+In wall clock on a settled box, comparators reproducing their figures: the
+event ledger's analyze phase 56 to 23 ms and its total 259 to 238, the
+channel fan-out under green at 68 ms against go's 72, the catalog workload at
+68 against rust's 65, the std pipeline 344 to 312.
+
+A note on the box, because it cost two runner passes here. Measurements taken
+in a degraded window read almost exactly 2x, and a short canary process does
+not detect the state: the go comparator read its quiet 371 ms immediately
+before a multi-language run in which every arm then read double. The
+signature that identified it was phase-level: in the degraded runs the event
+ledger's allocation-heavy `gen` and `parse` phases doubled while `analyze`,
+which this very work made allocation-free, held its correct 23 ms. Runs whose
+comparators do not reproduce are discarded; that is the rule in
+bench/README.md and it is the reason the figures above are the third pass and
+not the first.
 
 ### a note on how these are measured
 

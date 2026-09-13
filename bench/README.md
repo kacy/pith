@@ -62,23 +62,21 @@ zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledge
 ```
 
 Latest measured results on this machine, 200000 events, median of 5
-interleaved trials (2026-09-10, after the night's std and runtime work; the
-2026-08-16 pith total was 351, the 2026-08-08 total 570, the 2026-07-29
-total 618):
+interleaved trials (2026-09-13, after the map work in #1126, #1128 and
+#1129; the 2026-09-10 pith total was 259, the 2026-08-16 total 351, the
+2026-07-29 total 618):
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 105 | 98 | 56 | 0 | 259 |
-| go | 48 | 315 | 14 | 0 | 380 |
-| rust | 25 | 55 | 22 | 0 | 104 |
-| zig | 18 | 93 | 9 | 0 | 121 |
+| pith | 112 | 102 | 23 | 0 | 238 |
+| go | 51 | 326 | 15 | 0 | 393 |
+| rust | 26 | 57 | 23 | 0 | 106 |
+| zig | 18 | 97 | 9 | 0 | 125 |
 
-the 2026-08-16 row for reference: pith 120 / 175 / 53 / 0 / 351, go 122 /
-333 / 14 / 0 / 466. the comparators moved by their usual few percent; pith's
-`parse` fell 175 to 98 because the runtime's typed decode no longer splits
-its field spec per key (#1104) and the line split runs on `memmem` (#1103),
-and by instruction count the whole program is 20.5% cheaper than at the
-start of the night (3.39 G to 2.70 G Ir, same source, both compilers).
+the `analyze` phase is the one that moved, 56 to 23 ms: it is the map and
+set rollup, and a string-keyed update that used to copy the key three
+times and box the value now allocates nothing at all. pith's `analyze` is
+now level with rust's and its total is 0.61x go's.
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
@@ -212,6 +210,22 @@ you can also override the ports for ad hoc runs:
 go run bench/catalog_bench.go 9201 9202
 ```
 
+first measured results, 2026-09-13 at `0429a5e0`, sequential with one
+connection at a time, both servers on the same dataset:
+
+| endpoint | go p50 | pith p50 | go p99 | pith p99 | pith/go p50 |
+|---|---:|---:|---:|---:|---:|
+| `GET /profile` | 509us | 578us | 821us | 1292us | 1.1x |
+| `GET /search` hot | 494us | 570us | 972us | 992us | 1.2x |
+| `GET /search` wide | 497us | 575us | 1055us | 2423us | 1.2x |
+| `POST /batch-score` | 501us | 584us | 749us | 1710us | 1.2x |
+
+no errors on either side. the medians sit within 20% of go across all four
+shapes; the tails do not, and the two scan-and-aggregate endpoints are where
+they spread (2.3x at p99). this benchmark is sequential by construction, so
+it says nothing about throughput under concurrency; the http server section
+above is the one that does.
+
 ## catalog workload benchmark
 
 for a stable service-shaped comparison without socket noise, there is also an
@@ -336,8 +350,13 @@ peak resident memory on this machine, two million rings:
 
 | back edge | peak RSS | structs freed |
 |---|---:|---|
-| `weak` | ~2 MB | all (flat) |
-| strong | ~730 MB | none (leaks every ring) |
+| `weak` | ~11 MB | all (bounded) |
+| strong | ~752 MB | none (leaks every ring) |
+
+(2026-09-13, peak rss from the child's rusage. the strong figure reproduces
+the ~730 MB this table carried before; the weak figure is larger than the
+~2 MB recorded earlier and is worth attributing, but the point of the pair
+stands, one is bounded and the other is not.)
 
 the `weak` run holds flat because the rings free as fast as they are
 built; the strong run grows without bound. `PITH_PERF_STATS=1` prints the
@@ -388,16 +407,16 @@ zig build-exe -O ReleaseFast -femit-bin=bench/chan_fanout_zig bench/chan_fanout.
 
 one million messages, median of 9 trials on this 2-core machine, run
 with nothing else on it. eight tasks on two cores is oversubscribed on
-purpose, and equally so for all four (measured 2026-09-10; the 2026-07-26
+purpose, and equally so for all four (measured 2026-09-13; the 2026-07-26
 table it replaces read 438 / 171 / 75 / 135 / 135):
 
 | lang | ms | messages/sec | peak rss |
 |---|---:|---:|---:|
-| pith (`PITH_GREEN=0`, os threads) | 274 | 3.6 m | 3.0 mb |
-| pith (green, the linux default) | 65 | 15.4 m | 3.0 mb |
+| pith (`PITH_GREEN=0`, os threads) | 250 | 4.0 m | 3.1 mb |
+| pith (green, the linux default) | 68 | 14.7 m | 3.1 mb |
 | go | 72 | 13.9 m | 3.7 mb |
-| rust | 59 | 16.9 m | 2.4 mb |
-| zig | 297 | 3.4 m | 4.6 mb |
+| rust | 62 | 16.1 m | 2.4 mb |
+| zig | 272 | 3.7 m | 4.5 mb |
 
 the green row has been bimodal on every rerun since july (fast rounds near
 60-70 ms, slow rounds near 95-100, see docs/performance.md); all nine
@@ -492,8 +511,20 @@ PITH_GREEN_MIGRATE=1 ./bench/cpu_parallel_sync 200 20000
 
 on 2026-09-06, medians of 5 interleaved rounds: 448 ms at 1 worker, 259 ms
 at 2 workers with the flag off (247-305), 337 ms with it on (230-402), with
-`PITH_PERF_STATS=1` showing ~280 migrations a run. that is why the flag is
-not the default; the numbers are in `docs/performance.md`.
+`PITH_PERF_STATS=1` showing ~280 migrations a run. that is why the flag was
+not made the default.
+
+on 2026-09-13 the ordering had reversed: 404 ms at 1 worker (403-405), 327
+with the flag off (228-364), **241 with it on** (223-370), nine rounds
+interleaved arm by arm after two warmups, and the flag won 5 of the 7 paired
+rounds (the paired comparison is within a round, so it survives a drifting
+box in a way the medians alone do not). the arm that used to cost a third of
+the two-worker speedup is now the fastest of the three. the 2026-09-06 run
+predates preemption safe points becoming the default (#1088), which changes
+when a task yields and so how placement settles, but that is a hypothesis
+and not an attribution. tracked in #1131; until it is settled, the paragraph
+in `docs/performance.md` explaining why the flag is off rests on the old
+numbers.
 
 ## task churn benchmark (per-thread pools)
 
@@ -558,6 +589,11 @@ instruction count because the check contains a call, so the loop's values move
 into callee-saved registers and the function grows a frame. Every other
 program measured here pays between +0.07% and +1.85% instructions; the table
 is in `docs/performance.md`.
+
+re-measured 2026-09-13 (9 rounds interleaved, 2 warmups, canary checked
+either side): 132 ms with safe points off (130-140), 265 with them on
+(262-278), +100.5%. that reproduces the +101% this section has carried since
+2026-09-07, on a binary two dozen changes newer.
 
 ## substring search (the runtime's `contains` and `index_of`)
 
@@ -723,9 +759,9 @@ latest measured results on this machine, using the median of 5 trials
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `~251 ms` | `~139 ms` | `~344 ms` | `1.37x` | `2.47x` |
+| `50000` | `~242 ms` | `~137 ms` | `~312 ms` | `1.29x` | `2.28x` |
 
-pith read `~480 ms` (1.50x go) on 2026-08-08 and `~576 ms` (1.63x) on
+(2026-09-13; pith read `~344 ms` on 2026-09-11.) pith read `~480 ms` (1.50x go) on 2026-08-08 and `~576 ms` (1.63x) on
 2026-07-29; the comparators reproduce their 2026-08-22 figures (go 249,
 rust 134). by instruction count the pipeline is 20% cheaper than at the
 start of 2026-09-10 (4.28 G to 3.41 G Ir): the csv quoting decision became
@@ -785,6 +821,37 @@ three caveats matter when reading this benchmark:
   still using go's json, gzip, sha256, url, path, and fs packages.
 - the pith version keeps the config setup local, so the benchmark times the
   csv/url/path/gzip/hash/fs pipeline rather than config parsing.
+
+## map update (the event ledger's rollup in isolation)
+
+`bench/map_update.pith` is the shape the event ledger's analyze phase is
+made of: `if m.contains_key(k): m.insert(k, m[k] + d)` over a small set of
+distinct keys, so nearly every update is a hit on a key that is already
+there. it exists because that shape used to cost four allocations per
+update, three key copies and a value box, none of which the program asked
+for.
+
+```
+pith build bench/map_update.pith
+./bench/map_update string 20000 64    # flavor, updates, distinct keys
+./bench/map_update bytes 20000 64
+./bench/map_update int 20000 64
+```
+
+2026-09-13, 20,000 updates over 64 distinct keys, instruction counts from
+`tooling/callgrind_ab.sh`, allocation counts from valgrind:
+
+| key flavor | Ir before | Ir after | allocations per update |
+|---|---:|---:|---:|
+| string | 28,373,869 | 11,761,225 | 4.00 to 0 |
+| bytes | 26,275,158 | 9,874,948 | 4.00 to 0 |
+| int | 6,148,579 | 4,505,198 | 0 to 0 |
+
+"before" is `19aceac7`, "after" `0429a5e0`: borrowed key probes (#1126),
+word-sized values stored in the table (#1128), and the read-add-write fused
+into one probe (#1129). the allocation count no longer scales with the
+number of updates at all: at 64 distinct keys the whole run allocates 523
+times whether it performs 20,000 updates or 80,000.
 
 ## std hotspot micro-benchmarks (2026-09-10)
 

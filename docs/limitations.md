@@ -241,6 +241,18 @@ something here that now works, the page is stale and a fix to it is welcome.
   `--exclude-tag` select and exclude, and `--json` reports the run as one json
   record per result for ci. benchmarks are still missing. the project's own
   suite is golden-snapshot based (see `tests/`).
+- **a json decode target holds scalars, optionals and nested structs** —
+  `json.decode[T]` and `json.decode_text[T]` fill a struct field by field, and
+  a field may be an `Int`, a `String`, a `Bool`, an optional of those, or
+  another struct, which is filled in place. a `List` field of any element
+  type, a `Map` field and a `Float` field are each refused at the checker
+  (E219, "json.decode does not support field 'x' of type List"). so a document
+  with an array or a non-integer number in it has no direct decode target:
+  reach those through `json.parse` and the node accessors, which read any
+  shape. issue #1110 tracks the decision on lists and on floats, which are
+  separate questions: an array of objects wants an element spec the filler
+  does not have yet, while a float field looks like an omission.
+
 - **plaintext http/2 needs an explicit listener** — over tls, `web.listen_tls`
   offers alpn `["h2", "http/1.1"]` and serves whichever the client picks. there
   is no such negotiation without tls, so plaintext http/2 means calling

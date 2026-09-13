@@ -1,0 +1,131 @@
+# `m[k] = m[k] + d` and `m.insert(k, m[k] + d)` lower to one runtime call
+# that reads the slot, adds the delta and writes the result back in a single
+# probe, where the written form reads and writes the same slot twice over.
+#
+# The rewrite has to be invisible, so every fused answer here is printed
+# beside the same arithmetic written through a local, which is a shape the
+# recognizer declines. The cases that must NOT fuse are here for the same
+# reason: a map of strings, where `+` is concatenation and the map takes a
+# count on what it is handed; a key expression that calls a function, which
+# the written form evaluates twice and the fused form would evaluate once;
+# and the update inside a `T!` function, where a missing key propagates to
+# the caller rather than aborting.
+
+struct Counters:
+    pub totals: Map[String, Int]
+
+# the unfused twin: the store's value is a bare name, so the recognizer has
+# nothing to match and this is the plain read-then-store pair.
+fn add_via_local(mut m: Map[String, Int], key: String, delta: Int):
+    old := m[key]
+    m.insert(key, old + delta)
+
+fn add_via_local_int(mut m: Map[Int, Int], key: Int, delta: Int):
+    old := m[key]
+    m.insert(key, old + delta)
+
+fn string_keys():
+    neg := 0 - 20
+    mut m: Map[String, Int] := {}
+    m.insert("a", 10)
+    m.insert("a", m["a"] + 5)      # the method form
+    m["a"] = m["a"] + 0            # the index form, and a zero delta
+    m["a"] = m["a"] + neg          # the stored value goes negative
+    m.insert("b", 0)
+    m.insert("b", m["b"] + 7)
+    print("string: {m["a"]} {m["b"]} {m.len()}")
+
+    mut control: Map[String, Int] := {}
+    control.insert("a", 10)
+    add_via_local(control, "a", 5)
+    add_via_local(control, "a", 0)
+    add_via_local(control, "a", neg)
+    control.insert("b", 0)
+    add_via_local(control, "b", 7)
+    print("string control: {control["a"]} {control["b"]} {control.len()}")
+
+fn int_keys():
+    neg := 0 - 60
+    mut m: Map[Int, Int] := {}
+    m.insert(1, 100)
+    m.insert(1, m[1] + 5)
+    m[1] = m[1] + 0
+    m[1] = m[1] + neg
+    key := 2
+    m.insert(key, 3)
+    m.insert(key, m[key] + 4)      # a key read from a local, both sides
+    print("int: {m[1]} {m[2]} {m.len()}")
+
+    mut control: Map[Int, Int] := {}
+    control.insert(1, 100)
+    add_via_local_int(control, 1, 5)
+    add_via_local_int(control, 1, 0)
+    add_via_local_int(control, 1, neg)
+    control.insert(2, 3)
+    add_via_local_int(control, 2, 4)
+    print("int control: {control[1]} {control[2]} {control.len()}")
+
+fn bytes_keys():
+    mut m: Map[Bytes, Int] := {}
+    key := bytes_from_string_utf8("alpha")
+    m.insert(key, 3)
+    m.insert(key, m[key] + 4)
+    m[key] = m[key] + 1
+    # the same content built a second time finds the same entry
+    other := bytes_from_string_utf8("alpha")
+    m[other] = m[other] + 2
+    print("bytes: {m[key]} {m.len()}")
+
+# the map behind a field access: `c.totals` is a read on both sides of the
+# update, so the recognizer can prove the two name the same map.
+fn field_map():
+    c := Counters({})
+    c.totals.insert("hits", 1)
+    c.totals.insert("hits", c.totals["hits"] + 9)
+    c.totals["hits"] = c.totals["hits"] + 90
+    print("field: {c.totals["hits"]} {c.totals.len()}")
+
+# a map of strings: `+` is concatenation, the map takes a count on the value
+# it is handed, and the fused call would add the two handles as integers.
+fn string_values():
+    mut m: Map[String, String] := {}
+    m.insert("a", "x")
+    m.insert("a", m["a"] + "y")
+    m["a"] = m["a"] + "z"
+    print("string values: {m["a"]} {m.len()}")
+
+# a key expression with a side effect. The written form calls it once for the
+# read and once for the store, so the two lines below are the proof the
+# update did not fuse; one line would mean it had.
+fn noisy_key() -> String:
+    print("key call")
+    return "n"
+
+fn side_effect_key():
+    mut m: Map[String, Int] := {}
+    m.insert("n", 1)
+    m.insert(noisy_key(), m[noisy_key()] + 1)
+    print("side effect key: {m["n"]}")
+
+# inside a `T!` function `m[k]` propagates a missing key to the caller. The
+# fused call aborts instead, so the update must stay unfused here, and a miss
+# has to come back as a failed result the caller can catch.
+fn add_in_result_fn(mut m: Map[String, Int], key: String, delta: Int) -> Int!:
+    m.insert(key, m[key] + delta)
+    return m[key]
+
+fn result_fn_update():
+    mut m: Map[String, Int] := {}
+    m.insert("a", 4)
+    hit := add_in_result_fn(m, "a", 6) catch 0 - 1
+    miss := add_in_result_fn(m, "absent", 1) catch 0 - 1
+    print("result fn: {hit} {miss} {m.len()}")
+
+fn main():
+    string_keys()
+    int_keys()
+    bytes_keys()
+    field_map()
+    string_values()
+    side_effect_key()
+    result_fn_update()

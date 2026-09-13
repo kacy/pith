@@ -86,6 +86,18 @@ pub fn ir_index_set_call_name(obj_type: String) -> String:
         return "map_insert"
     return "pith_list_set_value"
 
+# the runtime entry point behind the fused `m[k] = m[k] + d`: it reads the
+# stored word, adds the delta and writes the result back in one probe, where
+# the unfused pair hashed the key and walked the table twice. the emitter
+# only reaches for this on an integer-valued map whose key expression it can
+# prove is the same side-effect-free expression on both sides.
+pub fn ir_map_upsert_add_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_upsert_add_ikey"
+    if obj_type == "map_bytes":
+        return "map_upsert_add_bkey"
+    return "map_upsert_add"
+
 # the runtime getter a counted `for` loop uses to read one element. the loop
 # head already compares the index against the length, so a string or int
 # element takes the unchecked getter; a char steps through the source string

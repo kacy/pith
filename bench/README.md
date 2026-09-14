@@ -909,6 +909,25 @@ from the same source, run under callgrind, outputs and checksums identical:
 the list shape did not move because a list of structs still goes through
 the node pool by hand (#1110).
 
+### the same head read over tls (2026-09-14)
+
+`bench/tls_head_read` is the tls twin of `http_head_read`. it cannot skip the
+socket the way the plaintext one does, because the head arrives as decrypted
+record data, so it handshakes once and then sends `requests` keepalive GETs
+down that one connection while a second task drains the answers.
+
+```
+pith build bench/tls_head_read.pith
+./bench/tls_head_read 1
+./bench/tls_head_read 500
+```
+
+run it at 1 and at 500: the one-request run is almost all handshake, so the
+difference between the two divided by the request count is what the head read
+costs per request. before #1100 that was 409,441 Ir per request and after it
+274,350 (−33.0%), with the whole 500-request program at −27.2% and the
+one-request run unchanged within 0.14%.
+
 ## hash kernels (std.hash and std.checksum, per byte)
 
 `bench/hash_kernels.pith` runs one kernel over a few megabytes of fixed

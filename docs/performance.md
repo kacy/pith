@@ -1021,8 +1021,20 @@ path was missing. `tests/cases/test_http_head_read_shapes` pins pipelined
 requests, bodies, heads that straddle a chunk boundary every way they can,
 a truncated stream, an empty stream and oversize heads against the output
 of the byte-at-a-time reader; `tests/leaks/leak_http_head_read` is flat.
-the tls fallback's head reader has the same byte loop over a `tls.Conn`
-and was not in the profile; it is left for its own measurement.
+the tls fallback's head reader had the same byte loop over a `tls.Conn`
+and was not in that profile, because that workload was plaintext. #1100
+measured it on its own with `bench/tls_head_read`, which handshakes once and
+then pushes keepalive requests down the one connection: one request costs
+43,286,962 Ir and 500 cost 247,597,923, so the head read was 409,441 Ir per
+request. reading the head in record-sized chunks and handing the tail past the
+blank line back to the conn (a new `tls.Conn.unread_bytes`, which prepends to
+the pending tail the read path already keeps) puts those at 43,348,460 and
+180,249,269: 274,350 Ir per request, −33.0%, and −27.2% over the 500-request
+program. the one-request run moves +0.14%, which is the fixed cost of the new
+path and is all a handshake-dominated run sees. the byte loop's real cost was
+not the loop: every byte took the connection's read lock and then re-sliced
+the record's pending tail, which is quadratic in the size of the record the
+head arrived in.
 
 csv. `csv_field_needs_quoting` reads the field's bytes once in place
 (`ord(field[i])`, allocation-free) and replaces the three `contains` calls

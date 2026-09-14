@@ -1,0 +1,111 @@
+# http request-head reading over a tls conn.
+#
+# the plaintext twin of this (bench/http_head_read) reads the head through a
+# buffered reader and can be run with no socket at all. the tls fallback cannot:
+# the head arrives as decrypted record data, so the only way to measure it is to
+# handshake once and then push requests down the same connection. one connection
+# carries `requests` keep-alive GETs, the server answers each from
+# http.serve_connection_tls, and the client reads the answers in a second task so
+# neither side ever blocks waiting for the other.
+#
+#   pith build bench/tls_head_read.pith
+#   ./bench/tls_head_read <requests>
+#
+# run it once with 1 request and once with many: the one-request run is almost
+# all handshake, so the difference between the two divided by the request count
+# is what the head reader costs per request.
+#
+# the profile that motivated this (#1100, after #1097 did the same for the
+# plaintext path) read the head one byte at a time, and every one of those bytes
+# took the connection's read lock and re-sliced the record's pending tail.
+import std.bytes as bytes
+import std.net.http as http
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+fn requests_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 2000
+
+# find a free loopback port so repeated runs never collide with TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+# a fixed small answer: what is being measured is the read of the request head,
+# so the response should cost as little as possible and never vary.
+fn respond(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.response(200).with_body_bytes(bytes.from_string_utf8("ok")).content_type("text/plain")
+
+fn serve_one(conn: tls.Conn) -> Int:
+    http.serve_connection_tls(conn, respond) catch 0
+    conn.close()
+    return 0
+
+fn run_server(listener: tls.Listener) -> Int!:
+    conn := listener.accept()!
+    task := spawn serve_one(conn)
+    await task
+    listener.close()
+    return 0
+
+# the same 64-byte GET the plaintext probe sends, with an id that varies so no
+# two heads are byte-identical. the last one asks for the connection to close,
+# which is what ends the reader loop below.
+fn send_requests(conn: tls.Conn, count: Int) -> Int!:
+    crlf := chr(13) + chr(10)
+    mut i := 0
+    while i < count:
+        mut close_header := "Connection: keep-alive"
+        if i == count - 1:
+            close_header = "Connection: close"
+        raw := "GET /item?id=" + (12345 + i % 1000).to_string() + " HTTP/1.1" + crlf + "Host: x" + crlf + close_header + crlf + crlf
+        conn.write_all_bytes(bytes.from_string_utf8(raw))!
+        i = i + 1
+    return 0
+
+fn main() -> Int!:
+    count := requests_from_args()
+    port := choose_port(19240)!
+    server_config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["http/1.1"])
+    listener := tls.listen("127.0.0.1", port, server_config)!
+    server_task := spawn run_server(listener)
+
+    config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", config)!
+
+    start := time()
+    writer := spawn send_requests(conn, count)
+    # drain the answers in big reads: the client side of this probe should cost
+    # as little as possible, so it never parses a response, it only counts bytes.
+    mut received := 0
+    while true:
+        chunk := conn.read_bytes(16384) catch bytes.empty()
+        if chunk.is_empty():
+            break
+        received = received + chunk.len()
+    await writer
+    elapsed := time() - start
+
+    conn.close()
+    await server_task
+    server_config.close()
+
+    print("tls head read benchmark")
+    print("requests=" + count.to_string())
+    print("elapsed_ms=" + elapsed.to_string())
+    print("response_bytes=" + received.to_string())
+    return 0

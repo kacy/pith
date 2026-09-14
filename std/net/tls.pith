@@ -2929,6 +2929,15 @@ fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream) -> tls13.Re
         fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "malformed tls record")
     return record
 
+# prepend to the connection's pending tail, under the same lock the read path
+# takes: pending is read-side state that the record loop also writes, so a
+# concurrent reader must not see it half-replaced.
+fn native_conn_unread_bytes(handle: Int, data: Bytes):
+    cs := native_conn_get(handle)
+    cs.read_mu.lock()
+    defer cs.read_mu.unlock()
+    cs.pending = bytes.concat(data, cs.pending)
+
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
     if size <= 0:
@@ -3581,6 +3590,18 @@ impl Conn:
         if is_native_conn(self.handle):
             return native_conn_read_bytes(self.handle, max_bytes)
         fail "native tls conn not found"
+
+    # Put bytes back at the head of the stream, so the next read returns them
+    # before it decrypts anything further. A caller that reads ahead in chunks
+    # hands back what it did not want and leaves the stream positioned exactly
+    # where it stopped, which is what lets a framed protocol scan for its
+    # delimiter without taking a byte out of the next message. Passing empty
+    # bytes does nothing.
+    fn unread_bytes(data: Bytes):
+        if data.is_empty():
+            return
+        if is_native_conn(self.handle):
+            native_conn_unread_bytes(self.handle, data)
 
     fn read(max_bytes: Int) -> String!:
         return self.read_bytes(max_bytes)!.to_string_utf8()!

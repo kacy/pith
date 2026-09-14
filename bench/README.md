@@ -682,8 +682,13 @@ its cost is dominated by key calls rather than by comparisons, and the speedup
 there grows with n rather than settling. And the old `algo.sort_by_key` was an
 insertion sort that inserted before the first strictly greater element, which
 makes a descending input its best case: it probes exactly one element per
-insertion. That is the one cell the merge sort loses, at 100 and 1000 elements,
-before the insertion cost turns it around again at 10000.
+insertion. That was the one cell the merge sort lost, at 100 and 1000 elements.
+Run detection (#1096) recovered it: the sort now finds the ascending and
+strictly descending runs the input already has, so a sorted or exactly reversed
+input is one run and one linear scan. The reverse string cells went from 0.4x
+and 0.5x against the insertion sort to 0.8x at 100 and 1.1x at 1000, and from
+2.8x to 6.9x at 10000. The scan gives up within about eight comparisons on an
+input with no runs in it, so no other cell pays for it.
 
 Wall clock on the two-core box moves around; instruction counts through
 `tooling/callgrind_ab.sh` are the number to quote for a per-operation claim.

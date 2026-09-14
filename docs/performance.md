@@ -500,7 +500,8 @@ preemption safe-points cost" above). rebuilding the tip with
 and the zstd codec at −0.23% against arm A, so those three rows are the
 safe-point check and nothing else; the tight loop is its documented worst
 case. the generic sort reverse row is the old insertion sort's best case (a
-run it recognized and the merge sort does not yet, #1096).
+run it recognized and the merge sort did not, #1096, since fixed by run
+detection).
 
 what the cuts are, by row: the three workloads share the typed decode's
 field lookup (#1104), the `memmem` substring search (#1103) and the csv and

@@ -473,10 +473,20 @@ pub fn filter_entries[K, V](items: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, 
 # Sorting
 # ---------------------------------------------------------------
 
-# stable bottom-up merge sort that returns the *positions* of items in sorted
+# stable natural merge sort that returns the *positions* of items in sorted
 # order rather than the elements themselves. std.algo imports this and builds
 # its string-keyed sorts on it, so there is one sort in the standard library
 # and not one per key type.
+#
+# it looks for the ascending and strictly descending runs the input already
+# has before it merges anything, so an input that is already ordered, or
+# exactly reversed, costs one linear scan instead of n log n comparisons. that
+# was the one shape the plain bottom-up merge lost on: the insertion sort it
+# replaced probed once per element on a reverse-sorted input and beat it below
+# ten thousand elements (#1096). the scan gives up early on an input with no
+# runs in it, so a shuffled input pays about eight comparisons for the attempt
+# and then sorts exactly as it did before. the answer is the same whichever
+# path it takes, since a stable sort has only one.
 #
 # sorting positions is what keeps the ownership cost down: a merge pass moves
 # nothing but an Int, so no element is retained or released while the sort
@@ -502,8 +512,149 @@ pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
         i = i + 1
     if n < 2:
         return src
+
+    mut runs := detect_runs(items, less, n)
+    if runs.len() == 0:
+        return bottom_up_positions(items, less, src, n)
+
+    # turn each descending run round. a descending run is strictly descending,
+    # so no two equal elements are ever inside one and reversing it cannot move
+    # a pair of them past each other: the sort stays stable. the run's
+    # direction is re-read here rather than carried out of the scan, which
+    # costs one comparison per run and keeps the scan free to give up without
+    # having touched anything.
+    mut count := runs.len()
+    mut r := 0
+    while r + 1 < count:
+        start := runs[r]
+        end := runs[r + 1]
+        if end > start + 1 and less(items[start + 1], items[start]):
+            mut left_end := start
+            mut right_end := end - 1
+            while left_end < right_end:
+                held := src[left_end]
+                src[left_end] = src[right_end]
+                src[right_end] = held
+                left_end = left_end + 1
+                right_end = right_end - 1
+        r = r + 1
+    if count <= 2:
+        # one run covers the whole input, so src is already the answer and the
+        # sort was the scan
+        return src
+
     mut dst: List[Int] := []
     i = 0
+    while i < n:
+        dst.push(0)
+        i = i + 1
+    # merge neighbouring runs pairwise until one is left, rewriting the run
+    # boundaries in place as it goes: a pass never produces more runs than it
+    # consumed, so the boundary it writes always lands on an index it has
+    # already read. a merge takes from the right run only when that element
+    # sorts strictly before the head of the left run, and every position in the
+    # left run precedes every position in the right one, so equal elements keep
+    # their input order.
+    while count > 2:
+        mut merged := 0
+        mut b := 0
+        mut lo := 0
+        while b + 1 < count:
+            runs[merged] = lo
+            merged = merged + 1
+            if b + 2 < count:
+                mid := runs[b + 1]
+                hi := runs[b + 2]
+                mut left := lo
+                mut right := mid
+                mut out := lo
+                while left < mid and right < hi:
+                    # both positions are read once and reused for the store, so a
+                    # merge step costs two index loads on src rather than four.
+                    left_pos := src[left]
+                    right_pos := src[right]
+                    if less(items[right_pos], items[left_pos]):
+                        dst[out] = right_pos
+                        right = right + 1
+                    else:
+                        dst[out] = left_pos
+                        left = left + 1
+                    out = out + 1
+                while left < mid:
+                    dst[out] = src[left]
+                    left = left + 1
+                    out = out + 1
+                while right < hi:
+                    dst[out] = src[right]
+                    right = right + 1
+                    out = out + 1
+                lo = hi
+                b = b + 2
+            else:
+                # an odd run at the end has nothing to merge with this pass, but
+                # it still has to reach the buffer the next pass reads from.
+                tail := runs[b + 1]
+                mut k := lo
+                while k < tail:
+                    dst[k] = src[k]
+                    k = k + 1
+                lo = tail
+                b = b + 1
+        runs[merged] = n
+        count = merged + 1
+        # the pass just written becomes the next pass's input, and the buffer
+        # it read from becomes the next pass's scratch.
+        carry := src
+        src = dst
+        dst = carry
+    return src
+
+# the first position of every run `items` already has, followed by n. a run is
+# a maximal stretch that is ascending (the next element does not sort before
+# the last) or strictly descending (it does).
+#
+# an empty list means the scan gave up. run detection pays for itself only when
+# the runs it finds are long enough to save a merge pass; on an input with no
+# order in it the scan is a whole extra comparison per element and the plain
+# width-doubling merge is the cheaper sort. the test is an average run length
+# below four, and it is applied from the eighth element on, so an unordered
+# input pays for about eight comparisons and then stops.
+fn detect_runs[T](items: List[T], less: fn(T, T) -> Bool, n: Int) -> List[Int]:
+    mut gave_up: List[Int] := []
+    mut starts: List[Int] := []
+    mut i := 0
+    while i < n:
+        if i >= 8 and starts.len() * 4 > i:
+            return gave_up
+        starts.push(i)
+        mut j := i + 1
+        if j < n:
+            # the run's last element is carried rather than read again: a read
+            # from a generic list is a call, and this loop would otherwise make
+            # two of them per element.
+            mut last := items[j]
+            descending := less(last, items[i])
+            j = j + 1
+            while j < n:
+                cur := items[j]
+                if descending:
+                    if not less(cur, last):
+                        break
+                elif less(cur, last):
+                    break
+                last = cur
+                j = j + 1
+        i = j
+    starts.push(n)
+    return starts
+
+# the plain bottom-up merge: every element starts as its own run and the run
+# width doubles each pass. this is what the sort was in full before run
+# detection, and it is what an input with no runs worth finding still gets.
+fn bottom_up_positions[T](items: List[T], less: fn(T, T) -> Bool, positions: List[Int], n: Int) -> List[Int]:
+    mut src := positions
+    mut dst: List[Int] := []
+    mut i := 0
     while i < n:
         dst.push(0)
         i = i + 1

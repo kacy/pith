@@ -65,6 +65,11 @@ pub MAX_REQUEST_BODY := 10485760
 # checked against MAX_REQUEST_BODY, but the line's own length was not.
 CHUNK_LINE_LIMIT := 8192
 
+# how much the tls head reader asks for at a time: one tls record's worth of
+# plaintext, so a read takes a whole record rather than leaving most of it on
+# the connection's pending tail to be sliced off a byte at a time.
+TLS_READ_CHUNK := 16384
+
 # the messages the head and body readers fail with when a limit is exceeded. the
 # serve loops match on them to answer with the right status (431 / 413) and then
 # close the connection, so a rejected request never leaves unread body bytes to be
@@ -1144,25 +1149,39 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     return out.take_bytes()
 
 # `cap` bounds the bytes read before the separator, so a tls peer that
-# never sends it cannot grow `out` without bound; 0 or less means no limit.
+# never sends it cannot grow the buffer without bound; 0 or less means no limit.
+#
+# the read is chunked rather than one byte at a time. a tls conn already holds
+# whatever it decrypted but was not asked for, and unread_bytes hands the tail
+# past the separator straight back to it, so reading ahead never takes a byte
+# out of what follows. the byte loop this replaces paid a lock, a record-loop
+# entry and two buffer copies for every byte of every head, and the second copy
+# made the cost quadratic in the size of the record the head arrived in.
 fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
-    out := bytes.buffer()
-    errdefer out.free()
-    mut window := bytes.empty()
+    mut seen := bytes.empty()
+    # bytes of `seen` already known to start no match: a separator that was not
+    # found before cannot begin more than sep.len() - 1 bytes from the end, so
+    # each chunk is scanned once rather than the whole buffer being rescanned.
+    mut scanned := 0
     while true:
-        if cap > 0 and out.len() > cap:
+        if seen.len() >= sep.len():
+            at := bytes.index_of(seen.slice(scanned, seen.len()), sep)
+            if at >= 0:
+                end := scanned + at + sep.len()
+                conn.unread_bytes(seen.slice(end, seen.len()))
+                return seen.slice(0, end)
+            scanned = seen.len() - sep.len() + 1
+        if cap > 0 and seen.len() > cap:
             fail "read_until exceeded {cap} bytes without the separator"
-        chunk := conn.read_bytes(1)!
+        chunk := conn.read_bytes(TLS_READ_CHUNK)!
         if chunk.is_empty():
-            return out.take_bytes()
-        out.write(chunk)!
-        if window.len() >= sep.len():
-            window = window.slice(1, window.len())
-        window = window.concat(chunk)
-        if window == sep:
-            return out.take_bytes()
+            # the peer stopped before the separator; hand back what arrived, the
+            # same value the byte loop produced.
+            return seen
+        seen = seen.concat(chunk)
+    return seen
 
 fn consume_chunk_line_ending_tls(conn: tls.Conn):
     ending := read_exact_from_tls(conn, 1) catch bytes.empty()
@@ -3027,35 +3046,21 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
     tcp_close(fd)
     return written
 
-# read one http/1.1 request head off a tls conn, a byte at a time until the blank
-# line. reading one byte at a time stops exactly on the head boundary, so the
-# body (and any following request) is never over-read — the same rolling-window
-# scan read_request_head_buffered_bytes uses, only sourced from the tls conn.
+# read one http/1.1 request head off a tls conn: one bounded read_until for the
+# blank line, the same shape read_request_head_buffered_bytes uses over a
+# buffered reader. the tls reader reads ahead and gives back what is past the
+# terminator, so the body (and any following request) is still never over-read.
 fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
-    buf := bytes.buffer_with_capacity(1024)
-    errdefer buf.free()
-    mut w1 := 0
-    mut w2 := 0
-    mut w3 := 0
-    mut w4 := 0
-    while true:
-        chunk := conn.read_bytes(1)!
-        if chunk.is_empty():
-            # take_bytes frees the buffer; an empty head yields empty bytes, the
-            # same value the old early return produced.
-            return buf.take_bytes()
-        buf.write(chunk)!
-        # refuse a head that grows past the limit, exactly as the plaintext reader
-        # does, so the tls fallback bounds an endless head too.
-        if buf.len() > MAX_HEADER_BYTES:
+    head := read_until_including_from_tls(conn, head_terminator(), MAX_HEADER_BYTES)
+    if head.is_err:
+        if io.is_read_until_limit_error(head.err):
             fail HEADER_LIMIT_MESSAGE
-        w1 = w2
-        w2 = w3
-        w3 = w4
-        w4 = chunk[0]
-        if w1 == 13 and w2 == 10 and w3 == 13 and w4 == 10:
-            return buf.take_bytes()
-    return bytes.empty()
+        fail head.err
+    # the cap is checked before the chunk that crossed it is scanned, so a head
+    # whose terminator lands inside that chunk still has to be refused here.
+    if head.ok.len() > MAX_HEADER_BYTES:
+        fail HEADER_LIMIT_MESSAGE
+    return head.ok
 
 # read one http/1.1 request off a tls conn: the head, then the body. a chunked
 # body is decoded with the tls chunked reader (the same logic the plaintext path

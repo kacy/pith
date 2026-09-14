@@ -682,8 +682,13 @@ its cost is dominated by key calls rather than by comparisons, and the speedup
 there grows with n rather than settling. And the old `algo.sort_by_key` was an
 insertion sort that inserted before the first strictly greater element, which
 makes a descending input its best case: it probes exactly one element per
-insertion. That is the one cell the merge sort loses, at 100 and 1000 elements,
-before the insertion cost turns it around again at 10000.
+insertion. That was the one cell the merge sort lost, at 100 and 1000 elements.
+Run detection (#1096) recovered it: the sort now finds the ascending and
+strictly descending runs the input already has, so a sorted or exactly reversed
+input is one run and one linear scan. The reverse string cells went from 0.4x
+and 0.5x against the insertion sort to 0.8x at 100 and 1.1x at 1000, and from
+2.8x to 6.9x at 10000. The scan gives up within about eight comparisons on an
+input with no runs in it, so no other cell pays for it.
 
 Wall clock on the two-core box moves around; instruction counts through
 `tooling/callgrind_ab.sh` are the number to quote for a per-operation claim.
@@ -908,6 +913,25 @@ from the same source, run under callgrind, outputs and checksums identical:
 
 the list shape did not move because a list of structs still goes through
 the node pool by hand (#1110).
+
+### the same head read over tls (2026-09-14)
+
+`bench/tls_head_read` is the tls twin of `http_head_read`. it cannot skip the
+socket the way the plaintext one does, because the head arrives as decrypted
+record data, so it handshakes once and then sends `requests` keepalive GETs
+down that one connection while a second task drains the answers.
+
+```
+pith build bench/tls_head_read.pith
+./bench/tls_head_read 1
+./bench/tls_head_read 500
+```
+
+run it at 1 and at 500: the one-request run is almost all handshake, so the
+difference between the two divided by the request count is what the head read
+costs per request. before #1100 that was 409,441 Ir per request and after it
+274,350 (−33.0%), with the whole 500-request program at −27.2% and the
+one-request run unchanged within 0.14%.
 
 ## hash kernels (std.hash and std.checksum, per byte)
 

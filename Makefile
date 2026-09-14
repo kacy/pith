@@ -1764,6 +1764,7 @@ test: build
 	@$(MAKE) --no-print-directory check-invalid-self-host-only
 	@echo "=== Step 12: run self-host cli regressions ==="
 	@$(MAKE) --no-print-directory cli-regressions-self-only
+	@$(MAKE) --no-print-directory test-runner-goldens-only
 	@echo "=== Step 13: self-hosted compiler works ==="
 	./self-host/pith_main version
 	./self-host/pith_main lex examples/hello.pith > /dev/null

@@ -4,6 +4,8 @@
 #   pith build <file.pith>      compile to native binary
 #   pith run <file.pith>        compile and run
 #   pith test <file.pith>       run test declarations
+#   pith test <file> [--filter <substr>] [--tag <name>] [--exclude-tag <name>]
+#                    [--json]          flags are forwarded to the runner
 #   pith check <file.pith>      type check (human-readable output)
 #   pith check --json <file>  machine-readable diagnostics
 #   pith fmt <file.pith>        format source code
@@ -60,7 +62,12 @@ fn native_backend_path() -> String:
         return "../target/release/pith"
     return "./target/release/pith"
 
-fn backend_command(command: String, path: String) -> String:
+# the backend is spawned without a shell and the command line is split on
+# whitespace, so no argument can carry a space. the guards below refuse one
+# rather than passing a half-argument down; the runner reads every selection
+# flag from the environment too, which is the way to pass a value with a space
+# through this wrapper.
+fn backend_command(command: String, path: String, extra: List[String]) -> String:
     if path.contains(" "):
         print("error: paths with spaces are not supported by self-hosted " + command)
         exit(1)
@@ -68,23 +75,32 @@ fn backend_command(command: String, path: String) -> String:
     if backend.contains(" "):
         print("error: backend path contains spaces; set PITH_NATIVE to a path without spaces")
         exit(1)
-    parts := [backend, command, path]
+    mut parts := [backend, command, path]
+    for arg in extra:
+        if arg.contains(" "):
+            print("error: arguments with spaces are not supported by self-hosted " + command + "; pass the value through the environment instead")
+            exit(1)
+        parts.push(arg)
     return parts.join(" ")
 
-fn run_backend_command(command: String, path: String) -> String!:
-    status := exec(backend_command(command, path))
+fn run_backend_command(command: String, path: String, extra: List[String]) -> String!:
+    status := exec(backend_command(command, path, extra))
     if status != 0:
         exit(status)
     return ""
 
 fn cmd_build(path: String) -> String!:
-    return run_backend_command("build", path)
+    return run_backend_command("build", path, [])
 
 fn cmd_run(path: String) -> String!:
-    return run_backend_command("run", path)
+    return run_backend_command("run", path, [])
 
-fn cmd_test(path: String) -> String!:
-    return run_backend_command("test", path)
+# every argument after the path goes to the runner untouched, so `--filter`,
+# `--tag`, `--exclude-tag` and `--json` mean the same thing here as they do on
+# the native cli. the wrapper does not read them: whatever the runner accepts
+# today it accepts through this path too.
+fn cmd_test(path: String, extra: List[String]) -> String!:
+    return run_backend_command("test", path, extra)
 
 fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
     mut output := ""
@@ -253,7 +269,7 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
     if action == "check":
         return cmd_check(root, false)
     if action == "test":
-        return cmd_test(root)
+        return cmd_test(root, args_list.slice(3, args_list.len()))
     if action == "lint":
         return cmd_lint(root, false)
     if action == "doc":
@@ -335,6 +351,7 @@ fn print_help():
     print("  build <file.pith>        compile to native binary")
     print("  run <file.pith>          compile and run")
     print("  test <file.pith>         run test declarations")
+    print("    [--filter <substr>] [--tag <name>] [--exclude-tag <name>] [--json]")
     print("  check <file.pith>        type check (human-readable)")
     print("  check --json <file>    type check (JSON output)")
     print("  fmt <file.pith>          format source code")
@@ -485,7 +502,7 @@ fn run_cli() -> String!:
         _result := cmd_run(path)!
 
     elif command == "test":
-        _result := cmd_test(path)!
+        _result := cmd_test(path, a.slice(3, a.len()))!
 
     elif command == "parse":
         _result := cmd_parse(path)!

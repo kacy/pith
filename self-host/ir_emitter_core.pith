@@ -10545,6 +10545,13 @@ fn ir_emit_optional_walks(trace: Bool):
         ir_rc_walk_slot(vr, k, trace)
         ir_emit_zero_ret_endfunc()
 
+# every walk below iterates a name-keyed registry, and a map hands its keys
+# back in whatever order its table holds them, which is a property of the
+# runtime rather than of the program being compiled. sorting by name first
+# makes the emission order a property of the source: a change to the map or
+# set implementation moved it once already (#1125), which read as a
+# whole-program ir difference for programs with more than one destructor.
+#
 # one destructor per known struct with rc fields: releases each such
 # field, then the runtime frees the allocation. every module emits its
 # own copy (module prefixing keeps the names distinct), so construction
@@ -10552,7 +10559,7 @@ fn ir_emit_optional_walks(trace: Bool):
 # tracer twin: the same field walk, visiting each traceable field instead of
 # releasing it, and only for the structs that have one.
 fn ir_emit_struct_walks(trace: Bool):
-    for sname in ir_struct_names.keys():
+    for sname in ir_struct_names.keys().sort():
         if sname.index_of("[") >= 0:
             continue
         # boxed enums live in ir_struct_names too but their releasable slots
@@ -10602,7 +10609,7 @@ fn ir_emit_struct_walks(trace: Bool):
 # layout is [tag, payload0, payload1, ...] at offsets 0, 8, 16, mirroring the
 # variant allocator and the equality helper.
 fn ir_emit_enum_dtors():
-    for ename in ir_boxed_enums.keys():
+    for ename in ir_boxed_enums.keys().sort():
         if not ir_enum_needs_dtor(ename):
             continue
         if not ir_enum_variant_lists.contains_key(ename):
@@ -10613,7 +10620,7 @@ fn ir_emit_enum_dtors():
 # pass beside the generic struct instance destructors: the declared-enum pass
 # above runs before any body, when the registry is still empty.
 fn ir_emit_generic_enum_instance_dtors():
-    for sym in ir_generic_enum_dtor_base.keys():
+    for sym in ir_generic_enum_dtor_base.keys().sort():
         ir_emit_enum_walk_body("__dtor_" + sym, ir_generic_enum_variant_kinds(sym), false)
 
 # the generic struct instances registered at construction sites, emitted in the
@@ -10621,7 +10628,7 @@ fn ir_emit_generic_enum_instance_dtors():
 # registry is still empty, and a construction inside a specialization or a
 # lambda only registers itself as that body is emitted.
 fn ir_emit_generic_struct_instance_dtors():
-    for sym in ir_generic_struct_dtor_base.keys():
+    for sym in ir_generic_struct_dtor_base.keys().sort():
         base := ir_generic_struct_dtor_base[sym]
         kinds := ir_generic_struct_dtor_kinds[sym].split(";")
         pr := ir_emit_rc_walk_header("__dtor_" + sym)
@@ -10662,7 +10669,7 @@ fn ir_generic_struct_instance_needs_tracer(sym: String) -> Bool:
 # tracer twin of a generic struct instance destructor: the same slot walk,
 # visiting each traceable child instead of releasing it.
 fn ir_emit_generic_struct_instance_tracers():
-    for sym in ir_generic_struct_dtor_base.keys():
+    for sym in ir_generic_struct_dtor_base.keys().sort():
         if not ir_generic_struct_instance_needs_tracer(sym):
             continue
         base := ir_generic_struct_dtor_base[sym]
@@ -10745,7 +10752,7 @@ fn ir_emit_enum_walk_body(symbol: String, variant_kinds: List[String], trace: Bo
 # tracer twin of a boxed enum's __dtor_<ename>: the same tag dispatch,
 # visiting the matching variant's traceable payload slots.
 fn ir_emit_enum_tracers():
-    for ename in ir_boxed_enums.keys():
+    for ename in ir_boxed_enums.keys().sort():
         if not ir_enum_needs_tracer(ename):
             continue
         if not ir_enum_variant_lists.contains_key(ename):
@@ -10754,7 +10761,7 @@ fn ir_emit_enum_tracers():
 
 # tracer twins for the generic enum instances, same late pass as their dtors.
 fn ir_emit_generic_enum_instance_tracers():
-    for sym in ir_generic_enum_dtor_base.keys():
+    for sym in ir_generic_enum_dtor_base.keys().sort():
         if ir_variant_kinds_have_trace(ir_generic_enum_variant_kinds(sym)):
             ir_emit_enum_walk_body("__cc_trace_" + sym, ir_generic_enum_variant_kinds(sym), true)
 
@@ -10796,7 +10803,7 @@ fn ir_emit_tuple_walks(trace: Bool):
 # equal payloads. string payloads compare by content and nested boxed
 # enums recurse; struct payloads keep pointer identity.
 fn ir_emit_enum_eq_fns():
-    for ename in ir_boxed_enums.keys():
+    for ename in ir_boxed_enums.keys().sort():
         if not ir_enum_variant_lists.contains_key(ename):
             continue
         ir_emit_func_header("__enum_eq_" + ename, 2, "bool")
@@ -11089,7 +11096,7 @@ fn ir_emit_cc_register_tracers():
     opt_kinds := ["struct", "list", "map", "set", "closure"]
     for k in opt_kinds:
         ir_emit_cc_register_pair("__opt_dtor_" + k, "__opt_trace_" + k)
-    for sname in ir_struct_names.keys():
+    for sname in ir_struct_names.keys().sort():
         if sname.index_of("[") >= 0:
             continue
         if ir_boxed_enums.contains_key(sname):
@@ -11099,20 +11106,20 @@ fn ir_emit_cc_register_tracers():
         if not ir_struct_needs_tracer(sname):
             continue
         ir_emit_cc_register_pair("__dtor_" + sname, "__cc_trace_" + sname)
-    for ename in ir_boxed_enums.keys():
+    for ename in ir_boxed_enums.keys().sort():
         if not ir_enum_needs_tracer(ename):
             continue
         if not ir_enum_variant_lists.contains_key(ename):
             continue
         ir_emit_cc_register_pair("__dtor_" + ename, "__cc_trace_" + ename)
-    for sym in ir_generic_enum_dtor_base.keys():
+    for sym in ir_generic_enum_dtor_base.keys().sort():
         if ir_variant_kinds_have_trace(ir_generic_enum_variant_kinds(sym)):
             ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     for sig in ir_tuple_dtor_sigs:
         if not ir_tuple_sig_has_trace(sig):
             continue
         ir_emit_cc_register_pair(ir_tuple_dtor_name(sig), ir_tuple_tracer_name(sig))
-    for sym in ir_generic_struct_dtor_base.keys():
+    for sym in ir_generic_struct_dtor_base.keys().sort():
         if not ir_generic_struct_instance_needs_tracer(sym):
             continue
         ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)

@@ -339,6 +339,12 @@ to stderr, so a reader takes the lines that parse as json and leaves the rest.
 `--filter` reads `PITH_TEST_FILTER`. a wrapper script that drives the tests
 sets those and needs to know nothing about the flags.
 
+the self-hosted compiler forwards every argument after the file to the same
+runner, so `self-host/pith_main test <file> --tag fast --json` selects the same
+tests as the native binary does. it spawns the backend without a shell, so a
+value carrying a space cannot travel as an argument and is refused by name; the
+environment variables above are the way to pass one through that entry point.
+
 ## std.testing
 
 `std.testing` is a helper library for a different shape of test: a standalone

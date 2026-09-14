@@ -18,11 +18,21 @@
 # `"duration_ms":<ms>` before the comparison. the field stays in the golden,
 # which keeps it proved present and well-formed; only its value is dropped.
 #
+# the self-hosted wrapper forwards these flags to the same runner rather than
+# reimplementing them, so a second pass replays the cases through it and pins
+# them against the same goldens: the two entry points are only the same if they
+# print the same thing. the wrapper spawns the backend without a shell and the
+# command line is split on whitespace, so a value carrying a space cannot ride
+# an argument; those cases stay native-only and the refusal is pinned instead.
+# the pass is skipped when the wrapper has not been built, which is the state
+# the native gate runs in.
+#
 # regenerate with PITH_TEST_GOLDEN_UPDATE=1 and read the diff before committing.
 
 set -u
 
 PITH=${PITH:-./target/release/pith}
+WRAPPER=${PITH_WRAPPER:-./self-host/pith_main}
 FIXTURE=tests/testrunner/fixture.pith
 EXPECTED_DIR=tests/testrunner/expected
 UPDATE=${PITH_TEST_GOLDEN_UPDATE:-0}
@@ -90,6 +100,51 @@ run_case tag_one_of_several --tag slow
 run_case tag_unmatched --tag nope
 # the row identity `--filter` has always accepted still selects one row
 run_case row_filter --filter "rows report one by one / beta"
+
+# --- the same flags through the self-hosted wrapper ---
+
+wrapper_case() {
+  local name=$1
+  shift
+  local output status normalized expected_file
+  output=$(PITH_NATIVE="$PITH" "$WRAPPER" test "$FIXTURE" "$@" 2>/dev/null)
+  status=$?
+  normalized=$(printf '%s\n' "$output" | sed 's/"duration_ms":[0-9][0-9]*/"duration_ms":<ms>/g')
+  normalized=$(printf '%s\nexit: %d\n' "$normalized" "$status")
+  expected_file="$EXPECTED_DIR/$name.txt"
+  if [ ! -f "$expected_file" ]; then
+    echo "FAIL wrapper/$name (no golden at $expected_file)"
+    fail=$((fail + 1))
+    return 0
+  fi
+  if [ "$normalized" = "$(cat "$expected_file")" ]; then
+    echo "ok   wrapper/$name"
+    pass=$((pass + 1))
+  else
+    echo "FAIL wrapper/$name"
+    diff -u "$expected_file" - <<< "$normalized"
+    fail=$((fail + 1))
+  fi
+}
+
+if [ "$UPDATE" != "1" ]; then
+  if [ -x "$WRAPPER" ]; then
+    echo "--- the same flags through the self-hosted wrapper ---"
+    # every flag the wrapper is meant to forward, against the native goldens
+    wrapper_case json_full --json
+    wrapper_case prose_full
+    wrapper_case tag_select --tag fast
+    wrapper_case tag_exclude --exclude-tag fast
+    wrapper_case tag_and_filter --tag fast --filter arithmetic
+    wrapper_case tag_unmatched --tag nope
+    wrapper_case json_unmatched_tag --json --tag nope
+    # a value with a space cannot survive the shell-free spawn, so the wrapper
+    # refuses it by name rather than passing half of it down
+    wrapper_case wrapper_space_refused --filter "two words"
+  else
+    echo "skip: no self-hosted wrapper at $WRAPPER (run 'make self-host')"
+  fi
+fi
 
 if [ "$UPDATE" = "1" ]; then
   exit 0

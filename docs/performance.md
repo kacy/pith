@@ -608,17 +608,16 @@ the run is discarded, whatever pith reads.
 
 ### the map pass (2026-09-13): borrowed keys, inline values, one probe per update
 
-Three changes to how a map stores and reaches its entries, measured against
-`19aceac7`, the tip the section above was written at. `#1126` probes with the
-caller's own key bytes and allocates a key only when a new entry is actually
-created, for sets as well as maps. `#1128` stores a word-sized value in the
-table instead of boxing it, which is the exemption int-keyed scalar maps
-already had, extended to every flavor. `#1129` fuses `m.insert(k, m[k] + d)`
-into a single probe, after a phase-scoped measurement showed the hasher at
-12.8% of the event ledger's analyze phase (#1127); the fused form is taken
-only when the map and key are the same side-effect-free read, the delta is
-side-effect-free, the values are integers, and the enclosing function does
-not return a result.
+three changes to how a map stores and reaches its entries, measured against
+`19aceac7`, the tip the section above was written at. #1126 probes with the
+caller's own key bytes and allocates a key only when a new entry is created,
+for sets as well as maps. #1128 stores a word-sized value in the table
+instead of boxing it, which is the exemption int-keyed scalar maps already
+had, extended to every flavor. #1129 fuses `m.insert(k, m[k] + d)` into a
+single probe, after a phase-scoped measurement put the hasher at 12.8% of the
+event ledger's analyze phase (#1127); the fused form is taken only when the
+map and key are the same side-effect-free read, the delta is side-effect-free,
+the values are integers, and the enclosing function does not return a result.
 
 | 2026-09-13, callgrind | before | after | delta |
 |---|---:|---:|---:|
@@ -632,31 +631,30 @@ not return a result.
 | http request head read, 20k | 2,030,573,462 | 2,000,571,656 | −1.5% |
 | every other bench program | | | 0.00% |
 
-Allocations per update went from four to zero on string and bytes keys: three
-key copies and a value box, none of which the program asked for. At 64
-distinct keys the probe now allocates 523 times whether it performs 20,000
-updates or 80,000, so allocation no longer scales with update count at all.
+allocations per update went from four to zero on string and bytes keys: three
+key copies and a value box. at 64 distinct keys the probe allocates 523 times
+whether it performs 20,000 updates or 80,000, so allocation no longer scales
+with update count.
 
-The compile-time rows were not the target. The compiler is itself a heavy
-string-keyed map user, so it picked up 4.7% without anyone aiming at it, and
-this time the input was identical in both arms (the std sources did not
-change), so the comparison means what it says.
+the compile-time rows were not the target. the compiler is a heavy user of
+string-keyed maps and gained 4.7% as a side effect. the input was identical in
+both arms of that comparison, since the std sources did not change between
+them, so the delta is attributable to the change and not to a larger source.
 
-In wall clock on a settled box, comparators reproducing their figures: the
-event ledger's analyze phase 56 to 23 ms and its total 259 to 238, the
+wall clock on a settled box, with the comparators reproducing their figures:
+the event ledger's analyze phase 56 to 23 ms and its total 259 to 238, the
 channel fan-out under green at 68 ms against go's 72, the catalog workload at
 68 against rust's 65, the std pipeline 344 to 312.
 
-A note on the box, because it cost two runner passes here. Measurements taken
-in a degraded window read almost exactly 2x, and a short canary process does
-not detect the state: the go comparator read its quiet 371 ms immediately
-before a multi-language run in which every arm then read double. The
-signature that identified it was phase-level: in the degraded runs the event
-ledger's allocation-heavy `gen` and `parse` phases doubled while `analyze`,
-which this very work made allocation-free, held its correct 23 ms. Runs whose
-comparators do not reproduce are discarded; that is the rule in
-bench/README.md and it is the reason the figures above are the third pass and
-not the first.
+two runner passes were discarded before those figures were taken. in a
+degraded window every arm reads about 2x, and a short canary process does not
+detect the state: the go comparator read its usual 371 ms immediately before a
+multi-language run in which every arm read double. what identified the window
+was phase-level. in the degraded runs the event ledger's allocation-heavy
+`gen` and `parse` phases doubled, while `analyze`, which this change made
+allocation-free, held at 23 ms. a run whose comparators do not reproduce their
+published figures is discarded, which is the rule in bench/README.md; the
+figures above come from the third pass.
 
 ### a note on how these are measured
 

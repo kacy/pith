@@ -1,0 +1,247 @@
+# Float fields in a json decode target, over every lowering that fills
+# one: the flat fill (`f` in the packed spec), the nested fill, the
+# scalar-object path an optional field takes, and the node-pool path a
+# nested struct with an optional field takes (object_require_float).
+# valgrind-gated in MEMCHECK_CASES.
+#
+# a float slot takes any json number: a fraction, an exponent, a negative,
+# `-0.0` with its sign kept, the largest and smallest finite values, and
+# an integer, which widens (`3` reads 3.0). an int slot still takes only
+# an integer, so a fraction or an exponent under an Int field is the
+# wrong-type error it always was. `NaN` and `Infinity` are not json and
+# are refused, as is an exponent past the type's range. every value
+# decoded directly is printed beside the same document read through
+# json.parse and get_float, and the two lines must match byte for byte:
+# both go through the runtime's one float conversion.
+#
+# the error lines pin what each path already said for the other scalars:
+# the flat fill's one generic message for any malformed document, the
+# nested fill's and node pool's kind-named messages ("expected float
+# field: lat"), and the scalar-object path's reading of a present but
+# wrong-typed optional as absent, which is how it treats an Int? or a
+# String? too.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Reading:
+    pub id: Int
+    pub label: String
+    pub live: Bool
+    pub value: Float
+    pub delta: Float
+
+struct Maybe:
+    pub id: Int
+    pub value: Float?
+
+struct Geo:
+    pub lat: Float
+    pub lon: Float
+    pub name: String
+
+struct Site:
+    pub code: String
+    pub geo: Geo
+    pub level: Int
+
+struct SiteMaybe:
+    pub code: String
+    pub geo: Geo
+    pub note: String?
+
+struct Point:
+    pub x: Int
+    pub y: Int
+
+struct OnlyFloat:
+    pub f: Float
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn bits(f: Float) -> String:
+    return float_to_bits(f).to_string()
+
+fn show_float(f: Float) -> String:
+    return f.to_string() + " bits=" + bits(f)
+
+fn reading_doc(value: String, delta: String) -> String:
+    return obj(q("id") + ":7," + q("label") + ":" + q("probe") + "," + q("live") + ":true," + q("value") + ":" + value + "," + q("delta") + ":" + delta)
+
+fn show_reading(label: String, r: Reading!json.JsonDecodeError) -> String:
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return ""
+    line := "id=" + r.ok.id.to_string() + " label=" + r.ok.label + " live=" + r.ok.live.to_string() + " value=" + show_float(r.ok.value) + " delta=" + show_float(r.ok.delta)
+    print(label + " ok: " + line)
+    return line
+
+fn print_reading(label: String, r: Reading!json.JsonDecodeError):
+    line := show_reading(label, r)
+    if line.len() < 0:
+        print("impossible")
+
+# the parsed side of the comparison. the node parser types `3` as an int
+# node and get_float reads only float nodes, so an integer-written value
+# is widened here the way the fillers widen it; everything else is
+# get_float on the float node.
+fn parsed_float(h: Int, key: String) -> Float:
+    node := json.object_get(h, key)
+    if json.type_of(node) == "int":
+        return json.get_int(node).to_float()
+    return json.get_float(node)
+
+fn reading_via_parse(doc: String) -> String:
+    scope := json.open_scope()
+    defer json.close_scope(scope)
+    h := json.parse(doc)
+    return "id=" + json.object_get_int(h, "id").to_string() + " label=" + json.object_get_string(h, "label") + " live=" + json.object_get_bool(h, "live").to_string() + " value=" + show_float(parsed_float(h, "value")) + " delta=" + show_float(parsed_float(h, "delta"))
+
+fn compare_reading(label: String, value: String, delta: String):
+    doc := reading_doc(value, delta)
+    direct := show_reading(label, json.decode_text[Reading](doc))
+    parsed := reading_via_parse(doc)
+    print(label + " parse: " + parsed)
+    print(label + " same: " + (direct == parsed).to_string())
+
+fn show_maybe(label: String, r: Maybe!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    if let v = r.ok.value:
+        print(label + " ok: id=" + r.ok.id.to_string() + " value=" + show_float(v))
+    else:
+        print(label + " ok: id=" + r.ok.id.to_string() + " value=none")
+
+fn show_site(label: String, r: Site!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    s := r.ok
+    print(label + " ok: " + s.code + " lat=" + show_float(s.geo.lat) + " lon=" + show_float(s.geo.lon) + " " + s.geo.name + " level=" + s.level.to_string())
+
+fn show_site_maybe(label: String, r: SiteMaybe!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    s := r.ok
+    mut note := "none"
+    if let n = s.note:
+        note = n
+    print(label + " ok: " + s.code + " lat=" + show_float(s.geo.lat) + " lon=" + show_float(s.geo.lon) + " " + s.geo.name + " note=" + note)
+
+fn show_point(label: String, r: Point!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + r.ok.x.to_string() + "," + r.ok.y.to_string())
+
+fn show_only(label: String, r: OnlyFloat!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + show_float(r.ok.f))
+
+fn geo_doc(lat: String, lon: String) -> String:
+    return obj(q("lat") + ":" + lat + "," + q("lon") + ":" + lon + "," + q("name") + ":" + q("home"))
+
+fn site_doc(geo: String, level: String) -> String:
+    return obj(q("code") + ":" + q("s1") + "," + q("geo") + ":" + geo + "," + q("level") + ":" + level)
+
+fn main():
+    print("--- flat fill: Float beside Int, String, Bool ---")
+    compare_reading("fraction", "1.5", "-2.25")
+    compare_reading("integers", "3", "-7")
+    compare_reading("exponents", "1e10", "2.5E-3")
+    compare_reading("negative zero", "-0.0", "0.0")
+    compare_reading("zero exponent", "0e5", "-0e5")
+    compare_reading("largest finite", "1.7976931348623157e308", "-1.7976931348623157e308")
+    compare_reading("smallest positive", "5e-324", "2.2250738585072014e-308")
+    compare_reading("underflow", "1e-400", "-1e-400")
+    compare_reading("many digits", "0.1", "123456789.123456789")
+    compare_reading("plus exponent", "1.25e+2", "10")
+
+    print("--- flat fill from bytes ---")
+    print_reading("bytes", json.decode[Reading](bytes.from_string_utf8(reading_doc("4.75", "-1e-2"))))
+
+    print("--- flat fill: refused numbers ---")
+    print_reading("nan", json.decode_text[Reading](reading_doc("NaN", "1.0")))
+    print_reading("infinity", json.decode_text[Reading](reading_doc("Infinity", "1.0")))
+    print_reading("negative infinity", json.decode_text[Reading](reading_doc("-Infinity", "1.0")))
+    print_reading("overflow", json.decode_text[Reading](reading_doc("1e309", "1.0")))
+    print_reading("string in float", json.decode_text[Reading](reading_doc(q("1.5"), "1.0")))
+    print_reading("bool in float", json.decode_text[Reading](reading_doc("true", "1.0")))
+    print_reading("null in float", json.decode_text[Reading](reading_doc("null", "1.0")))
+    print_reading("two dots", json.decode_text[Reading](reading_doc("1.2.3", "1.0")))
+    print_reading("bare exponent", json.decode_text[Reading](reading_doc("1e", "1.0")))
+    print_reading("leading dot", json.decode_text[Reading](reading_doc(".5", "1.0")))
+    print_reading("missing float", json.decode_text[Reading](obj(q("id") + ":7," + q("label") + ":" + q("probe") + "," + q("live") + ":true," + q("value") + ":1.5")))
+
+    print("--- flat fill: a float in an Int field stays refused ---")
+    show_point("int ok", json.decode_text[Point](obj(q("x") + ":1," + q("y") + ":2")))
+    show_point("fraction in int", json.decode_text[Point](obj(q("x") + ":1.5," + q("y") + ":2")))
+    show_point("exponent in int", json.decode_text[Point](obj(q("x") + ":1," + q("y") + ":2e3")))
+    show_point("negative zero in int", json.decode_text[Point](obj(q("x") + ":-0.0," + q("y") + ":2")))
+
+    print("--- flat fill: numbers and nested values under keys the target does not read ---")
+    show_point("stray float", json.decode_text[Point](obj(q("x") + ":1," + q("z") + ":1.5," + q("y") + ":2")))
+    show_point("stray exponent", json.decode_text[Point](obj(q("x") + ":1," + q("z") + ":1e3," + q("y") + ":2")))
+    show_point("stray object", json.decode_text[Point](obj(q("x") + ":1," + q("z") + ":" + obj(q("a") + ":[1,2.5," + obj("") + "]") + "," + q("y") + ":2")))
+    show_point("stray array", json.decode_text[Point](obj(q("x") + ":1," + q("z") + ":[1,[2],3]," + q("y") + ":2")))
+    show_point("stray unterminated", json.decode_text[Point](obj(q("x") + ":1," + q("z") + ":[1,2," + q("y") + ":2")))
+
+    print("--- one-field target ---")
+    show_only("one float", json.decode_text[OnlyFloat](obj(q("f") + ":-12.5")))
+    show_only("one int widened", json.decode_text[OnlyFloat](obj(q("f") + ":12")))
+    show_only("one nan", json.decode_text[OnlyFloat](obj(q("f") + ":NaN")))
+
+    print("--- optional Float? (scalar-object path) ---")
+    show_maybe("present", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":2.5")))
+    show_maybe("present int", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":2")))
+    show_maybe("present exponent", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":-1e2")))
+    show_maybe("present negative zero", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":-0.0")))
+    show_maybe("absent", json.decode_text[Maybe](obj(q("id") + ":1")))
+    show_maybe("string in float", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":" + q("2.5"))))
+    show_maybe("nan", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":NaN")))
+    show_maybe("overflow", json.decode_text[Maybe](obj(q("id") + ":1," + q("value") + ":1e309")))
+    show_maybe("float in int", json.decode_text[Maybe](obj(q("id") + ":1.5," + q("value") + ":2.5")))
+    show_maybe("stray float", json.decode_text[Maybe](obj(q("id") + ":1," + q("z") + ":9.75")))
+    show_maybe("stray object", json.decode_text[Maybe](obj(q("id") + ":1," + q("z") + ":" + obj(q("a") + ":[1.5]") + "," + q("value") + ":3.5")))
+    show_maybe("stray array", json.decode_text[Maybe](obj(q("id") + ":1," + q("z") + ":[" + obj(q("k") + ":" + q("v")) + ",2]")))
+
+    print("--- nested fill: a struct with Float fields inside a struct ---")
+    show_site("nested", json.decode_text[Site](site_doc(geo_doc("48.8566", "2.3522"), "3")))
+    show_site("nested ints", json.decode_text[Site](site_doc(geo_doc("48", "-2"), "3")))
+    show_site("nested exponents", json.decode_text[Site](site_doc(geo_doc("4.88566e1", "235.22E-2"), "3")))
+    show_site("nested negative zero", json.decode_text[Site](site_doc(geo_doc("-0.0", "0"), "3")))
+    show_site("nested bytes", json.decode[Site](bytes.from_string_utf8(site_doc(geo_doc("1.5", "2.5"), "9"))))
+    show_site("nested string in float", json.decode_text[Site](site_doc(geo_doc(q("48.8"), "2.3"), "3")))
+    show_site("nested nan", json.decode_text[Site](site_doc(geo_doc("NaN", "2.3"), "3")))
+    show_site("nested overflow", json.decode_text[Site](site_doc(geo_doc("1e999", "2.3"), "3")))
+    show_site("nested missing float", json.decode_text[Site](site_doc(obj(q("lat") + ":1.5," + q("name") + ":" + q("x")), "3")))
+    show_site("nested float in int", json.decode_text[Site](site_doc(geo_doc("1.5", "2.5"), "3.5")))
+    show_site("nested repeated key", json.decode_text[Site](site_doc(obj(q("lat") + ":1.5," + q("lat") + ":9.25," + q("lon") + ":2," + q("name") + ":" + q("x")), "3")))
+
+    print("--- node-pool path: nested struct beside an optional field ---")
+    show_site_maybe("pool", json.decode_text[SiteMaybe](obj(q("code") + ":" + q("p1") + "," + q("geo") + ":" + geo_doc("1.25", "-3") + "," + q("note") + ":" + q("hi"))))
+    show_site_maybe("pool absent", json.decode_text[SiteMaybe](obj(q("code") + ":" + q("p1") + "," + q("geo") + ":" + geo_doc("1e2", "-0.0"))))
+    show_site_maybe("pool string in float", json.decode_text[SiteMaybe](obj(q("code") + ":" + q("p1") + "," + q("geo") + ":" + geo_doc(q("1.25"), "-3"))))
+    show_site_maybe("pool nan", json.decode_text[SiteMaybe](obj(q("code") + ":" + q("p1") + "," + q("geo") + ":" + geo_doc("NaN", "-3"))))
+
+    print("--- decode_object on a parsed handle ---")
+    scope := json.open_scope()
+    root := json.parse(obj(q("lat") + ":10.5," + q("lon") + ":20," + q("name") + ":" + q("h")))
+    g := json.decode_object[Geo](root)
+    if g.is_err:
+        print("handle err: " + g.err.message)
+    else:
+        print("handle ok: lat=" + show_float(g.ok.lat) + " lon=" + show_float(g.ok.lon) + " " + g.ok.name)
+    bad := json.parse(obj(q("lat") + ":" + q("10.5") + "," + q("lon") + ":20," + q("name") + ":" + q("h")))
+    gb := json.decode_object[Geo](bad)
+    if gb.is_err:
+        print("handle wrong type: " + gb.err.message)
+    json.close_scope(scope)

@@ -1,0 +1,13 @@
+# a json decode target may hold Int, String, Bool, Float, an optional of
+# those, or another struct; a List field of any element type is refused
+# at the checker (#1110).
+import std.json as json
+
+struct Order:
+    pub id: Int
+    pub tags: List[String]
+
+fn main():
+    r := json.decode_text[Order]("x")
+    if r.is_err:
+        print("err")

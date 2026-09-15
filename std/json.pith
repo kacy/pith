@@ -30,12 +30,15 @@ pub struct JsonCheckpoint:
     pub object_entry_len: Int
     pub array_item_len: Int
 
-# shallow scalar fields from a json object.
+# shallow scalar fields from a json object. a number lands in `ints` when
+# it is written as an integer and in `floats` when it carries a fraction
+# or an exponent; the float accessors read both, widening an integer.
 pub struct JsonScalarObject:
     pub ok: Bool
     pub strings: Map[String, String]
     pub ints: Map[String, Int]
     pub bools: Map[String, Bool]
+    pub floats: Map[String, Float]
 
 # error returned by the typed json decoding helpers.
 pub struct JsonDecodeError:
@@ -49,6 +52,11 @@ struct JsonByteString:
 struct JsonByteInt:
     ok: Bool
     value: Int
+    next_pos: Int
+
+struct JsonByteFloat:
+    ok: Bool
+    value: Float
     next_pos: Int
 
 struct JsonByteFieldPos:
@@ -278,34 +286,6 @@ fn parse_integer_manual(s: String) -> Int:
         return 0 - val
     return val
 
-# Parses a float from a string manually (handles decimal and negative)
-fn parse_float_manual(s: String) -> Float:
-    mut int_part := 0
-    mut frac_part := 0.0
-    mut frac_div := 1.0
-    mut neg := false
-    mut i := 0
-    mut in_frac := false
-    if s.len() > 0 and s[0] == "-":
-        neg = true
-        i = 1
-    if s.len() > 0 and s[0] == "+":
-        i = 1
-    while i < s.len():
-        c := s[i]
-        if c == ".":
-            in_frac = true
-        if c >= "0" and c <= "9" and not in_frac:
-            int_part = int_part * 10 + (ord(c) - 48)
-        if c >= "0" and c <= "9" and in_frac:
-            frac_div = frac_div * 10.0
-            frac_part = frac_part + (ord(c) - 48).to_float() / frac_div
-        i = i + 1
-    result := int_part.to_float() + frac_part
-    if neg:
-        return 0.0 - result
-    return result
-
 # Returns true if character is valid in a number (digit, dot, e, E, +, -)
 fn is_number_char(c: String) -> Bool:
     if c >= "0" and c <= "9":
@@ -388,7 +368,101 @@ fn json_scalar_object(ok: Bool) -> JsonScalarObject:
     mut string_values_map: Map[String, String] := {}
     mut int_values_map: Map[String, Int] := {}
     mut bool_values_map: Map[String, Bool] := {}
-    return JsonScalarObject(ok, string_values_map, int_values_map, bool_values_map)
+    mut float_values_map: Map[String, Float] := {}
+    return JsonScalarObject(ok, string_values_map, int_values_map, bool_values_map, float_values_map)
+
+# the bit patterns of the two infinities, which `parse_float` hands back
+# for an exponent past the type's range and no json number may denote.
+POSITIVE_INFINITY_BITS := 9218868437227405312
+NEGATIVE_INFINITY_BITS := 0 - 4503599627370496
+# -0.0: the sign bit alone. spelled as a subtraction because the literal
+# 9223372036854775808 does not fit an Int.
+NEGATIVE_ZERO_BITS := 0 - 9223372036854775807 - 1
+
+# true for a byte a json number is written with: a digit, a sign, `.`,
+# `e` or `E`.
+fn json_byte_is_number_char(value: Int) -> Bool:
+    return json_byte_is_digit(value) or value == 45 or value == 43 or value == 46 or value == 101 or value == 69
+
+# the end of the number span at `pos`: the maximal run of number bytes.
+fn json_byte_number_span_end(input: Bytes, pos: Int) -> Int:
+    mut i := pos
+    while i < input.len() and json_byte_is_number_char(input[i]):
+        i = i + 1
+    return i
+
+# true when a number's text carries a fraction or an exponent, which is
+# what makes it a float rather than an int, in the parser and here alike.
+fn json_number_text_is_float(text: String) -> Bool:
+    return text.contains(".") or text.contains("e") or text.contains("E")
+
+# true when `text` is a number `parse_float` converts: an optional sign,
+# digits with an optional fraction (`5`, `5.`, `5.25`, `.5`), and an
+# optional exponent with its own sign. this is the grammar check only;
+# the value comes from parse_float, whose result reads any zero as a
+# failure (#1140), so without this check a malformed span and `0.0`
+# would be indistinguishable.
+fn json_number_text_well_formed(text: String) -> Bool:
+    mut i := 0
+    n := text.len()
+    if i < n and (text[i] == "-" or text[i] == "+"):
+        i = i + 1
+    mut int_digits := 0
+    while i < n and text[i] >= "0" and text[i] <= "9":
+        i = i + 1
+        int_digits = int_digits + 1
+    mut frac_digits := 0
+    if i < n and text[i] == ".":
+        i = i + 1
+        while i < n and text[i] >= "0" and text[i] <= "9":
+            i = i + 1
+            frac_digits = frac_digits + 1
+    if int_digits == 0 and frac_digits == 0:
+        return false
+    if i < n and (text[i] == "e" or text[i] == "E"):
+        i = i + 1
+        if i < n and (text[i] == "-" or text[i] == "+"):
+            i = i + 1
+        mut exp_digits := 0
+        while i < n and text[i] >= "0" and text[i] <= "9":
+            i = i + 1
+            exp_digits = exp_digits + 1
+        if exp_digits == 0:
+            return false
+    return i == n
+
+# the float a json number's text denotes, through the runtime's parser
+# (`parse_float`, std's f64 conversion), with `ok` false when the text is
+# not a finite number. an integer text widens (`3` reads 3.0); `-0.0`
+# keeps its sign; an exponent past the type's range (`1e309`) is refused,
+# so 1.7976931348623157e308 is the largest value accepted and 5e-324 the
+# smallest positive one. a zero, `1e-400` included, reads as the failure
+# parse_float reports for any zero (#1140) and is rebuilt here with the
+# text's sign.
+fn json_float_of_text(text: String) -> JsonByteFloat:
+    if not json_number_text_well_formed(text):
+        return JsonByteFloat(false, 0.0, 0)
+    parsed := parse_float(text)
+    if parsed.is_err:
+        if text.len() > 0 and text[0] == "-":
+            return JsonByteFloat(true, float_from_bits(NEGATIVE_ZERO_BITS), 0)
+        return JsonByteFloat(true, 0.0, 0)
+    bits := float_to_bits(parsed.ok)
+    if bits == POSITIVE_INFINITY_BITS or bits == NEGATIVE_INFINITY_BITS:
+        return JsonByteFloat(false, 0.0, 0)
+    return JsonByteFloat(true, parsed.ok, 0)
+
+# read the number at `pos` as a float: the whole number span, converted
+# by json_float_of_text. `next_pos` is the byte after the span.
+fn json_byte_read_float(input: Bytes, pos: Int) -> JsonByteFloat:
+    if pos >= input.len() or not (input[pos] == 45 or json_byte_is_digit(input[pos])):
+        return JsonByteFloat(false, 0.0, pos)
+    end := json_byte_number_span_end(input, pos)
+    text := bytes.substring_utf8(input, pos, end)
+    if text.is_err:
+        return JsonByteFloat(false, 0.0, pos)
+    value := json_float_of_text(text.ok)
+    return JsonByteFloat(value.ok, value.value, end)
 
 fn json_byte_is_whitespace(value: Int) -> Bool:
     return value == 32 or value == 9 or value == 10 or value == 13
@@ -551,6 +625,12 @@ fn json_byte_match_literal(input: Bytes, pos: Int, literal: String) -> Bool:
         i = i + 1
     return true
 
+# step over the value under a key a scan does not want, returning the
+# byte after it or -1 when it is malformed. a number is stepped over by
+# its whole span, so `1.5` or `1e3` under a stray key does not stop a
+# scan at its `.`; an object or an array is walked with
+# json_byte_skip_nested, so a flat target still decodes a document that
+# carries a nested value it does not read.
 fn json_byte_skip_scalar_value(input: Bytes, pos: Int) -> Int:
     if pos >= input.len():
         return -1
@@ -561,16 +641,58 @@ fn json_byte_skip_scalar_value(input: Bytes, pos: Int) -> Int:
             return value.next_pos
         return -1
     if b == 45 or json_byte_is_digit(b):
-        value := json_byte_read_int(input, pos)
-        if value.ok:
-            return value.next_pos
-        return -1
+        return json_byte_number_span_end(input, pos)
     if json_byte_match_literal(input, pos, "true"):
         return pos + 4
     if json_byte_match_literal(input, pos, "false"):
         return pos + 5
     if json_byte_match_literal(input, pos, "null"):
         return pos + 4
+    if b == 123 or b == 91:
+        return json_byte_skip_nested(input, pos, 1)
+    return -1
+
+# the depth past which a nested value under a stray key is refused
+# rather than walked; the node parser's MAX_PARSE_DEPTH.
+SKIP_MAX_DEPTH := 128
+
+# step over the object or array opening at `pos`, whatever it holds, to
+# the byte after its closing bracket; -1 when it is malformed or nested
+# past SKIP_MAX_DEPTH. keys and string values are stepped over by their
+# quotes, so an escaped quote inside one is not mistaken for its end.
+fn json_byte_skip_nested(input: Bytes, pos: Int, depth: Int) -> Int:
+    if depth > SKIP_MAX_DEPTH:
+        return -1
+    close := input[pos] + 2
+    mut i := json_byte_skip_whitespace(input, pos + 1)
+    if i < input.len() and input[i] == close:
+        return i + 1
+    while i < input.len():
+        if input[pos] == 123:
+            if input[i] != 34:
+                return -1
+            key := json_byte_string_span(input, i)
+            if not key.ok:
+                return -1
+            i = json_byte_skip_whitespace(input, key.next_pos)
+            if i >= input.len() or input[i] != 58:
+                return -1
+            i = json_byte_skip_whitespace(input, i + 1)
+            if i >= input.len():
+                return -1
+        if input[i] == 123 or input[i] == 91:
+            i = json_byte_skip_nested(input, i, depth + 1)
+        else:
+            i = json_byte_skip_scalar_value(input, i)
+        if i < 0:
+            return -1
+        i = json_byte_skip_whitespace(input, i)
+        if i < input.len() and input[i] == 44:
+            i = json_byte_skip_whitespace(input, i + 1)
+            continue
+        if i < input.len() and input[i] == close:
+            return i + 1
+        return -1
     return -1
 
 fn json_byte_find_field_value(input: Bytes, key: String) -> JsonByteFieldPos:
@@ -649,6 +771,17 @@ fn json_scan_required_int_bytes(input: Bytes, key: String) -> Int!JsonDecodeErro
         fail json_wrong_field_error("int", key)
     return value.value
 
+fn json_scan_required_float_bytes(input: Bytes, key: String) -> Float!JsonDecodeError:
+    found := json_byte_find_field_value(input, key)
+    if not found.ok:
+        fail json_invalid_object_error()
+    if not found.found:
+        fail json_missing_field_error("float", key)
+    value := json_byte_read_float(input, found.pos)
+    if not value.ok:
+        fail json_wrong_field_error("float", key)
+    return value.value
+
 fn json_scan_required_bool_bytes(input: Bytes, key: String) -> Bool!JsonDecodeError:
     found := json_byte_find_field_value(input, key)
     if not found.ok:
@@ -691,11 +824,24 @@ fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
             pos = value.next_pos
             handled = true
         if not handled and (b == 45 or json_byte_is_digit(b)):
-            value := json_byte_read_int(input, pos)
-            if not value.ok:
+            # the whole number span; a fraction or an exponent makes it a
+            # float, digits alone an int, and a span the int reader does
+            # not consume to its end (`12-3`) is malformed.
+            end := json_byte_number_span_end(input, pos)
+            text := bytes.substring_utf8(input, pos, end)
+            if text.is_err:
                 return json_scalar_object(false)
-            result.ints.insert(key.value, value.value)
-            pos = value.next_pos
+            if json_number_text_is_float(text.ok):
+                value := json_float_of_text(text.ok)
+                if not value.ok:
+                    return json_scalar_object(false)
+                result.floats.insert(key.value, value.value)
+            else:
+                value := json_byte_read_int(input, pos)
+                if not value.ok or value.next_pos != end:
+                    return json_scalar_object(false)
+                result.ints.insert(key.value, value.value)
+            pos = end
             handled = true
         if not handled and json_byte_match_literal(input, pos, "true"):
             result.bools.insert(key.value, true)
@@ -708,6 +854,14 @@ fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
         if not handled and json_byte_match_literal(input, pos, "null"):
             pos = pos + 4
             handled = true
+        if not handled and (b == 123 or b == 91):
+            # a nested value under a key no scalar field reads: walked
+            # past, not recorded.
+            skipped := json_byte_skip_nested(input, pos, 1)
+            if skipped < 0:
+                return json_scalar_object(false)
+            pos = skipped
+            handled = true
         if not handled:
             return json_scalar_object(false)
 
@@ -717,7 +871,7 @@ fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
             continue
         if pos < input.len() and input[pos] == 125:
             pos = json_byte_skip_whitespace(input, pos + 1)
-            return JsonScalarObject(pos == input.len(), result.strings, result.ints, result.bools)
+            return JsonScalarObject(pos == input.len(), result.strings, result.ints, result.bools, result.floats)
         return json_scalar_object(false)
     return json_scalar_object(false)
 
@@ -866,8 +1020,15 @@ fn parse_value_node() -> Int:
             parser_position = parser_position + 1
         num_str := parser_input.substring(start, parser_position)
         if is_float:
+            # the runtime's conversion, so a float node holds the same
+            # value the typed fillers write for the same text; a span that
+            # is not a finite number fails the parse.
+            value := json_float_of_text(num_str)
+            if not value.ok:
+                parser_error = true
+                return 0 - 1
             idx := allocate_node("float")
-            float_values.insert(idx, parse_float_manual(num_str))
+            float_values.insert(idx, value.value)
             return idx
         if not is_float:
             idx := allocate_node("int")
@@ -967,6 +1128,20 @@ pub fn scalar_bool_or(object: JsonScalarObject, key: String, default_value: Bool
 pub fn scalar_has_bool(object: JsonScalarObject, key: String) -> Bool:
     return object.bools.contains_key(key)
 
+ # gets a float from a scanned scalar object with a fallback. a number
+ # written as an integer in the document widens (`3` reads 3.0).
+pub fn scalar_float_or(object: JsonScalarObject, key: String, default_value: Float) -> Float:
+    if object.floats.contains_key(key):
+        return object.floats[key]
+    if object.ints.contains_key(key):
+        return object.ints[key].to_float()
+    return default_value
+
+ # returns true when a scanned scalar object contains a number field,
+ # written with a fraction or an exponent or as an integer.
+pub fn scalar_has_float(object: JsonScalarObject, key: String) -> Bool:
+    return object.floats.contains_key(key) or object.ints.contains_key(key)
+
  # decodes a shallow scalar object or returns a typed error.
 pub fn decode_scalars_bytes(input: Bytes) -> JsonScalarObject!JsonDecodeError:
     object := scan_object_scalars_bytes(input)
@@ -996,6 +1171,15 @@ pub fn require_bool(object: JsonScalarObject, key: String) -> Bool!JsonDecodeErr
         return object.bools[key]
     fail JsonDecodeError("missing bool field: " + key)
 
+ # gets a required float field from a scanned scalar object. a number
+ # written as an integer in the document widens (`3` reads 3.0).
+pub fn require_float(object: JsonScalarObject, key: String) -> Float!JsonDecodeError:
+    if object.floats.contains_key(key):
+        return object.floats[key]
+    if object.ints.contains_key(key):
+        return object.ints[key].to_float()
+    fail JsonDecodeError("missing float field: " + key)
+
  # scans one required string field from object bytes without building a map.
 pub fn scan_required_string_bytes(input: Bytes, key: String) -> String!JsonDecodeError:
     return json_scan_required_string_bytes(input, key)!
@@ -1007,6 +1191,13 @@ pub fn scan_required_int_bytes(input: Bytes, key: String) -> Int!JsonDecodeError
  # scans one required bool field from object bytes without building a map.
 pub fn scan_required_bool_bytes(input: Bytes, key: String) -> Bool!JsonDecodeError:
     return json_scan_required_bool_bytes(input, key)!
+
+ # scans one required float field from object bytes without building a
+ # map. any json number is taken, an integer widened (`3` reads 3.0);
+ # `-0.0` keeps its sign, and an exponent past the type's range (`1e309`)
+ # is a wrong-type error, as is anything that is not a number.
+pub fn scan_required_float_bytes(input: Bytes, key: String) -> Float!JsonDecodeError:
+    return json_scan_required_float_bytes(input, key)!
 
  # decodes json object bytes into a concrete struct.
  # this is lowered by the compiler so structs do not need runtime reflection.
@@ -1297,6 +1488,19 @@ pub fn object_get_int_or(handle: Int, key: String, default_value: Int) -> Int:
 # Gets a float value by key from an object. Returns 0.0 if missing or wrong type.
 pub fn object_get_float(handle: Int, key: String) -> Float:
     return json_get_float(json_object_get(handle, key))
+
+# gets a required float value by key from an object. a number node the
+# parser typed as an int widens (`3` reads 3.0); a string, bool, null,
+# array or object under the key is a wrong-type error.
+pub fn object_require_float(handle: Int, key: String) -> Float!JsonDecodeError:
+    value := json_object_get(handle, key)
+    if handle_has_type(value, "float"):
+        return float_values[value]
+    if handle_has_type(value, "int"):
+        return integer_values[value].to_float()
+    if value < 0:
+        fail json_missing_field_error("float", key)
+    fail json_wrong_field_error("float", key)
 
 # Gets a float value by key from an object with a fallback.
 pub fn object_get_float_or(handle: Int, key: String, default_value: Float) -> Float:
@@ -1902,12 +2106,61 @@ test "json byte scalar scanner reads shallow objects":
     assert_eq(scalar_int_or(scanned, "missing", 9), 9)
     assert(scalar_bool_or(scanned, "missing", true))
 
-test "json byte scalar scanner rejects nested values":
+test "json byte scalar scanner steps over nested values":
     dq := chr(34)
-    doc := chr(123) + dq + "nested" + dq + ":" + chr(123) + dq + "x" + dq + ":1" + chr(125) + chr(125)
+    inner := chr(123) + dq + "x" + dq + ":[1,2.5," + dq + "]" + dq + "]" + chr(125)
+    doc := chr(123) + dq + "nested" + dq + ":" + inner + "," + dq + "n" + dq + ":3" + chr(125)
     scanned := scan_object_scalars_bytes(bytes.from_string_utf8(doc))
 
-    assert(not scanned.ok)
+    assert(scanned.ok)
+    assert_eq(scalar_int_or(scanned, "n", 0), 3)
+    assert(not scalar_has_int(scanned, "nested"))
+    assert(not scalar_has_string(scanned, "nested"))
+
+    truncated := chr(123) + dq + "nested" + dq + ":" + chr(123) + dq + "x" + dq + ":[1,2" + chr(125)
+    assert(not scan_object_scalars_bytes(bytes.from_string_utf8(truncated)).ok)
+
+test "json byte scalar scanner reads floats and widens ints":
+    dq := chr(34)
+    doc := chr(123) + dq + "f" + dq + ":1.5," + dq + "e" + dq + ":2.5E-3," + dq + "i" + dq + ":3," + dq + "z" + dq + ":-0.0" + chr(125)
+    scanned := scan_object_scalars_bytes(bytes.from_string_utf8(doc))
+
+    assert(scanned.ok)
+    assert(scalar_has_float(scanned, "f"))
+    assert(scalar_has_float(scanned, "i"))
+    assert(not scalar_has_int(scanned, "f"))
+    assert_eq(scalar_float_or(scanned, "f", 0.0), 1.5)
+    assert_eq(scalar_float_or(scanned, "e", 0.0), 0.0025)
+    assert_eq(scalar_float_or(scanned, "i", 0.0), 3.0)
+    assert_eq(scalar_int_or(scanned, "i", 0), 3)
+    assert_eq(float_to_bits(scalar_float_or(scanned, "z", 1.0)), NEGATIVE_ZERO_BITS)
+    assert_eq(scalar_float_or(scanned, "missing", 7.5), 7.5)
+
+    nan := chr(123) + dq + "f" + dq + ":NaN" + chr(125)
+    assert(not scan_object_scalars_bytes(bytes.from_string_utf8(nan)).ok)
+    huge := chr(123) + dq + "f" + dq + ":1e309" + chr(125)
+    assert(not scan_object_scalars_bytes(bytes.from_string_utf8(huge)).ok)
+    junk := chr(123) + dq + "f" + dq + ":1.2.3" + chr(125)
+    assert(not scan_object_scalars_bytes(bytes.from_string_utf8(junk)).ok)
+
+test "json parse converts floats with the runtime":
+    dq := chr(34)
+    doc := chr(123) + dq + "e" + dq + ":1e10," + dq + "s" + dq + ":2.5E-3," + dq + "n" + dq + ":-0.0," + dq + "d" + dq + ":0.123" + chr(125)
+    scope := open_scope()
+    h := parse(doc)
+    assert_eq(object_get_float(h, "e"), 10000000000.0)
+    assert_eq(object_get_float(h, "s"), 0.0025)
+    assert_eq(float_to_bits(object_get_float(h, "n")), NEGATIVE_ZERO_BITS)
+    assert_eq(float_to_bits(object_get_float(h, "d")), float_to_bits(0.123))
+    widened := object_require_float(h, "e") catch 0.0
+    assert_eq(widened, 10000000000.0)
+    close_scope(scope)
+    bad := chr(123) + dq + "e" + dq + ":1e999" + chr(125)
+    scope2 := open_scope()
+    assert_eq(parse(bad), 0 - 1)
+    junk := chr(123) + dq + "e" + dq + ":1.2.3" + chr(125)
+    assert_eq(parse(junk), 0 - 1)
+    close_scope(scope2)
 
 struct JsonStructDecodeFixture:
     pub name: String

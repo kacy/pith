@@ -251,15 +251,17 @@ something here that now works, the page is stale and a fix to it is welcome.
   suite is golden-snapshot based (see `tests/`).
 - **a json decode target holds scalars, optionals and nested structs** —
   `json.decode[T]` and `json.decode_text[T]` fill a struct field by field, and
-  a field may be an `Int`, a `String`, a `Bool`, an optional of those, or
-  another struct, which is filled in place. a `List` field of any element
-  type, a `Map` field and a `Float` field are each refused at the checker
-  (E219, "json.decode does not support field 'x' of type List"). so a document
-  with an array or a non-integer number in it has no direct decode target:
-  reach those through `json.parse` and the node accessors, which read any
-  shape. issue #1110 tracks the decision on lists and on floats, which are
-  separate questions: an array of objects wants an element spec the filler
-  does not have yet, while a float field looks like an omission.
+  a field may be an `Int`, a `String`, a `Bool`, a `Float`, an optional of
+  those, or another struct, which is filled in place. a `List` field of any
+  element type and a `Map` field are refused at the checker (E219,
+  "json.decode does not support field 'x' of type List"). so a document with
+  an array in it has no direct decode target: reach it through `json.parse`
+  and the node accessors, which read any shape. issue #1110 tracks lists and
+  maps: an array of objects wants an element spec the filler does not have
+  yet. a `Float` field takes any json number, an integer included (`3` reads
+  as `3.0`), while an `Int` field takes only an integer; `config.decode` and
+  the toml and yaml decoders still refuse a `Float` field, since their
+  require helpers have no float form.
 
 - **plaintext http/2 needs an explicit listener** — over tls, `web.listen_tls`
   offers alpn `["h2", "http/1.1"]` and serves whichever the client picks. there

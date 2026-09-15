@@ -1,8 +1,11 @@
 # typed json decoding, one struct shape at a time.
 #
-# four shapes: a small flat struct (three fields), a wide flat struct
-# (twenty fields), a struct with a nested struct, and an array of small
-# objects decoded element by element. the flat shapes take the single-pass
+# six shapes: a small flat struct (three fields), a wide flat struct
+# (twenty fields), a struct with a nested struct, an array of small
+# objects decoded element by element, and a pair of four-field structs
+# that differ only in two fields being Float (`float`) or Int (`ints`),
+# read against the same document layout so the float path's per-decode
+# cost sits beside the int path's. the flat shapes take the single-pass
 # runtime fill (`pith_json_fill_struct`) and the nested shape its nested
 # twin (`pith_json_fill_struct_nested`); the list shape parses into the
 # node pool first. `size` scales the string values of the flat shapes and
@@ -12,8 +15,9 @@
 #   pith build bench/json_decode_shapes.pith
 #   ./bench/json_decode_shapes <shape> <size> <rounds>
 #
-# shape is one of small, wide, nested, list. every decoded value feeds the
-# checksum, so an arm that decoded a field differently cannot look fast.
+# shape is one of small, wide, nested, list, float, ints. every decoded
+# value feeds the checksum, so an arm that decoded a field differently
+# cannot look fast.
 #
 # the profile that motivated this (docs/performance.md, 2026-09-10) put a
 # third of catalog_workload's instructions in the runtime fill, most of it
@@ -56,6 +60,18 @@ struct Nested:
     pub name: String
     pub addr: Inner
     pub score: Int
+
+struct Sample:
+    pub id: Int
+    pub name: String
+    pub value: Float
+    pub delta: Float
+
+struct SampleInts:
+    pub id: Int
+    pub name: String
+    pub value: Int
+    pub delta: Int
 
 fn arg_or(index: Int, fallback: String) -> String:
     argv := args()
@@ -105,6 +121,17 @@ fn nested_doc(width: Int) -> String:
     inner := chr(123) + q("city") + ":" + q(text_of(width)) + "," + q("zip") + ":75001" + chr(125)
     return chr(123) + q("name") + ":" + q(text_of(width)) + "," + q("addr") + ":" + inner + "," + q("score") + ":42" + chr(125)
 
+# the same layout for both number shapes: `value` and `delta` are written
+# as `12.5`/`-0.25` for the float arm and `1250`/`-2500` for the int arm,
+# so the two documents are the same length and differ in one byte each.
+fn sample_doc(width: Int, floats: Bool) -> String:
+    mut value := "1250"
+    mut delta := "-2500"
+    if floats:
+        value = "12.5"
+        delta = "-0.25"
+    return chr(123) + q("id") + ":7," + q("name") + ":" + q(text_of(width)) + "," + q("value") + ":" + value + "," + q("delta") + ":" + delta + chr(125)
+
 fn list_doc(count: Int) -> String:
     mut s := "["
     mut i := 0
@@ -137,6 +164,14 @@ fn wide_sum(doc: Bytes) -> Int:
 fn nested_sum(doc: Bytes) -> Int:
     r := json.decode[Nested](doc) catch Nested("", Inner("", 0), 0 - 1)
     return r.name.len() + r.addr.city.len() + r.addr.zip + r.score
+
+fn float_sum(doc: Bytes) -> Int:
+    r := json.decode[Sample](doc) catch Sample(0 - 1, "", 0.0, 0.0)
+    return r.id + r.name.len() + (r.value * 10.0).to_int() + (r.delta * 100.0).to_int()
+
+fn ints_sum(doc: Bytes) -> Int:
+    r := json.decode[SampleInts](doc) catch SampleInts(0 - 1, "", 0, 0)
+    return r.id + r.name.len() + r.value + r.delta
 
 fn list_sum(doc: String) -> Int:
     mark := json.pool_mark_node_id()
@@ -176,6 +211,16 @@ fn main() -> Int:
         doc := list_doc(size)
         while i < rounds:
             total = total + list_sum(doc)
+            i = i + 1
+    elif shape == "float":
+        doc := bytes.from_string_utf8(sample_doc(size, true))
+        while i < rounds:
+            total = total + float_sum(doc)
+            i = i + 1
+    elif shape == "ints":
+        doc := bytes.from_string_utf8(sample_doc(size, false))
+        while i < rounds:
+            total = total + ints_sum(doc)
             i = i + 1
     else:
         print("unknown shape: " + shape)

@@ -1,0 +1,99 @@
+# typed json decodes of structs with Float fields, over the lowerings
+# that fill one in place: the flat fill, the nested fill, and the
+# scalar-object path an optional Float? takes.
+#
+# a float slot holds a bit pattern and owns nothing, so what this case
+# watches is everything around it: the strings minted into the same
+# struct, the scalar-object its path builds per decode, and the release
+# of a partly filled struct when a float is refused (a string in a float
+# field, a NaN literal, an exponent past the range) after strings were
+# minted. the scalar object used to be stranded whole, about a kilobyte
+# per decode of any struct with an optional or defaulted field, so the
+# Maybe rounds pin that release as well. a round also parses a float
+# document into the node pool inside a scope, since the parser's float
+# branch now goes through the runtime's conversion.
+#
+# the node-pool path (a nested struct beside an optional field) is left
+# out, as leak_json_fill_nested leaves it out: that path strands the
+# nested struct's string per decode on its own (#1142), about 32 bytes
+# a round, the same on the compiler before this change.
+import leakprobe as probe
+import std.json as json
+import std.bytes as bytes
+
+pub struct Reading:
+    pub id: Int
+    pub label: String
+    pub live: Bool
+    pub value: Float
+    pub delta: Float
+
+pub struct Maybe:
+    pub id: Int
+    pub label: String
+    pub value: Float?
+
+pub struct Geo:
+    pub lat: Float
+    pub lon: Float
+    pub name: String
+
+pub struct Site:
+    pub code: String
+    pub geo: Geo
+    pub level: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn round(i: Int) -> Int:
+    n := i.to_string()
+    reading := obj(q("id") + ":" + n + "," + q("label") + ":" + q("r" + n) + "," + q("live") + ":true," + q("value") + ":" + n + ".25," + q("delta") + ":-1e-" + (i % 9 + 1).to_string())
+    failing := obj(q("id") + ":" + n + "," + q("label") + ":" + q("r" + n) + "," + q("live") + ":true," + q("value") + ":" + q("bad") + "," + q("delta") + ":1.5")
+    nan := obj(q("id") + ":" + n + "," + q("label") + ":" + q("r" + n) + "," + q("live") + ":true," + q("value") + ":NaN," + q("delta") + ":1.5")
+    maybe := obj(q("id") + ":" + n + "," + q("label") + ":" + q("m" + n) + "," + q("value") + ":" + n + ".5," + q("extra") + ":" + obj(q("k") + ":[1.5,2]"))
+    maybe_absent := obj(q("id") + ":" + n + "," + q("label") + ":" + q("m" + n))
+    geo := obj(q("lat") + ":" + n + ".5," + q("lon") + ":-" + n + "e-2," + q("name") + ":" + q("g" + n))
+    site := obj(q("code") + ":" + q("s" + n) + "," + q("geo") + ":" + geo + "," + q("level") + ":3")
+    site_failing := obj(q("code") + ":" + q("s" + n) + "," + q("geo") + ":" + obj(q("lat") + ":1e999," + q("lon") + ":2," + q("name") + ":" + q("x")) + "," + q("level") + ":3")
+    a := json.decode_text[Reading](reading) catch Reading(0, "", false, 0.0, 0.0)
+    b := json.decode[Reading](bytes.from_string_utf8(reading)) catch Reading(0, "", false, 0.0, 0.0)
+    c := json.decode_text[Reading](failing)
+    d := json.decode_text[Reading](nan)
+    e := json.decode_text[Maybe](maybe) catch Maybe(0, "", none)
+    f := json.decode_text[Maybe](maybe_absent) catch Maybe(0, "", none)
+    g := json.decode_text[Site](site) catch Site("", Geo(0.0, 0.0, ""), 0)
+    h := json.decode_text[Site](site_failing)
+    scope := json.open_scope()
+    root := json.parse(reading)
+    parsed := json.object_get_float(root, "value") + json.object_get_float(root, "delta")
+    json.close_scope(scope)
+    mut v := a.label.len() + b.id + g.geo.name.len()
+    if a.value > 0.0 and g.geo.lon < 1.0 and parsed < 1e12:
+        v = v + 1
+    if let x = e.value:
+        if x > 0.0:
+            v = v + 1
+    if f.value == none:
+        v = v + 1
+    if c.is_err:
+        v = v + c.err.message.len()
+    if d.is_err:
+        v = v + d.err.message.len()
+    if h.is_err:
+        v = v + h.err.message.len()
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

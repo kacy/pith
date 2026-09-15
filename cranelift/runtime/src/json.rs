@@ -56,6 +56,57 @@ fn read_int(input: &[u8], pos: usize) -> Option<(i64, usize)> {
     Some((value, i))
 }
 
+/// The end of the number span at `pos`: the maximal run of the bytes a
+/// json number is written with. The span is the unit both fillers hand to
+/// the float conversion, and the unit an unknown key's number is skipped
+/// by, so `1.5` or `1e3` under a key the spec does not name is stepped
+/// over whole instead of stopping the decode at its `.`.
+#[inline(always)]
+fn number_span_end(input: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < input.len() && nested_is_number_char(input[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// The f64 a json number span denotes, or None when the span is not a
+/// finite number. The conversion is std's `f64::from_str`, the one
+/// `parse_float` uses, so both fillers and the node parser agree on the
+/// value to the last bit. The span's bytes are digits, sign, `.`, `e` and
+/// `E` only, so `NaN` and `Infinity` can never reach the conversion; an
+/// exponent past the type's range comes back infinite and is refused
+/// here, which leaves `1.7976931348623157e308` the largest value a field
+/// takes and `5e-324` the smallest positive one. An integer span (`3`)
+/// converts like any other and widens to `3.0`; `-0.0` keeps its sign.
+#[inline(always)]
+fn float_of_span(span: &[u8]) -> Option<f64> {
+    let text = std::str::from_utf8(span).ok()?;
+    let value: f64 = text.parse().ok()?;
+    if value.is_finite() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Read the float at `pos` for an `f` field of the flat spec: a json
+/// number, so it starts with a digit or `-` like `read_int`'s, converted
+/// whole by `float_of_span`. Returns the value and the position after it.
+fn read_float(input: &[u8], pos: usize) -> Option<(f64, usize)> {
+    if pos >= input.len() || !(input[pos] == b'-' || input[pos].is_ascii_digit()) {
+        return None;
+    }
+    let end = number_span_end(input, pos);
+    let value = float_of_span(&input[pos..end])?;
+    Some((value, end))
+}
+
+/// Step over the value under a key the flat spec does not name. A scalar
+/// is stepped over by its own grammar, a number by its whole span; an
+/// object or an array is consumed with the node parser's grammar, the way
+/// the nested filler does it, so a flat target still decodes a document
+/// that carries a nested value under a key it does not want.
 fn skip_scalar(input: &[u8], pos: usize) -> Option<usize> {
     if pos >= input.len() {
         return None;
@@ -64,7 +115,7 @@ fn skip_scalar(input: &[u8], pos: usize) -> Option<usize> {
         return read_string_end(input, pos).map(|end| end + 1);
     }
     if input[pos] == b'-' || input[pos].is_ascii_digit() {
-        return read_int(input, pos).map(|(_, end)| end);
+        return Some(number_span_end(input, pos));
     }
     if input[pos..].starts_with(b"true") {
         return Some(pos + 4);
@@ -74,6 +125,10 @@ fn skip_scalar(input: &[u8], pos: usize) -> Option<usize> {
     }
     if input[pos..].starts_with(b"null") {
         return Some(pos + 4);
+    }
+    if input[pos] == b'{' || input[pos] == b'[' {
+        // depth 2: the value sits inside the root object, which is depth 1.
+        return nested_skip_value(input, pos, 2).ok();
     }
     None
 }
@@ -111,8 +166,9 @@ unsafe fn err_result(message: &[u8]) -> i64 {
 }
 
 /// The packed field spec is comma-separated fields, each `<type_char><name>`
-/// (i=int, s=string, b=bool) in declaration order, so a field's position is
-/// its struct slot. The emitter interns one literal per struct type.
+/// (i=int, s=string, b=bool, f=float) in declaration order, so a field's
+/// position is its struct slot. The emitter interns one literal per struct
+/// type.
 ///
 /// A key is matched against the field whose type char sits at `pos` without
 /// splitting the spec first: the name bytes are compared in place and the
@@ -201,8 +257,12 @@ fn read_key_end(input: &[u8], pos: usize) -> Option<usize> {
 /// Decode a flat object of scalar fields straight into a pre-allocated
 /// struct in a single pass. The caller allocates the struct (with its
 /// destructor attached) and passes its data pointer; this writes each
-/// matched field into its slot — ints and bools inline, strings as fresh
-/// counted cstrings the struct then owns. Returns a bitmask of the fields
+/// matched field into its slot — ints and bools inline, floats as their
+/// f64 bit pattern, strings as fresh counted cstrings the struct then
+/// owns. A float slot takes any json number, an integer one included (`3`
+/// widens to `3.0`); an int slot takes only an integer, so a fraction or
+/// an exponent under an `i` field fails the fill the way any wrong type
+/// does. Returns a bitmask of the fields
 /// it filled, or -1 on a malformed object. The caller checks the mask
 /// against the required set and, on any miss, releases the struct.
 ///
@@ -283,6 +343,13 @@ pub unsafe extern "C" fn pith_json_fill_struct(
                         return -1;
                     }
                 }
+                b'f' => {
+                    let Some((value, n)) = read_float(input, pos) else {
+                        return -1;
+                    };
+                    *obj.add(idx) = value.to_bits() as i64;
+                    n
+                }
                 _ => return -1,
             };
             mask |= bit;
@@ -352,7 +419,9 @@ pub unsafe extern "C" fn pith_json_decode_missing_error(mask: i64, spec_ptr: i64
 // the spec grammar grows one field kind for this: `o<name>(<sub-spec>)`,
 // a struct field whose slot holds a pre-allocated struct laid out by the
 // sub-spec. the flat spec above never contains one, and the flat filler
-// never sees this grammar.
+// never sees this grammar. the scalar letters are the flat spec's, `f`
+// for a float included: an `f` slot takes any json number and holds the
+// f64 bit pattern, an `i` slot only an integer.
 // ---------------------------------------------------------------------------
 
 /// std.json's MAX_PARSE_DEPTH: a value nested deeper than this fails the
@@ -446,6 +515,7 @@ fn nested_kind_word(kind: u8) -> &'static [u8] {
         b's' => b"string",
         b'i' => b"int",
         b'b' => b"bool",
+        b'f' => b"float",
         _ => b"object",
     }
 }
@@ -590,15 +660,8 @@ fn nested_is_number_char(b: u8) -> bool {
 /// bound. Signs and stray number characters inside the span are skipped
 /// the way the parser skips them, so `1-2` reads as 12 and `-` alone as 0.
 fn nested_read_number(input: &[u8], pos: usize) -> Result<(Option<i64>, usize), ()> {
-    let mut i = pos + 1;
-    let mut is_float = false;
-    while i < input.len() && nested_is_number_char(input[i]) {
-        if matches!(input[i], b'.' | b'e' | b'E') {
-            is_float = true;
-        }
-        i += 1;
-    }
-    if is_float {
+    let i = number_span_end(input, pos + 1);
+    if input[pos + 1..i].iter().any(|b| matches!(b, b'.' | b'e' | b'E')) {
         return Ok((None, i));
     }
     let span = &input[pos..i];
@@ -776,6 +839,19 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
                         }
                         pos = end;
                     }
+                    b'f' if nested_is_number_start(b) => {
+                        // the node parser's float branch: the whole number
+                        // span, an integer one included, converted by the
+                        // runtime. a span that is not a finite number fails
+                        // the parse the way the parser's float branch does.
+                        let end = number_span_end(input, pos + 1);
+                        let Some(value) = float_of_span(&input[pos..end]) else {
+                            return Err(());
+                        };
+                        *slot = value.to_bits() as i64;
+                        pos = end;
+                        ok = true;
+                    }
                     b'b' if input[pos..].starts_with(b"true") => {
                         *slot = 1;
                         pos += 4;
@@ -894,5 +970,59 @@ pub unsafe extern "C" fn pith_json_fill_struct_nested(
             crate::pith_struct_release(struct_ptr);
             err_result(&msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{float_of_span, read_float, skip_scalar};
+
+    #[test]
+    fn float_span_takes_every_json_number_form() {
+        assert_eq!(float_of_span(b"1.5"), Some(1.5));
+        assert_eq!(float_of_span(b"-2.25"), Some(-2.25));
+        assert_eq!(float_of_span(b"1e10"), Some(1e10));
+        assert_eq!(float_of_span(b"2.5E-3"), Some(2.5e-3));
+        assert_eq!(float_of_span(b"3"), Some(3.0));
+        assert_eq!(float_of_span(b"-7"), Some(-7.0));
+        assert_eq!(float_of_span(b"1.7976931348623157e308"), Some(f64::MAX));
+        assert_eq!(float_of_span(b"5e-324"), Some(f64::from_bits(1)));
+    }
+
+    #[test]
+    fn negative_zero_keeps_its_sign() {
+        let value = float_of_span(b"-0.0").unwrap();
+        assert_eq!(value, 0.0);
+        assert!(value.is_sign_negative());
+    }
+
+    #[test]
+    fn float_span_refuses_what_is_not_a_finite_number() {
+        assert_eq!(float_of_span(b"1e309"), None);
+        assert_eq!(float_of_span(b"-1e309"), None);
+        assert_eq!(float_of_span(b"1-2"), None);
+        assert_eq!(float_of_span(b"1e"), None);
+        assert_eq!(float_of_span(b"1.2.3"), None);
+        assert_eq!(float_of_span(b"-"), None);
+        assert_eq!(float_of_span(b""), None);
+    }
+
+    #[test]
+    fn read_float_starts_like_a_json_number() {
+        assert_eq!(read_float(b"1.5,", 0), Some((1.5, 3)));
+        assert_eq!(read_float(b"-0.5}", 0), Some((-0.5, 4)));
+        assert_eq!(read_float(b"NaN", 0), None);
+        assert_eq!(read_float(b"Infinity", 0), None);
+        assert_eq!(read_float(b".5", 0), None);
+        assert_eq!(read_float(b"+1", 0), None);
+        assert_eq!(read_float(b"\"1.5\"", 0), None);
+    }
+
+    #[test]
+    fn skip_scalar_steps_over_a_whole_number_and_a_nested_value() {
+        assert_eq!(skip_scalar(b"1.5,", 0), Some(3));
+        assert_eq!(skip_scalar(b"1e3}", 0), Some(3));
+        assert_eq!(skip_scalar(b"{\"a\":[1,2.5,{}]},", 0), Some(16));
+        assert_eq!(skip_scalar(b"[1,2]}", 0), Some(5));
     }
 }

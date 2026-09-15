@@ -104,6 +104,31 @@ malformed body still lands in the `is_err` branch, so both cases come back as a 
 under the hood `web.parse[T]` is just `json.decode_text[T](req.body())`. reach for
 `json.decode_text` directly when you already have the body text and not a request.
 
+a target's fields may be `Int`, `String`, `Bool`, `Float`, an optional of those
+(`Float?` reads as `none` when the key is absent), or another struct with the
+same kinds of fields, which is filled in place. a `Float` field takes any json
+number: `1.5`, `-2.5e-3`, and an integer such as `3`, which widens to `3.0`. an
+`Int` field takes only an integer, so `1.5` under one is a decode error. `NaN`
+and `Infinity` are not json and are refused, as is an exponent past the range
+of a 64-bit float.
+
+```pith
+struct Reading:
+    pub sensor: String
+    pub value: Float
+    pub delta: Float?
+
+fn record(req: web.Request) -> http.HttpResponse:
+    parsed := web.parse[Reading](req)
+    if parsed.is_err:
+        return http.bad_request_response()
+    r := parsed.ok
+    return http.text(200, "{r.sensor}: {r.value}")
+```
+
+a `List` or a `Map` field is refused at the checker (`docs/limitations.md`);
+decode such a document through `json.parse` and the node accessors instead.
+
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:
 

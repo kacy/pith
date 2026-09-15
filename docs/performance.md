@@ -1276,6 +1276,38 @@ by `pool_restore`, with nothing decoded, read 6,000 kb at 50k rounds and
 15,456 kb at 200k. that is the pool's defect and the next thing on this
 path.
 
+## typed json decoding: float fields (2026-09-15)
+
+a `Float` field in a decode target used to be refused at the checker
+(E219), so a document with a non-integer number had no direct decode
+target. the packed spec now has an `f` letter. both fillers take the
+number span and convert it with std's `f64::from_str`, the conversion
+`parse_float` already uses, and write the bit pattern into the slot.
+the scalar-object path (an optional `Float?`) and the node-pool
+accessors have float forms too. `bench/json_decode_shapes` has two new
+shapes that differ only in two fields being `Float` or `Int`, read
+against documents of the same length:
+
+| shape, 20000 rounds, size 4 | Ir | per decode |
+|---|---:|---:|
+| `ints` (Int, String, Int, Int) | 41,014,881 | 2,051 |
+| `float` (Int, String, Float, Float) | 52,774,922 | 2,639 |
+| `small` (Int, String, Bool) | 33,070,985 | 1,654 |
+| `nested` (a struct with a struct field, for scale) | 81,361,184 | 4,068 |
+
+so a float field costs about 290 instructions more than an int field:
+the utf-8 check and the f64 parse against `read_int`'s digit loop. the
+checksums of the two arms differ by design (the shapes decode different
+values), which is why `tooling/callgrind_ab.sh` reports the comparison
+void; the per-arm totals are the measurement. two runs agreed to within
+300 instructions.
+
+the same change released the scalar object the optional-field path
+built per decode, which had been stranded whole: a struct with any
+optional or defaulted field leaked about a kilobyte per `json.decode`
+(tests/leaks/leak_json_fill_float's `Maybe` rounds read 29,756 kb at
+20k rounds and 110,336 kb at 80k before, flat after).
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

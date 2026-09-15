@@ -290,27 +290,18 @@ pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: Strin
 # the per-key byte scanner for a scalar field, or "" for anything else.
 # used by the small flat-struct lowering, which calls one of these per
 # field straight against the input bytes instead of first building a
-# scalar object. this returns exactly what
-# ir_json_scan_required_helper_name returns — the two tables are
-# duplicates of each other.
+# scalar object. the same table as ir_json_scan_required_helper_name,
+# kept under the name that lowering calls it by.
 pub fn ir_json_field_helper_name(field_tid: Int) -> String:
-    info := get_type_info(field_tid)
-    if info.kind == "primitive":
-        if info.name == "String":
-            return "std_json_scan_required_string_bytes"
-        if info.name == "Int":
-            return "std_json_scan_required_int_bytes"
-        if info.name == "Bool":
-            return "std_json_scan_required_bool_bytes"
-    return ""
+    return ir_json_scan_required_helper_name(field_tid)
 
 # the scalar accessor for a field read out of a parsed object node, as a
 # bare member name — the caller has to run it through
 # ir_resolve_json_call_name before emitting, because unlike the
 # std_json_* tables below these are not already qualified. "" when the
-# field is not String, Int or Bool; the caller then skips the field, and
-# only the checker's rejection of unsupported field types keeps that
-# skip from shifting the struct slots after it.
+# field is not String, Int, Bool or Float; the caller then skips the
+# field, and only the checker's rejection of unsupported field types
+# keeps that skip from shifting the struct slots after it.
 pub fn ir_json_object_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -320,6 +311,8 @@ pub fn ir_json_object_helper_name(field_tid: Int) -> String:
             return "object_require_int"
         if info.name == "Bool":
             return "object_require_bool"
+        if info.name == "Float":
+            return "object_require_float"
     return ""
 
 # the scalar accessor for a field read out of a JsonScalarObject — the
@@ -337,6 +330,8 @@ pub fn ir_json_require_helper_name(field_tid: Int) -> String:
             return "std_json_require_int"
         if info.name == "Bool":
             return "std_json_require_bool"
+        if info.name == "Float":
+            return "std_json_require_float"
     return ""
 
 # the per-key byte scanner for a scalar field, or "" when the field is
@@ -352,10 +347,14 @@ pub fn ir_json_scan_required_helper_name(field_tid: Int) -> String:
             return "std_json_scan_required_int_bytes"
         if info.name == "Bool":
             return "std_json_scan_required_bool_bytes"
+        if info.name == "Float":
+            return "std_json_scan_required_float_bytes"
     return ""
 
 # the single-character type code for a scalar type name, used in the
-# packed spec the single-pass fill decoder reads. "" for a non-scalar.
+# packed spec the single-pass fill decoder reads: `s`, `i`, `b`, and `f`
+# for a Float, whose slot the filler writes as the f64 bit pattern. ""
+# for a non-scalar.
 pub fn ir_json_type_name_char(name: String) -> String:
     if name == "String":
         return "s"
@@ -363,6 +362,8 @@ pub fn ir_json_type_name_char(name: String) -> String:
         return "i"
     if name == "Bool":
         return "b"
+    if name == "Float":
+        return "f"
     return ""
 
 # the packed-spec type code for a field's tid, "" for a non-scalar. the
@@ -390,6 +391,8 @@ pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
             return "std_json_scalar_has_int"
         if info.name == "Bool":
             return "std_json_scalar_has_bool"
+        if info.name == "Float":
+            return "std_json_scalar_has_float"
     return ""
 
 # the std.config require-helper for a scalar field, as a bare member
@@ -435,7 +438,7 @@ pub fn ir_struct_decode_field_tid(field_tid: Int) -> Int:
     return 0 - 1
 
 # the numeric scalar code for a field tid — 0 String, 1 Int, 2 Bool,
-# -1 for anything else. the integer counterpart of
+# 3 Float, -1 for anything else. the integer counterpart of
 # ir_json_field_type_char; nothing in the tree calls it today, so treat
 # the encoding as unpinned by any test.
 pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
@@ -447,6 +450,8 @@ pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
             return 1
         if info.name == "Bool":
             return 2
+        if info.name == "Float":
+            return 3
     return 0 - 1
 
 # the tid inside an optional field, or -1 when the field is not

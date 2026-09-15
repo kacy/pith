@@ -1351,6 +1351,12 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
     ir_emit_decode_result_call1(scan_r, "std_json_decode_scalars_bytes", input_r)
     ir_emit_result_store_error_branch(scan_r, temp_name, done_l)
     fields_r := ir_take_result_ok(scan_r, -1)
+    # the scalar object and its maps are this decode's to drop: every exit
+    # from here on, the built struct and each field error alike, passes
+    # through fields_done_l, which releases it before done_l. it used to be
+    # stranded, about a kilobyte per decode of a struct with an optional
+    # or defaulted field.
+    fields_done_l := ir_label()
 
     mut field_regs: List[Int] := []
     for field_name, i in target_info.fields:
@@ -1373,7 +1379,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
-            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, fields_done_l)
             ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
@@ -1393,7 +1399,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
             ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
-            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, fields_done_l)
             ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
@@ -1401,10 +1407,12 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
         ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
         field_result_r := ir_reg()
         ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
-        ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+        ir_emit_result_store_error_branch(field_result_r, temp_name, fields_done_l)
         field_regs.push(ir_take_json_ok(field_result_r, field_tid))
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
+    ir_emit_label(fields_done_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", fields_r)
     ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)

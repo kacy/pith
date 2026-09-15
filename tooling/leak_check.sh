@@ -140,6 +140,7 @@ cases=(
   tests/leaks/leak_json_parse_restore
   tests/leaks/leak_json_parse_decode_list
   tests/leaks/leak_toml_parse_restore
+  tests/leaks/leak_json_fill_float
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_tls12_client_auth

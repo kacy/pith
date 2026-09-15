@@ -1235,6 +1235,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
 	tests/cases/test_json_fill_struct_shapes \
 	tests/cases/test_json_fill_nested_shapes \
+	tests/cases/test_json_fill_float_shapes \
 	tests/cases/test_env_overlay \
 	tests/cases/test_optional_struct_value_release \
 	tests/cases/test_optional_tuple_return_ownership \

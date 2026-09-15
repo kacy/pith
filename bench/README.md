@@ -886,6 +886,8 @@ pith build bench/json_decode_shapes.pith
 ./bench/json_decode_shapes wide 32 20000    # twenty-field struct, 32-byte strings
 ./bench/json_decode_shapes nested 4 2000    # a struct with a nested struct (nested fill)
 ./bench/json_decode_shapes list 32 400      # an array of 32 small objects (node pool)
+./bench/json_decode_shapes float 4 20000    # four fields, two of them Float
+./bench/json_decode_shapes ints 4 20000     # the same layout with Int in their place
 ```
 
 `json_decode_shapes` decodes one struct shape per run; `size` is the

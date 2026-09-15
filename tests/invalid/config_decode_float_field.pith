@@ -1,0 +1,14 @@
+# config.decode reads its scalars through require helpers that have no
+# float form, so a Float field stays refused there even though json.decode
+# now takes one.
+import std.config as config
+
+struct Settings:
+    pub name: String
+    pub ratio: Float
+
+fn main():
+    cfg := config.empty()
+    r := config.decode[Settings](cfg)
+    if r.is_err:
+        print("err")

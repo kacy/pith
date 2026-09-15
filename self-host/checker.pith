@@ -3520,12 +3520,20 @@ fn resolve_json_decode_type_arg(type_arg_idx: Int) -> Int:
 fn decode_support_seen_key(field_tid: Int) -> String:
     return "|" + field_tid.to_string() + "|"
 
-fn json_decode_field_supported_with_seen(field_tid: Int, seen: String) -> Bool:
+# the field types a typed decode can fill: the scalars every decoder reads,
+# a `Float` only where `floats` says the decoder has a float path (the json
+# fillers and accessors do; the config and handle-pool decoders have no
+# float helper, and a field their lowering skipped would shift the slots
+# after it), an optional of those, and a struct of the same shape at any
+# depth. a `List` or a `Map` field is refused everywhere (#1110).
+fn json_decode_field_supported_with_seen(field_tid: Int, seen: String, floats: Bool) -> Bool:
     if field_tid == lookup_type_id("String") or field_tid == lookup_type_id("Int") or field_tid == lookup_type_id("Bool"):
+        return true
+    if floats and field_tid == lookup_type_id("Float"):
         return true
     info := get_type_info(field_tid)
     if info.kind == "optional" and info.inner >= 0:
-        return json_decode_field_supported_with_seen(info.inner, seen)
+        return json_decode_field_supported_with_seen(info.inner, seen, floats)
     if info.kind == "struct":
         seen_key := decode_support_seen_key(field_tid)
         if seen.contains(seen_key):
@@ -3536,13 +3544,18 @@ fn json_decode_field_supported_with_seen(field_tid: Int, seen: String) -> Bool:
                 return false
             if i >= info.field_types.len():
                 return false
-            if not json_decode_field_supported_with_seen(info.field_types[i], next_seen):
+            if not json_decode_field_supported_with_seen(info.field_types[i], next_seen, floats):
                 return false
         return true
     return false
 
+# the config and handle-pool decoders' field set: no `Float`.
 fn json_decode_field_supported(field_tid: Int) -> Bool:
-    return json_decode_field_supported_with_seen(field_tid, "")
+    return json_decode_field_supported_with_seen(field_tid, "", false)
+
+# json.decode's field set: the same, plus `Float`.
+fn json_decode_target_field_supported(field_tid: Int) -> Bool:
+    return json_decode_field_supported_with_seen(field_tid, "", true)
 
 fn check_config_decode_call(index_node: Node, arg_indices: List[Int], scope_id: Int, prefixed: Bool) -> Int:
     if index_node.children.len() < 2:
@@ -3628,7 +3641,7 @@ fn check_json_decode_call(index_node: Node, arg_indices: List[Int], scope_id: In
             return TID_ERR
         if i < target_info.field_types.len():
             field_tid := target_info.field_types[i]
-            if not json_decode_field_supported(field_tid):
+            if not json_decode_target_field_supported(field_tid):
                 report_error("E219", "json.decode does not support field '" + field_name + "' of type " + get_type_name(field_tid))
                 return TID_ERR
     err_tid := lookup_type_id("JsonDecodeError")

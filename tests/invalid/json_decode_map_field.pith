@@ -1,0 +1,13 @@
+# a Map field in a json decode target is refused at the checker (#1110);
+# the Float field beside it, once refused the same way, is accepted.
+import std.json as json
+
+struct Order:
+    pub id: Int
+    pub price: Float
+    pub attrs: Map[String, Int]
+
+fn main():
+    r := json.decode_text[Order]("x")
+    if r.is_err:
+        print("err")

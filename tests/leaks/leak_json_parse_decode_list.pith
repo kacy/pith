@@ -1,0 +1,96 @@
+# json.parse, then decode_object[T] on each element of an array, then
+# pool_restore: the way a list of structs is decoded today, since a
+# json.decode target cannot hold a List field (E219).
+#
+# leak_json_fill_nested left this pattern out of its round because the
+# parse alone stranded bytes at the time (#1108), so until this case the
+# pattern had no leak coverage. each element decode is a compiler-lowered
+# decode_object specialization reading its fields out of the pool nodes,
+# minting a string per string field into a struct the caller owns; the
+# structs die at the end of the round and the restore reclaims the nodes.
+# a struct with a nested struct field goes through the same accessors one
+# level deeper. one element in three is malformed (a string where an int
+# is expected), so the error path, which releases what was minted before
+# the failing field, runs as well. a round decodes one list, flat items
+# on even rounds and nested rows on odd ones: a parse through the pool
+# costs about 50us and the gate runs a million rounds, and one stranded
+# string a round is already six times the growth limit.
+import leakprobe as probe
+import std.json as json
+
+pub struct Item:
+    pub id: Int
+    pub name: String
+    pub live: Bool
+
+pub struct Inner:
+    pub city: String
+    pub zip: Int
+
+pub struct Nested:
+    pub name: String
+    pub addr: Inner
+    pub score: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn item(i: Int, bad: Bool) -> String:
+    mut id := i.to_string()
+    if bad:
+        id = q("nope")
+    return obj(q("id") + ":" + id + "," + q("name") + ":" + q("n" + i.to_string()) + "," + q("live") + ":true")
+
+fn nested(i: Int) -> String:
+    inner := obj(q("city") + ":" + q("c" + i.to_string()) + "," + q("zip") + ":" + i.to_string())
+    return obj(q("name") + ":" + q("n" + i.to_string()) + "," + q("addr") + ":" + inner + "," + q("score") + ":" + i.to_string())
+
+fn decode_items(i: Int) -> Int:
+    doc := obj(q("items") + ":[" + item(i, false) + "," + item(i + 1, i % 3 == 0) + "," + item(i + 2, false) + "]")
+    mark := json.pool_mark_node_id()
+    root := json.parse(doc)
+    list := json.object_get_array(root, "items")
+    mut acc := 0
+    mut k := 0
+    while k < json.array_len(list):
+        r := json.decode_object[Item](json.array_get(list, k))
+        if r.is_err:
+            acc = acc + r.err.message.len()
+        else:
+            acc = acc + r.ok.id + r.ok.name.len()
+        k = k + 1
+    json.pool_restore(mark, 0)
+    return acc
+
+fn decode_rows(i: Int) -> Int:
+    doc := obj(q("rows") + ":[" + nested(i) + "," + nested(i + 1) + "]")
+    mark := json.pool_mark_node_id()
+    root := json.parse(doc)
+    rows := json.object_get_array(root, "rows")
+    mut acc := 0
+    mut k := 0
+    while k < json.array_len(rows):
+        row := json.decode_object[Nested](json.array_get(rows, k)) catch Nested("", Inner("", 0), 0)
+        acc = acc + row.addr.city.len() + row.score
+        k = k + 1
+    json.pool_restore(mark, 0)
+    return acc
+
+fn round(i: Int) -> Int:
+    if i % 2 == 0:
+        return decode_items(i)
+    return decode_rows(i)
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

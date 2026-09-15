@@ -17,9 +17,8 @@
 # that fails inside the sub-object after strings were minted at both
 # levels. a list of structs is not in the round: json.decode[T] has no
 # list field, so a list is decoded element by element out of a parsed
-# array, and the parse itself strands about 64 bytes a round with
-# nothing decoded at all (json.parse followed by pool_restore), which is
-# the pool's own defect and not this filler's.
+# array; that pattern is leak_json_parse_decode_list's, and the parse on
+# its own is leak_json_parse_restore's (#1108).
 import leakprobe as probe
 import std.json as json
 import std.bytes as bytes

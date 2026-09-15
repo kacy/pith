@@ -137,6 +137,9 @@ cases=(
   tests/leaks/leak_json_decode_struct
   tests/leaks/leak_json_fill_struct
   tests/leaks/leak_json_fill_nested
+  tests/leaks/leak_json_parse_restore
+  tests/leaks/leak_json_parse_decode_list
+  tests/leaks/leak_toml_parse_restore
   tests/leaks/leak_closure_spill_capture
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_tls12_client_auth

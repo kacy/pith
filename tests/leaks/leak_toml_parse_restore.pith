@@ -1,0 +1,40 @@
+# toml.parse followed by pool_restore, with nothing decoded: the toml node
+# pool's own lifecycle, the twin of leak_json_parse_restore.
+#
+# std.toml's parser has the same shape std.json's had when #1108 was
+# found: parse_value_node bound one name to the decoded text in its string
+# branch and to a child node handle (an Int) in its array and table
+# branches, and a name bound to different kinds in sibling branches is one
+# the emitter drops from exit cleanup (ir_prepass_track_or_poison), so
+# every string value the parser read kept one count forever. before the
+# rename this round read 24,592 kb at 200k rounds and 90,172 kb at 800k,
+# about 112 bytes a round for three strings.
+#
+# a round parses, and restores after, a document with quoted strings at
+# the top level, an array of strings, a table with a string in it and a
+# key whose value is an int.
+import leakprobe as probe
+import std.toml as toml
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn round(i: Int) -> Int:
+    nl := chr(10)
+    label := i.to_string()
+    doc := "name = " + q("row" + label) + nl + "count = " + label + nl + "tags = [" + q("a" + label) + ", " + q("b") + "]" + nl + "[owner]" + nl + "city = " + q("c" + label) + nl + "zip = " + label + nl
+    mark := toml.pool_mark_node_id()
+    root := toml.parse(doc)
+    toml.pool_restore(mark, 0, 0)
+    return root
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

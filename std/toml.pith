@@ -402,10 +402,15 @@ fn parse_value_node() -> Int:
             # unterminated string — reject rather than accept the truncation
             parser_error = true
             return 0 - 1
-        val := parser_input.substring(start, parser_position)
+        # its own name on purpose: `val` below is an Int (a child node handle)
+        # in the array and table branches, and a name bound to different
+        # kinds in sibling branches is one the emitter cannot release at exit
+        # (ir_prepass_track_or_poison), so a `val` here stranded every string
+        # value the parser read (the toml twin of json's #1108).
+        text := parser_input.substring(start, parser_position)
         parser_position = parser_position + 1
         idx := allocate_node("string")
-        string_values.insert(idx, val)
+        string_values.insert(idx, text)
         return idx
 
     # boolean true

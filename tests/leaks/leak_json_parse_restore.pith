@@ -1,0 +1,67 @@
+# json.parse followed by pool_restore, with nothing decoded at all: the
+# node pool's own lifecycle, apart from any filler.
+#
+# every node a parse allocates lands in six threadlocal per-node maps and
+# in the slot maps that hold an object's keys and an array's elements
+# under string slot keys built per access. json_restore_to walks the ids
+# back to the mark and removes each node's entry from every map, so a
+# parse-then-restore round has to leave every one of those maps at the
+# size it started with, and every string it held (the type names, the
+# string values, the object keys, the slot keys, the document itself in
+# parser_input) released. #1108 measured this shape at about 64 bytes a
+# round on the runtime before the map internals changed (#1126, #1128,
+# #1129); this case pins whichever way that goes.
+#
+# a round parses one document and restores after it, cycling through six
+# shapes: a flat object of scalars, an array of numbers and strings, an
+# object holding an array of objects, an object nested three deep, a
+# string with escapes in it, and a document that fails part way through
+# after nodes were allocated (the parser leaves those nodes in the pool
+# for the restore to reclaim). one document a round rather than all six,
+# because a parse through the pool costs about 50us and the gate runs a
+# million rounds; the signal does not need more, a single stranded string
+# a round is six times the growth limit.
+import leakprobe as probe
+import std.json as json
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn item(i: Int) -> String:
+    return obj(q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("n" + i.to_string()) + "," + q("live") + ":true")
+
+fn document(i: Int) -> String:
+    label := i.to_string()
+    shape := i % 6
+    if shape == 0:
+        return obj(q("id") + ":" + label + "," + q("name") + ":" + q("row" + label) + "," + q("ratio") + ":1.5," + q("ok") + ":false," + q("gone") + ":null")
+    if shape == 1:
+        return "[" + label + "," + (i + 1).to_string() + "," + q("s" + label) + ",2.5,true,null]"
+    if shape == 2:
+        return obj(q("items") + ":[" + item(i) + "," + item(i + 1) + "," + item(i + 2) + "]," + q("total") + ":3")
+    if shape == 3:
+        return obj(q("a") + ":" + obj(q("b") + ":" + obj(q("c") + ":" + obj(q("d") + ":" + label + "," + q("tags") + ":[" + q("x") + "," + q("y") + "]"))))
+    if shape == 4:
+        return obj(q("text") + ":" + q("quote " + chr(92) + chr(34) + " tab " + chr(92) + "t unicode " + chr(92) + "u00e9 " + label))
+    return obj(q("items") + ":[" + item(i) + "," + item(i + 1) + "," + q("k") + ":" + label)
+
+fn round(i: Int) -> Int:
+    doc := document(i)
+    mark := json.pool_mark_node_id()
+    root := json.parse(doc)
+    json.pool_restore(mark, 0)
+    return root
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

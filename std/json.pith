@@ -770,11 +770,15 @@ fn parse_value_node() -> Int:
         return 0 - 1
     c := get_char_at(parser_position)
 
-    # string
+    # string. the decoded text has its own name on purpose: `val` below is
+    # an Int (a child node handle) in the array and object branches, and a
+    # name bound to different kinds in sibling branches is one the emitter
+    # cannot release at exit (ir_prepass_track_or_poison), so a `val` here
+    # stranded every string value the parser ever read (#1108).
     if c == chr(34):
-        val := parse_string_raw()
+        text := parse_string_raw()
         idx := allocate_node("string")
-        string_values.insert(idx, val)
+        string_values.insert(idx, text)
         return idx
 
     # boolean true

@@ -354,9 +354,9 @@ peak resident memory on this machine, two million rings:
 | strong | ~752 MB | none (leaks every ring) |
 
 (2026-09-13, peak rss from the child's rusage. the strong figure reproduces
-the ~730 MB this table carried before; the weak figure is larger than the
-~2 MB recorded earlier and is worth attributing, but the point of the pair
-stands, one is bounded and the other is not.)
+the ~730 MB this table carried before. the weak figure is larger than the
+~2 MB recorded earlier and has not been attributed; the pair still shows
+what it is for, one back edge is bounded and the other is not.)
 
 the `weak` run holds flat because the rings free as fast as they are
 built; the strong run grows without bound. `PITH_PERF_STATS=1` prints the
@@ -833,8 +833,7 @@ three caveats matter when reading this benchmark:
 made of: `if m.contains_key(k): m.insert(k, m[k] + d)` over a small set of
 distinct keys, so nearly every update is a hit on a key that is already
 there. it exists because that shape used to cost four allocations per
-update, three key copies and a value box, none of which the program asked
-for.
+update: three key copies and a value box.
 
 ```
 pith build bench/map_update.pith

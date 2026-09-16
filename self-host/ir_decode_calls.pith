@@ -9,7 +9,7 @@ from ast import get_node
 from ir_names import ir_import_target_name, ir_global_storage_symbol
 from ir_type_helpers import ir_resolve_type_hint_with_state
 from ir_generics import ir_param_name_at, ir_resolve_generic_module_call_name
-from types import get_type_info
+from types import get_type_info, lookup_type_id
 
 fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
     index_node := get_node(index_idx)
@@ -349,6 +349,32 @@ pub fn ir_json_list_elem_tid(field_tid: Int) -> Int:
         return 0 - 1
     return info.inner
 
+# the value tid of a `Map[String, T]` field, -1 for any other field. a
+# map with another key type is not a decode target (the checker refuses
+# it; a json object's keys are strings), so it reads as no map here and
+# the lowering treats it as a field it cannot fill.
+pub fn ir_json_map_value_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind != "map" or info.value_type < 0:
+        return 0 - 1
+    if info.key_type != lookup_type_id("String"):
+        return 0 - 1
+    return info.value_type
+
+# true for a collection field the node-pool path builds by walking the
+# parsed node with the general builder (ir_emit_json_node_value): a map,
+# or a list whose element is itself a list or a map. a list of scalars
+# has its accessor and a list of structs its own loop, both from before
+# the general builder, and they keep their ir.
+pub fn ir_json_node_built_collection(field_tid: Int) -> Bool:
+    if ir_json_map_value_tid(field_tid) >= 0:
+        return true
+    elem_tid := ir_json_list_elem_tid(field_tid)
+    if elem_tid < 0:
+        return false
+    elem := get_type_info(elem_tid)
+    return elem.kind == "list" or elem.kind == "map"
+
 # the scalar accessor for a field read out of a JsonScalarObject — the
 # three-map summary std_json_decode_scalars_bytes returns — rather than
 # out of a node handle. already fully qualified, so the caller emits it
@@ -522,20 +548,24 @@ pub fn ir_struct_has_default_fields_with_state(target_info: TypeInfo, struct_fie
             return true
     return false
 
-# true when any field is a struct or a list, or an optional wrapping
-# one. the third shape question, and the one with the strongest
+# true when any field is a struct, a list or a map, or an optional
+# wrapping one. the third shape question, and the one with the strongest
 # consequence: a nested field means the decode either fills in place
 # through the nested filler or parses into the node pool and recurses,
 # so the lowering brackets the parse with a pool mark and restore
-# instead of scanning the bytes flat. a list counts because the flat and
-# scalar-object paths have no list accessor at all, and a field they
-# skipped would shift the slots after it. only one level is inspected;
-# a nested struct's own fields are the recursive call's problem.
+# instead of scanning the bytes flat. a list or a map counts because the
+# flat and scalar-object paths have no collection accessor at all, and a
+# field they skipped would shift the slots after it. only one level is
+# inspected; a nested struct's own fields are the recursive call's
+# problem.
 pub fn ir_struct_has_nested_decode_fields(target_info: TypeInfo) -> Bool:
     for field_tid in target_info.field_types:
-        if ir_struct_decode_field_tid(field_tid) >= 0 or ir_json_list_elem_tid(field_tid) >= 0:
+        if ir_json_field_is_nested(field_tid):
             return true
         optional_inner_tid := ir_optional_inner_tid(field_tid)
-        if optional_inner_tid >= 0 and (ir_struct_decode_field_tid(optional_inner_tid) >= 0 or ir_json_list_elem_tid(optional_inner_tid) >= 0):
+        if optional_inner_tid >= 0 and ir_json_field_is_nested(optional_inner_tid):
             return true
     return false
+
+fn ir_json_field_is_nested(field_tid: Int) -> Bool:
+    return ir_struct_decode_field_tid(field_tid) >= 0 or ir_json_list_elem_tid(field_tid) >= 0 or ir_json_map_value_tid(field_tid) >= 0

@@ -13,10 +13,10 @@ from ir_ast_helpers import ir_unwrap_pub_node
 from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
-from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid
+from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid, ir_json_map_value_tid, ir_json_node_built_collection
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_handle_generic_name_with_state, ir_specialize_type_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
-from ir_ownership import ir_rc_release_reg
+from ir_ownership import ir_rc_release_reg, ir_string_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
 from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
@@ -25,7 +25,7 @@ from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_re
 from ir_tree_cache import ir_cached_decode_call_nodes, ir_root_items
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
-from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
+from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label
 
 # result-returning decode helper calls, routed through the register-ABI
 # registry: a registered pair-returning helper is rcall'd and its pair
@@ -368,6 +368,385 @@ fn ir_emit_json_struct_list_field(handle_r: Int, key_r: Int, elem_tid: Int, help
     result_r := ir_reg()
     ir_emit("load " + result_r.to_string() + " " + temp_name)
     return result_r
+
+## the std.json helpers the general node builder calls, resolved for the
+## call site the way IrJsonListHelpers are: the direct decode against its
+## receiver, a specialization body against its module path.
+struct IrJsonNodeHelpers:
+    require_array: String
+    require_map: String
+    array_len: String
+    array_get: String
+    object_get: String
+    member_count: String
+    member_key: String
+    node_int: String
+    node_string: String
+    node_bool: String
+    node_float: String
+    node_object: String
+    node_array: String
+    node_map: String
+    element_path: String
+    member_path: String
+    path_error: String
+    decode_object: String
+
+fn ir_json_node_helpers_for_call(index_idx: Int) -> IrJsonNodeHelpers:
+    decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
+    return IrJsonNodeHelpers(ir_resolve_json_call_name(index_idx, "object_require_array"), ir_resolve_json_call_name(index_idx, "object_require_map"), ir_resolve_json_call_name(index_idx, "array_len"), ir_resolve_json_call_name(index_idx, "array_get"), ir_resolve_json_call_name(index_idx, "object_get"), ir_resolve_json_call_name(index_idx, "object_member_count"), ir_resolve_json_call_name(index_idx, "object_member_key"), ir_resolve_json_call_name(index_idx, "node_require_int"), ir_resolve_json_call_name(index_idx, "node_require_string"), ir_resolve_json_call_name(index_idx, "node_require_bool"), ir_resolve_json_call_name(index_idx, "node_require_float"), ir_resolve_json_call_name(index_idx, "node_require_object"), ir_resolve_json_call_name(index_idx, "node_require_array"), ir_resolve_json_call_name(index_idx, "node_require_map"), ir_resolve_json_call_name(index_idx, "element_path"), ir_resolve_json_call_name(index_idx, "member_path"), ir_resolve_json_call_name(index_idx, "path_decode_error"), decode_name)
+
+fn ir_json_node_helpers_for_module(module_path: String) -> IrJsonNodeHelpers:
+    return IrJsonNodeHelpers(ir_resolve_generic_module_call_name(module_path, "object_require_array"), ir_resolve_generic_module_call_name(module_path, "object_require_map"), ir_resolve_generic_module_call_name(module_path, "array_len"), ir_resolve_generic_module_call_name(module_path, "array_get"), ir_resolve_generic_module_call_name(module_path, "object_get"), ir_resolve_generic_module_call_name(module_path, "object_member_count"), ir_resolve_generic_module_call_name(module_path, "object_member_key"), ir_resolve_generic_module_call_name(module_path, "node_require_int"), ir_resolve_generic_module_call_name(module_path, "node_require_string"), ir_resolve_generic_module_call_name(module_path, "node_require_bool"), ir_resolve_generic_module_call_name(module_path, "node_require_float"), ir_resolve_generic_module_call_name(module_path, "node_require_object"), ir_resolve_generic_module_call_name(module_path, "node_require_array"), ir_resolve_generic_module_call_name(module_path, "node_require_map"), ir_resolve_generic_module_call_name(module_path, "element_path"), ir_resolve_generic_module_call_name(module_path, "member_path"), ir_resolve_generic_module_call_name(module_path, "path_decode_error"), ir_json_generic_name("decode_object"))
+
+# how a container holds a value of type `tid`: "string", "list", "map" or
+# "struct" for the kinds held by count, where a store takes the count the
+# decode minted; "" for an int, a bool or a float, copied as a word. asked
+# of the checker's type, not of the ir kind string, because
+# ir_type_from_tid names a struct by its bare name.
+fn ir_json_value_ownership(tid: Int) -> String:
+    info := get_type_info(tid)
+    if info.kind == "primitive" and info.name == "String":
+        return "string"
+    if info.kind == "list" or info.kind == "map" or info.kind == "struct":
+        return info.kind
+    return ""
+
+# the element-tag code a kind-carrying map store takes for values held
+# the `ownership` way: the codes pith_list_new takes, part of the ir
+# contract.
+fn ir_json_value_tag_code(ownership: String) -> Int:
+    if ownership == "string":
+        return 1
+    if ownership == "list":
+        return 2
+    if ownership == "map":
+        return 3
+    return 4
+
+# the list constructor for elements held the `ownership` way, the one a
+# literal of that element type gets, so the list owns strings, lists,
+# maps and structs.
+fn ir_json_list_ctor_for_ownership(ownership: String) -> String:
+    if ownership == "string":
+        return "__list_new_str"
+    if ownership == "list":
+        return "__list_new_list"
+    if ownership == "map":
+        return "__list_new_map"
+    if ownership == "struct":
+        return "__list_new_struct"
+    return "__list_new"
+
+fn ir_json_node_scalar_helper(helpers: IrJsonNodeHelpers, info: TypeInfo) -> String:
+    if info.name == "String":
+        return helpers.node_string
+    if info.name == "Bool":
+        return helpers.node_bool
+    if info.name == "Float":
+        return helpers.node_float
+    return helpers.node_int
+
+## the general node builder: a `tid`-typed value read out of the parsed
+## node `node_r`, which sits at `path_r` in the document (`grid[1]`,
+## `scores.bob`), as a result box in the returned register. a scalar
+## goes through its node accessor, which checks the kind and words its
+## error by the path (`expected int element: grid[1][3]`); a struct
+## through the element type's decode_object specialization, its own
+## error placed under the path (`scores.bob: missing int field: x`); a
+## list and a map through the loops below, which build the container
+## first and store each value as it is built, so a failed value drops the
+## container and everything in it before the error comes back. this is
+## the node-pool path's reading of the shapes the filler builds in place
+## for a target without optional or defaulted fields: a `Map[String, T]`
+## and a list of lists or of maps, at any depth. the messages are the
+## filler's for the same document. a list of scalars and a list of
+## structs keep the accessors and the loop they had before this builder.
+fn ir_emit_json_node_value(node_r: Int, path_r: Int, tid: Int, helpers: IrJsonNodeHelpers) -> Int:
+    info := get_type_info(tid)
+    if info.kind == "primitive":
+        result_r := ir_reg()
+        ir_emit_decode_result_call2(result_r, ir_json_node_scalar_helper(helpers, info), node_r, path_r)
+        return result_r
+    if info.kind == "struct":
+        return ir_emit_json_node_struct(node_r, path_r, tid, helpers)
+    temp_name := ir_new_temp_name("json_node_value")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    container_result_r := ir_reg()
+    if info.kind == "list":
+        ir_emit_decode_result_call2(container_result_r, helpers.node_array, node_r, path_r)
+    else:
+        ir_emit_decode_result_call2(container_result_r, helpers.node_map, node_r, path_r)
+    ir_emit_result_store_error_branch(container_result_r, temp_name, done_l)
+    container_r := ir_take_result_ok(container_result_r, lookup_type_id("Int"))
+    mut built_r := 0
+    if info.kind == "list":
+        built_r = ir_emit_json_node_list_from_array(container_r, path_r, tid, helpers)
+    else:
+        built_r = ir_emit_json_node_map_from_object(container_r, path_r, tid, helpers)
+    ir_emit("store " + temp_name + " " + built_r.to_string())
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_json_node_struct(node_r: Int, path_r: Int, tid: Int, helpers: IrJsonNodeHelpers) -> Int:
+    temp_name := ir_new_temp_name("json_node_struct")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    obj_result_r := ir_reg()
+    ir_emit_decode_result_call2(obj_result_r, helpers.node_object, node_r, path_r)
+    ir_emit_result_store_error_branch(obj_result_r, temp_name, done_l)
+    obj_r := ir_take_result_ok(obj_result_r, lookup_type_id("Int"))
+    decode_result_r := ir_reg()
+    ir_emit_decode_result_call1(decode_result_r, ir_queue_generic_specialization(helpers.decode_object, [ir_type_from_tid(tid)], "tuple"), obj_r)
+    ok_r := ir_emit_result_flag_field(decode_result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_r.to_string() + " " + ok_l + " " + err_l)
+    # a failed struct: its error under the path, the box and the error
+    # it came in dropped
+    ir_emit_label(err_l)
+    inner_err_r := ir_reg()
+    ir_emit("field " + inner_err_r.to_string() + " " + decode_result_r.to_string() + " 16 struct:JsonDecodeError err")
+    wrapped_r := ir_reg()
+    ir_emit_call2(wrapped_r, helpers.path_error, "struct:JsonDecodeError", path_r, inner_err_r)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", inner_err_r)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", decode_result_r)
+    ir_emit("store " + temp_name + " " + ir_emit_err_result_tuple_raw(wrapped_r).to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+## a `List[T]` built out of the array node `arr_r` at `path_r`: one
+## element per node, each through ir_emit_json_node_value under
+## `<path>[<i>]`, pushed as it is built. the result box in the returned
+## register holds the list, or the first element's error once the list
+## and every element before it are released.
+fn ir_emit_json_node_list_from_array(arr_r: Int, path_r: Int, tid: Int, helpers: IrJsonNodeHelpers) -> Int:
+    elem_tid := get_type_info(tid).inner
+    elem_ownership := ir_json_value_ownership(elem_tid)
+    temp_name := ir_new_temp_name("json_node_list")
+    ir_var_types.insert(temp_name, "tuple")
+    list_name := ir_new_temp_name("json_node_list_out")
+    len_name := ir_new_temp_name("json_node_list_len")
+    idx_name := ir_new_temp_name("json_node_list_idx")
+    arr_name := ir_new_temp_name("json_node_list_arr")
+    ir_var_types.insert(list_name, ir_type_from_tid(tid))
+    ir_var_types.insert(len_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    ir_var_types.insert(arr_name, "int")
+    done_l := ir_label()
+    ir_emit("store " + arr_name + " " + arr_r.to_string())
+    list_r := ir_reg()
+    ir_emit_call0(list_r, ir_json_list_ctor_for_ownership(elem_ownership), ir_type_from_tid(tid))
+    ir_emit("store " + list_name + " " + list_r.to_string())
+    len_arr_r := ir_reg()
+    ir_emit("load " + len_arr_r.to_string() + " " + arr_name)
+    len_r := ir_reg()
+    ir_emit_call1(len_r, helpers.array_len, "int", len_arr_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    loop_done_l := ir_label()
+    fail_l := ir_label()
+    ok_l := ir_label()
+    ir_emit_label(loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+
+    ir_emit_label(body_l)
+    body_arr_r := ir_reg()
+    ir_emit("load " + body_arr_r.to_string() + " " + arr_name)
+    body_idx_r := ir_reg()
+    ir_emit("load " + body_idx_r.to_string() + " " + idx_name)
+    elem_node_r := ir_reg()
+    ir_emit_call2(elem_node_r, helpers.array_get, "int", body_arr_r, body_idx_r)
+    elem_path_r := ir_reg()
+    ir_emit_call2(elem_path_r, helpers.element_path, "string", path_r, body_idx_r)
+    elem_result_r := ir_emit_json_node_value(elem_node_r, elem_path_r, elem_tid, helpers)
+    ir_string_release_reg(elem_path_r)
+    elem_ok_r := ir_emit_result_flag_field(elem_result_r, "is_ok")
+    ir_emit("brif " + elem_ok_r.to_string() + " " + ok_l + " " + fail_l)
+    # a failed element: its box is the list's result, the list goes
+    ir_emit_label(fail_l)
+    ir_emit("store " + temp_name + " " + elem_result_r.to_string())
+    fail_list_r := ir_reg()
+    ir_emit("load " + fail_list_r.to_string() + " " + list_name)
+    ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", fail_list_r)
+    ir_emit("jmp " + done_l)
+    # a built element: the list takes the count the build minted
+    ir_emit_label(ok_l)
+    value_r := ir_take_json_ok(elem_result_r, elem_tid)
+    push_list_r := ir_reg()
+    ir_emit("load " + push_list_r.to_string() + " " + list_name)
+    if elem_ownership.len() > 0:
+        ir_emit_call2(ir_reg(), "pith_list_push_value_owned", "void", push_list_r, value_r)
+    else:
+        ir_emit_call2(ir_reg(), "pith_list_push_value", "void", push_list_r, value_r)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+    ir_emit_label(loop_done_l)
+    out_list_r := ir_reg()
+    ir_emit("load " + out_list_r.to_string() + " " + list_name)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(out_list_r).to_string())
+    ir_emit_label(done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+## a `Map[String, T]` built out of the object node `obj_r` at `path_r`:
+## one member per key slot of the node, its value read through
+## `object_get` (the last value under a repeated key, as the node
+## accessors read it) and built through ir_emit_json_node_value under
+## `<path>.<key>`, then stored under the key; a repeated key stores the
+## same last value twice, which the map resolves to one entry. a heap
+## value goes in through the kind-carrying owned store, so the map owns
+## it; the result box holds the map, or the first member's error once
+## the map and every value before it are released.
+fn ir_emit_json_node_map_from_object(obj_r: Int, path_r: Int, tid: Int, helpers: IrJsonNodeHelpers) -> Int:
+    val_tid := get_type_info(tid).value_type
+    val_ownership := ir_json_value_ownership(val_tid)
+    temp_name := ir_new_temp_name("json_node_map")
+    ir_var_types.insert(temp_name, "tuple")
+    map_name := ir_new_temp_name("json_node_map_out")
+    count_name := ir_new_temp_name("json_node_map_count")
+    idx_name := ir_new_temp_name("json_node_map_idx")
+    obj_name := ir_new_temp_name("json_node_map_obj")
+    ir_var_types.insert(map_name, "map")
+    ir_var_types.insert(count_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    ir_var_types.insert(obj_name, "int")
+    done_l := ir_label()
+    ir_emit("store " + obj_name + " " + obj_r.to_string())
+    map_r := ir_reg()
+    ir_emit_call0(map_r, "__map_new", "map")
+    ir_emit("store " + map_name + " " + map_r.to_string())
+    count_obj_r := ir_reg()
+    ir_emit("load " + count_obj_r.to_string() + " " + obj_name)
+    count_r := ir_reg()
+    ir_emit_call1(count_r, helpers.member_count, "int", count_obj_r)
+    ir_emit("store " + count_name + " " + count_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    loop_done_l := ir_label()
+    fail_l := ir_label()
+    ok_l := ir_label()
+    ir_emit_label(loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_count_r := ir_reg()
+    ir_emit("load " + loop_count_r.to_string() + " " + count_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_count_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+
+    ir_emit_label(body_l)
+    body_obj_r := ir_reg()
+    ir_emit("load " + body_obj_r.to_string() + " " + obj_name)
+    body_idx_r := ir_reg()
+    ir_emit("load " + body_idx_r.to_string() + " " + idx_name)
+    key_r := ir_reg()
+    ir_emit_call2(key_r, helpers.member_key, "string", body_obj_r, body_idx_r)
+    val_node_r := ir_reg()
+    ir_emit_call2(val_node_r, helpers.object_get, "int", body_obj_r, key_r)
+    member_path_r := ir_reg()
+    ir_emit_call2(member_path_r, helpers.member_path, "string", path_r, key_r)
+    val_result_r := ir_emit_json_node_value(val_node_r, member_path_r, val_tid, helpers)
+    ir_string_release_reg(member_path_r)
+    val_ok_r := ir_emit_result_flag_field(val_result_r, "is_ok")
+    ir_emit("brif " + val_ok_r.to_string() + " " + ok_l + " " + fail_l)
+    # a failed value: its box is the map's result, the map and the key go
+    ir_emit_label(fail_l)
+    ir_string_release_reg(key_r)
+    ir_emit("store " + temp_name + " " + val_result_r.to_string())
+    fail_map_r := ir_reg()
+    ir_emit("load " + fail_map_r.to_string() + " " + map_name)
+    ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", fail_map_r)
+    ir_emit("jmp " + done_l)
+    # a built value: stored under the key, which the map copies, so the
+    # key string dies here; a counted value hands the map its count
+    ir_emit_label(ok_l)
+    value_r := ir_take_json_ok(val_result_r, val_tid)
+    store_map_r := ir_reg()
+    ir_emit("load " + store_map_r.to_string() + " " + map_name)
+    if val_ownership.len() > 0:
+        tag_r := ir_reg()
+        ir_emit("iconst " + tag_r.to_string() + " " + ir_json_value_tag_code(val_ownership).to_string())
+        ir_emit_call4(ir_reg(), "map_insert_owned_kind", "void", store_map_r, key_r, value_r, tag_r)
+    else:
+        ir_emit_call3(ir_reg(), "map_insert", "void", store_map_r, key_r, value_r)
+    ir_string_release_reg(key_r)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+    ir_emit_label(loop_done_l)
+    out_map_r := ir_reg()
+    ir_emit("load " + out_map_r.to_string() + " " + map_name)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(out_map_r).to_string())
+    ir_emit_label(done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+## a collection field the general builder reads out of a parsed object
+## node: the array or object under `key_r` (missing or of the wrong kind
+## is the field's error, `missing map field: scores`, `expected list
+## field: grid`), then the list or map built from it with the key as the
+## path. the result box comes back in the returned register.
+fn ir_emit_json_node_collection_field(handle_r: Int, key_r: Int, field_tid: Int, helpers: IrJsonNodeHelpers) -> Int:
+    temp_name := ir_new_temp_name("json_node_field")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    container_result_r := ir_reg()
+    is_map := ir_json_map_value_tid(field_tid) >= 0
+    if is_map:
+        ir_emit_decode_result_call2(container_result_r, helpers.require_map, handle_r, key_r)
+    else:
+        ir_emit_decode_result_call2(container_result_r, helpers.require_array, handle_r, key_r)
+    ir_emit_result_store_error_branch(container_result_r, temp_name, done_l)
+    container_r := ir_take_result_ok(container_result_r, lookup_type_id("Int"))
+    mut built_r := 0
+    if is_map:
+        built_r = ir_emit_json_node_map_from_object(container_r, key_r, field_tid, helpers)
+    else:
+        built_r = ir_emit_json_node_list_from_array(container_r, key_r, field_tid, helpers)
+    ir_emit("store " + temp_name + " " + built_r.to_string())
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
 
 ## emit the json nested decode path sequence.
 pub fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
@@ -1308,17 +1687,18 @@ fn ir_json_spec_dtor_index(name: String) -> Int:
     return ir_json_spec_dtor_names.len() - 1
 
 # the nested spec of a declaration: the flat spec's `<type><name>` entries
-# with a struct field written as `o<name>(<sub-spec>)` and a list field as
-# `l<name>(<elem>)`, where the element is a scalar letter, `l(<elem>)` or
+# with a struct field written as `o<name>(<sub-spec>)`, a list field as
+# `l<name>(<elem>)` and a `Map[String, T]` field as `m<name>(<elem>)`,
+# where the element is a scalar letter, `l(<elem>)`, `m(<elem>)` or
 # `o#<k>(<sub-spec>)`; parentheses, not braces, because an IR string
 # literal reads `}}` as one escaped brace and a doubly nested spec ends
-# in two. a struct the filler allocates itself (a list element, or a
-# struct field inside one) carries `#<k>`, the index of its destructor
-# in the table the decode hands over; a struct the lowering pre-allocates
-# does not. "" when a field is neither a scalar, a list of these, nor a
-# struct this map resolves, or the nesting runs deeper than any real
-# shape; such a struct has no nested spec and its decode takes the
-# node-pool path.
+# in two. a struct the filler allocates itself (a list element, a map
+# value, or a struct field inside one) carries `#<k>`, the index of its
+# destructor in the table the decode hands over; a struct the lowering
+# pre-allocates does not. "" when a field is neither a scalar, a
+# collection of these, nor a struct this map resolves, or the nesting
+# runs deeper than any real shape; such a struct has no nested spec and
+# its decode takes the node-pool path.
 pub fn ir_json_decode_nested_spec_from_decl(decl: Node, depth: Int) -> String:
     ir_json_spec_dtor_names = []
     return ir_json_nested_spec_of_decl(decl, depth, false)
@@ -1342,6 +1722,12 @@ fn ir_json_nested_spec_of_decl(decl: Node, depth: Int, under_list: Bool) -> Stri
                     return ""
                 spec = spec + "l" + fname + "(" + elem + ")"
                 continue
+            if ir_json_type_node_is_string_map(type_node):
+                elem := ir_json_nested_elem_spec(get_node(type_node.children[1]), depth + 1)
+                if elem.len() == 0:
+                    return ""
+                spec = spec + "m" + fname + "(" + elem + ")"
+                continue
             type_char := ir_json_type_name_char(type_node.value)
             if type_char.len() > 0:
                 spec = spec + type_char + fname
@@ -1360,14 +1746,23 @@ fn ir_json_nested_spec_of_decl(decl: Node, depth: Int, under_list: Bool) -> Stri
             spec = spec + "o" + fname + marker + "(" + sub_spec + ")"
     return spec
 
-# a written `List[...]` type: the one generic the nested spec reads.
+# a written `List[...]` type: one of the two generics the nested spec reads.
 fn ir_json_type_node_is_list(type_node: Node) -> Bool:
     return type_node.kind == "generic_type" and type_node.value == "List" and type_node.children.len() == 1
 
-# the element part of a list entry: a scalar letter, `l(<elem>)` for a
-# list of lists, or `o#<k>(<sub-spec>)` for a struct the map resolves,
-# whose fields are laid out under the filler's ownership. "" for
-# anything else.
+# a written `Map[String, ...]` type: the other generic the nested spec
+# reads. a map with any other key type has no spec entry, as the checker
+# refuses it (a json object's keys are strings).
+fn ir_json_type_node_is_string_map(type_node: Node) -> Bool:
+    if type_node.kind != "generic_type" or type_node.value != "Map" or type_node.children.len() != 2:
+        return false
+    key_node := get_node(type_node.children[0])
+    return key_node.kind == "type" and key_node.value == "String"
+
+# the element part of a list or map entry: a scalar letter, `l(<elem>)`
+# for a list, `m(<elem>)` for a string-keyed map, or `o#<k>(<sub-spec>)`
+# for a struct the map resolves, whose fields are laid out under the
+# filler's ownership. "" for anything else.
 fn ir_json_nested_elem_spec(type_node: Node, depth: Int) -> String:
     if depth > 16:
         return ""
@@ -1376,6 +1771,11 @@ fn ir_json_nested_elem_spec(type_node: Node, depth: Int) -> String:
         if inner.len() == 0:
             return ""
         return "l(" + inner + ")"
+    if ir_json_type_node_is_string_map(type_node):
+        inner := ir_json_nested_elem_spec(get_node(type_node.children[1]), depth + 1)
+        if inner.len() == 0:
+            return ""
+        return "m(" + inner + ")"
     if type_node.kind != "type":
         return ""
     type_char := ir_json_type_name_char(type_node.value)
@@ -1391,8 +1791,8 @@ fn ir_json_nested_elem_spec(type_node: Node, depth: Int) -> String:
     return "o" + marker + "(" + sub_spec + ")"
 
 # true when a declaration has a field the flat spec cannot carry: a
-# struct, or a list. the declarations the prepass interns a nested spec
-# for.
+# struct, a list or a map. the declarations the prepass interns a nested
+# spec for.
 fn ir_json_decl_has_nested_field(decl: Node) -> Bool:
     for child in decl.children:
         fnode := ir_unwrap_pub_node(child)
@@ -1400,7 +1800,7 @@ fn ir_json_decl_has_nested_field(decl: Node) -> Bool:
             type_node := get_node(fnode.children[0])
             if type_node.kind == "type" and ir_json_type_name_char(type_node.value).len() == 0:
                 return true
-            if ir_json_type_node_is_list(type_node):
+            if ir_json_type_node_is_list(type_node) or ir_json_type_node_is_string_map(type_node):
                 return true
     return false
 
@@ -1511,7 +1911,12 @@ fn ir_json_decode_nested_fill_shape(target_info: TypeInfo, depth: Int) -> Bool:
         elif ir_json_list_elem_tid(field_tid) >= 0:
             if not ir_json_type_node_is_list(type_node):
                 return false
-            if not ir_json_list_elem_fill_shape(ir_json_list_elem_tid(field_tid), get_node(type_node.children[0]), depth + 1):
+            if not ir_json_elem_fill_shape(ir_json_list_elem_tid(field_tid), get_node(type_node.children[0]), depth + 1):
+                return false
+        elif ir_json_map_value_tid(field_tid) >= 0:
+            if not ir_json_type_node_is_string_map(type_node):
+                return false
+            if not ir_json_elem_fill_shape(ir_json_map_value_tid(field_tid), get_node(type_node.children[1]), depth + 1):
                 return false
         elif ir_json_type_name_char(type_node.value).len() == 0 or ir_json_type_name_char(type_node.value) != ir_json_field_type_char(field_tid):
             return false
@@ -1529,11 +1934,11 @@ fn ir_json_struct_decl_matches(struct_tid: Int, written_name: String, depth: Int
         return false
     return ir_json_decode_nested_fill_shape(nested_info, depth + 1)
 
-# true when a list element type is one the filler builds: a scalar whose
-# written name agrees with the checker's type, a list of such elements,
-# or a struct of the fill shape whose written name resolves to its
-# declaration.
-fn ir_json_list_elem_fill_shape(elem_tid: Int, elem_node: Node, depth: Int) -> Bool:
+# true when a list element or map value type is one the filler builds: a
+# scalar whose written name agrees with the checker's type, a list or a
+# string-keyed map of such elements, or a struct of the fill shape whose
+# written name resolves to its declaration.
+fn ir_json_elem_fill_shape(elem_tid: Int, elem_node: Node, depth: Int) -> Bool:
     if depth > 16:
         return false
     elem_info := get_type_info(elem_tid)
@@ -1544,27 +1949,31 @@ fn ir_json_list_elem_fill_shape(elem_tid: Int, elem_node: Node, depth: Int) -> B
     if elem_info.kind == "list":
         if not ir_json_type_node_is_list(elem_node) or elem_info.inner < 0:
             return false
-        return ir_json_list_elem_fill_shape(elem_info.inner, get_node(elem_node.children[0]), depth + 1)
+        return ir_json_elem_fill_shape(elem_info.inner, get_node(elem_node.children[0]), depth + 1)
+    if elem_info.kind == "map":
+        if not ir_json_type_node_is_string_map(elem_node) or ir_json_map_value_tid(elem_tid) < 0:
+            return false
+        return ir_json_elem_fill_shape(elem_info.value_type, get_node(elem_node.children[1]), depth + 1)
     if elem_info.kind == "struct":
         if elem_node.kind != "type":
             return false
         return ir_json_struct_decl_matches(elem_tid, elem_node.value, depth)
     return false
 
-# true when a field at any depth of the target is a list: the decode then
-# hands the filler the destructor table and calls the list-aware entry
-# point.
-fn ir_json_target_has_list_field(target_info: TypeInfo, depth: Int) -> Bool:
+# true when a field at any depth of the target is a list or a map: the
+# decode then hands the filler the destructor table and calls the
+# collection-aware entry point.
+fn ir_json_target_has_collection_field(target_info: TypeInfo, depth: Int) -> Bool:
     if depth > 16:
         return false
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             return false
         field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
-        if ir_json_list_elem_tid(field_tid) >= 0:
+        if ir_json_list_elem_tid(field_tid) >= 0 or ir_json_map_value_tid(field_tid) >= 0:
             return true
         nested_tid := ir_struct_decode_field_tid(field_tid)
-        if nested_tid >= 0 and ir_json_target_has_list_field(get_type_info(nested_tid), depth + 1):
+        if nested_tid >= 0 and ir_json_target_has_collection_field(get_type_info(nested_tid), depth + 1):
             return true
     return false
 
@@ -1595,14 +2004,15 @@ fn ir_emit_json_nested_alloc(target_info: TypeInfo) -> Int:
 # here; `check_utf8` is what a bytes input got from the node path, which
 # validated it before parsing.
 #
-# a target with a list field anywhere in it goes to the list-aware entry
-# point with a destructor table: the filler allocates a list's element
-# structs itself, so it needs the address of each one's destructor, and
-# the table holds them in the order the spec's `#<k>` markers name them
+# a target with a list or a map field anywhere in it goes to the
+# collection-aware entry point with a destructor table: the filler
+# allocates a list's element structs and a map's value structs itself,
+# so it needs the address of each one's destructor, and the table holds
+# them in the order the spec's `#<k>` markers name them
 # (ir_json_spec_dtor_names, as the spec build just left it). the table
 # is a bare struct this decode releases after the call; a struct that
-# needs no destructor gets a 0 entry. a target with no list field calls
-# the entry point it always did, so its ir is unchanged.
+# needs no destructor gets a 0 entry. a target with no collection field
+# calls the entry point it always did, so its ir is unchanged.
 fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: String, check_utf8: Bool) -> Int:
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -1615,7 +2025,7 @@ fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: St
         flag = 1
     ir_emit("iconst " + flag_r.to_string() + " " + flag.to_string())
     result_r := ir_reg()
-    if not ir_json_target_has_list_field(target_info, 0):
+    if not ir_json_target_has_collection_field(target_info, 0):
         ir_emit_call_text(result_r, "pith_json_fill_struct_nested", "tuple", 4, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string() + " " + flag_r.to_string())
         ir_emit("store " + temp_name + " " + result_r.to_string())
         r := ir_reg()
@@ -1800,6 +2210,39 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             field_regs.push(ir_take_json_ok(field_result_r, field_tid))
             continue
+        # a map, or a list of lists or of maps, plain, optional or
+        # defaulted: the general node builder walks the parsed node
+        mut node_built_tid := field_tid
+        if optional_inner_tid >= 0:
+            node_built_tid = optional_inner_tid
+        if ir_json_node_built_collection(node_built_tid):
+            node_helpers := ir_json_node_helpers_for_call(index_idx)
+            if optional_inner_tid >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_optional_collection_field", "tuple")
+                ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, optional_inner_tid, node_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                continue
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_collection_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid), emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, field_tid, node_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                continue
+            field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, field_tid, node_helpers)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            field_regs.push(ir_take_json_ok(field_result_r, field_tid))
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_json_object_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
@@ -1849,16 +2292,23 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         return ir_zero_reg()
     target_info := get_type_info(target_tid)
     mut input_r := arg_regs[0]
-    # a bytes argument minted by a call (`decode[T](bytes.from_string_utf8(s))`,
-    # a body read) is transferred to this expression and dies with the decode;
-    # a named local or field stays the caller's. a text argument is left to its
-    # owner either way — the conversion below mints the bytes this call frees.
+    # an argument minted by a call (`decode[T](bytes.from_string_utf8(s))`, a
+    # body read, `decode_text[T](req.body())`) is transferred to this
+    # expression and dies with the decode; a named local or field stays the
+    # caller's. a text argument's conversion below mints the bytes this call
+    # frees either way; the text itself is released here only when a call
+    # minted it, which used to strand one string per `decode_text[T](f())`.
     mut fresh_bytes_input := false
-    if not text_input:
-        input_expr := ir_decode_arg_expr_idx(node, 1)
-        if input_expr >= 0:
-            input_kind := get_node(input_expr).kind
-            fresh_bytes_input = input_kind == "call" or input_kind == "method_call"
+    mut fresh_text_input := false
+    input_expr := ir_decode_arg_expr_idx(node, 1)
+    if input_expr >= 0:
+        input_kind := get_node(input_expr).kind
+        fresh_input := input_kind == "call" or input_kind == "method_call"
+        if text_input:
+            fresh_text_input = fresh_input
+        else:
+            fresh_bytes_input = fresh_input
+    text_r := input_r
     owns_input := text_input or fresh_bytes_input
     has_optional_fields := ir_struct_has_optional_fields(target_info)
     has_default_fields := ir_struct_has_default_fields(target_info)
@@ -1876,6 +2326,8 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         fill_r := ir_emit_json_decode_fill_nested(fill_input_r, target_info, nested_spec, not text_input)
         if owns_input:
             ir_rc_release_reg(fill_input_r, "bytes")
+        if fresh_text_input:
+            ir_string_release_reg(text_r)
         return fill_r
     if has_nested_fields:
         temp_name := ir_new_temp_name("json_decode_nested")
@@ -1903,6 +2355,8 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
         if fresh_bytes_input:
             ir_rc_release_reg(input_r, "bytes")
+        if fresh_text_input:
+            ir_string_release_reg(text_r)
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -1916,11 +2370,15 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         scan_r := ir_emit_json_decode_scan_fields(input_r, target_info)
         if owns_input:
             ir_rc_release_reg(input_r, "bytes")
+        if fresh_text_input:
+            ir_string_release_reg(text_r)
         return scan_r
     if target_info.fields.len() > 3 or has_optional_fields or has_default_fields:
         map_r := ir_emit_json_decode_map_call(input_r, target_info, emit_expr, emit_value)
         if owns_input:
             ir_rc_release_reg(input_r, "bytes")
+        if fresh_text_input:
+            ir_string_release_reg(text_r)
         return map_r
 
     temp_name := ir_new_temp_name("json_decode")
@@ -1946,6 +2404,8 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     ir_emit_label(done_l)
     if owns_input:
         ir_rc_release_reg(input_r, "bytes")
+    if fresh_text_input:
+        ir_string_release_reg(text_r)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2035,6 +2495,40 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
                 i = i + 1
                 continue
             field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            field_regs.push(ir_take_json_ok(field_result_r, field_tid))
+            i = i + 1
+            continue
+        # a map, or a list of lists or of maps, plain, optional or
+        # defaulted, through the general node builder
+        mut node_built_tid := field_tid
+        if optional_inner_tid >= 0:
+            node_built_tid = optional_inner_tid
+        if ir_json_node_built_collection(node_built_tid):
+            node_helpers := ir_json_node_helpers_for_module(module_path)
+            if optional_inner_tid >= 0:
+                has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_optional_collection_field", "tuple")
+                ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, optional_inner_tid, node_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                i = i + 1
+                continue
+            if default_idx >= 0:
+                has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_collection_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid), emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, field_tid, node_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                i = i + 1
+                continue
+            field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, field_tid, node_helpers)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             field_regs.push(ir_take_json_ok(field_result_r, field_tid))
             i = i + 1

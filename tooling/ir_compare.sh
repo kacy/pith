@@ -14,12 +14,16 @@
 # comparison that silently compares nothing cannot pass.
 #
 #   tooling/ir_compare.sh <tree A> <tree B> [--canary <program>] [--out <dir>]
-#                                          [--only <glob>]
+#                                          [--only <glob>] [--keep]
 #
 # --only restricts the corpus to the programs whose name matches the glob
 # (`--only 'test_generic_*'`), for a quick look at one shape or for checking
 # the harness itself: a canary run over its own program alone takes seconds.
 # a verdict over a subset is not a corpus verdict and the summary says so.
+# --keep saves the normalized ir of every differing program under
+# <out>/keep/<name>.{a,b}.n, so the differences can be classified after the
+# run (which functions changed, which literals were added) instead of
+# rebuilt one program at a time.
 #
 # both trees must already be built (target/release/pith, self-host/ir_driver,
 # self-host/pith_main). the corpus is tree A's tests/cases/test_*.pith and
@@ -29,9 +33,10 @@
 # did not differ). one heavy job at a time on this box: run it alone.
 set -uo pipefail
 
-a=""; b=""; canary=""; out=""; only=""
+a=""; b=""; canary=""; out=""; only=""; keep=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --keep) keep=1; shift ;;
     --canary) canary="$2"; shift 2 ;;
     --only) only="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
@@ -83,6 +88,10 @@ for f in tests/cases/test_*.pith examples/*.pith; do
     same=$((same + 1))
   else
     echo "$name norm=$norm retain=$ra->$rb release=$la->$lb" >> "$out/differ.txt"
+    if [ -n "$keep" ]; then
+      mkdir -p "$out/keep"
+      cp "$out/a.n" "$out/keep/$name.a.n"; cp "$out/b.n" "$out/keep/$name.b.n"
+    fi
   fi
   [ "$name" = "$canary" ] && canary_seen="$norm"
 done

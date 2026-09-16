@@ -1,0 +1,136 @@
+# typed json.decode of structs with nested collection fields and map
+# fields, decoded successfully round after round.
+#
+# the nested filler builds a `List[List[T]]` by recursing into its own
+# list filler, and a `Map[String, T]` by building a string-keyed map that
+# owns its values and inserting each member as it is read: a scalar by
+# value or as a fresh string, a struct allocated with its destructor and
+# inserted before its first field is read, a list or a map built and
+# inserted before its first element. every container sits in its slot,
+# or in its parent, before anything under it exists, so the decoded
+# struct owns the whole tree and its destructor drops it. a repeated key
+# in a map has its last value win, the map releasing the first at the
+# insert. this case churns every shape at once, empty containers at every
+# level included, with strings minted into the values so a stranded one
+# would show.
+import leakprobe as probe
+import std.json as json
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Grid:
+    pub name: String
+    pub cells: List[List[Int]]
+    pub rows: List[List[Row]]
+
+pub struct Inner:
+    pub tags: List[String]
+
+pub struct Outer:
+    pub id: Int
+    pub xs: List[Int]
+    pub inner: Inner
+
+pub struct Outers:
+    pub items: List[Outer]
+
+pub struct Scores:
+    pub title: String
+    pub ints: Map[String, Int]
+    pub names: Map[String, String]
+    pub rows: Map[String, Row]
+    pub lists: Map[String, List[Int]]
+    pub nested: Map[String, Map[String, String]]
+    pub count: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn grid_doc(i: Int) -> String:
+    cells := "[[1,2,3],[]," + "[" + i.to_string() + "]]"
+    rows := "[[" + row(i, "r" + i.to_string()) + "," + row(i + 1, "s") + "],[],[" + row(0, "") + "]]"
+    return obj(q("name") + ":" + q("grid-" + i.to_string()) + "," + q("cells") + ":" + cells + "," + q("rows") + ":" + rows)
+
+fn outers_doc(i: Int) -> String:
+    inner := obj(q("tags") + ":[" + q("a" + i.to_string()) + "," + q("b") + "]")
+    empty_inner := obj(q("tags") + ":[]")
+    a := obj(q("id") + ":1," + q("xs") + ":[1,2]," + q("inner") + ":" + inner)
+    b := obj(q("id") + ":2," + q("xs") + ":[]," + q("inner") + ":" + empty_inner)
+    return obj(q("items") + ":[" + a + "," + b + "]")
+
+fn scores_doc(i: Int, dup: Bool) -> String:
+    mut ints := q("a") + ":1," + q("b") + ":" + i.to_string()
+    mut names := q("x") + ":" + q("ex-" + i.to_string()) + "," + q("y") + ":" + q("")
+    mut rows := q("p") + ":" + row(i, "p-" + i.to_string()) + "," + q("q") + ":" + row(0, "")
+    mut lists := q("l1") + ":[1,2," + i.to_string() + "]," + q("l2") + ":[]"
+    mut nested := q("n1") + ":" + obj(q("k") + ":" + q("v" + i.to_string())) + "," + q("n2") + ":" + obj("")
+    if dup:
+        # every key repeated: the first value goes at the second insert
+        ints = ints + "," + q("b") + ":" + (i + 1).to_string()
+        names = names + "," + q("x") + ":" + q("again-" + i.to_string())
+        rows = rows + "," + q("p") + ":" + row(i + 1, "again")
+        lists = lists + "," + q("l1") + ":[9]"
+        nested = nested + "," + q("n1") + ":" + obj(q("k") + ":" + q("w"))
+    return obj(q("title") + ":" + q("t") + "," + q("ints") + ":" + obj(ints) + "," + q("names") + ":" + obj(names) + "," + q("rows") + ":" + obj(rows) + "," + q("lists") + ":" + obj(lists) + "," + q("nested") + ":" + obj(nested) + "," + q("count") + ":7")
+
+fn empty_scores_doc() -> String:
+    return obj(q("title") + ":" + q("e") + "," + q("ints") + ":" + obj("") + "," + q("names") + ":" + obj("") + "," + q("rows") + ":" + obj("") + "," + q("lists") + ":" + obj("") + "," + q("nested") + ":" + obj("") + "," + q("count") + ":0")
+
+fn grid_sum(v: Grid) -> Int:
+    mut t := v.name.len()
+    for r in v.cells:
+        for x in r:
+            t = t + x
+    for r in v.rows:
+        for x in r:
+            t = t + x.id + x.label.len()
+    return t
+
+fn outers_sum(v: Outers) -> Int:
+    mut t := 0
+    for o in v.items:
+        t = t + o.id + o.xs.len() + o.inner.tags.len()
+        for s in o.inner.tags:
+            t = t + s.len()
+    return t
+
+fn scores_sum(v: Scores) -> Int:
+    mut t := v.title.len() + v.count
+    for k in v.ints.keys():
+        t = t + v.ints[k]
+    for k in v.names.keys():
+        t = t + v.names[k].len()
+    for k in v.rows.keys():
+        t = t + v.rows[k].id + v.rows[k].label.len()
+    for k in v.lists.keys():
+        t = t + v.lists[k].len()
+    for k in v.nested.keys():
+        t = t + v.nested[k].len()
+    return t
+
+fn round(i: Int) -> Int:
+    g := json.decode_text[Grid](grid_doc(i)) catch Grid("", [], [])
+    o := json.decode_text[Outers](outers_doc(i)) catch Outers([])
+    s := json.decode_text[Scores](scores_doc(i, false)) catch Scores("", {}, {}, {}, {}, {}, 0 - 1)
+    d := json.decode_text[Scores](scores_doc(i, true)) catch Scores("", {}, {}, {}, {}, {}, 0 - 1)
+    e := json.decode_text[Scores](empty_scores_doc()) catch Scores("", {}, {}, {}, {}, {}, 0 - 1)
+    return grid_sum(g) + outers_sum(o) + scores_sum(s) + scores_sum(d) + scores_sum(e)
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

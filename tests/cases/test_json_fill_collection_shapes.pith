@@ -1,0 +1,561 @@
+# nested collection fields and map fields in a json decode target: the
+# shapes the nested filler builds in place, and the same documents read
+# through the node pool. valgrind-gated in MEMCHECK_CASES.
+#
+# a `List[List[T]]` and a `Map[String, T]` field used to be refused at the
+# checker. now the filler builds them for any element the list filler
+# takes: a scalar, a struct, a list, a map, at any depth. a map is a
+# string-keyed map that owns its values, each member inserted before its
+# value's first byte is read, so the root owns the whole tree at every
+# moment and a failure anywhere releases it all; a repeated key has its
+# last value win and the first released at the insert. every good
+# document below is decoded through the direct decode (`fill`) and through
+# `json.parse` plus a hand walk over the node accessors (`walk`), and the
+# `same` line says the two agree byte for byte; maps print by sorted key,
+# since a map has no order. errors name the position by path: an element
+# by index (`cells[2][1]`), a map member by key (`scores.b`), a struct's
+# own error under its position (`rows.b: missing string field: label`). a
+# target with an optional field takes the node-pool path instead, where
+# the lowering walks the parsed nodes, and its messages are pinned beside
+# the filler's for the same documents. the depth bound is the parser's:
+# 128 levels, root at 1.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Row:
+    pub id: Int
+    pub label: String
+
+struct Grid:
+    pub name: String
+    pub cells: List[List[Int]]
+
+struct Table:
+    pub rows: List[List[Row]]
+    pub n: Int
+
+struct Inner:
+    pub tags: List[String]
+
+struct Outer:
+    pub id: Int
+    pub xs: List[Int]
+    pub inner: Inner
+
+struct Outers:
+    pub items: List[Outer]
+    pub grid: List[List[Outer]]
+
+struct Scores:
+    pub title: String
+    pub scores: Map[String, Int]
+
+struct Names:
+    pub names: Map[String, String]
+
+struct Rows:
+    pub rows: Map[String, Row]
+
+struct Lists:
+    pub lists: Map[String, List[Int]]
+
+struct Mixed:
+    pub name: String
+    pub tags: List[String]
+    pub scores: Map[String, Int]
+    pub rows: Map[String, Row]
+    pub nested: Map[String, Map[String, String]]
+    pub groups: List[Map[String, Int]]
+    pub count: Int
+
+struct Deep:
+    pub cells: List[List[List[Int]]]
+
+# the node-pool path: an optional field beside the collections
+struct Maybe:
+    pub cells: List[List[Int]]
+    pub scores: Map[String, Int]
+    pub rows: Map[String, Row]
+    pub lists: Map[String, List[Int]]
+    pub groups: List[Map[String, Int]]
+    pub note: String?
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn kv(key: String, value: String) -> String:
+    return q(key) + ":" + value
+
+# `unit` repeated n times, built by doubling so a hundred thousand
+# repetitions is a handful of concatenations rather than a quadratic walk
+fn repeated(unit: String, n: Int) -> String:
+    mut out := ""
+    mut piece := unit
+    mut left := n
+    while left > 0:
+        if left % 2 == 1:
+            out = out + piece
+        piece = piece + piece
+        left = left / 2
+    return out
+
+fn brackets(n: Int) -> String:
+    return repeated("[", n) + repeated("]", n)
+
+fn objects(n: Int) -> String:
+    return repeated(chr(123) + q("k") + ":", n) + "1" + repeated(chr(125), n)
+
+fn sorted(keys: List[String]) -> List[String]:
+    return keys.sort()
+
+fn fmt_ints(xs: List[Int]) -> String:
+    mut s := "["
+    for x in xs:
+        s = s + x.to_string() + ";"
+    return s + "]"
+
+fn fmt_strings(xs: List[String]) -> String:
+    mut s := "["
+    for x in xs:
+        s = s + q(x) + ";"
+    return s + "]"
+
+fn fmt_row(r: Row) -> String:
+    return r.id.to_string() + "/" + q(r.label)
+
+fn fmt_grid(v: Grid) -> String:
+    mut s := q(v.name) + " [" + v.cells.len().to_string() + "]"
+    for r in v.cells:
+        s = s + " " + fmt_ints(r)
+    return s
+
+fn fmt_table(v: Table) -> String:
+    mut s := "[" + v.rows.len().to_string() + "]"
+    for r in v.rows:
+        s = s + " ("
+        for x in r:
+            s = s + fmt_row(x) + ";"
+        s = s + ")"
+    return s + " n=" + v.n.to_string()
+
+fn fmt_outer(o: Outer) -> String:
+    return o.id.to_string() + ":" + fmt_ints(o.xs) + ":" + fmt_strings(o.inner.tags)
+
+fn fmt_outers(v: Outers) -> String:
+    mut s := "[" + v.items.len().to_string() + "]"
+    for o in v.items:
+        s = s + " " + fmt_outer(o)
+    s = s + " grid[" + v.grid.len().to_string() + "]"
+    for r in v.grid:
+        s = s + " ("
+        for o in r:
+            s = s + fmt_outer(o) + ";"
+        s = s + ")"
+    return s
+
+fn fmt_int_map(m: Map[String, Int]) -> String:
+    mut s := "[" + m.len().to_string() + "]"
+    for k in sorted(m.keys()):
+        s = s + " " + k + "=" + m[k].to_string()
+    return s
+
+fn fmt_scores(v: Scores) -> String:
+    return q(v.title) + " " + fmt_int_map(v.scores)
+
+fn fmt_names(v: Names) -> String:
+    mut s := "[" + v.names.len().to_string() + "]"
+    for k in sorted(v.names.keys()):
+        s = s + " " + k + "=" + q(v.names[k])
+    return s
+
+fn fmt_row_map(m: Map[String, Row]) -> String:
+    mut s := "[" + m.len().to_string() + "]"
+    for k in sorted(m.keys()):
+        s = s + " " + k + "=" + fmt_row(m[k])
+    return s
+
+fn fmt_rows(v: Rows) -> String:
+    return fmt_row_map(v.rows)
+
+fn fmt_list_map(m: Map[String, List[Int]]) -> String:
+    mut s := "[" + m.len().to_string() + "]"
+    for k in sorted(m.keys()):
+        s = s + " " + k + "=" + fmt_ints(m[k])
+    return s
+
+fn fmt_lists(v: Lists) -> String:
+    return fmt_list_map(v.lists)
+
+fn fmt_groups(groups: List[Map[String, Int]]) -> String:
+    mut s := "[" + groups.len().to_string() + "]"
+    for g in groups:
+        s = s + " (" + fmt_int_map(g) + ")"
+    return s
+
+fn fmt_mixed(v: Mixed) -> String:
+    mut s := q(v.name) + " " + fmt_strings(v.tags) + " scores" + fmt_int_map(v.scores) + " rows" + fmt_row_map(v.rows) + " nested[" + v.nested.len().to_string() + "]"
+    for k in sorted(v.nested.keys()):
+        inner := v.nested[k]
+        s = s + " " + k + "=("
+        for ik in sorted(inner.keys()):
+            s = s + ik + "=" + q(inner[ik]) + ";"
+        s = s + ")"
+    return s + " groups" + fmt_groups(v.groups) + " count=" + v.count.to_string()
+
+fn fmt_maybe(v: Maybe) -> String:
+    mut s := "cells[" + v.cells.len().to_string() + "]"
+    for r in v.cells:
+        s = s + " " + fmt_ints(r)
+    s = s + " scores" + fmt_int_map(v.scores) + " rows" + fmt_row_map(v.rows) + " lists" + fmt_list_map(v.lists) + " groups" + fmt_groups(v.groups)
+    if let n = v.note:
+        return s + " note=" + q(n)
+    return s + " note=none"
+
+# the hand walks: json.parse, then the node accessors
+fn walk_int_list(node: Int) -> List[Int]:
+    mut xs: List[Int] := []
+    mut i := 0
+    while i < json.array_len(node):
+        xs.push(json.get_int(json.array_get(node, i)))
+        i = i + 1
+    return xs
+
+fn walk_string_list(node: Int) -> List[String]:
+    mut xs: List[String] := []
+    mut i := 0
+    while i < json.array_len(node):
+        xs.push(json.get_string(json.array_get(node, i)))
+        i = i + 1
+    return xs
+
+fn walk_int_map(node: Int) -> Map[String, Int]:
+    mut m: Map[String, Int] := {}
+    for k in json.object_keys(node):
+        m.insert(k, json.get_int(json.object_get(node, k)))
+    return m
+
+fn walk_row_map(node: Int) -> Map[String, Row]:
+    mut m: Map[String, Row] := {}
+    for k in json.object_keys(node):
+        m.insert(k, json.decode_object[Row](json.object_get(node, k)) catch Row(0 - 1, "?"))
+    return m
+
+fn walk_grid(doc: String) -> Grid:
+    root := json.parse(doc)
+    arr := json.object_get(root, "cells")
+    mut cells: List[List[Int]] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        cells.push(walk_int_list(json.array_get(arr, i)))
+        i = i + 1
+    return Grid(json.object_get_string(root, "name"), cells)
+
+fn walk_table(doc: String) -> Table:
+    root := json.parse(doc)
+    arr := json.object_get(root, "rows")
+    mut rows: List[List[Row]] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        inner := json.array_get(arr, i)
+        mut r: List[Row] := []
+        mut k := 0
+        while k < json.array_len(inner):
+            r.push(json.decode_object[Row](json.array_get(inner, k)) catch Row(0 - 1, "?"))
+            k = k + 1
+        rows.push(r)
+        i = i + 1
+    return Table(rows, json.object_get_int(root, "n"))
+
+fn walk_outer(node: Int) -> Outer:
+    inner := json.object_get(node, "inner")
+    return Outer(json.object_get_int(node, "id"), walk_int_list(json.object_get(node, "xs")), Inner(walk_string_list(json.object_get(inner, "tags"))))
+
+fn walk_outers(doc: String) -> Outers:
+    root := json.parse(doc)
+    arr := json.object_get(root, "items")
+    mut items: List[Outer] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        items.push(walk_outer(json.array_get(arr, i)))
+        i = i + 1
+    grid_arr := json.object_get(root, "grid")
+    mut grid: List[List[Outer]] := []
+    i = 0
+    while i < json.array_len(grid_arr):
+        inner := json.array_get(grid_arr, i)
+        mut r: List[Outer] := []
+        mut k := 0
+        while k < json.array_len(inner):
+            r.push(walk_outer(json.array_get(inner, k)))
+            k = k + 1
+        grid.push(r)
+        i = i + 1
+    return Outers(items, grid)
+
+fn walk_scores(doc: String) -> Scores:
+    root := json.parse(doc)
+    return Scores(json.object_get_string(root, "title"), walk_int_map(json.object_get(root, "scores")))
+
+fn walk_names(doc: String) -> Names:
+    root := json.parse(doc)
+    node := json.object_get(root, "names")
+    mut m: Map[String, String] := {}
+    for k in json.object_keys(node):
+        m.insert(k, json.get_string(json.object_get(node, k)))
+    return Names(m)
+
+fn walk_rows(doc: String) -> Rows:
+    root := json.parse(doc)
+    return Rows(walk_row_map(json.object_get(root, "rows")))
+
+fn walk_lists(doc: String) -> Lists:
+    root := json.parse(doc)
+    node := json.object_get(root, "lists")
+    mut m: Map[String, List[Int]] := {}
+    for k in json.object_keys(node):
+        m.insert(k, walk_int_list(json.object_get(node, k)))
+    return Lists(m)
+
+fn walk_mixed(doc: String) -> Mixed:
+    root := json.parse(doc)
+    nested_node := json.object_get(root, "nested")
+    mut nested: Map[String, Map[String, String]] := {}
+    for k in json.object_keys(nested_node):
+        inner_node := json.object_get(nested_node, k)
+        mut inner: Map[String, String] := {}
+        for ik in json.object_keys(inner_node):
+            inner.insert(ik, json.get_string(json.object_get(inner_node, ik)))
+        nested.insert(k, inner)
+    groups_node := json.object_get(root, "groups")
+    mut groups: List[Map[String, Int]] := []
+    mut i := 0
+    while i < json.array_len(groups_node):
+        groups.push(walk_int_map(json.array_get(groups_node, i)))
+        i = i + 1
+    return Mixed(json.object_get_string(root, "name"), walk_string_list(json.object_get(root, "tags")), walk_int_map(json.object_get(root, "scores")), walk_row_map(json.object_get(root, "rows")), nested, groups, json.object_get_int(root, "count"))
+
+fn both(label: String, fill: String, walk: String):
+    print(label + " fill: " + fill)
+    print(label + " walk: " + walk)
+    print(label + " same: " + (fill == walk).to_string())
+
+fn grid_both(label: String, doc: String):
+    r := json.decode_text[Grid](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_grid(r.ok), fmt_grid(walk_grid(doc)))
+
+fn table_both(label: String, doc: String):
+    r := json.decode_text[Table](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_table(r.ok), fmt_table(walk_table(doc)))
+
+fn scores_both(label: String, doc: String):
+    r := json.decode_text[Scores](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_scores(r.ok), fmt_scores(walk_scores(doc)))
+
+fn rows_both(label: String, doc: String):
+    r := json.decode_text[Rows](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_rows(r.ok), fmt_rows(walk_rows(doc)))
+
+fn lists_both(label: String, doc: String):
+    r := json.decode_text[Lists](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_lists(r.ok), fmt_lists(walk_lists(doc)))
+
+fn mixed_both(label: String, doc: String):
+    r := json.decode_text[Mixed](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_mixed(r.ok), fmt_mixed(walk_mixed(doc)))
+
+fn grid_err(label: String, doc: String):
+    r := json.decode_text[Grid](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + fmt_grid(r.ok))
+
+fn table_err(label: String, doc: String):
+    r := json.decode_text[Table](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + fmt_table(r.ok))
+
+fn mixed_err(label: String, doc: String):
+    r := json.decode_text[Mixed](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + fmt_mixed(r.ok))
+
+fn deep_err(label: String, doc: String):
+    r := json.decode_text[Deep](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + r.ok.cells.len().to_string())
+    parsed := json.parse(doc)
+    print(label + " parse: " + json.type_of(parsed))
+
+fn node_err(label: String, doc: String):
+    r := json.decode_text[Maybe](doc)
+    if r.is_err:
+        print(label + " node err: " + r.err.message)
+    else:
+        print(label + " node ok: " + fmt_maybe(r.ok))
+
+fn maybe_doc(cells: String, scores: String, rows: String, lists: String, groups: String) -> String:
+    return obj(kv("cells", cells) + "," + kv("scores", scores) + "," + kv("rows", rows) + "," + kv("lists", lists) + "," + kv("groups", groups))
+
+fn mixed_doc(tags: String, scores: String, rows: String, nested: String, groups: String) -> String:
+    return obj(kv("name", q("m")) + "," + kv("tags", tags) + "," + kv("scores", scores) + "," + kv("rows", rows) + "," + kv("nested", nested) + "," + kv("groups", groups) + "," + kv("count", "9"))
+
+fn main() -> Int:
+    # nested lists: empty at every level, one, many, a list of lists of
+    # structs, from text and from bytes
+    grid_both("grid_empty", obj(kv("name", q("e")) + "," + kv("cells", "[]")))
+    grid_both("grid_inner_empty", obj(kv("name", q("i")) + "," + kv("cells", "[[],[]]")))
+    grid_both("grid_many", obj(kv("name", q("m")) + "," + kv("cells", "[[1,2,3],[],[4],[-5,0]]")))
+    grid_bytes := json.decode[Grid](bytes.from_string_utf8(obj(kv("name", q("b")) + "," + kv("cells", "[[7],[8,9]]"))))
+    if grid_bytes.is_err:
+        print("grid_bytes err: " + grid_bytes.err.message)
+    else:
+        print("grid_bytes fill: " + fmt_grid(grid_bytes.ok))
+    table_both("table_empty", obj(kv("rows", "[]") + "," + kv("n", "0")))
+    table_both("table_many", obj(kv("rows", "[[" + row(1, "one") + "," + row(2, "two") + "],[],[" + row(3, "three") + "]]") + "," + kv("n", "3")))
+    outers_doc := obj(kv("items", "[" + obj(kv("id", "1") + "," + kv("xs", "[1,2]") + "," + kv("inner", obj(kv("tags", "[" + q("a") + "," + q("b") + "]")))) + "," + obj(kv("id", "2") + "," + kv("xs", "[]") + "," + kv("inner", obj(kv("tags", "[]")))) + "]") + "," + kv("grid", "[[" + obj(kv("id", "3") + "," + kv("xs", "[3]") + "," + kv("inner", obj(kv("tags", "[" + q("c") + "]")))) + "],[]]"))
+    outers := json.decode_text[Outers](outers_doc)
+    if outers.is_err:
+        print("outers fill err: " + outers.err.message)
+    else:
+        both("outers", fmt_outers(outers.ok), fmt_outers(walk_outers(outers_doc)))
+
+    # maps: empty, one, many, of every value kind; keys with spaces, dots
+    # and escapes; a repeated key, whose last value wins
+    scores_both("scores_empty", obj(kv("title", q("e")) + "," + kv("scores", obj(""))))
+    scores_both("scores_one", obj(kv("title", q("o")) + "," + kv("scores", obj(kv("only", "1")))))
+    scores_both("scores_many", obj(kv("title", q("m")) + "," + kv("scores", obj(kv("bob", "3") + "," + kv("al", "-5") + "," + kv("with space", "0") + "," + kv("dot.ted", "7")))))
+    scores_both("scores_dup", obj(kv("title", q("d")) + "," + kv("scores", obj(kv("bob", "3") + "," + kv("al", "5") + "," + kv("bob", "7")))))
+    scores_bytes := json.decode[Scores](bytes.from_string_utf8(obj(kv("title", q("b")) + "," + kv("scores", obj(kv("x", "1"))))))
+    if scores_bytes.is_err:
+        print("scores_bytes err: " + scores_bytes.err.message)
+    else:
+        print("scores_bytes fill: " + fmt_scores(scores_bytes.ok))
+    names_doc := obj(kv("names", obj(kv("a", q("")) + "," + kv("b", q("bee")) + "," + kv(chr(92) + "u00e9", q("esc" + chr(92) + "n")))))
+    names := json.decode_text[Names](names_doc)
+    if names.is_err:
+        print("names fill err: " + names.err.message)
+    else:
+        both("names", fmt_names(names.ok), fmt_names(walk_names(names_doc)))
+    rows_both("rows_empty", obj(kv("rows", obj(""))))
+    rows_both("rows_many", obj(kv("rows", obj(kv("a", row(1, "one")) + "," + kv("b", row(2, "two")) + "," + kv("c", row(3, ""))))))
+    rows_both("rows_dup", obj(kv("rows", obj(kv("a", row(1, "one")) + "," + kv("a", row(2, "two"))))))
+    lists_both("lists_empty", obj(kv("lists", obj(""))))
+    lists_both("lists_many", obj(kv("lists", obj(kv("a", "[1,2]") + "," + kv("b", "[]") + "," + kv("c", "[3]")))))
+    lists_both("lists_dup", obj(kv("lists", obj(kv("a", "[1,2]") + "," + kv("a", "[9]")))))
+
+    # a struct with maps beside lists and scalars, maps of maps, a list of
+    # maps, whitespace and keys out of order, unknown keys holding objects
+    mixed_both("mixed", mixed_doc("[" + q("t") + "]", obj(kv("s", "1")), obj(kv("r", row(4, "four"))), obj(kv("n", obj(kv("k", q("v")) + "," + kv("k2", q("v2")))) + "," + kv("e", obj(""))), "[" + obj(kv("g", "1") + "," + kv("h", "2")) + "," + obj("") + "]"))
+    mixed_both("mixed_empty", mixed_doc("[]", obj(""), obj(""), obj(""), "[]"))
+    mixed_both("mixed_spaced", " " + chr(123) + " " + q("count") + " : 9 , " + q("groups") + " : [ " + chr(123) + " " + q("g") + " : 1 " + chr(125) + " ] , " + q("nested") + " : " + chr(123) + " " + q("n") + " : " + chr(123) + " " + q("k") + " : " + q("v") + " " + chr(125) + " " + chr(125) + " , " + q("rows") + " : " + chr(123) + chr(125) + " , " + q("scores") + " : " + chr(123) + " " + q("a") + " : 1 " + chr(125) + " , " + q("tags") + " : [ ] , " + q("name") + " : " + q("sp") + " " + chr(125))
+    junk := obj(kv("a", "[1," + obj(kv("b", obj(kv("c", "[[]]")))) + "]"))
+    mixed_both("mixed_extras", obj(kv("junk", junk) + "," + kv("name", q("x")) + "," + kv("tags", "[]") + "," + kv("scores", obj(kv("s", "1"))) + "," + kv("rows", obj(kv("r", obj(kv("junk", junk) + "," + kv("id", "1") + "," + kv("label", q("l")))))) + "," + kv("nested", obj("")) + "," + kv("groups", "[]") + "," + kv("count", "1") + "," + kv("more", junk)))
+    # a map has no unknown keys: every member is a value of the map's type
+    mixed_err("map_junk_member", mixed_doc("[]", obj(kv("s", "1") + "," + kv("junk", junk)), obj(""), obj(""), "[]"))
+
+    # errors through the filler: a wrong element in the inner list of the
+    # third outer element, an inner element of the wrong kind, an inner
+    # list that is not a list, a struct missing a field in the third inner
+    # list, a map's second value of the wrong type, a struct member missing
+    # a field, a member of the wrong kind, a map field holding an array, a
+    # missing map field, a list element that should be a map, an inner map
+    # value of the wrong kind, a malformed member, a member cut off
+    grid_err("inner_third", obj(kv("name", q("w")) + "," + kv("cells", "[[1],[2],[3," + q("x") + "],[4]]")))
+    grid_err("inner_first_of_third", obj(kv("name", q("w")) + "," + kv("cells", "[[1],[2],[null,3]]")))
+    grid_err("inner_not_list", obj(kv("name", q("w")) + "," + kv("cells", "[[1],7,[3]]")))
+    grid_err("inner_object", obj(kv("name", q("w")) + "," + kv("cells", "[[1]," + obj(kv("a", "1")) + "]")))
+    table_err("table_third_missing", obj(kv("rows", "[[" + row(1, "a") + "],[],[" + row(2, "b") + "," + obj(kv("id", "3")) + "]]") + "," + kv("n", "1")))
+    table_err("table_field_after", obj(kv("rows", "[[" + obj(kv("id", "3")) + "]]") + "," + kv("n", q("x"))))
+    mixed_err("map_second_wrong", mixed_doc("[]", obj(kv("a", "1") + "," + kv("b", q("two")) + "," + kv("c", "3")), obj(""), obj(""), "[]"))
+    mixed_err("map_second_missing", mixed_doc("[]", obj(""), obj(kv("a", row(1, "a")) + "," + kv("b", obj(kv("id", "2"))) + "," + kv("c", row(3, "c"))), obj(""), "[]"))
+    mixed_err("map_member_kind", mixed_doc("[]", obj(""), obj(kv("a", "[1]")), obj(""), "[]"))
+    mixed_err("map_member_null", mixed_doc("[]", obj(kv("a", "null")), obj(""), obj(""), "[]"))
+    mixed_err("map_is_array", mixed_doc("[]", "[1,2]", obj(""), obj(""), "[]"))
+    mixed_err("map_is_string", mixed_doc("[]", q("s"), obj(""), obj(""), "[]"))
+    mixed_err("map_missing", obj(kv("name", q("m")) + "," + kv("tags", "[]") + "," + kv("rows", obj("")) + "," + kv("nested", obj("")) + "," + kv("groups", "[]") + "," + kv("count", "1")))
+    mixed_err("group_not_map", mixed_doc("[]", obj(""), obj(""), obj(""), "[" + obj(kv("g", "1")) + ",5]"))
+    mixed_err("nested_inner_wrong", mixed_doc("[]", obj(""), obj(""), obj(kv("n", obj(kv("k", "1")))), "[]"))
+    mixed_err("nested_inner_not_map", mixed_doc("[]", obj(""), obj(""), obj(kv("n", "[]")), "[]"))
+    mixed_err("field_order", mixed_doc("[7]", obj(kv("a", q("x"))), obj(""), obj(""), "[]"))
+    mixed_err("member_malformed", mixed_doc("[]", obj(kv("a", "1") + "," + kv("b", "?")), obj(""), obj(""), "[]"))
+    mixed_err("member_key_unquoted", mixed_doc("[]", chr(123) + "a:1" + chr(125), obj(""), obj(""), "[]"))
+    mixed_err("member_cut", chr(123) + kv("name", q("m")) + "," + kv("tags", "[]") + "," + kv("scores", chr(123) + kv("a", "1") + "," + q("b")))
+    mixed_err("member_dup_then_wrong", mixed_doc("[]", obj(kv("a", "1") + "," + kv("a", q("x"))), obj(""), obj(""), "[]"))
+    mixed_err("member_wrong_then_dup", mixed_doc("[]", obj(kv("a", q("x")) + "," + kv("a", "1")), obj(""), obj(""), "[]"))
+
+    # the depth bound, the parser's: 127 brackets under the field read
+    # (the innermost is an element of the wrong kind, at depth 128), 128
+    # do not, and the parser agrees; a hundred thousand deep, as brackets
+    # and as objects, fails the same way without touching the stack
+    deep_err("depth_at_limit", obj(kv("cells", brackets(127))))
+    deep_err("depth_past_limit", obj(kv("cells", brackets(128))))
+    deep_err("depth_hostile_arrays", obj(kv("cells", brackets(100000))))
+    deep_err("depth_hostile_objects", obj(kv("cells", "[[[" + objects(100000) + "]]]")))
+    mixed_err("depth_under_map", mixed_doc("[]", obj(kv("a", objects(200))), obj(""), obj(""), "[]"))
+    mixed_err("depth_under_unknown_key", mixed_doc("[]", obj(""), obj(""), obj(""), "[]" + "," + kv("junk", brackets(200))))
+
+    # the node-pool path on the same documents: good, then the errors
+    node_err("node_full", maybe_doc("[[1,2],[]]", obj(kv("bob", "3") + "," + kv("al", "5") + "," + kv("bob", "7")), obj(kv("a", row(1, "one")) + "," + kv("a", row(2, "two"))), obj(kv("l", "[1]") + "," + kv("l", "[2,3]")), "[" + obj(kv("g", "1")) + "," + obj("") + "]"))
+    node_err("node_with_note", obj(kv("cells", "[]") + "," + kv("scores", obj("")) + "," + kv("rows", obj("")) + "," + kv("lists", obj("")) + "," + kv("groups", "[]") + "," + kv("note", q("n"))))
+    node_err("node_inner_third", maybe_doc("[[1],[2],[3," + q("x") + "]]", obj(""), obj(""), obj(""), "[]"))
+    node_err("node_inner_not_list", maybe_doc("[[1],7]", obj(""), obj(""), obj(""), "[]"))
+    node_err("node_map_second_wrong", maybe_doc("[]", obj(kv("a", "1") + "," + kv("b", q("two"))), obj(""), obj(""), "[]"))
+    node_err("node_map_second_missing", maybe_doc("[]", obj(""), obj(kv("a", row(1, "a")) + "," + kv("b", obj(kv("id", "2")))), obj(""), "[]"))
+    node_err("node_map_member_kind", maybe_doc("[]", obj(""), obj(kv("a", "[1]")), obj(""), "[]"))
+    node_err("node_map_is_array", maybe_doc("[]", "[1]", obj(""), obj(""), "[]"))
+    node_err("node_map_missing", obj(kv("cells", "[]") + "," + kv("rows", obj("")) + "," + kv("lists", obj("")) + "," + kv("groups", "[]")))
+    node_err("node_list_value_wrong", maybe_doc("[]", obj(""), obj(""), obj(kv("l", "[1," + q("x") + "]")), "[]"))
+    node_err("node_group_not_map", maybe_doc("[]", obj(""), obj(""), obj(""), "[" + obj("") + ",5]"))
+    node_err("node_group_value_wrong", maybe_doc("[]", obj(""), obj(""), obj(""), "[" + obj(kv("g", q("x"))) + "]"))
+    parsed := json.parse(maybe_doc("[[4]]", obj(kv("p", "1")), obj(kv("r", row(5, "five"))), obj(kv("l", "[6]")), "[" + obj(kv("g", "7")) + "]"))
+    from_object := json.decode_object[Maybe](parsed)
+    if from_object.is_err:
+        print("decode_object err: " + from_object.err.message)
+    else:
+        print("decode_object ok: " + fmt_maybe(from_object.ok))
+
+    # churn: many decodes whose containers are kept long enough to read, a
+    # failing document every third round, so every destructor runs
+    mut total := 0
+    mut n := 0
+    while n < 200:
+        mut scores := kv("a", n.to_string()) + "," + kv("b", "2")
+        if n % 3 == 2:
+            scores = scores + "," + kv("c", q("bad"))
+        m := json.decode_text[Mixed](mixed_doc("[" + q("t" + n.to_string()) + "]", obj(scores), obj(kv("r", row(n, "r" + n.to_string()))), obj(kv("n", obj(kv("k", q("v"))))), "[" + obj(kv("g", n.to_string())) + "]")) catch Mixed("", [], {}, {}, {}, [], 0 - 1)
+        total = total + m.count + m.scores.len() + m.rows.len() + m.tags.len() + m.groups.len()
+        n = n + 1
+    print("churn " + total.to_string())
+    return 0

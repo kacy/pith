@@ -1,0 +1,15 @@
+# a Map whose value is an optional is refused in a json decode target, as
+# a List of optionals is: a null under a key has no meaning the filler and
+# the node accessors agree on, so the value of a Map[String, T] is a
+# scalar, a struct, a list or a map, never a T?. the Map[String, List[Int]]
+# beside it is accepted.
+import std.json as json
+
+struct Sparse:
+    pub lists: Map[String, List[Int]]
+    pub maybe: Map[String, Int?]
+
+fn main():
+    r := json.decode_text[Sparse]("x")
+    if r.is_err:
+        print("err")

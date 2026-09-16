@@ -249,20 +249,25 @@ something here that now works, the page is stale and a fix to it is welcome.
   `--exclude-tag` select and exclude, and `--json` reports the run as one json
   record per result for ci. benchmarks are still missing. the project's own
   suite is golden-snapshot based (see `tests/`).
-- **a json decode target holds scalars, optionals, nested structs and lists
-  of those** — `json.decode[T]` and `json.decode_text[T]` fill a struct field
-  by field, and a field may be an `Int`, a `String`, a `Bool`, a `Float`, an
-  optional of those, another struct, which is filled in place, or a `List`
-  whose element is an `Int`, a `String`, a `Bool`, a `Float` or such a
-  struct (which may itself hold lists and structs). a `Map` field is refused
-  at the checker (E219, "json.decode does not support field 'x' of type
-  Map"), and so is a `List` whose element is a `List`, a `Map` or an
-  optional; reach such a document through `json.parse` and the node
-  accessors, which read any shape. issue #1110 tracks the rest. a `Float`
-  field takes any json number, an integer included (`3` reads as `3.0`),
-  while an `Int` field takes only an integer; `config.decode` and the toml
-  and yaml decoders still refuse a `Float` and a `List` field, since their
-  require helpers have neither form.
+- **a json decode target holds scalars, optionals, nested structs, lists
+  and string-keyed maps** — `json.decode[T]` and `json.decode_text[T]` fill
+  a struct field by field, and a field may be an `Int`, a `String`, a
+  `Bool`, a `Float`, an optional of those, another struct (filled in
+  place), a `List` or a `Map[String, _]`. a list's element and a map's value
+  may be any of the scalars, such a struct, or another list or map, at any
+  depth: `List[List[Int]]`, `Map[String, Row]`, `Map[String, List[String]]`,
+  `List[Map[String, Int]]`. what stays refused at the checker (E219,
+  "json.decode does not support field 'x' of type ..."): a `Map` whose key
+  is not a `String` (a json object's keys are strings), and a `List` or a
+  `Map` whose element is an optional (`List[Int?]`, `Map[String, Int?]`), since
+  a null in an array or under a key has no meaning the decoders agree on;
+  reach such a document through `json.parse` and the node accessors. a
+  `Float` field takes any json number, an integer included (`3` reads as
+  `3.0`), while an `Int` field takes only an integer. a document nested
+  deeper than 128 levels is refused, as `json.parse` refuses it ("json
+  nested deeper than 128 levels"). `config.decode` and the toml and yaml
+  decoders still refuse a `Float`, a `List` and a `Map` field, since their
+  require helpers have none of those forms.
 
 - **plaintext http/2 needs an explicit listener** — over tls, `web.listen_tls`
   offers alpn `["h2", "http/1.1"]` and serves whichever the client picks. there

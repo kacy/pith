@@ -888,19 +888,22 @@ pith build bench/json_decode_shapes.pith
 ./bench/json_decode_shapes list 32 400      # a struct with a List of 32 small objects (list fill)
 ./bench/json_decode_shapes list_walk 32 400 # the same document through json.parse and decode_object per element
 ./bench/json_decode_shapes list_scalar 32 400  # a struct with a List[Int] of 32 elements
+./bench/json_decode_shapes nested_list 32 400  # a struct with a List[List[Int]] of 32 inner lists of four
+./bench/json_decode_shapes map 32 400          # a struct with a Map[String, Int] of 32 members
+./bench/json_decode_shapes map_struct 32 400   # a struct with a Map[String, Small] of 32 members
 ./bench/json_decode_shapes float 4 20000    # four fields, two of them Float
 ./bench/json_decode_shapes ints 4 20000     # the same layout with Int in their place
 ```
 
 `json_decode_shapes` decodes one struct shape per run; `size` is the
 string value width for the flat shapes and the element count for the
-lists. the flat shapes take the runtime's single-pass fill, the nested
-shape its nested twin, which fills the sub-struct in place, and the two
-list shapes the list-aware form of that filler, which builds the list
-and its element structs as it reads; `list_walk` parses the same
-document into the node pool and decodes each element out of it, the way
-a list had to be read before a `List` field was a decode target, so the
-pair reads one document two ways.
+collections. the flat shapes take the runtime's single-pass fill, the
+nested shape its nested twin, which fills the sub-struct in place, and
+the list and map shapes the collection-aware form of that filler, which
+builds the lists, maps and element structs as it reads; `list_walk`
+parses the same document into the node pool and decodes each element out
+of it, the way a list had to be read before a `List` field was a decode
+target, so the pair reads one document two ways.
 
 the night's totals for these programs, each compiled by the compiler at the
 start of 2026-09-10 (`0fe497c0`) and by the tip (`099e7e62`, after #1107)

@@ -1,0 +1,108 @@
+# typed json.decode of a struct with map fields and nested list fields
+# beside an optional field, the shape that takes the node-pool path
+# rather than the filler, and json.decode_object of the same struct out
+# of a parsed document.
+#
+# on this path a map, and a list whose element is a list or a map, is
+# built by the general node builder the decode lowering emits: the
+# container first, then each value read out of its node under its path
+# and stored as it is built (a heap value through the owned kind-carrying
+# store, so the container owns it), a struct value through the element
+# type's decode_object specialization. every container built has to end
+# up owned by the decoded struct, and the struct's destructor has to drop
+# it; a value that fails drops the container and everything before it.
+#
+# the round decodes from text or through decode_object inside a pool
+# scope, with the optional field absent every time (a present
+# `String?` on this path strands about 32 bytes per decode, #1144), and
+# fails once in the FIRST field, since a failure in a later field strands
+# the fields read before it on this path (#1145); both are older than
+# collection fields and are kept out of what this case measures.
+import leakprobe as probe
+import std.json as json
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Order:
+    pub scores: Map[String, Int]
+    pub note: String?
+    pub rows: Map[String, Row]
+    pub grid: List[List[Int]]
+    pub tags: Map[String, List[String]]
+    pub names: Map[String, String]
+    pub groups: List[Map[String, Int]]
+    pub table: List[List[Row]]
+    pub nested: Map[String, Map[String, Row]]
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+# one member per collection, a repeated key in the struct map, an empty
+# inner container where the shape allows: the node pool costs a string
+# key build per access, so the document stays small enough for the
+# gate's 800k rounds
+fn order_doc(i: Int, scores: String) -> String:
+    rows := obj(q("a") + ":" + row(0, "") + "," + q("a") + ":" + row(i, "label-" + i.to_string()))
+    grid := "[[1," + i.to_string() + "],[]]"
+    tags := obj(q("t") + ":[" + q("x" + i.to_string()) + "]")
+    names := obj(q("n") + ":" + q("name-" + i.to_string()))
+    groups := "[" + obj(q("g") + ":1") + "]"
+    table := "[[" + row(i, "t-" + i.to_string()) + "]]"
+    nested := obj(q("outer") + ":" + obj(q("inner") + ":" + row(i, "n-" + i.to_string())))
+    return obj(q("scores") + ":" + scores + "," + q("rows") + ":" + rows + "," + q("grid") + ":" + grid + "," + q("tags") + ":" + tags + "," + q("names") + ":" + names + "," + q("groups") + ":" + groups + "," + q("table") + ":" + table + "," + q("nested") + ":" + nested)
+
+fn order_sum(o: Order) -> Int:
+    mut t := o.scores.len() + o.grid.len() + o.groups.len()
+    for k in o.rows.keys():
+        t = t + o.rows[k].id + o.rows[k].label.len()
+    for k in o.tags.keys():
+        t = t + o.tags[k].len()
+    for k in o.names.keys():
+        t = t + o.names[k].len()
+    for r in o.table:
+        t = t + r.len()
+    for k in o.nested.keys():
+        t = t + o.nested[k].len()
+    return t
+
+# one full decode a round, from text on even rounds and through
+# decode_object out of a parsed document on odd ones, plus the failing
+# document
+fn round(i: Int) -> Int:
+    doc := order_doc(i, obj(q("s") + ":" + i.to_string()))
+    mut v := 0
+    if i % 2 == 0:
+        a := json.decode_text[Order](doc) catch Order({}, none, {}, [], {}, {}, [], [], {})
+        v = order_sum(a)
+    else:
+        mark := json.pool_mark_node_id()
+        parsed := json.parse(doc)
+        b := json.decode_object[Order](parsed) catch Order({}, none, {}, [], {}, {}, [], [], {})
+        json.pool_restore(mark, 0)
+        v = order_sum(b)
+    # the first field fails on its second member, after one was built;
+    # the fields after it are never reached, so the document ends there
+    bad := obj(q("scores") + ":" + obj(q("s") + ":1," + q("t") + ":" + q("two")))
+    c := json.decode_text[Order](bad)
+    if c.is_err:
+        v = v + c.err.message.len()
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

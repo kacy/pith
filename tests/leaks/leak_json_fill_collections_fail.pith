@@ -1,0 +1,137 @@
+# typed json.decode of structs with nested collection and map fields,
+# failing part way through: the cleanup after a partially built tree.
+#
+# the nested filler stores a list or a map into its slot before the first
+# element is read, and inserts a map value or pushes a list element before
+# its first byte is read (a struct allocated with its destructor, a nested
+# list or map built empty), so at every moment the root struct owns
+# everything built so far and the one release the entry point does on
+# failure drops the whole tree through the destructors. this case is the
+# pin for that at depth: a wrong element in the inner list of the third
+# outer element of a `List[List[Int]]` and of a `List[List[Row]]`, a
+# struct missing a field in the second value of a `Map[String, Row]`, a
+# wrong-typed value in the second member of a `Map[String, Int]` and of a
+# `Map[String, List[String]]`, a non-object under a map key, a repeated
+# key whose first value was a struct with strings, a struct member of a
+# map that fails after two members were built, and a document nested past
+# the depth bound, each with strings minted before and around the failure.
+# a filler that inserted a map value only after it had read clean grew
+# here by about 200 bytes a round.
+import leakprobe as probe
+import std.json as json
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Grid:
+    pub name: String
+    pub cells: List[List[Int]]
+    pub note: String
+
+pub struct Rows:
+    pub name: String
+    pub rows: List[List[Row]]
+    pub note: String
+
+pub struct Scores:
+    pub title: String
+    pub rows: Map[String, Row]
+    pub ints: Map[String, Int]
+    pub tags: Map[String, List[String]]
+    pub note: String
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn grid_doc(cells: String) -> String:
+    return obj(q("name") + ":" + q("name-text") + "," + q("cells") + ":" + cells + "," + q("note") + ":" + q("note-text"))
+
+fn rows_doc(rows: String) -> String:
+    return obj(q("name") + ":" + q("name-text") + "," + q("rows") + ":" + rows + "," + q("note") + ":" + q("note-text"))
+
+fn scores_doc(rows: String, ints: String, tags: String) -> String:
+    return obj(q("title") + ":" + q("title-text") + "," + q("rows") + ":" + rows + "," + q("ints") + ":" + ints + "," + q("tags") + ":" + tags + "," + q("note") + ":" + q("note-text"))
+
+fn brackets(n: Int) -> String:
+    mut s := ""
+    mut i := 0
+    while i < n:
+        s = s + "["
+        i = i + 1
+    i = 0
+    while i < n:
+        s = s + "]"
+        i = i + 1
+    return s
+
+fn count_grid(r: Grid!json.JsonDecodeError) -> Int:
+    if r.is_err:
+        return r.err.message.len()
+    return 0 - 1000
+
+fn count_rows(r: Rows!json.JsonDecodeError) -> Int:
+    if r.is_err:
+        return r.err.message.len()
+    return 0 - 1000
+
+fn count_scores(r: Scores!json.JsonDecodeError) -> Int:
+    if r.is_err:
+        return r.err.message.len()
+    return 0 - 1000
+
+fn round(i: Int) -> Int:
+    label := "label-" + i.to_string()
+    good := row(i, label)
+    good_rows := q("a") + ":" + good + "," + q("b") + ":" + good
+    good_ints := q("a") + ":1," + q("b") + ":2"
+    good_tags := q("a") + ":[" + q("x") + "," + q("y") + "]"
+    # the inner list of the third outer element fails
+    cells_third := grid_doc("[[1,2],[3],[4," + q("x") + ",5],[6]]")
+    rows_third := rows_doc("[[" + good + "],[" + good + "," + good + "],[" + good + "," + obj(q("id") + ":3") + "],[" + good + "]]")
+    rows_kind := rows_doc("[[" + good + "],[" + good + "],[" + good + ",7]]")
+    # a map's second value: a struct missing a field, a wrong-typed
+    # scalar, a wrong-typed element inside a list value
+    map_second_missing := scores_doc(obj(q("a") + ":" + good + "," + q("b") + ":" + obj(q("id") + ":2") + "," + q("c") + ":" + good), obj(good_ints), obj(good_tags))
+    map_second_wrong := scores_doc(obj(good_rows), obj(q("a") + ":1," + q("b") + ":" + q("two") + "," + q("c") + ":3"), obj(good_tags))
+    map_list_wrong := scores_doc(obj(good_rows), obj(good_ints), obj(q("a") + ":[" + q("x") + "]," + q("b") + ":[" + q("y") + ",2]"))
+    # a non-object under a map key, and a map value of the wrong kind
+    map_not_object := scores_doc("[" + good + "]", obj(good_ints), obj(good_tags))
+    map_value_kind := scores_doc(obj(q("a") + ":" + good + "," + q("b") + ":[1]"), obj(good_ints), obj(good_tags))
+    # a repeated key whose first value was a struct, then a failure later
+    map_dup_then_fail := scores_doc(obj(q("a") + ":" + good + "," + q("a") + ":" + good + "," + q("b") + ":" + good), obj(good_ints), obj(q("a") + ":[1]"))
+    # malformed inside a map value, and cut off inside one
+    map_malformed := scores_doc(obj(q("a") + ":" + good + "," + q("b") + ":" + chr(123) + q("id") + ":?" + chr(125)), obj(good_ints), obj(good_tags))
+    map_cut := chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":" + chr(123) + q("a") + ":" + good + "," + q("b") + ":" + chr(123) + q("id") + ":2," + q("label") + ":" + chr(34) + "tw"
+    # nested past the depth bound, after a good list was built
+    too_deep := grid_doc("[[1,2]," + brackets(130) + "]")
+    mut v := count_grid(json.decode_text[Grid](cells_third))
+    v = v + count_rows(json.decode_text[Rows](rows_third))
+    v = v + count_rows(json.decode_text[Rows](rows_kind))
+    v = v + count_scores(json.decode_text[Scores](map_second_missing))
+    v = v + count_scores(json.decode_text[Scores](map_second_wrong))
+    v = v + count_scores(json.decode_text[Scores](map_list_wrong))
+    v = v + count_scores(json.decode_text[Scores](map_not_object))
+    v = v + count_scores(json.decode_text[Scores](map_value_kind))
+    v = v + count_scores(json.decode_text[Scores](map_dup_then_fail))
+    v = v + count_scores(json.decode_text[Scores](map_malformed))
+    v = v + count_scores(json.decode_text[Scores](map_cut))
+    v = v + count_grid(json.decode_text[Grid](too_deep))
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

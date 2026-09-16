@@ -1,0 +1,114 @@
+grid_empty fill: "e" [0]
+grid_empty walk: "e" [0]
+grid_empty same: true
+grid_inner_empty fill: "i" [2] [] []
+grid_inner_empty walk: "i" [2] [] []
+grid_inner_empty same: true
+grid_many fill: "m" [4] [1;2;3;] [] [4;] [-5;0;]
+grid_many walk: "m" [4] [1;2;3;] [] [4;] [-5;0;]
+grid_many same: true
+grid_bytes fill: "b" [2] [7;] [8;9;]
+table_empty fill: [0] n=0
+table_empty walk: [0] n=0
+table_empty same: true
+table_many fill: [3] (1/"one";2/"two";) () (3/"three";) n=3
+table_many walk: [3] (1/"one";2/"two";) () (3/"three";) n=3
+table_many same: true
+outers fill: [2] 1:[1;2;]:["a";"b";] 2:[]:[] grid[2] (3:[3;]:["c";];) ()
+outers walk: [2] 1:[1;2;]:["a";"b";] 2:[]:[] grid[2] (3:[3;]:["c";];) ()
+outers same: true
+scores_empty fill: "e" [0]
+scores_empty walk: "e" [0]
+scores_empty same: true
+scores_one fill: "o" [1] only=1
+scores_one walk: "o" [1] only=1
+scores_one same: true
+scores_many fill: "m" [4] al=-5 bob=3 dot.ted=7 with space=0
+scores_many walk: "m" [4] al=-5 bob=3 dot.ted=7 with space=0
+scores_many same: true
+scores_dup fill: "d" [2] al=5 bob=7
+scores_dup walk: "d" [2] al=5 bob=7
+scores_dup same: true
+scores_bytes fill: "b" [1] x=1
+names fill: [3] a="" b="bee" é="esc
+"
+names walk: [3] a="" b="bee" é="esc
+"
+names same: true
+rows_empty fill: [0]
+rows_empty walk: [0]
+rows_empty same: true
+rows_many fill: [3] a=1/"one" b=2/"two" c=3/""
+rows_many walk: [3] a=1/"one" b=2/"two" c=3/""
+rows_many same: true
+rows_dup fill: [1] a=2/"two"
+rows_dup walk: [1] a=2/"two"
+rows_dup same: true
+lists_empty fill: [0]
+lists_empty walk: [0]
+lists_empty same: true
+lists_many fill: [3] a=[1;2;] b=[] c=[3;]
+lists_many walk: [3] a=[1;2;] b=[] c=[3;]
+lists_many same: true
+lists_dup fill: [1] a=[9;]
+lists_dup walk: [1] a=[9;]
+lists_dup same: true
+mixed fill: "m" ["t";] scores[1] s=1 rows[1] r=4/"four" nested[2] e=() n=(k="v";k2="v2";) groups[2] ([2] g=1 h=2) ([0]) count=9
+mixed walk: "m" ["t";] scores[1] s=1 rows[1] r=4/"four" nested[2] e=() n=(k="v";k2="v2";) groups[2] ([2] g=1 h=2) ([0]) count=9
+mixed same: true
+mixed_empty fill: "m" [] scores[0] rows[0] nested[0] groups[0] count=9
+mixed_empty walk: "m" [] scores[0] rows[0] nested[0] groups[0] count=9
+mixed_empty same: true
+mixed_spaced fill: "sp" [] scores[1] a=1 rows[0] nested[1] n=(k="v";) groups[1] ([1] g=1) count=9
+mixed_spaced walk: "sp" [] scores[1] a=1 rows[0] nested[1] n=(k="v";) groups[1] ([1] g=1) count=9
+mixed_spaced same: true
+mixed_extras fill: "x" [] scores[1] s=1 rows[1] r=1/"l" nested[0] groups[0] count=1
+mixed_extras walk: "x" [] scores[1] s=1 rows[1] r=1/"l" nested[0] groups[0] count=1
+mixed_extras same: true
+map_junk_member fill err: expected int element: scores.junk
+inner_third fill err: expected int element: cells[2][1]
+inner_first_of_third fill err: expected int element: cells[2][0]
+inner_not_list fill err: expected list element: cells[1]
+inner_object fill err: expected list element: cells[1]
+table_third_missing fill err: rows[2][1]: missing string field: label
+table_field_after fill err: rows[0][0]: missing string field: label
+map_second_wrong fill err: expected int element: scores.b
+map_second_missing fill err: rows.b: missing string field: label
+map_member_kind fill err: expected object element: rows.a
+map_member_null fill err: expected int element: scores.a
+map_is_array fill err: expected map field: scores
+map_is_string fill err: expected map field: scores
+map_missing fill err: missing map field: scores
+group_not_map fill err: expected map element: groups[1]
+nested_inner_wrong fill err: expected string element: nested.n.k
+nested_inner_not_map fill err: expected map element: nested.n
+field_order fill err: expected string element: tags[0]
+member_malformed fill err: invalid json object
+member_key_unquoted fill err: invalid json object
+member_cut fill err: invalid json object
+member_dup_then_wrong fill err: expected int element: scores.a
+member_wrong_then_dup fill ok: "m" [] scores[1] a=1 rows[0] nested[0] groups[0] count=9
+depth_at_limit fill err: expected int element: cells[0][0][0]
+depth_at_limit parse: object
+depth_past_limit fill err: json nested deeper than 128 levels
+depth_past_limit parse: invalid
+depth_hostile_arrays fill err: json nested deeper than 128 levels
+depth_hostile_arrays parse: invalid
+depth_hostile_objects fill err: json nested deeper than 128 levels
+depth_hostile_objects parse: invalid
+depth_under_map fill err: json nested deeper than 128 levels
+depth_under_unknown_key fill err: json nested deeper than 128 levels
+node_full node ok: cells[2] [1;2;] [] scores[2] al=5 bob=7 rows[1] a=2/"two" lists[1] l=[2;3;] groups[2] ([1] g=1) ([0]) note=none
+node_with_note node ok: cells[0] scores[0] rows[0] lists[0] groups[0] note="n"
+node_inner_third node err: expected int element: cells[2][1]
+node_inner_not_list node err: expected list element: cells[1]
+node_map_second_wrong node err: expected int element: scores.b
+node_map_second_missing node err: rows.b: missing string field: label
+node_map_member_kind node err: expected object element: rows.a
+node_map_is_array node err: expected map field: scores
+node_map_missing node err: missing map field: scores
+node_list_value_wrong node err: expected int element: lists.l[1]
+node_group_not_map node err: expected map element: groups[1]
+node_group_value_wrong node err: expected int element: groups[0].g
+decode_object ok: cells[1] [4;] scores[1] p=1 rows[1] r=5/"five" lists[1] l=[6;] groups[1] ([1] g=7) note=none
+churn 1810

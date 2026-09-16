@@ -1653,6 +1653,111 @@ pub fn object_require_float_list(handle: Int, key: String) -> List[Float]!JsonDe
         i = i + 1
     return out
 
+# gets a required object handle by key from an object, for a
+# `Map[String, T]` field: "missing map field: scores" when the key is
+# absent, "expected map field: scores" when it holds anything but an
+# object. the typed decode lowering calls this for a map field on the
+# node-pool path, then reads the members through object_member_count,
+# object_member_key and object_get.
+pub fn object_require_map(handle: Int, key: String) -> Int!JsonDecodeError:
+    value := json_object_get(handle, key)
+    if handle_has_type(value, "object"):
+        return value
+    if value < 0:
+        fail json_missing_field_error("map", key)
+    fail json_wrong_field_error("map", key)
+
+# the number of key slots an object node holds, repeated keys counted
+# once per occurrence; 0 for a node that is not an object. with
+# object_member_key this walks an object whose keys the caller does not
+# know, the way a `Map[String, T]` field is read.
+pub fn object_member_count(handle: Int) -> Int:
+    if not handle_has_type(handle, "object"):
+        return 0
+    return object_key_counts[handle]
+
+# the key in slot `index` of an object node, in document order; "" past
+# the end. object_get on that key reads the value the accessors read,
+# the last one under the key when it repeats.
+pub fn object_member_key(handle: Int, index: Int) -> String:
+    if not handle_has_type(handle, "object"):
+        return ""
+    if index < 0 or index >= object_key_counts[handle]:
+        return ""
+    return object_slot_name(handle, index)
+
+# the error for a value that is not of its kind, at a path that already
+# names its position: "expected int element: grid[1][3]", "expected
+# string element: scores.bob". the same text the typed filler produces
+# for the same document.
+fn json_kind_error_at(kind: String, path: String) -> JsonDecodeError:
+    return JsonDecodeError("expected " + kind + " element: " + path)
+
+# the node at `path`, which must be an int: its value, or the kind error.
+# the general node builder of the typed decode lowering reads a list
+# element or a map value through these node_require accessors.
+pub fn node_require_int(node: Int, path: String) -> Int!JsonDecodeError:
+    if handle_has_type(node, "int"):
+        return integer_values[node]
+    fail json_kind_error_at("int", path)
+
+# the node at `path`, which must be a string: its value, or the kind error.
+pub fn node_require_string(node: Int, path: String) -> String!JsonDecodeError:
+    if handle_has_type(node, "string"):
+        return string_values[node]
+    fail json_kind_error_at("string", path)
+
+# the node at `path`, which must be a bool: its value, or the kind error.
+pub fn node_require_bool(node: Int, path: String) -> Bool!JsonDecodeError:
+    if handle_has_type(node, "bool"):
+        return json_get_bool(node)
+    fail json_kind_error_at("bool", path)
+
+# the node at `path`, which must be a number: its value as a Float, an
+# integer widened (`3` reads 3.0), or the kind error.
+pub fn node_require_float(node: Int, path: String) -> Float!JsonDecodeError:
+    if handle_has_type(node, "float"):
+        return float_values[node]
+    if handle_has_type(node, "int"):
+        return integer_values[node].to_float()
+    fail json_kind_error_at("float", path)
+
+# the node at `path`, which must be an object to decode a struct from:
+# the handle, or "expected object element: <path>".
+pub fn node_require_object(node: Int, path: String) -> Int!JsonDecodeError:
+    if handle_has_type(node, "object"):
+        return node
+    fail json_kind_error_at("object", path)
+
+# the node at `path`, which must be an array to build a list from: the
+# handle, or "expected list element: <path>".
+pub fn node_require_array(node: Int, path: String) -> Int!JsonDecodeError:
+    if handle_has_type(node, "array"):
+        return node
+    fail json_kind_error_at("list", path)
+
+# the node at `path`, which must be an object to build a map from: the
+# handle, or "expected map element: <path>".
+pub fn node_require_map(node: Int, path: String) -> Int!JsonDecodeError:
+    if handle_has_type(node, "object"):
+        return node
+    fail json_kind_error_at("map", path)
+
+# the path of element `index` under `path`: "grid[1]" under "grid".
+pub fn element_path(path: String, index: Int) -> String:
+    return path + "[" + index.to_string() + "]"
+
+# the path of the member under `key` of the object at `path`:
+# "scores.bob" under "scores", the dotted form decode_path reads.
+pub fn member_path(path: String, key: String) -> String:
+    return path + "." + key
+
+# the error a struct's own decode reported, placed under the path it sat
+# at: "scores.bob: missing int field: x". element_decode_error's form
+# for a position the caller has already spelled out.
+pub fn path_decode_error(path: String, err: JsonDecodeError) -> JsonDecodeError:
+    return JsonDecodeError(path + ": " + err.message)
+
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     return json_object_keys(handle)

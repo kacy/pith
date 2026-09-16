@@ -150,9 +150,41 @@ fn place(req: web.Request) -> http.HttpResponse:
     return http.text(200, "{order.id}: {order.items.len()} items")
 ```
 
-a `Map` field, and a `List` whose element is a `List`, a `Map` or an optional,
-are refused at the checker (`docs/limitations.md`); decode such a document
-through `json.parse` and the node accessors instead.
+a field may also be a `Map[String, _]`, for an object whose keys are data
+rather than field names, and lists and maps nest: the value of a map or the
+element of a list may be a scalar, a struct, another list or another map. a
+map's members are inserted as they are read, a repeated key keeping its last
+value, and a wrong value is reported by its path (`expected int element:
+scores.bob`, `variants.xl: missing int field: qty`, `expected int element:
+grid[1][3]`):
+
+```pith
+struct Variant:
+    pub qty: Int
+    pub price: Float
+
+struct Product:
+    pub sku: String
+    pub scores: Map[String, Int]
+    pub variants: Map[String, Variant]
+    pub grid: List[List[Int]]
+    pub labels: Map[String, List[String]]
+
+fn stock(req: web.Request) -> http.HttpResponse:
+    parsed := web.parse[Product](req)
+    if parsed.is_err:
+        return http.bad_request_response()
+    p := parsed.ok
+    mut total := 0
+    for size in p.variants.keys():
+        total = total + p.variants[size].qty
+    return http.text(200, "{p.sku}: {total} in stock")
+```
+
+a `Map` whose key is not a `String`, and a `List` or a `Map` whose element is
+an optional, are refused at the checker (`docs/limitations.md`); decode such a
+document through `json.parse` and the node accessors instead. a document
+nested deeper than 128 levels is refused, as `json.parse` refuses it.
 
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:

@@ -1,27 +1,30 @@
 # typed json decoding, one struct shape at a time.
 #
-# eight shapes: a small flat struct (three fields), a wide flat struct
+# eleven shapes: a small flat struct (three fields), a wide flat struct
 # (twenty fields), a struct with a nested struct, a struct holding a list
 # of small objects (`list`), the same document read through `json.parse`
 # and decoded element by element (`list_walk`, the way a list had to be
 # read before a `List` field was a decode target), a struct holding a list
-# of ints (`list_scalar`), and a pair of four-field structs that differ
-# only in two fields being Float (`float`) or Int (`ints`), read against
-# the same document layout so the float path's per-decode cost sits
-# beside the int path's. the flat shapes take the single-pass runtime fill
-# (`pith_json_fill_struct`), the nested shape its nested twin
-# (`pith_json_fill_struct_nested`), and the two list shapes the list-aware
-# form of it (`pith_json_fill_struct_lists`); `list_walk` parses into the
-# node pool first. `size` scales the string values of the flat shapes and
-# the element count of the lists, so a per-call cost can be read against
-# the bytes it had to look at.
+# of ints (`list_scalar`), a struct holding a list of lists of ints
+# (`nested_list`, `size` inner lists of four), a struct holding a
+# `Map[String, Int]` of `size` members (`map`) and one holding a
+# `Map[String, Small]` of `size` members (`map_struct`), and a pair of
+# four-field structs that differ only in two fields being Float (`float`)
+# or Int (`ints`), read against the same document layout so the float
+# path's per-decode cost sits beside the int path's. the flat shapes take
+# the single-pass runtime fill (`pith_json_fill_struct`), the nested shape
+# its nested twin (`pith_json_fill_struct_nested`), and the list and map
+# shapes the collection-aware form of it (`pith_json_fill_struct_lists`);
+# `list_walk` parses into the node pool first. `size` scales the string
+# values of the flat shapes and the element count of the collections, so
+# a per-call cost can be read against the bytes it had to look at.
 #
 #   pith build bench/json_decode_shapes.pith
 #   ./bench/json_decode_shapes <shape> <size> <rounds>
 #
 # shape is one of small, wide, nested, list, list_walk, list_scalar,
-# float, ints. every decoded value feeds the checksum, so an arm that
-# decoded a field differently cannot look fast.
+# nested_list, map, map_struct, float, ints. every decoded value feeds the
+# checksum, so an arm that decoded a field differently cannot look fast.
 #
 # the profile that motivated this (docs/performance.md, 2026-09-10) put a
 # third of catalog_workload's instructions in the runtime fill, most of it
@@ -83,6 +86,18 @@ struct Items:
 struct Ids:
     pub name: String
     pub ids: List[Int]
+
+struct Grid:
+    pub name: String
+    pub cells: List[List[Int]]
+
+struct Scores:
+    pub name: String
+    pub scores: Map[String, Int]
+
+struct Catalog:
+    pub name: String
+    pub items: Map[String, Small]
 
 fn arg_or(index: Int, fallback: String) -> String:
     argv := args()
@@ -165,6 +180,39 @@ fn list_scalar_doc(count: Int) -> String:
         i = i + 1
     return s + "]" + chr(125)
 
+# an object holding `count` inner arrays of four ints
+fn nested_list_doc(count: Int) -> String:
+    mut s := chr(123) + q("name") + ":" + q("grid") + "," + q("cells") + ":["
+    mut i := 0
+    while i < count:
+        if i > 0:
+            s = s + ","
+        s = s + "[" + i.to_string() + "," + (i * 2).to_string() + "," + (i * 3).to_string() + "," + (i * 4).to_string() + "]"
+        i = i + 1
+    return s + "]" + chr(125)
+
+# an object holding a map of `count` members, `k<i>` to an int
+fn map_doc(count: Int) -> String:
+    mut s := chr(123) + q("name") + ":" + q("scores") + "," + q("scores") + ":" + chr(123)
+    mut i := 0
+    while i < count:
+        if i > 0:
+            s = s + ","
+        s = s + q("k" + i.to_string()) + ":" + (i * 7).to_string()
+        i = i + 1
+    return s + chr(125) + chr(125)
+
+# an object holding a map of `count` members, `k<i>` to a small object
+fn map_struct_doc(count: Int) -> String:
+    mut s := chr(123) + q("name") + ":" + q("catalog") + "," + q("items") + ":" + chr(123)
+    mut i := 0
+    while i < count:
+        if i > 0:
+            s = s + ","
+        s = s + q("k" + i.to_string()) + ":" + chr(123) + q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("item" + i.to_string()) + "," + q("active") + ":false" + chr(125)
+        i = i + 1
+    return s + chr(125) + chr(125)
+
 fn small_sum(doc: Bytes) -> Int:
     r := json.decode[Small](doc) catch Small(0 - 1, "", false)
     mut v := r.id + r.name.len()
@@ -224,6 +272,29 @@ fn list_scalar_sum(doc: Bytes) -> Int:
         v = v + id
     return v
 
+fn nested_list_sum(doc: Bytes) -> Int:
+    r := json.decode[Grid](doc) catch Grid("", [])
+    mut v := r.name.len()
+    for row in r.cells:
+        for x in row:
+            v = v + x
+    return v
+
+fn map_sum(doc: Bytes) -> Int:
+    r := json.decode[Scores](doc) catch Scores("", {})
+    mut v := r.name.len() + r.scores.len()
+    for k in r.scores.keys():
+        v = v + r.scores[k]
+    return v
+
+fn map_struct_sum(doc: Bytes) -> Int:
+    r := json.decode[Catalog](doc) catch Catalog("", {})
+    mut v := r.name.len() + r.items.len()
+    for k in r.items.keys():
+        item := r.items[k]
+        v = v + item.id + item.name.len()
+    return v
+
 fn main() -> Int:
     shape := arg_or(1, "small")
     size := int_arg_or(2, 8)
@@ -259,6 +330,21 @@ fn main() -> Int:
         doc := bytes.from_string_utf8(list_scalar_doc(size))
         while i < rounds:
             total = total + list_scalar_sum(doc)
+            i = i + 1
+    elif shape == "nested_list":
+        doc := bytes.from_string_utf8(nested_list_doc(size))
+        while i < rounds:
+            total = total + nested_list_sum(doc)
+            i = i + 1
+    elif shape == "map":
+        doc := bytes.from_string_utf8(map_doc(size))
+        while i < rounds:
+            total = total + map_sum(doc)
+            i = i + 1
+    elif shape == "map_struct":
+        doc := bytes.from_string_utf8(map_struct_doc(size))
+        while i < rounds:
+            total = total + map_struct_sum(doc)
             i = i + 1
     elif shape == "float":
         doc := bytes.from_string_utf8(sample_doc(size, true))

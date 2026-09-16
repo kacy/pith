@@ -1361,6 +1361,40 @@ placement: its own functions emit the identical ir line for line, and
 the binary only gained the eight std.json accessors nothing in it calls.
 checksums match across arms where the arms decode the same values.
 
+## typed json decoding: nested collections and maps (2026-09-16)
+
+the last stage of the collection work: a `List[List[T]]` at any depth and a
+`Map[String, T]` field, whose value may be a scalar, a struct, a list or a
+map, decode in place through the same filler. the spec gained `m<name>(<elem>)`
+and the element form `m(<elem>)`; the runtime builds a string-keyed map
+tagged with the value kind (the map a literal of that type gets), inserts
+each member before its value's first byte is read, and lets the map release
+the earlier value under a repeated key. the depth bound is the parser's 128
+levels and now names itself ("json nested deeper than 128 levels") instead
+of reading as a malformed document. a target with an optional or defaulted
+field beside such a collection takes the node-pool path, where the lowering
+walks the parsed nodes with a general builder (container first, each value
+stored as it is built).
+
+callgrind, the same toolchain, `bench/json_decode_shapes`, per-decode
+figures from a 2000-round run with the 400-round total subtracted:
+
+| shape, callgrind | 400 rounds | per decode |
+|---|---:|---:|
+| `nested_list` 32 × 400, a `List[List[Int]]` of 32 inner lists of four | 43,885,513 | 107,842 (about 840 per int, 3,370 per inner list) |
+| `map` 32 × 400, a `Map[String, Int]` of 32 members | 32,915,486 | 80,768 (about 2,520 per member) |
+| `map_struct` 32 × 400, a `Map[String, Small]` of 32 members | 64,451,761 | 158,531 (about 4,950 per member) |
+
+a map member costs what a list element costs plus the key: a hash, a probe
+and the map's own copy of the key bytes on the vacant arm, so a
+`Map[String, Small]` member sits at about 4,950 against the 2,700 a
+`List[Small]` element read for #1146. the stage 2 shapes are the control,
+the A arm the main tree at e22c5a69 building the stage 2 bench source:
+`list 32 400` 35,406,953 to 35,371,404 (-0.10%), `list_scalar 32 400`
+5,342,138 to 5,312,686 (-0.55%), `nested 4 2000` 8,889,613 to 8,905,144
+(+0.17%), `small 4 20000` 33,115,253 to 32,700,739 (-1.25%); checksums
+identical, and none of those paths changed, so the movement is placement.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

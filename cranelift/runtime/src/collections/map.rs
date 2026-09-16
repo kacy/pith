@@ -577,6 +577,31 @@ unsafe fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> Pit
     PithMap { ptr }
 }
 
+/// A string-keyed map that owns values of kind `val_tag`, as a handle: the
+/// map a typed json decode builds for a `Map[String, T]` field, whose value
+/// kind the spec names (`Primitive` for a map of ints, bools or floats).
+pub(crate) unsafe fn new_string_keyed_handle(val_tag: ListTypeTag) -> i64 {
+    pith_map_new_tagged(1, 8, val_tag as i32).ptr as i64
+}
+
+/// Store `value` under a key given as bytes, with `pith_map_insert_cstr`'s
+/// contract when `takes_caller_count` is false and `pith_map_insert_cstr_owned`'s
+/// when it is true: a heap value is retained or its caller's count taken,
+/// and whatever the key displaced is released. For a caller holding key
+/// bytes that are not a C string, such as the json filler, which reads a
+/// key straight out of the document.
+///
+/// # Safety
+/// `map_handle` must be a live string-keyed map; `value` must be of the
+/// map's value kind.
+pub(crate) unsafe fn insert_bytes_key(map_handle: i64, key: &[u8], value: i64, takes_caller_count: bool) {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return;
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
+    insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count);
+}
+
 /// Get map length
 #[no_mangle]
 pub extern "C" fn pith_map_len(map: PithMap) -> i64 {

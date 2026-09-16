@@ -295,13 +295,18 @@ pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: Strin
 pub fn ir_json_field_helper_name(field_tid: Int) -> String:
     return ir_json_scan_required_helper_name(field_tid)
 
-# the scalar accessor for a field read out of a parsed object node, as a
-# bare member name — the caller has to run it through
+# the accessor for a field read out of a parsed object node, as a bare
+# member name: the caller has to run it through
 # ir_resolve_json_call_name before emitting, because unlike the
-# std_json_* tables below these are not already qualified. "" when the
-# field is not String, Int, Bool or Float; the caller then skips the
-# field, and only the checker's rejection of unsupported field types
-# keeps that skip from shifting the struct slots after it.
+# std_json_* tables below these are not already qualified. a scalar
+# field has its require accessor, a list of scalars the accessor that
+# builds the whole list (`object_require_int_list` and its siblings). ""
+# when the field is none of those: a struct, which recurses into a
+# decode_object specialization, a list of structs, which goes through
+# the object_require_list specialization, or a type no decoder reads;
+# the caller then skips the field, and only the checker's rejection of
+# unsupported field types keeps that skip from shifting the struct
+# slots after it.
 pub fn ir_json_object_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -313,7 +318,36 @@ pub fn ir_json_object_helper_name(field_tid: Int) -> String:
             return "object_require_bool"
         if info.name == "Float":
             return "object_require_float"
+    if info.kind == "list" and info.inner >= 0:
+        elem := get_type_info(info.inner)
+        if elem.kind == "primitive":
+            if elem.name == "String":
+                return "object_require_string_list"
+            if elem.name == "Int":
+                return "object_require_int_list"
+            if elem.name == "Bool":
+                return "object_require_bool_list"
+            if elem.name == "Float":
+                return "object_require_float_list"
     return ""
+
+# the element struct's tid when the field is a List of structs, -1 for
+# any other field. such a field is read out of a parsed object node by
+# the object_require_list specialization for the element type, which
+# decodes each element through decode_object; the filler reads it in
+# place with an `l<name>(o#<k>(...))` spec entry.
+pub fn ir_json_struct_list_elem_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind != "list" or info.inner < 0:
+        return 0 - 1
+    return ir_struct_decode_field_tid(info.inner)
+
+# the element tid of a List field, -1 for any other field.
+pub fn ir_json_list_elem_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind != "list" or info.inner < 0:
+        return 0 - 1
+    return info.inner
 
 # the scalar accessor for a field read out of a JsonScalarObject — the
 # three-map summary std_json_decode_scalars_bytes returns — rather than
@@ -488,18 +522,20 @@ pub fn ir_struct_has_default_fields_with_state(target_info: TypeInfo, struct_fie
             return true
     return false
 
-# true when any field is a struct, or an optional wrapping one. the
-# third shape question, and the one with the strongest consequence: a
-# nested field means the decode must parse into the node pool and
-# recurse, so the lowering brackets the parse with a pool mark and
-# restore instead of scanning the bytes flat. only one level is
-# inspected — a nested struct's own fields are the recursive call's
-# problem.
+# true when any field is a struct or a list, or an optional wrapping
+# one. the third shape question, and the one with the strongest
+# consequence: a nested field means the decode either fills in place
+# through the nested filler or parses into the node pool and recurses,
+# so the lowering brackets the parse with a pool mark and restore
+# instead of scanning the bytes flat. a list counts because the flat and
+# scalar-object paths have no list accessor at all, and a field they
+# skipped would shift the slots after it. only one level is inspected;
+# a nested struct's own fields are the recursive call's problem.
 pub fn ir_struct_has_nested_decode_fields(target_info: TypeInfo) -> Bool:
     for field_tid in target_info.field_types:
-        if ir_struct_decode_field_tid(field_tid) >= 0:
+        if ir_struct_decode_field_tid(field_tid) >= 0 or ir_json_list_elem_tid(field_tid) >= 0:
             return true
         optional_inner_tid := ir_optional_inner_tid(field_tid)
-        if optional_inner_tid >= 0 and ir_struct_decode_field_tid(optional_inner_tid) >= 0:
+        if optional_inner_tid >= 0 and (ir_struct_decode_field_tid(optional_inner_tid) >= 0 or ir_json_list_elem_tid(optional_inner_tid) >= 0):
             return true
     return false

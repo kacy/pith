@@ -13,15 +13,15 @@ from ir_ast_helpers import ir_unwrap_pub_node
 from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
-from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name
+from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_handle_generic_name_with_state, ir_specialize_type_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_ownership import ir_rc_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
-from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
+from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
 from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names, ir_struct_needs_dtor
-from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
+from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
 from ir_tree_cache import ir_cached_decode_call_nodes, ir_root_items
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
@@ -226,6 +226,144 @@ pub fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: 
     decode_result_r := ir_reg()
     ir_emit_decode_result_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), child_handle_r)
     ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit_label(done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+## the std.json helpers a list-of-structs field on the node-pool path
+## calls, resolved for the call site: the direct decode resolves them
+## against its receiver, a specialization body against its module path.
+struct IrJsonListHelpers:
+    require_array: String
+    array_len: String
+    require_element: String
+    element_error: String
+    decode_object: String
+
+fn ir_json_list_helpers_for_call(index_idx: Int) -> IrJsonListHelpers:
+    decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
+    return IrJsonListHelpers(ir_resolve_json_call_name(index_idx, "object_require_array"), ir_resolve_json_call_name(index_idx, "array_len"), ir_resolve_json_call_name(index_idx, "require_object_element"), ir_resolve_json_call_name(index_idx, "element_decode_error"), decode_name)
+
+fn ir_json_list_helpers_for_module(module_path: String) -> IrJsonListHelpers:
+    return IrJsonListHelpers(ir_resolve_generic_module_call_name(module_path, "object_require_array"), ir_resolve_generic_module_call_name(module_path, "array_len"), ir_resolve_generic_module_call_name(module_path, "require_object_element"), ir_resolve_generic_module_call_name(module_path, "element_decode_error"), ir_json_generic_name("decode_object"))
+
+## a list-of-structs field read out of a parsed object node, as a loop
+## over the array under the key: each element is checked to be an object
+## and decoded through the element type's decode_object specialization,
+## and the struct it yields is pushed into a struct-owning list. the
+## result box comes back in the returned register, as the scalar
+## accessors' does. an element that fails releases the list, and with it
+## every element built before, and comes back as an error naming the
+## position (`rows[1]: missing string field: name`, the message the
+## filler gives the same document). the loop is emitted here rather than
+## written as a std.json generic because a generic body specialized from
+## a decode site is emitted without the checker's re-check, and read its
+## `T`-typed result at the wrong offset.
+fn ir_emit_json_struct_list_field(handle_r: Int, key_r: Int, elem_tid: Int, helpers: IrJsonListHelpers) -> Int:
+    temp_name := ir_new_temp_name("json_struct_list")
+    ir_var_types.insert(temp_name, "tuple")
+    list_name := ir_new_temp_name("json_struct_list_out")
+    len_name := ir_new_temp_name("json_struct_list_len")
+    idx_name := ir_new_temp_name("json_struct_list_idx")
+    arr_name := ir_new_temp_name("json_struct_list_arr")
+    ir_var_types.insert(list_name, "list")
+    ir_var_types.insert(len_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    ir_var_types.insert(arr_name, "int")
+    done_l := ir_label()
+
+    arr_result_r := ir_reg()
+    ir_emit_decode_result_call2(arr_result_r, helpers.require_array, handle_r, key_r)
+    ir_emit_result_store_error_branch(arr_result_r, temp_name, done_l)
+    ir_emit("store " + arr_name + " " + ir_take_result_ok(arr_result_r, lookup_type_id("Int")).to_string())
+    list_r := ir_reg()
+    ir_emit_call0(list_r, "__list_new_struct", "list")
+    ir_emit("store " + list_name + " " + list_r.to_string())
+    arr_r := ir_reg()
+    ir_emit("load " + arr_r.to_string() + " " + arr_name)
+    len_r := ir_reg()
+    ir_emit_call1(len_r, helpers.array_len, "int", arr_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    loop_done_l := ir_label()
+    fail_l := ir_label()
+    ir_emit_label(loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+
+    ir_emit_label(body_l)
+    body_arr_r := ir_reg()
+    ir_emit("load " + body_arr_r.to_string() + " " + arr_name)
+    body_idx_r := ir_reg()
+    ir_emit("load " + body_idx_r.to_string() + " " + idx_name)
+    elem_result_r := ir_reg()
+    ir_emit_decode_result_call3(elem_result_r, helpers.require_element, body_arr_r, key_r, body_idx_r)
+    # a non-object element: its error is already worded by position, so
+    # it becomes this field's result once the list is dropped
+    elem_ok_r := ir_emit_result_flag_field(elem_result_r, "is_ok")
+    elem_ok_l := ir_label()
+    ir_emit("brif " + elem_ok_r.to_string() + " " + elem_ok_l + " " + fail_l)
+    ir_emit_label(elem_ok_l)
+    elem_r := ir_take_result_ok(elem_result_r, lookup_type_id("Int"))
+    decode_result_r := ir_reg()
+    ir_emit_decode_result_call1(decode_result_r, ir_queue_generic_specialization(helpers.decode_object, [ir_type_from_tid(elem_tid)], "tuple"), elem_r)
+    decode_ok_r := ir_emit_result_flag_field(decode_result_r, "is_ok")
+    decode_ok_l := ir_label()
+    decode_err_l := ir_label()
+    ir_emit("brif " + decode_ok_r.to_string() + " " + decode_ok_l + " " + decode_err_l)
+    # a failed element: wrap its error under the position, drop the
+    # element's box and error, and hand the wrapped box to fail_l
+    ir_emit_label(decode_err_l)
+    inner_err_r := ir_reg()
+    ir_emit("field " + inner_err_r.to_string() + " " + decode_result_r.to_string() + " 16 struct:JsonDecodeError err")
+    wrapped_r := ir_reg()
+    ir_emit_call3(wrapped_r, helpers.element_error, "struct:JsonDecodeError", key_r, body_idx_r, inner_err_r)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", inner_err_r)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", decode_result_r)
+    wrapped_box_r := ir_emit_err_result_tuple_raw(wrapped_r)
+    ir_emit("store " + temp_name + " " + wrapped_box_r.to_string())
+    drop_list_r := ir_reg()
+    ir_emit("load " + drop_list_r.to_string() + " " + list_name)
+    ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", drop_list_r)
+    ir_emit("jmp " + done_l)
+    # a decoded element: the list takes the count the decode minted
+    ir_emit_label(decode_ok_l)
+    value_r := ir_take_json_ok(decode_result_r, elem_tid)
+    push_list_r := ir_reg()
+    ir_emit("load " + push_list_r.to_string() + " " + list_name)
+    ir_emit_call2(ir_reg(), "pith_list_push_value_owned", "void", push_list_r, value_r)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+    # the element check failed: its box is the field's result
+    ir_emit_label(fail_l)
+    ir_emit("store " + temp_name + " " + elem_result_r.to_string())
+    fail_list_r := ir_reg()
+    ir_emit("load " + fail_list_r.to_string() + " " + list_name)
+    ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", fail_list_r)
+    ir_emit("jmp " + done_l)
+
+    ir_emit_label(loop_done_l)
+    out_list_r := ir_reg()
+    ir_emit("load " + out_list_r.to_string() + " " + list_name)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(out_list_r).to_string())
     ir_emit_label(done_l)
     result_r := ir_reg()
     ir_emit("load " + result_r.to_string() + " " + temp_name)
@@ -608,6 +746,25 @@ pub fn ir_emit_handle_spec_field(handle_r: Int, module_path: String, field_name:
         return ir_emit_handle_spec_optional_scalar_field(handle_r, key_r, module_path, default_idx, optional_inner_tid, emit_value, emit_default_ret)
     return ir_emit_handle_spec_scalar_field(handle_r, key_r, module_path, field_tid, default_idx, emit_expr, emit_default_ret)
 
+## the type id of field `i` of a struct a specialization body is decoding.
+## a specialization body has no call node to take the checker's field
+## tids from, so it used to ask the layout with no fallback, and the
+## layout has no id of its own for a field whose kind is an optional, a
+## list or a map: those came back -1, the body skipped the field, and
+## every slot after it shifted (a nested struct with an optional field
+## read its optional as the next field's value and crashed). the
+## checker's type for the struct, looked up by name, supplies the tid the
+## layout cannot; a scalar or struct field still resolves through the
+## layout first, as it always did.
+fn ir_specialized_struct_field_tid(struct_name: String, i: Int) -> Int:
+    mut fallback := 0 - 1
+    struct_tid := lookup_type_id(struct_name)
+    if struct_tid >= 0:
+        info := get_type_info(struct_tid)
+        if info.kind == "struct" and i < info.field_types.len():
+            fallback = info.field_types[i]
+    return ir_struct_field_tid_at(struct_name, i, fallback)
+
 ## emit the handle-pool decode struct from handle sequence.
 pub fn ir_emit_handle_decode_struct_from_handle(struct_name: String, module_path: String, handle_name: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
@@ -621,7 +778,7 @@ pub fn ir_emit_handle_decode_struct_from_handle(struct_name: String, module_path
     mut i := 0
     while i < field_count:
         field_name := ir_struct_field_name_at(struct_name, i)
-        field_tid := ir_struct_field_tid_at(struct_name, i, -1)
+        field_tid := ir_specialized_struct_field_tid(struct_name, i)
         default_idx := ir_struct_field_default_node(struct_name, field_name)
         field_value := ir_emit_handle_spec_field(handle_r, module_path, field_name, field_tid, default_idx, emit_expr, emit_value, emit_default_ret)
         if not field_value.ok:
@@ -1135,14 +1292,38 @@ fn ir_json_bare_decl_name(node: Node) -> String:
         return node.value.substring(0, node.value.index_of("["))
     return node.value
 
+# the structs whose destructor address the nested filler needs, in the
+# order the spec's `#<k>` indices name them: the element struct of every
+# list and every struct field under one, which the filler allocates
+# itself because their count is the document's. rebuilt by every spec
+# build, so the table a decode passes matches the spec it passes; the
+# prepass builds the same spec and discards the list.
+pub mut ir_json_spec_dtor_names: List[String] := []
+
+fn ir_json_spec_dtor_index(name: String) -> Int:
+    for existing, i in ir_json_spec_dtor_names:
+        if existing == name:
+            return i
+    ir_json_spec_dtor_names.push(name)
+    return ir_json_spec_dtor_names.len() - 1
+
 # the nested spec of a declaration: the flat spec's `<type><name>` entries
-# with a struct field written as `o<name>(<sub-spec>)`; parentheses, not
-# braces, because an IR string literal reads `}}` as one escaped brace
-# and a doubly nested spec ends in two. "" when a field is
-# neither a scalar nor a struct this map resolves, or the nesting runs
-# deeper than any real shape; such a struct has no nested spec and its
-# decode takes the node-pool path.
+# with a struct field written as `o<name>(<sub-spec>)` and a list field as
+# `l<name>(<elem>)`, where the element is a scalar letter, `l(<elem>)` or
+# `o#<k>(<sub-spec>)`; parentheses, not braces, because an IR string
+# literal reads `}}` as one escaped brace and a doubly nested spec ends
+# in two. a struct the filler allocates itself (a list element, or a
+# struct field inside one) carries `#<k>`, the index of its destructor
+# in the table the decode hands over; a struct the lowering pre-allocates
+# does not. "" when a field is neither a scalar, a list of these, nor a
+# struct this map resolves, or the nesting runs deeper than any real
+# shape; such a struct has no nested spec and its decode takes the
+# node-pool path.
 pub fn ir_json_decode_nested_spec_from_decl(decl: Node, depth: Int) -> String:
+    ir_json_spec_dtor_names = []
+    return ir_json_nested_spec_of_decl(decl, depth, false)
+
+fn ir_json_nested_spec_of_decl(decl: Node, depth: Int, under_list: Bool) -> String:
     if depth > 16:
         return ""
     mut spec := ""
@@ -1155,6 +1336,12 @@ pub fn ir_json_decode_nested_spec_from_decl(decl: Node, depth: Int) -> String:
             first = false
             fname := fnode.value.split(" ")[0]
             type_node := get_node(fnode.children[0])
+            if ir_json_type_node_is_list(type_node):
+                elem := ir_json_nested_elem_spec(get_node(type_node.children[0]), depth + 1)
+                if elem.len() == 0:
+                    return ""
+                spec = spec + "l" + fname + "(" + elem + ")"
+                continue
             type_char := ir_json_type_name_char(type_node.value)
             if type_char.len() > 0:
                 spec = spec + type_char + fname
@@ -1164,24 +1351,62 @@ pub fn ir_json_decode_nested_spec_from_decl(decl: Node, depth: Int) -> String:
             sub_idx := ir_json_nested_decl_index(type_node.value)
             if sub_idx < 0:
                 return ""
-            sub_spec := ir_json_decode_nested_spec_from_decl(get_node(sub_idx), depth + 1)
+            mut marker := ""
+            if under_list:
+                marker = "#" + ir_json_spec_dtor_index(type_node.value).to_string()
+            sub_spec := ir_json_nested_spec_of_decl(get_node(sub_idx), depth + 1, under_list)
             if sub_spec.len() == 0:
                 return ""
-            spec = spec + "o" + fname + "(" + sub_spec + ")"
+            spec = spec + "o" + fname + marker + "(" + sub_spec + ")"
     return spec
 
-fn ir_json_decl_has_struct_field(decl: Node) -> Bool:
+# a written `List[...]` type: the one generic the nested spec reads.
+fn ir_json_type_node_is_list(type_node: Node) -> Bool:
+    return type_node.kind == "generic_type" and type_node.value == "List" and type_node.children.len() == 1
+
+# the element part of a list entry: a scalar letter, `l(<elem>)` for a
+# list of lists, or `o#<k>(<sub-spec>)` for a struct the map resolves,
+# whose fields are laid out under the filler's ownership. "" for
+# anything else.
+fn ir_json_nested_elem_spec(type_node: Node, depth: Int) -> String:
+    if depth > 16:
+        return ""
+    if ir_json_type_node_is_list(type_node):
+        inner := ir_json_nested_elem_spec(get_node(type_node.children[0]), depth + 1)
+        if inner.len() == 0:
+            return ""
+        return "l(" + inner + ")"
+    if type_node.kind != "type":
+        return ""
+    type_char := ir_json_type_name_char(type_node.value)
+    if type_char.len() > 0:
+        return type_char
+    sub_idx := ir_json_nested_decl_index(type_node.value)
+    if sub_idx < 0:
+        return ""
+    marker := "#" + ir_json_spec_dtor_index(type_node.value).to_string()
+    sub_spec := ir_json_nested_spec_of_decl(get_node(sub_idx), depth + 1, true)
+    if sub_spec.len() == 0:
+        return ""
+    return "o" + marker + "(" + sub_spec + ")"
+
+# true when a declaration has a field the flat spec cannot carry: a
+# struct, or a list. the declarations the prepass interns a nested spec
+# for.
+fn ir_json_decl_has_nested_field(decl: Node) -> Bool:
     for child in decl.children:
         fnode := ir_unwrap_pub_node(child)
         if fnode.kind == "field" and fnode.children.len() > 0:
             type_node := get_node(fnode.children[0])
             if type_node.kind == "type" and ir_json_type_name_char(type_node.value).len() == 0:
                 return true
+            if ir_json_type_node_is_list(type_node):
+                return true
     return false
 
 fn ir_json_intern_nested_spec_of(decl_idx: Int):
     node := get_node(decl_idx)
-    if ir_json_is_struct_decl_kind(node.kind) and ir_json_decl_has_struct_field(node):
+    if ir_json_is_struct_decl_kind(node.kind) and ir_json_decl_has_nested_field(node):
         spec := ir_json_decode_nested_spec_from_decl(node, 0)
         if spec.len() > 0:
             ir_str(spec)
@@ -1281,18 +1506,67 @@ fn ir_json_decode_nested_fill_shape(target_info: TypeInfo, depth: Int) -> Bool:
         if nested_tid >= 0:
             if type_node.kind != "type":
                 return false
-            nested_info := get_type_info(nested_tid)
-            resolved := ir_json_nested_decl_index(type_node.value)
-            if resolved < 0 or not ir_struct_decl_nodes.contains_key(nested_info.name):
+            if not ir_json_struct_decl_matches(nested_tid, type_node.value, depth):
                 return false
-            if ir_struct_decl_nodes[nested_info.name] != resolved:
+        elif ir_json_list_elem_tid(field_tid) >= 0:
+            if not ir_json_type_node_is_list(type_node):
                 return false
-            if not ir_json_decode_nested_fill_shape(nested_info, depth + 1):
+            if not ir_json_list_elem_fill_shape(ir_json_list_elem_tid(field_tid), get_node(type_node.children[0]), depth + 1):
                 return false
         elif ir_json_type_name_char(type_node.value).len() == 0 or ir_json_type_name_char(type_node.value) != ir_json_field_type_char(field_tid):
             return false
         i = i + 1
     return i == n
+
+# true when the struct type `struct_tid` is the one the written name
+# resolves to in the declaration map, and is itself of the fill shape.
+fn ir_json_struct_decl_matches(struct_tid: Int, written_name: String, depth: Int) -> Bool:
+    nested_info := get_type_info(struct_tid)
+    resolved := ir_json_nested_decl_index(written_name)
+    if resolved < 0 or not ir_struct_decl_nodes.contains_key(nested_info.name):
+        return false
+    if ir_struct_decl_nodes[nested_info.name] != resolved:
+        return false
+    return ir_json_decode_nested_fill_shape(nested_info, depth + 1)
+
+# true when a list element type is one the filler builds: a scalar whose
+# written name agrees with the checker's type, a list of such elements,
+# or a struct of the fill shape whose written name resolves to its
+# declaration.
+fn ir_json_list_elem_fill_shape(elem_tid: Int, elem_node: Node, depth: Int) -> Bool:
+    if depth > 16:
+        return false
+    elem_info := get_type_info(elem_tid)
+    if elem_info.kind == "primitive":
+        if elem_node.kind != "type":
+            return false
+        return ir_json_type_name_char(elem_node.value).len() > 0 and ir_json_type_name_char(elem_node.value) == ir_json_field_type_char(elem_tid)
+    if elem_info.kind == "list":
+        if not ir_json_type_node_is_list(elem_node) or elem_info.inner < 0:
+            return false
+        return ir_json_list_elem_fill_shape(elem_info.inner, get_node(elem_node.children[0]), depth + 1)
+    if elem_info.kind == "struct":
+        if elem_node.kind != "type":
+            return false
+        return ir_json_struct_decl_matches(elem_tid, elem_node.value, depth)
+    return false
+
+# true when a field at any depth of the target is a list: the decode then
+# hands the filler the destructor table and calls the list-aware entry
+# point.
+fn ir_json_target_has_list_field(target_info: TypeInfo, depth: Int) -> Bool:
+    if depth > 16:
+        return false
+    for field_name, i in target_info.fields:
+        if i >= target_info.field_types.len():
+            return false
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        if ir_json_list_elem_tid(field_tid) >= 0:
+            return true
+        nested_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_tid >= 0 and ir_json_target_has_list_field(get_type_info(nested_tid), depth + 1):
+            return true
+    return false
 
 # allocate the struct tree the nested fill writes into: the struct, its
 # destructor when the type needs one, and each struct field's own tree
@@ -1320,6 +1594,15 @@ fn ir_emit_json_nested_alloc(target_info: TypeInfo) -> Int:
 # runtime releases the tree itself on any failure, so there is no branch
 # here; `check_utf8` is what a bytes input got from the node path, which
 # validated it before parsing.
+#
+# a target with a list field anywhere in it goes to the list-aware entry
+# point with a destructor table: the filler allocates a list's element
+# structs itself, so it needs the address of each one's destructor, and
+# the table holds them in the order the spec's `#<k>` markers name them
+# (ir_json_spec_dtor_names, as the spec build just left it). the table
+# is a bare struct this decode releases after the call; a struct that
+# needs no destructor gets a 0 entry. a target with no list field calls
+# the entry point it always did, so its ir is unchanged.
 fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: String, check_utf8: Bool) -> Int:
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -1332,7 +1615,30 @@ fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: St
         flag = 1
     ir_emit("iconst " + flag_r.to_string() + " " + flag.to_string())
     result_r := ir_reg()
-    ir_emit_call_text(result_r, "pith_json_fill_struct_nested", "tuple", 4, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string() + " " + flag_r.to_string())
+    if not ir_json_target_has_list_field(target_info, 0):
+        ir_emit_call_text(result_r, "pith_json_fill_struct_nested", "tuple", 4, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string() + " " + flag_r.to_string())
+        ir_emit("store " + temp_name + " " + result_r.to_string())
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp_name)
+        return r
+    dtor_names := ir_json_spec_dtor_names
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + dtor_names.len().to_string())
+    table_r := ir_reg()
+    if dtor_names.len() == 0:
+        ir_emit("iconst " + table_r.to_string() + " 0")
+    else:
+        ir_emit_call1(table_r, "__struct_alloc", "tuple", count_r)
+        for name, k in dtor_names:
+            entry_r := ir_reg()
+            if ir_struct_needs_dtor(name):
+                ir_emit("funcref " + entry_r.to_string() + " __dtor_" + ir_struct_base_name(name))
+            else:
+                ir_emit("iconst " + entry_r.to_string() + " 0")
+            ir_emit("sstore " + table_r.to_string() + " " + k.to_string() + " " + entry_r.to_string())
+    ir_emit_call_text(result_r, "pith_json_fill_struct_lists", "tuple", 6, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string() + " " + flag_r.to_string() + " " + table_r.to_string() + " " + count_r.to_string())
+    if dtor_names.len() > 0:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", table_r)
     ir_emit("store " + temp_name + " " + result_r.to_string())
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
@@ -1457,6 +1763,40 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
                 field_regs.push(ir_decode_field_load_after_merge(branch))
                 continue
             field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            field_regs.push(ir_take_json_ok(field_result_r, field_tid))
+            continue
+        # a list of structs, plain, optional or defaulted: the
+        # object_require_list specialization for the element type builds
+        # the list element by element through decode_object
+        mut struct_list_tid := ir_json_struct_list_elem_tid(field_tid)
+        if optional_inner_tid >= 0:
+            struct_list_tid = ir_json_struct_list_elem_tid(optional_inner_tid)
+        if struct_list_tid >= 0:
+            list_helpers := ir_json_list_helpers_for_call(index_idx)
+            if optional_inner_tid >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_optional_list_field", "tuple")
+                ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                continue
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_list_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid), emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                continue
+            field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             field_regs.push(ir_take_json_ok(field_result_r, field_tid))
             continue
@@ -1628,7 +1968,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
     mut i := 0
     while i < field_count:
         field_name := ir_struct_field_name_at(struct_name, i)
-        field_tid := ir_struct_field_tid_at(struct_name, i, -1)
+        field_tid := ir_specialized_struct_field_tid(struct_name, i)
         default_idx := ir_struct_field_default_node(struct_name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
         key_r := ir_reg()
@@ -1661,6 +2001,40 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
                 i = i + 1
                 continue
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+            ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+            field_regs.push(ir_take_json_ok(field_result_r, field_tid))
+            i = i + 1
+            continue
+        # a list of structs, plain, optional or defaulted, through the
+        # object_require_list specialization for the element type
+        mut struct_list_tid := ir_json_struct_list_elem_tid(field_tid)
+        if optional_inner_tid >= 0:
+            struct_list_tid = ir_json_struct_list_elem_tid(optional_inner_tid)
+        if struct_list_tid >= 0:
+            list_helpers := ir_json_list_helpers_for_module(module_path)
+            if optional_inner_tid >= 0:
+                has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_optional_list_field", "tuple")
+                ir_decode_field_store_missing_optional(branch, default_idx, emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                i = i + 1
+                continue
+            if default_idx >= 0:
+                has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_list_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid), emit_value)
+                ir_decode_field_present(branch)
+                field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
+                ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+                ir_decode_field_store_and_merge(branch, ir_take_json_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
+                i = i + 1
+                continue
+            field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
             field_regs.push(ir_take_json_ok(field_result_r, field_tid))
             i = i + 1

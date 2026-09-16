@@ -1308,6 +1308,59 @@ optional or defaulted field leaked about a kilobyte per `json.decode`
 (tests/leaks/leak_json_fill_float's `Maybe` rounds read 29,756 kb at
 20k rounds and 110,336 kb at 80k before, flat after).
 
+## typed json decoding: list fields (2026-09-15)
+
+a `List` field in a decode target used to be refused at the checker, so a
+document with an array in it was parsed into the node pool and walked by
+hand: `json.parse`, `array_len`, `array_get`, `decode_object[T]` per
+element, `pool_restore`. every child read cost two int-to-string
+conversions, a concatenation and a string-keyed map probe, and
+`bench/json_decode_shapes list 32 400` read 4.31 billion instructions,
+about 10.8 million per decode of 32 three-field objects.
+
+the nested filler now takes a list entry in its spec, `l<name>(<elem>)`,
+where the element is a scalar letter or `o#<k>(<sub-spec>)` for a struct.
+the runtime builds the list with the element kind's constructor, the one
+the emitter picks for a list literal of that type, so a list of strings
+or structs owns its elements. each element struct is allocated with the
+destructor the decode's table names under `k`, pushed before its first
+field is read, and filled in place. the list sits in its slot before the
+first element is read. at every moment, then, the root struct owns
+everything built so far, and the one release on failure drops it all.
+a filler that stored the list only after a clean read grew
+tests/leaks/leak_json_fill_list_fail by 230 mb over 60k rounds; the
+fixed one is flat. a target with an optional or defaulted field beside a
+list still takes the node-pool path, which reads a scalar list through
+`object_require_int_list` and its siblings and a struct list through a
+loop the lowering emits around `decode_object`.
+
+callgrind, the before arm the toolchain at ef96045d reading the document
+as a top-level array (the only way it could), the after arm the same
+elements under an `items` key decoded into a `List[Small]` field:
+
+| shape, callgrind | before | after | per decode after |
+|---|---:|---:|---:|
+| `list` 32 × 400 | 4,319,363,939 | 35,399,488 (−99.18%) | 86,211 |
+| `list_walk` 32 × 400 (after toolchain, node pool) | | 4,356,333,494 | about 10,890,000 |
+| `list_scalar` 32 × 400, a `List[Int]` field | | 5,341,412 | 12,079 |
+| event_ledger 200000 | 2,357,723,738 | 2,357,717,155 (−0.00%) | |
+| catalog_workload 4000 | 32,784,652 | 32,897,996 (+0.35%) | |
+
+the per-decode figures come from a second run at more rounds (2000 and
+20000) with the 400-round total subtracted, so program startup is out of
+them: 86,211 instructions for 32 small objects, about 2,700 per element
+against the 1,654 a `small` decode of the same object costs on its own
+(the difference is the element struct's allocation, its push and the
+per-element key lookups against a spec cursor that resets per object),
+and 12,079 for 32 integers, about 380 per element. the same document
+read through the node pool by the new toolchain (`list_walk`) costs what
+the old arm did, so the drop is the path and not the compiler around it.
+the ledger and catalog workloads decode flat structs and do not take the
+list path; their rows are the control, and the catalog's +0.35% is code
+placement: its own functions emit the identical ir line for line, and
+the binary only gained the eight std.json accessors nothing in it calls.
+checksums match across arms where the arms decode the same values.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

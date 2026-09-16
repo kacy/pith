@@ -1,0 +1,449 @@
+# list fields in a json decode target: the shapes the nested filler builds
+# in place, and the same documents read through the node pool. valgrind-
+# gated in MEMCHECK_CASES.
+#
+# a `List` field used to be refused at the checker, so a document with an
+# array in it had no direct decode target. now `List[Int]`, `List[String]`,
+# `List[Bool]`, `List[Float]` and a `List` of a decode-target struct fill in
+# place: the filler builds the list with the element kind's constructor,
+# allocates each element struct with its destructor, and pushes as it
+# reads, so the root owns everything at every moment. every value below is
+# printed twice, once from the direct decode (`fill`) and once from
+# `json.parse` plus a hand walk over the node accessors (`walk`), and the
+# `same` line says the two agree byte for byte. the errors name the element
+# and the field (`expected int element: xs[1]`, `rows[1]: missing string
+# field: label`) and come in the parser's order: a malformed byte first,
+# then the fields in declaration order, then the elements by position. a
+# target with an optional field takes the node-pool path instead, and its
+# messages are pinned beside the filler's for the same documents.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Ints:
+    pub name: String
+    pub xs: List[Int]
+
+struct Strings:
+    pub tags: List[String]
+    pub n: Int
+
+struct Bools:
+    pub flags: List[Bool]
+
+struct Floats:
+    pub weights: List[Float]
+
+struct Row:
+    pub id: Int
+    pub label: String
+
+struct Rows:
+    pub title: String
+    pub rows: List[Row]
+    pub count: Int
+
+struct Geo:
+    pub lat: Int
+    pub label: String
+
+struct Site:
+    pub code: String
+    pub geo: Geo
+    pub tags: List[String]
+
+struct Sites:
+    pub owner: String
+    pub sites: List[Site]
+
+struct Maybe:
+    pub title: String
+    pub rows: List[Row]
+    pub xs: List[Int]
+    pub note: String?
+
+# an element struct with an optional field: the list goes through the
+# node pool, and each element through the decode_object specialization
+# for RowOpt, which used to skip an optional field (its layout has no
+# type id for one) and shift the slots after it
+struct RowOpt:
+    pub id: Int
+    pub label: String?
+
+struct RowsOpt:
+    pub title: String
+    pub rows: List[RowOpt]
+
+struct Holder:
+    pub name: String
+    pub inner: RowOpt
+
+# the list filler's neighbours: a flat target (the single-pass fill) and
+# one with an optional field (the scalar-object path), each handed an
+# unknown key holding an array of objects
+struct Flat:
+    pub a: Int
+    pub b: String
+
+struct FlatOpt:
+    pub a: Int
+    pub b: String
+    pub c: Int?
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn ints_doc(name: String, xs: String) -> String:
+    return obj(q("name") + ":" + q(name) + "," + q("xs") + ":" + xs)
+
+fn rows_doc(items: String) -> String:
+    return obj(q("title") + ":" + q("t") + "," + q("rows") + ":[" + items + "]," + q("count") + ":" + "3")
+
+fn site_doc(code: String, lat: Int, label: String, tags: String) -> String:
+    return obj(q("code") + ":" + q(code) + "," + q("geo") + ":" + obj(q("lat") + ":" + lat.to_string() + "," + q("label") + ":" + q(label)) + "," + q("tags") + ":" + tags)
+
+fn fmt_ints(v: Ints) -> String:
+    mut s := q(v.name) + " [" + v.xs.len().to_string() + "]"
+    for x in v.xs:
+        s = s + " " + x.to_string()
+    return s
+
+fn fmt_strings(v: Strings) -> String:
+    mut s := "[" + v.tags.len().to_string() + "]"
+    for t in v.tags:
+        s = s + " " + q(t)
+    return s + " n=" + v.n.to_string()
+
+fn fmt_bools(v: Bools) -> String:
+    mut s := "[" + v.flags.len().to_string() + "]"
+    for f in v.flags:
+        s = s + " " + f.to_string()
+    return s
+
+fn fmt_floats(v: Floats) -> String:
+    mut s := "[" + v.weights.len().to_string() + "]"
+    for w in v.weights:
+        s = s + " " + w.to_string()
+    return s
+
+fn fmt_rows(v: Rows) -> String:
+    mut s := v.title + " [" + v.rows.len().to_string() + "]"
+    for r in v.rows:
+        s = s + " " + r.id.to_string() + "/" + q(r.label)
+    return s + " count=" + v.count.to_string()
+
+fn fmt_sites(v: Sites) -> String:
+    mut s := v.owner + " [" + v.sites.len().to_string() + "]"
+    for site in v.sites:
+        s = s + " " + site.code + "/" + site.geo.lat.to_string() + "/" + site.geo.label + "/["
+        for t in site.tags:
+            s = s + t + ";"
+        s = s + "]"
+    return s
+
+fn fmt_maybe(v: Maybe) -> String:
+    mut s := v.title + " [" + v.rows.len().to_string() + "]"
+    for r in v.rows:
+        s = s + " " + r.id.to_string() + "/" + q(r.label)
+    s = s + " xs=["
+    for x in v.xs:
+        s = s + x.to_string() + ";"
+    s = s + "]"
+    if let n = v.note:
+        return s + " note=" + q(n)
+    return s + " note=none"
+
+# the hand walks: json.parse, then the node accessors element by element
+fn walk_ints(doc: String) -> Ints:
+    root := json.parse(doc)
+    arr := json.object_get(root, "xs")
+    mut xs: List[Int] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        xs.push(json.get_int(json.array_get(arr, i)))
+        i = i + 1
+    return Ints(json.object_get_string(root, "name"), xs)
+
+fn walk_strings(doc: String) -> Strings:
+    root := json.parse(doc)
+    arr := json.object_get(root, "tags")
+    mut tags: List[String] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        tags.push(json.get_string(json.array_get(arr, i)))
+        i = i + 1
+    return Strings(tags, json.object_get_int(root, "n"))
+
+fn walk_bools(doc: String) -> Bools:
+    root := json.parse(doc)
+    arr := json.object_get(root, "flags")
+    mut flags: List[Bool] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        flags.push(json.get_bool(json.array_get(arr, i)))
+        i = i + 1
+    return Bools(flags)
+
+fn walk_floats(doc: String) -> Floats:
+    root := json.parse(doc)
+    arr := json.object_get(root, "weights")
+    mut weights: List[Float] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        node := json.array_get(arr, i)
+        if json.type_of(node) == "int":
+            weights.push(json.get_int(node).to_float())
+        else:
+            weights.push(json.get_float(node))
+        i = i + 1
+    return Floats(weights)
+
+fn walk_rows(doc: String) -> Rows:
+    root := json.parse(doc)
+    arr := json.object_get(root, "rows")
+    mut rows: List[Row] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        rows.push(json.decode_object[Row](json.array_get(arr, i)) catch Row(0 - 1, "?"))
+        i = i + 1
+    return Rows(json.object_get_string(root, "title"), rows, json.object_get_int(root, "count"))
+
+fn walk_sites(doc: String) -> Sites:
+    root := json.parse(doc)
+    arr := json.object_get(root, "sites")
+    mut sites: List[Site] := []
+    mut i := 0
+    while i < json.array_len(arr):
+        node := json.array_get(arr, i)
+        tags_arr := json.object_get(node, "tags")
+        mut tags: List[String] := []
+        mut k := 0
+        while k < json.array_len(tags_arr):
+            tags.push(json.get_string(json.array_get(tags_arr, k)))
+            k = k + 1
+        geo := json.object_get(node, "geo")
+        sites.push(Site(json.object_get_string(node, "code"), Geo(json.object_get_int(geo, "lat"), json.object_get_string(geo, "label")), tags))
+        i = i + 1
+    return Sites(json.object_get_string(root, "owner"), sites)
+
+fn both(label: String, fill: String, walk: String):
+    print(label + " fill: " + fill)
+    print(label + " walk: " + walk)
+    print(label + " same: " + (fill == walk).to_string())
+
+fn ints_both(label: String, doc: String):
+    r := json.decode_text[Ints](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_ints(r.ok), fmt_ints(walk_ints(doc)))
+
+fn rows_both(label: String, doc: String):
+    r := json.decode_text[Rows](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+        return
+    both(label, fmt_rows(r.ok), fmt_rows(walk_rows(doc)))
+
+fn fill_err(label: String, doc: String):
+    r := json.decode_text[Rows](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + fmt_rows(r.ok))
+
+fn node_err(label: String, doc: String):
+    r := json.decode_text[Maybe](doc)
+    if r.is_err:
+        print(label + " node err: " + r.err.message)
+    else:
+        print(label + " node ok: " + fmt_maybe(r.ok))
+
+fn ints_err(label: String, doc: String):
+    r := json.decode_text[Ints](doc)
+    if r.is_err:
+        print(label + " fill err: " + r.err.message)
+    else:
+        print(label + " fill ok: " + fmt_ints(r.ok))
+
+fn main() -> Int:
+    dq := chr(34)
+    bs := chr(92)
+
+    # scalar lists: empty, one, many, from text and from bytes
+    ints_both("ints_empty", ints_doc("e", "[]"))
+    ints_both("ints_one", ints_doc("o", "[42]"))
+    ints_both("ints_many", ints_doc("m", "[1,-2,3,0,99999]"))
+    ints_bytes := json.decode[Ints](bytes.from_string_utf8(ints_doc("b", "[7,8]")))
+    if ints_bytes.is_err:
+        print("ints_bytes err: " + ints_bytes.err.message)
+    else:
+        print("ints_bytes fill: " + fmt_ints(ints_bytes.ok))
+    strings_doc := obj(q("tags") + ":[" + q("a") + "," + q("") + "," + q("with space") + "," + dq + "esc" + bs + dq + "q" + bs + "n" + bs + "u00e9" + dq + "]," + q("n") + ":3")
+    strings := json.decode_text[Strings](strings_doc)
+    if strings.is_err:
+        print("strings fill err: " + strings.err.message)
+    else:
+        both("strings", fmt_strings(strings.ok), fmt_strings(walk_strings(strings_doc)))
+    bools_doc := obj(q("flags") + ":[true,false,true]")
+    bools := json.decode_text[Bools](bools_doc)
+    if bools.is_err:
+        print("bools fill err: " + bools.err.message)
+    else:
+        both("bools", fmt_bools(bools.ok), fmt_bools(walk_bools(bools_doc)))
+    # floats: fractions, exponents, an integer widened, a negative zero
+    floats_doc := obj(q("weights") + ":[1.5,-0.25,2e3,3,-0.0,1e10,2.5E-3]")
+    floats := json.decode_text[Floats](floats_doc)
+    if floats.is_err:
+        print("floats fill err: " + floats.err.message)
+    else:
+        both("floats", fmt_floats(floats.ok), fmt_floats(walk_floats(floats_doc)))
+
+    # struct lists: empty, one, many, a struct holding a nested struct and
+    # its own list, from text and from bytes
+    rows_both("rows_empty", rows_doc(""))
+    rows_both("rows_one", rows_doc(row(1, "one")))
+    rows_both("rows_many", rows_doc(row(1, "one") + "," + row(2, "two") + "," + row(3, "three")))
+    rows_bytes := json.decode[Rows](bytes.from_string_utf8(rows_doc(row(5, "five"))))
+    if rows_bytes.is_err:
+        print("rows_bytes err: " + rows_bytes.err.message)
+    else:
+        print("rows_bytes fill: " + fmt_rows(rows_bytes.ok))
+    sites_doc := obj(q("owner") + ":" + q("olive") + "," + q("sites") + ":[" + site_doc("s1", 48, "paris", "[" + q("a") + "," + q("b") + "]") + "," + site_doc("s2", -3, "oslo", "[]") + "]")
+    sites := json.decode_text[Sites](sites_doc)
+    if sites.is_err:
+        print("sites fill err: " + sites.err.message)
+    else:
+        both("sites", fmt_sites(sites.ok), fmt_sites(walk_sites(sites_doc)))
+
+    # the parser's grammar: whitespace everywhere, keys out of order, a
+    # missing comma between elements, a trailing comma, an array cut off
+    # after a comma (the parser accepts an array that runs off the end)
+    ints_both("spaced", " " + chr(123) + " " + q("xs") + " : [ 1 , 2 ,3 ] , " + q("name") + " : " + q("s") + " " + chr(125))
+    ints_both("no_comma", ints_doc("n", "[1 2 3]"))
+    ints_both("trailing_comma", ints_doc("t", "[1,2,]"))
+    ints_both("open_end", chr(123) + q("name") + ":" + q("u") + "," + q("xs") + ":[1,2,")
+
+    # unknown keys holding arrays of objects and nested arrays, before and
+    # after the list field, and inside an element
+    junk := "[" + obj(q("a") + ":[1,2]," + q("b") + ":" + obj(q("c") + ":[]")) + "," + obj("") + ",[[1],[2,[3]]]]"
+    rows_both("extras", obj(q("junk") + ":" + junk + "," + q("title") + ":" + q("t") + "," + q("rows") + ":[" + obj(q("id") + ":1," + q("extra") + ":" + junk + "," + q("label") + ":" + q("l")) + "]," + q("more") + ":" + junk + "," + q("count") + ":3"))
+
+    flat := json.decode_text[Flat](obj(q("a") + ":1," + q("junk") + ":" + junk + "," + q("b") + ":" + q("s")))
+    if flat.is_err:
+        print("flat_extras err: " + flat.err.message)
+    else:
+        print("flat_extras ok: " + flat.ok.a.to_string() + " " + flat.ok.b)
+    flat_opt := json.decode_text[FlatOpt](obj(q("a") + ":1," + q("junk") + ":" + junk + "," + q("b") + ":" + q("s") + "," + q("more") + ":" + junk))
+    if flat_opt.is_err:
+        print("flat_opt_extras err: " + flat_opt.err.message)
+    else:
+        if let c = flat_opt.ok.c:
+            print("flat_opt_extras ok: " + flat_opt.ok.a.to_string() + " " + flat_opt.ok.b + " " + c.to_string())
+        else:
+            print("flat_opt_extras ok: " + flat_opt.ok.a.to_string() + " " + flat_opt.ok.b + " none")
+
+    # a repeated list key: the last array wins and the first is dropped
+    rows_both("duplicate", obj(q("title") + ":" + q("d") + "," + q("rows") + ":[" + row(1, "one") + "]," + q("rows") + ":[" + row(2, "two") + "," + row(3, "three") + "]," + q("count") + ":3"))
+
+    # errors, through the filler and through the node pool: a wrong-typed
+    # element at the first, second and last position, an element missing a
+    # field, an element of the wrong kind, a list field that is not an
+    # array, a missing list field, a malformed element, an array cut off
+    # inside an element
+    ints_err("wrong_first", ints_doc("w", "[" + q("x") + ",2,3]"))
+    ints_err("wrong_second", ints_doc("w", "[1,1.5,3]"))
+    ints_err("wrong_last", ints_doc("w", "[1,2,null]"))
+    ints_err("wrong_two", ints_doc("w", "[1,true,false]"))
+    ints_err("not_array", ints_doc("w", "7"))
+    ints_err("object_for_array", ints_doc("w", obj(q("a") + ":1")))
+    ints_err("missing_list", obj(q("name") + ":" + q("w")))
+    ints_err("missing_after_list", obj(q("xs") + ":[1]"))
+    ints_err("big_int_element", ints_doc("w", "[99999999999999999999]"))
+    fill_err("elem_missing_first", rows_doc(obj(q("id") + ":1") + "," + row(2, "two")))
+    node_err("elem_missing_first", rows_doc(obj(q("id") + ":1") + "," + row(2, "two")))
+    fill_err("elem_missing_second", rows_doc(row(1, "one") + "," + obj(q("label") + ":" + q("l"))))
+    node_err("elem_missing_second", rows_doc(row(1, "one") + "," + obj(q("label") + ":" + q("l"))))
+    fill_err("elem_missing_last", rows_doc(row(1, "one") + "," + row(2, "two") + "," + obj("")))
+    node_err("elem_missing_last", rows_doc(row(1, "one") + "," + row(2, "two") + "," + obj("")))
+    fill_err("elem_wrong_field", rows_doc(row(1, "one") + "," + obj(q("id") + ":" + q("2") + "," + q("label") + ":" + q("l"))))
+    node_err("elem_wrong_field", rows_doc(row(1, "one") + "," + obj(q("id") + ":" + q("2") + "," + q("label") + ":" + q("l"))))
+    fill_err("elem_not_object", rows_doc(row(1, "one") + ",7"))
+    node_err("elem_not_object", rows_doc(row(1, "one") + ",7"))
+    fill_err("elem_null", rows_doc("null"))
+    node_err("elem_null", rows_doc("null"))
+    fill_err("rows_not_array", obj(q("title") + ":" + q("t") + "," + q("rows") + ":" + row(1, "one") + "," + q("count") + ":3"))
+    node_err("rows_not_array", obj(q("title") + ":" + q("t") + "," + q("rows") + ":" + row(1, "one") + "," + q("count") + ":3"))
+    fill_err("rows_missing", obj(q("title") + ":" + q("t") + "," + q("count") + ":3"))
+    node_err("rows_missing", obj(q("title") + ":" + q("t") + "," + q("count") + ":3"))
+    fill_err("field_before_list", obj(q("title") + ":7," + q("rows") + ":[" + obj("") + "]," + q("count") + ":3"))
+    fill_err("elem_malformed", rows_doc(row(1, "one") + "," + chr(123) + q("id") + ":?" + chr(125)))
+    node_err("elem_malformed", rows_doc(row(1, "one") + "," + chr(123) + q("id") + ":?" + chr(125)))
+    fill_err("elem_bad_escape", rows_doc(obj(q("id") + ":1," + q("label") + ":" + dq + bs + "x" + dq)))
+    fill_err("cut_in_element", chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":[" + row(1, "one") + "," + chr(123) + q("id") + ":2," + q("label") + ":" + dq + "tw")
+    node_err("cut_in_element", chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":[" + row(1, "one") + "," + chr(123) + q("id") + ":2," + q("label") + ":" + dq + "tw")
+    fill_err("cut_after_element", chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":[" + row(1, "one") + ",")
+    node_err("cut_after_element", chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":[" + row(1, "one") + ",")
+    bad_utf8 := json.decode[Rows](bytes.from_string_utf8(rows_doc(obj(q("id") + ":1," + q("label") + ":" + dq + chr(255) + dq))))
+    if bad_utf8.is_err:
+        print("bad_utf8_element fill err: " + bad_utf8.err.message)
+
+    # the node-pool path on a good document, with and without the optional
+    node_err("node_full", obj(q("title") + ":" + q("t") + "," + q("rows") + ":[" + row(1, "one") + "," + row(2, "two") + "]," + q("xs") + ":[4,5]," + q("note") + ":" + q("n")))
+    node_err("node_no_note", obj(q("title") + ":" + q("t") + "," + q("rows") + ":[]," + q("xs") + ":[]"))
+    node_err("node_wrong_int", obj(q("title") + ":" + q("t") + "," + q("rows") + ":[]," + q("xs") + ":[1," + q("x") + "]"))
+    parsed := json.parse(obj(q("title") + ":" + q("p") + "," + q("rows") + ":[" + row(9, "nine") + "]," + q("xs") + ":[1]"))
+    from_object := json.decode_object[Maybe](parsed)
+    if from_object.is_err:
+        print("decode_object err: " + from_object.err.message)
+    else:
+        print("decode_object ok: " + fmt_maybe(from_object.ok))
+
+    # an element struct with an optional field, present and absent, and a
+    # nested struct with one: both through the decode_object specialization
+    opt_doc := obj(q("title") + ":" + q("o") + "," + q("rows") + ":[" + obj(q("id") + ":1," + q("label") + ":" + q("one")) + "," + obj(q("id") + ":2") + "]")
+    opt := json.decode_text[RowsOpt](opt_doc)
+    if opt.is_err:
+        print("elem_optional err: " + opt.err.message)
+    else:
+        mut line := "elem_optional ok: " + opt.ok.title
+        for r in opt.ok.rows:
+            if let l = r.label:
+                line = line + " " + r.id.to_string() + "/" + q(l)
+            else:
+                line = line + " " + r.id.to_string() + "/none"
+        print(line)
+    opt_bad := json.decode_text[RowsOpt](obj(q("title") + ":" + q("o") + "," + q("rows") + ":[" + obj(q("id") + ":1") + "," + obj(q("label") + ":" + q("x")) + "]"))
+    if opt_bad.is_err:
+        print("elem_optional_missing err: " + opt_bad.err.message)
+    holder := json.decode_text[Holder](obj(q("name") + ":" + q("h") + "," + q("inner") + ":" + obj(q("id") + ":3," + q("label") + ":" + q("three"))))
+    if holder.is_err:
+        print("nested_optional err: " + holder.err.message)
+    else:
+        if let l = holder.ok.inner.label:
+            print("nested_optional ok: " + holder.ok.name + " " + holder.ok.inner.id.to_string() + "/" + q(l))
+        else:
+            print("nested_optional ok: " + holder.ok.name + " " + holder.ok.inner.id.to_string() + "/none")
+
+    # churn: many decodes whose lists are kept long enough to read, a
+    # failing document every third round, so every destructor runs
+    mut total := 0
+    mut n := 0
+    while n < 300:
+        mut items := row(n, "r" + n.to_string()) + "," + row(n + 1, "s" + n.to_string())
+        if n % 3 == 2:
+            items = items + "," + obj(q("id") + ":0")
+        r := json.decode_text[Rows](rows_doc(items)) catch Rows("", [], 0 - 1)
+        s := json.decode_text[Sites](sites_doc) catch Sites("", [])
+        total = total + r.rows.len() + r.count + s.sites.len()
+        for x in r.rows:
+            total = total + x.label.len()
+        n = n + 1
+    print("churn " + total.to_string())
+    return 0

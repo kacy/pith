@@ -1,0 +1,73 @@
+# typed json.decode of a struct with list fields beside an optional field,
+# the shape that takes the node-pool path rather than the filler, and
+# json.decode_object of the same struct out of a parsed array.
+#
+# on this path a list of scalars is built by a std.json accessor
+# (object_require_int_list and its siblings) and a list of structs by a
+# loop the decode lowering emits, one decode_object specialization call
+# per element, pushed into a struct-owning list. every list built has to
+# end up owned by the decoded struct, and the struct's destructor has to
+# drop it. before this path existed, decode_object of a struct with a
+# List field compiled and silently skipped the field, shifting every slot
+# after it.
+#
+# a round decodes the struct from text twice and once through
+# decode_object out of a parsed document inside a pool scope, with the
+# optional field absent every time: a present `String?` on this path
+# strands about 32 bytes per decode on the compiler before this change
+# too (#1144), so it is kept out of the round to leave the list
+# shapes the only thing measured. the failing documents are not in the
+# round either: on the node-pool path a field read before the failing one
+# is not released, a defect older than list fields (#1145).
+import leakprobe as probe
+import std.json as json
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Order:
+    pub id: Int
+    pub tags: List[String]
+    pub note: String?
+    pub rows: List[Row]
+    pub weights: List[Float]
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn order_doc(i: Int, note: String) -> String:
+    rows := "[" + row(1, "one") + "," + row(i, "row" + i.to_string()) + "]"
+    return obj(q("id") + ":" + i.to_string() + "," + q("tags") + ":[" + q("a") + "," + q("tag" + i.to_string()) + "]," + note + q("rows") + ":" + rows + "," + q("weights") + ":[1.5," + i.to_string() + "]")
+
+fn round(i: Int) -> Int:
+    first := order_doc(i, "")
+    second := order_doc(i + 1, "")
+    a := json.decode_text[Order](first) catch Order(0, [], none, [], [])
+    b := json.decode_text[Order](second) catch Order(0, [], none, [], [])
+    mut v := a.tags.len() + a.rows.len() + a.weights.len() + b.tags.len() + b.rows.len()
+    if a.rows.len() > 1:
+        v = v + a.rows[1].label.len()
+    scope := json.open_scope()
+    root := json.parse(first)
+    c := json.decode_object[Order](root) catch Order(0, [], none, [], [])
+    v = v + c.rows.len() + c.id
+    json.close_scope(scope)
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

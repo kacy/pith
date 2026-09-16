@@ -1552,6 +1552,107 @@ pub fn object_require_object(handle: Int, key: String) -> Int!JsonDecodeError:
         fail json_missing_field_error("object", key)
     fail json_wrong_field_error("object", key)
 
+# gets a required array handle by key from an object: "missing list
+# field: tags" when the key is absent, "expected list field: tags" when
+# it holds anything but an array.
+pub fn object_require_array(handle: Int, key: String) -> Int!JsonDecodeError:
+    value := json_object_get(handle, key)
+    if handle_has_type(value, "array"):
+        return value
+    if value < 0:
+        fail json_missing_field_error("list", key)
+    fail json_wrong_field_error("list", key)
+
+# the error for an array element of the wrong kind, naming the element's
+# position under its field: "expected int element: xs[2]". the same text
+# the typed filler produces for the same document, so a struct decoded
+# through the node pool and one filled in place report alike.
+fn json_element_error(kind: String, key: String, index: Int) -> JsonDecodeError:
+    return JsonDecodeError("expected " + kind + " element: " + key + "[" + index.to_string() + "]")
+
+# the error a struct element's own decode reported, placed under the
+# element's position: "rows[1]: missing string field: name". the typed
+# decode lowering calls this for a `List[T]` field of structs on the
+# node-pool path, once decode_object has failed on element `index`.
+pub fn element_decode_error(key: String, index: Int, err: JsonDecodeError) -> JsonDecodeError:
+    return JsonDecodeError(key + "[" + index.to_string() + "]: " + err.message)
+
+# element `index` of the array `arr`, which must be an object: the
+# handle to decode, or "expected object element: rows[2]" for anything
+# else. the typed decode lowering calls this per element of a `List[T]`
+# field of structs on the node-pool path, before decode_object.
+pub fn require_object_element(arr: Int, key: String, index: Int) -> Int!JsonDecodeError:
+    elem := json_array_get(arr, index)
+    if handle_has_type(elem, "object"):
+        return elem
+    fail json_element_error("object", key, index)
+
+# gets a required array of ints by key from an object, as a List[Int].
+# an element that is not an integer (a float, a string, null) is the
+# error json_element_error describes. the accessor a typed decode uses
+# for a `List[Int]` field when the target takes the node-pool path.
+pub fn object_require_int_list(handle: Int, key: String) -> List[Int]!JsonDecodeError:
+    arr := object_require_array(handle, key)!
+    mut out: List[Int] := []
+    n := json_array_len(arr)
+    mut i := 0
+    while i < n:
+        elem := json_array_get(arr, i)
+        if not handle_has_type(elem, "int"):
+            fail json_element_error("int", key, i)
+        out.push(integer_values[elem])
+        i = i + 1
+    return out
+
+# gets a required array of strings by key from an object, as a
+# List[String]; an element of any other kind is an error.
+pub fn object_require_string_list(handle: Int, key: String) -> List[String]!JsonDecodeError:
+    arr := object_require_array(handle, key)!
+    mut out: List[String] := []
+    n := json_array_len(arr)
+    mut i := 0
+    while i < n:
+        elem := json_array_get(arr, i)
+        if not handle_has_type(elem, "string"):
+            fail json_element_error("string", key, i)
+        out.push(string_values[elem])
+        i = i + 1
+    return out
+
+# gets a required array of bools by key from an object, as a List[Bool];
+# an element of any other kind is an error.
+pub fn object_require_bool_list(handle: Int, key: String) -> List[Bool]!JsonDecodeError:
+    arr := object_require_array(handle, key)!
+    mut out: List[Bool] := []
+    n := json_array_len(arr)
+    mut i := 0
+    while i < n:
+        elem := json_array_get(arr, i)
+        if not handle_has_type(elem, "bool"):
+            fail json_element_error("bool", key, i)
+        out.push(json_get_bool(elem))
+        i = i + 1
+    return out
+
+# gets a required array of numbers by key from an object, as a
+# List[Float]. an element the parser typed as an int widens (`3` reads
+# 3.0), the way a `Float` field does; any other kind is an error.
+pub fn object_require_float_list(handle: Int, key: String) -> List[Float]!JsonDecodeError:
+    arr := object_require_array(handle, key)!
+    mut out: List[Float] := []
+    n := json_array_len(arr)
+    mut i := 0
+    while i < n:
+        elem := json_array_get(arr, i)
+        if handle_has_type(elem, "float"):
+            out.push(float_values[elem])
+        elif handle_has_type(elem, "int"):
+            out.push(integer_values[elem].to_float())
+        else:
+            fail json_element_error("float", key, i)
+        i = i + 1
+    return out
+
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     return json_object_keys(handle)

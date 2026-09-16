@@ -1,0 +1,14 @@
+# config.decode reads its fields through require helpers that have no list
+# form, so a List field stays refused there even though json.decode now
+# takes one.
+import std.config as config
+
+struct Settings:
+    pub name: String
+    pub hosts: List[String]
+
+fn main():
+    cfg := config.empty()
+    r := config.decode[Settings](cfg)
+    if r.is_err:
+        print("err")

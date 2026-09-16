@@ -885,17 +885,22 @@ pith build bench/json_decode_shapes.pith
 ./bench/json_decode_shapes small 4 20000    # three-field struct, 4-byte strings
 ./bench/json_decode_shapes wide 32 20000    # twenty-field struct, 32-byte strings
 ./bench/json_decode_shapes nested 4 2000    # a struct with a nested struct (nested fill)
-./bench/json_decode_shapes list 32 400      # an array of 32 small objects (node pool)
+./bench/json_decode_shapes list 32 400      # a struct with a List of 32 small objects (list fill)
+./bench/json_decode_shapes list_walk 32 400 # the same document through json.parse and decode_object per element
+./bench/json_decode_shapes list_scalar 32 400  # a struct with a List[Int] of 32 elements
 ./bench/json_decode_shapes float 4 20000    # four fields, two of them Float
 ./bench/json_decode_shapes ints 4 20000     # the same layout with Int in their place
 ```
 
 `json_decode_shapes` decodes one struct shape per run; `size` is the
 string value width for the flat shapes and the element count for the
-list. the flat shapes take the runtime's single-pass fill and the
-nested shape its nested twin, which fills the sub-struct in place; the
-list shape parses into the node pool and decodes each element out of
-it, so it answers a different question.
+lists. the flat shapes take the runtime's single-pass fill, the nested
+shape its nested twin, which fills the sub-struct in place, and the two
+list shapes the list-aware form of that filler, which builds the list
+and its element structs as it reads; `list_walk` parses the same
+document into the node pool and decodes each element out of it, the way
+a list had to be read before a `List` field was a decode target, so the
+pair reads one document two ways.
 
 the night's totals for these programs, each compiled by the compiler at the
 start of 2026-09-10 (`0fe497c0`) and by the tip (`099e7e62`, after #1107)
@@ -912,8 +917,10 @@ from the same source, run under callgrind, outputs and checksums identical:
 | json_decode_shapes nested 4 × 2000 | 1,059,907,351 | 8,408,038 | −99.2% |
 | json_decode_shapes list 32 × 400 | 4,380,580,768 | 4,383,020,015 | +0.06% |
 
-the list shape did not move because a list of structs still goes through
-the node pool by hand (#1110).
+the list shape did not move that night because a list of structs still
+went through the node pool by hand (#1110); the list fill that took it
+off the pool is measured under "typed json decoding: list fields" in
+docs/performance.md.
 
 ### the same head read over tls (2026-09-14)
 

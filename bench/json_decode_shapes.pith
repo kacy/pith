@@ -1,23 +1,27 @@
 # typed json decoding, one struct shape at a time.
 #
-# six shapes: a small flat struct (three fields), a wide flat struct
-# (twenty fields), a struct with a nested struct, an array of small
-# objects decoded element by element, and a pair of four-field structs
-# that differ only in two fields being Float (`float`) or Int (`ints`),
-# read against the same document layout so the float path's per-decode
-# cost sits beside the int path's. the flat shapes take the single-pass
-# runtime fill (`pith_json_fill_struct`) and the nested shape its nested
-# twin (`pith_json_fill_struct_nested`); the list shape parses into the
+# eight shapes: a small flat struct (three fields), a wide flat struct
+# (twenty fields), a struct with a nested struct, a struct holding a list
+# of small objects (`list`), the same document read through `json.parse`
+# and decoded element by element (`list_walk`, the way a list had to be
+# read before a `List` field was a decode target), a struct holding a list
+# of ints (`list_scalar`), and a pair of four-field structs that differ
+# only in two fields being Float (`float`) or Int (`ints`), read against
+# the same document layout so the float path's per-decode cost sits
+# beside the int path's. the flat shapes take the single-pass runtime fill
+# (`pith_json_fill_struct`), the nested shape its nested twin
+# (`pith_json_fill_struct_nested`), and the two list shapes the list-aware
+# form of it (`pith_json_fill_struct_lists`); `list_walk` parses into the
 # node pool first. `size` scales the string values of the flat shapes and
-# the element count of the list, so a per-call cost can be read against
+# the element count of the lists, so a per-call cost can be read against
 # the bytes it had to look at.
 #
 #   pith build bench/json_decode_shapes.pith
 #   ./bench/json_decode_shapes <shape> <size> <rounds>
 #
-# shape is one of small, wide, nested, list, float, ints. every decoded
-# value feeds the checksum, so an arm that decoded a field differently
-# cannot look fast.
+# shape is one of small, wide, nested, list, list_walk, list_scalar,
+# float, ints. every decoded value feeds the checksum, so an arm that
+# decoded a field differently cannot look fast.
 #
 # the profile that motivated this (docs/performance.md, 2026-09-10) put a
 # third of catalog_workload's instructions in the runtime fill, most of it
@@ -72,6 +76,13 @@ struct SampleInts:
     pub name: String
     pub value: Int
     pub delta: Int
+
+struct Items:
+    pub items: List[Small]
+
+struct Ids:
+    pub name: String
+    pub ids: List[Int]
 
 fn arg_or(index: Int, fallback: String) -> String:
     argv := args()
@@ -132,15 +143,27 @@ fn sample_doc(width: Int, floats: Bool) -> String:
         delta = "-0.25"
     return chr(123) + q("id") + ":7," + q("name") + ":" + q(text_of(width)) + "," + q("value") + ":" + value + "," + q("delta") + ":" + delta + chr(125)
 
+# an object holding an array of `count` small objects, the document the
+# `list` and `list_walk` shapes both read
 fn list_doc(count: Int) -> String:
-    mut s := "["
+    mut s := chr(123) + q("items") + ":["
     mut i := 0
     while i < count:
         if i > 0:
             s = s + ","
         s = s + chr(123) + q("id") + ":" + i.to_string() + "," + q("name") + ":" + q("item" + i.to_string()) + "," + q("active") + ":false" + chr(125)
         i = i + 1
-    return s + "]"
+    return s + "]" + chr(125)
+
+fn list_scalar_doc(count: Int) -> String:
+    mut s := chr(123) + q("name") + ":" + q("ids") + "," + q("ids") + ":["
+    mut i := 0
+    while i < count:
+        if i > 0:
+            s = s + ","
+        s = s + (i * 7).to_string()
+        i = i + 1
+    return s + "]" + chr(125)
 
 fn small_sum(doc: Bytes) -> Int:
     r := json.decode[Small](doc) catch Small(0 - 1, "", false)
@@ -173,17 +196,32 @@ fn ints_sum(doc: Bytes) -> Int:
     r := json.decode[SampleInts](doc) catch SampleInts(0 - 1, "", 0, 0)
     return r.id + r.name.len() + r.value + r.delta
 
-fn list_sum(doc: String) -> Int:
+fn list_sum(doc: Bytes) -> Int:
+    r := json.decode[Items](doc) catch Items([])
+    mut v := 0
+    for item in r.items:
+        v = v + item.id + item.name.len()
+    return v
+
+fn list_walk_sum(doc: String) -> Int:
     mark := json.pool_mark_node_id()
     root := json.parse(doc)
-    n := json.array_len(root)
+    arr := json.object_get(root, "items")
+    n := json.array_len(arr)
     mut v := 0
     mut i := 0
     while i < n:
-        item := json.decode_object[Small](json.array_get(root, i)) catch Small(0 - 1, "", false)
+        item := json.decode_object[Small](json.array_get(arr, i)) catch Small(0 - 1, "", false)
         v = v + item.id + item.name.len()
         i = i + 1
     json.pool_restore(mark, 0)
+    return v
+
+fn list_scalar_sum(doc: Bytes) -> Int:
+    r := json.decode[Ids](doc) catch Ids("", [])
+    mut v := r.name.len()
+    for id in r.ids:
+        v = v + id
     return v
 
 fn main() -> Int:
@@ -208,9 +246,19 @@ fn main() -> Int:
             total = total + nested_sum(doc)
             i = i + 1
     elif shape == "list":
-        doc := list_doc(size)
+        doc := bytes.from_string_utf8(list_doc(size))
         while i < rounds:
             total = total + list_sum(doc)
+            i = i + 1
+    elif shape == "list_walk":
+        doc := list_doc(size)
+        while i < rounds:
+            total = total + list_walk_sum(doc)
+            i = i + 1
+    elif shape == "list_scalar":
+        doc := bytes.from_string_utf8(list_scalar_doc(size))
+        while i < rounds:
+            total = total + list_scalar_sum(doc)
             i = i + 1
     elif shape == "float":
         doc := bytes.from_string_utf8(sample_doc(size, true))

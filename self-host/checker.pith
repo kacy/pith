@@ -3521,19 +3521,26 @@ fn decode_support_seen_key(field_tid: Int) -> String:
     return "|" + field_tid.to_string() + "|"
 
 # the field types a typed decode can fill: the scalars every decoder reads,
-# a `Float` only where `floats` says the decoder has a float path (the json
-# fillers and accessors do; the config and handle-pool decoders have no
-# float helper, and a field their lowering skipped would shift the slots
-# after it), an optional of those, and a struct of the same shape at any
-# depth. a `List` or a `Map` field is refused everywhere (#1110).
-fn json_decode_field_supported_with_seen(field_tid: Int, seen: String, floats: Bool) -> Bool:
+# a `Float` and a `List` only where `json_target` says the decoder is the
+# json one (its fillers and accessors have a float path and build lists;
+# the config and handle-pool decoders have neither helper, and a field
+# their lowering skipped would shift the slots after it), an optional of
+# those, and a struct of the same shape at any depth. a list's element is
+# a scalar or a struct of the same shape; a list of lists, of optionals or
+# of maps is not read yet, and a `Map` field is refused everywhere (#1110).
+fn json_decode_field_supported_with_seen(field_tid: Int, seen: String, json_target: Bool) -> Bool:
     if field_tid == lookup_type_id("String") or field_tid == lookup_type_id("Int") or field_tid == lookup_type_id("Bool"):
         return true
-    if floats and field_tid == lookup_type_id("Float"):
+    if json_target and field_tid == lookup_type_id("Float"):
         return true
     info := get_type_info(field_tid)
     if info.kind == "optional" and info.inner >= 0:
-        return json_decode_field_supported_with_seen(info.inner, seen, floats)
+        return json_decode_field_supported_with_seen(info.inner, seen, json_target)
+    if info.kind == "list" and info.inner >= 0 and json_target:
+        elem_info := get_type_info(info.inner)
+        if elem_info.kind != "primitive" and elem_info.kind != "struct":
+            return false
+        return json_decode_field_supported_with_seen(info.inner, seen, json_target)
     if info.kind == "struct":
         seen_key := decode_support_seen_key(field_tid)
         if seen.contains(seen_key):
@@ -3544,16 +3551,16 @@ fn json_decode_field_supported_with_seen(field_tid: Int, seen: String, floats: B
                 return false
             if i >= info.field_types.len():
                 return false
-            if not json_decode_field_supported_with_seen(info.field_types[i], next_seen, floats):
+            if not json_decode_field_supported_with_seen(info.field_types[i], next_seen, json_target):
                 return false
         return true
     return false
 
-# the config and handle-pool decoders' field set: no `Float`.
+# the config and handle-pool decoders' field set: no `Float`, no `List`.
 fn json_decode_field_supported(field_tid: Int) -> Bool:
     return json_decode_field_supported_with_seen(field_tid, "", false)
 
-# json.decode's field set: the same, plus `Float`.
+# json.decode's field set: the same, plus `Float` and `List`.
 fn json_decode_target_field_supported(field_tid: Int) -> Bool:
     return json_decode_field_supported_with_seen(field_tid, "", true)
 

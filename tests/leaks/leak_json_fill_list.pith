@@ -1,0 +1,85 @@
+# typed json.decode of a struct with list fields, the shapes the nested
+# filler builds itself: a list of ints, of strings, of bools, of floats,
+# a list of structs, and a list of structs each holding a nested struct
+# and its own list. every list and every element struct is allocated by
+# the runtime while the document is read, so each one has to end up owned
+# by exactly the struct that holds it, and the struct's destructor has to
+# drop the whole tree when the decoded value dies. a repeated list key has
+# to release the list its first occurrence built.
+#
+# a round decodes each shape once from text and the struct list once from
+# bytes, keeps the values alive long enough to read them, and lets them
+# go. the failing documents are leak_json_fill_list_fail's.
+import leakprobe as probe
+import std.json as json
+import std.bytes as bytes
+
+pub struct Scalars:
+    pub name: String
+    pub ids: List[Int]
+    pub tags: List[String]
+    pub flags: List[Bool]
+    pub weights: List[Float]
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Rows:
+    pub title: String
+    pub rows: List[Row]
+
+pub struct Geo:
+    pub lat: Int
+    pub label: String
+
+pub struct Site:
+    pub code: String
+    pub geo: Geo
+    pub tags: List[String]
+
+pub struct Sites:
+    pub owner: String
+    pub sites: List[Site]
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn site(i: Int) -> String:
+    geo := obj(q("lat") + ":" + i.to_string() + "," + q("label") + ":" + q("g" + i.to_string()))
+    return obj(q("code") + ":" + q("s" + i.to_string()) + "," + q("geo") + ":" + geo + "," + q("tags") + ":[" + q("a") + "," + q("b" + i.to_string()) + "]")
+
+fn round(i: Int) -> Int:
+    scalars := obj(q("name") + ":" + q("n" + i.to_string()) + "," + q("ids") + ":[1,2," + i.to_string() + "]," + q("tags") + ":[" + q("x") + "," + q("tag" + i.to_string()) + "]," + q("flags") + ":[true,false]," + q("weights") + ":[1.5,-0.25," + i.to_string() + "]")
+    rows := obj(q("title") + ":" + q("t" + i.to_string()) + "," + q("rows") + ":[" + row(1, "one") + "," + row(i, "row" + i.to_string()) + "," + row(3, "three") + "]")
+    dup := obj(q("title") + ":" + q("first") + "," + q("rows") + ":[" + row(1, "one") + "]," + q("rows") + ":[" + row(2, "two") + "," + row(3, "three") + "]")
+    sites := obj(q("owner") + ":" + q("o" + i.to_string()) + "," + q("sites") + ":[" + site(i) + "," + site(i + 1) + "]")
+    a := json.decode_text[Scalars](scalars) catch Scalars("", [], [], [], [])
+    b := json.decode_text[Rows](rows) catch Rows("", [])
+    c := json.decode[Rows](bytes.from_string_utf8(rows)) catch Rows("", [])
+    d := json.decode_text[Rows](dup) catch Rows("", [])
+    e := json.decode_text[Sites](sites) catch Sites("", [])
+    mut v := a.ids.len() + a.tags.len() + a.flags.len() + a.weights.len() + a.name.len()
+    v = v + b.rows.len() + c.rows.len() + d.rows.len()
+    if b.rows.len() > 1:
+        v = v + b.rows[1].id + b.rows[1].label.len()
+    for s in e.sites:
+        v = v + s.geo.lat + s.tags.len() + s.code.len()
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

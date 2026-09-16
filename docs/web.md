@@ -126,8 +126,33 @@ fn record(req: web.Request) -> http.HttpResponse:
     return http.text(200, "{r.sensor}: {r.value}")
 ```
 
-a `List` or a `Map` field is refused at the checker (`docs/limitations.md`);
-decode such a document through `json.parse` and the node accessors instead.
+a field may also be a `List` of any of those scalars or of another struct, so
+an array in the document decodes in the same call. the filler builds the list
+as it reads the array and each element struct with it, and a wrong element is
+reported by its position (`expected int element: sizes[2]`,
+`items[1]: missing string field: sku`):
+
+```pith
+struct Item:
+    pub sku: String
+    pub qty: Int
+
+struct Order:
+    pub id: Int
+    pub tags: List[String]
+    pub items: List[Item]
+
+fn place(req: web.Request) -> http.HttpResponse:
+    parsed := web.parse[Order](req)
+    if parsed.is_err:
+        return http.bad_request_response()
+    order := parsed.ok
+    return http.text(200, "{order.id}: {order.items.len()} items")
+```
+
+a `Map` field, and a `List` whose element is a `List`, a `Map` or an optional,
+are refused at the checker (`docs/limitations.md`); decode such a document
+through `json.parse` and the node accessors instead.
 
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:

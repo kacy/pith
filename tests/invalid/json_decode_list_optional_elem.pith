@@ -1,0 +1,13 @@
+# a List whose element is an optional is refused in a json decode target:
+# a json array has no missing elements, and the filler has no null form
+# for a list element (#1110).
+import std.json as json
+
+struct Sparse:
+    pub name: String
+    pub xs: List[Int?]
+
+fn main():
+    r := json.decode_text[Sparse]("x")
+    if r.is_err:
+        print("err")

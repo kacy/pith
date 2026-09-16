@@ -1,0 +1,100 @@
+# typed json.decode of a struct with a list field, failing part way through
+# the array: the cleanup after a partially decoded list.
+#
+# the nested filler builds a list's elements as it reads them, so when
+# element k fails every element built before it, the list itself and the
+# fields of the enclosing struct filled before the list already exist. the
+# filler owns none of them separately: the list sits in its slot before
+# the first element is read and an element struct is pushed before its
+# first field is read, so the one release the entry point does on failure
+# drops them all through the destructors. this case is the pin for that:
+# it fails at the first, the second and the last element, on a scalar list
+# and on a struct list, with a wrong-typed element, an element missing a
+# field, a malformed byte inside an element, and an array cut off inside
+# an element string, each with strings minted before and around the
+# failure. a version of the filler that stored the list into its slot only
+# after the array had read clean grew here by about 200 bytes a round.
+import leakprobe as probe
+import std.json as json
+
+pub struct Row:
+    pub id: Int
+    pub label: String
+
+pub struct Rows:
+    pub title: String
+    pub rows: List[Row]
+    pub note: String
+
+pub struct Tags:
+    pub name: String
+    pub tags: List[String]
+    pub ids: List[Int]
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn row(id: Int, label: String) -> String:
+    return obj(q("id") + ":" + id.to_string() + "," + q("label") + ":" + q(label))
+
+fn rows_doc(items: String) -> String:
+    return obj(q("title") + ":" + q("title-text") + "," + q("rows") + ":[" + items + "]," + q("note") + ":" + q("note-text"))
+
+fn tags_doc(tags: String, ids: String) -> String:
+    return obj(q("name") + ":" + q("name-text") + "," + q("tags") + ":[" + tags + "]," + q("ids") + ":[" + ids + "]")
+
+fn count_err(r: Rows!json.JsonDecodeError) -> Int:
+    if r.is_err:
+        return r.err.message.len()
+    return 0 - 1000
+
+fn count_tags_err(r: Tags!json.JsonDecodeError) -> Int:
+    if r.is_err:
+        return r.err.message.len()
+    return 0 - 1000
+
+fn round(i: Int) -> Int:
+    label := "label-" + i.to_string()
+    good := row(i, label)
+    # a struct element missing a field: first, second, last
+    at0 := rows_doc(obj(q("id") + ":1") + "," + good + "," + good)
+    at1 := rows_doc(good + "," + obj(q("id") + ":2") + "," + good)
+    at_last := rows_doc(good + "," + good + "," + obj(q("id") + ":3"))
+    # a struct element of the wrong kind, and one with a wrong-typed field
+    wrong_kind := rows_doc(good + ",7," + good)
+    wrong_field := rows_doc(good + "," + good + "," + obj(q("id") + ":" + q("x") + "," + q("label") + ":" + q("y")))
+    # malformed inside an element, and cut off inside an element string
+    malformed := rows_doc(good + "," + chr(123) + q("id") + ":?" + chr(125) + "," + good)
+    cut := chr(123) + q("title") + ":" + q("t") + "," + q("rows") + ":[" + good + "," + chr(123) + q("id") + ":2," + q("label") + ":" + chr(34) + "tw"
+    # a scalar list failing at the first, second and last element, after
+    # strings were minted into the list and into the struct
+    tags0 := tags_doc("1," + q("a") + "," + q("b"), "1,2")
+    tags1 := tags_doc(q("a") + ",true," + q("b"), "1,2")
+    tags_last := tags_doc(q("a") + "," + q("b") + ",null", "1,2")
+    ids_last := tags_doc(q("a") + "," + q("b"), "1,2," + q("three"))
+    mut v := count_err(json.decode_text[Rows](at0))
+    v = v + count_err(json.decode_text[Rows](at1))
+    v = v + count_err(json.decode_text[Rows](at_last))
+    v = v + count_err(json.decode_text[Rows](wrong_kind))
+    v = v + count_err(json.decode_text[Rows](wrong_field))
+    v = v + count_err(json.decode_text[Rows](malformed))
+    v = v + count_err(json.decode_text[Rows](cut))
+    v = v + count_tags_err(json.decode_text[Tags](tags0))
+    v = v + count_tags_err(json.decode_text[Tags](tags1))
+    v = v + count_tags_err(json.decode_text[Tags](tags_last))
+    v = v + count_tags_err(json.decode_text[Tags](ids_last))
+    return v
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(i)
+        i = i + 1
+    if total < 0:
+        print("impossible")
+    print("{probe.peak_kb()}")

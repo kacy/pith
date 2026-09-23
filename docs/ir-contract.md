@@ -270,6 +270,15 @@ that returns a struct defined in a third module used to spell the kind bare:
 the contract was violated in 22 corpus programs and, since the classifier saw
 nothing to release, every such returned struct leaked (#1057).
 
+it also refuses a `strref` that names no `string` line anywhere in the
+combined file. each module's string table is written before its bodies, so a
+literal a body interns for the first time lands after the table has been
+emitted; the consumer reads such a reference as a null string (see the
+soft spots below), and the text goes missing without a diagnostic. that is how
+`parse_float`'s error message came out empty (#1147) and how an index miss in
+a fallible function lost its `index out of bounds` (#1109). a string a body
+refers to belongs in the string prepass in `emit_ir`.
+
 known soft spots, where the consumer is quieter than it should be — these are the
 tightening targets, not settled behavior:
 
@@ -278,6 +287,10 @@ tightening targets, not settled behavior:
 - a `func` whose name collides with a runtime declaration is silently skipped.
 - if `pith_struct_alloc` is somehow absent, a struct construction falls back to a
   zero register instead of failing.
+- a `strref` naming no string reads as a null string instead of failing,
+  because a single-module dump may name a string another compilation unit
+  defines. `--validate` refuses it in a combined file, which is where every
+  string the program uses is defined.
 
 ## sources of truth
 

@@ -1,4 +1,4 @@
-unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
+unsafe fn alloc_parse_result(is_ok: i64, ok: i64, err: i64) -> i64 {
     // this matches pith's heap result tuple layout: [is_ok, ok, err].
     let tuple = crate::pith_struct_alloc(3) as *mut i64;
     if tuple.is_null() {
@@ -10,9 +10,9 @@ unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
     tuple as i64
 }
 
-unsafe fn parse_int_error(message: &[u8]) -> i64 {
+unsafe fn parse_error(message: &[u8]) -> i64 {
     let err = crate::pith_copy_bytes_to_cstring(message) as i64;
-    alloc_parse_int_result(0, 0, err)
+    alloc_parse_result(0, 0, err)
 }
 
 /// Parse string to int and return a result tuple pointer.
@@ -22,7 +22,7 @@ unsafe fn parse_int_error(message: &[u8]) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     if s.is_null() {
-        return parse_int_error(b"invalid integer");
+        return parse_error(b"invalid integer");
     }
     let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
         end -= 1;
     }
     if start == end {
-        return parse_int_error(b"invalid integer");
+        return parse_error(b"invalid integer");
     }
     let mut pos = start;
     let mut negative = false;
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
         negative = slice[pos] == b'-';
         pos += 1;
         if pos == end {
-            return parse_int_error(b"invalid integer");
+            return parse_error(b"invalid integer");
         }
     }
     let limit = if negative {
@@ -55,11 +55,11 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     while pos < end {
         let digit = slice[pos];
         if !digit.is_ascii_digit() {
-            return parse_int_error(b"invalid integer");
+            return parse_error(b"invalid integer");
         }
         let digit_value = (digit - b'0') as u64;
         if value > (limit - digit_value) / 10 {
-            return parse_int_error(b"integer overflow");
+            return parse_error(b"integer overflow");
         }
         value = value * 10 + digit_value;
         pos += 1;
@@ -73,25 +73,50 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     } else {
         value as i64
     };
-    alloc_parse_int_result(1, parsed, 0)
+    alloc_parse_result(1, parsed, 0)
 }
 
-/// Parse string to float — returns 0.0 on failure
+/// Parse a string to a float and return a result tuple pointer, laid out
+/// as parse_int's is: `[is_ok, ok, err]`, with the ok slot holding the
+/// f64's bit pattern so every value, a signed zero included, round-trips.
+///
+/// The text is trimmed of whitespace and converted by std's
+/// `f64::from_str`: an optional sign, digits with an optional fraction
+/// (`5`, `5.`, `.5`, `5.25`) and an optional exponent. A value too small
+/// for the type rounds to a zero of the text's sign and is a success. The
+/// failures are text that is not a number (`invalid float`), an exponent
+/// past the type's range (`float out of range`), and the spellings of a
+/// NaN or an infinity (`float is not finite`), because a parsed float is
+/// always finite.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> f64 {
+pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> i64 {
     if s.is_null() {
-        return 0.0;
+        return parse_error(b"invalid float");
     }
     let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
-    if let Ok(str_ref) = std::str::from_utf8(slice) {
-        str_ref.trim().parse::<f64>().unwrap_or(0.0)
-    } else {
-        0.0
+    let Ok(text) = std::str::from_utf8(slice) else {
+        return parse_error(b"invalid float");
+    };
+    let text = text.trim();
+    let Ok(value) = text.parse::<f64>() else {
+        return parse_error(b"invalid float");
+    };
+    if !value.is_finite() {
+        // from_str spells a NaN or an infinity with letters, so text with
+        // no letter but the exponent's that comes back infinite overflowed
+        if text
+            .bytes()
+            .any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E')
+        {
+            return parse_error(b"float is not finite");
+        }
+        return parse_error(b"float out of range");
     }
+    alloc_parse_result(1, value.to_bits() as i64, 0)
 }
 
 /// Base64 encode a C string — returns newly allocated C string
@@ -340,8 +365,8 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::pith_parse_int;
-    use std::ffi::CString;
+    use super::{pith_parse_float, pith_parse_int};
+    use std::ffi::{CStr, CString};
 
     fn parse(input: &str) -> (bool, i64) {
         let c_input = CString::new(input).unwrap();
@@ -373,5 +398,47 @@ mod tests {
     fn parse_int_handles_i64_bounds() {
         assert_eq!(parse("9223372036854775807"), (true, i64::MAX));
         assert_eq!(parse("-9223372036854775808"), (true, i64::MIN));
+    }
+
+    // the bits of the ok value, or the error message
+    fn parse_f(input: &str) -> Result<u64, String> {
+        let c_input = CString::new(input).unwrap();
+        let tuple = unsafe { pith_parse_float(c_input.as_ptr()) as *const i64 };
+        assert!(!tuple.is_null());
+        if unsafe { *tuple } != 0 {
+            return Ok(unsafe { *tuple.add(1) } as u64);
+        }
+        let err = unsafe { *tuple.add(2) } as *const std::os::raw::c_char;
+        Err(unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn parse_float_accepts_zeros_with_their_sign() {
+        assert_eq!(parse_f("0"), Ok(0.0f64.to_bits()));
+        assert_eq!(parse_f("0.0"), Ok(0.0f64.to_bits()));
+        assert_eq!(parse_f("-0.0"), Ok((-0.0f64).to_bits()));
+        assert_eq!(parse_f("1e-400"), Ok(0.0f64.to_bits()));
+        assert_eq!(parse_f("-1e-400"), Ok((-0.0f64).to_bits()));
+    }
+
+    #[test]
+    fn parse_float_accepts_trimmed_values() {
+        assert_eq!(parse_f("1.5"), Ok(1.5f64.to_bits()));
+        assert_eq!(parse_f(" -2.5e3\n"), Ok((-2500.0f64).to_bits()));
+        assert_eq!(parse_f(".5"), Ok(0.5f64.to_bits()));
+        assert_eq!(parse_f("1.7976931348623157e308"), Ok(f64::MAX.to_bits()));
+    }
+
+    #[test]
+    fn parse_float_rejects_malformed_and_non_finite_text() {
+        let err = |m: &str| Err(m.to_string());
+        assert_eq!(parse_f(""), err("invalid float"));
+        assert_eq!(parse_f("abc"), err("invalid float"));
+        assert_eq!(parse_f("1.5x"), err("invalid float"));
+        assert_eq!(parse_f("1e400"), err("float out of range"));
+        assert_eq!(parse_f("-1e400"), err("float out of range"));
+        assert_eq!(parse_f("inf"), err("float is not finite"));
+        assert_eq!(parse_f("-Infinity"), err("float is not finite"));
+        assert_eq!(parse_f("NaN"), err("float is not finite"));
     }
 }

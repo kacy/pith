@@ -1,0 +1,13 @@
+# a `main` that returns a result reports its error on stderr and exits 1.
+# the message has to survive the trip: an index miss in main propagates
+# "index out of bounds", which no literal in the program spells, and the
+# emitter used to intern it after the string table was written, so main
+# reported "main returned an error" instead (#1109). the parse_float
+# failure through `!` carries the runtime's own message (#1140, #1147).
+fn main() -> Int!:
+    print("parsed {parse_float("2.5")!}")
+    text := "one two"
+    words := text.split(" ")
+    print("first {words[0]}")
+    print("third {words[2]}")
+    return 0

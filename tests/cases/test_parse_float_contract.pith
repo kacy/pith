@@ -1,0 +1,73 @@
+# parse_float's contract, and the std readers built on it.
+#
+# the runtime returns the result box itself, with the f64's bit pattern in
+# the ok slot, so a zero is a value like any other: `0`, `0.0`, `-0.0` and
+# an underflow (`1e-400`) all succeed, and a negative zero keeps its sign
+# through `catch` and through `!`. the failures carry the runtime's own
+# message: text that is not a number reads "invalid float", an exponent
+# past the type's range "float out of range", and a NaN or an infinity
+# spelled out "float is not finite". a float prints without its sign
+# when it is zero, so every value is shown with its bits too.
+# valgrind-gated in MEMCHECK_CASES.
+
+import std.env as env
+import std.os as os
+import std.config as config
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn bits(f: Float) -> String:
+    return float_to_bits(f).to_string()
+
+fn show(text: String):
+    r := parse_float(text)
+    if r.is_ok:
+        print("parse " + q(text) + " ok " + r.ok.to_string() + " bits=" + bits(r.ok))
+    else:
+        print("parse " + q(text) + " err [" + r.err + "] len=" + r.err.len().to_string())
+
+# a `!` over parse_float: the ok value and the runtime's message both
+# travel through the propagation.
+fn doubled(text: String) -> Float!:
+    return parse_float(text)! * 2.0
+
+fn show_doubled(text: String):
+    r := doubled(text)
+    if r.is_ok:
+        print("doubled " + q(text) + " ok bits=" + bits(r.ok))
+    else:
+        print("doubled " + q(text) + " err [" + r.err + "]")
+
+fn main() -> Int:
+    texts := ["0", "0.0", "-0.0", "1e-400", "-1e-400", "1.5", "-2.5e3", " 7.25 ", "1e400", "-1e400", "nan", "inf", "-Infinity", "abc", "", "1.5x"]
+    for t in texts:
+        show(t)
+
+    print("--- catch ---")
+    print("catch " + q("-0.0") + " bits=" + bits(parse_float("-0.0") catch 1.0))
+    print("catch " + q("0") + " bits=" + bits(parse_float("0") catch 1.0))
+    print("catch " + q("abc") + " bits=" + bits(parse_float("abc") catch 1.0))
+    print("catch " + q("1e400") + " bits=" + bits(parse_float("1e400") catch 1.0))
+
+    print("--- ! ---")
+    show_doubled("0.25")
+    show_doubled("-0.0")
+    show_doubled("abc")
+    show_doubled("1e400")
+
+    print("--- std.env.float_or, fallback 9.5 ---")
+    for t in texts:
+        os.set_env("PITH_PARSE_FLOAT_CONTRACT", t)
+        print("env " + q(t) + " bits=" + bits(env.float_or("PITH_PARSE_FLOAT_CONTRACT", 9.5)))
+    os.unset_env("PITH_PARSE_FLOAT_CONTRACT")
+    print("env unset bits=" + bits(env.float_or("PITH_PARSE_FLOAT_CONTRACT", 9.5)))
+
+    print("--- std.config.get_float_or, fallback 9.5 ---")
+    for t in texts:
+        mut values: Map[String, String] := {}
+        values.insert("rate", t)
+        cfg := config.from_map(values)
+        print("config " + q(t) + " bits=" + bits(config.get_float_or(cfg, "rate", 9.5)))
+    print("config missing bits=" + bits(config.get_float_or(config.empty(), "rate", 9.5)))
+    return 0

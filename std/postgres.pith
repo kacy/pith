@@ -701,9 +701,18 @@ fn decode_value(raw: String, oid: Int) -> sql.Value:
     # float4, float8 — these genuinely are floats
     if oid == 700 or oid == 701:
         parsed := parse_float(raw)
-        if parsed.is_err:
-            return sql.text(raw)
-        return sql.real(parsed.ok)
+        if parsed.is_ok:
+            return sql.real(parsed.ok)
+        # unlike a numeric, a float column holds these three as values, and
+        # parse_float refuses every non-finite spelling. the literals are the
+        # bit patterns of the two infinities and of the quiet NaN.
+        if raw == "Infinity":
+            return sql.real(float_from_bits(9218868437227405312))
+        if raw == "-Infinity":
+            return sql.real(float_from_bits(0 - 4503599627370496))
+        if raw == "NaN":
+            return sql.real(float_from_bits(9221120237041090560))
+        return sql.text(raw)
     # bool
     if oid == 16:
         if raw == "t":

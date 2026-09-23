@@ -371,12 +371,9 @@ fn json_scalar_object(ok: Bool) -> JsonScalarObject:
     mut float_values_map: Map[String, Float] := {}
     return JsonScalarObject(ok, string_values_map, int_values_map, bool_values_map, float_values_map)
 
-# the bit patterns of the two infinities, which `parse_float` hands back
-# for an exponent past the type's range and no json number may denote.
-POSITIVE_INFINITY_BITS := 9218868437227405312
-NEGATIVE_INFINITY_BITS := 0 - 4503599627370496
-# -0.0: the sign bit alone. spelled as a subtraction because the literal
-# 9223372036854775808 does not fit an Int.
+# -0.0: the sign bit alone, which the tests below expect a `-0.0` to read
+# as. spelled as a subtraction because the literal 9223372036854775808
+# does not fit an Int.
 NEGATIVE_ZERO_BITS := 0 - 9223372036854775807 - 1
 
 # true for a byte a json number is written with: a digit, a sign, `.`,
@@ -396,59 +393,19 @@ fn json_byte_number_span_end(input: Bytes, pos: Int) -> Int:
 fn json_number_text_is_float(text: String) -> Bool:
     return text.contains(".") or text.contains("e") or text.contains("E")
 
-# true when `text` is a number `parse_float` converts: an optional sign,
-# digits with an optional fraction (`5`, `5.`, `5.25`, `.5`), and an
-# optional exponent with its own sign. this is the grammar check only;
-# the value comes from parse_float, whose result reads any zero as a
-# failure (#1140), so without this check a malformed span and `0.0`
-# would be indistinguishable.
-fn json_number_text_well_formed(text: String) -> Bool:
-    mut i := 0
-    n := text.len()
-    if i < n and (text[i] == "-" or text[i] == "+"):
-        i = i + 1
-    mut int_digits := 0
-    while i < n and text[i] >= "0" and text[i] <= "9":
-        i = i + 1
-        int_digits = int_digits + 1
-    mut frac_digits := 0
-    if i < n and text[i] == ".":
-        i = i + 1
-        while i < n and text[i] >= "0" and text[i] <= "9":
-            i = i + 1
-            frac_digits = frac_digits + 1
-    if int_digits == 0 and frac_digits == 0:
-        return false
-    if i < n and (text[i] == "e" or text[i] == "E"):
-        i = i + 1
-        if i < n and (text[i] == "-" or text[i] == "+"):
-            i = i + 1
-        mut exp_digits := 0
-        while i < n and text[i] >= "0" and text[i] <= "9":
-            i = i + 1
-            exp_digits = exp_digits + 1
-        if exp_digits == 0:
-            return false
-    return i == n
-
 # the float a json number's text denotes, through the runtime's parser
 # (`parse_float`, std's f64 conversion), with `ok` false when the text is
-# not a finite number. an integer text widens (`3` reads 3.0); `-0.0`
-# keeps its sign; an exponent past the type's range (`1e309`) is refused,
-# so 1.7976931348623157e308 is the largest value accepted and 5e-324 the
-# smallest positive one. a zero, `1e-400` included, reads as the failure
-# parse_float reports for any zero (#1140) and is rebuilt here with the
-# text's sign.
+# not a finite number. every caller hands over a span of number bytes
+# (digits, a sign, `.`, `e`, `E`), and over those bytes parse_float's
+# grammar is json's own widened by a leading `+`, a bare `5.` and `.5`.
+# an integer text widens (`3` reads 3.0); `-0.0` keeps its sign; a value
+# too small for the type (`1e-400`) reads as a zero of the text's sign;
+# an exponent past the type's range (`1e309`) is refused, so
+# 1.7976931348623157e308 is the largest value accepted and 5e-324 the
+# smallest positive one.
 fn json_float_of_text(text: String) -> JsonByteFloat:
-    if not json_number_text_well_formed(text):
-        return JsonByteFloat(false, 0.0, 0)
     parsed := parse_float(text)
     if parsed.is_err:
-        if text.len() > 0 and text[0] == "-":
-            return JsonByteFloat(true, float_from_bits(NEGATIVE_ZERO_BITS), 0)
-        return JsonByteFloat(true, 0.0, 0)
-    bits := float_to_bits(parsed.ok)
-    if bits == POSITIVE_INFINITY_BITS or bits == NEGATIVE_INFINITY_BITS:
         return JsonByteFloat(false, 0.0, 0)
     return JsonByteFloat(true, parsed.ok, 0)
 

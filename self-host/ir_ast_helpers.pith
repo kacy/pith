@@ -15,14 +15,16 @@ pub fn ir_list_contains(items: List[String], value: String) -> Bool:
 
 # whether a node of this kind carries literal string text in its `value`,
 # and so has to be interned into the module string table before any body
-# is emitted. the parser produces two such kinds: `string_lit` for a whole
-# literal and `lit` for one plain-text run between the interpolations of an
-# interpolated string; `string` and `str_lit` are older spellings accepted
-# here that parser.pith no longer emits. `string_interp` is deliberately
-# not one of them — that node holds no text of its own, only `lit` and
-# expression children.
+# is emitted. the parser produces three such kinds: `string_lit` for a whole
+# literal, `lit` for one plain-text run between the interpolations of an
+# interpolated string, and `pat_string` for a string literal a match arm
+# compares against (missing it here left a pattern's text out of the table
+# unless the same literal appeared elsewhere, so the arm never matched);
+# `string` and `str_lit` are older spellings accepted here that parser.pith
+# no longer emits. `string_interp` is deliberately not one of them: that
+# node holds no text of its own, only `lit` and expression children.
 pub fn ir_is_string_literal_kind(kind: String) -> Bool:
-    return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit"
+    return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit" or kind == "pat_string"
 
 # the declaration behind a `pub` wrapper. the parser does not mark a
 # declaration public in place — it wraps it in a `pub` node holding the

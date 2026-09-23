@@ -570,7 +570,15 @@ pub fn to_bigint(value: Decimal, mode: Rounding) -> bigint.BigInt!:
 # Float's range — for display and estimation, never for a value that has to
 # reconcile.
 pub fn to_float(value: Decimal) -> Float:
-    return parse_float(to_string(value)) catch 0.0
+    parsed := parse_float(to_string(value))
+    if parsed.is_ok:
+        return parsed.ok
+    # the text is a well-formed number, so parse_float's one refusal is a
+    # magnitude past a Float's range, which reads as the infinity of its
+    # sign (the literals are the two infinities' bit patterns)
+    if sign_of(value) < 0:
+        return float_from_bits(0 - 4503599627370496)
+    return float_from_bits(9218868437227405312)
 
 # --- internals ---
 
@@ -793,6 +801,10 @@ test "conversions out are explicit about what they lose":
     assert_eq(bigint.to_string(to_bigint(parse("12.9")!, half_even())!), "13")
     assert_eq(bigint.to_string(to_bigint(parse("-12.5")!, half_even())!), "-12")
     assert_eq(to_float(parse("1.5")!), 1.5)
+    assert_eq(float_to_bits(to_float(parse("0.00")!)), 0)
+    # past a float's range the value is the infinity of its sign
+    assert_eq(float_to_bits(to_float(parse("1e400")!)), 9218868437227405312)
+    assert_eq(float_to_bits(to_float(parse("-1e400")!)), 0 - 4503599627370496)
 
 test "values too large for an int keep every digit":
     huge := parse("123456789012345678901234567890.12345")!

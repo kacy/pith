@@ -1,0 +1,62 @@
+parse "0" ok 0 bits=0
+parse "0.0" ok 0 bits=0
+parse "-0.0" ok 0 bits=-9223372036854775808
+parse "1e-400" ok 0 bits=0
+parse "-1e-400" ok 0 bits=-9223372036854775808
+parse "1.5" ok 1.5 bits=4609434218613702656
+parse "-2.5e3" ok -2500 bits=-4565656063642173440
+parse " 7.25 " ok 7.25 bits=4619848792751996928
+parse "1e400" err [float out of range] len=18
+parse "-1e400" err [float out of range] len=18
+parse "nan" err [float is not finite] len=19
+parse "inf" err [float is not finite] len=19
+parse "-Infinity" err [float is not finite] len=19
+parse "abc" err [invalid float] len=13
+parse "" err [invalid float] len=13
+parse "1.5x" err [invalid float] len=13
+--- catch ---
+catch "-0.0" bits=-9223372036854775808
+catch "0" bits=0
+catch "abc" bits=4607182418800017408
+catch "1e400" bits=4607182418800017408
+--- ! ---
+doubled "0.25" ok bits=4602678819172646912
+doubled "-0.0" ok bits=-9223372036854775808
+doubled "abc" err [invalid float]
+doubled "1e400" err [float out of range]
+--- std.env.float_or, fallback 9.5 ---
+env "0" bits=0
+env "0.0" bits=0
+env "-0.0" bits=-9223372036854775808
+env "1e-400" bits=0
+env "-1e-400" bits=-9223372036854775808
+env "1.5" bits=4609434218613702656
+env "-2.5e3" bits=-4565656063642173440
+env " 7.25 " bits=4619848792751996928
+env "1e400" bits=4621537642612260864
+env "-1e400" bits=4621537642612260864
+env "nan" bits=4621537642612260864
+env "inf" bits=4621537642612260864
+env "-Infinity" bits=4621537642612260864
+env "abc" bits=4621537642612260864
+env "" bits=4621537642612260864
+env "1.5x" bits=4621537642612260864
+env unset bits=4621537642612260864
+--- std.config.get_float_or, fallback 9.5 ---
+config "0" bits=0
+config "0.0" bits=0
+config "-0.0" bits=-9223372036854775808
+config "1e-400" bits=0
+config "-1e-400" bits=-9223372036854775808
+config "1.5" bits=4609434218613702656
+config "-2.5e3" bits=-4565656063642173440
+config " 7.25 " bits=4619848792751996928
+config "1e400" bits=4621537642612260864
+config "-1e400" bits=4621537642612260864
+config "nan" bits=4621537642612260864
+config "inf" bits=4621537642612260864
+config "-Infinity" bits=4621537642612260864
+config "abc" bits=4621537642612260864
+config "" bits=4621537642612260864
+config "1.5x" bits=4621537642612260864
+config missing bits=4621537642612260864

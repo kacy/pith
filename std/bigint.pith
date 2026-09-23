@@ -453,7 +453,20 @@ fn combine_limbs(value: BigInt) -> Int:
 # never a step to take with money.
 pub fn to_float(value: BigInt) -> Float:
     # the text form is exact, so the only rounding is the one a Float forces.
-    return parse_float(to_string(value)) catch 0.0
+    parsed := parse_float(to_string(value))
+    if parsed.is_ok:
+        return parsed.ok
+    # the text is a well-formed integer, so parse_float's one refusal is a
+    # magnitude past a Float's range, which reads as the infinity of its sign
+    return infinity_of_sign(value.sign)
+
+# the infinity with the sign of `sign` (-1 or 1), for a conversion to Float
+# whose value is past the type's range. the literals are the two
+# infinities' bit patterns.
+fn infinity_of_sign(sign: Int) -> Float:
+    if sign < 0:
+        return float_from_bits(0 - 4503599627370496)
+    return float_from_bits(9218868437227405312)
 
 # --- internals: canonical form ---
 
@@ -988,3 +1001,7 @@ test "a value crosses to a float, losing precision where a float must":
     assert_eq(to_float(from_int(1)), 1.0)
     assert_eq(to_float(from_int(-250)), -250.0)
     assert_eq(to_float(parse("9007199254740993")!), 9007199254740992.0)
+    assert_eq(float_to_bits(to_float(from_int(0))), 0)
+    # past a float's range the value is the infinity of its sign
+    assert_eq(float_to_bits(to_float(ten_pow(400)!)), 9218868437227405312)
+    assert_eq(float_to_bits(to_float(negate(ten_pow(400)!))), 0 - 4503599627370496)

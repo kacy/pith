@@ -1,0 +1,9 @@
+# parse_float's failure through `!` in main: the runtime's message reaches
+# stderr. it used to be a wrapped "parse_float failed" interned after the
+# string table was written, which main reported as "main returned an
+# error" (#1140, #1147).
+fn main() -> Int!:
+    print("zero {parse_float("0")!}")
+    value := parse_float("twelve")!
+    print("unreachable {value}")
+    return 0

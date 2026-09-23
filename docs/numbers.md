@@ -15,6 +15,28 @@ measurements, ratios, and anything headed for a chart. `Decimal` for money, tax,
 invoice lines, and anything a person will later reconcile against a statement.
 `BigInt` when a whole number outgrows 64 bits.
 
+## text to a number
+
+`parse_int(text)` returns `Int!String` and `parse_float(text)` returns
+`Float!String`. both trim surrounding whitespace first.
+
+`parse_float` accepts an optional sign, digits with an optional fraction
+(`5`, `5.`, `.5`, `5.25`) and an optional exponent (`2.5e3`, `1E-9`). every
+finite value is a success, zeros included: `0`, `0.0` and `-0.0` parse, a
+negative zero keeps its sign, and a value too small for a `Float` (`1e-400`)
+rounds to a zero of the text's sign. the errors are:
+
+| text | error |
+| --- | --- |
+| not a number (`abc`, `1.5x`, the empty string) | `invalid float` |
+| an exponent past a Float's range (`1e400`, `-1e400`) | `float out of range` |
+| a NaN or an infinity spelled out (`nan`, `inf`, `Infinity`) | `float is not finite` |
+
+so a successful `parse_float` is always a finite number. `std.env.float_or` and
+`std.config.get_float_or` read through it and return their fallback exactly
+when it fails. `parse_int`'s errors are `invalid integer` and `integer
+overflow`.
+
 ## why money is never a Float
 
 a `Float` stores a binary fraction. `0.1` is not a binary fraction, so a Float
@@ -200,7 +222,9 @@ handle.exec("insert into ledger (amount) values ($1)", [decimal.to_string(amount
 
 a value the driver cannot parse as a number — postgres sends `NaN`, `Infinity`
 and `-Infinity` for a numeric — decodes to `Value.Text` holding the original
-string. it is never turned into a zero.
+string. it is never turned into a zero. a `float4` or `float8` column holds
+those three as values, so there they decode to `Value.Real` with the NaN or
+the infinity itself.
 
 see [docs/db.md](db.md) for the rest of the database surface.
 

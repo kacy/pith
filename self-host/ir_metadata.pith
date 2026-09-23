@@ -12,8 +12,9 @@ VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,lis
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,list_join_int,read_file,env,chr"
 
 # fallible builtins, grouped by how the ir carries their result (see the result
-# encoding in docs/ir-contract.md). parse_int and parse_float keep their own
-# legacy retkinds and are handled directly in ir_builtin_result_retkind.
+# encoding in docs/ir-contract.md). parse_int and parse_float return the
+# three-slot result box itself and are handled directly in
+# ir_builtin_result_retkind.
 RESULT_INT_FUNCS := "file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,crypto_p256_keygen,crypto_p384_keygen"
 RESULT_BOOL_FUNCS := "write_file,append_file,write_file_bytes,append_file_bytes"
 RESULT_STRING_FUNCS := "read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err"
@@ -129,23 +130,24 @@ pub fn ir_is_known_returning_func(fname: String) -> Bool:
 
 # the ir retkind of a fallible builtin's result. the match order is preserved
 # from the original hand-written chain so every function's retkind is unchanged.
+# the parsers build the box in the runtime, so a zero is a value like any other
+# and the error carries the runtime's own message.
 pub fn ir_builtin_result_retkind(name: String) -> String:
     ir_build_metadata_sets()
-    if name == "parse_int":
+    if name == "parse_int" or name == "parse_float":
         return "tuple"
     if result_int_funcs.contains_key(name):
         return "result_int"
     if result_bool_funcs.contains_key(name):
         return "result_bool"
-    if name == "parse_float":
-        return "float"
     if result_string_funcs.contains_key(name):
         return "string"
     if result_bytes_funcs.contains_key(name):
         return "bytes"
     return ""
 
-# the ok-value kind for a builtin whose result is carried as result_int/bool.
+# the ok-value kind for a builtin whose result is carried as result_int/bool,
+# or as the box the parsers return.
 pub fn ir_builtin_result_ok_kind(name: String) -> String:
     legacy_kind := ir_builtin_result_retkind(name)
     if legacy_kind == "result_int":
@@ -154,6 +156,8 @@ pub fn ir_builtin_result_ok_kind(name: String) -> String:
         return "bool"
     if name == "parse_int":
         return "int"
+    if name == "parse_float":
+        return "float"
     return ""
 
 # whether a method call yields a bool. type inference answers "bool" for

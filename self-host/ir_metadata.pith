@@ -146,6 +146,18 @@ pub fn ir_builtin_result_retkind(name: String) -> String:
         return "bytes"
     return ""
 
+# every builtin whose failure is a single-register sentinel, in table order:
+# the emitter wraps such a call's result into a box whose error is the
+# literal "<name> failed" (ir_emit_result_error_message), and the string
+# prepass interns each of those messages from this list, so a builtin added
+# to a table cannot leave its message out of the string table.
+pub fn ir_sentinel_result_builtin_names() -> List[String]:
+    mut names: List[String] := []
+    for table in [RESULT_INT_FUNCS, RESULT_BOOL_FUNCS, RESULT_STRING_FUNCS, RESULT_BYTES_FUNCS]:
+        for name in table.split(","):
+            names.push(name)
+    return names
+
 # the ok-value kind for a builtin whose result is carried as result_int/bool,
 # or as the box the parsers return.
 pub fn ir_builtin_result_ok_kind(name: String) -> String:

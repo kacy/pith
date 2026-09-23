@@ -1238,6 +1238,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_json_fill_nested_shapes \
 	tests/cases/test_json_fill_float_shapes \
 	tests/cases/test_parse_float_contract \
+	tests/cases/test_synthesized_error_messages \
 	tests/cases/test_json_fill_list_shapes \
 	tests/cases/test_json_fill_collection_shapes \
 	tests/cases/test_env_overlay \

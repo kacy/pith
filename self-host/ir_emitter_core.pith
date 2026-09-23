@@ -42,7 +42,7 @@ from ast import get_node, node_kind, node_value, node_child, node_child_count, N
 from checker import generic_base_identity, generic_identity_bare_name, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
-from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_obj_type_is_primitive, ir_primitive_method_call_name
+from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
@@ -10986,10 +10986,17 @@ fn ir_append_lambda_bodies():
     bodies: List[String] := ir_lambda_bodies
     ir_builder_append_lines(bodies)
 
-fn ir_preseed_result_error_strings():
-    builtin_names := "parse_int,file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,crypto_p384_keygen,write_file,append_file,write_file_bytes,append_file_bytes,read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_aes_256_gcm_seal,crypto_aes_256_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8,crypto_sign_rsa_pkcs1_sha256_pkcs8,crypto_sign_ed25519_pkcs8,crypto_sign_ecdsa_p256_sha256_pkcs8,crypto_sign_ecdsa_p256_sha256_asn1_pkcs8,crypto_sign_rsa_pss_sha384_pkcs8,crypto_sign_rsa_pss_sha512_pkcs8,crypto_sign_rsa_pkcs1_sha384_pkcs8,crypto_sign_rsa_pkcs1_sha512_pkcs8,crypto_sign_ecdsa_p384_sha384_asn1_pkcs8,crypto_blake2b,crypto_argon2id,zstd_compress,zstd_decompress".split(",")
-    for builtin_name in builtin_names:
+# the text of every error a body synthesizes rather than reads from the
+# source: the "<name> failed" message of a sentinel builtin's wrapped
+# result, and the messages an index miss and a `?` on none propagate. no
+# literal holds them, so the collector cannot see them, and a body that
+# interned one itself would add it after the table was written, where the
+# consumer reads it as a null string (#1147, #1109).
+fn ir_preseed_synthesized_error_strings():
+    for builtin_name in ir_sentinel_result_builtin_names():
         ir_str(builtin_name + " failed")
+    _index_id := ir_str("index out of bounds")
+    _unwrap_id := ir_str("unwrap of none")
 
 fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}
@@ -11263,7 +11270,7 @@ pub fn emit_ir(root_idx: Int) -> String:
         preload_i = preload_i + 1
     ir_collect_strings(root_idx)
     ir_collect_struct_field_strings(root_idx)
-    ir_preseed_result_error_strings()
+    ir_preseed_synthesized_error_strings()
     # the text an interpolated optional renders as when empty
     # (ir_emit_optional_value_to_string) is no literal the collector sees,
     # so it is interned here, ahead of the table like every other string a

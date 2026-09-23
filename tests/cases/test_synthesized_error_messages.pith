@@ -1,0 +1,59 @@
+# the errors a body synthesizes rather than reads from the source keep
+# their text. an index miss or a `?` on none inside a fallible function
+# propagates an error whose message no literal in the program spells, and
+# a sentinel builtin's failure is wrapped with "<name> failed". each of
+# those messages used to be interned while the body was emitted, after
+# the module's string table had been written, so the reference named no
+# string and the message read back empty (#1147, #1109). the string
+# prepass interns them now, and `ir_driver --validate` refuses a strref
+# that names no string. valgrind-gated in MEMCHECK_CASES.
+
+import std.bytes as bytes
+
+fn at(xs: List[Int], i: Int) -> Int!:
+    return xs[i]
+
+fn lookup(m: Map[String, Int], key: String) -> Int!:
+    return m[key]
+
+fn maybe(n: Int) -> Int?:
+    if n > 0:
+        return n
+    return none
+
+fn unwrapped(n: Int) -> Int!:
+    v := maybe(n)?
+    return v * 10
+
+# bytes_substring_utf8 reports failure with a null, which the emitter
+# wraps into a result whose error is "bytes_substring_utf8 failed"
+fn sliced(raw: Bytes, end: Int) -> String!:
+    return bytes.substring_utf8(raw, 0, end)!
+
+fn report(label: String, r: Int!):
+    if r.is_ok:
+        print(label + " ok " + r.ok.to_string())
+    else:
+        print(label + " err [" + r.err + "] len=" + r.err.len().to_string())
+
+fn main() -> Int:
+    xs := [10, 20]
+    report("list hit", at(xs, 1))
+    report("list miss", at(xs, 5))
+
+    mut m: Map[String, Int] := {}
+    m.insert("one", 1)
+    report("map hit", lookup(m, "one"))
+    report("map miss", lookup(m, "two"))
+
+    report("unwrap some", unwrapped(3))
+    report("unwrap none", unwrapped(0))
+
+    # the two bytes of one two-byte character: the first alone is not utf-8
+    raw := bytes.from_string_utf8("é")
+    good := sliced(raw, 2)
+    print("utf8 whole ok " + (good catch "?"))
+    bad := sliced(raw, 1)
+    if bad.is_err:
+        print("utf8 half err [" + bad.err + "]")
+    return 0

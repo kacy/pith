@@ -358,12 +358,29 @@ fn validate_field_contract(line_no: Int, line: String, parts: List[String]):
         return
     ir_contract_error(line_no, "field instructions must use an explicit numeric offset or tuple index: " + line)
 
+# every strref has to name a string some module's table defines. each
+# module's table is written before its bodies, so a literal a body interns
+# for the first time lands in a table nobody writes again, and the consumer
+# reads the reference as a null string: the text silently goes missing
+# (#1147, #1109). a string a body refers to belongs in the prepass.
+fn validate_strref_contract(line_no: Int, parts: List[String], string_names: Map[String, Bool]):
+    if parts.len() < 3 or parts[0] != "strref":
+        return
+    if not string_names.contains_key(parts[2]):
+        ir_contract_error(line_no, "strref " + parts[2] + " names no string in any string table; intern it in the string prepass")
+
 fn validate_combined_ir_contract(ir: String):
     mut func_kinds: Map[String, String] := {}
     mut struct_names: Map[String, Bool] := {}
+    mut string_names: Map[String, Bool] := {}
     lines := ir_lines(ir)
     mut line_no := 1
     for line in lines:
+        if line.starts_with("string "):
+            string_parts := line.split(" ")
+            string_names.insert(string_parts[1], true)
+            line_no = line_no + 1
+            continue
         if not line.starts_with("struct ") and not line.starts_with("func "):
             line_no = line_no + 1
             continue
@@ -375,12 +392,13 @@ fn validate_combined_ir_contract(ir: String):
 
     line_no = 1
     for line in lines:
-        if not line.starts_with("call ") and not line.starts_with("field "):
+        if not line.starts_with("call ") and not line.starts_with("field ") and not line.starts_with("strref "):
             line_no = line_no + 1
             continue
         parts := line.split(" ")
         validate_call_retkind(line_no, parts, struct_names)
         validate_field_contract(line_no, line, parts)
+        validate_strref_contract(line_no, parts, string_names)
         line_no = line_no + 1
     return
 

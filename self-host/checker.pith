@@ -17,7 +17,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -3166,38 +3166,55 @@ fn from_import_source_module(name: String) -> String:
             return entry.substring(needle.len(), entry.len())
     return ""
 
+# the modules a bare `name` in the current module may come from by import:
+# the source of a from-import naming it, or else every module the current
+# one imports with `*`. an aliased import contributes nothing, since its
+# names are reached only through the alias.
+fn bare_name_import_sources(name: String) -> List[String]:
+    mut sources: List[String] := []
+    named := from_import_source_module(name)
+    if named.len() > 0:
+        sources.push(named)
+        return sources
+    wildcard_needle := current_checker_module_path + chr(9)
+    for w in generic_wildcard_import_entries:
+        if w.starts_with(wildcard_needle):
+            sources.push(w.substring(wildcard_needle.len(), w.len()))
+    return sources
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
-        # a name defined by another module resolves only through an
-        # import; the shared global scope would otherwise let it leak
-        # across modules and die later in emission. builtins and the
-        # current module's own names always pass.
-        if binding_visible_from(scope_id, name, current_checker_module_path) == false:
-            # the shared global scope answers with whichever module
-            # registered the name last. a from-import names its source
-            # module, so prefer the declaration that module owns —
-            # otherwise two modules declaring the same function name
-            # (binary.reader / protobuf.reader) hand the caller the wrong
-            # signature, and every type derived from it is the wrong
-            # module's same-named struct.
-            source := from_import_source_module(name)
-            if source.len() > 0:
-                owned := lookup_binding_owned_by(scope_id, name, source)
-                if owned >= 0:
-                    return owned
-            if current_module_imports_name(name) == false:
-                # a generic declaration never enters the binding table, so a
-                # module calling its own generic fn can land here when some
-                # other loaded module has a concrete fn of the same name
-                # (collections.partition[T] vs strings.partition). the generic
-                # resolver is module-aware and prefers the current module, so
-                # let the generic call path take over exactly as it does when
-                # no concrete binding exists at all.
-                if has_generic_declaration(name):
-                    return TID_ERR
-                report_error_with_fix_at(node_idx, "E201", "'" + name + "' belongs to another module and is not imported here", "import it where it is defined")
+        # the shared global scope holds every module's top-level names at
+        # once and answers with whichever module registered the name
+        # last. that is the wrong binding whenever another module
+        # declared the same name: two modules declaring `reader`
+        # (binary.reader / protobuf.reader) handed the caller the wrong
+        # signature, and std.uuid's `pub fn max()` shadowed the builtin
+        # `max(a, b)` in every module of the program, including std
+        # modules that never imported it (#1138). so resolve to the
+        # binding this module owns or a builtin, or the one a from-import
+        # took from its source module; a name reached only through an
+        # alias never answers a bare reference.
+        owned_idx := lookup_binding_index_preferring(scope_id, name, current_checker_module_path, bare_name_import_sources(name))
+        if owned_idx >= 0:
+            record_definition(node_idx, binding_decl_node_at(owned_idx))
+            return binding_type_at(owned_idx)
+        # every binding of the name belongs to another module: it resolves
+        # only through an import; the shared global scope would otherwise
+        # let it leak across modules and die later in emission.
+        if current_module_imports_name(name) == false:
+            # a generic declaration never enters the binding table, so a
+            # module calling its own generic fn can land here when some
+            # other loaded module has a concrete fn of the same name
+            # (collections.partition[T] vs strings.partition). the generic
+            # resolver is module-aware and prefers the current module, so
+            # let the generic call path take over exactly as it does when
+            # no concrete binding exists at all.
+            if has_generic_declaration(name):
                 return TID_ERR
+            report_error_with_fix_at(node_idx, "E201", "'" + name + "' belongs to another module and is not imported here", "import it where it is defined")
+            return TID_ERR
         record_definition(node_idx, lookup_binding_decl_node(scope_id, name))
         return tid
     # check if it's a generic decl name — suppress false "undefined" errors

@@ -191,6 +191,51 @@ pub fn lookup_binding_owned_by(scope_id: Int, name: String, module_path: String)
         return lookup_binding_owned_by(entry.parent, name, module_path)
     return -1
 
+## the arena index of the binding a name resolves to from this scope
+## once other modules' names are set aside, or -1 when every binding of
+## the name in the chain is foreign. the root scope holds every module's
+## top-level names at once, and the plain lookup answers with whichever
+## module registered the name last, so a module's `pub fn max()` would
+## shadow the builtin `max` in every module of the program. here a
+## binding the module owns, or a builtin (tagged ""), is what the name
+## means; a binding from one of `source_modules`, the modules a
+## from-import took the name from, is preferred over both, since the
+## import said so. inner scopes hold only the current module's locals,
+## so a local still shadows everything outside its function.
+pub fn lookup_binding_index_preferring(scope_id: Int, name: String, module_path: String, source_modules: List[String]) -> Int:
+    key := binding_key(scope_id, name)
+    if binding_index.contains_key(key):
+        entries := binding_index[key]
+        for source in source_modules:
+            mut i := entries.len() - 1
+            while i >= 0:
+                if binding_module_tags[entries[i]] == source:
+                    return entries[i]
+                i = i - 1
+        mut j := entries.len() - 1
+        while j >= 0:
+            tag := binding_module_tags[entries[j]]
+            if tag == "" or tag == module_path:
+                return entries[j]
+            j = j - 1
+    entry := scope_entries[scope_id]
+    if entry.parent >= 0:
+        return lookup_binding_index_preferring(entry.parent, name, module_path, source_modules)
+    return -1
+
+## the type recorded for a binding by arena index, or -1 for an index
+## no binding has.
+pub fn binding_type_at(index: Int) -> Int:
+    if index >= 0 and index < binding_types.len():
+        return binding_types[index]
+    return -1
+
+## the declaration node recorded for a binding by arena index, or -1.
+pub fn binding_decl_node_at(index: Int) -> Int:
+    if index >= 0 and index < binding_decl_nodes.len():
+        return binding_decl_nodes[index]
+    return -1
+
 ## the arena index of the binding a lookup from this scope would find,
 ## or -1. the checker uses it to retype a binding after the fact: an
 ## empty collection literal has no element type at its declaration, so

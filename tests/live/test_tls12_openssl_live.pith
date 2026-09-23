@@ -12,7 +12,7 @@ import std.time as time
 CERT := "tests/live/fixtures/localhost.crt"
 KEY := "tests/live/fixtures/localhost.key"
 CA := "tests/live/fixtures/localhost-ca.crt"
-PORT := 44380
+PORT := 24380
 
 fn server_command(extra: List[String]) -> process.Command:
     base := process.command("openssl").arg("s_server").arg("-accept").arg(PORT.to_string()).arg("-cert").arg(CERT).arg("-key").arg(KEY).arg("-www").arg("-quiet")
@@ -69,8 +69,6 @@ fn run_case(label: String, extra: List[String], require13: Bool):
     print(label + ": " + outcome)
     proc.kill()
     proc.wait()
-
-
 
 fn main() -> Int!:
     run_case("aes128gcm", ["-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256"], false)

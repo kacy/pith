@@ -5,7 +5,7 @@
 #
 # start the server first (from the repo root):
 #   bash bench/grpc/build.sh
-#   bench/grpc/bin/server -addr 127.0.0.1:50055 \
+#   bench/grpc/bin/server -addr 127.0.0.1:20055 \
 #     -cert tests/live/fixtures/localhost.crt -key tests/live/fixtures/localhost.key &
 # then: pith test tests/live/grpc_stream_live.pith
 #
@@ -55,7 +55,7 @@ fn bidi_sender(stream: grpc.BidiStream, request: Bytes, count: Int) -> Int:
     return count
 
 test "client streaming sends several messages and reads the last":
-    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    opened := grpc.dial_with_config("localhost", 20055, local_config()!)
     if opened.is_err:
         skip_test("local grpc server not reachable: {opened.err}")
     channel := opened.ok
@@ -77,7 +77,7 @@ test "client streaming sends several messages and reads the last":
     assert_eq(echoed(reply.ok)!, "three")
 
 test "bidi streaming echoes every message in order":
-    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    opened := grpc.dial_with_config("localhost", 20055, local_config()!)
     if opened.is_err:
         skip_test("local grpc server not reachable: {opened.err}")
     channel := opened.ok
@@ -107,7 +107,7 @@ test "bidi streaming echoes every message in order":
     assert_eq(got[2], "z")
 
 test "bidi streaming runs a spawned sender concurrently with recv":
-    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    opened := grpc.dial_with_config("localhost", 20055, local_config()!)
     if opened.is_err:
         skip_test("local grpc server not reachable: {opened.err}")
     channel := opened.ok

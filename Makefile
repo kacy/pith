@@ -73,9 +73,10 @@ build:
 check-no-panics:
 	bash tooling/check_no_panics.sh
 
-# a regression case must listen outside linux's ephemeral port range, or a
-# client socket some earlier program (or the ci runner) dialed out from can
-# hold its number in TIME_WAIT and turn its listen into EADDRINUSE (#1092).
+# a regression case, live test or example must listen outside linux's
+# ephemeral port range, or a client socket some earlier program (or the ci
+# runner) dialed out from can hold its number in TIME_WAIT and turn its listen
+# into EADDRINUSE (#1092, #1149).
 check-test-ports:
 	sh tooling/check_test_ports.sh
 

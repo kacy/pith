@@ -1,0 +1,28 @@
+# std.uuid exports `max()`, the all-ones uuid. an aliased import used to put
+# that name in front of the builtin `max(a, b)` for every module in the
+# program, so this one failed with E207 at its own `max(3, 4)` and inside
+# std.bigint and std.decimal, which call the builtin (#1138). a module's
+# names are reached through its alias only; a bare name means the current
+# module's own declaration, a from-import, or the builtin.
+import std.uuid as uuid
+import std.bigint as bigint
+import std.decimal as decimal
+import builtin_named_exports as named
+
+fn main() -> Int!:
+    print("builtin max: " + max(3, 4).to_string())
+    print("builtin min: " + min(3, 4).to_string())
+    print("uuid max: " + uuid.max().to_string())
+    print("uuid max is_max: " + uuid.max().is_max().to_string())
+    # bigint's add_limbs sizes its loop with the builtin max over two limb
+    # lists of different lengths
+    big := bigint.add(bigint.parse("123456789012345678901234567890")!, bigint.from_int(10))
+    print("bigint sum: " + bigint.to_string(big))
+    # decimal's add and compare rescale to the builtin max of the two scales
+    sum := decimal.add(decimal.parse("1.5")!, decimal.parse("2.25")!)
+    print("decimal sum: " + decimal.to_string(sum))
+    print("decimal compare: " + decimal.compare(decimal.parse("1.50")!, decimal.parse("1.5")!).to_string())
+    # a same-arity export stays behind its alias
+    print("module max: " + named.max(3, 4).to_string())
+    print("module min: " + named.min())
+    return 0

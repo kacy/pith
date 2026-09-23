@@ -75,6 +75,13 @@ cases=(
   "tests/leaks/leak_optional_tuple_return SHAPE=2"
   "tests/leaks/leak_optional_tuple_return SHAPE=3"
   "tests/leaks/leak_optional_tuple_return SHAPE=4"
+  "tests/leaks/leak_optional_result_payload SHAPE=1"
+  "tests/leaks/leak_optional_result_payload SHAPE=2"
+  "tests/leaks/leak_optional_result_payload SHAPE=3"
+  "tests/leaks/leak_optional_result_payload SHAPE=4"
+  "tests/leaks/leak_optional_result_payload SHAPE=5"
+  "tests/leaks/leak_optional_result_payload SHAPE=6"
+  "tests/leaks/leak_optional_result_payload SHAPE=7"
   tests/leaks/leak_await_optional_shell
   tests/leaks/leak_index_search_shell
   tests/leaks/leak_discarded_optional_result

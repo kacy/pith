@@ -8205,7 +8205,14 @@ pub fn ir_emit_return_value(expr_child: Int):
             else:
                 r = ir_emit_optional_some_value(r)
     elif ir_current_func_return_kind == "tuple":
-        if result_kind != "tuple":
+        # a result return: forward a whole result, wrap anything else as the
+        # ok payload. the checker can only have accepted `return none` here
+        # when the ok type is an optional, so its payload is the empty shell;
+        # the zero built above was stored bare and every extraction read the
+        # null ok slot as a shell (#1076).
+        if expr_node.kind == "none_lit":
+            r = ir_emit_ok_result_tuple(ir_emit_optional_none_value())
+        elif not ir_return_forwards_result(expr_kind, result_kind):
             r = ir_emit_ok_result_tuple(r)
     elif ir_current_func_return_kind == "result_reg":
         if result_kind == "tuple":
@@ -8227,6 +8234,21 @@ pub fn ir_emit_return_value(expr_child: Int):
     ir_emit_rc_cleanup(exclude)
     ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
+
+# whether a value returned from a function declared `-> T!` is already the
+# result (forward it) or its ok payload (wrap it). the ir result kind cannot
+# answer alone: an optional and a tuple lower to the same "tuple" kind as a
+# result, so `return maybe()` with `maybe() -> String?` in a `(String?)!`
+# function read as a result and handed the caller the optional shell as the
+# box, whose ok slot then held the bare payload (#1076). the checker's type
+# decides whenever it names one of the three; a type parameter or an
+# unrecorded expression keeps the kind test.
+fn ir_return_forwards_result(expr_kind: String, result_kind: String) -> Bool:
+    if expr_kind == "result":
+        return true
+    if expr_kind == "optional" or expr_kind == "tuple":
+        return false
+    return result_kind == "tuple"
 
 # propagate `err_r` out of the current function as its error return: the
 # two-register pair when the function uses the register ABI, a fresh error

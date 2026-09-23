@@ -1,0 +1,521 @@
+# a function returning `(T?)!` hands back an optional inside a result. two
+# return spellings built that result wrong (#1076). `return none` stored a bare
+# zero in the ok slot instead of an empty optional, so every extraction read a
+# null shell and segfaulted. `return maybe()`, where `maybe` returns `T?`, was
+# forwarded as if it were already the result, because an optional and a result
+# lower to the same "tuple" kind: the caller took the optional shell for the
+# box and read the bare payload as the inner shell, printing an empty string
+# or a garbage struct, or crashing, depending on the payload. a `maybe()` that
+# answered none turned into a failure: its empty shell read as a result whose
+# flag was false, with an error read past the end of the shell. the correct
+# twins, an optional local returned by name, sat beside them all along.
+#
+# every producer below is read back through every consumer spelling, for a
+# String, Int, struct and List payload, and each row prints what it read, in
+# this order: `catch none` then `unwrap_or`, `catch` with an optional fallback
+# then `unwrap_or`, `catch none` then `if let`, a `!` relay, `is_ok` and `ok`,
+# a `match`, a `catch:` block, and `catch none` on a bound result. the
+# expected file was derived from the source; runs under valgrind with the
+# freelist off (MEMCHECK_CASES).
+
+struct Pt:
+    x: Int
+    s: String
+
+# --- String payload ---
+
+fn show_str(v: String) -> String:
+    return v
+
+fn wrap_str(v: String) -> String?:
+    return v
+
+fn nothing_str() -> String?:
+    return none
+
+fn str_some_local(k: Int) -> (String?)!:
+    v: String? := "val"
+    return v
+
+fn str_some_call(k: Int) -> (String?)!:
+    return wrap_str("val")
+
+fn str_none_lit(k: Int) -> (String?)!:
+    return none
+
+fn str_none_local(k: Int) -> (String?)!:
+    v: String? := none
+    return v
+
+fn str_none_branch(k: Int) -> (String?)!:
+    if k > 0:
+        return none
+    v: String? := "val"
+    return v
+
+fn str_none_call(k: Int) -> (String?)!:
+    return nothing_str()
+
+fn str_fail(k: Int) -> (String?)!:
+    fail "boom"
+
+fn str_produce(which: String) -> (String?)!:
+    if which == "some_local":
+        return str_some_local(1)
+    elif which == "some_call":
+        return str_some_call(1)
+    elif which == "none_lit":
+        return str_none_lit(1)
+    elif which == "none_local":
+        return str_none_local(1)
+    elif which == "none_branch":
+        return str_none_branch(1)
+    elif which == "none_call":
+        return str_none_call(1)
+    elif which == "fail":
+        return str_fail(1)
+    fail "no producer"
+
+fn str_relay(which: String) -> (String?)!:
+    v := str_produce(which)!
+    return v
+
+fn str_catch_block(which: String) -> String:
+    v := str_produce(which) catch:
+        return "blockerr"
+    if let got = v:
+        return "some " + show_str(got)
+    return "none"
+
+fn str_read(which: String) -> String:
+    mut out: List[String] := []
+    a := str_produce(which) catch none
+    out.push(show_str(a.unwrap_or("fb")))
+    cv: String? := "cfb"
+    b := str_produce(which) catch cv
+    out.push(show_str(b.unwrap_or("fb")))
+    c := str_produce(which) catch none
+    if let got = c:
+        out.push("some " + show_str(got))
+    else:
+        out.push("none")
+    d := str_relay(which) catch none
+    out.push(show_str(d.unwrap_or("fb")))
+    r := str_produce(which)
+    if r.is_ok:
+        o := r.ok
+        if let got = o:
+            out.push("ok some " + show_str(got))
+        else:
+            out.push("ok none")
+    else:
+        out.push("err " + r.err)
+    m := str_produce(which)
+    matched := match m:
+        mm if mm.is_ok => "m " + show_str(mm.ok.unwrap_or("fb"))
+        mm => "merr " + mm.err
+    out.push(matched)
+    out.push(str_catch_block(which))
+    bound := str_produce(which)
+    e := bound catch none
+    out.push(show_str(e.unwrap_or("fb")))
+    return out.join(" | ")
+
+# --- Int payload ---
+
+fn show_int(v: Int) -> String:
+    return v.to_string()
+
+fn wrap_int(v: Int) -> Int?:
+    return v
+
+fn nothing_int() -> Int?:
+    return none
+
+fn int_some_local(k: Int) -> (Int?)!:
+    v: Int? := 42
+    return v
+
+fn int_some_call(k: Int) -> (Int?)!:
+    return wrap_int(42)
+
+fn int_none_lit(k: Int) -> (Int?)!:
+    return none
+
+fn int_none_local(k: Int) -> (Int?)!:
+    v: Int? := none
+    return v
+
+fn int_none_branch(k: Int) -> (Int?)!:
+    if k > 0:
+        return none
+    v: Int? := 42
+    return v
+
+fn int_none_call(k: Int) -> (Int?)!:
+    return nothing_int()
+
+fn int_fail(k: Int) -> (Int?)!:
+    fail "boom"
+
+fn int_produce(which: String) -> (Int?)!:
+    if which == "some_local":
+        return int_some_local(1)
+    elif which == "some_call":
+        return int_some_call(1)
+    elif which == "none_lit":
+        return int_none_lit(1)
+    elif which == "none_local":
+        return int_none_local(1)
+    elif which == "none_branch":
+        return int_none_branch(1)
+    elif which == "none_call":
+        return int_none_call(1)
+    elif which == "fail":
+        return int_fail(1)
+    fail "no producer"
+
+fn int_relay(which: String) -> (Int?)!:
+    v := int_produce(which)!
+    return v
+
+fn int_catch_block(which: String) -> String:
+    v := int_produce(which) catch:
+        return "blockerr"
+    if let got = v:
+        return "some " + show_int(got)
+    return "none"
+
+fn int_read(which: String) -> String:
+    mut out: List[String] := []
+    a := int_produce(which) catch none
+    out.push(show_int(a.unwrap_or(7)))
+    cv: Int? := 8
+    b := int_produce(which) catch cv
+    out.push(show_int(b.unwrap_or(7)))
+    c := int_produce(which) catch none
+    if let got = c:
+        out.push("some " + show_int(got))
+    else:
+        out.push("none")
+    d := int_relay(which) catch none
+    out.push(show_int(d.unwrap_or(7)))
+    r := int_produce(which)
+    if r.is_ok:
+        o := r.ok
+        if let got = o:
+            out.push("ok some " + show_int(got))
+        else:
+            out.push("ok none")
+    else:
+        out.push("err " + r.err)
+    m := int_produce(which)
+    matched := match m:
+        mm if mm.is_ok => "m " + show_int(mm.ok.unwrap_or(7))
+        mm => "merr " + mm.err
+    out.push(matched)
+    out.push(int_catch_block(which))
+    bound := int_produce(which)
+    e := bound catch none
+    out.push(show_int(e.unwrap_or(7)))
+    return out.join(" | ")
+
+# --- Pt payload ---
+
+fn show_pt(v: Pt) -> String:
+    return "Pt(" + v.x.to_string() + "," + v.s + ")"
+
+fn wrap_pt(v: Pt) -> Pt?:
+    return v
+
+fn nothing_pt() -> Pt?:
+    return none
+
+fn pt_some_local(k: Int) -> (Pt?)!:
+    v: Pt? := Pt(3, "pt")
+    return v
+
+fn pt_some_call(k: Int) -> (Pt?)!:
+    return wrap_pt(Pt(3, "pt"))
+
+fn pt_none_lit(k: Int) -> (Pt?)!:
+    return none
+
+fn pt_none_local(k: Int) -> (Pt?)!:
+    v: Pt? := none
+    return v
+
+fn pt_none_branch(k: Int) -> (Pt?)!:
+    if k > 0:
+        return none
+    v: Pt? := Pt(3, "pt")
+    return v
+
+fn pt_none_call(k: Int) -> (Pt?)!:
+    return nothing_pt()
+
+fn pt_fail(k: Int) -> (Pt?)!:
+    fail "boom"
+
+fn pt_produce(which: String) -> (Pt?)!:
+    if which == "some_local":
+        return pt_some_local(1)
+    elif which == "some_call":
+        return pt_some_call(1)
+    elif which == "none_lit":
+        return pt_none_lit(1)
+    elif which == "none_local":
+        return pt_none_local(1)
+    elif which == "none_branch":
+        return pt_none_branch(1)
+    elif which == "none_call":
+        return pt_none_call(1)
+    elif which == "fail":
+        return pt_fail(1)
+    fail "no producer"
+
+fn pt_relay(which: String) -> (Pt?)!:
+    v := pt_produce(which)!
+    return v
+
+fn pt_catch_block(which: String) -> String:
+    v := pt_produce(which) catch:
+        return "blockerr"
+    if let got = v:
+        return "some " + show_pt(got)
+    return "none"
+
+fn pt_read(which: String) -> String:
+    mut out: List[String] := []
+    a := pt_produce(which) catch none
+    out.push(show_pt(a.unwrap_or(Pt(0, "fbpt"))))
+    cv: Pt? := Pt(1, "cpt")
+    b := pt_produce(which) catch cv
+    out.push(show_pt(b.unwrap_or(Pt(0, "fbpt"))))
+    c := pt_produce(which) catch none
+    if let got = c:
+        out.push("some " + show_pt(got))
+    else:
+        out.push("none")
+    d := pt_relay(which) catch none
+    out.push(show_pt(d.unwrap_or(Pt(0, "fbpt"))))
+    r := pt_produce(which)
+    if r.is_ok:
+        o := r.ok
+        if let got = o:
+            out.push("ok some " + show_pt(got))
+        else:
+            out.push("ok none")
+    else:
+        out.push("err " + r.err)
+    m := pt_produce(which)
+    matched := match m:
+        mm if mm.is_ok => "m " + show_pt(mm.ok.unwrap_or(Pt(0, "fbpt")))
+        mm => "merr " + mm.err
+    out.push(matched)
+    out.push(pt_catch_block(which))
+    bound := pt_produce(which)
+    e := bound catch none
+    out.push(show_pt(e.unwrap_or(Pt(0, "fbpt"))))
+    return out.join(" | ")
+
+# --- List[Int] payload ---
+
+fn show_list(v: List[Int]) -> String:
+    return "list" + v.len().to_string() + ":" + v[0].to_string()
+
+fn wrap_list(v: List[Int]) -> List[Int]?:
+    return v
+
+fn nothing_list() -> List[Int]?:
+    return none
+
+fn list_some_local(k: Int) -> (List[Int]?)!:
+    v: List[Int]? := [4, 5]
+    return v
+
+fn list_some_call(k: Int) -> (List[Int]?)!:
+    return wrap_list([4, 5])
+
+fn list_none_lit(k: Int) -> (List[Int]?)!:
+    return none
+
+fn list_none_local(k: Int) -> (List[Int]?)!:
+    v: List[Int]? := none
+    return v
+
+fn list_none_branch(k: Int) -> (List[Int]?)!:
+    if k > 0:
+        return none
+    v: List[Int]? := [4, 5]
+    return v
+
+fn list_none_call(k: Int) -> (List[Int]?)!:
+    return nothing_list()
+
+fn list_fail(k: Int) -> (List[Int]?)!:
+    fail "boom"
+
+fn list_produce(which: String) -> (List[Int]?)!:
+    if which == "some_local":
+        return list_some_local(1)
+    elif which == "some_call":
+        return list_some_call(1)
+    elif which == "none_lit":
+        return list_none_lit(1)
+    elif which == "none_local":
+        return list_none_local(1)
+    elif which == "none_branch":
+        return list_none_branch(1)
+    elif which == "none_call":
+        return list_none_call(1)
+    elif which == "fail":
+        return list_fail(1)
+    fail "no producer"
+
+fn list_relay(which: String) -> (List[Int]?)!:
+    v := list_produce(which)!
+    return v
+
+fn list_catch_block(which: String) -> String:
+    v := list_produce(which) catch:
+        return "blockerr"
+    if let got = v:
+        return "some " + show_list(got)
+    return "none"
+
+fn list_read(which: String) -> String:
+    mut out: List[String] := []
+    a := list_produce(which) catch none
+    out.push(show_list(a.unwrap_or([9])))
+    cv: List[Int]? := [8]
+    b := list_produce(which) catch cv
+    out.push(show_list(b.unwrap_or([9])))
+    c := list_produce(which) catch none
+    if let got = c:
+        out.push("some " + show_list(got))
+    else:
+        out.push("none")
+    d := list_relay(which) catch none
+    out.push(show_list(d.unwrap_or([9])))
+    r := list_produce(which)
+    if r.is_ok:
+        o := r.ok
+        if let got = o:
+            out.push("ok some " + show_list(got))
+        else:
+            out.push("ok none")
+    else:
+        out.push("err " + r.err)
+    m := list_produce(which)
+    matched := match m:
+        mm if mm.is_ok => "m " + show_list(mm.ok.unwrap_or([9]))
+        mm => "merr " + mm.err
+    out.push(matched)
+    out.push(list_catch_block(which))
+    bound := list_produce(which)
+    e := bound catch none
+    out.push(show_list(e.unwrap_or([9])))
+    return out.join(" | ")
+
+# --- other function forms returning `(String?)!` ---
+
+struct Holder:
+    s: String?
+
+impl Holder:
+    fn get() -> String?:
+        return self.s
+
+    fn get_r() -> (String?)!:
+        return self.get()
+
+    fn none_r() -> (String?)!:
+        return none
+
+fn gen_none[T](x: T) -> (T?)!:
+    return none
+
+fn gen_id[T](v: T) -> T:
+    return v
+
+fn gen_call[T](x: T) -> (T?)!:
+    v: T? := x
+    return gen_id(v)
+
+fn gen_pass[T](x: T) -> T!:
+    return gen_id(x)
+
+fn gen_call_fn[T](f: fn() -> T) -> T!:
+    return f()
+
+fn state(r: (String?)!) -> String:
+    if r.is_err:
+        return "err " + r.err
+    o := r.ok
+    if let got = o:
+        return "ok some " + got
+    return "ok none"
+
+fn tail_match(k: Int) -> (String?)!:
+    return match k:
+        0 => none
+        _ => wrap_str("tail")
+
+fn text(r: (String?)!) -> String:
+    v := r catch none
+    return v.unwrap_or("fb")
+
+fn int_text(r: (Int?)!) -> String:
+    v := r catch none
+    return v.unwrap_or(7).to_string()
+
+fn main():
+
+    print("str some_local: " + str_read("some_local"))
+    print("str some_call: " + str_read("some_call"))
+    print("str none_lit: " + str_read("none_lit"))
+    print("str none_local: " + str_read("none_local"))
+    print("str none_branch: " + str_read("none_branch"))
+    print("str none_call: " + str_read("none_call"))
+    print("str fail: " + str_read("fail"))
+    print("int some_local: " + int_read("some_local"))
+    print("int some_call: " + int_read("some_call"))
+    print("int none_lit: " + int_read("none_lit"))
+    print("int none_local: " + int_read("none_local"))
+    print("int none_branch: " + int_read("none_branch"))
+    print("int none_call: " + int_read("none_call"))
+    print("int fail: " + int_read("fail"))
+    print("pt some_local: " + pt_read("some_local"))
+    print("pt some_call: " + pt_read("some_call"))
+    print("pt none_lit: " + pt_read("none_lit"))
+    print("pt none_local: " + pt_read("none_local"))
+    print("pt none_branch: " + pt_read("none_branch"))
+    print("pt none_call: " + pt_read("none_call"))
+    print("pt fail: " + pt_read("fail"))
+    print("list some_local: " + list_read("some_local"))
+    print("list some_call: " + list_read("some_call"))
+    print("list none_lit: " + list_read("none_lit"))
+    print("list none_local: " + list_read("none_local"))
+    print("list none_branch: " + list_read("none_branch"))
+    print("list none_call: " + list_read("none_call"))
+    print("list fail: " + list_read("fail"))
+    h := Holder("held")
+    print("method call: " + text(h.get_r()))
+    print("method none: " + text(h.none_r()))
+    print("generic none: " + text(gen_none("x")))
+    print("generic none int: " + int_text(gen_none(5)))
+    print("generic call: " + text(gen_call("gc")))
+    print("generic call int: " + int_text(gen_call(6)))
+    print("generic result of optional: " + state(gen_pass(wrap_str("gp"))))
+    print("generic result of none: " + state(gen_pass(nothing_str())))
+    print("generic result via fn: " + state(gen_call_fn(fn() -> String? => wrap_str("gf"))))
+    print("generic result via fn none: " + state(gen_call_fn(fn() -> String? => nothing_str())))
+    print("tail match none: " + text(tail_match(0)))
+    print("tail match call: " + text(tail_match(1)))
+    lam_none := fn() -> (String?)!:
+        return none
+    print("closure none: " + text(lam_none()))
+    lam_call := fn() -> (String?)!:
+        return wrap_str("lam")
+    print("closure call: " + text(lam_call()))

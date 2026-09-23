@@ -1,0 +1,106 @@
+# a function returning `(T?)!` hands back an optional inside a result, one
+# shape per SHAPE value (tooling/leak_check.sh registers each). `return none`
+# stored a bare zero in the ok slot and every extraction segfaulted on it, and
+# `return maybe()` forwarded the optional shell as if it were the result box
+# (#1076). the fixed return path wraps both in an ok box whose slot owns the
+# shell, the convention an optional local returned by name (shape 7) already
+# had, so every consumer that takes the ok payload has to release a shell it
+# did not see before. the payload's text varies per round so a retained copy
+# cannot hide behind the string table.
+import leakprobe as probe
+import std.env as env
+
+struct Pt:
+    x: Int
+    s: String
+
+fn wrap(s: String) -> String?:
+    return s
+
+fn wrap_pt(p: Pt) -> Pt?:
+    return p
+
+fn wrap_list(xs: List[String]) -> List[String]?:
+    return xs
+
+fn nothing() -> String?:
+    return none
+
+fn str_call(i: Int) -> (String?)!:
+    return wrap(probe.fresh_string(i))
+
+fn str_none(i: Int) -> (String?)!:
+    if i < 0:
+        fail "negative"
+    return none
+
+fn pt_call(i: Int) -> (Pt?)!:
+    return wrap_pt(Pt(i, probe.fresh_string(i)))
+
+fn list_call(i: Int) -> (List[String]?)!:
+    return wrap_list([probe.fresh_string(i)])
+
+fn list_relay(i: Int) -> (List[String]?)!:
+    v := list_call(i)!
+    return v
+
+fn none_call(i: Int) -> (String?)!:
+    if i < 0:
+        fail "negative"
+    return nothing()
+
+fn str_local(i: Int) -> (String?)!:
+    v: String? := probe.fresh_string(i)
+    return v
+
+fn shape(s: Int, i: Int) -> Int:
+    if s == 1:
+        v1 := str_call(i) catch none
+        return v1.unwrap_or("").len()
+    if s == 2:
+        v2 := str_none(i) catch none
+        return v2.unwrap_or("fallback").len()
+    if s == 3:
+        r3 := pt_call(i)
+        if r3.is_ok:
+            o3 := r3.ok
+            if let p = o3:
+                return p.s.len()
+        return 0
+    if s == 4:
+        v4 := list_relay(i) catch none
+        if let xs = v4:
+            return xs[0].len()
+        return 0
+    if s == 5:
+        v5 := none_call(i) catch:
+            return 0
+        return v5.unwrap_or("fallback").len()
+    if s == 6:
+        r6 := str_none(i)
+        if r6.is_ok:
+            o6 := r6.ok
+            if let got = o6:
+                return got.len()
+            return 8
+        return 0
+    if s == 7:
+        v7 := str_local(i) catch none
+        return v7.unwrap_or("").len()
+    return 0
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut acc := 0
+    mut want := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i)
+        if s == 2 or s == 5 or s == 6:
+            want = want + 8
+        else:
+            want = want + probe.fresh_string(i).len()
+        i = i + 1
+    if acc != want:
+        print("WRONG shape {s}: got {acc} want {want}")
+    print("{probe.peak_kb()}")

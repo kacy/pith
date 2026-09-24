@@ -1,7 +1,8 @@
-# the byte-count writes return a result box the runtime builds (#1153): on
-# success it holds the count, on failure a message string the box owns. the
-# box and the message are new on both paths, where the old zero sentinel
-# carried a bare register and a static message, so every consumer position
+# the byte-count writes report their own outcome (#1153): on success the
+# count, on failure a message string the caller owns. they returned a result
+# box the runtime built until #1162 made that a register pair, and the message
+# is new on the failure path, where the old zero sentinel carried a bare
+# register and a static message, so every consumer position
 # is churned here on a success and on a failure: a bound result read by
 # field, `!` through a fallible caller, `catch`, a discarded statement, and a
 # result handed to a function.

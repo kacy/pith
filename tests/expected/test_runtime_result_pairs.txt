@@ -1,0 +1,87 @@
+-- parse_int
+catch ok: 41
+catch err: -7
+! ok: 42
+! err: err [invalid integer]
+two frames ok: ok 42
+two frames err: err [integer overflow]
+forwarded ok: ok -17
+forwarded err: err [invalid integer]
+catch block ok: 6
+catch block err: -1
+unwrap_or ok: 12
+unwrap_or err: 99
+local is_ok: true false
+local ok: 0
+local err: invalid integer
+inline is_ok: true false
+inline ok: -9223372036854775808
+inline err: invalid integer
+argument ok: ok 8
+argument err: err [invalid integer]
+match ok 64
+match err [invalid integer]
+or_else handler: ok 15
+to_string ok: 5
+to_string err: invalid integer
+fn value ok: ok 123
+fn value err: err [invalid integer]
+lambda: 1105
+-- parse_float
+catch ok: 2.5
+catch err: -1.5
+! ok: 5
+! err: err [float is not finite]
+two frames ok: ok 1.5
+two frames err: err [float out of range]
+forwarded ok: ok 0
+forwarded err: err [float is not finite]
+catch block ok: 2
+catch block err: -1
+unwrap_or ok: 0.125
+unwrap_or err: 9.5
+local is_ok: true false
+local ok: 1000
+local err: invalid float
+argument ok: ok 0.5
+argument err: err [invalid float]
+inline ok: 3.75
+inline err: float is not finite
+-- byte buffer writes
+catch ok: 2
+catch err: -1
+string catch ok: 6
+string catch err: -1
+two frames ok: ok 104
+two frames err: err [byte_buffer_write failed: invalid buffer handle]
+unwrap_or ok: 0
+unwrap_or err: -1
+local: 0 [byte_buffer_write_string_utf8 failed: invalid buffer handle]
+argument err: err [byte_buffer_write failed: invalid buffer handle]
+len: 13
+-- file writes
+catch ok: 3
+bytes catch ok: 2
+two frames ok: ok 30
+local ok: 0
+catch err: -1
+two frames err: err [file_write failed: invalid or closed file handle]
+local err: file_write_bytes failed: invalid or closed file handle
+contents: abcxyqxy
+argument err: err [file_write failed: No space left on device (os error 28)]
+unwrap_or err: -5
+-- process writes
+catch ok: 2
+two frames ok: ok 1003
+local ok: 2
+catch err: -1
+two frames err: err [process_write failed: invalid or closed process handle]
+local err: process_write_bytes failed: invalid or closed process handle
+-- tcp writes
+catch ok: 4
+two frames ok: ok 10005
+local ok: 0
+peer read: ping-pong
+catch err: -1
+two frames err: err [tcp_write failed: invalid or closed socket handle]
+local err: tcp_write_bytes failed: invalid or closed socket handle

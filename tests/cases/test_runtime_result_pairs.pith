@@ -1,0 +1,255 @@
+# the builtins whose result the runtime hands back as an (is_ok, payload)
+# register pair (#1162): parse_int, parse_float and the eight byte-count
+# writes. a call site that consumes the pair on the spot (`!`, `catch`, a
+# `catch:` block, `unwrap_or`, a pair return) never builds a result box, and
+# every other position folds the pair into the box it always had. the
+# payload is the ok value on success and the runtime's own message string
+# on failure. each family goes through every position on both paths, and the
+# output is what the box-returning build printed, line for line.
+# valgrind-gated in MEMCHECK_CASES.
+
+import std.bytes as bytes
+
+PATH := "/tmp/pith-test-runtime-result-pairs.txt"
+PORT := 17590
+
+fn show(label: String, r: Int!):
+    if r.is_ok:
+        print(label + ": ok " + r.ok.to_string())
+    else:
+        print(label + ": err [" + r.err + "]")
+
+fn show_float(label: String, r: Float!):
+    if r.is_ok:
+        print(label + ": ok " + r.ok.to_string())
+    else:
+        print(label + ": err [" + r.err + "]")
+
+# one frame: `!` hands the pair's error straight up.
+fn parsed_sum(a: String, b: String) -> Int!:
+    return parse_int(a)! + parse_int(b)!
+
+# two frames: the error made by the runtime crosses both unchanged.
+fn parsed_sum_twice(a: String, b: String) -> Int!:
+    first := parsed_sum(a, b)!
+    return first * 2
+
+fn parsed_scale(text: String, by: Float) -> Float!:
+    return parse_float(text)! * by
+
+fn parsed_scale_twice(text: String) -> Float!:
+    return parsed_scale(text, 2.0)! + 1.0
+
+# a builtin's result returned as the function's own, with no `!`.
+fn forwarded(text: String) -> Int!:
+    return parse_int(text)
+
+fn forwarded_float(text: String) -> Float!:
+    return parse_float(text)
+
+fn catch_block_int(text: String) -> Int:
+    n := parse_int(text) catch:
+        return -1
+    return n + 1
+
+fn catch_block_float(text: String) -> Float:
+    x := parse_float(text) catch:
+        return -1.0
+    return x + 0.5
+
+fn matched(text: String) -> String:
+    match parse_int(text):
+        r if r.is_ok => "match ok " + r.ok.to_string()
+        r => "match err [" + r.err + "]"
+
+fn recover(message: String) -> Int!:
+    return message.len()
+
+fn ints():
+    print("-- parse_int")
+    a := parse_int("41") catch 0
+    print("catch ok: " + a.to_string())
+    b := parse_int("4x1") catch -7
+    print("catch err: " + b.to_string())
+    print("! ok: " + (parsed_sum("40", "2") catch -1).to_string())
+    show("! err", parsed_sum("40", "two"))
+    show("two frames ok", parsed_sum_twice("20", "1"))
+    show("two frames err", parsed_sum_twice("9223372036854775808", "1"))
+    show("forwarded ok", forwarded(" -17 "))
+    show("forwarded err", forwarded(""))
+    print("catch block ok: " + catch_block_int("5").to_string())
+    print("catch block err: " + catch_block_int("five").to_string())
+    print("unwrap_or ok: " + parse_int("12").unwrap_or(0).to_string())
+    print("unwrap_or err: " + parse_int("1.5").unwrap_or(99).to_string())
+    local_ok := parse_int("0")
+    local_err := parse_int("+")
+    print("local is_ok: " + local_ok.is_ok.to_string() + " " + local_err.is_ok.to_string())
+    print("local ok: " + local_ok.ok.to_string())
+    print("local err: " + local_err.err)
+    print("inline is_ok: " + parse_int("3").is_ok.to_string() + " " + parse_int("x").is_ok.to_string())
+    print("inline ok: " + parse_int("-9223372036854775808").ok.to_string())
+    print("inline err: " + parse_int("x").err)
+    show("argument ok", parse_int("8"))
+    show("argument err", parse_int("-"))
+    print(matched("64"))
+    print(matched("6 4"))
+    show("or_else handler", parse_int("abc").or_else(recover))
+    print("to_string ok: " + parse_int("5").to_string())
+    print("to_string err: " + parse_int("q").to_string())
+    parse_int("discarded")
+    parser := forwarded
+    show("fn value ok", parser("123"))
+    show("fn value err", parser("12 3"))
+    # a bound result captured by a closure (a builtin called inside a lambda
+    # body is #1082's capture bug on either build)
+    held_ok := parse_int("5")
+    held_err := parse_int("z")
+    add_held := fn(x: Int) => held_ok.unwrap_or(0) + held_err.unwrap_or(100) + x
+    print("lambda: " + add_held(1000).to_string())
+
+fn floats():
+    print("-- parse_float")
+    a := parse_float("2.5") catch 0.0
+    print("catch ok: " + a.to_string())
+    b := parse_float("2.5.1") catch -1.5
+    print("catch err: " + b.to_string())
+    print("! ok: " + (parsed_scale("1.25", 4.0) catch 0.0).to_string())
+    show_float("! err", parsed_scale("nan", 4.0))
+    show_float("two frames ok", parsed_scale_twice("0.25"))
+    show_float("two frames err", parsed_scale_twice("1e400"))
+    show_float("forwarded ok", forwarded_float("-0.0"))
+    show_float("forwarded err", forwarded_float("inf"))
+    print("catch block ok: " + catch_block_float("1.5").to_string())
+    print("catch block err: " + catch_block_float("x").to_string())
+    print("unwrap_or ok: " + parse_float("0.125").unwrap_or(0.0).to_string())
+    print("unwrap_or err: " + parse_float("").unwrap_or(9.5).to_string())
+    local_ok := parse_float("1e3")
+    local_err := parse_float("e3")
+    print("local is_ok: " + local_ok.is_ok.to_string() + " " + local_err.is_ok.to_string())
+    print("local ok: " + local_ok.ok.to_string())
+    print("local err: " + local_err.err)
+    show_float("argument ok", parse_float(".5"))
+    show_float("argument err", parse_float("."))
+    print("inline ok: " + parse_float("3.75").ok.to_string())
+    print("inline err: " + parse_float("infinity").err)
+    parse_float("discarded")
+
+fn buffer_through(buf: Int, data: Bytes) -> Int!:
+    return byte_buffer_write(buf, data)! + byte_buffer_write_string_utf8(buf, "cd")!
+
+fn buffer_through_twice(buf: Int, data: Bytes) -> Int!:
+    return buffer_through(buf, data)! + 100
+
+fn buffers():
+    print("-- byte buffer writes")
+    buf := byte_buffer_new()
+    data := bytes.from_string_utf8("ab")
+    print("catch ok: " + (byte_buffer_write(buf, data) catch -1).to_string())
+    print("catch err: " + (byte_buffer_write(0, data) catch -1).to_string())
+    print("string catch ok: " + (byte_buffer_write_string_utf8(buf, "héllo") catch -1).to_string())
+    print("string catch err: " + (byte_buffer_write_string_utf8(0, "x") catch -1).to_string())
+    show("two frames ok", buffer_through_twice(buf, data))
+    show("two frames err", buffer_through_twice(0, data))
+    print("unwrap_or ok: " + byte_buffer_write_string_utf8(buf, "").unwrap_or(-1).to_string())
+    print("unwrap_or err: " + byte_buffer_write(0, bytes.empty()).unwrap_or(-1).to_string())
+    local_ok := byte_buffer_write(buf, bytes.empty())
+    local_err := byte_buffer_write_string_utf8(0, "")
+    print("local: " + local_ok.ok.to_string() + " [" + local_err.err + "]")
+    show("argument err", byte_buffer_write(0, data))
+    byte_buffer_write_string_utf8(buf, "!")
+    print("len: " + byte_buffer_len(buf).to_string())
+    byte_buffer_free(buf)
+
+fn file_through(h: Int, text: String, data: Bytes) -> Int!:
+    return file_write(h, text)! + file_write_bytes(h, data)!
+
+fn file_through_twice(h: Int, text: String, data: Bytes) -> Int!:
+    return file_through(h, text, data)! * 10
+
+fn files():
+    print("-- file writes")
+    out := file_open_write(PATH) catch -1
+    data := bytes.from_string_utf8("xy")
+    print("catch ok: " + (file_write(out, "abc") catch -1).to_string())
+    print("bytes catch ok: " + (file_write_bytes(out, data) catch -1).to_string())
+    show("two frames ok", file_through_twice(out, "q", data))
+    local_ok := file_write(out, "")
+    print("local ok: " + local_ok.ok.to_string())
+    file_close(out)
+    print("catch err: " + (file_write(out, "abc") catch -1).to_string())
+    show("two frames err", file_through_twice(out, "q", data))
+    local_err := file_write_bytes(out, data)
+    print("local err: " + local_err.err)
+    print("contents: " + (read_file(PATH) catch "?"))
+    full := file_open_write("/dev/full") catch -1
+    show("argument err", file_write(full, "x"))
+    print("unwrap_or err: " + file_write_bytes(full, data).unwrap_or(-5).to_string())
+    file_close(full)
+    _removed := remove_file(PATH)
+
+fn process_through(child: Int, text: String, data: Bytes) -> Int!:
+    return process_write(child, text)! + process_write_bytes(child, data)!
+
+fn process_through_twice(child: Int, text: String, data: Bytes) -> Int!:
+    return process_through(child, text, data)! + 1000
+
+fn processes() -> Int!:
+    print("-- process writes")
+    child := process_spawn("cat")!
+    data := bytes.from_string_utf8("zz")
+    print("catch ok: " + (process_write(child, "hi") catch -1).to_string())
+    show("two frames ok", process_through_twice(child, "a", data))
+    local_ok := process_write_bytes(child, data)
+    print("local ok: " + local_ok.ok.to_string())
+    process_close(child)
+    print("catch err: " + (process_write(child, "x") catch -1).to_string())
+    show("two frames err", process_through_twice(child, "a", data))
+    local_err := process_write_bytes(child, data)
+    print("local err: " + local_err.err)
+    return 0
+
+fn accept_and_read(listener: Int) -> String!:
+    conn := tcp_accept(listener)!
+    mut got := ""
+    while true:
+        chunk := tcp_read(conn, 64)!
+        if chunk.len() == 0:
+            break
+        got = got + chunk
+    tcp_close(conn)
+    return got
+
+fn tcp_through(fd: Int, text: String, data: Bytes) -> Int!:
+    return tcp_write(fd, text)! + tcp_write_bytes(fd, data)!
+
+fn tcp_through_twice(fd: Int, text: String, data: Bytes) -> Int!:
+    return tcp_through(fd, text, data)! + 10000
+
+fn sockets() -> Int!:
+    print("-- tcp writes")
+    listener := tcp_listen("127.0.0.1", PORT)!
+    reader := spawn accept_and_read(listener)
+    fd := tcp_connect("127.0.0.1", PORT)!
+    data := bytes.from_string_utf8("pong")
+    print("catch ok: " + (tcp_write(fd, "ping") catch -1).to_string())
+    show("two frames ok", tcp_through_twice(fd, "-", data))
+    local_ok := tcp_write_bytes(fd, bytes.empty())
+    print("local ok: " + local_ok.ok.to_string())
+    tcp_close(fd)
+    received := await reader
+    print("peer read: " + (received catch "?"))
+    print("catch err: " + (tcp_write(fd, "x") catch -1).to_string())
+    show("two frames err", tcp_through_twice(fd, "-", data))
+    local_err := tcp_write_bytes(fd, data)
+    print("local err: " + local_err.err)
+    tcp_close(listener)
+    return 0
+
+fn main() -> Int:
+    ints()
+    floats()
+    buffers()
+    files()
+    processes() catch 0
+    sockets() catch 0
+    return 0

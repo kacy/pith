@@ -1,0 +1,40 @@
+# the handler from tests/cases/test_grpc_stream_serve.pith, called directly
+# once per round. `out` is a List[Bytes] in the Count branch and a Bytes in
+# the Join branch, and before kinded locals (#1137) neither value was
+# released, so every request to either method leaked what it built.
+import std.bytes as bytes
+import std.net.grpc as grpc
+import leakprobe as probe
+
+fn route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:
+    msgs := grpc.unframe_messages(body)!
+    if path == "/t.Svc/Count":
+        mut out: List[Bytes] := []
+        mut i := 0
+        while i < 3:
+            out.push(bytes.concat(msgs[0], bytes.from_string_utf8("-" + i.to_string())))
+            i = i + 1
+        return grpc.frame_messages(out)
+    if path == "/t.Svc/Join":
+        joined := bytes.buffer()
+        for m in msgs:
+            joined.write(m) catch 0
+        out := joined.bytes()
+        joined.free()
+        return grpc.frame_one(out)
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+fn main():
+    body := grpc.frame_one(bytes.from_string_utf8("payload"))
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        mut path := "/t.Svc/Count"
+        if i % 2 == 1:
+            path = "/t.Svc/Join"
+        reply := route(path, body) catch bytes.from_string_utf8("")
+        acc = acc + reply.len()
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

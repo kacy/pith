@@ -1,0 +1,134 @@
+# a local bound under different kinds at different sites (a String in one
+# branch and an Int in another, a List here and a Bytes there) is a kinded
+# local: each binding site records the kind of the count it took, a rebind
+# drops the outgoing value under that kind, and the exit cleanup drops what
+# the last binding on the path taken left behind. before that, the prepass
+# dropped such a name from the exit cleanup altogether, and every owned value
+# bound under it leaked (issue #1137: about 47 bytes a string for shape 1).
+# one SHAPE per registration in tooling/leak_check.sh.
+import std.bytes as bytes
+import std.env as env
+import leakprobe as probe
+
+struct Pair:
+    left: String
+    right: Int
+
+enum Token:
+    Word(String)
+    Count(Int)
+    Parts(List[String])
+
+# shape 1: the issue's reproducer, a fresh concatenation beside an Int.
+fn pick(i: Int) -> Int:
+    if i % 2 == 0:
+        v := "fresh-" + i.to_string()
+        return v.len()
+    v := i + 1
+    return v
+
+# shape 2: an owned String from a call beside an Int, falling through to the
+# exit cleanup rather than returning out of the branch.
+fn string_call(i: Int) -> Int:
+    mut n := 0
+    if i % 2 == 0:
+        v := probe.fresh_string(i)
+        n = v.len()
+    else:
+        v := i * 3
+        n = v
+    return n
+
+# shape 3: a fresh List beside a fresh Bytes, the grpc route's shape.
+fn list_or_bytes(i: Int) -> Int:
+    if i % 2 == 0:
+        out := ["a-{i}", "b-{i}"]
+        return out.len()
+    out := bytes.from_string_utf8("bytes-{i}")
+    return out.len()
+
+# shape 4: a struct beside a String.
+fn struct_or_string(i: Int) -> Int:
+    if i % 2 == 0:
+        v := Pair(left: "left-{i}", right: i)
+        return v.left.len() + v.right
+    v := "right-{i}"
+    return v.len()
+
+# shape 5: a borrowed element beside an Int. the binding takes a count of its
+# own and the exit cleanup drops it, so the list keeps exactly its own.
+fn borrowed(items: List[String], i: Int) -> Int:
+    if i % 2 == 0:
+        v := items[i % items.len()]
+        return v.len()
+    v := i
+    return v
+
+# shape 6: rebound across kinds inside a loop body, every iteration.
+fn loop_rebind(i: Int) -> Int:
+    mut total := 0
+    mut k := 0
+    while k < 4:
+        if (i + k) % 2 == 0:
+            v := "loop-{i}-{k}"
+            total = total + v.len()
+        else:
+            v := [k, i]
+            total = total + v.len()
+        k = k + 1
+    return total
+
+# shape 7: three arms of a match binding the name under three kinds.
+fn three_arms(t: Token) -> Int:
+    mut n := 0
+    match t:
+        Token.Word(x) =>
+            n = x.len()
+        Token.Count(x) =>
+            n = x
+        Token.Parts(x) =>
+            n = x.len()
+    return n
+
+fn token_for(i: Int) -> Token:
+    r := i % 3
+    if r == 0:
+        return Token.Word("word-{i}")
+    if r == 1:
+        return Token.Count(i)
+    return Token.Parts(["p-{i}", "q-{i}"])
+
+# shape 8: the shape inside a generic body, a String beside the parameter.
+fn generic_pick[T](x: T, i: Int) -> Int:
+    if i % 2 == 0:
+        v := "generic-" + i.to_string()
+        return v.len()
+    v := x
+    return 1
+
+fn main():
+    shape := env.int_or("SHAPE", 1)
+    items := ["one", "two", "three"]
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        if shape == 1:
+            acc = acc + pick(i)
+        elif shape == 2:
+            acc = acc + string_call(i)
+        elif shape == 3:
+            acc = acc + list_or_bytes(i)
+        elif shape == 4:
+            acc = acc + struct_or_string(i)
+        elif shape == 5:
+            acc = acc + borrowed(items, i)
+        elif shape == 6:
+            acc = acc + loop_rebind(i)
+        elif shape == 7:
+            acc = acc + three_arms(token_for(i))
+        else:
+            acc = acc + generic_pick(i, i) + generic_pick("s-{i}", i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

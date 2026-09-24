@@ -36,6 +36,17 @@ variables:
   collection element, a struct field) retains it first; fresh call
   results already arrive owned
 - rebinding or reassigning releases the value being replaced
+- a name bound under different kinds at different sites (a string in
+  one branch and an int in another, a list in one match arm and bytes
+  in the next) has no single kind to release it under, so it gets a
+  side slot recording the kind of the count its current value holds.
+  each binding site retains a borrowed value under its own kind,
+  releases the outgoing value under the recorded kind, and records its
+  own kind in its place: none for a plain value, or for a view that
+  takes no count, such as a tuple pattern's element. the exit cleanup
+  releases whatever the last binding on the path taken left in the
+  slot. returning such a name retains the value for the caller rather
+  than handing over the slot's count (#1137)
 - a return hands its count to the caller: a returned variable is
   excluded from the function's exit cleanup, a returned borrow is
   retained

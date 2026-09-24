@@ -1234,6 +1234,11 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
+	tests/cases/test_crosskind_binding_release \
+	tests/cases/test_if_let_crosskind_binding \
+	tests/cases/test_mixed_kind_match_binding \
+	tests/cases/test_match_binding_reuse \
+	tests/cases/test_generic_match_binding \
 	tests/cases/test_json_fill_struct_shapes \
 	tests/cases/test_json_fill_nested_shapes \
 	tests/cases/test_json_fill_float_shapes \

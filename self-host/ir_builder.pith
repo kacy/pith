@@ -142,14 +142,25 @@ pub fn ir_label() -> String:
 # per-function state the lowering families read constantly.
 pub mut ir_var_types: Map[String, String] := {}
 
-# rc-typed names bound with conflicting rc kinds in sibling branches or match
-# arms (e.g. `E.S(v)` binding a string and `E.M(v)` binding a struct). the
-# prologue prepass drops these from the exit cleanup — releasing with either
-# kind could fire the wrong runtime release — and records them here so the
-# match emitter also skips the release-of-previous-value for them. lives in
-# ir_builder (not ir_emitter_core) so ir_match_emit can read it without a
-# module cycle, same as ir_var_regs/ir_var_types.
+# names the prologue prepass could not track under a single rc kind: a name
+# bound with conflicting kinds in sibling branches or match arms (`E.S(v)`
+# binding a string and `E.M(v)` binding a struct), or with an rc kind at one
+# site and a plain value at another. the ones that never hold a count stay
+# here only. lives in ir_builder (not ir_emitter_core) so ir_match_emit can
+# read it without a module cycle, same as ir_var_regs/ir_var_types.
 pub mut ir_untracked_rc_binds: List[String] := []
+
+# the subset of ir_untracked_rc_binds that some binding site gives an rc kind.
+# each of these carries a side slot (ir_kinded_tag_slot) holding the rc kind
+# code of the value its slot owns, written at every binding site, so a rebind
+# releases the outgoing value under the kind it was bound with and the exit
+# cleanup releases whatever the last binding on the path taken left there.
+pub mut ir_kinded_rc_binds: List[String] := []
+
+# the module's kind-dispatching release helper, named per module like the
+# tuple cascade helpers, and whether any function of the module called it.
+pub mut ir_kinded_release_symbol: String := ""
+pub mut ir_kinded_release_used: Bool := false
 
 ## the current function's variable registers.
 pub mut ir_var_regs: Map[String, Int] := {}

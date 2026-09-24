@@ -5,7 +5,7 @@
 # a value of a given rc kind. the owned-locals tracking state and the exit
 # cleanup stay in ir_emitter_core.
 
-from ir_builder import ir_reg, ir_emit
+from ir_builder import ir_reg, ir_emit, ir_kinded_release_symbol, ir_kinded_release_used
 from ir_call_emit import ir_emit_call1, ir_emit_call2
 
 # take one count on the string in `r`. safe on any string register: the
@@ -137,3 +137,69 @@ pub fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_channel_release", "void", r)
     elif kind == "weak":
         ir_emit_call1(ir_reg(), "pith_struct_weak_release", "void", r)
+
+# the code a kinded local's side slot holds for the rc kind of the value in
+# its slot. 0 means the slot owns nothing: a plain value, a view that took no
+# count, or a slot no binding has reached. a kind outside this table also
+# gets 0. a binding site checks the code before it retains, so such a site
+# takes no count and releases none: it can leak, but it never releases under
+# the wrong kind.
+pub fn ir_kinded_code(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if kind == "set":
+        return 4
+    if kind == "bytes":
+        return 5
+    if ir_kind_is_struct_header(kind):
+        return 6
+    if kind == "closure":
+        return 7
+    if kind == "channel":
+        return 8
+    return 0
+
+# the rc kind the release helper dispatches `code` to, "" for 0 or an
+# unknown code.
+pub fn ir_kinded_code_kind(code: Int) -> String:
+    kinds := ["", "string", "list", "map", "set", "bytes", "struct", "closure", "channel"]
+    if code < 0 or code >= kinds.len():
+        return ""
+    return kinds[code]
+
+# one past the highest code ir_kinded_code hands out.
+pub fn ir_kinded_code_count() -> Int:
+    return 9
+
+# the side slot holding the kind code of what a kinded local's slot owns.
+pub fn ir_kinded_tag_slot(name: String) -> String:
+    return "__rck_" + name
+
+# release whatever a kinded local's slot owns: the value under the kind its
+# side slot names, through the module's dispatch helper. a zero value or a
+# zero code releases nothing.
+pub fn ir_kinded_release_slot(name: String):
+    val_r := ir_reg()
+    ir_emit("load " + val_r.to_string() + " " + name)
+    code_r := ir_reg()
+    ir_emit("load " + code_r.to_string() + " " + ir_kinded_tag_slot(name))
+    ir_kinded_release_used = true
+    ir_emit_call2(ir_reg(), ir_kinded_release_symbol, "void", val_r, code_r)
+
+# a binding site of a kinded local, called after the incoming value is built
+# (and retained, when the site takes a count) and before it is stored: drop
+# the outgoing value under the kind it was bound with, then record the
+# incoming value's kind. `kind` is the rc kind the site's count was taken
+# under, or "" for a site that took none. loading the outgoing value here,
+# after the right-hand side, rather than before it is what keeps a binding
+# of the same name inside that right-hand side (a match arm in the value
+# expression) from being released twice.
+pub fn ir_kinded_rebind(name: String, kind: String):
+    ir_kinded_release_slot(name)
+    code_r := ir_reg()
+    ir_emit("iconst " + code_r.to_string() + " " + ir_kinded_code(kind).to_string())
+    ir_emit("store " + ir_kinded_tag_slot(name) + " " + code_r.to_string())

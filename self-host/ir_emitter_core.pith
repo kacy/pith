@@ -51,10 +51,10 @@ from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_ma
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_json_intern_nested_specs, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
-from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg
+from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg, ir_kinded_code, ir_kinded_code_kind, ir_kinded_code_count, ir_kinded_tag_slot, ir_kinded_release_slot, ir_kinded_rebind
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_handle_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_handle_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_struct_drop_symbol, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
-from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds, ir_kinded_release_symbol, ir_kinded_release_used
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
@@ -116,6 +116,9 @@ mut ir_last_lambda_symbol := ""
 # is a no-op). lists, not maps, so cleanup order is deterministic and the
 # emitted ir stays bootstrap-stable.
 mut ir_rc_locals: List[String] := []
+# a lambda's captures while its prologue runs: loaded from the closure
+# environment, which owns them, so none of them may become a kinded local.
+mut ir_rc_prologue_captures: List[String] := []
 mut ir_rc_local_kinds: List[String] := []
 
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
@@ -399,6 +402,7 @@ fn ir_reset_type_state():
     ir_tuple_dtor_sigs = []
     ir_optional_tuple_dtor_needed = false
     ir_tuple_cascade_sigs = []
+    ir_kinded_release_used = false
     ir_result_arg_release_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
@@ -1787,6 +1791,47 @@ fn ir_emit_tuple_cascade_helpers():
         ir_emit_label(done_l)
         ir_emit_zero_ret_endfunc()
 
+# the module's release dispatch for kinded locals (ir_kinded_rc_binds): drop
+# one count on the value in `p` under the rc kind code in `k`
+# (ir_kinded_code), or nothing for code 0 or a zero value. a call rather
+# than inline branches for the reason ir_rc_release_local gives: the caller's
+# basic block stays whole.
+fn ir_emit_kinded_release_helper():
+    if not ir_kinded_release_used:
+        return
+    ir_emit_func_header("__kinded_release_m" + ir_module_count.to_string(), 2, "void")
+    ir_emit("param p")
+    ir_emit("param k")
+    pr := ir_reg()
+    ir_emit("load " + pr.to_string() + " p")
+    kr := ir_reg()
+    ir_emit("load " + kr.to_string() + " k")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    live_r := ir_reg()
+    ir_emit("neq " + live_r.to_string() + " " + pr.to_string() + " " + zero_r.to_string())
+    live_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
+    ir_emit_label(live_l)
+    mut code := 1
+    while code < ir_kinded_code_count():
+        code_r := ir_reg()
+        ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
+        hit_r := ir_reg()
+        ir_emit("eq " + hit_r.to_string() + " " + kr.to_string() + " " + code_r.to_string())
+        hit_l := ir_label()
+        next_l := ir_label()
+        ir_emit("brif " + hit_r.to_string() + " " + hit_l + " " + next_l)
+        ir_emit_label(hit_l)
+        ir_rc_release_reg(pr, ir_kinded_code_kind(code))
+        ir_emit("jmp " + done_l)
+        ir_emit_label(next_l)
+        code = code + 1
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+    ir_emit_zero_ret_endfunc()
+
 # one helper per (ok, err) payload signature a fresh result argument of this
 # module carries (ir_release_fresh_result_arg). the body is the cascade
 # helper's, gated on ownership: the live payload is released and its slot
@@ -1855,6 +1900,12 @@ fn ir_emit_rc_cleanup(exclude: String):
             ir_emit_local_slot_load(r, name)
             ir_rc_release_local(r, kind, name)
         i = i + 1
+    # a kinded local releases what the last binding on the path taken left in
+    # its slot, under the kind that binding recorded. a return never
+    # transfers one (ir_rc_local_kind does not report it, so the return
+    # retains its value like any borrow), so no exclusion applies.
+    for kname in ir_kinded_rc_binds:
+        ir_kinded_release_slot(kname)
 
 # pre-pass: names of string-typed binds anywhere in the body. an
 # under-approximation is safe — a missed name is never released (a leak),
@@ -1879,6 +1930,13 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
         val_node := get_node(parts.val_idx)
         if val_node.kind == "ident" and names.contains(val_node.value):
             bind_type = ir_rc_local_kind(val_node.value)
+            # the chained kind is the kind of the source's first binding.
+            # when another site binds the source under a different kind,
+            # this read can see that binding, so the checker's type for the
+            # read takes precedence.
+            read_kind := ir_rc_kind(ir_checked_type(parts.val_idx))
+            if read_kind.len() > 0 and read_kind != ir_rc_kind(bind_type):
+                bind_type = read_kind
         else:
             # the checker's recorded type resolves module-qualified calls
             # (bytes.from_string_utf8 and friends) that local inference
@@ -1906,13 +1964,19 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
     return bind_type
 
 # the prepass policy for one owned-local candidate: track the name under its
-# rc kind, or poison it. a name bound with DIFFERENT rc kinds in sibling
-# branches cannot be tracked — the exit cleanup would fire the wrong
-# retain/release at runtime — and a name bound with a non-rc (or unknown)
-# type somewhere falls under the same rule. a poisoned name is dropped from
-# tracking entirely: a bounded leak, never a wild pointer. `names` is the
-# live tracking list (ir_rc_locals — ir_rc_track_local appends to it),
-# so contains() here means "already tracked by an earlier binding".
+# rc kind, or poison it. a name is poisoned when two sites bind it under
+# different rc kinds, or when any site binds it under a non-rc or unknown
+# type, because one exit release cannot be right for every path. the
+# prologue removes poisoned names from the single-kind tracking. a poisoned
+# name that some site bound under an rc kind (and that was therefore tracked
+# at some point) becomes a kinded local (ir_kinded_rc_binds): each binding
+# site records the kind of the count it took in a side slot, a rebind
+# releases the outgoing value under the recorded kind, and the exit cleanup
+# releases the value the last binding on the path taken stored. a poisoned
+# name that no site binds under an rc kind never holds a count and is not
+# tracked. `names` is the live tracking list (ir_rc_locals, which
+# ir_rc_track_local appends to), so contains() here means "already tracked
+# by an earlier binding".
 fn ir_prepass_track_or_poison(name: String, kind: String, names: List[String], poisoned: List[String]):
     if kind.len() > 0:
         if names.contains(name):
@@ -2089,24 +2153,32 @@ fn ir_emit_rc_prologue(body_idx: Int):
     if body_idx >= 0:
         ir_collect_reassigned_string_params(body_idx, ir_rc_locals)
         ir_collect_rc_bind_names(body_idx, ir_rc_locals, poisoned)
+    ir_kinded_rc_binds = []
+    ir_kinded_release_symbol = "__kinded_release_m" + ir_module_count.to_string()
     if poisoned.len() > 0:
         mut kept: List[String] := []
         mut kept_kinds: List[String] := []
         mut pi := 0
         while pi < ir_rc_locals.len():
-            if not poisoned.contains(ir_rc_locals[pi]):
-                kept.push(ir_rc_locals[pi])
+            pname := ir_rc_locals[pi]
+            if not poisoned.contains(pname):
+                kept.push(pname)
                 if pi < ir_rc_local_kinds.len():
                     kept_kinds.push(ir_rc_local_kinds[pi])
                 else:
                     kept_kinds.push("string")
+            elif not ir_rc_prologue_captures.contains(pname):
+                # a poisoned name some site binds under an rc kind: it
+                # leaves the single-kind tracking for the kinded form, whose
+                # side slot records the kind of what the slot owns.
+                ir_kinded_rc_binds.push(pname)
             pi = pi + 1
         ir_rc_locals = kept
         ir_rc_local_kinds = kept_kinds
-        # publish the poisoned names so the match emitter skips the
-        # release-of-previous-value for their bindings; the untracked name is
-        # never zero-stored here, so that release would load a name the ir
-        # has not declared yet (and could fire the wrong-kind release later).
+        # publish the poisoned names. the kinded ones are zero-stored below
+        # with their side slots; the rest never hold a count, get no
+        # zero-store, and the match emitter skips the release-of-previous
+        # value for them, which would load a name the ir has not declared.
         ir_untracked_rc_binds = poisoned
     # with the final tracked set known, decide which tuple locals may cascade
     # their payload at cleanup (all uses provably safe); the rest stay shell-only
@@ -2124,6 +2196,25 @@ fn ir_emit_rc_prologue(body_idx: Int):
             ir_emit("iconst " + z.to_string() + " 0")
             ir_emit_name_store(name, z)
         i = i + 1
+    for kname in ir_kinded_rc_binds:
+        mut code := 0
+        if ir_var_regs.contains_key(kname):
+            # a parameter rebound under another kind: it starts out owning a
+            # count of its own on the caller's value, the way a tracked
+            # reassigned parameter does, so the first rebind can drop it.
+            pkind := ir_rc_kind(ir_lookup_name_type(kname))
+            code = ir_kinded_code(pkind)
+            if code > 0:
+                pr := ir_reg()
+                ir_emit("load " + pr.to_string() + " " + kname)
+                ir_rc_retain_reg(pr, pkind)
+        else:
+            z := ir_reg()
+            ir_emit("iconst " + z.to_string() + " 0")
+            ir_emit("store " + kname + " " + z.to_string())
+        code_r := ir_reg()
+        ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
+        ir_emit("store " + ir_kinded_tag_slot(kname) + " " + code_r.to_string())
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)
@@ -5989,6 +6080,8 @@ fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_t
     if bind_name.len() > 0:
         if bind_type.len() > 0:
             ir_var_types.insert(bind_name, bind_type)
+        if ir_kinded_rc_binds.contains(bind_name):
+            ir_kinded_rebind(bind_name, "")
         ir_emit("store " + bind_name + " " + bind_r.to_string())
     body_node := get_node(body_idx)
     mut body_r := ir_zero_reg()
@@ -6769,6 +6862,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # not outlive its body: leaving them set changed the enclosing function's
     # release decisions and made it load a name the ir had not declared.
     saved_untracked_binds := ir_untracked_rc_binds
+    saved_kinded_binds := ir_kinded_rc_binds
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -6795,7 +6889,11 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # one. without this the tracking list stayed empty for the whole body, so
     # scope exit released nothing and every heap value a closure bound leaked
     # on every call.
+    # a capture never becomes a kinded local of the lambda either: its slot is
+    # loaded from the environment above, which keeps the count.
+    ir_rc_prologue_captures = parts.captures
     ir_emit_rc_prologue(parts.body_idx)
+    ir_rc_prologue_captures = []
     # a captured name belongs to the closure environment, which drops it when
     # the closure is freed. the body must not release it as well, and the
     # prepass cannot tell the difference: a capture is loaded into a slot that
@@ -6827,6 +6925,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # still sees which of the ENCLOSING lambda's names are weak captures
     ir_weak_capture_names = saved_weak_caps
     ir_untracked_rc_binds = saved_untracked_binds
+    ir_kinded_rc_binds = saved_kinded_binds
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -8333,6 +8432,22 @@ fn ir_generic_name_unresolved(name: String) -> Bool:
         return true
     return ir_current_impl_subst_params.contains(base)
 
+# whether `name` is a kinded local of the emitting function at this point. a
+# `for` variable shadowing it writes its own slot, so a binding of the loop
+# variable's name inside that loop is not a binding of the kinded slot.
+fn ir_name_is_kinded(name: String) -> Bool:
+    if not ir_kinded_rc_binds.contains(name):
+        return false
+    return ir_loop_var_slot(name).len() == 0
+
+# the kind a kinded binding site takes its count under: the site's rc kind
+# when the dispatch helper can release it, "" (no count taken, none released)
+# otherwise.
+fn ir_kinded_site_kind(rc_kind: String) -> String:
+    if ir_kinded_code(rc_kind) == 0:
+        return ""
+    return rc_kind
+
 fn ir_emit_bind_stmt(node: Node):
     parts := ir_collect_bind_parts(node)
     name := parts.name
@@ -8392,6 +8507,29 @@ fn ir_emit_bind_stmt(node: Node):
         map_value_type := ir_resolve_map_value_type_node(type_idx)
         if map_value_type.len() > 0:
             ir_map_value_types.insert(name, map_value_type)
+    if val_idx >= 0 and ir_name_is_kinded(name):
+        # a kinded local: this site's kind is worked out the way the prepass
+        # works it out, the value takes a count of its own under that kind
+        # when it is a borrow, and the rebind drops whatever the slot owned
+        # under the kind recorded for it.
+        site_kind := ir_kinded_site_kind(ir_rc_kind(ir_substitute_type_name(ir_prepass_bind_type(parts, ir_rc_locals))))
+        bind_target := ir_map_init_target(name, target_type)
+        r := ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
+        if site_kind.len() > 0 and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
+            ir_rc_retain_reg(r, site_kind)
+        ir_kinded_rebind(name, site_kind)
+        ir_var_regs.insert(name, r)
+        ir_emit_name_store(name, r)
+        # record this site's type, replacing an earlier site's: a capture
+        # or an assignment reads the rc kind from it, and an earlier site's
+        # kind is wrong after this binding.
+        if target_type.len() == 0:
+            inferred := ir_infer_type(val_idx)
+            if inferred.len() > 0:
+                ir_var_types.insert(name, inferred)
+            elif ir_var_types.contains_key(name):
+                ir_var_types.remove(name)
+        return
     if val_idx >= 0:
         # a tracked string local that is bound again (a loop body re-entering
         # the binding) owns a count on its previous value; capture it before
@@ -8429,6 +8567,9 @@ fn ir_emit_assign_stmt(node: Node):
     if node.children.len() >= 2:
         if ir_emit_index_assignment(node.children[0], node.children[1]):
             return
+    if node.children.len() > 0 and ir_name_is_kinded(name):
+        ir_emit_kinded_assign(name, node.children[0], ir_infer_type(node.children[0]), "")
+        return
     if node.children.len() > 0:
         # same ownership dance as rebinding; string globals get the
         # retain/release pair too but are never in the exit cleanup.
@@ -8447,6 +8588,19 @@ fn ir_emit_assign_stmt(node: Node):
             ir_rc_release_local(old_r, legacy_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
+
+# `name = value` on a kinded local: the value is of the type the binding in
+# effect gave the name, so it takes its count under that type's kind, and the
+# slot's previous value is released under the kind recorded for it.
+fn ir_emit_kinded_assign(name: String, value_idx: Int, target_type: String, target_inner: String):
+    site_kind := ir_kinded_site_kind(ir_rc_kind(target_type))
+    assign_target := ir_map_init_target(name, target_type)
+    r := ir_emit_value_for_target_inner(value_idx, assign_target, target_inner)
+    if site_kind.len() > 0 and assign_target != "tuple" and ir_expr_is_borrowed(value_idx):
+        ir_rc_retain_reg(r, site_kind)
+    ir_kinded_rebind(name, site_kind)
+    ir_var_regs.insert(name, r)
+    ir_emit_name_store(name, r)
 
 fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
     direct := ir_field_lookup_key(recv_idx, fname)
@@ -8538,6 +8692,9 @@ fn ir_emit_compound_assignment(node: Node):
         tn := get_node(node.children[0])
         name := tn.value
         target_type := ir_checked_target_type(node.children[0], name)
+        if tn.kind == "ident" and ir_name_is_kinded(name):
+            ir_emit_kinded_assign(name, node.children[1], target_type, ir_optional_inner_type_of_tid(c_get_expr_type(node.children[0])))
+            return
         # same ownership dance as ir_emit_bind_stmt: retain a borrowed RHS,
         # release the value being replaced. this is the path plain
         # `name = value` statements actually take.
@@ -8835,6 +8992,7 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
         subj_tid := c_get_expr_type(subj_idx)
         val_r := ir_optional_value_field(subj_r, subj_tid)
         ir_var_regs.insert(pat.value, val_r)
+        mut kinded_bound := false
         if subj_tid >= 0:
             info := get_type_info(subj_tid)
             if info.kind == "optional" and info.inner >= 0:
@@ -8859,13 +9017,24 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 # the same terms the prepass poisons it: its count belongs to
                 # its owner and the binding is an uncounted view.
                 rc_kind := ir_rc_kind(inner_kind)
-                if rc_kind.len() > 0 and rc_kind != "tuple":
+                if ir_kinded_rc_binds.contains(pat.value):
+                    # a kinded name counts the payload under its kind unless
+                    # it is the uncounted tuple view, and records which.
+                    mut taken := ""
+                    if rc_kind != "tuple" and ir_kinded_code(rc_kind) > 0 and ir_extraction_retains(subj_idx, rc_kind, ir_optional_subject_is_owned(subj_idx)):
+                        ir_rc_retain_reg(val_r, rc_kind)
+                        taken = rc_kind
+                    ir_kinded_rebind(pat.value, taken)
+                    kinded_bound = true
+                elif rc_kind.len() > 0 and rc_kind != "tuple":
                     if ir_rc_local_kind(pat.value).len() > 0:
                         old_r := ir_reg()
                         ir_emit("load " + old_r.to_string() + " " + pat.value)
                         ir_rc_release_reg(old_r, rc_kind)
                     if ir_extraction_retains(subj_idx, rc_kind, ir_optional_subject_is_owned(subj_idx)):
                         ir_rc_retain_reg(val_r, rc_kind)
+        if not kinded_bound and ir_kinded_rc_binds.contains(pat.value):
+            ir_kinded_rebind(pat.value, "")
         ir_emit("store " + pat.value + " " + val_r.to_string())
         return
     ir_emit_match_bindings(pat_idx, subj_r, "")
@@ -9984,6 +10153,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_untracked_rc_binds = []
+    ir_kinded_rc_binds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
     ir_func_local_names = {}
@@ -11199,6 +11369,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_tuple_walks(false)
     ir_emit_tuple_walks(true)
     ir_emit_tuple_cascade_helpers()
+    ir_emit_kinded_release_helper()
     ir_emit_result_arg_release_helpers()
     ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair

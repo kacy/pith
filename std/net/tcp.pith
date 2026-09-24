@@ -116,7 +116,9 @@ pub fn read(fd: Int, max_bytes: Int) -> String!:
 # drops the tail silently, and the peer waits for bytes that will never come.
 # reach for write_all() unless you have a reason to handle the count yourself.
 #
-# a write on a closed handle fails, as read() does.
+# a write on a closed handle fails, as read() does, and the error names the
+# reason (`tcp_write failed: Broken pipe (os error 32)` for a peer that hung
+# up). an empty write on an open handle succeeds and returns 0.
 pub fn write(fd: Int, data: String) -> Int!:
     return tcp_write(fd, data)
 

@@ -450,8 +450,7 @@ fn encode_multipart(parts: List[MultipartPart], boundary: String) -> Bytes!:
                 continue
             out.write_string_utf8(key + ": " + part.headers[key] + crlf)!
         out.write_string_utf8(crlf)!
-        if not part.body.is_empty():
-            out.write(part.body)!
+        out.write(part.body)!
         out.write_string_utf8(crlf)!
     out.write_string_utf8("--" + boundary + "--" + crlf)!
     return out.take_bytes()
@@ -1717,8 +1716,7 @@ impl HttpResponse:
         buf := bytes.buffer_with_capacity(header_bytes.len() + self.body.len())
         errdefer buf.free()
         buf.write(header_bytes)!
-        if self.body.len() > 0:
-            buf.write(self.body)!
+        buf.write(self.body)!
         return buf.take_bytes()
 
     fn to_string() -> String!:
@@ -2802,8 +2800,7 @@ impl ClientRequest:
         buf := bytes.buffer_with_capacity(head.len() + self.body.len())
         defer buf.free()
         buf.write(head)!
-        if not self.body.is_empty():
-            buf.write(self.body)!
+        buf.write(self.body)!
         return buf.bytes()
 
     fn send() -> HttpResponse!:

@@ -680,8 +680,7 @@ fn native_write_all(stream: TcpStream, data: Bytes) -> Int!:
 
 fn transcript_append(transcript: ByteBuffer, message: tls13.HandshakeMessage) -> Bool!:
     encoded := tls13.encode_handshake(message.message_type, message.body)!
-    if encoded.len() > 0:
-        transcript.write(encoded)!
+    transcript.write(encoded)!
     return true
 
 fn traffic_keys_for_cipher(cipher: Int, secret: Bytes) -> tls13.TrafficKeys!:
@@ -2662,8 +2661,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
 
     transcript := bytes.buffer()
     defer transcript.free()
-    if hrr_prefix.len() > 0:
-        transcript.write(hrr_prefix)!
+    transcript.write(hrr_prefix)!
     transcript_append(transcript, client_messages[0])!
     server_messages := tls13.decode_handshakes(server_hello)!
     transcript_append(transcript, server_messages[0])!
@@ -2868,8 +2866,7 @@ fn record_bytes(record: tls13.Record) -> Bytes!:
     write_u8(out, record.content_type)!
     write_u16_be(out, 771)!
     write_u16_be(out, record.payload.len())!
-    if record.payload.len() > 0:
-        out.write(record.payload)!
+    out.write(record.payload)!
     return out.bytes()
 
 fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:

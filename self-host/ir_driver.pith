@@ -285,7 +285,10 @@ fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String
 fn builtin_retkind(name: String) -> String:
     if name == "parse_int" or name == "parse_float":
         return "tuple"
-    if name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "tcp_write" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "process_write" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append" or name == "file_write":
+    # the byte-count writes build their result box in the runtime (#1153)
+    if name == "tcp_write" or name == "tcp_write_bytes" or name == "process_write" or name == "process_write_bytes" or name == "file_write" or name == "file_write_bytes" or name == "byte_buffer_write" or name == "byte_buffer_write_string_utf8":
+        return "tuple"
+    if name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append":
         return "result_int"
     if name == "write_file" or name == "append_file":
         return "result_bool"

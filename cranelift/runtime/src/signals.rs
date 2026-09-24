@@ -123,9 +123,11 @@ fn ensure_pipe() -> bool {
 /// broken pipe can still say so: arming SIGPIPE through `pith_signal_notify`
 /// replaces this disposition, since it runs later.
 ///
-/// called from the socket entry points rather than at startup because a static
-/// library has no startup hook of its own, and a program that never opens a
-/// socket cannot raise SIGPIPE.
+/// called from the socket entry points and from process spawn rather than at
+/// startup because a static library has no startup hook of its own, and a
+/// program that never opens a socket or a child's stdin pipe cannot raise
+/// SIGPIPE. the child case is `process_write` to a child that has exited,
+/// which killed the parent before this was called at spawn (#1153).
 pub fn ignore_sigpipe() {
     static SIGPIPE_ONCE: Once = Once::new();
     SIGPIPE_ONCE.call_once(|| {

@@ -210,11 +210,6 @@ fn write_u24_be(out: ByteBuffer, value: Int) -> Bool!:
     checked_write(binary.write_u24_be(out, value))!
     return true
 
-fn write_bytes_if_any(out: ByteBuffer, data: Bytes) -> Bool!:
-    if data.len() > 0:
-        out.write(data)!
-    return true
-
 fn write_u16_vector(out: ByteBuffer, values: List[Int]) -> Bool!:
     write_u16_be(out, values.len() * 2)!
     for value in values:
@@ -291,7 +286,7 @@ fn extension_record(extension_type: Int, data: Bytes) -> Bytes!:
     defer out.free()
     write_u16_be(out, extension_type)!
     write_u16_be(out, data.len())!
-    write_bytes_if_any(out, data)!
+    out.write(data)!
     return out.bytes()
 
 fn server_name_extension(server_name: String) -> Bytes!:
@@ -304,11 +299,11 @@ fn server_name_extension(server_name: String) -> Bytes!:
     defer name.free()
     write_u8(name, 0)!
     write_u16_be(name, host.len())!
-    write_bytes_if_any(name, host)!
+    name.write(host)!
     data := bytes.buffer_with_capacity(name.len() + 2)
     defer data.free()
     write_u16_be(data, name.len())!
-    write_bytes_if_any(data, name.bytes())!
+    data.write(name.bytes())!
     return extension_record(EXT_SERVER_NAME, data.bytes())
 
 fn alpn_extension(protocols: List[String]) -> Bytes!:
@@ -325,9 +320,9 @@ fn alpn_extension(protocols: List[String]) -> Bytes!:
         if encoded.len() > 255:
             fail "tls alpn protocol too long"
         write_u8(names, encoded.len())!
-        write_bytes_if_any(names, encoded)!
+        names.write(encoded)!
     write_u16_be(data, names.len())!
-    write_bytes_if_any(data, names.bytes())!
+    data.write(names.bytes())!
     return extension_record(EXT_ALPN, data.bytes())
 
 fn supported_versions_client_extension() -> Bytes!:
@@ -369,15 +364,15 @@ fn key_share_client_extension(x25519_public_key: Bytes, p256_public_key: Bytes) 
     defer entries.free()
     write_u16_be(entries, GROUP_X25519)!
     write_u16_be(entries, x25519_public_key.len())!
-    write_bytes_if_any(entries, x25519_public_key)!
+    entries.write(x25519_public_key)!
     if p256_public_key.len() > 0:
         write_u16_be(entries, GROUP_SECP256R1)!
         write_u16_be(entries, p256_public_key.len())!
-        write_bytes_if_any(entries, p256_public_key)!
+        entries.write(p256_public_key)!
     data := bytes.buffer_with_capacity(entries.len() + 2)
     defer data.free()
     write_u16_be(data, entries.len())!
-    write_bytes_if_any(data, entries.bytes())!
+    data.write(entries.bytes())!
     return extension_record(EXT_KEY_SHARE, data.bytes())
 
 fn supported_versions_server_extension(version: Int) -> Bytes!:
@@ -393,7 +388,7 @@ fn key_share_server_extension(group: Int, public_key: Bytes) -> Bytes!:
     defer data.free()
     write_u16_be(data, group)!
     write_u16_be(data, public_key.len())!
-    write_bytes_if_any(data, public_key)!
+    data.write(public_key)!
     return extension_record(EXT_KEY_SHARE, data.bytes())
 
 fn pre_shared_key_client_extension(identity: Bytes, obfuscated_ticket_age: Int, binder: Bytes) -> Bytes!:
@@ -404,18 +399,18 @@ fn pre_shared_key_client_extension(identity: Bytes, obfuscated_ticket_age: Int, 
     identities := bytes.buffer()
     defer identities.free()
     write_u16_be(identities, identity.len())!
-    write_bytes_if_any(identities, identity)!
+    identities.write(identity)!
     checked_write(binary.write_u32_be(identities, obfuscated_ticket_age))!
     binders := bytes.buffer()
     defer binders.free()
     write_u8(binders, binder.len())!
-    write_bytes_if_any(binders, binder)!
+    binders.write(binder)!
     data := bytes.buffer()
     defer data.free()
     write_u16_be(data, identities.len())!
-    write_bytes_if_any(data, identities.bytes())!
+    data.write(identities.bytes())!
     write_u16_be(data, binders.len())!
-    write_bytes_if_any(data, binders.bytes())!
+    data.write(binders.bytes())!
     return extension_record(EXT_PRE_SHARED_KEY, data.bytes())
 
 fn pre_shared_key_client_partial_extension(identity: Bytes, obfuscated_ticket_age: Int, binder_len: Int) -> Bytes!:
@@ -426,14 +421,14 @@ fn pre_shared_key_client_partial_extension(identity: Bytes, obfuscated_ticket_ag
     identities := bytes.buffer()
     defer identities.free()
     write_u16_be(identities, identity.len())!
-    write_bytes_if_any(identities, identity)!
+    identities.write(identity)!
     checked_write(binary.write_u32_be(identities, obfuscated_ticket_age))!
     extension := bytes.buffer()
     defer extension.free()
     write_u16_be(extension, EXT_PRE_SHARED_KEY)!
     write_u16_be(extension, 2 + identities.len() + 2 + 1 + binder_len)!
     write_u16_be(extension, identities.len())!
-    write_bytes_if_any(extension, identities.bytes())!
+    extension.write(identities.bytes())!
     return extension.bytes()
 
 fn pre_shared_key_server_extension(selected_identity: Int) -> Bytes!:
@@ -455,12 +450,12 @@ fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_p
     # secp384r1 is advertised without a share: a server that insists on it
     # answers with a HelloRetryRequest and the client supplies the share then.
     groups.push(GROUP_SECP384R1)
-    write_bytes_if_any(out, server_name_extension(server_name)!)!
-    write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
-    write_bytes_if_any(out, supported_versions_client_extension()!)!
-    write_bytes_if_any(out, supported_groups_extension(groups)!)!
-    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
-    write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
+    out.write(server_name_extension(server_name)!)!
+    out.write(alpn_extension(alpn_protocols)!)!
+    out.write(supported_versions_client_extension()!)!
+    out.write(supported_groups_extension(groups)!)!
+    out.write(signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
+    out.write(key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return true
 
 fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
@@ -473,9 +468,9 @@ fn default_client_extensions_with_options(server_name: String, x25519_public_key
     # this on already-having-a-psk meant the first handshake never yielded a
     # resumable session against a strict server. mainstream clients always
     # send it. pre_shared_key itself stays last, as the rfc requires.
-    write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
+    out.write(psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     if psk_identity.len() > 0:
-        write_bytes_if_any(out, pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
+        out.write(pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
     return out.bytes()
 
 fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> Bytes!:
@@ -485,8 +480,8 @@ fn default_client_extensions_partial_psk(server_name: String, x25519_public_key:
     out := bytes.buffer()
     defer out.free()
     write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
-    write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
-    write_bytes_if_any(out, pre_shared_key_client_partial_extension(psk_identity, psk_obfuscated_ticket_age, 32)!)!
+    out.write(psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
+    out.write(pre_shared_key_client_partial_extension(psk_identity, psk_obfuscated_ticket_age, 32)!)!
     return out.bytes()
 
 fn sequence_nonce(static_iv: Bytes, sequence: Int) -> Bytes!:
@@ -519,7 +514,7 @@ fn inner_plaintext(content_type: Int, plaintext: Bytes) -> Bytes!:
         fail tls13_fail("invalid tls inner content type")
     out := bytes.buffer_with_capacity(plaintext.len() + 1)
     defer out.free()
-    write_bytes_if_any(out, plaintext)!
+    out.write(plaintext)!
     write_u8(out, content_type)!
     return out.bytes()
 
@@ -601,9 +596,9 @@ fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!
     while i < 64:
         out.write_byte(32)
         i = i + 1
-    write_bytes_if_any(out, bytes.from_string_utf8(context))!
+    out.write(bytes.from_string_utf8(context))!
     out.write_byte(0)
-    write_bytes_if_any(out, transcript_hash)!
+    out.write(transcript_hash)!
     return out.bytes()
 
 # Verify a signature over `message` under a certificate's public key for the
@@ -652,7 +647,7 @@ pub fn encode_record_with_version(content_type: Int, record_version: Int, payloa
     write_u8(out, content_type)!
     write_u16_be(out, record_version)!
     write_u16_be(out, payload.len())!
-    write_bytes_if_any(out, payload)!
+    out.write(payload)!
     return out.bytes()
 
 # the record version of an initial ClientHello (rfc 8446 §5.1): 0x0301.
@@ -689,7 +684,7 @@ pub fn encode_handshake(message_type: Int, body: Bytes) -> Bytes!:
     defer out.free()
     write_u8(out, message_type)!
     write_u24_be(out, body.len())!
-    write_bytes_if_any(out, body)!
+    out.write(body)!
     return out.bytes()
 
 # decode handshake messages from a handshake record payload.
@@ -744,14 +739,14 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, random)!
+    body.write(random)!
     write_u8(body, session_id.len())!
-    write_bytes_if_any(body, session_id)!
+    body.write(session_id)!
     write_u16_vector(body, [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_AES_256_GCM_SHA384, CIPHER_TLS_CHACHA20_POLY1305_SHA256])!
     write_u8(body, 1)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
 
 # The supported_versions extension offering both TLS 1.3 and 1.2, highest first,
@@ -812,16 +807,16 @@ fn client_extensions_offering_tls12(server_name: String, x25519_public_key: Byte
         versions = [TLS_LEGACY_VERSION]
     out := bytes.buffer()
     defer out.free()
-    write_bytes_if_any(out, server_name_extension(server_name)!)!
-    write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
-    write_bytes_if_any(out, supported_versions_client_extension_list(versions)!)!
-    write_bytes_if_any(out, supported_groups_extension(groups)!)!
-    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
-    write_bytes_if_any(out, extended_master_secret_extension()!)!
-    write_bytes_if_any(out, renegotiation_info_extension()!)!
-    write_bytes_if_any(out, ec_point_formats_extension()!)!
-    write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
-    write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
+    out.write(server_name_extension(server_name)!)!
+    out.write(alpn_extension(alpn_protocols)!)!
+    out.write(supported_versions_client_extension_list(versions)!)!
+    out.write(supported_groups_extension(groups)!)!
+    out.write(signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_ECDSA_SECP384R1_SHA384, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512, SIG_ED25519])!)!
+    out.write(extended_master_secret_extension()!)!
+    out.write(renegotiation_info_extension()!)!
+    out.write(ec_point_formats_extension()!)!
+    out.write(psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
+    out.write(key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return out.bytes()
 
 # Encode a ClientHello that offers TLS 1.3 and, as a fallback, the TLS 1.2 suites
@@ -841,14 +836,14 @@ pub fn encode_client_hello_offering_tls12(server_name: String, random: Bytes, se
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, random)!
+    body.write(random)!
     write_u8(body, session_id.len())!
-    write_bytes_if_any(body, session_id)!
+    body.write(session_id)!
     write_u16_vector(body, suites)!
     write_u8(body, 1)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
 
 # The PSK binder is a MAC over the truncated ClientHello *handshake message* —
@@ -862,7 +857,7 @@ fn client_hello_binder_transcript(truncated_body: Bytes, full_body_length: Int) 
     defer out.free()
     write_u8(out, HANDSHAKE_CLIENT_HELLO)!
     write_u24_be(out, full_body_length)!
-    write_bytes_if_any(out, truncated_body)!
+    out.write(truncated_body)!
     return out.bytes()
 
 ## Encode the ClientHello prefix used when computing a PSK binder. The key
@@ -879,14 +874,14 @@ pub fn client_hello_psk_binder_input(server_name: String, random: Bytes, session
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, random)!
+    body.write(random)!
     write_u8(body, session_id.len())!
-    write_bytes_if_any(body, session_id)!
+    body.write(session_id)!
     write_u16_vector(body, [CIPHER_TLS_AES_128_GCM_SHA256, CIPHER_TLS_AES_256_GCM_SHA384, CIPHER_TLS_CHACHA20_POLY1305_SHA256])!
     write_u8(body, 1)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len() + 2 + 1 + 32)!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     truncated := body.bytes()
     # the full body adds the 35-byte binders section (u16 list length + u8
     # binder length + 32-byte binder) after this truncated prefix.
@@ -1152,13 +1147,13 @@ pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, random)!
+    body.write(random)!
     write_u8(body, session_id.len())!
-    write_bytes_if_any(body, session_id)!
+    body.write(session_id)!
     write_u16_be(body, cipher_suite)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     return encode_handshake(HANDSHAKE_SERVER_HELLO, body.bytes())
 
 # ---------------------------------------------------------------
@@ -1271,13 +1266,13 @@ pub fn encode_hello_retry_request_with_ech(session_id: Bytes, cipher_suite: Int,
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, hello_retry_request_random())!
+    body.write(hello_retry_request_random())!
     write_u8(body, session_id.len())!
-    write_bytes_if_any(body, session_id)!
+    body.write(session_id)!
     write_u16_be(body, cipher_suite)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     return encode_handshake(HANDSHAKE_SERVER_HELLO, body.bytes())
 
 # Rebuild an encoded ClientHello handshake message with a cookie extension
@@ -1309,14 +1304,14 @@ pub fn client_hello_with_cookie(client_hello: Bytes, cookie: Bytes) -> Bytes!:
     cookie_data := bytes.buffer()
     defer cookie_data.free()
     write_u16_be(cookie_data, cookie.len())!
-    write_bytes_if_any(cookie_data, cookie)!
+    cookie_data.write(cookie)!
     cookie_ext := extension_record(EXT_COOKIE, cookie_data.bytes())!
     out := bytes.buffer()
     defer out.free()
-    write_bytes_if_any(out, body.slice(0, ext_len_offset))!
+    out.write(body.slice(0, ext_len_offset))!
     write_u16_be(out, ext_len + cookie_ext.len())!
-    write_bytes_if_any(out, body.slice(ext_len_offset + 2, body.len()))!
-    write_bytes_if_any(out, cookie_ext)!
+    out.write(body.slice(ext_len_offset + 2, body.len()))!
+    out.write(cookie_ext)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, out.bytes())
 
 # Rebuild an encoded ClientHello with its key_share extension replaced by a
@@ -1344,11 +1339,11 @@ pub fn client_hello_with_key_share(client_hello: Bytes, group: Int, public_key: 
     defer share.free()
     write_u16_be(share, group)!
     write_u16_be(share, public_key.len())!
-    write_bytes_if_any(share, public_key)!
+    share.write(public_key)!
     shares := bytes.buffer()
     defer shares.free()
     write_u16_be(shares, share.len())!
-    write_bytes_if_any(shares, share.bytes())!
+    shares.write(share.bytes())!
     new_key_share := extension_record(EXT_KEY_SHARE, shares.bytes())!
     out_extensions := bytes.buffer()
     defer out_extensions.free()
@@ -1359,19 +1354,19 @@ pub fn client_hello_with_key_share(client_hello: Bytes, group: Int, public_key: 
         data_len := checked_read(binary.read_u16_be(er))!
         data := checked_bytes(binary.read_bytes(er, data_len))!
         if extension_type == EXT_KEY_SHARE:
-            write_bytes_if_any(out_extensions, new_key_share)!
+            out_extensions.write(new_key_share)!
             replaced = true
         else:
             write_u16_be(out_extensions, extension_type)!
             write_u16_be(out_extensions, data.len())!
-            write_bytes_if_any(out_extensions, data)!
+            out_extensions.write(data)!
     if not replaced:
         fail "tls client hello has no key share to replace"
     out := bytes.buffer()
     defer out.free()
-    write_bytes_if_any(out, body.slice(0, prefix_len))!
+    out.write(body.slice(0, prefix_len))!
     write_u16_be(out, out_extensions.len())!
-    write_bytes_if_any(out, out_extensions.bytes())!
+    out.write(out_extensions.bytes())!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, out.bytes())
 
 # Overwrite `patch` into `message` at `offset` — how the ech acceptance
@@ -1394,7 +1389,7 @@ pub fn hrr_transcript_prefix_for_cipher(cipher: Int, client_hello1: Bytes) -> By
     write_u8(out, 0)!
     write_u8(out, 0)!
     write_u8(out, hello_hash.len())!
-    write_bytes_if_any(out, hello_hash)!
+    out.write(hello_hash)!
     return out.bytes()
 
 # A ClientHello parsed without assuming TLS 1.3: enough for a server to decide
@@ -1692,11 +1687,11 @@ pub fn encode_encrypted_extensions_with_alpn(alpn_protocol: String) -> Bytes!:
     extensions := bytes.buffer()
     defer extensions.free()
     if alpn_protocol != "":
-        write_bytes_if_any(extensions, alpn_extension([alpn_protocol])!)!
+        extensions.write(alpn_extension([alpn_protocol])!)!
     body := bytes.buffer_with_capacity(extensions.len() + 2)
     defer body.free()
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions.bytes())!
+    body.write(extensions.bytes())!
     return encode_handshake(HANDSHAKE_ENCRYPTED_EXTENSIONS, body.bytes())
 
 ## Parse a CertificateRequest handshake body.
@@ -1732,9 +1727,9 @@ pub fn encode_certificate_request(signature_schemes: List[Int]) -> Bytes!:
     write_u8(body, 0)!
     extensions := bytes.buffer()
     defer extensions.free()
-    write_bytes_if_any(extensions, signature_algorithms_extension(signature_schemes)!)!
+    extensions.write(signature_algorithms_extension(signature_schemes)!)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions.bytes())!
+    body.write(extensions.bytes())!
     return encode_handshake(HANDSHAKE_CERTIFICATE_REQUEST, body.bytes())
 
 # encode a tls 1.3 Certificate handshake message.
@@ -1743,13 +1738,13 @@ pub fn encode_certificate_message(certs_der: List[Bytes]) -> Bytes!:
     defer entries.free()
     for cert in certs_der:
         write_u24_be(entries, cert.len())!
-        write_bytes_if_any(entries, cert)!
+        entries.write(cert)!
         write_u16_be(entries, 0)!
     body := bytes.buffer()
     defer body.free()
     write_u8(body, 0)!
     write_u24_be(body, entries.len())!
-    write_bytes_if_any(body, entries.bytes())!
+    body.write(entries.bytes())!
     return encode_handshake(HANDSHAKE_CERTIFICATE, body.bytes())
 
 # parse a tls 1.3 CertificateVerify message body.
@@ -1770,7 +1765,7 @@ pub fn encode_certificate_verify(signature_scheme: Int, signed: Bytes) -> Bytes!
     defer body.free()
     write_u16_be(body, signature_scheme)!
     write_u16_be(body, signed.len())!
-    write_bytes_if_any(body, signed)!
+    body.write(signed)!
     return encode_handshake(HANDSHAKE_CERTIFICATE_VERIFY, body.bytes())
 
 # parse a tls 1.3 Finished message body.
@@ -1863,9 +1858,9 @@ pub fn encode_new_session_ticket(ticket_lifetime: Int, ticket_age_add: Int, nonc
     checked_write(binary.write_u32_be(body, ticket_lifetime))!
     checked_write(binary.write_u32_be(body, ticket_age_add))!
     write_u8(body, nonce.len())!
-    write_bytes_if_any(body, nonce)!
+    body.write(nonce)!
     write_u16_be(body, ticket.len())!
-    write_bytes_if_any(body, ticket)!
+    body.write(ticket)!
     write_u16_be(body, 0)!
     return encode_handshake(HANDSHAKE_NEW_SESSION_TICKET, body.bytes())
 
@@ -1961,9 +1956,9 @@ pub fn hkdf_label(label: String, context: Bytes, length: Int) -> Bytes!:
     defer out.free()
     write_u16_be(out, length)!
     write_u8(out, label_bytes.len())!
-    write_bytes_if_any(out, label_bytes)!
+    out.write(label_bytes)!
     write_u8(out, context.len())!
-    write_bytes_if_any(out, context)!
+    out.write(context)!
     return out.bytes()
 
 # run tls 1.3 hkdf-expand-label with sha-256.
@@ -1979,7 +1974,7 @@ pub fn handshake_transcript_hash_sha256(messages: List[HandshakeMessage]) -> Byt
     out := bytes.buffer()
     defer out.free()
     for message in messages:
-        write_bytes_if_any(out, encode_handshake(message.message_type, message.body)!)!
+        out.write(encode_handshake(message.message_type, message.body)!)!
     return transcript_hash_sha256(out.bytes())
 
 # derive a tls 1.3 sha-256 secret for the current transcript.
@@ -2129,7 +2124,7 @@ pub fn handshake_transcript_hash_sha384(messages: List[HandshakeMessage]) -> Byt
     out := bytes.buffer()
     defer out.free()
     for message in messages:
-        write_bytes_if_any(out, encode_handshake(message.message_type, message.body)!)!
+        out.write(encode_handshake(message.message_type, message.body)!)!
     return transcript_hash_sha384(out.bytes())
 
 # derive a tls 1.3 sha-384 secret for the current transcript.
@@ -2527,18 +2522,18 @@ test "tls13 parses server hello":
     defer key_data.free()
     write_u16_be(key_data, GROUP_X25519)!
     write_u16_be(key_data, public_key.len())!
-    write_bytes_if_any(key_data, public_key)!
+    key_data.write(public_key)!
     extensions := extension_record(EXT_SUPPORTED_VERSIONS, version_data.bytes())!.concat(extension_record(EXT_KEY_SHARE, key_data.bytes())!)
     body := bytes.buffer()
     defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
-    write_bytes_if_any(body, random)!
+    body.write(random)!
     write_u8(body, session.len())!
-    write_bytes_if_any(body, session)!
+    body.write(session)!
     write_u16_be(body, CIPHER_TLS_AES_128_GCM_SHA256)!
     write_u8(body, 0)!
     write_u16_be(body, extensions.len())!
-    write_bytes_if_any(body, extensions)!
+    body.write(extensions)!
     parsed := parse_server_hello(body.bytes())!
 
     assert_eq(parsed.legacy_version, TLS_LEGACY_VERSION)

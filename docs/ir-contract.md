@@ -197,6 +197,15 @@ consumer's `normalize_runtime_result` applies this. it is the reason a runtime
 function that can fail returns 0 for failure and its real (nonnegative) value
 plus one otherwise.
 
+the sentinel only works for a builtin whose success can never be a raw 0. one
+whose success can be 0 builds the three-slot result box `[is_ok, ok, err]`
+itself and takes the `tuple` retkind, so the error carries the runtime's own
+message: `parse_int`, `parse_float` (#1140), and the byte-count writes
+`file_write`, `file_write_bytes`, `tcp_write`, `tcp_write_bytes`,
+`process_write`, `process_write_bytes`, `byte_buffer_write` and
+`byte_buffer_write_string_utf8`, where an empty write is a success of 0 (#1153).
+`ir_builtin_result_retkind` in `ir_metadata.pith` is the list.
+
 **struct construction.** a struct is built with an ordinary call whose function
 name is a declared struct: `call REG StructName NFIELDS f0 f1 ...`. the consumer
 recognizes the name as a struct, allocates with `pith_struct_alloc(NFIELDS)`, and

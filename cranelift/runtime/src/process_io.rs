@@ -18,7 +18,7 @@
 
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::fd_handle::{self, FdKind, Guard};
-use crate::ffi_util::cstr_str_or_empty;
+use crate::ffi_util::{cstr_bytes, write_result};
 use crate::fdio;
 use crate::handle_registry::{is_valid_id, HandleKind};
 use crate::process::{process_handles, Pipe};
@@ -75,13 +75,15 @@ fn read_pipe(handle: i64, pipe: Pipe, max_bytes: i64) -> PipeRead {
     }
 }
 
-/// write one buffer to a child's stdin, returning the bytes it accepted. zero
-/// covers an unknown handle, a closed child, and a failed write alike, as
-/// before.
-fn write_stdin(handle: i64, data: &[u8]) -> i64 {
+/// write one buffer to a child's stdin, returning the bytes it accepted,
+/// `Ok(0)` for an empty buffer, or the reason the write failed: an unknown or
+/// closed process handle, a child whose stdin was not captured, or a failed
+/// write, which for a child that has exited or closed its stdin is `EPIPE`.
+fn write_stdin(handle: i64, data: &[u8]) -> Result<usize, fdio::WriteError> {
     match pipe_guard(handle, Pipe::Stdin) {
         Some(Some(guard)) => fdio::write_yielding(&guard, data),
-        _ => 0,
+        Some(None) => Err("the process has no stdin pipe".to_string()),
+        None => Err("invalid or closed process handle".to_string()),
     }
 }
 
@@ -128,25 +130,32 @@ pub unsafe extern "C" fn pith_process_read_err_bytes(handle: i64, max_bytes: i64
     read_as_bytes(handle, Pipe::Stderr, max_bytes)
 }
 
+/// one write of a string's bytes to a child's stdin, as a result box holding
+/// the count (`0` for an empty string, which is a success) or the failure's
+/// reason. the bytes go out as they are, valid utf-8 or not.
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64 {
-    if data.is_null() {
-        return 0;
-    }
-    write_stdin(handle, cstr_str_or_empty(data).as_bytes())
+    let outcome = match cstr_bytes(data) {
+        Some(text) => write_stdin(handle, text),
+        None => Err("invalid string".to_string()),
+    };
+    write_result("process_write", outcome)
 }
 
+/// the `Bytes` form of `pith_process_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return 0;
+    let outcome = match pith_bytes_ref(data) {
+        Some(bytes) => write_stdin(handle, &bytes.data),
+        None => Err("invalid bytes value".to_string()),
     };
-    write_stdin(handle, &bytes.data)
+    write_result("process_write_bytes", outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi_util::unbox_result;
 
     #[test]
     fn invalid_process_io_handles_return_safe_defaults() {
@@ -155,8 +164,18 @@ mod tests {
             assert_eq!(pith_process_read_bytes(12345, 16), 0);
             assert!(pith_process_read_err(12345, 16).is_null());
             assert_eq!(pith_process_read_err_bytes(12345, 16), 0);
-            assert_eq!(pith_process_write(12345, std::ptr::null()), 0);
-            assert_eq!(pith_process_write_bytes(12345, 0), 0);
+            assert_eq!(
+                unbox_result(pith_process_write(12345, std::ptr::null())),
+                Err("process_write failed: invalid string".to_string())
+            );
+            assert_eq!(
+                unbox_result(pith_process_write_bytes(12345, 0)),
+                Err("process_write_bytes failed: invalid bytes value".to_string())
+            );
+            assert_eq!(
+                unbox_result(pith_process_write(12345, c"".as_ptr())),
+                Err("process_write failed: invalid or closed process handle".to_string())
+            );
         }
     }
 

@@ -448,31 +448,52 @@ fn read_channel(guard: &Guard, size: usize, channel: Channel) -> Option<Vec<u8>>
     }
 }
 
+/// why a write to a pipe or socket failed, as the text a pith error carries.
+/// the runtime entry points prefix it with the builtin's name.
+pub(crate) type WriteError = String;
+
+/// the reason text for a failed write syscall: the os's own description of
+/// the errno (`Broken pipe (os error 32)`), except for the two outcomes that
+/// are not the peer's or the descriptor's doing. a handle closed by another
+/// task while the write was inside is reported as that, since the errno the
+/// closer's shutdown produces (`EPIPE`) would blame the peer, and the
+/// `EAGAIN` of an expired send deadline is reported as a timeout.
+fn write_error(guard: &Guard, err: i32) -> WriteError {
+    if !guard.is_live() {
+        return "the handle was closed".to_string();
+    }
+    if is_would_block(err) {
+        return "write timed out".to_string();
+    }
+    std::io::Error::from_raw_os_error(err).to_string()
+}
+
 /// write one buffer to a child's pipe. see `write_channel` for the contract.
-pub(crate) fn write_yielding(guard: &Guard, data: &[u8]) -> i64 {
+pub(crate) fn write_yielding(guard: &Guard, data: &[u8]) -> Result<usize, WriteError> {
     write_channel(guard, data, Channel::Pipe)
 }
 
 /// write one buffer to a socket. the socket half of `write_yielding`.
-pub(crate) fn socket_write_yielding(guard: &Guard, data: &[u8]) -> i64 {
+pub(crate) fn socket_write_yielding(guard: &Guard, data: &[u8]) -> Result<usize, WriteError> {
     write_channel(guard, data, Channel::Socket)
 }
 
 /// write one buffer: one write syscall, yielding only if it would block with
 /// nothing written yet. returns the bytes written (a partial count is returned
-/// as-is — callers loop), or `0` for a real error, a closed reader, or a send
-/// deadline that expired — which is again what the blocking path reports for
-/// the `EAGAIN` an expired `SO_SNDTIMEO` gives it. it never returns `0` for an
-/// ordinary would-block: `0` must mean closed/EOF only, so a would-block waits
-/// and retries until at least one byte goes out.
+/// as-is; callers loop), or the reason for a real error, a closed reader, or a
+/// send deadline that expired, which is again what the blocking path reports
+/// for the `EAGAIN` an expired `SO_SNDTIMEO` gives it. an empty buffer is an
+/// immediate `Ok(0)`: nothing was asked for and nothing failed. a non-empty
+/// one never comes back as `Ok(0)`: a would-block waits and retries until at
+/// least one byte goes out.
 ///
 /// nothing in pith sets `SO_SNDTIMEO` today, so this budget resolves to "wait
 /// forever" on every socket the runtime has. it is read anyway so that the two
 /// directions stay the same shape: a send deadline, if one is ever set, must
 /// bound a green write exactly as it already bounds an os-thread one.
-fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> i64 {
+fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> Result<usize, WriteError> {
     if data.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let fd = guard.fd() as i64;
     let mut budget = WaitBudget::Unasked;
@@ -484,24 +505,25 @@ fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> i64 {
             if matches!(channel, Channel::Socket) {
                 crate::perf_stats!(PERF_SOCK_WRITES += 1, PERF_SOCK_WRITE_BYTES += n as usize);
             }
-            return n as i64;
+            return Ok(n as usize);
         }
         if n == 0 {
             // a zero-length write of non-empty data means the reader is gone.
-            return 0;
+            return Err("the reader is gone".to_string());
         }
         let err = errno();
         channel.check(fd, err, "write");
         if is_would_block(err) {
-            if budget.wait(guard, false, channel) != 1 {
-                return 0;
+            match budget.wait(guard, false, channel) {
+                1 => continue,
+                0 => return Err("write timed out".to_string()),
+                _ => return Err("the handle was closed".to_string()),
             }
-            continue;
         }
         if err == libc::EINTR {
             continue;
         }
-        return 0;
+        return Err(write_error(guard, err));
     }
 }
 
@@ -540,8 +562,9 @@ pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>
 }
 
 /// one write to a socket that blocks in the kernel, the counterpart of
-/// `socket_read_blocking`. returns the bytes accepted, or `0` for any error.
-pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> i64 {
+/// `socket_read_blocking`. returns the bytes accepted, or the reason for any
+/// error. an empty buffer is a zero-byte `send`, which succeeds with `Ok(0)`.
+pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> Result<usize, WriteError> {
     let fd = guard.fd() as i64;
     // a full send buffer can hold this in the kernel indefinitely; like the
     // blocking read it touches only the borrowed buffer, so it is a native
@@ -553,10 +576,11 @@ pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> i64 {
         unsafe { Channel::Socket.write(fd as i32, data.as_ptr(), data.len()) }
     };
     if n >= 0 {
-        return n as i64;
+        return Ok(n as usize);
     }
-    Channel::Socket.check(fd, errno(), "write");
-    0
+    let err = errno();
+    Channel::Socket.check(fd, err, "write");
+    Err(write_error(guard, err))
 }
 
 #[cfg(test)]
@@ -636,7 +660,7 @@ mod tests {
     #[test]
     fn a_write_round_trips_to_the_read_end() {
         let (read_end, write_end) = pipe();
-        assert_eq!(write_yielding(&pipe_hold(write_end), b"pith"), 4);
+        assert_eq!(write_yielding(&pipe_hold(write_end), b"pith"), Ok(4));
         assert_eq!(read_yielding(&pipe_hold(read_end), 16).unwrap(), b"pith");
         close(read_end);
         close(write_end);
@@ -672,8 +696,8 @@ mod tests {
         assert!(socket_read_blocking(&guard, 16).is_none());
         assert!(socket_read_yielding(&guard, 16).is_none());
         // and the write side of the same close.
-        assert_eq!(socket_write_blocking(&guard, b"x"), 0);
-        assert_eq!(socket_write_yielding(&guard, b"x"), 0);
+        assert_eq!(socket_write_blocking(&guard, b"x"), Err("the handle was closed".to_string()));
+        assert_eq!(socket_write_yielding(&guard, b"x"), Err("the handle was closed".to_string()));
         drop(guard);
         close(b);
     }
@@ -697,7 +721,7 @@ mod tests {
         let (read_end, write_end) = pipe();
         assert_eq!(wait_ready(read_end as i64, true, 0), 0);
         // once there is something to read it reports ready.
-        assert_eq!(write_yielding(&pipe_hold(write_end), b"x"), 1);
+        assert_eq!(write_yielding(&pipe_hold(write_end), b"x"), Ok(1));
         assert_eq!(wait_ready(read_end as i64, true, 0), 1);
         close(read_end);
         close(write_end);
@@ -706,10 +730,10 @@ mod tests {
     #[test]
     fn a_socket_moves_the_same_bytes_recv_and_send_as_read_and_write_did() {
         let (a, b) = socket_pair();
-        assert_eq!(socket_write_yielding(&sock(a), b"pith"), 4);
+        assert_eq!(socket_write_yielding(&sock(a), b"pith"), Ok(4));
         assert_eq!(socket_read_yielding(&sock(b), 16).unwrap(), b"pith");
         // and the blocking pair, which is the os-thread backend's path.
-        assert_eq!(socket_write_blocking(&sock(b), b"back"), 4);
+        assert_eq!(socket_write_blocking(&sock(b), b"back"), Ok(4));
         assert_eq!(socket_read_blocking(&sock(a), 16).unwrap(), b"back");
         close(a);
         close(b);
@@ -723,6 +747,30 @@ mod tests {
         assert!(socket_read_yielding(&sock(b), 16).unwrap().is_empty());
         assert!(socket_read_blocking(&sock(b), 16).unwrap().is_empty());
         close(b);
+    }
+
+    /// an empty write is a success that wrote nothing, on every path, where a
+    /// write to a gone reader is an error naming the errno. the two used to
+    /// share the return value 0 (#1153).
+    #[test]
+    fn an_empty_write_succeeds_and_a_gone_reader_is_an_error() {
+        let broken = Err("Broken pipe (os error 32)".to_string());
+
+        let (read_end, write_end) = pipe();
+        assert_eq!(write_yielding(&pipe_hold(write_end), b""), Ok(0));
+        close(read_end);
+        assert_eq!(write_yielding(&pipe_hold(write_end), b"x"), broken);
+        // with nothing asked for, the gone reader goes unnoticed.
+        assert_eq!(write_yielding(&pipe_hold(write_end), b""), Ok(0));
+        close(write_end);
+
+        let (a, b) = socket_pair();
+        assert_eq!(socket_write_yielding(&sock(a), b""), Ok(0));
+        assert_eq!(socket_write_blocking(&sock(a), b""), Ok(0));
+        close(b);
+        assert_eq!(socket_write_yielding(&sock(a), b"x"), broken);
+        assert_eq!(socket_write_blocking(&sock(a), b"x"), broken);
+        close(a);
     }
 
     /// the socket syscalls refuse a descriptor that is not a socket, where
@@ -740,7 +788,7 @@ mod tests {
         assert_eq!(socket_write_errno(write_end), libc::ENOTSOCK);
         // which is exactly why a child process's pipe keeps `Channel::Pipe`:
         // the same two fds work fine through it.
-        assert_eq!(write_yielding(&pipe_hold(write_end), b"x"), 1);
+        assert_eq!(write_yielding(&pipe_hold(write_end), b"x"), Ok(1));
         assert_eq!(read_yielding(&pipe_hold(read_end), 16).unwrap(), b"x");
         close(read_end);
         close(write_end);
@@ -916,7 +964,7 @@ mod tests {
     #[test]
     fn an_absurd_wait_is_clamped_rather_than_overflowing_a_deadline() {
         let (a, b) = socket_pair();
-        assert_eq!(socket_write_yielding(&sock(b), b"x"), 1);
+        assert_eq!(socket_write_yielding(&sock(b), b"x"), Ok(1));
         assert_eq!(wait_ready(a as i64, true, i64::MAX), 1);
         close(a);
         close(b);
@@ -932,7 +980,7 @@ mod tests {
         let mut budget = WaitBudget::Unasked;
         // ready immediately, so this does not actually block — what is being
         // checked is which deadline it resolved before waiting.
-        assert_eq!(socket_write_yielding(&sock(b), b"x"), 1);
+        assert_eq!(socket_write_yielding(&sock(b), b"x"), Ok(1));
         assert_eq!(budget.wait(&sock(a), true, Channel::Socket), 1);
         assert!(matches!(budget, WaitBudget::Forever));
         close(a);

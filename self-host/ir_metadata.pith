@@ -15,7 +15,12 @@ STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,re
 # encoding in docs/ir-contract.md). parse_int and parse_float return the
 # three-slot result box itself and are handled directly in
 # ir_builtin_result_retkind.
-RESULT_INT_FUNCS := "file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,crypto_p256_keygen,crypto_p384_keygen"
+RESULT_INT_FUNCS := "file_open_read,file_open_write,file_open_append,byte_buffer_write_byte,tcp_connect,tcp_listen,tcp_accept,process_spawn,process_spawn_argv,process_output_argv,crypto_x25519_keygen,crypto_p256_keygen,crypto_p384_keygen"
+# the writes that report a byte count. like the parsers they build the
+# three-slot result box in the runtime and take the tuple retkind: a count of
+# 0 (an empty write) is a success, where the zero sentinel of result_int read
+# it as a failure, and the error carries the runtime's own reason (#1153).
+RESULT_BOX_INT_FUNCS := "byte_buffer_write,byte_buffer_write_string_utf8,file_write,file_write_bytes,tcp_write,tcp_write_bytes,process_write,process_write_bytes"
 RESULT_BOOL_FUNCS := "write_file,append_file,write_file_bytes,append_file_bytes"
 RESULT_STRING_FUNCS := "read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err"
 RESULT_BYTES_FUNCS := "term_read,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_aes_256_gcm_seal,crypto_aes_256_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8,crypto_sign_rsa_pkcs1_sha256_pkcs8,crypto_sign_ed25519_pkcs8,crypto_sign_ecdsa_p256_sha256_pkcs8,crypto_sign_ecdsa_p256_sha256_asn1_pkcs8,crypto_sign_rsa_pss_sha384_pkcs8,crypto_sign_rsa_pss_sha512_pkcs8,crypto_sign_rsa_pkcs1_sha384_pkcs8,crypto_sign_rsa_pkcs1_sha512_pkcs8,crypto_sign_ecdsa_p384_sha384_asn1_pkcs8,crypto_blake2b,crypto_argon2id,zstd_compress,zstd_decompress"
@@ -38,6 +43,7 @@ mut bool_returning_methods: Map[String, Bool] := {}
 mut void_methods: Map[String, Bool] := {}
 mut string_returning_methods: Map[String, Bool] := {}
 mut result_int_funcs: Map[String, Bool] := {}
+mut result_box_int_funcs: Map[String, Bool] := {}
 mut result_bool_funcs: Map[String, Bool] := {}
 mut result_string_funcs: Map[String, Bool] := {}
 mut result_bytes_funcs: Map[String, Bool] := {}
@@ -63,6 +69,7 @@ fn ir_build_metadata_sets():
     void_methods = ir_csv_set(VOID_METHODS)
     string_returning_methods = ir_csv_set(STRING_RETURNING_METHODS)
     result_int_funcs = ir_csv_set(RESULT_INT_FUNCS)
+    result_box_int_funcs = ir_csv_set(RESULT_BOX_INT_FUNCS)
     result_bool_funcs = ir_csv_set(RESULT_BOOL_FUNCS)
     result_string_funcs = ir_csv_set(RESULT_STRING_FUNCS)
     result_bytes_funcs = ir_csv_set(RESULT_BYTES_FUNCS)
@@ -130,11 +137,11 @@ pub fn ir_is_known_returning_func(fname: String) -> Bool:
 
 # the ir retkind of a fallible builtin's result. the match order is preserved
 # from the original hand-written chain so every function's retkind is unchanged.
-# the parsers build the box in the runtime, so a zero is a value like any other
-# and the error carries the runtime's own message.
+# the parsers and the byte-count writes build the box in the runtime, so a zero
+# is a value like any other and the error carries the runtime's own message.
 pub fn ir_builtin_result_retkind(name: String) -> String:
     ir_build_metadata_sets()
-    if name == "parse_int" or name == "parse_float":
+    if name == "parse_int" or name == "parse_float" or result_box_int_funcs.contains_key(name):
         return "tuple"
     if result_int_funcs.contains_key(name):
         return "result_int"
@@ -159,14 +166,14 @@ pub fn ir_sentinel_result_builtin_names() -> List[String]:
     return names
 
 # the ok-value kind for a builtin whose result is carried as result_int/bool,
-# or as the box the parsers return.
+# or as the box the parsers and the byte-count writes return.
 pub fn ir_builtin_result_ok_kind(name: String) -> String:
     legacy_kind := ir_builtin_result_retkind(name)
     if legacy_kind == "result_int":
         return "int"
     if legacy_kind == "result_bool":
         return "bool"
-    if name == "parse_int":
+    if name == "parse_int" or result_box_int_funcs.contains_key(name):
         return "int"
     if name == "parse_float":
         return "float"

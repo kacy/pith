@@ -1,0 +1,51 @@
+file_write empty: ok 0
+file_write abc: ok 3
+file_write_bytes empty: ok 0
+file_write_bytes xy: ok 2
+file_write through ! empty+de: ok 2
+file_write empty catch: 0
+file_write empty after close: err [file_write failed: invalid or closed file handle]
+file_write_bytes after close: err [file_write_bytes failed: invalid or closed file handle]
+file_write through ! after close: err [file_write failed: invalid or closed file handle]
+file contents: abcxyde
+file_write empty on a read handle: ok 0
+file_write on a read handle: err [file_write failed: Bad file descriptor (os error 9)]
+file_write_bytes on a read handle: err [file_write_bytes failed: Bad file descriptor (os error 9)]
+file_write empty to /dev/full: ok 0
+file_write to /dev/full: err [file_write failed: No space left on device (os error 28)]
+file_write_bytes to /dev/full: err [file_write_bytes failed: No space left on device (os error 28)]
+byte_buffer_write empty: ok 0
+byte_buffer_write ab: ok 2
+byte_buffer_write_string_utf8 empty: ok 0
+byte_buffer_write_string_utf8 héllo: ok 6
+byte_buffer_len: 8
+byte_buffer_write on handle 0: err [byte_buffer_write failed: invalid buffer handle]
+byte_buffer_write_string_utf8 on handle 0: err [byte_buffer_write_string_utf8 failed: invalid buffer handle]
+process_write empty: ok 0
+process_write hi: ok 2
+process_write_bytes empty: ok 0
+process_write empty after close: err [process_write failed: invalid or closed process handle]
+process_write_bytes after close: err [process_write_bytes failed: invalid or closed process handle]
+process_write empty to an exited child: ok 0
+process_write to an exited child: err [process_write failed: Broken pipe (os error 32)]
+process_write_bytes to an exited child: err [process_write_bytes failed: Broken pipe (os error 32)]
+tcp_write empty: ok 0
+tcp_write ping: ok 4
+tcp_write_bytes empty: ok 0
+tcp_write_bytes pong: ok 4
+tcp.write empty: ok 0
+peer read: pingpong
+tcp_write empty after close: err [tcp_write failed: invalid or closed socket handle]
+tcp_write_bytes after close: err [tcp_write_bytes failed: invalid or closed socket handle]
+ByteBuffer.write empty: ok 0
+ByteBuffer.write_string_utf8 empty: ok 0
+ByteBuffer.write_line_utf8 empty: ok 1
+StringBuffer.write empty: ok 0
+FileStream.write empty: ok 0
+FileStream.write_bytes empty: ok 0
+FileStream.write_all empty: ok 0
+ProcessStdin.write empty: ok 0
+ProcessStdin.write_bytes empty: ok 0
+TcpStream.write empty: ok 0
+TcpStream.write_bytes empty: ok 0
+peer read: []

@@ -163,6 +163,11 @@ fn pith_store_process_output(status: i64, stdout: String, stderr: String) -> i64
 }
 
 fn pith_store_process_handle(mut child: Child) -> i64 {
+    // a write to the stdin of a child that has exited raises SIGPIPE, which
+    // would kill this process where `process_write` should report `EPIPE`.
+    // see signals::ignore_sigpipe. the child itself starts with the default
+    // disposition: std resets SIGPIPE before it execs.
+    crate::signals::ignore_sigpipe();
     let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
     // the pipes are taken out of the `Child` here and owned as handles from
     // now on: `Child` never closes them again, and neither does `wait`.

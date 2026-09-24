@@ -2,7 +2,7 @@ use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fd_handle::{self, FdKind, Guard};
 use crate::fdio;
-use crate::ffi_util::{cstr_str, cstr_str_or_empty};
+use crate::ffi_util::{cstr_bytes, cstr_str, cstr_str_or_empty, write_result};
 use crate::netpoll;
 use std::os::unix::io::RawFd;
 
@@ -342,11 +342,18 @@ fn socket_read(conn: i64, size: usize) -> Option<Vec<u8>> {
 }
 
 /// one write to a connection handle, the counterpart of `socket_read`. returns
-/// the bytes accepted, `0` for a failure or a closed peer.
-fn socket_write(conn: i64, data: &[u8]) -> i64 {
+/// the bytes accepted, `Ok(0)` for an empty buffer, or the reason the write
+/// failed: a stale or closed handle, a closed peer (`EPIPE`, `ECONNRESET`), or
+/// a handle closed by another task while the write was inside.
+fn socket_write(conn: i64, data: &[u8]) -> Result<usize, fdio::WriteError> {
     let Some(guard) = socket(conn) else {
-        return 0;
+        return Err("invalid or closed socket handle".to_string());
     };
+    // no syscall for an empty buffer on either backend, as for a pipe or a
+    // file: the blocking path's zero-byte `send` could only report the peer.
+    if data.is_empty() {
+        return Ok(0);
+    }
     if is_green() {
         fdio::socket_write_yielding(&guard, data)
     } else {
@@ -400,18 +407,27 @@ pub extern "C" fn pith_tcp_wait_writable(conn: i64, timeout_ms: i64) -> i64 {
     wait_handle(conn, false, timeout_ms)
 }
 
-/// TCP write — write data to connection fd, return bytes written
+/// one write of a string's bytes to a connection, as a result box holding the
+/// count (`0` for an empty string, which is a success) or the failure's
+/// reason. the bytes go out as they are: a string that is not valid utf-8 is
+/// still the bytes the caller asked to send.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
-    socket_write(conn_fd, cstr_str_or_empty(data).as_bytes())
+    let outcome = match cstr_bytes(data) {
+        Some(text) => socket_write(conn_fd, text),
+        None => Err("invalid string".to_string()),
+    };
+    write_result("tcp_write", outcome)
 }
 
+/// the `Bytes` form of `pith_tcp_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return 0;
+    let outcome = match pith_bytes_ref(data) {
+        Some(bytes) => socket_write(conn_fd, &bytes.data),
+        None => Err("invalid bytes value".to_string()),
     };
-    socket_write(conn_fd, &bytes.data)
+    write_result("tcp_write_bytes", outcome)
 }
 
 /// TCP set read timeout in milliseconds (0 = no timeout). a stale handle is

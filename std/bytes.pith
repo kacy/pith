@@ -149,10 +149,6 @@ pub fn array_filled(count: Int, value: Int) -> ByteArray!:
 
 impl ByteBuffer:
     fn write(data: Bytes) -> Int!:
-        # the builtin reports bytes written and the result convention
-        # reads 0 as failure; an empty write is a legitimate no-op
-        if data.len() == 0:
-            return 0
         return byte_buffer_write(self.handle, data)
 
     fn free():
@@ -165,13 +161,6 @@ impl ByteBuffer:
         return byte_buffer_write_byte(self.handle, value)
 
     fn write_string_utf8(text: String) -> Int!:
-        # same reasoning as write: the builtin reports bytes written and the
-        # result convention reads 0 as failure, so appending an empty string
-        # has to short-circuit rather than report an error for a no-op. text
-        # assembled piece by piece — a header value, a field that happens to
-        # be blank — is full of empty pieces.
-        if text.len() == 0:
-            return 0
         return byte_buffer_write_string_utf8(self.handle, text)
 
     fn write_line_utf8(text: String) -> Int!:

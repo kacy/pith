@@ -1,0 +1,157 @@
+# the byte-count write builtins' contract, and the std writers built on them.
+#
+# file_write, file_write_bytes, tcp_write, tcp_write_bytes, process_write,
+# process_write_bytes, byte_buffer_write and byte_buffer_write_string_utf8
+# return the number of bytes they wrote. the runtime builds the result box
+# itself, so an empty payload is a success of 0 rather than the zero sentinel
+# the caller used to read as a failure (#1153), and a failure carries its
+# reason: "<name> failed: " and then the os error, or what was wrong with the
+# handle. an empty write makes no syscall, so it succeeds on any open handle
+# and fails only on one that is not open.
+# valgrind-gated in MEMCHECK_CASES.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+import std.net.tcp as tcp
+
+PATH := "/tmp/pith-test-empty-write-contract.txt"
+PORT := 17580
+
+fn show(label: String, r: Int!):
+    if r.is_ok:
+        print(label + ": ok " + r.ok.to_string())
+    else:
+        print(label + ": err [" + r.err + "]")
+
+# `!` carries the count and the runtime's message alike.
+fn both(h: Int, first: String, second: String) -> Int!:
+    return file_write(h, first)! + file_write(h, second)!
+
+fn files():
+    out := file_open_write(PATH) catch -1
+    show("file_write empty", file_write(out, ""))
+    show("file_write abc", file_write(out, "abc"))
+    show("file_write_bytes empty", file_write_bytes(out, bytes.empty()))
+    show("file_write_bytes xy", file_write_bytes(out, bytes.from_string_utf8("xy")))
+    show("file_write through ! empty+de", both(out, "", "de"))
+    print("file_write empty catch: " + (file_write(out, "") catch -1).to_string())
+    file_close(out)
+    show("file_write empty after close", file_write(out, ""))
+    show("file_write_bytes after close", file_write_bytes(out, bytes.from_string_utf8("z")))
+    show("file_write through ! after close", both(out, "", "de"))
+    print("file contents: " + (read_file(PATH) catch "?"))
+
+    input := file_open_read(PATH) catch -1
+    show("file_write empty on a read handle", file_write(input, ""))
+    show("file_write on a read handle", file_write(input, "x"))
+    show("file_write_bytes on a read handle", file_write_bytes(input, bytes.from_string_utf8("x")))
+    file_close(input)
+
+    full := file_open_write("/dev/full") catch -1
+    show("file_write empty to /dev/full", file_write(full, ""))
+    show("file_write to /dev/full", file_write(full, "x"))
+    show("file_write_bytes to /dev/full", file_write_bytes(full, bytes.from_string_utf8("x")))
+    file_close(full)
+
+fn buffers():
+    buf := byte_buffer_new()
+    show("byte_buffer_write empty", byte_buffer_write(buf, bytes.empty()))
+    show("byte_buffer_write ab", byte_buffer_write(buf, bytes.from_string_utf8("ab")))
+    show("byte_buffer_write_string_utf8 empty", byte_buffer_write_string_utf8(buf, ""))
+    show("byte_buffer_write_string_utf8 héllo", byte_buffer_write_string_utf8(buf, "héllo"))
+    print("byte_buffer_len: " + byte_buffer_len(buf).to_string())
+    byte_buffer_free(buf)
+    show("byte_buffer_write on handle 0", byte_buffer_write(0, bytes.empty()))
+    show("byte_buffer_write_string_utf8 on handle 0", byte_buffer_write_string_utf8(0, ""))
+
+fn accept_and_read(listener: Int) -> String!:
+    conn := tcp_accept(listener)!
+    mut got := ""
+    while true:
+        chunk := tcp_read(conn, 64)!
+        if chunk.len() == 0:
+            break
+        got = got + chunk
+    tcp_close(conn)
+    return got
+
+fn sockets() -> Int!:
+    listener := tcp_listen("127.0.0.1", PORT)!
+    reader := spawn accept_and_read(listener)
+    fd := tcp_connect("127.0.0.1", PORT)!
+    show("tcp_write empty", tcp_write(fd, ""))
+    show("tcp_write ping", tcp_write(fd, "ping"))
+    show("tcp_write_bytes empty", tcp_write_bytes(fd, bytes.empty()))
+    show("tcp_write_bytes pong", tcp_write_bytes(fd, bytes.from_string_utf8("pong")))
+    show("tcp.write empty", tcp.write(fd, ""))
+    tcp_close(fd)
+    received := await reader
+    print("peer read: " + (received catch "?"))
+    show("tcp_write empty after close", tcp_write(fd, ""))
+    show("tcp_write_bytes after close", tcp_write_bytes(fd, bytes.from_string_utf8("x")))
+    tcp_close(listener)
+    return 0
+
+fn processes() -> Int!:
+    child := process_spawn("cat")!
+    show("process_write empty", process_write(child, ""))
+    show("process_write hi", process_write(child, "hi"))
+    show("process_write_bytes empty", process_write_bytes(child, bytes.empty()))
+    process_close(child)
+    show("process_write empty after close", process_write(child, ""))
+    show("process_write_bytes after close", process_write_bytes(child, bytes.from_string_utf8("x")))
+
+    # a child that has exited has no reader on its stdin, so a write is EPIPE,
+    # which used to kill this process with SIGPIPE when no socket had been
+    # opened first. this runs before any socket is.
+    gone := process_spawn("true")!
+    process_wait(gone)
+    show("process_write empty to an exited child", process_write(gone, ""))
+    show("process_write to an exited child", process_write(gone, "x"))
+    show("process_write_bytes to an exited child", process_write_bytes(gone, bytes.from_string_utf8("x")))
+    process_close(gone)
+    return 0
+
+# the std writers, each through its public api.
+fn wrappers() -> Int!:
+    buf := bytes.buffer()
+    show("ByteBuffer.write empty", buf.write(bytes.empty()))
+    show("ByteBuffer.write_string_utf8 empty", buf.write_string_utf8(""))
+    show("ByteBuffer.write_line_utf8 empty", buf.write_line_utf8(""))
+    buf.free()
+
+    sb := io.string_buffer()
+    show("StringBuffer.write empty", sb.write(""))
+
+    stream := fs.create(PATH)!
+    show("FileStream.write empty", stream.write(""))
+    show("FileStream.write_bytes empty", stream.write_bytes(bytes.empty()))
+    show("FileStream.write_all empty", stream.write_all(""))
+    stream.close()
+
+    child := io.spawn_process("cat")!
+    stdin := child.stdin()
+    show("ProcessStdin.write empty", stdin.write(""))
+    show("ProcessStdin.write_bytes empty", stdin.write_bytes(bytes.empty()))
+    child.close()
+
+    listener := tcp_listen("127.0.0.1", PORT + 1)!
+    reader := spawn accept_and_read(listener)
+    conn := io.connect("127.0.0.1", PORT + 1)!
+    show("TcpStream.write empty", conn.write(""))
+    show("TcpStream.write_bytes empty", conn.write_bytes(bytes.empty()))
+    conn.close()
+    received := await reader
+    print("peer read: [" + (received catch "?") + "]")
+    tcp_close(listener)
+    return 0
+
+fn main() -> Int:
+    files()
+    buffers()
+    processes() catch 0
+    sockets() catch 0
+    wrappers() catch 0
+    _removed := remove_file(PATH)
+    return 0

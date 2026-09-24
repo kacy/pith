@@ -19,7 +19,7 @@ from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 from driver import file_for_node, dr_read_source
 from types import get_type_name, get_type_info
 from ast import get_node
-from lsp_state import uri_to_path, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
+from lsp_state import uri_to_path, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_has_at
 from lsp_features import analysis_is_checked, find_decl_position
 import std.json as json
 
@@ -430,7 +430,7 @@ fn binding_name_end(line_text: String, name: String) -> Int:
     mut count := 0
     mut i := 0
     while i + name.len() <= line_text.len():
-        if line_text.substring(i, i + name.len()) == name:
+        if text_has_at(line_text, i, name):
             boundary_before := i == 0 or not is_ident_byte(ord(line_text[i - 1]))
             mut j := i + name.len()
             boundary_after := j >= line_text.len() or not is_ident_byte(ord(line_text[j]))

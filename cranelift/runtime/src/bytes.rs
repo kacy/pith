@@ -1,4 +1,4 @@
-use crate::ffi_util::{cstr_bytes, write_result};
+use crate::ffi_util::{cstr_bytes, write_result, ResultPair};
 use std::io::Read;
 
 #[repr(C)]
@@ -355,18 +355,18 @@ unsafe fn append_to_buffer(handle: i64, bytes: Option<&[u8]>, what: &str) -> Res
     Ok(bytes.len())
 }
 
-/// append a `Bytes` value to a buffer, as a result box holding the count or
+/// append a `Bytes` value to a buffer, as a result pair holding the count or
 /// the failure's reason: an invalid buffer handle or an invalid bytes value.
 #[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> ResultPair {
     let bytes = pith_bytes_ref(data).map(|bytes| bytes.data.as_slice());
     write_result("byte_buffer_write", append_to_buffer(handle, bytes, "bytes value"))
 }
 
-/// append a string's bytes to a buffer, as a result box holding the count or
+/// append a string's bytes to a buffer, as a result pair holding the count or
 /// the failure's reason: an invalid buffer handle or an invalid string.
 #[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> ResultPair {
     let outcome = append_to_buffer(handle, cstr_bytes(s), "string");
     write_result("byte_buffer_write_string_utf8", outcome)
 }
@@ -719,6 +719,30 @@ mod tests {
             );
             assert_eq!(pith_byte_buffer_len(buffer), 2);
             pith_bytes_release(empty);
+            pith_byte_buffer_free(buffer);
+        }
+    }
+
+    /// a successful append hands its count back in two registers: once the
+    /// buffer has the room, a write allocates nothing, where each one used to
+    /// allocate a result box (#1162). more writes than the struct pool holds
+    /// blocks for, so a box would have to come from the allocator.
+    #[test]
+    fn a_successful_append_allocates_nothing() {
+        unsafe {
+            let buffer = pith_byte_buffer_with_capacity(1 << 16);
+            let pair = pith_bytes_from_vec(b"cd".to_vec());
+            let count = crate::collections::alloc_probe::allocations_during(|| {
+                for _ in 0..2000 {
+                    let wrote = pith_byte_buffer_write_string_utf8(buffer, c"ab".as_ptr());
+                    assert_eq!((wrote.is_ok, wrote.payload), (1, 2));
+                    let wrote = pith_byte_buffer_write(buffer, pair);
+                    assert_eq!((wrote.is_ok, wrote.payload), (1, 2));
+                }
+            });
+            assert_eq!(count, 0);
+            assert_eq!(pith_byte_buffer_len(buffer), 8000);
+            pith_bytes_release(pair);
             pith_byte_buffer_free(buffer);
         }
     }

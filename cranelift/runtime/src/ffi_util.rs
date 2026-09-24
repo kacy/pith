@@ -59,72 +59,80 @@ pub unsafe fn alloc_cstring(s: &str) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
-/// Build a fallible builtin's result box, laid out as pith's heap result
-/// tuple: `[is_ok, ok, err]`. A builtin that returns one takes the `tuple`
-/// retkind, so every ok value, a zero included, is a value, and the error
-/// slot carries the builtin's own message rather than one the compiler
+/// A fallible builtin's result as two machine words: the ok flag, and one
+/// payload that is the ok value when `is_ok` is 1 and an owned pith C string
+/// (the error message) when it is 0. A builtin that returns one gets the
+/// `rcall` form, so every ok value, a zero included, is a value, and the
+/// error carries the builtin's own message rather than one the compiler
 /// synthesizes.
 ///
-/// # Safety
-/// `err` must be 0 or a pith C string the box now owns.
-pub unsafe fn result_box(is_ok: i64, ok: i64, err: i64) -> i64 {
-    let tuple = crate::pith_struct_alloc(3) as *mut i64;
-    if tuple.is_null() {
-        return 0;
+/// A `#[repr(C)]` struct of two `i64`s comes back in two registers on every
+/// target the compiler supports: `rax:rdx` under the x86-64 System V ABI and
+/// `x0:x1` under AAPCS64, Apple's variant included. Those are the registers a
+/// Cranelift signature with two `I64` returns reads, so these functions are
+/// declared with `I64,I64` returns in `runtime_functions.txt` and no heap
+/// result box exists on either path. A float payload travels as its bit
+/// pattern in the second word rather than as an `f64`: AAPCS64 returns a
+/// mixed `{i64, f64}` struct in `x0:x1`, where a Cranelift `(I64, F64)`
+/// signature would read `x0` and `v0`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultPair {
+    pub is_ok: i64,
+    pub payload: i64,
+}
+
+// the two-register return depends on the struct being exactly two words.
+const _: () = assert!(std::mem::size_of::<ResultPair>() == 16);
+
+/// A successful result carrying `value`.
+pub fn result_ok(value: i64) -> ResultPair {
+    ResultPair {
+        is_ok: 1,
+        payload: value,
     }
-    *tuple = is_ok;
-    *tuple.add(1) = ok;
-    *tuple.add(2) = err;
-    tuple as i64
 }
 
-/// A result box holding `value` as its ok payload.
+/// A failed result carrying a copy of `message`, which the caller then owns.
 ///
 /// # Safety
-/// Allocates through the pith runtime; see [`result_box`].
-pub unsafe fn result_ok(value: i64) -> i64 {
-    result_box(1, value, 0)
+/// Allocates the message through the pith runtime.
+pub unsafe fn result_err(message: &[u8]) -> ResultPair {
+    ResultPair {
+        is_ok: 0,
+        payload: crate::pith_copy_bytes_to_cstring(message) as i64,
+    }
 }
 
-/// A result box holding a copy of `message` as its error.
-///
-/// # Safety
-/// Allocates through the pith runtime; see [`result_box`].
-pub unsafe fn result_err(message: &[u8]) -> i64 {
-    let err = crate::pith_copy_bytes_to_cstring(message) as i64;
-    result_box(0, 0, err)
-}
-
-/// The result box of a byte-count write: the count on success, and
+/// The result of a byte-count write: the count on success, and
 /// `"<builtin> failed: <reason>"` on failure. The prefix is the message the
-/// compiler synthesized for these builtins before they built their own box,
-/// so a caller matching on it still matches.
+/// compiler synthesized for these builtins before they reported their own
+/// reason, so a caller matching on it still matches.
 ///
 /// # Safety
-/// Allocates through the pith runtime; see [`result_box`].
-pub unsafe fn write_result(builtin: &str, outcome: Result<usize, String>) -> i64 {
+/// Allocates the error message through the pith runtime; see [`result_err`].
+pub unsafe fn write_result(builtin: &str, outcome: Result<usize, String>) -> ResultPair {
     match outcome {
         Ok(count) => result_ok(count as i64),
         Err(reason) => result_err(format!("{builtin} failed: {reason}").as_bytes()),
     }
 }
 
-/// Read a result box back for a test: the ok payload, or the error text.
+/// Read a result back for a test: the ok payload, or the error text. The
+/// error string is released here, as the compiled caller releases it.
 ///
 /// # Safety
-/// `tuple` must be a box `result_box` built.
+/// `pair` must come from one of the builtins above.
 #[cfg(test)]
-pub(crate) unsafe fn unbox_result(tuple: i64) -> Result<i64, String> {
-    assert_ne!(tuple, 0, "the result box allocation failed");
-    let slots = tuple as *const i64;
-    let outcome = if *slots != 0 {
-        Ok(*slots.add(1))
-    } else {
-        let err = *slots.add(2) as *const std::os::raw::c_char;
-        Err(std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned())
-    };
-    crate::pith_struct_release(tuple);
-    outcome
+pub(crate) unsafe fn unbox_result(pair: ResultPair) -> Result<i64, String> {
+    if pair.is_ok != 0 {
+        return Ok(pair.payload);
+    }
+    let err = pair.payload as *const std::os::raw::c_char;
+    assert!(!err.is_null(), "a failed result carries no message");
+    let text = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+    crate::pith_cstring_release(err);
+    Err(text)
 }
 
 #[cfg(test)]

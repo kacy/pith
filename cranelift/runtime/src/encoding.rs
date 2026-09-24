@@ -1,15 +1,16 @@
-use crate::ffi_util::{result_err, result_ok};
+use crate::ffi_util::{result_err, result_ok, ResultPair};
 
-unsafe fn parse_error(message: &[u8]) -> i64 {
+unsafe fn parse_error(message: &[u8]) -> ResultPair {
     result_err(message)
 }
 
-/// Parse string to int and return a result tuple pointer.
+/// Parse a string to an int, as the (is_ok, payload) register pair: the value,
+/// or an owned message (`invalid integer`, `integer overflow`).
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
     if s.is_null() {
         return parse_error(b"invalid integer");
     }
@@ -65,9 +66,9 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     result_ok(parsed)
 }
 
-/// Parse a string to a float and return a result tuple pointer, laid out
-/// as parse_int's is: `[is_ok, ok, err]`, with the ok slot holding the
-/// f64's bit pattern so every value, a signed zero included, round-trips.
+/// Parse a string to a float, as the (is_ok, payload) register pair that
+/// parse_int returns, with the payload holding the f64's bit pattern so every
+/// value, a signed zero included, round-trips.
 ///
 /// The text is trimmed of whitespace and converted by std's
 /// `f64::from_str`: an optional sign, digits with an optional fraction
@@ -81,7 +82,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> ResultPair {
     if s.is_null() {
         return parse_error(b"invalid float");
     }
@@ -355,15 +356,39 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::{pith_parse_float, pith_parse_int};
-    use std::ffi::{CStr, CString};
+    use crate::collections::alloc_probe::allocations_during;
+    use crate::ffi_util::unbox_result;
+    use std::ffi::CString;
 
+    // (is_ok, the value) with 0 standing in for the value of a failure
     fn parse(input: &str) -> (bool, i64) {
         let c_input = CString::new(input).unwrap();
-        let tuple = unsafe { pith_parse_int(c_input.as_ptr()) as *const i64 };
-        assert!(!tuple.is_null());
-        let is_ok = unsafe { *tuple } != 0;
-        let value = unsafe { *tuple.add(1) };
-        (is_ok, value)
+        match unsafe { unbox_result(pith_parse_int(c_input.as_ptr())) } {
+            Ok(value) => (true, value),
+            Err(_) => (false, 0),
+        }
+    }
+
+    // a successful parse hands its value back in two registers: no result box
+    // and no allocation of any kind. more calls than the struct pool can hold
+    // blocks for, with nothing released in between, so a box would have to
+    // come from the allocator on most of them.
+    #[test]
+    fn a_successful_parse_allocates_nothing() {
+        let int_text = CString::new("12345").unwrap();
+        let float_text = CString::new("2.5").unwrap();
+        let count = allocations_during(|| {
+            for _ in 0..2000 {
+                let int_pair = unsafe { pith_parse_int(int_text.as_ptr()) };
+                assert_eq!((int_pair.is_ok, int_pair.payload), (1, 12345));
+                let float_pair = unsafe { pith_parse_float(float_text.as_ptr()) };
+                assert_eq!(
+                    (float_pair.is_ok, float_pair.payload),
+                    (1, 2.5f64.to_bits() as i64)
+                );
+            }
+        });
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -392,13 +417,7 @@ mod tests {
     // the bits of the ok value, or the error message
     fn parse_f(input: &str) -> Result<u64, String> {
         let c_input = CString::new(input).unwrap();
-        let tuple = unsafe { pith_parse_float(c_input.as_ptr()) as *const i64 };
-        assert!(!tuple.is_null());
-        if unsafe { *tuple } != 0 {
-            return Ok(unsafe { *tuple.add(1) } as u64);
-        }
-        let err = unsafe { *tuple.add(2) } as *const std::os::raw::c_char;
-        Err(unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned())
+        unsafe { unbox_result(pith_parse_float(c_input.as_ptr())) }.map(|bits| bits as u64)
     }
 
     #[test]

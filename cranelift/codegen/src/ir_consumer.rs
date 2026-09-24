@@ -2070,8 +2070,9 @@ fn compile_ir_function(
 
             // Register result ABI call: `rcall flag_reg val_reg fname payload_kind nargs args...`
             // The callee returns two values (is_ok, payload); bind both into the
-            // named registers. Only user functions declared with the result ABI
-            // are called this way, so this is always a direct declared-func call.
+            // named registers. The callee is a user function declared with the
+            // result ABI, or a runtime builtin whose table row returns I64,I64
+            // (its two-word result struct). Either way it is a direct call.
             "rcall" if parts.len() >= 6 => {
                 let flag_reg = parse_reg(parts[1], line, func_name)?;
                 let val_reg = parse_reg(parts[2], line, func_name)?;
@@ -2087,12 +2088,16 @@ fn compile_ir_function(
                 for j in 0..nargs {
                     args.push(get_reg(&regs, parts[6 + j])?);
                 }
-                let fid = declared_funcs.get(fname).copied().ok_or_else(|| {
-                    CompileError::ModuleError(format!(
-                        "ir consumer: rcall to unknown function {} in {}",
-                        fname, func_name
-                    ))
-                })?;
+                let fid = declared_funcs
+                    .get(fname)
+                    .or_else(|| runtime_funcs.get(fname))
+                    .copied()
+                    .ok_or_else(|| {
+                        CompileError::ModuleError(format!(
+                            "ir consumer: rcall to unknown function {} in {}",
+                            fname, func_name
+                        ))
+                    })?;
                 let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
                     codegen.module.declare_func_in_func(fid, builder.func)
                 });
@@ -2114,16 +2119,26 @@ fn compile_ir_function(
                 }
                 let call = builder.ins().call(fref, &args);
                 let results = builder.func.dfg.inst_results(call);
-                let flag_v = results[0];
-                let payload_v = results[1];
+                let &[flag_v, payload_v] = results else {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: rcall to {} in {}, which does not return a register pair",
+                        fname, func_name
+                    )));
+                };
                 // Normalize the flag (iadd 0 works around a Cranelift register
                 // state issue also handled on the normal call path).
                 let zero = builder.ins().iconst(types::I64, 0);
                 let flag_norm = builder.ins().iadd(flag_v, zero);
                 regs.insert(flag_reg, flag_norm);
-                // The payload is an f64 when the ok value is a float; hold it as
-                // an i64 bit pattern like the rest of the register file.
-                if payload_kind == "float" {
+                // A float ok value is held as an i64 bit pattern like the rest
+                // of the register file. A `result_reg_f` function returns it
+                // as an f64 and is cast here; a runtime builtin already returns
+                // the bits in its second integer word.
+                let payload_is_f64 = builder.func.dfg.value_type(payload_v) == types::F64;
+                if payload_kind == "float" && !payload_is_f64 {
+                    regs.insert(val_reg, payload_v);
+                    float_regs.insert(val_reg);
+                } else if payload_kind == "float" {
                     let cast = builder.ins().bitcast(
                         types::I64,
                         cranelift::codegen::ir::MemFlags::new(),
@@ -2500,6 +2515,16 @@ fn compile_ir_function(
                         // Check function signature for f64 params and bitcast as needed
                         let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
                         let sig = &builder.func.dfg.signatures[sig_ref];
+                        // a callee that returns the register pair is reached
+                        // only through rcall: a plain call would read the flag
+                        // as the value and drop the payload, an owned error
+                        // string included.
+                        if sig.returns.len() > 1 {
+                            return Err(CompileError::ModuleError(format!(
+                                "ir consumer: call to '{}' in {} must be an rcall: it returns a register pair",
+                                fname, func_name
+                            )));
+                        }
                         let param_types: Vec<types::Type> =
                             sig.params.iter().map(|p| p.value_type).collect();
                         let mut typed_args = args.clone();
@@ -3338,6 +3363,16 @@ mod tests {
         assert!(result.is_ok(), "expected IR to compile, got {:?}", result.err());
     }
 
+    // the same, with the runtime table declared, for ir that calls builtins.
+    fn compile_with_runtime_for_ir(ir: &str) -> Result<(), String> {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
+            .expect("declare runtime functions");
+        compile_from_ir(&mut codegen, ir, &runtime_funcs)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     #[test]
     fn push_return_types_uses_two_returns_for_result_abi() {
         let mut r = Vec::new();
@@ -3385,6 +3420,40 @@ mod tests {
                   ret 3\n\
                   endfunc\n";
         compile_ok_for_ir(ir);
+    }
+
+    #[test]
+    fn rcall_reaches_a_runtime_pair_builtin() {
+        // parse_int and parse_float return their (is_ok, payload) pair in two
+        // registers; rcall resolves them from the runtime table, the float
+        // payload arriving as bits in an integer word.
+        let ir = "string 0 \"12\"\n\
+                  func main 0 int\n\
+                  strref 1 0\n\
+                  rcall 2 3 parse_int int 1 1\n\
+                  rcall 4 5 parse_float float 1 1\n\
+                  ret 3\n\
+                  endfunc\n";
+        let result = compile_with_runtime_for_ir(ir);
+        assert!(result.is_ok(), "expected IR to compile, got {result:?}");
+    }
+
+    #[test]
+    fn a_plain_call_to_a_runtime_pair_builtin_is_an_error() {
+        let err = compile_with_runtime_for_ir(
+            "string 0 \"12\"\nfunc main 0 int\nstrref 1 0\ncall 2 parse_int tuple 1 1\nret 2\nendfunc\n",
+        )
+        .expect_err("a plain call to a pair builtin must not compile");
+        assert!(err.contains("must be an rcall"), "{err}");
+    }
+
+    #[test]
+    fn rcall_to_a_single_return_function_is_an_error() {
+        let err = compile_with_runtime_for_ir(
+            "string 0 \"12\"\nfunc main 0 int\nstrref 1 0\nrcall 2 3 ord int 1 1\nret 2\nendfunc\n",
+        )
+        .expect_err("an rcall to a single-return builtin must not compile");
+        assert!(err.contains("does not return a register pair"), "{err}");
     }
 
     #[test]

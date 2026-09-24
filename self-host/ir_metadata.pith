@@ -13,13 +13,14 @@ STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,re
 
 # fallible builtins, grouped by how the ir carries their result (see the result
 # encoding in docs/ir-contract.md). parse_int and parse_float return the
-# three-slot result box itself and are handled directly in
+# (is_ok, payload) register pair and are handled directly in
 # ir_builtin_result_retkind.
 RESULT_INT_FUNCS := "file_open_read,file_open_write,file_open_append,byte_buffer_write_byte,tcp_connect,tcp_listen,tcp_accept,process_spawn,process_spawn_argv,process_output_argv,crypto_x25519_keygen,crypto_p256_keygen,crypto_p384_keygen"
-# the writes that report a byte count. like the parsers they build the
-# three-slot result box in the runtime and take the tuple retkind: a count of
-# 0 (an empty write) is a success, where the zero sentinel of result_int read
-# it as a failure, and the error carries the runtime's own reason (#1153).
+# the writes that report a byte count. like the parsers they return the
+# (is_ok, payload) pair in two registers, reached by rcall, and hold the tuple
+# kind wherever a call site keeps the result as a box: a count of 0 (an empty
+# write) is a success, where the zero sentinel of result_int read it as a
+# failure, and the error carries the runtime's own reason (#1153, #1162).
 RESULT_BOX_INT_FUNCS := "byte_buffer_write,byte_buffer_write_string_utf8,file_write,file_write_bytes,tcp_write,tcp_write_bytes,process_write,process_write_bytes"
 RESULT_BOOL_FUNCS := "write_file,append_file,write_file_bytes,append_file_bytes"
 RESULT_STRING_FUNCS := "read_file,exec_output,dns_resolve,bytes_to_string_utf8,bytes_substring_utf8,file_read,tcp_read,process_read,process_read_err"
@@ -44,6 +45,7 @@ mut void_methods: Map[String, Bool] := {}
 mut string_returning_methods: Map[String, Bool] := {}
 mut result_int_funcs: Map[String, Bool] := {}
 mut result_box_int_funcs: Map[String, Bool] := {}
+mut pair_builtin_funcs: Map[String, Bool] := {}
 mut result_bool_funcs: Map[String, Bool] := {}
 mut result_string_funcs: Map[String, Bool] := {}
 mut result_bytes_funcs: Map[String, Bool] := {}
@@ -70,6 +72,7 @@ fn ir_build_metadata_sets():
     string_returning_methods = ir_csv_set(STRING_RETURNING_METHODS)
     result_int_funcs = ir_csv_set(RESULT_INT_FUNCS)
     result_box_int_funcs = ir_csv_set(RESULT_BOX_INT_FUNCS)
+    pair_builtin_funcs = ir_csv_set("parse_int,parse_float," + RESULT_BOX_INT_FUNCS)
     result_bool_funcs = ir_csv_set(RESULT_BOOL_FUNCS)
     result_string_funcs = ir_csv_set(RESULT_STRING_FUNCS)
     result_bytes_funcs = ir_csv_set(RESULT_BYTES_FUNCS)
@@ -137,8 +140,10 @@ pub fn ir_is_known_returning_func(fname: String) -> Bool:
 
 # the ir retkind of a fallible builtin's result. the match order is preserved
 # from the original hand-written chain so every function's retkind is unchanged.
-# the parsers and the byte-count writes build the box in the runtime, so a zero
-# is a value like any other and the error carries the runtime's own message.
+# the parsers and the byte-count writes return the (is_ok, payload) register
+# pair, so a zero is a value like any other and the error carries the
+# runtime's own message; "tuple" is the kind of the box a call site folds that
+# pair into where it keeps the result whole.
 pub fn ir_builtin_result_retkind(name: String) -> String:
     ir_build_metadata_sets()
     if name == "parse_int" or name == "parse_float" or result_box_int_funcs.contains_key(name):
@@ -152,6 +157,13 @@ pub fn ir_builtin_result_retkind(name: String) -> String:
     if result_bytes_funcs.contains_key(name):
         return "bytes"
     return ""
+
+# whether `name` is a builtin that returns the (is_ok, payload) register pair:
+# the ones ir_builtin_result_retkind calls "tuple". one set lookup, because the
+# emitter asks it at every call site it lowers.
+pub fn ir_is_pair_builtin_name(name: String) -> Bool:
+    ir_build_metadata_sets()
+    return pair_builtin_funcs.contains_key(name)
 
 # every builtin whose failure is a single-register sentinel, in table order:
 # the emitter wraps such a call's result into a box whose error is the

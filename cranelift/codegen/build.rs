@@ -97,6 +97,18 @@ fn generate_runtime_table() -> Result<(), String> {
             .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?;
         let returns = parse_type_list(parts[3].trim())
             .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?;
+        // two returns are the register result pair, which the runtime hands
+        // back as a two-word `#[repr(C)]` struct. only two integer words are
+        // returned in registers the same way by the runtime's C ABI and by a
+        // Cranelift signature on every supported target, so nothing else is
+        // accepted.
+        if returns.len() > 1 && returns != ["I64", "I64"] {
+            return Err(format!(
+                "{}:{}: a runtime function returns nothing, one value, or the pair I64,I64",
+                abi_path.display(),
+                line_no + 1
+            ));
+        }
         let class = if parts.len() == 5 {
             parse_decl_class(parts[4].trim())
                 .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?

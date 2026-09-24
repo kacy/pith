@@ -26,7 +26,7 @@
 use crate::blocking::{self, Pool};
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::collections::list::{pith_list_new, pith_list_push_value};
-use crate::ffi_util::{cstr_bytes, cstr_str, write_result};
+use crate::ffi_util::{cstr_bytes, cstr_str, write_result, ResultPair};
 use crate::runtime_core::optional_tuple;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -458,11 +458,11 @@ pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i6
     }
 }
 
-/// one write of a string's bytes to an open file, as a result box holding the
+/// one write of a string's bytes to an open file, as a result pair holding the
 /// count (`0` for an empty string, which is a success) or the failure's
 /// reason.
 #[no_mangle]
-pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> ResultPair {
     let outcome = match cstr_bytes(data) {
         Some(bytes) => write_handle_chunk(handle, bytes),
         None => Err("invalid string".to_string()),
@@ -472,7 +472,7 @@ pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> i64 {
 
 /// the `Bytes` form of `pith_file_write`.
 #[no_mangle]
-pub unsafe extern "C" fn pith_file_write_bytes(handle: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_file_write_bytes(handle: i64, data: i64) -> ResultPair {
     let outcome = match pith_bytes_ref(data) {
         Some(bytes) => write_handle_chunk(handle, &bytes.data),
         None => Err("invalid bytes value".to_string()),

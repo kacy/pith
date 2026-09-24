@@ -1395,6 +1395,116 @@ the A arm the main tree at e22c5a69 building the stage 2 bench source:
 (+0.17%), `small 4 20000` 33,115,253 to 32,700,739 (-1.25%); checksums
 identical, and none of those paths changed, so the movement is placement.
 
+## result boxes (2026-09-24)
+
+a `T!` crosses a call as a heap struct, `[is_ok, ok, err]`: the callee
+allocates it and the caller frees it after reading the flag and the payload.
+the two-register result abi (`PITH_RESULT_REG=1`, above) removes that box for
+pith functions but is still off by default, and since #1156 and #1163 the ten
+builtins that report their own outcome (`parse_int`, `parse_float` and the
+eight byte-count writes) built the same box in the runtime on every call.
+
+### where the boxes are
+
+callgrind at 92684dd5, `PITH_KEEP_SYMBOLS=1`, with every `pith_struct_alloc`
+caller classified: the runtime's result builders count in full, and so does
+a pith function whose only allocation sites are the three-slot result tuple
+the emitter builds (`tooling/callgrind_ab.sh --annotate` names the callers,
+the ir dump names the sites). a released box costs 100 Ir (a dtor-less
+three-slot `pith_struct_release`, `struct_weak_drop` included, measured on
+the same runs), and every box is released exactly once.
+
+| workload | total Ir | result boxes | alloc + release Ir | share | where they come from |
+|---|---:|---:|---:|---:|---|
+| `event_ledger 200000` | 2,372,681,848 | 2,400,197 | 410,435,036 | 17.3% | 2,200,000 from the runtime under `ByteBuffer.write_string_utf8`, 200,191 from `ByteBuffer.write_byte`'s sentinel wrap |
+| the same, decode boxes | | 200,000 | about 34,000,000 | 1.4% | `json.decode_text[Event](line) catch ...` in `parse_events`, a box built by the inlined decode |
+| `std_pipeline 50000` | 3,302,862,259 | 1,301,572 | 222,570,383 | 6.7% | 600,319 `ByteBuffer.write_byte`, 500,012 from the runtime's writes, 100,000 `bytes.substring_utf8`, 100,001 in the csv writer |
+| `catalog_workload 200000` | 926,494,660 | 200,000 | about 35,000,000 | 3.8% | the inlined `json.decode[BatchRequest]` in `batch_checksum`, bound to a local |
+| the compiler compiling itself | 12,417,782,888 | 104 | 18,094 | 0.00% | `driver.read_source` and the import walk |
+
+the std profiling pass put `pith_struct_alloc` and `pith_struct_release`
+under `ByteBuffer.write_string_utf8` at 11.7% of event_ledger. the boxes cost
+the same today in absolute terms: 410 million Ir is 12.1% of the 3.39
+billion that run measured, and 17.3% of the 2.37 billion it measures now,
+after the map and substring passes took a third of the rest away. the
+compiler returns almost nothing through `T!` on its hot paths, so it has no
+result boxes to lose.
+
+which functions return a pair and which build a box is decided in one place,
+`ir_maybe_register_result_reg`: with `PITH_RESULT_REG=1`, a non-generic,
+lambda-free, non-`main` free function or plain-impl method whose ok payload
+fits one register. with the flag off, as it is by default, every `-> T!`
+function builds a box.
+
+### the change: builtins return the pair in two registers (#1162)
+
+the ten builtins now return a `#[repr(C)]` struct of two `i64`s, which every
+supported target returns in two registers: `rax:rdx` under the x86-64 System
+V ABI, `x0:x1` under AAPCS64 on linux and on macOS. their rows in
+`runtime_functions.txt` declare `I64,I64` returns, the consumer's `rcall`
+resolves runtime functions as well as declared ones, and the emitter lowers
+every call to one of them as an `rcall` (`ir_call_returns_pair`). a `!`,
+`catch`, `catch:` block, `unwrap_or` or pair return consumes the pair
+directly; every other position folds it into the box it always had. the error
+payload is the same owned string, released on the error arm. the float
+payload travels as its bits in the second word, because AAPCS64 returns a
+mixed `{i64, f64}` struct in `x0:x1` where a Cranelift `(I64, F64)`
+signature reads `x0` and `v0`.
+
+per call, callgrind, a probe calling each family 20,000 rounds through
+`catch` and through `!` in a fallible helper, all successful, the A arm the
+main tree at 92684dd5:
+
+| family | calls | Ir before | Ir after | per call | `pith_struct_alloc` from the builtin |
+|---|---:|---:|---:|---:|---:|
+| `parse_int` | 40,000 | 19,853,110 | 12,552,528 | -182.5 | 40,002 to 0 |
+| `parse_float` | 40,000 | 27,333,239 | 20,052,630 | -182.0 | 40,000 to 0 |
+| `byte_buffer_write`, `byte_buffer_write_string_utf8` | 80,000 | 31,093,757 | 16,733,208 | -179.5 | 80,000 to 0 |
+| `file_write`, `file_write_bytes` (`/dev/null`) | 80,000 | 48,875,357 | 34,514,752 | -179.5 | 80,000 to 0 |
+| `process_write`, `process_write_bytes` (`cat > /dev/null`) | 80,000 | 79,454,614 | 65,114,033 | -179.3 | 80,000 to 0 |
+| `tcp_write`, `tcp_write_bytes` (loopback, a draining reader task) | 80,000 | 481,232,170 | 449,112,976 | not isolated | 80,000 to 0 |
+
+three runs of the tcp arm pair went 481 to 449, 526 to 412 and 541 to 402
+million Ir: the reader task and the scheduler move the total by more than
+the boxes do, so for tcp only the allocation count is a measurement. the
+20,000 allocations left in each after arm are the probe's own fallible
+helper returning its box, which is the pith-function half of the problem.
+the runtime's unit tests check the builtins directly: 2,000 successful parses and
+4,000 successful buffer appends allocate nothing at all.
+
+### the four workloads
+
+| workload | before | after | with `PITH_RESULT_REG=1` as well |
+|---|---:|---:|---:|
+| `event_ledger 200000` | 2,372,681,726 | 2,390,282,114 (+0.74%) | 1,935,834,848 (-18.4%) |
+| `std_pipeline 50000` | 3,299,870,014 | 3,303,676,030 (+0.10%) | 3,078,602,971 (-6.7%) |
+| `catalog_workload 200000` | 926,494,740 | 926,494,648 (0.00%) | 926,488,148 (0.00%) |
+| the compiler compiling itself | 12,417,797,170 | 12,420,884,217 (+0.03%) | 12,429,126,742 (+0.09%) |
+
+on its own the change moves none of the four, and event_ledger gets slightly
+worse. every hot builtin call in them sits behind a std wrapper, such as
+`fn write_string_utf8(text: String) -> Int!: return
+byte_buffer_write_string_utf8(self.handle, text)`, and a wrapper that returns
+a box still has to build one, now in the wrapper from the pair instead of in
+the runtime, which is about 8 Ir more per call. the direct call sites gain
+the 180 Ir above. with the wrapper on the register abi as well, the box is
+gone from both ends of that chain, and event_ledger drops 18.4% with an
+identical digest: the 2.4 million boxes in the table are 17.3% of it. the
+json decode boxes in event_ledger and catalog_workload are built inline by
+the decode lowering and are not touched by either.
+
+each after figure is compared with the before arm of its own run. the
+compiler's +0.03% is one more set lookup per call site the emitter lowers
+(`ir_is_pair_builtin`); its flag column was measured before that lookup was
+cut to a single set probe, at about three times the cost.
+
+the flag is still off by default because it has not been under the gate
+suite since it landed: the regression corpus with `PITH_RESULT_REG=1` fails
+two of 493 cases, on this branch and at 92684dd5 alike, both a pair-returning
+function handing back its own result parameter (#1164). the decode boxes
+need the decode lowering to hand its (flag, payload) to a waiting consumer
+the way the builtins now do, and a `Float!` function still boxes.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

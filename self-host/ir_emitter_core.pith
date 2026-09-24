@@ -42,7 +42,7 @@ from ast import get_node, node_kind, node_value, node_child, node_child_count, N
 from checker import generic_base_identity, generic_identity_bare_name, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, ti_optional, ti_list, ti_map, ti_set, ti_tuple, add_type_info, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
-from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
+from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_generic_preferred_name, ir_queue_generic_specialization
@@ -188,6 +188,9 @@ mut ir_named_fn_value_wrappers: Map[String, String] := {}
 # eligibility (ir_maybe_register_result_reg) is deliberately narrow for the
 # measured prototype: non-generic free functions whose ok payload is an Int
 # or Bool. the error payload is always a single register (a handle or zero).
+# the runtime builtins that return the same pair (ir_is_pair_builtin: the
+# parsers and the byte-count writes) take these call paths whatever the flag
+# says, since the runtime decides their return convention, not the emitter.
 mut ir_result_reg_flag := 0 - 1
 # the pair handshake: a consumer that can use (flag, payload) directly (the
 # `!` emitter) stores its operand node index here before emitting it; the
@@ -4805,7 +4808,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)
     ret_type := ir_call_retkind_for_name(idx, uses_result_abi, callee.name)
-    if ir_result_reg_funcs.contains_key(callee.name):
+    if ir_call_returns_pair(callee.name):
         ir_rcall_current_idx = idx
         r = ir_emit_result_reg_call(r, callee.name, arg_regs.len(), ir_join_arg_regs(arg_regs))
         ir_rcall_current_idx = 0 - 1
@@ -5658,12 +5661,27 @@ fn ir_result_reg_ok_kind_fits(ok_kind: String) -> Bool:
         return true
     return ok_kind.starts_with("struct:")
 
+# true for a runtime builtin that returns its result as the (flag, payload)
+# pair in two registers rather than as a box: the parsers and the byte-count
+# writes (ir_builtin_result_retkind's "tuple" list). a name a declaration
+# claims is that declaration's, never the builtin.
+fn ir_is_pair_builtin(name: String) -> Bool:
+    return ir_is_pair_builtin_name(name) and not ir_is_declared_callable(name)
+
+# whether a call to `name` yields the (flag, payload) pair and so has to be
+# lowered with rcall: a function registered for the register abi, or a pair
+# builtin. every call site that can reach one asks this, not the registry.
+fn ir_call_returns_pair(name: String) -> Bool:
+    return ir_result_reg_funcs.contains_key(name) or ir_is_pair_builtin(name)
+
 fn ir_emit_result_reg_call(r: Int, fname: String, arg_count: Int, arg_text: String) -> Int:
     flag_r := ir_reg()
     val_r := ir_reg()
     mut payload_kind := "int"
     if ir_func_result_ok_kinds.contains_key(fname):
         payload_kind = ir_func_result_ok_kinds[fname]
+    elif ir_is_pair_builtin(fname):
+        payload_kind = ir_builtin_result_ok_kind(fname)
     mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " " + payload_kind + " " + arg_count.to_string()
     if arg_text.len() > 0:
         line = line + arg_text
@@ -6006,7 +6024,7 @@ fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) ->
         call_name = handler_node.value
     if call_name.len() > 0:
         out_r := ir_reg()
-        if ir_result_reg_funcs.contains_key(call_name):
+        if ir_call_returns_pair(call_name):
             # a pair-returning handler: bind the pair and fold it into the
             # box this consumer expects.
             return ir_emit_result_reg_call(out_r, call_name, 1, " " + arg_r.to_string())
@@ -6470,7 +6488,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
-        if ir_result_reg_funcs.contains_key(call_name):
+        if ir_call_returns_pair(call_name):
             ir_rcall_current_idx = idx
             r = ir_emit_result_reg_call(r, call_name, arg_regs.len(), ir_join_arg_regs(arg_regs))
             ir_rcall_current_idx = 0 - 1
@@ -6618,7 +6636,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if store_tag_r >= 0:
         call_arg_text = call_arg_text + " " + store_tag_r.to_string()
         call_arg_count = call_arg_count + 1
-    if ir_result_reg_funcs.contains_key(call_name):
+    if ir_call_returns_pair(call_name):
         # a pair-returning callee: a registered plain-impl method, or a
         # module-alias call that resolved to a pair-returning free function.
         # the handshake lets a `!` or `catch` wrapping this call consume the
@@ -7098,7 +7116,7 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
         ir_emit("ret " + zero_r.to_string())
     else:
         mut call_r := ir_reg()
-        if ir_result_reg_funcs.contains_key(target_name):
+        if ir_call_returns_pair(target_name):
             # a pair-returning target reached through a fn value: the wrapper
             # itself keeps the box convention, so fold the pair into a box.
             call_r = ir_emit_result_reg_call(call_r, target_name, arg_regs.len(), ir_join_arg_regs(arg_regs))

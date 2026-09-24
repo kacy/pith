@@ -21,6 +21,22 @@ fn declare_runtime_function(
 ) -> Result<FuncId, CompileError> {
     let mut sig = module.make_signature();
 
+    // a two-value return is the runtime's two-word result pair, which Rust
+    // returns in two integer registers under System V (x86-64 and aarch64
+    // linux) and Apple's aarch64 variant, exactly where a two-return
+    // Cranelift signature reads them. Windows x64 returns a 16-byte struct
+    // through a hidden pointer instead, so refuse to compile rather than read
+    // garbage there.
+    if returns.len() == 2 {
+        use cranelift::codegen::isa::CallConv;
+        if !matches!(sig.call_conv, CallConv::SystemV | CallConv::AppleAarch64) {
+            return Err(CompileError::ModuleError(format!(
+                "runtime function {} returns a register pair, which calling convention {} does not support",
+                name, sig.call_conv
+            )));
+        }
+    }
+
     for param in params {
         sig.params.push(AbiParam::new(*param));
     }

@@ -1,0 +1,137 @@
+# the builtins that return their result as an (is_ok, payload) register pair
+# (#1162), one family and one path per SHAPE value (tooling/leak_check.sh
+# registers each). on success the payload is a plain count or value; on
+# failure it is a fresh message string the caller owns, released on the
+# error arm of a `!`, `catch`, `catch:` block or `unwrap_or`, and by the box
+# a bound local or an argument folds the pair into. every round runs each of
+# those positions once, so a missed release on any of them grows the peak.
+import leakprobe as probe
+import std.bytes as bytes
+import std.env as env
+
+fn take(r: Int!) -> Int:
+    if r.is_ok:
+        return r.ok
+    return r.err.len()
+
+fn take_float(r: Float!) -> Int:
+    if r.is_ok:
+        return r.ok.to_int()
+    return r.err.len()
+
+fn int_through(text: String) -> Int!:
+    return parse_int(text)! + 1
+
+fn int_block(text: String) -> Int:
+    n := parse_int(text) catch:
+        return 3
+    return n
+
+fn int_round(text: String) -> Int:
+    mut acc := int_through(text) catch 2
+    acc = acc + (parse_int(text) catch 1)
+    acc = acc + parse_int(text).unwrap_or(4)
+    acc = acc + int_block(text)
+    local := parse_int(text)
+    acc = acc + take(local)
+    acc = acc + take(parse_int(text))
+    parse_int(text)
+    return acc
+
+fn float_through(text: String) -> Float!:
+    return parse_float(text)! + 1.0
+
+fn float_block(text: String) -> Float:
+    x := parse_float(text) catch:
+        return 3.0
+    return x
+
+fn float_round(text: String) -> Int:
+    mut acc := (float_through(text) catch 2.0).to_int()
+    acc = acc + (parse_float(text) catch 1.0).to_int()
+    acc = acc + parse_float(text).unwrap_or(4.0).to_int()
+    acc = acc + float_block(text).to_int()
+    local := parse_float(text)
+    acc = acc + take_float(local)
+    acc = acc + take_float(parse_float(text))
+    parse_float(text)
+    return acc
+
+fn buffer_through(buf: Int, data: Bytes) -> Int!:
+    return byte_buffer_write(buf, data)! + byte_buffer_write_string_utf8(buf, "ab")!
+
+fn buffer_round(buf: Int, data: Bytes) -> Int:
+    mut acc := buffer_through(buf, data) catch 2
+    acc = acc + (byte_buffer_write_string_utf8(buf, "xyz") catch 1)
+    acc = acc + byte_buffer_write(buf, data).unwrap_or(4)
+    local := byte_buffer_write_string_utf8(buf, "q")
+    acc = acc + take(local)
+    acc = acc + take(byte_buffer_write(buf, data))
+    byte_buffer_write_string_utf8(buf, "")
+    if buf != 0:
+        byte_buffer_clear(buf)
+    return acc
+
+fn file_through(h: Int, data: Bytes) -> Int!:
+    return file_write(h, "ab")! + file_write_bytes(h, data)!
+
+fn file_round(h: Int, data: Bytes) -> Int:
+    mut acc := file_through(h, data) catch 2
+    acc = acc + (file_write(h, "xyz") catch 1)
+    acc = acc + file_write_bytes(h, data).unwrap_or(4)
+    local := file_write(h, "q")
+    acc = acc + take(local)
+    acc = acc + take(file_write_bytes(h, data))
+    file_write(h, "")
+    return acc
+
+# the socket and process writes on a closed handle: their failure builds the
+# same message the file writes do, through their own entry points.
+fn stream_round(fd: Int, child: Int, data: Bytes) -> Int:
+    mut acc := tcp_write(fd, "ab") catch 2
+    acc = acc + tcp_write_bytes(fd, data).unwrap_or(4)
+    acc = acc + take(tcp_write(fd, "q"))
+    acc = acc + (process_write(child, "ab") catch 1)
+    local := process_write_bytes(child, data)
+    acc = acc + take(local)
+    return acc
+
+fn shape(s: Int, i: Int, buf: Int, sink: Int, closed: Int, child: Int, data: Bytes) -> Int:
+    if s == 1:
+        return int_round((i % 1000).to_string())
+    if s == 2:
+        return int_round("x" + (i % 1000).to_string())
+    if s == 3:
+        return float_round((i % 1000).to_string() + ".5")
+    if s == 4:
+        return float_round((i % 1000).to_string() + ".5.")
+    if s == 5:
+        return buffer_round(buf, data)
+    if s == 6:
+        return buffer_round(0, data)
+    if s == 7:
+        return file_round(sink, data)
+    if s == 8:
+        return file_round(closed, data)
+    return stream_round(0 - 1, child, data)
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    buf := byte_buffer_new()
+    sink := file_open_write("/dev/null") catch -1
+    closed := file_open_write("/dev/null") catch -1
+    file_close(closed)
+    child := process_spawn("true") catch -1
+    process_close(child)
+    data := bytes.from_string_utf8("abcdef")
+    mut acc := 0
+    mut i := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i, buf, sink, closed, child, data)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    file_close(sink)
+    byte_buffer_free(buf)
+    kb := probe.peak_kb()
+    print("{kb}")

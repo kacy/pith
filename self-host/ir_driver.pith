@@ -282,12 +282,20 @@ fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String
             out = inject_imported_init_calls(out, imported_init_funcs)
     return out.join(chr(10))
 
-fn builtin_retkind(name: String) -> String:
-    if name == "parse_int" or name == "parse_float":
-        return "tuple"
-    # the byte-count writes build their result box in the runtime (#1153)
+# the ok payload kind of a builtin that returns its result as the
+# (flag, payload) register pair, or "" for any other name: the parsers and
+# the byte-count writes (#1153, #1162). such a builtin is reached only by
+# rcall, whose payload kind has to be this one.
+fn pair_builtin_payload_kind(name: String) -> String:
+    if name == "parse_int":
+        return "int"
+    if name == "parse_float":
+        return "float"
     if name == "tcp_write" or name == "tcp_write_bytes" or name == "process_write" or name == "process_write_bytes" or name == "file_write" or name == "file_write_bytes" or name == "byte_buffer_write" or name == "byte_buffer_write_string_utf8":
-        return "tuple"
+        return "int"
+    return ""
+
+fn builtin_retkind(name: String) -> String:
     if name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append":
         return "result_int"
     if name == "write_file" or name == "append_file":
@@ -325,16 +333,43 @@ fn validate_declared_func_retkind(line_no: Int, parts: List[String], struct_name
         ir_contract_error(line_no, "function '" + parts[1] + "' is defined more than once")
     func_kinds.insert(parts[1], retkind)
 
-fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[String, Bool]):
+fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[String, Bool], func_kinds: Map[String, String]):
     if parts.len() < 5 or parts[0] != "call":
         return
     callee := parts[2]
     retkind := parts[3]
     if is_bare_declared_retkind(retkind, struct_names):
         ir_contract_error(line_no, "bare or unknown call retkind '" + retkind + "' for " + callee)
+    if func_kinds.contains_key(callee):
+        callee_kind := func_kinds[callee]
+        if callee_kind == "result_reg" or callee_kind == "result_reg_f":
+            ir_contract_error(line_no, "call to " + callee + ", which returns a register pair: it must be an rcall")
+        return
+    if pair_builtin_payload_kind(callee).len() > 0:
+        ir_contract_error(line_no, "call to builtin " + callee + ", which returns a register pair: it must be an rcall")
     builtin_kind := builtin_retkind(callee)
     if builtin_kind.len() > 0 and builtin_kind != retkind:
         ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
+
+# `rcall FLAG VAL FNAME PAYLOAD_KIND NARGS ARG...` must name a function that
+# returns the register pair: a declared result_reg / result_reg_f function,
+# or a pair builtin whose payload kind the line repeats. anything else would
+# read a second return register the callee never wrote.
+fn validate_rcall_contract(line_no: Int, parts: List[String], func_kinds: Map[String, String]):
+    if parts.len() < 6 or parts[0] != "rcall":
+        return
+    callee := parts[3]
+    payload_kind := parts[4]
+    if func_kinds.contains_key(callee):
+        callee_kind := func_kinds[callee]
+        if callee_kind != "result_reg" and callee_kind != "result_reg_f":
+            ir_contract_error(line_no, "rcall to " + callee + ", whose retkind '" + callee_kind + "' returns no register pair")
+        return
+    builtin_kind := pair_builtin_payload_kind(callee)
+    if builtin_kind.len() == 0:
+        ir_contract_error(line_no, "rcall to " + callee + ", which is neither a declared pair function nor a pair builtin")
+    if builtin_kind != payload_kind:
+        ir_contract_error(line_no, "rcall payload kind '" + payload_kind + "' does not match '" + builtin_kind + "' for " + callee)
 
 fn is_numeric_token(text: String) -> Bool:
     if text.len() == 0:
@@ -395,11 +430,12 @@ fn validate_combined_ir_contract(ir: String):
 
     line_no = 1
     for line in lines:
-        if not line.starts_with("call ") and not line.starts_with("field ") and not line.starts_with("strref "):
+        if not line.starts_with("call ") and not line.starts_with("rcall ") and not line.starts_with("field ") and not line.starts_with("strref "):
             line_no = line_no + 1
             continue
         parts := line.split(" ")
-        validate_call_retkind(line_no, parts, struct_names)
+        validate_call_retkind(line_no, parts, struct_names, func_kinds)
+        validate_rcall_contract(line_no, parts, func_kinds)
         validate_field_contract(line_no, line, parts)
         validate_strref_contract(line_no, parts, string_names)
         line_no = line_no + 1

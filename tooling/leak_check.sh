@@ -59,6 +59,15 @@ cases=(
   tests/leaks/leak_discarded_container
   tests/leaks/leak_generic_builtin_result
   tests/leaks/leak_write_result_box
+  "tests/leaks/leak_runtime_result_pair SHAPE=1"
+  "tests/leaks/leak_runtime_result_pair SHAPE=2"
+  "tests/leaks/leak_runtime_result_pair SHAPE=3"
+  "tests/leaks/leak_runtime_result_pair SHAPE=4"
+  "tests/leaks/leak_runtime_result_pair SHAPE=5"
+  "tests/leaks/leak_runtime_result_pair SHAPE=6"
+  "tests/leaks/leak_runtime_result_pair SHAPE=7"
+  "tests/leaks/leak_runtime_result_pair SHAPE=8"
+  "tests/leaks/leak_runtime_result_pair SHAPE=9"
   tests/leaks/leak_sort_engine
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let

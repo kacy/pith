@@ -18,7 +18,7 @@
 
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::fd_handle::{self, FdKind, Guard};
-use crate::ffi_util::{cstr_bytes, write_result};
+use crate::ffi_util::{cstr_bytes, write_result, ResultPair};
 use crate::fdio;
 use crate::handle_registry::{is_valid_id, HandleKind};
 use crate::process::{process_handles, Pipe};
@@ -130,11 +130,11 @@ pub unsafe extern "C" fn pith_process_read_err_bytes(handle: i64, max_bytes: i64
     read_as_bytes(handle, Pipe::Stderr, max_bytes)
 }
 
-/// one write of a string's bytes to a child's stdin, as a result box holding
+/// one write of a string's bytes to a child's stdin, as a result pair holding
 /// the count (`0` for an empty string, which is a success) or the failure's
 /// reason. the bytes go out as they are, valid utf-8 or not.
 #[no_mangle]
-pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> ResultPair {
     let outcome = match cstr_bytes(data) {
         Some(text) => write_stdin(handle, text),
         None => Err("invalid string".to_string()),
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64
 
 /// the `Bytes` form of `pith_process_write`.
 #[no_mangle]
-pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> ResultPair {
     let outcome = match pith_bytes_ref(data) {
         Some(bytes) => write_stdin(handle, &bytes.data),
         None => Err("invalid bytes value".to_string()),

@@ -1,4 +1,10 @@
 # key|symbol|params|returns
+#
+# returns is empty (void), one type, or `I64,I64`: a fallible builtin that
+# hands back its (is_ok, payload) pair in two registers, the payload being the
+# ok value or an owned error string. the runtime returns a `#[repr(C)]` struct
+# of two i64s (`ffi_util::ResultPair`), and the ir reaches these only through
+# `rcall`; a plain `call` to one is a consumer error. see docs/ir-contract.md.
 pith_string_new|pith_string_new|I64,I64|I64
 pith_runtime_error|pith_runtime_error|I64|I64
 pith_concat_cstr|pith_concat_cstr|I64,I64|I64
@@ -194,10 +200,10 @@ pith_json_fill_struct_nested|pith_json_fill_struct_nested|I64,I64,I64,I64|I64
 pith_json_fill_struct_lists|pith_json_fill_struct_lists|I64,I64,I64,I64,I64,I64|I64
 byte_buffer_new|pith_byte_buffer_new||I64
 byte_buffer_with_capacity|pith_byte_buffer_with_capacity|I64|I64
-byte_buffer_write|pith_byte_buffer_write|I64,I64|I64
+byte_buffer_write|pith_byte_buffer_write|I64,I64|I64,I64
 byte_buffer_free|pith_byte_buffer_free|I64|
 byte_buffer_take_bytes|pith_byte_buffer_take_bytes|I64|I64
-byte_buffer_write_string_utf8|pith_byte_buffer_write_string_utf8|I64,I64|I64
+byte_buffer_write_string_utf8|pith_byte_buffer_write_string_utf8|I64,I64|I64,I64
 byte_buffer_write_byte|pith_byte_buffer_write_byte|I64,I64|I64
 byte_buffer_copy_within|pith_byte_buffer_copy_within|I64,I64,I64|I64
 bytes_read_word|pith_bytes_read_word|I64,I64,I64|I64
@@ -245,9 +251,9 @@ file_open_read|pith_file_open_read|I64|I64
 file_open_write|pith_file_open_write|I64|I64
 file_open_append|pith_file_open_append|I64|I64
 file_read|pith_file_read|I64,I64|I64
-file_write|pith_file_write|I64,I64|I64
+file_write|pith_file_write|I64,I64|I64,I64
 file_read_bytes|pith_file_read_bytes|I64,I64|I64
-file_write_bytes|pith_file_write_bytes|I64,I64|I64
+file_write_bytes|pith_file_write_bytes|I64,I64|I64,I64
 file_close|pith_file_close|I64|
 exit|pith_exit|I64|
 sleep|pith_sleep|I64|
@@ -344,8 +350,8 @@ pith_int_to_float|pith_int_to_float|I64|F64
 pith_float_to_int|pith_float_to_int|F64|I64
 float_from_bits|pith_float_from_bits|I64|F64
 float_to_bits|pith_float_to_bits|F64|I64
-parse_int|pith_parse_int|I64|I64
-parse_float|pith_parse_float|I64|I64
+parse_int|pith_parse_int|I64|I64,I64
+parse_float|pith_parse_float|I64|I64,I64
 b64_encode|pith_b64_encode|I64|I64
 encode|pith_b64_encode|I64|I64
 pith_hex_encode|pith_hex_encode|I64|I64
@@ -384,17 +390,17 @@ list_slice_copy|pith_list_slice_copy|I64,I64,I64|I64
 second|pith_second|I64,I64|I64
 process_read|pith_process_read|I64,I64|I64
 process_read_err|pith_process_read_err|I64,I64|I64
-process_write|pith_process_write|I64,I64|I64
+process_write|pith_process_write|I64,I64|I64,I64
 process_read_bytes|pith_process_read_bytes|I64,I64|I64
 process_read_err_bytes|pith_process_read_err_bytes|I64,I64|I64
-process_write_bytes|pith_process_write_bytes|I64,I64|I64
+process_write_bytes|pith_process_write_bytes|I64,I64|I64,I64
 tcp_listen|pith_tcp_listen|I64,I64|I64
 tcp_connect|pith_tcp_connect|I64,I64|I64
 tcp_accept|pith_tcp_accept|I64|I64
 tcp_read|pith_tcp_read|I64|I64
-tcp_write|pith_tcp_write|I64,I64|I64
+tcp_write|pith_tcp_write|I64,I64|I64,I64
 tcp_read_bytes|pith_tcp_read_bytes|I64,I64|I64
-tcp_write_bytes|pith_tcp_write_bytes|I64,I64|I64
+tcp_write_bytes|pith_tcp_write_bytes|I64,I64|I64,I64
 tcp_wait_readable|pith_tcp_wait_readable|I64,I64|I64
 tcp_wait_writable|pith_tcp_wait_writable|I64,I64|I64
 tcp_close|pith_tcp_close|I64|

@@ -2,7 +2,7 @@ use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fd_handle::{self, FdKind, Guard};
 use crate::fdio;
-use crate::ffi_util::{cstr_bytes, cstr_str, cstr_str_or_empty, write_result};
+use crate::ffi_util::{cstr_bytes, cstr_str, cstr_str_or_empty, write_result, ResultPair};
 use crate::netpoll;
 use std::os::unix::io::RawFd;
 
@@ -407,12 +407,12 @@ pub extern "C" fn pith_tcp_wait_writable(conn: i64, timeout_ms: i64) -> i64 {
     wait_handle(conn, false, timeout_ms)
 }
 
-/// one write of a string's bytes to a connection, as a result box holding the
+/// one write of a string's bytes to a connection, as a result pair holding the
 /// count (`0` for an empty string, which is a success) or the failure's
 /// reason. the bytes go out as they are: a string that is not valid utf-8 is
 /// still the bytes the caller asked to send.
 #[no_mangle]
-pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> ResultPair {
     let outcome = match cstr_bytes(data) {
         Some(text) => socket_write(conn_fd, text),
         None => Err("invalid string".to_string()),
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
 
 /// the `Bytes` form of `pith_tcp_write`.
 #[no_mangle]
-pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> ResultPair {
     let outcome = match pith_bytes_ref(data) {
         Some(bytes) => socket_write(conn_fd, &bytes.data),
         None => Err("invalid bytes value".to_string()),

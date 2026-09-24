@@ -110,10 +110,17 @@ functions, struct construction, and void calls. `RETKIND` names how to treat the
 result (see the type vocabulary). a void call is a `call` with a `void` retkind
 whose result register is simply never read — there is no separate `callv`.
 
-`rcall` is the register-result form. it calls a function whose retkind is
-`result_reg` or `result_reg_f` and lands the two returned values in two
-registers: `FLAG_REG` takes the ok flag, `VAL_REG` the payload, interpreted as
-`PAYLOAD_KIND`.
+`rcall` is the register-result form. it calls a function that returns an
+`(is_ok, payload)` pair and lands the two values in two registers: `FLAG_REG`
+takes the ok flag, `VAL_REG` the payload, interpreted as `PAYLOAD_KIND`. the
+callee is either a declared function whose retkind is `result_reg` or
+`result_reg_f`, or a runtime builtin whose row in `runtime_functions.txt`
+returns `I64,I64` (see the result encoding below). a `float` payload from a
+runtime builtin arrives as the f64's bits in the second integer word, where a
+`result_reg_f` function returns an actual f64; the consumer handles both. a
+plain `call` to a pair-returning callee is a consumer error, as is an `rcall`
+to anything else, and `ir_driver --validate` rejects both before the consumer
+sees them.
 
 **memory and fields**
 
@@ -189,7 +196,9 @@ float math is needed. returns are i64 too, except for the register-result abi.
 a function whose retkind is `result_reg` returns two values, `(is_ok: i64,
 payload: i64)`; `result_reg_f` returns `(is_ok: i64, payload: f64)`. everything
 else returns a single i64. `push_return_types` in the consumer is the authority,
-and `RETTYPE` does drive the machine signature for those two kinds.
+and `RETTYPE` does drive the machine signature for those two kinds. the runtime
+builtins that return the same pair take their signature from their table row
+instead (see the result encoding below).
 
 **result encoding.** `result_int` and `result_bool` use a zero sentinel for the
 error case: a real value `v` is carried as `v + 1`, and `0` means "error". the
@@ -198,13 +207,30 @@ function that can fail returns 0 for failure and its real (nonnegative) value
 plus one otherwise.
 
 the sentinel only works for a builtin whose success can never be a raw 0. one
-whose success can be 0 builds the three-slot result box `[is_ok, ok, err]`
-itself and takes the `tuple` retkind, so the error carries the runtime's own
-message: `parse_int`, `parse_float` (#1140), and the byte-count writes
-`file_write`, `file_write_bytes`, `tcp_write`, `tcp_write_bytes`,
-`process_write`, `process_write_bytes`, `byte_buffer_write` and
-`byte_buffer_write_string_utf8`, where an empty write is a success of 0 (#1153).
-`ir_builtin_result_retkind` in `ir_metadata.pith` is the list.
+whose success can be 0 returns the `(is_ok, payload)` pair in two registers
+instead, reached by `rcall`, so the error carries the runtime's own message:
+`parse_int`, `parse_float` (#1140), and the byte-count writes `file_write`,
+`file_write_bytes`, `tcp_write`, `tcp_write_bytes`, `process_write`,
+`process_write_bytes`, `byte_buffer_write` and `byte_buffer_write_string_utf8`,
+where an empty write is a success of 0 (#1153). the payload is the ok value
+(a float as its bits) when `is_ok` is 1, and an owned error string when it is
+0; the caller releases that string on its error arm. `ir_builtin_result_retkind`
+in `ir_metadata.pith` is the list, and names them `tuple` because that is the
+kind of the box a call site folds the pair into wherever it keeps the result
+whole (a bound local, an argument, a field read). a call site that consumes
+the pair on the spot (`!`, `catch`, a `catch:` block, `unwrap_or`, a pair
+return) builds no box at all (#1162).
+
+the runtime side is a `#[repr(C)]` struct of two `i64`s
+(`ffi_util::ResultPair`). every supported target returns such a struct in two
+integer registers, and they are the registers a Cranelift signature with two
+`I64` returns reads: `rax:rdx` under the x86-64 System V ABI, and `x0:x1`
+under AAPCS64 on linux and Apple's aarch64 variant on macOS. that is also why
+a float payload travels as bits: AAPCS64 returns a mixed `{i64, f64}` struct
+in `x0:x1`, where a Cranelift `(I64, F64)` signature would read `x0` and `v0`.
+Windows x64 returns a 16-byte struct through a hidden pointer, so
+`runtime_imports.rs` refuses to declare a pair-returning runtime function under
+any calling convention other than System V or Apple aarch64.
 
 **struct construction.** a struct is built with an ordinary call whose function
 name is a declared struct: `call REG StructName NFIELDS f0 f1 ...`. the consumer
@@ -214,7 +240,9 @@ instruction — the struct declaration is what makes the call special.
 
 **runtime functions.** the set of runtime functions and their machine signatures
 lives in `cranelift/runtime-abi/runtime_functions.txt`, one
-`key | symbol | params | returns` row each. `cranelift/codegen/build.rs`
+`key | symbol | params | returns` row each. `returns` is empty (void), one
+type, or `I64,I64` for a builtin that returns the result pair above; `build.rs`
+rejects any other multi-value return. `cranelift/codegen/build.rs`
 turns that file into the import table the consumer declares. the emitter has its
 own, separate notion of which runtime calls exist and what kind they return
 (`ir_builtin_result_retkind`, `ir_method_tables`) — the two are not yet a single

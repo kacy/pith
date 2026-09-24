@@ -85,6 +85,10 @@ buf.reset()
 
 `reset()` is just a clearer alias for `clear()`.
 
+`write` and `write_string_utf8` return the number of bytes appended, so
+appending an empty value succeeds and returns 0. text built piece by piece, such
+as a blank header value or an empty field, needs no guard around the write.
+
 ## practical rule
 
 if data came from a file, socket, process, or protocol layer, keep it as

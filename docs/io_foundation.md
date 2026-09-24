@@ -87,6 +87,18 @@ handle the count yourself. the same pair exists at every level:
   write by construction; `Conn.write_all_bytes` is the loop
 - the buffered writers flush through `write_all`, so they are already correct
 
+an empty write is a success that returns 0, at every level and on every
+target: a socket, a file, a child's stdin, a byte buffer. it makes no syscall,
+so it cannot tell you whether the peer is still there, but it still fails on a
+handle that was never opened or has been closed. a write that fails carries the
+reason in its error: `tcp_write failed: Broken pipe (os error 32)` for a peer
+that hung up, `file_write failed: Bad file descriptor (os error 9)` for a file
+opened for reading, `file_write failed: invalid or closed file handle` for a
+closed one. the `<name> failed: ` prefix names the builtin underneath. before
+#1153 an empty write came back as an error with no reason attached. the
+`write_all` loops stop on a write that accepts nothing, and a non-empty write
+never returns 0 without an error, so they still end when the reader is gone.
+
 one subtlety the loop has to get right: the resume runs on **bytes**, never on
 text. a send buffer fills at whatever byte offset it fills at, and that offset
 can be in the middle of a multi-byte character. a `String` cannot be cut there —

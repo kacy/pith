@@ -1,0 +1,137 @@
+# a name bound under different kinds at different sites is a kinded local:
+# every binding site records the kind of the count it took, a rebind releases
+# the outgoing value under that kind, and the exit cleanup releases what the
+# last binding on the path taken left in the slot. each function below hands
+# something out of such a binding, or borrows through one, and everything is
+# printed only after the function has returned, so a release under the wrong
+# kind or a release too many shows up here as wrong output (and under
+# valgrind as an invalid read) rather than passing quietly.
+import std.bytes as bytes
+
+struct Pair:
+    left: String
+    right: Int
+
+enum Token:
+    Word(String)
+    Count(Int)
+    Parts(List[String])
+
+# the String binding is returned, so the caller holds the only count.
+fn text_or_len(i: Int) -> String:
+    if i % 2 == 0:
+        v := "fresh-" + i.to_string()
+        return v
+    v := i + 1
+    return "int-{v}"
+
+# a borrowed element under the kinded name: returned, and the list keeps its
+# own count on it.
+fn borrowed_or_int(items: List[String], i: Int) -> String:
+    if i % 2 == 0:
+        v := items[i % items.len()]
+        return v
+    v := i * 10
+    return "int-{v}"
+
+# a List in one branch and a Bytes in the other, each read after return
+# through what it was copied into.
+fn list_or_bytes(i: Int) -> List[String]:
+    mut out_names: List[String] := []
+    if i % 2 == 0:
+        out := ["a-{i}", "b-{i}"]
+        for s in out:
+            out_names.push(s)
+    else:
+        out := bytes.from_string_utf8("bytes-{i}")
+        out_names.push("bytes len {out.len()}")
+    return out_names
+
+# a struct stored into a caller's list from under the kinded name.
+fn keep_struct(keep: List[Pair], i: Int) -> Int:
+    if i % 2 == 0:
+        v := Pair(left: "left-{i}", right: i)
+        keep.push(v)
+        return v.right
+    v := "right-{i}"
+    return v.len()
+
+# rebound across kinds inside a loop body; the last String is returned.
+fn loop_rebind(n: Int) -> String:
+    mut last := ""
+    mut k := 0
+    while k < n:
+        if k % 2 == 0:
+            v := "loop-{k}"
+            last = v
+        else:
+            v := [k, k + 1]
+            last = last + "+{v.len()}"
+        k = k + 1
+    return last
+
+# three arms of a match binding the name under three kinds, the payload
+# handed out of the one that holds a string or a list.
+fn three_arms(t: Token) -> String:
+    match t:
+        Token.Word(x) =>
+            return x
+        Token.Count(x) =>
+            return "count {x}"
+        Token.Parts(x) =>
+            return x[0]
+
+# the shape inside a generic body: T is a String in one instance and an Int
+# in the other.
+fn generic_pick[T](x: T, i: Int) -> String:
+    if i % 2 == 0:
+        v := "generic-" + i.to_string()
+        return v
+    v := x
+    return "{v}"
+
+# a name bound from a kinded source: the copy takes the kind the checker
+# gives this read, not the source's first binding's.
+fn chained(i: Int) -> String:
+    if i % 2 == 0:
+        v := i + 5
+        return "int {v}"
+    v := "chained-{i}"
+    w := v
+    return w
+
+fn main():
+    mut got: List[String] := []
+    items := ["one", "two", "three"]
+    mut i := 0
+    while i < 4:
+        got.push(text_or_len(i))
+        got.push(borrowed_or_int(items, i))
+        for s in list_or_bytes(i):
+            got.push(s)
+        got.push(generic_pick("str-{i}", i))
+        got.push(generic_pick(i, i))
+        got.push(chained(i))
+        i = i + 1
+    mut keep: List[Pair] := []
+    mut total := 0
+    i = 0
+    while i < 4:
+        total = total + keep_struct(keep, i)
+        i = i + 1
+    got.push(loop_rebind(5))
+    tokens := [Token.Word("word"), Token.Count(3), Token.Parts(["p", "q"])]
+    for t in tokens:
+        got.push(three_arms(t))
+    for s in got:
+        print(s)
+    for p in keep:
+        print("{p.left} {p.right}")
+    print("total {total}")
+    print(items.join(","))
+    match tokens[0]:
+        Token.Word(w) => print("word still {w}")
+        _ => print("other")
+    match tokens[2]:
+        Token.Parts(ps) => print("parts still {ps.join(",")}")
+        _ => print("other")

@@ -77,14 +77,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   of it. reading the global and then binding a local of the same name in one
   function asks for both and is E266 rather than a guess. `pith lint` mentions
   the shadowing itself as E308.
-- **a local bound to different kinds in sibling branches is never
-  released** — `v := "a" + s` in one branch and `v := n + 1` in another
-  binds one name to a heap value and to an int, and the emitter's exit
-  cleanup tracks a name under exactly one kind, so it drops such a name from
-  cleanup rather than release it wrongly. the heap binding then keeps its
-  count: a fresh string, list or struct bound that way leaks once per call
-  (#1137). give the two bindings different names. std.json and std.toml had
-  this shape in their parsers (#1108).
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

@@ -26,7 +26,7 @@
 use crate::blocking::{self, Pool};
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::collections::list::{pith_list_new, pith_list_push_value};
-use crate::ffi_util::{cstr_bytes, cstr_str};
+use crate::ffi_util::{cstr_bytes, cstr_str, write_result};
 use crate::runtime_core::optional_tuple;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -105,15 +105,28 @@ fn chunk_size(max_bytes: i64) -> usize {
 }
 
 /// write once, returning the bytes accepted. a short write is reported as it
-/// happened; the caller loops.
-fn write_chunk(file: &mut File, data: &[u8]) -> i64 {
+/// happened; the caller loops. a failure is the os's description of it
+/// (`Bad file descriptor (os error 9)` for a handle opened for reading).
+fn write_chunk(file: &mut File, data: &[u8]) -> FileWrite {
     use std::io::Write;
 
-    match file.write(data) {
-        Ok(n) => n as i64,
-        Err(_) => 0,
+    FileWrite(file.write(data).map_err(|err| err.to_string()))
+}
+
+/// the outcome of one file write, which may come back from a pool thread.
+/// `blocking::run` reports a job that panicked as the default, so the default
+/// is a failure with a reason of its own rather than a count.
+struct FileWrite(Result<usize, String>);
+
+impl Default for FileWrite {
+    fn default() -> Self {
+        FileWrite(Err("the write did not complete".to_string()))
     }
 }
+
+/// the reason a write names when its handle is not in the table: never
+/// opened, or closed since.
+const UNKNOWN_FILE_HANDLE: &str = "invalid or closed file handle";
 
 unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
     let Some(path_str) = cstr_str(path) else {
@@ -399,22 +412,31 @@ fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
     blocking::run(&POOL, move || read_chunk(&mut file, size))
 }
 
-/// write one chunk to an open handle, returning the bytes accepted. zero covers
-/// an unknown handle, a failed write, and a genuinely empty one alike, as
-/// before.
-fn write_handle_chunk(handle: i64, data: &[u8]) -> i64 {
+/// write one chunk to an open handle, on a pool thread when there is a worker
+/// to protect. returns the bytes accepted, `Ok(0)` for an empty chunk, or the
+/// reason the write failed: an unknown or closed handle, or the os error. an
+/// empty chunk makes no syscall on either path, so it succeeds on any open
+/// handle, one opened for reading included, as an empty pipe or socket write
+/// does.
+fn write_handle_chunk(handle: i64, data: &[u8]) -> Result<usize, String> {
     if !blocking::offloads() {
         let mut handles = file_handles().lock();
         let Some(file) = handles.get_mut(&handle) else {
-            return 0;
+            return Err(UNKNOWN_FILE_HANDLE.to_string());
         };
-        return write_chunk(file, data);
+        if data.is_empty() {
+            return Ok(0);
+        }
+        return write_chunk(file, data).0;
     }
-    let Some(mut file) = clone_file(handle) else {
-        return 0;
+    let cloned = match file_handles().lock().get(&handle) {
+        Some(_) if data.is_empty() => return Ok(0),
+        Some(file) => file.try_clone(),
+        None => return Err(UNKNOWN_FILE_HANDLE.to_string()),
     };
+    let mut file = cloned.map_err(|err| err.to_string())?;
     let data = data.to_vec();
-    blocking::run(&POOL, move || write_chunk(&mut file, &data))
+    blocking::run(&POOL, move || write_chunk(&mut file, &data)).0
 }
 
 #[no_mangle]
@@ -436,20 +458,26 @@ pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i6
     }
 }
 
+/// one write of a string's bytes to an open file, as a result box holding the
+/// count (`0` for an empty string, which is a success) or the failure's
+/// reason.
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> i64 {
-    let Some(bytes) = cstr_bytes(data) else {
-        return 0;
+    let outcome = match cstr_bytes(data) {
+        Some(bytes) => write_handle_chunk(handle, bytes),
+        None => Err("invalid string".to_string()),
     };
-    write_handle_chunk(handle, bytes)
+    write_result("file_write", outcome)
 }
 
+/// the `Bytes` form of `pith_file_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_write_bytes(handle: i64, data: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return 0;
+    let outcome = match pith_bytes_ref(data) {
+        Some(bytes) => write_handle_chunk(handle, &bytes.data),
+        None => Err("invalid bytes value".to_string()),
     };
-    write_handle_chunk(handle, &bytes.data)
+    write_result("file_write_bytes", outcome)
 }
 
 #[no_mangle]
@@ -603,6 +631,7 @@ pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi_util::unbox_result;
     use std::ffi::CString;
     use std::io::Read;
     use std::sync::atomic::AtomicU32;
@@ -698,7 +727,7 @@ mod tests {
             let out = pith_file_open_append(path.as_ptr());
             assert_ne!(out, 0);
             let chunk = cstring("abcdef");
-            assert_eq!(pith_file_write(out, chunk.as_ptr()), 6);
+            assert_eq!(unbox_result(pith_file_write(out, chunk.as_ptr())), Ok(6));
             pith_file_close(out);
 
             let input = pith_file_open_read(path.as_ptr());
@@ -731,9 +760,50 @@ mod tests {
             assert!(pith_file_read(9_999_999, 16).is_null());
             assert_eq!(pith_file_read_bytes(9_999_999, 16), 0);
             let data = cstring("x");
-            assert_eq!(pith_file_write(9_999_999, data.as_ptr()), 0);
+            assert_eq!(
+                unbox_result(pith_file_write(9_999_999, data.as_ptr())),
+                Err("file_write failed: invalid or closed file handle".to_string())
+            );
         }
         assert!(clone_file(9_999_999).is_none());
+    }
+
+    /// an empty write succeeds with a count of 0, where it used to share that
+    /// return value with every failure (#1153), and a failed write names the
+    /// os error.
+    #[test]
+    fn an_empty_write_succeeds_and_a_failed_one_names_the_error() {
+        let scratch = Scratch::new("empty-write");
+        let path = scratch.cstr();
+        unsafe {
+            let out = pith_file_open_write(path.as_ptr());
+            assert_ne!(out, 0);
+            let empty = cstring("");
+            assert_eq!(unbox_result(pith_file_write(out, empty.as_ptr())), Ok(0));
+            pith_file_close(out);
+            assert_eq!(
+                unbox_result(pith_file_write(out, empty.as_ptr())),
+                Err("file_write failed: invalid or closed file handle".to_string())
+            );
+
+            let input = pith_file_open_read(path.as_ptr());
+            assert_ne!(input, 0);
+            let data = cstring("x");
+            assert_eq!(unbox_result(pith_file_write(input, empty.as_ptr())), Ok(0));
+            assert_eq!(
+                unbox_result(pith_file_write(input, data.as_ptr())),
+                Err("file_write failed: Bad file descriptor (os error 9)".to_string())
+            );
+            pith_file_close(input);
+
+            let full = pith_file_open_write(c"/dev/full".as_ptr());
+            assert_ne!(full, 0);
+            assert_eq!(
+                unbox_result(pith_file_write(full, data.as_ptr())),
+                Err("file_write failed: No space left on device (os error 28)".to_string())
+            );
+            pith_file_close(full);
+        }
     }
 
     #[test]

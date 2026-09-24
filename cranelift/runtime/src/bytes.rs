@@ -1,3 +1,4 @@
+use crate::ffi_util::{cstr_bytes, write_result};
 use std::io::Read;
 
 #[repr(C)]
@@ -339,35 +340,35 @@ pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
     ptr as i64
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> i64 {
+/// append `bytes` to the buffer behind `handle`, returning the count appended
+/// (`0` for an empty slice, which is a success). the buffer handle is checked
+/// first, so an invalid one is what a call with two bad arguments reports.
+unsafe fn append_to_buffer(handle: i64, bytes: Option<&[u8]>, what: &str) -> Result<usize, String> {
     let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
+        return Err("invalid buffer handle".to_string());
     };
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return 0;
+    let Some(bytes) = bytes else {
+        return Err(format!("invalid {what}"));
     };
-    crate::perf_stats!(
-        PERF_BYTE_BUFFER_WRITES += 1,
-        PERF_BYTE_BUFFER_WRITE_BYTES += bytes.data.len(),
-    );
-    buffer.data.extend_from_slice(&bytes.data);
-    bytes.data.len() as i64
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
-    if s.is_null() {
-        return 0;
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let bytes = std::slice::from_raw_parts(s as *const u8, len);
     crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += bytes.len());
     buffer.data.extend_from_slice(bytes);
-    bytes.len() as i64
+    Ok(bytes.len())
+}
+
+/// append a `Bytes` value to a buffer, as a result box holding the count or
+/// the failure's reason: an invalid buffer handle or an invalid bytes value.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> i64 {
+    let bytes = pith_bytes_ref(data).map(|bytes| bytes.data.as_slice());
+    write_result("byte_buffer_write", append_to_buffer(handle, bytes, "bytes value"))
+}
+
+/// append a string's bytes to a buffer, as a result box holding the count or
+/// the failure's reason: an invalid buffer handle or an invalid string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> i64 {
+    let outcome = append_to_buffer(handle, cstr_bytes(s), "string");
+    write_result("byte_buffer_write_string_utf8", outcome)
 }
 
 #[no_mangle]
@@ -606,6 +607,7 @@ pub unsafe extern "C" fn pith_byte_buffer_clear(handle: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi_util::unbox_result;
 
     #[test]
     fn constant_time_eq_fails_closed_on_invalid_handles() {
@@ -683,20 +685,58 @@ mod tests {
         }
     }
 
+    /// an empty append succeeds with a count of 0, where it used to share
+    /// that return value with an invalid handle (#1153).
+    #[test]
+    fn an_empty_append_succeeds_and_an_invalid_handle_is_an_error() {
+        unsafe {
+            let buffer = pith_byte_buffer_new();
+            let empty = pith_bytes_from_vec(Vec::new());
+            assert_eq!(unbox_result(pith_byte_buffer_write(buffer, empty)), Ok(0));
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write_string_utf8(buffer, c"".as_ptr())),
+                Ok(0)
+            );
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write_string_utf8(buffer, c"ab".as_ptr())),
+                Ok(2)
+            );
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write(12345, empty)),
+                Err("byte_buffer_write failed: invalid buffer handle".to_string())
+            );
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write(buffer, 12345)),
+                Err("byte_buffer_write failed: invalid bytes value".to_string())
+            );
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write_string_utf8(0, c"".as_ptr())),
+                Err("byte_buffer_write_string_utf8 failed: invalid buffer handle".to_string())
+            );
+            assert_eq!(
+                unbox_result(pith_byte_buffer_write_string_utf8(buffer, std::ptr::null())),
+                Err("byte_buffer_write_string_utf8 failed: invalid string".to_string())
+            );
+            assert_eq!(pith_byte_buffer_len(buffer), 2);
+            pith_bytes_release(empty);
+            pith_byte_buffer_free(buffer);
+        }
+    }
+
     #[test]
     fn byte_buffer_string_copies_every_byte_verbatim() {
         unsafe {
             let buffer = pith_byte_buffer_new();
             // not utf-8, and a NUL in the middle: the string must carry both
             let raw = pith_bytes_from_vec(vec![0xC8, 0xFF, 0x00, b'z']);
-            assert_eq!(pith_byte_buffer_write(buffer, raw), 4);
+            assert_eq!(unbox_result(pith_byte_buffer_write(buffer, raw)), Ok(4));
             let text = pith_byte_buffer_string(buffer);
             assert_eq!(crate::string::pith_cstring_len(text), 4);
             let copied = std::slice::from_raw_parts(text as *const u8, 4);
             assert_eq!(copied, &[0xC8, 0xFF, 0x00, b'z']);
             // the buffer is untouched and a later write does not reach the copy
             assert_eq!(pith_byte_buffer_len(buffer), 4);
-            assert_eq!(pith_byte_buffer_write(buffer, raw), 4);
+            assert_eq!(unbox_result(pith_byte_buffer_write(buffer, raw)), Ok(4));
             assert_eq!(crate::string::pith_cstring_len(text), 4);
             crate::pith_cstring_release(text);
             pith_bytes_release(raw);

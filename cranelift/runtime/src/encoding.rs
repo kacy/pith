@@ -1,18 +1,7 @@
-unsafe fn alloc_parse_result(is_ok: i64, ok: i64, err: i64) -> i64 {
-    // this matches pith's heap result tuple layout: [is_ok, ok, err].
-    let tuple = crate::pith_struct_alloc(3) as *mut i64;
-    if tuple.is_null() {
-        return 0;
-    }
-    *tuple = is_ok;
-    *tuple.add(1) = ok;
-    *tuple.add(2) = err;
-    tuple as i64
-}
+use crate::ffi_util::{result_err, result_ok};
 
 unsafe fn parse_error(message: &[u8]) -> i64 {
-    let err = crate::pith_copy_bytes_to_cstring(message) as i64;
-    alloc_parse_result(0, 0, err)
+    result_err(message)
 }
 
 /// Parse string to int and return a result tuple pointer.
@@ -73,7 +62,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     } else {
         value as i64
     };
-    alloc_parse_result(1, parsed, 0)
+    result_ok(parsed)
 }
 
 /// Parse a string to a float and return a result tuple pointer, laid out
@@ -116,7 +105,7 @@ pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> i64 {
         }
         return parse_error(b"float out of range");
     }
-    alloc_parse_result(1, value.to_bits() as i64, 0)
+    result_ok(value.to_bits() as i64)
 }
 
 /// Base64 encode a C string — returns newly allocated C string

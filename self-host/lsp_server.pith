@@ -15,7 +15,7 @@
 # fd 1 is the protocol channel, so nothing here may print(): a stray
 # newline corrupts the frame stream.
 
-from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, has_dirty, take_dirty, set_position_encoding
+from lsp_state import lsp_open_document, lsp_change_document, lsp_save_document, lsp_close_document, document_is_open, document_text, has_dirty, take_dirty, set_position_encoding, get_position_encoding, apply_ranged_change
 from lsp_features import run_analysis, syntax_diagnostics, forget_syntax_cost, DEBOUNCE_MS, ensure_analyzed, hover_result, document_symbols, workspace_symbols, code_actions, formatting_edits
 from lsp_navigation import definition_location, references_locations, completion_items, prepare_rename_range, rename_workspace_edit
 from lsp_tokens import semantic_token_legend, semantic_tokens_full, signature_help, inlay_hints
@@ -146,7 +146,12 @@ struct PositionOut:
     character: Int
 
 fn params_position(params: Int) -> PositionOut:
-    position := json.object_get(params, "position")
+    return params_position_at(params, "position")
+
+# the Position object under one key of a json object, with the same
+# defaults as params_position.
+fn params_position_at(obj: Int, key: String) -> PositionOut:
+    position := json.object_get(obj, key)
     mut line := 0
     mut character := 0
     if position >= 0:
@@ -394,9 +399,22 @@ fn handle_did_change(params: Int):
     changes := json.object_get(params, "contentChanges")
     if changes < 0 or json.type_of(changes) != "array" or json.array_len(changes) == 0:
         return
-    # full sync: the last change carries the whole new text
-    change := json.array_get(changes, json.array_len(changes) - 1)
-    text := json.object_get_string_or(change, "text", "")
+    # the server asks for full sync, so each change normally carries the
+    # whole new text. a change with a range is spliced in instead, in
+    # order, through the same position conversion every handler uses.
+    mut text := document_text(uri)
+    mut i := 0
+    while i < json.array_len(changes):
+        change := json.array_get(changes, i)
+        new_text := json.object_get_string_or(change, "text", "")
+        range := json.object_get(change, "range")
+        if range >= 0:
+            start := params_position_at(range, "start")
+            end := params_position_at(range, "end")
+            text = apply_ranged_change(text, start.line, start.character, end.line, end.character, new_text, get_position_encoding())
+        else:
+            text = new_text
+        i = i + 1
     doc := json.object_get(params, "textDocument")
     mut version := 0
     if doc >= 0:

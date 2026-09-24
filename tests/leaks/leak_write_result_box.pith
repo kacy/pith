@@ -1,0 +1,61 @@
+# the byte-count writes return a result box the runtime builds (#1153): on
+# success it holds the count, on failure a message string the box owns. the
+# box and the message are new on both paths, where the old zero sentinel
+# carried a bare register and a static message, so every consumer position
+# is churned here on a success and on a failure: a bound result read by
+# field, `!` through a fallible caller, `catch`, a discarded statement, and a
+# result handed to a function.
+import leakprobe as probe
+import std.bytes as bytes
+
+fn counted(r: Int!) -> Int:
+    if r.is_ok:
+        return r.ok
+    return r.err.len()
+
+fn through_try(buf: Int, h: Int, data: Bytes) -> Int!:
+    return byte_buffer_write(buf, data)! + file_write(h, "ab")! + file_write_bytes(h, data)!
+
+fn churn_round(buf: Int, sink: Int, closed: Int, data: Bytes, empty: Bytes) -> Int:
+    mut acc := 0
+    # success, a bound result read by field
+    r := byte_buffer_write(buf, data)
+    if r.is_ok:
+        acc = acc + r.ok
+    s := byte_buffer_write_string_utf8(buf, "")
+    acc = acc + s.ok
+    # success and failure through `!`
+    acc = acc + (through_try(buf, sink, empty) catch 0)
+    acc = acc + (through_try(buf, closed, data) catch -1)
+    # catch on either path
+    acc = acc + (file_write(sink, "xyz") catch 0)
+    acc = acc + (file_write(closed, "xyz") catch 0)
+    acc = acc + (byte_buffer_write(0, data) catch 0)
+    # a discarded statement
+    file_write_bytes(sink, data)
+    byte_buffer_write_string_utf8(0, "x")
+    # handed to a function, the failure's message read there
+    acc = acc + counted(file_write(closed, ""))
+    acc = acc + counted(byte_buffer_write_string_utf8(buf, "pq"))
+    byte_buffer_clear(buf)
+    return acc
+
+fn main():
+    n := probe.rounds()
+    buf := byte_buffer_new()
+    sink := file_open_write("/dev/null") catch -1
+    closed := file_open_write("/dev/null") catch -1
+    file_close(closed)
+    data := bytes.from_string_utf8("abcdef")
+    empty := bytes.empty()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + churn_round(buf, sink, closed, data, empty)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    file_close(sink)
+    byte_buffer_free(buf)
+    kb := probe.peak_kb()
+    print("{kb}")

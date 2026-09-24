@@ -11,7 +11,8 @@ what `pith check` reports.
   position-encoding negotiation: utf-16 by default, utf-8 when the
   client offers it in `capabilities.general.positionEncodings`.
 - **document sync** — full-text sync (`textDocumentSync: 1`) via
-  didOpen/didChange/didSave/didClose.
+  didOpen/didChange/didSave/didClose. a didChange entry that carries a
+  range anyway is spliced into the text at that range, in order.
 - **publishDiagnostics** — parse, import, and type errors from the real
   checker, published after a 300ms debounce, with a syntax-only fast
   lane publishing parse errors ahead of it. per file: capped at 20,
@@ -120,6 +121,38 @@ the modules:
   completion, rename
 - `self-host/lsp_tokens.pith` — semantic tokens, signature help, and
   inlay hints
+
+### positions and multi-byte text
+
+the server answers `initialize` with `positionEncoding: "utf-16"`, the
+protocol's default unit. when the client lists `utf-8` in
+`capabilities.general.positionEncodings`, the server picks `utf-8`
+instead, and a position's character is then a byte offset within its
+line.
+
+the compiler reports 1-based lines and 1-based byte columns. every
+handler converts between the two through `lsp_state.pith`, and no
+handler computes an lsp character itself. the conversion:
+
+- counts utf-16 code units, so `é`, `€` and `中` are one unit each and
+  `𝄞` is two (a surrogate pair)
+- moves a position that lands inside a character back to that
+  character's start: between the two halves of a surrogate pair in
+  utf-16, or inside a multi-byte sequence in utf-8
+- clamps a character past the end of its line to the line's end, and a
+  line past the end of the document to the last line
+- ends a crlf line before its `\r`
+
+handlers that scan a line byte by byte compare bytes with
+`text_has_at` instead of cutting the line with `substring`. `substring`
+aborts when an offset falls inside a character, so a cut is only made
+at an offset that came from the conversion. without it, an
+inlay-hint request on a line holding a multi-byte character ended the
+server (#1070).
+
+the `multibyte_*` transcript cases cover each handler on lines with 4-,
+3- and 2-byte characters in front of and between the positions they
+use, in both encodings.
 
 ## running it
 

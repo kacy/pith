@@ -18,7 +18,7 @@ from errors import Diagnostic
 from lexer import lex_all
 from formatter import fmt_source
 import std.log as log
-from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count
+from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, open_document_uris, clear_dirty_if, dirty_is, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_line_count, text_has_at
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 import std.json as json
 import std.lsp.protocol as protocol
@@ -595,7 +595,7 @@ pub fn word_starts_at(line_text: String, col: Int, name: String) -> Bool:
     idx := col - 1
     if idx < 0 or name.len() == 0 or idx + name.len() > line_text.len():
         return false
-    if line_text.substring(idx, idx + name.len()) != name:
+    if not text_has_at(line_text, idx, name):
         return false
     if idx > 0 and is_ident_byte(ord(line_text[idx - 1])):
         return false

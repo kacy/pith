@@ -14,6 +14,7 @@
 
 from driver import set_source_overlay, clear_source_overlay
 import std.text.utf16 as utf16
+from std.text import floor_boundary
 
 # open documents keyed by uri, holding the client's current text.
 mut open_docs: Map[String, String] := {}
@@ -102,7 +103,7 @@ pub fn lsp_open_document(uri: String, text: String, version: Int):
     set_source_overlay(uri_to_path(uri), text)
     dirty_uri = uri
 
-## replace a document's text after a full-sync change.
+## replace a document's text after a change.
 pub fn lsp_change_document(uri: String, text: String, version: Int):
     open_docs.insert(uri, text)
     doc_versions.insert(uri, version)
@@ -202,44 +203,55 @@ pub fn text_line(text: String, line0: Int) -> String:
         i = i + 1
     return text.substring(start, text.len())
 
-# character offset within a line to a byte offset, clamped to the line.
+# the byte length of a line's content. a trailing \r from a crlf ending
+# belongs to the line terminator as the protocol counts lines, so no
+# position may point past the content.
+fn line_content_len(line_text: String) -> Int:
+    n := line_text.len()
+    if n > 0 and ord(line_text[n - 1]) == 13:
+        return n - 1
+    return n
+
+# a byte offset within a line, clamped to the line's content and moved
+# back to the start of the character it falls in, so a handler can
+# cut the line at it without splitting a character.
+fn snap_to_character(line_text: String, byte_off: Int) -> Int:
+    end := line_content_len(line_text)
+    if byte_off <= 0:
+        return 0
+    if byte_off >= end:
+        return end
+    return floor_boundary(line_text, byte_off)
+
+# character offset within a line to a byte offset on a character
+# boundary, clamped to the line's content.
 fn character_to_byte(line_text: String, character: Int, mode: String) -> Int:
-    mut ch := character
-    if ch < 0:
-        ch = 0
+    if character <= 0:
+        return 0
     if mode == "utf-8":
-        if ch > line_text.len():
-            return line_text.len()
-        return ch
-    units := utf16.length(line_text)
+        # a utf-8 offset inside a character backs up to its start
+        return snap_to_character(line_text, character)
+    content := line_text.substring(0, line_content_len(line_text))
+    units := utf16.length(content)
+    mut ch := character
     if ch > units:
         ch = units
     # a position landing between the halves of a surrogate pair backs
     # up one unit to the pair's start instead of failing
-    return utf16.to_byte_offset(line_text, ch) catch (utf16.to_byte_offset(line_text, ch - 1) catch line_text.len())
+    return utf16.to_byte_offset(content, ch) catch (utf16.to_byte_offset(content, ch - 1) catch content.len())
 
-# byte offset within a line to a character offset, clamped to the line.
+# byte offset within a line to a character offset, clamped to the
+# line's content. a byte offset inside a multi-byte character counts as
+# the character's start.
 fn byte_to_character(line_text: String, byte_off: Int, mode: String) -> Int:
-    mut b := byte_off
-    if b < 0:
-        b = 0
-    if b > line_text.len():
-        b = line_text.len()
+    b := snap_to_character(line_text, byte_off)
     if mode == "utf-8":
         return b
-    # a byte offset inside a multi-byte character backs up to the
-    # character's start
-    mut ch := 0 - 1
-    while ch < 0 and b >= 0:
-        ch = utf16.from_byte_offset(line_text, b) catch (0 - 1)
-        if ch < 0:
-            b = b - 1
-    if ch < 0:
-        return 0
-    return ch
+    return utf16.from_byte_offset(line_text, b) catch 0
 
 ## an lsp position to the compiler's 1-based line and byte column,
-## clamped into the document.
+## clamped into the document. the column always sits on a character
+## boundary within the line's content.
 pub fn lsp_pos_to_line_col(text: String, line0: Int, character: Int, mode: String) -> PithPos:
     mut l := line0
     if l < 0:
@@ -260,6 +272,51 @@ pub fn line_col_to_lsp_pos(text: String, line1: Int, col1: Int, mode: String) ->
         l = last
     lt := text_line(text, l)
     return LspPos(l, byte_to_character(lt, col1 - 1, mode))
+
+# the byte offset where the 0-based line starts in the whole text, or
+# the text's length when the text has fewer lines.
+fn line_start_offset(text: String, line0: Int) -> Int:
+    if line0 <= 0:
+        return 0
+    mut current := 0
+    mut i := 0
+    while i < text.len():
+        if ord(text[i]) == 10:
+            current = current + 1
+            if current == line0:
+                return i + 1
+        i = i + 1
+    return text.len()
+
+## an lsp position to a byte offset into the whole text, clamped into
+## the document and onto a character boundary.
+pub fn lsp_pos_to_offset(text: String, line0: Int, character: Int, mode: String) -> Int:
+    at := lsp_pos_to_line_col(text, line0, character, mode)
+    return line_start_offset(text, at.line - 1) + at.col - 1
+
+## the text after one ranged contentChanges entry: new_text replaces
+## the span between the two lsp positions. an end before the start is
+## treated as an insertion at the start.
+pub fn apply_ranged_change(text: String, start_line0: Int, start_character: Int, end_line0: Int, end_character: Int, new_text: String, mode: String) -> String:
+    start := lsp_pos_to_offset(text, start_line0, start_character, mode)
+    mut finish := lsp_pos_to_offset(text, end_line0, end_character, mode)
+    if finish < start:
+        finish = start
+    return text.substring(0, start) + new_text + text.substring(finish, text.len())
+
+## whether word occurs in line_text starting at byte offset at. the
+## comparison runs byte by byte and never cuts the line, so a scan may
+## try every byte offset, including ones inside a multi-byte character,
+## where a substring would abort.
+pub fn text_has_at(line_text: String, at: Int, word: String) -> Bool:
+    if at < 0 or at + word.len() > line_text.len():
+        return false
+    mut j := 0
+    while j < word.len():
+        if ord(line_text[at + j]) != ord(word[j]):
+            return false
+        j = j + 1
+    return true
 
 test "percent decoding handles escapes, case, and passthrough":
     assert_eq(percent_decode("plain"), "plain")
@@ -306,6 +363,82 @@ test "utf-8 mode counts characters as bytes":
     assert_eq(p.col, 6)
     back := line_col_to_lsp_pos(text, 1, 6, "utf-8")
     assert_eq(back.character, 5)
+
+test "a line made only of multi-byte characters converts both ways":
+    # 𝄞 bytes 0..4 and units 0..2, € 4..7 and 2..3, 中 7..10 and 3..4,
+    # é 10..12 and 4..5
+    text := "𝄞€中é\n"
+    units := [0, 2, 3, 4, 5]
+    cols := [1, 5, 8, 11, 13]
+    mut i := 0
+    while i < units.len():
+        assert_eq(lsp_pos_to_line_col(text, 0, units[i], "utf-16").col, cols[i])
+        assert_eq(line_col_to_lsp_pos(text, 1, cols[i], "utf-16").character, units[i])
+        # in utf-8 the character is the byte offset itself
+        assert_eq(lsp_pos_to_line_col(text, 0, cols[i] - 1, "utf-8").col, cols[i])
+        assert_eq(line_col_to_lsp_pos(text, 1, cols[i], "utf-8").character, cols[i] - 1)
+        i = i + 1
+
+test "surrogate pairs never split":
+    text := "𝄞𝄞x"
+    # unit 1 and unit 3 sit between the halves of a pair
+    assert_eq(lsp_pos_to_line_col(text, 0, 1, "utf-16").col, 1)
+    assert_eq(lsp_pos_to_line_col(text, 0, 3, "utf-16").col, 5)
+    assert_eq(lsp_pos_to_line_col(text, 0, 4, "utf-16").col, 9)
+    # a byte column inside the second pair counts as that pair's start
+    assert_eq(line_col_to_lsp_pos(text, 1, 7, "utf-16").character, 2)
+    assert_eq(line_col_to_lsp_pos(text, 1, 9, "utf-16").character, 4)
+
+test "a utf-8 character inside a multi-byte character backs up to its start":
+    text := "a€b"
+    # € occupies bytes 1..4
+    assert_eq(lsp_pos_to_line_col(text, 0, 2, "utf-8").col, 2)
+    assert_eq(lsp_pos_to_line_col(text, 0, 3, "utf-8").col, 2)
+    assert_eq(lsp_pos_to_line_col(text, 0, 4, "utf-8").col, 5)
+    assert_eq(line_col_to_lsp_pos(text, 1, 3, "utf-8").character, 1)
+
+test "positions past the end of a line clamp to the line's end":
+    text := "é中\nx\n"
+    assert_eq(lsp_pos_to_line_col(text, 0, 50, "utf-16").col, 6)
+    assert_eq(lsp_pos_to_line_col(text, 0, 50, "utf-8").col, 6)
+    assert_eq(line_col_to_lsp_pos(text, 1, 50, "utf-16").character, 2)
+    assert_eq(line_col_to_lsp_pos(text, 1, 50, "utf-8").character, 5)
+    # a line past the last clamps to the last, which is empty here
+    over := lsp_pos_to_line_col(text, 9, 3, "utf-16")
+    assert_eq(over.line, 3)
+    assert_eq(over.col, 1)
+
+test "a crlf line ends before its carriage return":
+    text := "a€\r\nb\r\n"
+    # the content of line 0 is two utf-16 units and four bytes; the \r
+    # is part of the terminator, so no position lands on or past it
+    assert_eq(lsp_pos_to_line_col(text, 0, 2, "utf-16").col, 5)
+    assert_eq(lsp_pos_to_line_col(text, 0, 9, "utf-16").col, 5)
+    assert_eq(lsp_pos_to_line_col(text, 0, 9, "utf-8").col, 5)
+    assert_eq(line_col_to_lsp_pos(text, 1, 6, "utf-16").character, 2)
+    assert_eq(line_col_to_lsp_pos(text, 1, 6, "utf-8").character, 4)
+    assert_eq(lsp_pos_to_line_col(text, 1, 1, "utf-16").col, 2)
+
+test "ranged changes splice at converted offsets":
+    text := "a𝄞b\nxé€y\n"
+    # utf-16: on line 1, x is unit 0, é 1, € 2, y 3
+    assert_eq(apply_ranged_change(text, 1, 2, 1, 3, "中", "utf-16"), "a𝄞b\nxé中y\n")
+    # on line 0 the pair covers units 1..3, so b is unit 3
+    assert_eq(apply_ranged_change(text, 0, 3, 0, 4, "", "utf-16"), "a𝄞\nxé€y\n")
+    # utf-8: € starts at byte 3 of line 1
+    assert_eq(apply_ranged_change(text, 1, 3, 1, 6, "e", "utf-8"), "a𝄞b\nxéey\n")
+    # a deletion spanning lines, and an end before its start
+    assert_eq(apply_ranged_change(text, 0, 4, 1, 1, "", "utf-16"), "a𝄞bé€y\n")
+    assert_eq(apply_ranged_change(text, 1, 1, 0, 0, "!", "utf-16"), "a𝄞b\nx!é€y\n")
+
+test "text_has_at compares without cutting a character":
+    line := "a𝄞b := 1"
+    # 𝄞 occupies bytes 1..5
+    assert(text_has_at(line, 5, "b"))
+    assert(not text_has_at(line, 2, "b"))
+    assert(not text_has_at(line, 3, "b :"))
+    assert(not text_has_at(line, 8, "1 2"))
+    assert(not text_has_at(line, 0 - 1, "a"))
 
 test "document lifecycle tracks text, dirtiness, and uris":
     uri := "file:///tmp/lsp_state_test.pith"

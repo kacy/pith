@@ -200,6 +200,33 @@ and `RETTYPE` does drive the machine signature for those two kinds. the runtime
 builtins that return the same pair take their signature from their table row
 instead (see the result encoding below).
 
+**who owns a returned pair.** the payload a `ret2` hands out is owned by the
+caller: it carries one count of its own, the same count the box's slot would
+have held for a caller that received the box. a function that returns a
+whole result box as the pair (`return x` for `x: T!`) has to produce that
+count from the box it holds, and how depends on who owns the box
+(`ir_emit_return_box_as_pair`):
+
+- a box the function built (the value of a call) is its own. the payload
+  takes over the count the box held on it, and the destructor-less shell is
+  freed.
+- a borrowed box (a parameter, a field, an element, a match binding over
+  one: whatever `ir_expr_is_borrowed` says the box return would retain)
+  belongs to the caller or to the container. the box keeps its count on the
+  payload, the payload is retained by its kind (the ok kind on the ok arm,
+  the error kind on the error arm), and the shell is not touched.
+- a tracked local holds one count on its box, but that box may be shared
+  (`y := x` over a parameter). the return reads `pith_struct_strong_count`:
+  when the local's count is the only one, it is the first case; otherwise
+  the payload is retained by its kind and the local's count on the shell is
+  released, the same decision the release of a result argument makes before
+  it drops a payload.
+
+taking the payload out of a box that someone else still holds, without a
+count of its own, left the caller's box and the returned payload sharing one
+count, and whichever was released first freed what the other still read
+(#1164).
+
 **result encoding.** `result_int` and `result_bool` use a zero sentinel for the
 error case: a real value `v` is carried as `v + 1`, and `0` means "error". the
 consumer's `normalize_runtime_result` applies this. it is the reason a runtime

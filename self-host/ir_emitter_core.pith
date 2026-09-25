@@ -153,6 +153,10 @@ mut ir_func_local_names: Set[String] := {}
 # looping.
 mut ir_tuple_walk_root: Int := 0 - 1
 mut ir_tuple_borrow_walk_active: List[String] := []
+# while that walk is inside a callee that returns the register pair: the
+# nodes whose value the callee returns (see ir_tuple_call_arg_is_borrow).
+mut ir_tuple_walk_pair_callee := false
+mut ir_tuple_walk_pair_returns: List[Int] := []
 
 # --- module globals collected during the prepass ---
 
@@ -1497,9 +1501,116 @@ fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_re
     if ir_tuple_borrow_walk_active.contains(walk_key):
         return false
     ir_tuple_borrow_walk_active.push(walk_key)
+    saved_pair_callee := ir_tuple_walk_pair_callee
+    saved_pair_returns := ir_tuple_walk_pair_returns
+    ir_tuple_walk_pair_callee = is_result and ir_result_reg_funcs.contains_key(callee.name)
+    ir_tuple_walk_pair_returns = []
+    if ir_tuple_walk_pair_callee:
+        ir_collect_pair_returns(body_idx)
+        tail := ir_unwrap_tail_match(body_idx)
+        if tail >= 0:
+            ir_collect_tail_match_returns(tail)
     safe := ir_tuple_uses_all_safe(body_idx, param, is_result)
+    ir_tuple_walk_pair_callee = saved_pair_callee
+    ir_tuple_walk_pair_returns = saved_pair_returns
     ir_tuple_borrow_walk_active.remove(ir_tuple_borrow_walk_active.len() - 1)
     return safe
+
+# a callee on the register abi never hands its caller the box it was given:
+# a returned result leaves as its payload, which takes a count of its own
+# when the box is borrowed (ir_emit_return_box_as_pair). so, walking such a
+# callee, the parameter in return position is a counted extraction like `!`
+# or `catch`, not the alias it is when the box itself goes back. these two
+# collect the return positions: every `return` value, and the arm values of
+# the function's tail match.
+fn ir_collect_pair_returns(idx: Int):
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return
+    if node.kind == "return" and node.children.len() > 0:
+        ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(node.children[0]))
+    for child_idx in node.children:
+        ir_collect_pair_returns(child_idx)
+
+fn ir_collect_tail_match_returns(match_idx: Int):
+    node := get_node(match_idx)
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        mut j := 1
+        while j < arm.children.len():
+            body := get_node(arm.children[j])
+            if body.kind == "body" and body.children.len() > 0:
+                ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(body.children[0]))
+            elif body.kind != "guard" and body.kind != "block":
+                ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(arm.children[j]))
+            j = j + 1
+        i = i + 1
+
+fn ir_unwrap_grouped(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "grouped" and node.children.len() > 0:
+        return ir_unwrap_grouped(node.children[0])
+    return idx
+
+# inside a register-abi callee (see above), a local bound straight from the
+# parameter, `y := x`, shares its box, and so does a bare match binding over
+# it. neither can leave as the box either, so each is judged by walking its
+# own uses: the name is safe when the alias is.
+fn ir_tuple_pair_alias_name(stmt_idx: Int, name: String) -> String:
+    stmt := get_node(stmt_idx)
+    if stmt.kind != "bind" and stmt.kind != "binding":
+        return ""
+    parts := ir_collect_bind_parts(stmt)
+    if parts.type_idx >= 0 or parts.val_idx < 0 or parts.name.len() == 0:
+        return ""
+    val := get_node(ir_unwrap_grouped(parts.val_idx))
+    if val.kind == "ident" and val.value == name:
+        return parts.name
+    return ""
+
+fn ir_tuple_pair_block_safe(node: Node, name: String) -> Bool:
+    for child_idx, ci in node.children:
+        alias := ir_tuple_pair_alias_name(child_idx, name)
+        if alias.len() > 0:
+            mut k := ci + 1
+            while k < node.children.len():
+                if not ir_tuple_pair_child_safe(node.children[k], alias):
+                    return false
+                k = k + 1
+        elif not ir_tuple_pair_child_safe(child_idx, name):
+            return false
+    return true
+
+fn ir_tuple_pair_match_safe(node: Node, name: String) -> Bool:
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        if arm.children.len() == 0:
+            return false
+        pat := get_node(arm.children[0])
+        mut binding := ""
+        if pat.kind == "pat_binding":
+            binding = pat.value
+        elif pat.kind != "pat_wildcard":
+            return false
+        mut j := 1
+        while j < arm.children.len():
+            if not ir_tuple_pair_child_safe(arm.children[j], name):
+                return false
+            if binding.len() > 0 and not ir_tuple_pair_child_safe(arm.children[j], binding):
+                return false
+            j = j + 1
+        i = i + 1
+    return true
+
+# the walk judges a name by its parent, so a statement or an arm value that
+# is the bare name itself is judged here: safe only in return position.
+fn ir_tuple_pair_child_safe(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident" and node.value == name:
+        return ir_tuple_walk_pair_returns.contains(idx)
+    return ir_tuple_uses_all_safe(idx, name, true)
 
 # the declaration of a bare-named function in the module being emitted, or -1.
 # ir_root_items unwraps `pub`, so public declarations resolve too.
@@ -1604,9 +1715,18 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
                         return false
                     li = li + 1
                 return true
+    if ir_tuple_walk_pair_callee:
+        if node.kind == "body" or node.kind == "block":
+            return ir_tuple_pair_block_safe(node, name)
+        if node.kind == "match_expr" and node.children.len() > 1:
+            subj := get_node(ir_unwrap_grouped(node.children[0]))
+            if subj.kind == "ident" and subj.value == name:
+                return ir_tuple_pair_match_safe(node, name)
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
+            if ir_tuple_walk_pair_callee and ir_tuple_walk_pair_returns.contains(child_idx):
+                continue
             if not ir_tuple_use_is_whitelisted(node, name, is_result):
                 return false
             # a whitelisted parent consumes this ident safely; its sibling
@@ -8250,6 +8370,12 @@ pub fn ir_emit_return_value(expr_child: Int):
     # a fresh count. fresh results already arrive owned.
     mut exclude := ""
     expr_node := get_node(expr_child)
+    result_kind := ir_expr_result_kind(expr_child)
+    # a whole result returned under the register abi leaves as its payload,
+    # not as the box, so a borrowed box takes its count on the payload
+    # instead of on the shell (see ir_emit_return_box_as_pair).
+    pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple"
+    mut pair_source := "fresh"
     # a returned tracked local transfers its count to the caller, so it
     # must be skipped in the exit cleanup. trust the tracked kind directly:
     # in a generic body the inferred type can miss (a tuple-lowered
@@ -8257,6 +8383,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     # yet the local is still tracked and returning it must not release it.
     if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
         exclude = expr_node.value
+        pair_source = "local"
     else:
         # substitute struct params (T -> the concrete type) so a specialized
         # impl method returning a borrowed T still retains it. without this
@@ -8264,8 +8391,10 @@ pub fn ir_emit_return_value(expr_child: Int):
         # and the caller's arg release frees the value the method handed back.
         ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_child)))
         if ret_kind.len() > 0 and ir_expr_is_borrowed(expr_child):
-            ir_rc_retain_reg(r, ret_kind)
-    result_kind := ir_expr_result_kind(expr_child)
+            if pair_forward:
+                pair_source = "borrowed"
+            else:
+                ir_rc_retain_reg(r, ret_kind)
     expr_tid := c_get_expr_type(expr_child)
     mut expr_kind := ""
     if expr_tid >= 0:
@@ -8332,12 +8461,10 @@ pub fn ir_emit_return_value(expr_child: Int):
         elif not ir_return_forwards_result(expr_kind, result_kind):
             r = ir_emit_ok_result_tuple(r)
     elif ir_current_func_return_kind == "result_reg":
-        if result_kind == "tuple":
-            # forwarding a whole result (`return other_fallible()`): the
-            # expression produced a box, so unpack it into the pair. the
-            # take-ok convention applies — the payload leaves with its
-            # count and the destructor-less shell is freed.
-            ir_emit_return_box_as_pair(r, exclude)
+        if pair_forward:
+            # forwarding a whole result (`return other_fallible()`, `return
+            # x`): the expression produced a box, so unpack it into the pair.
+            ir_emit_return_box_as_pair(r, exclude, pair_source, expr_tid)
             ir_last_was_ret = true
             return
         ir_defer_emit_to_function_frame(false)
@@ -8409,27 +8536,85 @@ fn ir_emit_catch_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
 # unpack a result box into the two-register return: branch on its flag and
 # ret2 each slot's payload from its own arm. run defers and cleanup before
 # the branch so both arms leave through already-settled state.
-fn ir_emit_return_box_as_pair(box_r: Int, exclude: String):
+#
+# the payload has to leave with a count the caller owns, and where that
+# count comes from depends on who owns the box (`source`, #1164):
+# - "fresh": the expression built the box (a call), so this function holds
+#   its only count. the payload takes over the count the box held on it and
+#   the destructor-less shell is freed.
+# - "borrowed": the box belongs to someone else (a parameter, a field, an
+#   element, a match binding over one), and the box return would retain it
+#   (ir_expr_is_borrowed). the box keeps its count on the payload, so the
+#   payload takes a count of its own by its kind and the shell is left alone.
+# - "local": a tracked local holds one count on the box, but the box may be
+#   shared with the caller (`y := x` over a parameter). when the count is the
+#   only one this is the fresh case; otherwise the payload takes its own
+#   count and the local's count on the shell is dropped. this is the check
+#   the result-argument release makes before it drops a payload.
+fn ir_emit_return_box_as_pair(box_r: Int, exclude: String, source: String, box_tid: Int):
     ir_defer_emit_to_function_frame(false)
     ir_emit_rc_cleanup(exclude)
+    mut sole_r := 0 - 1
+    if source == "local":
+        count_r := ir_reg()
+        ir_emit_call1(count_r, "pith_struct_strong_count", "int", box_r)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        sole_r = ir_reg()
+        ir_emit("eq " + sole_r.to_string() + " " + count_r.to_string() + " " + one_r.to_string())
     flag_r := ir_emit_result_flag_field(box_r, "is_ok")
     ok_l := ir_label()
     err_l := ir_label()
     ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
     ir_emit_label(ok_l)
-    ok_r := ir_reg()
-    ir_emit("field " + ok_r.to_string() + " " + box_r.to_string() + " 8 unknown ok")
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", box_r)
-    one_r := ir_reg()
-    ir_emit("iconst " + one_r.to_string() + " 1")
-    ir_emit("ret2 " + one_r.to_string() + " " + ok_r.to_string())
+    ir_emit_pair_payload_return(box_r, "ok", ir_result_payload_rc_kind(box_tid, "ok"), source, sole_r)
     ir_emit_label(err_l)
-    err_r := ir_reg()
-    ir_emit("field " + err_r.to_string() + " " + box_r.to_string() + " 16 unknown err")
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", box_r)
-    zero_r := ir_reg()
-    ir_emit("iconst " + zero_r.to_string() + " 0")
-    ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
+    ir_emit_pair_payload_return(box_r, "err", ir_result_payload_rc_kind(box_tid, "err"), source, sole_r)
+
+# the rc kind of a result box's ok or err payload, from the box's type. a
+# box whose type the checker did not record falls back to the current
+# function's own ok kind (a forwarded result has the function's type) and to
+# a String error.
+fn ir_result_payload_rc_kind(box_tid: Int, slot: String) -> String:
+    if box_tid >= 0 and get_type_info(box_tid).kind == "result":
+        return ir_rc_kind(ir_result_field_kind(box_tid, slot))
+    if slot == "err":
+        return "string"
+    if ir_func_result_ok_kinds.contains_key(ir_current_arc_func):
+        return ir_rc_kind(ir_func_result_ok_kinds[ir_current_arc_func])
+    return ""
+
+# return one slot of a result box as the pair, taking the payload's count
+# the way `source` says (see ir_emit_return_box_as_pair). `sole_r` is the
+# register holding "this is the box's only count" for a local source.
+fn ir_emit_pair_payload_return(box_r: Int, slot: String, kind: String, source: String, sole_r: Int):
+    mut offset := "8"
+    mut flag := "1"
+    if slot == "err":
+        offset = "16"
+        flag = "0"
+    val_r := ir_reg()
+    ir_emit("field " + val_r.to_string() + " " + box_r.to_string() + " " + offset + " unknown " + slot)
+    if source == "local" and kind.len() > 0:
+        take_l := ir_label()
+        share_l := ir_label()
+        ir_emit("brif " + sole_r.to_string() + " " + take_l + " " + share_l)
+        ir_emit_label(share_l)
+        ir_rc_retain_reg(val_r, kind)
+        ir_emit_pair_ret(box_r, true, flag, val_r)
+        ir_emit_label(take_l)
+    elif source == "borrowed":
+        ir_rc_retain_reg(val_r, kind)
+        ir_emit_pair_ret(box_r, false, flag, val_r)
+        return
+    ir_emit_pair_ret(box_r, true, flag, val_r)
+
+fn ir_emit_pair_ret(box_r: Int, release_shell: Bool, flag: String, val_r: Int):
+    if release_shell:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", box_r)
+    flag_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " " + flag)
+    ir_emit("ret2 " + flag_r.to_string() + " " + val_r.to_string())
 
 # true when a type name is still an unresolved generic spelling: the bare
 # parameter itself, or an associated type reached through one (`I.Item`).

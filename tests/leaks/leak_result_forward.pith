@@ -1,0 +1,165 @@
+# a `-> T!` function that returns a result it did not build (#1164), one
+# shape per SHAPE value (tooling/leak_check.sh registers each). under the
+# two-register result abi (PITH_RESULT_REG=1) the forwarded result leaves as
+# its payload, which takes a count of its own when the box belongs to the
+# caller; a count taken twice, or taken and never dropped, grows the peak.
+# every round forwards an ok and an error result and reads both the
+# forwarded value and its source. the same shapes are checked for values
+# and for invalid reads by tests/cases/test_result_forward_shapes, which
+# also covers a field and a list element; those two are not measured here
+# because a result box held by a struct or a list strands its payload with
+# the register abi off as well (#1167).
+import leakprobe as probe
+import std.env as env
+
+struct Point:
+    pub x: Int
+    pub label: String
+
+fn mk(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return "payload-{i}"
+
+fn mk_list(i: Int) -> List[String]!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return ["a{i}", "b{i}"]
+
+fn mk_point(i: Int) -> Point!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return Point(i, "p{i}")
+
+fn fwd(x: String!) -> String!:
+    return x
+
+fn fwd_list(x: List[String]!) -> List[String]!:
+    return x
+
+fn fwd_point(x: Point!) -> Point!:
+    return x
+
+fn fwd_fresh(i: Int) -> String!:
+    x := mk(i)
+    return x
+
+fn fwd_alias(x: String!) -> String!:
+    y := x
+    return y
+
+fn fwd_match(x: String!) -> String!:
+    match x:
+        v => v
+
+fn fwd_branch(x: String!, keep: Bool) -> String!:
+    if keep:
+        return x
+    return mk(0)
+
+fn fwd_two(x: String!) -> String!:
+    return fwd(x)
+
+fn late(i: Int) -> String!:
+    a := mk(i)
+    return fwd(a)
+
+fn len_of(r: String!) -> Int:
+    if r.is_ok:
+        return r.ok.len()
+    return r.err.len()
+
+fn list_len(r: List[String]!) -> Int:
+    if r.is_ok:
+        return r.ok[0].len() + r.ok.len()
+    return r.err.len()
+
+fn point_len(r: Point!) -> Int:
+    if r.is_ok:
+        return r.ok.label.len()
+    return r.err.len()
+
+# each shape is its own function: a result local's payload is released by
+# its cleanup only when every use of it in the function is one the emitter
+# can prove safe, so one function holding every shape would measure the
+# least safe of them.
+fn param_round(i: Int) -> Int:
+    a := mk(i)
+    b := fwd(a)
+    return len_of(b) + len_of(a)
+
+fn temp_round(i: Int) -> Int:
+    b := fwd(mk(i))
+    c := late(i)
+    return len_of(b) + len_of(c)
+
+fn fresh_round(i: Int) -> Int:
+    b := fwd_fresh(i)
+    return len_of(b)
+
+fn alias_round(i: Int) -> Int:
+    a := mk(i)
+    b := fwd_alias(a)
+    c := fwd_alias(mk(i))
+    return len_of(b) + len_of(c) + len_of(a)
+
+fn match_round(i: Int) -> Int:
+    a := mk(i)
+    b := fwd_match(a)
+    c := fwd_match(mk(i))
+    return len_of(b) + len_of(c) + len_of(a)
+
+fn branch_round(i: Int) -> Int:
+    a := mk(i)
+    b := fwd_branch(a, true)
+    c := fwd_branch(a, false)
+    return len_of(b) + len_of(c) + len_of(a)
+
+fn two_round(i: Int) -> Int:
+    a := mk(i)
+    b := fwd_two(a)
+    c := fwd_two(mk(i))
+    return len_of(b) + len_of(c) + len_of(a)
+
+fn list_round(i: Int) -> Int:
+    a := mk_list(i)
+    b := fwd_list(a)
+    c := fwd_list(mk_list(i))
+    return list_len(b) + list_len(a) + list_len(c)
+
+fn point_round(i: Int) -> Int:
+    a := mk_point(i)
+    b := fwd_point(a)
+    c := fwd_point(mk_point(i))
+    return point_len(b) + point_len(a) + point_len(c)
+
+fn shape(s: Int, i: Int) -> Int:
+    if s == 1:
+        return param_round(i)
+    if s == 2:
+        return temp_round(i)
+    if s == 3:
+        return fresh_round(i)
+    if s == 4:
+        return alias_round(i)
+    if s == 5:
+        return match_round(i)
+    if s == 6:
+        return branch_round(i)
+    if s == 7:
+        return two_round(i)
+    if s == 8:
+        return list_round(i)
+    return point_round(i)
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    mut acc := 0
+    mut i := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

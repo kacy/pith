@@ -68,6 +68,15 @@ cases=(
   "tests/leaks/leak_runtime_result_pair SHAPE=7"
   "tests/leaks/leak_runtime_result_pair SHAPE=8"
   "tests/leaks/leak_runtime_result_pair SHAPE=9"
+  "tests/leaks/leak_result_forward SHAPE=1"
+  "tests/leaks/leak_result_forward SHAPE=2"
+  "tests/leaks/leak_result_forward SHAPE=3"
+  "tests/leaks/leak_result_forward SHAPE=4"
+  "tests/leaks/leak_result_forward SHAPE=5"
+  "tests/leaks/leak_result_forward SHAPE=6"
+  "tests/leaks/leak_result_forward SHAPE=7"
+  "tests/leaks/leak_result_forward SHAPE=8"
+  "tests/leaks/leak_result_forward SHAPE=9"
   tests/leaks/leak_sort_engine
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let

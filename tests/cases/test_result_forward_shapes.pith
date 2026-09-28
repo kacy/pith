@@ -1,0 +1,490 @@
+# a function declared `-> T!` that hands back a result it did not build:
+# its parameter, a local bound from a call, a local bound from the
+# parameter, a match binding, a match arm or an `if` branch returning the
+# parameter, a field, a method returning `self.r`, a list element, a result
+# passed through two and three forwarding frames, and a generic forward.
+# under the two-register result abi (PITH_RESULT_REG=1) such a return leaves
+# as the (flag, payload) pair instead of the box, and the box still belongs
+# to whoever passed it in, so the payload has to leave with a count of its
+# own (#1164).
+#
+# each shape is one function. it reads the forwarded value and its source
+# while both are alive, forwards a temporary (`fwd(mk(i))`, which the caller
+# releases as soon as the call returns), and forwards from a source that
+# dies inside a helper; the last two are read with fresh allocations of the
+# same sizes alive, so a payload freed under them prints another value
+# instead of its own. every shape runs with an ok and an error result, and
+# the payload kinds are Int, String, List, Map, a struct, an optional (which
+# the register abi leaves in the box) and a struct error. the expected
+# output was derived from the source (every forward prints its source's
+# value) and is the same with the flag on and off. runs under valgrind with
+# the freelist off (MEMCHECK_CASES, so `memcheck` and
+# `memcheck-result-reg`).
+
+struct Point:
+    pub x: Int
+    pub label: String
+
+struct Failure:
+    pub code: Int
+    pub text: String
+
+struct Holder:
+    pub r: String!
+
+impl Holder:
+    fn get() -> String!:
+        return self.r
+
+fn mk(i: Int) -> String!:
+    if i < 0:
+        fail "e{i}"
+    return "s{i}"
+
+fn mk_int(i: Int) -> Int!:
+    if i < 0:
+        fail "e{i}"
+    return i * 10
+
+fn mk_list(i: Int) -> List[Int]!:
+    if i < 0:
+        fail "e{i}"
+    return [i, i + 1, i + 2]
+
+fn mk_map(i: Int) -> Map[String, Int]!:
+    if i < 0:
+        fail "e{i}"
+    mut m: Map[String, Int] := {}
+    m.insert("k{i}", i)
+    return m
+
+fn mk_point(i: Int) -> Point!:
+    if i < 0:
+        fail "e{i}"
+    return Point(i, "p{i}")
+
+fn mk_opt(i: Int) -> (String?)!:
+    if i < 0:
+        fail "e{i}"
+    v: String? := "o{i}"
+    return v
+
+fn mk_typed(i: Int) -> Int!Failure:
+    if i < 0:
+        fail Failure(i, "typed{i}")
+    return i
+
+fn show(label: String, r: String!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_int(label: String, r: Int!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_list(label: String, r: List[Int]!):
+    if r.is_ok:
+        xs := r.ok
+        print("{label} ok {xs.len()} {xs[0]} {xs[2]}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_map(label: String, r: Map[String, Int]!, key: String):
+    if r.is_ok:
+        m := r.ok
+        print("{label} ok {m.len()} {m.get(key).unwrap_or(0 - 1)}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_point(label: String, r: Point!):
+    if r.is_ok:
+        p := r.ok
+        print("{label} ok {p.x} {p.label}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_opt(label: String, r: (String?)!):
+    if r.is_ok:
+        v := r.ok
+        print("{label} ok {v.unwrap_or("none")}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_typed(label: String, r: Int!Failure):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        e := r.err
+        print("{label} err {e.code} {e.text}")
+
+# --- the forwarding callees ---
+
+fn fwd(x: String!) -> String!:
+    return x
+
+fn fwd_int(x: Int!) -> Int!:
+    return x
+
+fn fwd_list(x: List[Int]!) -> List[Int]!:
+    return x
+
+fn fwd_map(x: Map[String, Int]!) -> Map[String, Int]!:
+    return x
+
+fn fwd_point(x: Point!) -> Point!:
+    return x
+
+fn fwd_opt(x: (String?)!) -> (String?)!:
+    return x
+
+fn fwd_typed(x: Int!Failure) -> Int!Failure:
+    return x
+
+# a local bound from a call owns its box outright.
+fn fwd_fresh(i: Int) -> String!:
+    x := mk(i)
+    return x
+
+# a local bound from the parameter shares the caller's box.
+fn fwd_alias(x: String!) -> String!:
+    y := x
+    return y
+
+fn fwd_match(x: String!) -> String!:
+    match x:
+        v => v
+
+fn fwd_match_param(x: String!, n: Int) -> String!:
+    match n:
+        0 => x
+        _ => mk(n)
+
+fn fwd_branch(x: String!, keep: Bool) -> String!:
+    if keep:
+        return x
+    return mk(7)
+
+fn fwd_field(h: Holder) -> String!:
+    return h.r
+
+fn fwd_elem(rs: List[String!]) -> String!:
+    return rs[0]
+
+fn fwd_two(x: String!) -> String!:
+    return fwd(x)
+
+fn fwd_three(x: String!) -> String!:
+    return fwd_two(x)
+
+fn gfwd[T](x: T!) -> T!:
+    return x
+
+# --- one function per shape, fed an ok and an error result ---
+# each reads the forwarded value and its source while both are alive, then
+# forwards from a source that dies inside a helper and reads the result with
+# fresh allocations of the same sizes alive, so a payload freed under it
+# prints someone else's text instead of its own.
+
+fn junk() -> List[String!]:
+    return [mk(1), mk(2), mk(3), mk(0 - 1), mk(0 - 2), mk(0 - 3)]
+
+fn late(i: Int) -> String!:
+    a := mk(i)
+    return fwd(a)
+
+fn shape_param(i: Int):
+    a := mk(i)
+    b := fwd(a)
+    show("param.fwd", b)
+    show("param.src", a)
+    show("param.again", fwd(a))
+    show("param.src2", a)
+    r := late(i)
+    t := fwd(mk(i))
+    j := junk()
+    show("param.late", r)
+    show("param.temp", t)
+    print("junk {j.len()}")
+
+fn late_int(i: Int) -> Int!:
+    a := mk_int(i)
+    return fwd_int(a)
+
+fn shape_int(i: Int):
+    a := mk_int(i)
+    b := fwd_int(a)
+    show_int("int.fwd", b)
+    show_int("int.src", a)
+    r := late_int(i)
+    t := fwd_int(mk_int(i))
+    j := junk()
+    show_int("int.late", r)
+    show_int("int.temp", t)
+    print("junk {j.len()}")
+
+fn late_list(i: Int) -> List[Int]!:
+    a := mk_list(i)
+    return fwd_list(a)
+
+fn shape_list(i: Int):
+    a := mk_list(i)
+    b := fwd_list(a)
+    show_list("list.fwd", b)
+    show_list("list.src", a)
+    r := late_list(i)
+    t := fwd_list(mk_list(i))
+    j := [mk_list(1), mk_list(2)]
+    show_list("list.late", r)
+    show_list("list.temp", t)
+    print("junk {j.len()}")
+
+fn late_map(i: Int) -> Map[String, Int]!:
+    a := mk_map(i)
+    return fwd_map(a)
+
+fn shape_map(i: Int):
+    a := mk_map(i)
+    b := fwd_map(a)
+    show_map("map.fwd", b, "k{i}")
+    show_map("map.src", a, "k{i}")
+    r := late_map(i)
+    t := fwd_map(mk_map(i))
+    j := [mk_map(1), mk_map(2)]
+    show_map("map.late", r, "k{i}")
+    show_map("map.temp", t, "k{i}")
+    print("junk {j.len()}")
+
+fn late_point(i: Int) -> Point!:
+    a := mk_point(i)
+    b := fwd_point(a)
+    return b
+
+fn shape_struct(i: Int):
+    a := mk_point(i)
+    b := fwd_point(a)
+    show_point("struct.fwd", b)
+    show_point("struct.src", a)
+    r := late_point(i)
+    t := fwd_point(mk_point(i))
+    j := [mk_point(1), mk_point(2)]
+    show_point("struct.late", r)
+    show_point("struct.temp", t)
+    print("junk {j.len()}")
+
+fn late_opt(i: Int) -> (String?)!:
+    a := mk_opt(i)
+    return fwd_opt(a)
+
+fn shape_opt(i: Int):
+    a := mk_opt(i)
+    b := fwd_opt(a)
+    show_opt("opt.fwd", b)
+    show_opt("opt.src", a)
+    r := late_opt(i)
+    t := fwd_opt(mk_opt(i))
+    j := [mk_opt(1), mk_opt(2)]
+    show_opt("opt.late", r)
+    show_opt("opt.temp", t)
+    print("junk {j.len()}")
+
+fn late_typed(i: Int) -> Int!Failure:
+    a := mk_typed(i)
+    return fwd_typed(a)
+
+fn shape_typed(i: Int):
+    a := mk_typed(i)
+    b := fwd_typed(a)
+    show_typed("typed.fwd", b)
+    show_typed("typed.src", a)
+    r := late_typed(i)
+    t := fwd_typed(mk_typed(i))
+    j := [mk_typed(0 - 1), mk_typed(0 - 2)]
+    show_typed("typed.late", r)
+    show_typed("typed.temp", t)
+    print("junk {j.len()}")
+
+fn shape_fresh(i: Int):
+    r := fwd_fresh(i)
+    j := junk()
+    show("fresh", r)
+    print("junk {j.len()}")
+
+fn late_alias(i: Int) -> String!:
+    a := mk(i)
+    return fwd_alias(a)
+
+fn shape_alias(i: Int):
+    a := mk(i)
+    b := fwd_alias(a)
+    show("alias.fwd", b)
+    show("alias.src", a)
+    r := late_alias(i)
+    t := fwd_alias(mk(i))
+    j := junk()
+    show("alias.late", r)
+    show("alias.temp", t)
+    print("junk {j.len()}")
+
+fn late_match(i: Int) -> String!:
+    a := mk(i)
+    return fwd_match(a)
+
+fn shape_match(i: Int):
+    a := mk(i)
+    b := fwd_match(a)
+    show("match.fwd", b)
+    show("match.src", a)
+    r := late_match(i)
+    t := fwd_match(mk(i))
+    j := junk()
+    show("match.late", r)
+    show("match.temp", t)
+    print("junk {j.len()}")
+
+fn late_match_param(i: Int) -> String!:
+    a := mk(i)
+    return fwd_match_param(a, 0)
+
+fn shape_match_param(i: Int):
+    a := mk(i)
+    b := fwd_match_param(a, 0)
+    show("match_param.fwd", b)
+    show("match_param.other", fwd_match_param(a, 3))
+    show("match_param.src", a)
+    r := late_match_param(i)
+    t := fwd_match_param(mk(i), 0)
+    j := junk()
+    show("match_param.late", r)
+    show("match_param.temp", t)
+    print("junk {j.len()}")
+
+fn late_branch(i: Int) -> String!:
+    a := mk(i)
+    return fwd_branch(a, true)
+
+fn shape_branch(i: Int):
+    a := mk(i)
+    b := fwd_branch(a, true)
+    show("branch.fwd", b)
+    show("branch.other", fwd_branch(a, false))
+    show("branch.src", a)
+    r := late_branch(i)
+    t := fwd_branch(mk(i), true)
+    j := junk()
+    show("branch.late", r)
+    show("branch.temp", t)
+    print("junk {j.len()}")
+
+fn late_field(i: Int) -> String!:
+    h := Holder(mk(i))
+    return fwd_field(h)
+
+fn shape_field(i: Int):
+    h := Holder(mk(i))
+    f := fwd_field(h)
+    show("field.fwd", f)
+    show("field.src", h.r)
+    r := late_field(i)
+    t := fwd_field(Holder(mk(i)))
+    j := junk()
+    show("field.late", r)
+    show("field.temp", t)
+    print("junk {j.len()}")
+
+fn late_method(i: Int) -> String!:
+    h := Holder(mk(i))
+    return h.get()
+
+fn shape_method(i: Int):
+    h := Holder(mk(i))
+    m := h.get()
+    show("method.fwd", m)
+    show("method.src", h.r)
+    r := late_method(i)
+    t := Holder(mk(i)).get()
+    j := junk()
+    show("method.late", r)
+    show("method.temp", t)
+    print("junk {j.len()}")
+
+fn late_elem(i: Int) -> String!:
+    rs := [mk(i), mk(i + 1)]
+    return fwd_elem(rs)
+
+fn shape_elem(i: Int):
+    rs := [mk(i), mk(i + 1)]
+    el := fwd_elem(rs)
+    show("elem.fwd", el)
+    show("elem.src", rs[0])
+    r := late_elem(i)
+    t := fwd_elem([mk(i), mk(i + 1)])
+    j := junk()
+    show("elem.late", r)
+    show("elem.temp", t)
+    print("junk {j.len()}")
+
+fn late_two(i: Int) -> String!:
+    a := mk(i)
+    return fwd_two(a)
+
+fn shape_two(i: Int):
+    a := mk(i)
+    t := fwd_two(a)
+    show("two.fwd", t)
+    show("two.src", a)
+    t3 := fwd_three(a)
+    show("three.fwd", t3)
+    show("three.src", a)
+    r := late_two(i)
+    t := fwd_two(mk(i))
+    j := junk()
+    show("two.late", r)
+    show("two.temp", t)
+    print("junk {j.len()}")
+
+fn late_generic(i: Int) -> String!:
+    a := mk(i)
+    return gfwd(a)
+
+fn shape_generic(i: Int):
+    a := mk(i)
+    g := gfwd(a)
+    show("generic.fwd", g)
+    show("generic.src", a)
+    gi := mk_int(i)
+    show_int("generic.int", gfwd(gi))
+    show_int("generic.int.src", gi)
+    r := late_generic(i)
+    t := gfwd(mk(i))
+    j := junk()
+    show("generic.late", r)
+    show("generic.temp", t)
+    print("junk {j.len()}")
+
+fn run(i: Int):
+    shape_param(i)
+    shape_int(i)
+    shape_list(i)
+    shape_map(i)
+    shape_struct(i)
+    shape_opt(i)
+    shape_typed(i)
+    shape_fresh(i)
+    shape_alias(i)
+    shape_match(i)
+    shape_match_param(i)
+    shape_branch(i)
+    shape_field(i)
+    shape_method(i)
+    shape_elem(i)
+    shape_two(i)
+    shape_generic(i)
+
+fn main():
+    run(5)
+    run(0 - 5)
+    print("done")

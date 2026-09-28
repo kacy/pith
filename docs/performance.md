@@ -1505,6 +1505,56 @@ function handing back its own result parameter (#1164). the decode boxes
 need the decode lowering to hand its (flag, payload) to a waiting consumer
 the way the builtins now do, and a `Float!` function still boxes.
 
+### a forwarded result under the register abi (#1164)
+
+the two failures were one defect. a pair-returning function that returned a
+result box it did not build, such as `fn forward(x: T!) -> T!: return x`,
+read the payload out of the box and handed it out as if it held the box's
+count on it. the caller's box still held that same count, so the returned
+payload and the caller's box shared one count, and whichever was released
+first freed what the other still read. the fix gives the payload a count of
+its own whenever the box is not the function's alone
+(`ir_emit_return_box_as_pair`, the ownership rule in `docs/ir-contract.md`),
+and teaches the caller's cascade walk that such a callee's `return x` is a
+counted extraction, so the caller's local releases its own payload.
+
+`tests/cases/test_result_forward_shapes` covers a parameter, a local bound
+from a call, a local bound from the parameter, a match binding, a match arm
+and an `if` branch, a field, a method, a list element, two and three
+forwarding frames and a generic, each with an ok and an error result and
+with Int, String, List, Map, struct, optional and struct-error payloads.
+before the fix, with the flag on, 11 of its 17 shapes read freed memory
+under valgrind. 10 of those printed another value in place of the
+forwarded one, such as `param.temp ok s1` for `ok s5`, and the List shape
+crashed (`list index out of bounds`). after it, the output matches the flag-off
+output line for line and valgrind is clean.
+
+callgrind at the branch tip, flag off against flag on, and the flag-on
+build against the flag-on build without the fix (c5e569f8):
+
+| workload | flag off | flag on | change | fix cost (flag on, with and without the fix) |
+|---|---:|---:|---:|---:|
+| `event_ledger 200000` | 2,390,245,771 | 1,935,896,836 | -19.0% | +0.00% |
+| `std_pipeline 50000` | 3,300,695,904 | 3,075,916,830 | -6.8% | -0.18% |
+| `catalog_workload 200000` | 926,495,410 | 926,488,660 | -0.00% | +0.00% |
+| the compiler compiling itself | 12,423,402,239 | 12,422,105,790 | -0.01% | +0.01% |
+
+the compiler's output is byte-identical with the flag on and off. with the
+flag off, the emitted ir of all 643 corpus programs that build is identical
+to c5e569f8. with it on, 183 differ: 181 only in two std functions that
+return a tracked result local (`string_buffer_write_line` on its error
+path and `http.read_request_bytes`), which now check the box's strong
+count before taking its payload, and the forwarding cases themselves.
+
+what is left before the flag can become the default: a `Float!` function
+needs `result_reg_f`; interface impls, generic functions and methods on
+generic types, functions containing a lambda or a spawn, `main`, and
+optional or tuple ok payloads all still return the box; and a result local
+forwarded through an imported function or a method leaks its payload with
+the flag on (#1169), because the caller's walk cannot read that callee's
+body. #1167 (a result box held by a struct field or a list element) leaks
+with the flag off as well, and a little more with it on.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

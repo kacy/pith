@@ -138,21 +138,8 @@ jobs:
         # silence into a fast, visible failure.
         timeout-minutes: 30
         run: |
-          # not `|| true`: `make memcheck` skips itself when valgrind is
-          # missing, so a swallowed install failure would turn this step into a
-          # guard that passes without running.
-          #
-          # install valgrind with a hard wall-clock bound and a retry. the
-          # Acquire::*::Timeout options only bound an HTTP read, but the stalls
-          # seen in practice hung before that layer (dns, the dpkg lock, sudo
-          # itself) and sat until the step timeout with zero output. wrapping
-          # each apt call in `timeout` fails fast wherever it wedges, and a
-          # second attempt after a short sleep clears a transiently bad mirror.
-          install_valgrind() {
-            timeout 240 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq \
-              && timeout 240 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq valgrind
-          }
-          install_valgrind || { echo "apt install stalled or failed; retrying once after 15s"; sleep 15; install_valgrind; }
+          # the install is bounded and retried; see the script for why.
+          tooling/ci_install_valgrind.sh
           make memcheck
 
       - name: verify a fresh clone can bootstrap from the seed
@@ -231,3 +218,29 @@ jobs:
               exit 1
             fi
           done
+
+  # the two-register result abi (PITH_RESULT_REG=1) is off by default. nothing
+  # ran it between the day it landed and #1164, when two regression cases
+  # turned out to read freed memory with it on, so this job runs the
+  # regression corpus, the leak cases and the memcheck set with it on until it
+  # becomes the default. it runs beside the build job, so it adds no wall time.
+  result-reg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: cargo build --release
+
+      - name: regression corpus with the register result abi
+        run: make run-regressions-result-reg-only
+
+      - name: leak growth with the register result abi
+        run: make leak-check-result-reg-only
+
+      - name: memcheck with the register result abi
+        timeout-minutes: 30
+        run: |
+          tooling/ci_install_valgrind.sh
+          make memcheck-result-reg

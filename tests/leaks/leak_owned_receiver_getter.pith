@@ -1,0 +1,53 @@
+# a borrowing getter (`get`, `first`, `last`, map `get`) called on an owned
+# temporary returns a shell that takes its own count on the element, because
+# the temporary is released before anything reads the element. an `if let`
+# releases that shell as soon as the binding takes its count, so a body that
+# returns early does not leak the shell or the payload it owns.
+import leakprobe as probe
+import std.env as env
+
+struct P:
+    name: String
+
+fn mkl(n: Int) -> List[String]:
+    return ["e-" + n.to_string(), "f-" + n.to_string()]
+
+fn mkp(n: Int) -> List[P]:
+    return [P("p-" + n.to_string())]
+
+fn mkm(n: Int) -> Map[String, String]:
+    mut m: Map[String, String] := {}
+    m["k"] = "mv-" + n.to_string()
+    return m
+
+fn round(i: Int, shape: Int) -> Int:
+    if shape == 1:
+        return mkl(i).get(0).unwrap_or("none").len()
+    if shape == 2:
+        if let v = mkl(i).first():
+            return v.len()
+        return 0
+    if shape == 3:
+        if let v = mkm(i).get("k"):
+            return v.len()
+        return 0
+    if shape == 4:
+        return match mkl(i).last():
+            none => 0
+            s => s.len()
+    if shape == 5:
+        return mkp(i).get(0).value().name.len()
+    return mkl(i).get(9).unwrap_or("none").len()
+
+fn main():
+    n := probe.rounds()
+    shape := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i, shape)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

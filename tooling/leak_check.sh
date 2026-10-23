@@ -191,6 +191,12 @@ cases=(
   tests/leaks/leak_csv_encode
   tests/leaks/leak_path_clean_count
   tests/leaks/leak_metrics_scrape
+  "tests/leaks/leak_owned_receiver_getter SHAPE=1"
+  "tests/leaks/leak_owned_receiver_getter SHAPE=2"
+  "tests/leaks/leak_owned_receiver_getter SHAPE=3"
+  "tests/leaks/leak_owned_receiver_getter SHAPE=4"
+  "tests/leaks/leak_owned_receiver_getter SHAPE=5"
+  "tests/leaks/leak_owned_receiver_getter SHAPE=6"
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
   "tests/leaks/leak_map_value_cycle PITH_CYCLE_GC=1"
 )

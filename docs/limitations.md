@@ -428,8 +428,10 @@ correctness story:
   string `get`, a channel receive) have the matching destructor attached at
   the call site, so every extraction spelling is flat on call subjects and
   bound locals alike. the borrowing getters (`m.get(k)`, `xs.first()`) keep
-  destructor-less shells on purpose — their payload count stays with the
-  container.
+  destructor-less shells, because the container holds the payload's count.
+  the exception is a getter called on an owned temporary
+  (`make_list().first()`): the temporary is released right after the call,
+  so the call site retains the payload and attaches the destructor.
 - a `Set` element and a `Map` key hash int, string and bytes flavors only.
   any other element or key type used to fall into a flavor anyway and read
   its value's word as if it were that flavor: distinct optionals and lists

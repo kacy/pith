@@ -1,0 +1,28 @@
+# reading an element through a getter on a temporary container must not
+# see freed memory: the temporary is released right after the call.
+fn mkl(n: Int) -> List[String]:
+    return ["e-" + n.to_string(), "f-" + n.to_string()]
+
+fn mkm(n: Int) -> Map[String, String]:
+    mut m: Map[String, String] := {}
+    m["k"] = "mv-" + n.to_string()
+    return m
+
+fn first_len(n: Int) -> Int:
+    if let v = mkl(n).first():
+        return v.len()
+    return 0
+
+fn main():
+    print(mkl(8).get(0).unwrap_or("none"))
+    if let v = mkl(1).first():
+        print("iflet " + v)
+    if let v = mkm(2).get("k"):
+        print("iflet map " + v)
+    print(mkl(3).last().unwrap_or("none"))
+    match mkl(4).get(1):
+        none => print("none")
+        s => print("match " + s)
+    print(mkl(5).get(0).value())
+    print(mkl(6).get(9).unwrap_or("missing"))
+    print("{first_len(77)}")

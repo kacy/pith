@@ -1256,6 +1256,34 @@ fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
         return true
     return emit_name == "pith_list_first_opt" or emit_name == "pith_list_last_opt"
 
+# the payload kind that a borrowing getter's shell must own, or "" when the
+# shell can keep borrowing. a receiver that is an owned temporary
+# (`make_list().get(0)`, `load_map().get(k)`) is released right after the
+# call, and when that release frees the container it frees the element too,
+# before anything reads it. in that case the call site retains the payload
+# and attaches the destructor, so the shell owns the payload the same way a
+# transferring getter's shell does. a `T??` element is skipped: its inner
+# shell goes through the extraction rules in ir_shell_producer_transfers.
+fn ir_owned_receiver_getter_payload_kind(idx: Int, emit_name: String) -> String:
+    if not ir_runtime_getter_borrows_payload(emit_name):
+        return ""
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return ""
+    recv_idx := node.children[0]
+    if ir_rc_kind(ir_infer_type(recv_idx)).len() == 0 or ir_expr_is_borrowed(recv_idx):
+        return ""
+    opt_tid := c_get_expr_type(idx)
+    if opt_tid < 0 or get_type_info(opt_tid).kind != "optional":
+        return ""
+    inner_tid := get_type_info(opt_tid).inner
+    if inner_tid < 0:
+        return ""
+    inner_kind := get_type_info(inner_tid).kind
+    if inner_kind == "optional" or inner_kind == "result":
+        return ""
+    return ir_rc_kind(ir_type_from_tid(inner_tid))
+
 # the rc payload kind of the optional shell a TRANSFERRING runtime getter
 # hands back, or "" for every other callee. `env_opt` and the string `get`
 # mint a fresh one-off string, and a channel receive hands the sent value's
@@ -1312,7 +1340,10 @@ fn ir_shell_producer_transfers(idx: Int) -> Bool:
     recv_type := ir_method_receiver_type(node)
     if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
         return true
-    return not ir_runtime_getter_borrows_payload(ir_method_emit_name(mname, recv_type))
+    emit_name := ir_method_emit_name(mname, recv_type)
+    if ir_owned_receiver_getter_payload_kind(idx, emit_name).len() > 0:
+        return true
+    return not ir_runtime_getter_borrows_payload(emit_name)
 
 # true when `parent` uses its child ident `name` in a way that leaves the tuple
 # holding the count it was built with, so the cleanup path is the only thing
@@ -6778,6 +6809,16 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             if runtime_opt_kind == "tuple":
                 ir_optional_tuple_dtor_needed = true
             ir_emit_optional_attach_dtor(r, runtime_opt_kind)
+        # a borrowing getter on an owned receiver: the release below can free
+        # the element, so the shell takes its own count on it first
+        owned_getter_kind := ir_owned_receiver_getter_payload_kind(idx, emit_name)
+        if owned_getter_kind.len() > 0:
+            payload_r := ir_reg()
+            ir_emit("field " + payload_r.to_string() + " " + r.to_string() + " 8 unknown value")
+            ir_rc_retain_reg(payload_r, owned_getter_kind)
+            if owned_getter_kind == "tuple":
+                ir_optional_tuple_dtor_needed = true
+            ir_emit_optional_attach_dtor(r, owned_getter_kind)
     # a builtin that may hand an argument straight back out takes no count on
     # either branch, so the caller takes one here — before the release below,
     # which on the hand-back branch drops the very register this just counted.
@@ -9297,6 +9338,19 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
 fn ir_extraction_retains(subject_idx: Int, inner_kind: String, owns_subject: Bool) -> Bool:
     return inner_kind.len() > 0
 
+# whether an owned `if let` subject can be released as soon as the binding
+# takes its count. a tuple payload (an inner optional shell) is an uncounted
+# view whose count stays with the subject, so that subject must live until
+# the merge.
+fn ir_let_subject_releases_early(subj_idx: Int) -> Bool:
+    tid := c_get_expr_type(subj_idx)
+    if tid < 0 or get_type_info(tid).kind != "optional":
+        return false
+    inner_tid := get_type_info(tid).inner
+    if inner_tid < 0:
+        return false
+    return ir_rc_kind(ir_type_from_tid(inner_tid)) != "tuple"
+
 fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() < 3:
         return
@@ -9314,6 +9368,13 @@ fn ir_emit_if_let_stmt(node: Node):
     ir_emit_label(then_l)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    # once the binding holds its own count, an owned shell is dead. releasing
+    # it here, before the body, frees it on paths where the body returns. the
+    # release at the merge below never ran on those paths, so the shell
+    # leaked, and so did any payload it owned.
+    early_release := owns_subject and ir_let_subject_releases_early(node.children[1])
+    if early_release:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     # a weak-field (or weak-local) subject minted a fresh borrowing shell for
     # this one test (ir_emit_weak_read); the binding above took its own count
     # on the payload, so the shell is dead the moment the bindings exist.
@@ -9329,10 +9390,12 @@ fn ir_emit_if_let_stmt(node: Node):
     ir_emit_label(else_l)
     ir_last_was_ret = false
     ir_release_weak_shell(node.children[1], subj_r)
+    if early_release:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     if node.children.len() > 3:
         ir_block(node.children[3])
     ir_emit_label(end_l)
-    if owns_subject:
+    if owns_subject and not early_release:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_last_was_ret = false
 

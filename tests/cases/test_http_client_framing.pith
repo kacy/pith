@@ -1,0 +1,199 @@
+# how http.Client reads response bodies and sends request bodies, against
+# the repo's own http/1.1 server and a raw tcp server that writes canned
+# responses byte for byte: chunked bodies with trailers, bodies that run to
+# the close of the connection, the bodiless answers to HEAD, 204 and 304,
+# gzip decoding, chunked request bodies and Expect: 100-continue.
+
+import std.net.http as http
+import std.compress.gzip as gzip
+import std.bytes as bytes
+import std.time as time_mod
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+# --- the repo's server ---
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/204":
+        return http.response(204)
+    if path == "/304":
+        return http.response(304).header("ETag", "\"v1\"")
+    if path == "/gzip":
+        if (req.header("Accept-Encoding") catch "").index_of("gzip") < 0:
+            return http.text(200, "plain, since gzip was not asked for")
+        return http.response(200).header("Content-Type", "text/plain").header("Content-Encoding", "gzip").with_body_bytes(gzip.compress_string("decoded from gzip"))
+    if path == "/echo":
+        return http.text(200, "{req.method_text} host={masked_host(req.header("Host") catch "?")} te={req.header("Transfer-Encoding") catch ""} len={req.header("Content-Length") catch ""} body={req.body_text() catch "?"}")
+    return http.text(200, "body of " + path)
+
+# the Host value with its port replaced, since the port a run gets varies.
+fn masked_host(host: String) -> String:
+    colon := host.index_of(":")
+    if colon < 0:
+        return host
+    return host.substring(0, colon) + ":<port>"
+
+fn serve_conn(fd: Int) -> Int:
+    return http.serve_connection_fd(fd, route) catch 0
+
+fn http_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn serve_conn(fd)
+    return 0
+
+# --- the raw server ---
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+fn request_path(head: String) -> String:
+    parts := head.split(" ")
+    if parts.len() < 2:
+        return "?"
+    return parts[1]
+
+# the canned response for `path`, and whether the server closes after it.
+fn canned(path: String) -> String:
+    if path == "/chunked":
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nX-Checksum: abc123\r\n\r\n"
+    if path == "/until-close":
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nread until the server closed"
+    if path == "/http10":
+        return "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nold ok"
+    if path == "/interim":
+        return "HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal"
+    return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+
+# serves requests on one connection until it sees a canned response that
+# closes, or the peer goes away. the HEAD answer carries a Content-Length and
+# no body, as rfc 9110 9.3.2 allows.
+fn raw_conn(fd: Int) -> Int:
+    while true:
+        head := read_head(fd)
+        if head == "":
+            break
+        path := request_path(head)
+        if head.starts_with("HEAD "):
+            tcp_write(fd, "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n") catch 0
+            continue
+        tcp_write(fd, canned(path)) catch 0
+        if path == "/until-close" or path == "/http10":
+            break
+    tcp_close(fd)
+    return 0
+
+fn raw_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn raw_conn(fd)
+    return 0
+
+# --- servers for Expect: 100-continue ---
+
+# reads the head, then answers 417 without reading the body.
+fn refuse_conn(fd: Int) -> Int:
+    read_head(fd)
+    tcp_write(fd, "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 4\r\n\r\nnope") catch 0
+    tcp_read(fd, 4096) catch ""
+    tcp_close(fd)
+    return 0
+
+# reads the head, never sends 100 Continue, and answers once the body comes.
+fn silent_conn(fd: Int) -> Int:
+    read_head(fd)
+    body := tcp_read(fd, 4096) catch ""
+    tcp_write(fd, "HTTP/1.1 200 OK\r\nContent-Length: {body.len()}\r\n\r\n{body}") catch 0
+    tcp_read(fd, 4096) catch ""
+    tcp_close(fd)
+    return 0
+
+fn expect_loop(listener: Int, refuse: Bool) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            if refuse:
+                spawn refuse_conn(fd)
+            else:
+                spawn silent_conn(fd)
+    return 0
+
+fn listen_on(start: Int) -> List[Int]!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    return [port, listener]
+
+fn show(resp: http.HttpResponse!) -> String:
+    if resp.is_err:
+        return "error: " + resp.err
+    r := resp.ok
+    return "{r.status} [{r.body_text() catch "?"}]"
+
+fn main() -> String!:
+    std_server := listen_on(21300)!
+    std_server_fd := std_server[1]
+    spawn http_loop(std_server_fd)
+    raw_server := listen_on(21300)!
+    raw_server_fd := raw_server[1]
+    spawn raw_loop(raw_server_fd)
+    base := "http://127.0.0.1:{std_server[0]}"
+    raw := "http://127.0.0.1:{raw_server[0]}"
+    c := http.client()
+
+    chunked := c.get(raw + "/chunked")!
+    print("chunked: {chunked.status} [{chunked.body_text()!}] trailer X-Checksum={chunked.trailers["X-Checksum"]}")
+    print("until close: " + show(c.get(raw + "/until-close")))
+    print("http/1.0 with a length: " + show(c.get(raw + "/http10")))
+    print("103 before the final response: " + show(c.get(raw + "/interim")))
+    head := c.head(raw + "/anything")!
+    print("HEAD with a Content-Length: {head.status}, body {head.body.len()} bytes, Content-Length {head.header_value("Content-Length")}")
+    print("a GET on the same connection after HEAD: " + show(c.get(raw + "/chunked")))
+
+    print("204: " + show(c.get(base + "/204")))
+    not_modified := c.get(base + "/304")!
+    print("304: {not_modified.status}, body {not_modified.body.len()} bytes, ETag {not_modified.header_value("ETag")}")
+    print("HEAD from the std server: " + show(c.head(base + "/x")))
+
+    zipped := c.get(base + "/gzip")!
+    print("gzip: [{zipped.body_text()!}] Content-Encoding [{zipped.header_value("Content-Encoding")}]")
+    print("gzip with compression off: " + show(http.client().with_compression(false).get(base + "/gzip")))
+
+    print("POST with a body: " + show(c.send(http.new_request("POST", base + "/echo")!.body_text("hello"))))
+    print("POST without a body: " + show(c.send(http.new_request("POST", base + "/echo")!)))
+    print("GET without a body: " + show(c.get(base + "/echo")))
+    print("chunked request body: " + show(c.send(http.new_request("PUT", base + "/echo")!.body_text("in chunks").header("Transfer-Encoding", "chunked"))))
+    print("a Host the request names: " + show(c.send(http.get_request("127.0.0.1", std_server[0], "/echo").header("Host", "example.test"))))
+
+    continue_started := time_mod.mono_millis()
+    continued := c.send(http.new_request("POST", base + "/echo")!.body_text("after continue").expect_continue())
+    continue_ms := time_mod.mono_millis() - continue_started
+    print("expect 100-continue, std server: {show(continued)}, before the 1 s wait ran out: {continue_ms < 900}")
+    refusing := listen_on(21300)!
+    refusing_fd := refusing[1]
+    spawn expect_loop(refusing_fd, true)
+    print("expect 100-continue, server answers 417 first: " + show(c.send(http.new_request("POST", "http://127.0.0.1:{refusing[0]}/")!.body_text("never sent").expect_continue())))
+    silent := listen_on(21300)!
+    silent_fd := silent[1]
+    spawn expect_loop(silent_fd, false)
+    started := time_mod.mono_millis()
+    waited := c.with_expect_continue_timeout(150).send(http.new_request("POST", "http://127.0.0.1:{silent[0]}/")!.body_text("sent anyway").expect_continue())
+    elapsed := time_mod.mono_millis() - started
+    print("expect 100-continue, no 100 from the server: {show(waited)}, waited at least 100 ms: {elapsed >= 100}")
+    return ""

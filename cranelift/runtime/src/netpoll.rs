@@ -84,7 +84,8 @@
 
 use crate::concurrency::green;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use crate::int_hash::IntMap;
+use std::collections::BinaryHeap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -180,10 +181,12 @@ struct FdReg {
     armed: u32,
 }
 
-/// one poller's registry, behind its mutex.
+/// one poller's registry, behind its mutex. the maps are keyed by fd numbers
+/// and sequence numbers, so they use the runtime's integer hasher; siphash
+/// would run inside the lock on every park and wake.
 struct Inner {
-    waiters: HashMap<(RawFd, Interest), Vec<Waiter>>,
-    fds: HashMap<RawFd, FdReg>,
+    waiters: IntMap<(RawFd, Interest), Vec<Waiter>>,
+    fds: IntMap<RawFd, FdReg>,
     /// how many entries of `fds` are armed. a disarmed fd cannot report
     /// anything, so only an armed one gives a poll something to find.
     armed_fds: usize,
@@ -191,18 +194,18 @@ struct Inner {
     /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
     /// (fd, interest) to key on, and giving it its own map keeps it out of
     /// `waiters` — where everything is fd-shaped — entirely.
-    timers: HashMap<u64, Waiter>,
+    timers: IntMap<u64, Waiter>,
     next_seq: u64,
 }
 
 impl Inner {
     fn new() -> Self {
         Inner {
-            waiters: HashMap::new(),
-            fds: HashMap::new(),
+            waiters: IntMap::default(),
+            fds: IntMap::default(),
             armed_fds: 0,
             deadlines: BinaryHeap::new(),
-            timers: HashMap::new(),
+            timers: IntMap::default(),
             next_seq: 0,
         }
     }

@@ -109,9 +109,10 @@
 //!   boundary.
 
 use crate::handle_registry::{self, HandleKind};
+use crate::runtime_core::TlsMap;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::{Cell, UnsafeCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
@@ -453,7 +454,7 @@ struct SyncBlock {
     /// entry — see the `tls` field doc on `Task` for why the `Box` indirection
     /// makes the pointer stable). cached here so a resume does not need the
     /// slab lock to find it.
-    tls: UnsafeCell<*mut HashMap<i64, i64>>,
+    tls: UnsafeCell<*mut TlsMap>,
     /// a value handed to this task by its waker (see `wake_with`): written by
     /// the waker right after it claims the task (the Parked -> Ready CAS),
     /// taken by the task itself once it resumes.
@@ -484,7 +485,7 @@ impl SyncBlock {
     /// (unpinned, no pending flags). called from the spawn path before the
     /// task is enqueued, so nothing observes the block mid-reset — the old
     /// task was `Done` and reclaimed, and wakes against either state no-op.
-    fn reset(&self, coro: SendCoroutine, tls: *mut HashMap<i64, i64>) {
+    fn reset(&self, coro: SendCoroutine, tls: *mut TlsMap) {
         // SAFETY: no other thread touches this block between the old task's
         // reclamation and the new task's enqueue (which happens after this).
         unsafe {
@@ -950,7 +951,7 @@ struct Task {
     /// (and move every `Task`) when another task spawns mid-run. the `Box`'s heap
     /// allocation does not move, so a raw pointer to the map stays valid across
     /// such a realloc. see `run_task` and `current_task_tls`.
-    tls: Box<HashMap<i64, i64>>,
+    tls: Box<TlsMap>,
 }
 
 /// one worker's private run queues plus its own park spot. workers are created
@@ -1173,7 +1174,7 @@ thread_local! {
     /// restored immediately after, both inside `run_task`. the runtime's
     /// `threadlocal` FFI reads it (via `current_task_tls`) to route accesses to
     /// the running task's own storage instead of the shared per-OS-thread map.
-    static CURRENT_TLS: Cell<*mut HashMap<i64, i64>> = const { Cell::new(ptr::null_mut()) };
+    static CURRENT_TLS: Cell<*mut TlsMap> = const { Cell::new(ptr::null_mut()) };
 
     /// the slab id of the green task currently running on this worker, or `None`
     /// between tasks and on any non-worker thread. installed around `resume` in
@@ -1275,8 +1276,8 @@ fn set_current_worker(index: Option<usize>) {
 #[inline]
 fn swap_task_identity(
     task: Option<TaskId>,
-    tls: *mut HashMap<i64, i64>,
-) -> (Option<TaskId>, *mut HashMap<i64, i64>) {
+    tls: *mut TlsMap,
+) -> (Option<TaskId>, *mut TlsMap) {
     let prev_task = CURRENT_TASK.with(|c| c.replace(task));
     let prev_tls = CURRENT_TLS.with(|c| c.replace(tls));
     (prev_task, prev_tls)
@@ -1526,7 +1527,7 @@ pub(crate) fn take_handoff(id: TaskId) -> Option<i64> {
 /// initializer thunk (pith code, which can park) may run between a read of
 /// this and the map insert that follows it.
 #[inline]
-pub(crate) fn current_task_tls() -> Option<*mut HashMap<i64, i64>> {
+pub(crate) fn current_task_tls() -> Option<*mut TlsMap> {
     let ptr = CURRENT_TLS.with(|c| c.get());
     if ptr.is_null() {
         None
@@ -2399,7 +2400,7 @@ fn run_task(id: TaskId) {
     // restore whatever was there before (null in the common case; save/restore
     // keeps us correct even if resumes ever nest on one worker).
     //
-    // SAFETY: `tls_ptr` points into the `Box<HashMap>` owned by this task's slab
+    // SAFETY: `tls_ptr` points into the `Box<TlsMap>` owned by this task's slab
     // entry. nothing removes a task from the slab (it only grows), the entry is
     // not dropped while this coroutine runs, and the `Box` heap allocation is
     // stable across slab reallocation — so the pointer is valid for the whole
@@ -2602,13 +2603,13 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             join,
             // fresh, empty thread-local storage: this task starts with no
             // threadlocal slots materialized, exactly like a brand-new OS thread.
-            tls: Box::new(HashMap::new()),
+            tls: Box::new(TlsMap::default()),
         });
         // arm this slot's sync block — coroutine in, word to Ready — before the
         // enqueue below makes the task findable. the tls pointer is taken after
         // the insert so it targets the Box at its final home. inside the slab
         // lock only because insert is; the reset itself needs no lock.
-        let tls_ptr: *mut HashMap<i64, i64> = slab
+        let tls_ptr: *mut TlsMap = slab
             .get_mut(id)
             .map(|task| &mut *task.tls as *mut _)
             // panic-guard: `slab.insert` returned this id on the line above, still under the slab lock.
@@ -2848,9 +2849,9 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
                 }),
                 Condvar::new(),
             )),
-            tls: Box::new(HashMap::new()),
+            tls: Box::new(TlsMap::default()),
         });
-        let tls_ptr: *mut HashMap<i64, i64> = slab
+        let tls_ptr: *mut TlsMap = slab
             .get_mut(id)
             .map(|task| &mut *task.tls as *mut _)
             // panic-guard: `slab.insert` returned this id on the line above, still under the slab lock.
@@ -3078,11 +3079,11 @@ mod tests {
             result: 0,
             reclaim_on_done: false,
             join,
-            tls: Box::new(HashMap::new()),
+            tls: Box::new(TlsMap::default()),
         });
         // mirror green_spawn: arm the sync block (coroutine in, word Ready)
         // before run_task can claim the task.
-        let tls_ptr: *mut HashMap<i64, i64> =
+        let tls_ptr: *mut TlsMap =
             &mut *slab.get_mut(id).expect("freshly inserted task").tls;
         scheduler()
             .sync
@@ -3187,7 +3188,7 @@ mod tests {
             result: 0,
             reclaim_on_done: false,
             join: fresh_join(),
-            tls: Box::new(HashMap::new()),
+            tls: Box::new(TlsMap::default()),
         }
     }
 

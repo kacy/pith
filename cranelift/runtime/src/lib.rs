@@ -51,6 +51,7 @@ pub mod fd_handle;
 pub mod fdio;
 pub mod ffi_util;
 pub mod handle_registry;
+pub(crate) mod int_hash;
 pub mod zstd_codec;
 pub mod host_fs;
 pub mod json;

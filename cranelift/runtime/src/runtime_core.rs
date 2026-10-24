@@ -2418,9 +2418,15 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // initial value. A slot is materialized lazily the first time a thread touches
 // it. Entries are not reclaimed at thread exit — bounded by the number of
 // threadlocal globals, retained for the life of the process by design.
+//
+// The slots are small integers the compiler hands out, so the maps use the
+// runtime's integer hasher; with siphash, the lookups std.io and std.json make
+// on every buffered write and json scope cost an http server a few percent of
+// its cpu.
+pub(crate) type TlsMap = crate::int_hash::IntMap<i64, i64>;
+
 thread_local! {
-    static TLS_GLOBALS: std::cell::RefCell<std::collections::HashMap<i64, i64>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static TLS_GLOBALS: std::cell::RefCell<TlsMap> = std::cell::RefCell::new(TlsMap::default());
 }
 
 /// Under the green backend, the map backing the currently-running task's
@@ -2430,7 +2436,7 @@ thread_local! {
 /// untouched: one worker OS thread per task there means per-OS-thread already is
 /// per-task. Under green, one worker runs many tasks, so we must route to the
 /// task's own map instead of sharing the worker's.
-fn green_task_tls() -> Option<*mut std::collections::HashMap<i64, i64>> {
+fn green_task_tls() -> Option<*mut TlsMap> {
     use crate::concurrency::scheduler::{backend, Backend};
     if backend() != Backend::Green {
         return None;
@@ -2448,7 +2454,7 @@ fn green_task_tls() -> Option<*mut std::collections::HashMap<i64, i64>> {
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
     if let Some(map) = green_task_tls() {
-        // SAFETY: `map` points into the `Box<HashMap>` owned by the green task
+        // SAFETY: `map` points into the `Box<TlsMap>` owned by the green task
         // currently running on this worker thread. `green` installs it around
         // `resume` and clears it after, so it is valid for the whole synchronous
         // duration of this pith call, and only this worker thread touches it. we

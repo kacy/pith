@@ -1231,24 +1231,23 @@ pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     if std::ptr::eq(a, b) {
         return 1;
     }
-
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa;
-        let cb = *pb;
-
-        if ca != cb {
-            return 0;
-        }
-
-        if ca == 0 {
-            return 1;
-        }
-
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // most unequal pairs differ in the first byte, which settles it before
+    // either length is taken. an empty string's first byte is its zero
+    // terminator, so this holds for empty strings too.
+    if *a != *b {
+        return 0;
     }
+    // compare by length, then bytes. a heap string's length is one header
+    // read, and a string holding a zero byte compares in full rather than
+    // stopping at the zero.
+    let la = crate::string::pith_cstring_len(a) as usize;
+    let lb = crate::string::pith_cstring_len(b) as usize;
+    if la != lb {
+        return 0;
+    }
+    let sa = std::slice::from_raw_parts(a as *const u8, la);
+    let sb = std::slice::from_raw_parts(b as *const u8, lb);
+    (sa == sb) as i64
 }
 
 #[no_mangle]
@@ -2214,19 +2213,14 @@ pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64
     if b.is_null() {
         return 1;
     }
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa as u8;
-        let cb = *pb as u8;
-        if ca != cb {
-            return if ca < cb { -1 } else { 1 };
-        }
-        if ca == 0 {
-            return 0;
-        }
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // compare the full bytes so a zero byte inside a string does not end
+    // the compare; a string that is a prefix of the other sorts first
+    let sa = std::slice::from_raw_parts(a as *const u8, crate::string::pith_cstring_len(a) as usize);
+    let sb = std::slice::from_raw_parts(b as *const u8, crate::string::pith_cstring_len(b) as usize);
+    match sa.cmp(sb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 

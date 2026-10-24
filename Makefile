@@ -1376,7 +1376,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_sort_engine tests/cases/test_sort_key_once \
 	tests/cases/test_http_head_read_shapes tests/cases/test_csv_encode_quoting \
 	tests/cases/test_path_clean_part_count \
-	tests/cases/test_substring_search
+	tests/cases/test_substring_search \
+	tests/cases/test_temp_result_use
 
 memcheck: build memcheck-only
 

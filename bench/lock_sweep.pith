@@ -1,0 +1,117 @@
+# lock_sweep — how shared std and runtime state behaves as tasks are added.
+#
+#   pith build bench/lock_sweep.pith
+#   ./bench/lock_sweep <mode> <tasks> <ops>
+#
+# every run does the same total number of operations, split evenly across
+# `tasks` tasks, and prints the elapsed milliseconds. state that scales prints
+# the same time or less as tasks are added; state behind one lock prints more.
+# compare a mode at 1 task with the same mode at the worker count.
+#
+# modes:
+#   log        log.debug with the level at info, so every call is filtered out.
+#              a service with debug logging off still makes these calls.
+#   spawn      each op spawns a trivial task and awaits it.
+#   labels     metrics.counter(name).labels(pairs).inc(), the std.net.http
+#              pattern, which looks the series up on every write.
+#   breaker    a circuit breaker's allow() and success(), one breaker per task.
+#   trace      a recording span started and ended, with the span sink on.
+#   readfile   std.fs.read of this source file, which green runs on the file
+#              pool's threads.
+
+import std.fs as fs
+import std.log as log
+import std.metrics as metrics
+import std.resilience as resilience
+import std.trace as trace
+
+fn trivial(n: Int) -> Int:
+    return n + 1
+
+fn log_worker(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        log.debug("filtered out")
+        i = i + 1
+    return n
+
+fn spawn_worker(n: Int) -> Int:
+    mut i := 0
+    mut sum := 0
+    while i < n:
+        sum = sum + await spawn trivial(i)
+        i = i + 1
+    return n
+
+fn labels_worker(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        metrics.counter("lock_sweep_requests").labels(["route", "/api", "method", "GET"]).inc()
+        i = i + 1
+    return n
+
+fn breaker_worker(n: Int) -> Int:
+    breaker := resilience.circuit_breaker(5, 1000)
+    mut i := 0
+    while i < n:
+        if breaker.allow():
+            breaker.success()
+        i = i + 1
+    return n
+
+fn trace_worker(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        span := trace.start("op")
+        span.end()
+        if i % 1024 == 0:
+            trace.drain_finished_spans()
+        i = i + 1
+    return n
+
+fn readfile_worker(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        fs.read("bench/lock_sweep.pith") catch ""
+        i = i + 1
+    return n
+
+fn run_worker(mode: String, n: Int) -> Int:
+    if mode == "log":
+        return log_worker(n)
+    if mode == "spawn":
+        return spawn_worker(n)
+    if mode == "labels":
+        return labels_worker(n)
+    if mode == "breaker":
+        return breaker_worker(n)
+    if mode == "trace":
+        return trace_worker(n)
+    if mode == "readfile":
+        return readfile_worker(n)
+    print("unknown mode {mode}")
+    return 0
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 4:
+        print("usage: lock_sweep <log|spawn|labels|breaker|trace|readfile> <tasks> <ops>")
+        return 1
+    mode := argv[1]
+    tasks := parse_int(argv[2])!
+    ops := parse_int(argv[3])!
+    log.set_level(log.info_level())
+    trace.set_active(true)
+    trace.set_sink(true)
+    per := ops / tasks
+    start := time()
+    mut running: List[Task[Int]] := []
+    mut t := 0
+    while t < tasks:
+        running.push(spawn run_worker(mode, per))
+        t = t + 1
+    mut done := 0
+    for task in running:
+        done = done + await task
+    print("mode={mode} tasks={tasks} ops={done} elapsed_ms={time() - start}")
+    return 0

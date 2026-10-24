@@ -1093,3 +1093,70 @@ workers take part of a busy worker's pinned backlog evened the spread but
 did not raise throughput here, because `wrk` ran on the same machine and
 used the cores the idle workers would have had. It needs a separate client
 machine to measure.
+
+## global lock sweep (2026-10-24)
+
+After the scaling work above, `bench/lock_sweep.pith` measures shared state
+that the HTTP benchmarks do not exercise. Every mode does the same total work
+split across `tasks` tasks, so state that scales prints the same time or less
+as tasks are added, and state behind one lock prints more:
+
+```
+pith build bench/lock_sweep.pith
+./bench/lock_sweep spawn 1 1600000
+./bench/lock_sweep spawn 32 1600000
+```
+
+`bench/tls_server.pith` is `http_server`'s shape over TLS, with the
+live-test fixture certificate. Load it with `wrk https://127.0.0.1:<port>/`.
+
+On the 32-thread Ryzen 9 9950X, at 32 workers, before and after the sweep:
+
+| benchmark | before | after |
+|---|---:|---:|
+| `http_server`, `wrk -t 8 -c 256` | 870k req/s | 1.19M req/s |
+| `web_hello`, same load | 696k req/s | 1.04M req/s |
+| `tls_server`, same load, keep-alive | 138k req/s | 1.11M req/s |
+| `lock_sweep log`: filtered `log.debug`, 1 / 32 tasks | 172 / 431 ms | 32 / 17 ms |
+| `lock_sweep spawn`: spawn and await, 1 / 32 tasks | 885 / 2,741 ms | 725 / 157 ms |
+| `lock_sweep breaker`: a breaker per task, 1 / 32 tasks | 71 / 1,711 ms | 55 / 23 ms |
+| `lock_sweep trace`: span start and end, 1 / 32 tasks | 7,596 / 4,531 ms | 5,870 / 968 ms |
+| `lock_sweep labels`: labeled counter write, 1 / 32 tasks | 4,090 / 1,816 ms | 4,080 / 477 ms |
+| `metrics_contention 5 4000000 32 labels` | 40,135 ms | 1,198 ms |
+
+Each row was a single global lock on a per-operation path:
+
+- The handle registry still had a lock per shard on every list allocation and
+  free, and maps and sets registered there although nothing ever read their
+  entries. Maps and sets no longer register, and the list registry uses a
+  cheap hash and 256 shards.
+- Every `AtomicInt` operation validated its handle through that registry, so
+  the lock-free integer took a lock. Cells are now checked by magic word.
+- The green task slab had one lock for every spawn, finish and reclaim, and
+  the stack pool one for every stack taken and returned. The slab is sharded
+  by blocks of task ids, and each worker keeps its own stack cache.
+- `log.debug` took the settings lock before checking the level. The level is
+  now mirrored in an atomic and checked first.
+- Every rate limiter and circuit breaker shared one module lock. Each now
+  has its own.
+- `uuid.v7` took a mutex for its counter, twice per root trace span; it is now
+  one atomic. Secure random bytes opened `/dev/urandom` per call, and the
+  open and close contended on the process's fd table; Linux now uses
+  `getrandom`. The finished-span buffer is sharded by trace id.
+- Every labeled metric write resolved its series under the shard lock of
+  that series, so tasks writing one hot series queued on one lock. Each task
+  now caches the series it has resolved.
+- Every TLS read and write looked its connection up in one map under one
+  lock. The registry is sharded by handle.
+
+Two limits the sweep found are not locks. TLS handshakes are CPU-bound in
+RSA-PSS signing and SHA-2, and reach about 14k per second at 32 workers.
+`lock_sweep readfile` stops scaling at 4 tasks, the file pool's thread cap,
+and a larger cap made it slower, because jobs then landed on sleeping pool
+threads instead of spinning ones. The `readfile` mode also exposed a lost wake
+in the blocking pool that could park a task forever; that fix is separate.
+
+The remaining module-wide locks are in `std.web.session` (every session
+access), the Postgres and MySQL pool registries (every acquire and release),
+`std.crypto.jwks`, gRPC stream tracking and `std.shutdown`. None appeared in
+the profiles above, but none of these benchmarks exercises them.

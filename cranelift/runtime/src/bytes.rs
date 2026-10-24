@@ -1,5 +1,4 @@
 use crate::ffi_util::{cstr_bytes, write_result, ResultPair};
-use std::io::Read;
 
 #[repr(C)]
 pub(crate) struct PithBytes {
@@ -295,10 +294,46 @@ pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
         return pith_bytes_from_vec(out);
     }
 
-    match std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut out)) {
-        Ok(()) => pith_bytes_from_vec(out),
-        Err(_) => 0,
+    if fill_secure_random(&mut out) {
+        pith_bytes_from_vec(out)
+    } else {
+        0
     }
+}
+
+/// fill `out` from the kernel's random source. on linux that is one
+/// `getrandom` call: opening `/dev/urandom` per request cost an open, a read
+/// and a close, and the open and close contend on the process's fd table, so
+/// 32 tasks minting trace ids spent most of their time there.
+#[cfg(target_os = "linux")]
+fn fill_secure_random(out: &mut [u8]) -> bool {
+    let mut filled = 0;
+    while filled < out.len() {
+        // SAFETY: the pointer and length name the unfilled tail of `out`.
+        let n = unsafe {
+            libc::getrandom(
+                out[filled..].as_mut_ptr() as *mut libc::c_void,
+                out.len() - filled,
+                0,
+            )
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        filled += n as usize;
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fill_secure_random(out: &mut [u8]) -> bool {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(out))
+        .is_ok()
 }
 
 /// Free a byte buffer: single-owner lifecycle, no refcount. After this

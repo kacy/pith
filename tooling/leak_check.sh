@@ -193,6 +193,8 @@ cases=(
   tests/leaks/leak_tls_config_drop
   tests/leaks/leak_http_string_head_flood
   tests/leaks/leak_http_head_read
+  tests/leaks/leak_http_request_parse
+  tests/leaks/leak_http_response_paths
   tests/leaks/leak_csv_encode
   tests/leaks/leak_path_clean_count
   tests/leaks/leak_metrics_scrape

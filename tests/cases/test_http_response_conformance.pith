@@ -1,0 +1,171 @@
+import std.net.http as http
+import std.io as io
+import std.bytes as bytes
+
+# response conformance for the http/1.1 server (rfc 9110, rfc 9112).
+#
+# each case sends raw request bytes down one in-memory connection through
+# http.serve_connection, followed by a valid `GET /after` request, and prints
+# every byte the server wrote with CRLF shown as `|`. a Date field is checked
+# for the IMF-fixdate shape and printed as `Date: <imf-fixdate>`, since its
+# value changes from run to run. a response that closes the connection shows
+# up as the missing `/after` answer.
+#
+# every case runs twice, once with a reader that fills 4096 bytes at a time and
+# once with one that fills 3, so an expectation or body split across reads
+# takes the same path as one that arrives whole.
+
+AFTER := "GET /after HTTP/1.1\r\nHost: h\r\n\r\n"
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/after":
+        return http.text(200, "after")
+    if path == "/text":
+        return http.text(200, "hello")
+    if path == "/echo":
+        return http.text(200, req.body_text() catch "?")
+    if path == "/own-date":
+        return http.text(200, "x").header("Date", "Sun, 06 Nov 1994 08:49:37 GMT")
+    if path == "/204":
+        return http.response(204).header("Content-Length", "5").with_body_text("abc")
+    if path == "/304":
+        return http.response(304).header("ETag", "\"v1\"").with_body_text("abc")
+    if path == "/304-length":
+        return http.response(304).header("Content-Length", "42")
+    if path == "/103":
+        return http.response(103).header("Link", "</s.css>").with_body_text("abc")
+    if path == "/head-length":
+        return http.response(200).header("Content-Length", "1234")
+    if path == "/wrong-length":
+        return http.text(200, "hello").header("Content-Length", "99")
+    if path == "/te":
+        return http.text(200, "hello").header("Transfer-Encoding", "chunked")
+    if path == "/close":
+        return http.text(200, "x").close_connection()
+    if path == "/keep-alive":
+        return http.text(200, "x").keep_alive()
+    if path == "*":
+        return http.response(200).header("Allow", "GET, OPTIONS")
+    return http.not_found_response()
+
+fn is_digit_at(s: String, i: Int) -> Bool:
+    b := ord(s[i])
+    return b >= 48 and b <= 57
+
+# the IMF-fixdate shape (rfc 9110 5.6.7): "Sun, 06 Nov 1994 08:49:37 GMT".
+fn is_imf_fixdate(value: String) -> Bool:
+    if value.len() != 29:
+        return false
+    days := ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    months := ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    if not days.contains(value.substring(0, 3)) or not months.contains(value.substring(8, 11)):
+        return false
+    if value.substring(3, 5) != ", " or value[7] != " " or value[11] != " " or value[16] != " " or value[19] != ":" or value[22] != ":" or value.substring(25, 29) != " GMT":
+        return false
+    for i in [5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24]:
+        if not is_digit_at(value, i):
+            return false
+    return true
+
+# the wire text with CRLF shown as `|` and each Date value replaced by its shape.
+fn render(wire: String) -> String:
+    mut lines: List[String] := []
+    for line in wire.split("\r\n"):
+        if line.starts_with("Date: "):
+            value := line.substring(6, line.len())
+            if value == "Sun, 06 Nov 1994 08:49:37 GMT":
+                lines.push(line)
+            elif is_imf_fixdate(value):
+                lines.push("Date: <imf-fixdate>")
+            else:
+                lines.push("Date: BAD [" + value + "]")
+        else:
+            lines.push(line)
+    return lines.join("|")
+
+fn run_once(raw: Bytes, chunk: Int) -> String:
+    reader := io.bytes_reader(raw.concat(bytes.from_string_utf8(AFTER))).buffered_chunked(chunk)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    http.serve_connection(reader, writer, route) catch 0
+    writer.flush() catch 0
+    out := bytes.decode_utf8(sink.bytes())
+    reader.free()
+    writer.free()
+    sink.free()
+    if out.is_err:
+        return "non-utf8 response"
+    return render(out.ok)
+
+fn check(name: String, text: String):
+    raw := bytes.from_string_utf8(text)
+    whole := run_once(raw, 4096)
+    split := run_once(raw, 3)
+    if whole != split:
+        print(name + ": " + whole + " (split reads: " + split + ")")
+    else:
+        print(name + ": " + whole)
+
+fn status_line_of(status: Int) -> String:
+    wire := http.response(status).to_string() catch "?"
+    return wire.substring(0, wire.index_of("\r\n"))
+
+fn main() -> Int:
+    print("-- date --")
+    check("date on every response", "GET /text HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("handler date kept", "GET /own-date HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("date on a refused request", "GET / HTTP/1.1\r\n\r\n")
+    print(http.http_date(784111777))
+    print(http.http_date(0))
+    print(http.http_date(951782400))
+    print(http.http_date(1767225599))
+
+    print("-- head --")
+    check("head", "HEAD /text HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("head explicit length", "HEAD /head-length HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("head not found", "HEAD /missing HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("get explicit length", "GET /head-length HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- bodiless statuses --")
+    check("204", "GET /204 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("304", "GET /304 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("304 explicit length", "GET /304-length HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("1xx", "GET /103 HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- content-length --")
+    check("wrong explicit length", "GET /wrong-length HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("handler transfer-encoding", "GET /te HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- expect --")
+    check("100-continue", "POST /echo HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc")
+    check("100-continue case", "POST /echo HTTP/1.1\r\nHost: h\r\nExpect: 100-Continue\r\nContent-Length: 3\r\n\r\nabc")
+    check("100-continue chunked", "POST /echo HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+    check("100-continue without body", "GET /text HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n\r\n")
+    check("100-continue on http/1.0", "POST /echo HTTP/1.0\r\nConnection: keep-alive\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc")
+    check("unknown expectation", "POST /echo HTTP/1.1\r\nHost: h\r\nExpect: something\r\nContent-Length: 3\r\n\r\nabc")
+    check("unknown expectation without body", "GET /text HTTP/1.1\r\nHost: h\r\nExpect: something\r\n\r\n")
+    check("unknown expectation on http/1.0", "GET /text HTTP/1.0\r\nConnection: keep-alive\r\nExpect: something\r\n\r\n")
+
+    print("-- connection --")
+    check("http/1.1 persistent", "GET /text HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("http/1.1 close", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+    check("http/1.1 close case", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: Close\r\n\r\n")
+    check("http/1.1 close in a list", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\n")
+    check("http/1.1 close in a later field", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: upgrade\r\nConnection: close\r\n\r\n")
+    check("http/1.1 closed is not close", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: closed\r\n\r\n")
+    check("http/1.1 keep-alive", "GET /text HTTP/1.1\r\nHost: h\r\nConnection: keep-alive\r\n\r\n")
+    check("http/1.0 default", "GET /text HTTP/1.0\r\n\r\n")
+    check("http/1.0 keep-alive", "GET /text HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    check("http/1.0 keep-alive case", "GET /text HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n")
+    check("http/1.0 keep-alive in a list", "GET /text HTTP/1.0\r\nConnection: foo, keep-alive\r\n\r\n")
+    check("handler close", "GET /close HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("handler keep-alive", "GET /keep-alive HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- options --")
+    check("options asterisk", "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- status lines --")
+    for status in [100, 101, 103, 200, 201, 202, 203, 204, 205, 206, 300, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 421, 422, 426, 428, 429, 431, 451, 500, 501, 502, 503, 504, 505, 511, 299, 599]:
+        print(status_line_of(status) + "|")
+    return 0

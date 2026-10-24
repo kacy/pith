@@ -12,6 +12,7 @@
 #       else:
 #           http.send_response(fd, http.not_found())
 import std.bytes as bytes
+import std.datetime as datetime
 import std.encoding as encoding
 import std.fs as fs
 import std.json as json_mod
@@ -81,7 +82,15 @@ HTTP_RESPONSE_BODY_NONE := 0
 HTTP_RESPONSE_BODY_EXACT := 1
 HTTP_RESPONSE_BODY_CHUNKED := 2
 HTTP_RESPONSE_BODY_UNTIL_CLOSE := 3
-# raw request parts plus lazy decoded helpers for bytes-first request handling.
+# raw request parts plus decoded helpers for bytes-first request handling.
+#
+# a request read off the wire decodes only its request line up front. the
+# header fields, query parameters, path segments and body text are read from
+# `head` and `body` when a method asks for them, so headers_text,
+# body_text_cache, query_map and path_parts_cache stay empty, and header_map
+# holds only fields that replace the head's, such as the Host an absolute-form
+# target names. a request built directly with these fields filled still works:
+# each method prefers what the fields hold.
 pub struct HttpRequestBytes:
     pub head: Bytes
     pub body: Bytes
@@ -455,8 +464,17 @@ fn encode_multipart(parts: List[MultipartPart], boundary: String) -> Bytes!:
     out.write_string_utf8("--" + boundary + "--" + crlf)!
     return out.take_bytes()
 
+# header names compare ascii case-insensitively (rfc 9110 5.1), without
+# allocating a lowered copy of either.
 fn header_key_matches(left: String, right: String) -> Bool:
-    return left.to_lower() == right.to_lower()
+    if left.len() != right.len():
+        return false
+    mut i := 0
+    while i < left.len():
+        if ascii_lower(ord(left[i])) != ascii_lower(ord(right[i])):
+            return false
+        i = i + 1
+    return true
 
 fn header_lookup(headers: Map[String, String], name: String) -> String:
     for key in headers:
@@ -768,46 +786,509 @@ fn header_value_bytes(raw_head: Bytes, name: String) -> Bytes:
         pos = pos + 1
     return bytes.empty()
 
-fn request_headers_map(raw_head: Bytes) -> Map[String, String]!:
+# the value of every `name` field in a request head, joined with ", " in the
+# order they arrived (rfc 9110 5.3), or "" when there is none. Set-Cookie is
+# never combined: the first value wins. Cookie fields are joined with "; ", the
+# separator rfc 9113 8.2.3 uses when http/2 splits them. the head is scanned on
+# each call instead of being decoded into a map up front, since most handlers
+# read only a few fields.
+fn head_header_value(raw_head: Bytes, name: String) -> String:
+    hdrs := headers_bytes(raw_head)
+    mut first_start := 0 - 1
+    mut first_end := 0
+    mut joined := ""
+    mut combined := false
+    mut line_start := 0
+    while line_start < hdrs.len():
+        mut nl := find_byte(hdrs, line_start, 10)
+        if nl < 0:
+            nl = hdrs.len()
+        line_end := trim_trailing_cr(hdrs, line_start, nl)
+        colon := line_start + name.len()
+        if colon < line_end and hdrs[colon] == 58 and header_name_matches(hdrs, line_start, colon, name):
+            value_start := trim_ascii_start(hdrs, colon + 1, line_end)
+            value_end := trim_ascii_end(hdrs, value_start, line_end)
+            if first_start < 0:
+                first_start = value_start
+                first_end = value_end
+            elif not header_key_matches(name, "Set-Cookie"):
+                if not combined:
+                    joined = decode_utf8(hdrs.slice(first_start, first_end)) catch ""
+                    combined = true
+                mut separator := ", "
+                if header_key_matches(name, "Cookie"):
+                    separator = "; "
+                joined = joined + separator + (decode_utf8(hdrs.slice(value_start, value_end)) catch "")
+        line_start = nl + 1
+    if combined:
+        return joined
+    if first_start < 0:
+        return ""
+    return decode_utf8(hdrs.slice(first_start, first_end)) catch ""
+
+# every field in a request head as a map, with lowercase names and repeated
+# fields combined as head_header_value does.
+fn head_header_fields(raw_head: Bytes) -> Map[String, String]:
     mut result: Map[String, String] := {}
     hdrs := headers_bytes(raw_head)
     mut line_start := 0
-    mut pos := 0
-    while pos <= hdrs.len():
-        at_end := pos == hdrs.len()
-        mut at_nl := false
-        if not at_end:
-            at_nl = hdrs[pos] == 10
-        if at_end or at_nl:
-            line_end := trim_trailing_cr(hdrs, line_start, pos)
-            if line_end > line_start:
-                colon := find_byte(hdrs, line_start, 58)
-                if colon > line_start and colon < line_end:
-                    key := decode_utf8(hdrs.slice(line_start, colon))!
-                    value_start := trim_ascii_start(hdrs, colon + 1, line_end)
-                    value_end := trim_ascii_end(hdrs, value_start, line_end)
-                    value := decode_utf8(hdrs.slice(value_start, value_end))!
-                    result = header_with(result, key.trim(), value)
-            line_start = pos + 1
-        pos = pos + 1
+    while line_start < hdrs.len():
+        mut nl := find_byte(hdrs, line_start, 10)
+        if nl < 0:
+            nl = hdrs.len()
+        line_end := trim_trailing_cr(hdrs, line_start, nl)
+        colon := find_byte(hdrs, line_start, 58)
+        if colon > line_start and colon < line_end:
+            key := (decode_utf8(hdrs.slice(line_start, colon)) catch "").trim().to_lower()
+            if key != "" and not result.contains_key(key):
+                result.insert(key, head_header_value(raw_head, key))
+        line_start = nl + 1
     return result
 
-# parse a raw request head (the request line plus header lines) and body bytes
-# into an HttpRequestBytes, decoding the method, path, query, version, and
-# headers. other transports (e.g. the http/2 server, which synthesizes an
-# http/1.1 head from the request pseudo-headers) build a request through here so
-# they reuse the same parsing, params, and query handling.
+# lenient parse of a request head (the request line plus header lines) and body
+# bytes into an HttpRequestBytes. the http/2 server synthesizes an http/1.1 head
+# from the request pseudo-headers and builds its requests here, so both servers
+# hand handlers the same type. nothing is validated: the wire readers run
+# parse_request_head first. header fields, query parameters and path segments
+# are read from the head when a handler asks for them.
 pub fn build_http_request(head: Bytes, body: Bytes) -> HttpRequestBytes!:
     method_text := decode_utf8(request_line_field_bytes(head, 0))!
     path_text := decode_utf8(request_target_path_bytes(head))!
     query_text := decode_utf8(request_target_query_bytes(head))!
     version_text := decode_utf8(request_line_field_bytes(head, 2))!
-    headers_text := decode_utf8(headers_bytes(head))!
-    body_text := decode_utf8(body) catch ""
-    headers_map := request_headers_map(head)!
-    query_map := query_params_map_from_string(query_text)
-    path_parts := path_segments(path_text)
-    return HttpRequestBytes(head, body, method_text, path_text, query_text, version_text, headers_text, body_text, headers_map, query_map, path_parts)
+    return HttpRequestBytes(head, body, method_text, path_text, query_text, version_text, "", "", {}, {}, [])
+
+# the request a reader returns when the peer closed with nothing pending.
+fn empty_request() -> HttpRequestBytes:
+    return HttpRequestBytes(bytes.empty(), bytes.empty(), "", "", "", "", "", "", {}, {}, [])
+
+# ===============================================================
+# Request Validation
+# ===============================================================
+# the longest request-target the server accepts. a longer one gets 414
+# (rfc 9112 3), well before the head as a whole reaches MAX_HEADER_BYTES.
+pub MAX_REQUEST_TARGET_BYTES := 8192
+
+# the bounds a decimal wire integer is checked against before each digit.
+DECIMAL_INT_MAX_DIV10 := 922337203685477580
+DECIMAL_INT_MAX_LAST_DIGIT := 7
+
+# the failures parse_request_head and the body readers report. the serve loops
+# turn each into its status with request_error_status. a failure without one of
+# these shapes (eof in the middle of a request, a dropped socket) closes the
+# connection without a response.
+BAD_REQUEST_PREFIX := "http: bad request: "
+NOT_IMPLEMENTED_PREFIX := "http: not implemented: "
+TARGET_LIMIT_MESSAGE := "http: request target exceeds the maximum"
+VERSION_MESSAGE := "http: http version not supported"
+INCOMPLETE_HEAD_MESSAGE := "http: request head ended early"
+EXPECTATION_MESSAGE := "http: expectation failed"
+
+fn bad_request(reason: String) -> String:
+    return BAD_REQUEST_PREFIX + reason
+
+# the status the server answers a request-reading failure with, or 0 when it
+# should close the connection without answering.
+fn request_error_status(message: String) -> Int:
+    if message.starts_with(BAD_REQUEST_PREFIX):
+        return 400
+    if message == HEADER_LIMIT_MESSAGE:
+        return 431
+    if message == BODY_LIMIT_MESSAGE:
+        return 413
+    if message == TARGET_LIMIT_MESSAGE:
+        return 414
+    if message.starts_with(NOT_IMPLEMENTED_PREFIX):
+        return 501
+    if message == VERSION_MESSAGE:
+        return 505
+    if message == EXPECTATION_MESSAGE:
+        return 417
+    return 0
+
+# a request head checked by parse_request_head. `head` starts at the request
+# line, and the offsets index it. the target's path is path_start..path_end
+# and its query query_start..target_end (query_start is -1 without a "?").
+# authority_start..authority_end is the authority of an absolute-form or
+# authority-form target, which replaces the Host field (rfc 9112 3.2.2), or -1.
+# `expect` is one of the EXPECT_ codes, and `wants_close` is whether the
+# Connection field asks to close after this exchange (rfc 9112 9.3).
+struct RequestHead:
+    head: Bytes
+    method_end: Int
+    target_end: Int
+    path_start: Int
+    path_end: Int
+    query_start: Int
+    authority_start: Int
+    authority_end: Int
+    minor: Int
+    content_length: Int
+    chunked: Bool
+    expect: Int
+    wants_close: Bool
+
+# what an Expect field asks for (rfc 9110 10.1.1): nothing, a 100 Continue
+# before the body, or something this server does not do.
+EXPECT_NONE := 0
+EXPECT_CONTINUE := 1
+EXPECT_OTHER := 2
+
+# whether the comma-separated list in data[start..end] holds `token`, compared
+# case-insensitively (rfc 9110 5.6.1). empty elements are skipped.
+fn list_has_token(data: Bytes, start: Int, end: Int, token: String) -> Bool:
+    mut item := start
+    while item < end:
+        mut item_end := item
+        while item_end < end and data[item_end] != 44:
+            item_end = item_end + 1
+        token_start := trim_ascii_start(data, item, item_end)
+        if header_name_matches(data, token_start, trim_ascii_end(data, token_start, item_end), token):
+            return true
+        item = item_end + 1
+    return false
+
+# whether a request's Connection options mean the connection closes after it
+# (rfc 9112 9.3): http/1.0 closes unless it asks for keep-alive, and either
+# version closes when it names close.
+fn connection_closes(http10: Bool, has_close: Bool, has_keep_alive: Bool) -> Bool:
+    return has_close or (http10 and not has_keep_alive)
+
+# tchar (rfc 9110 5.6.2), the bytes of a method or a field name.
+fn is_tchar(b: Int) -> Bool:
+    if b >= 97 and b <= 122:
+        return true
+    if b >= 65 and b <= 90:
+        return true
+    if b >= 48 and b <= 57:
+        return true
+    return b == 33 or (b >= 35 and b <= 39) or b == 42 or b == 43 or b == 45 or b == 46 or b == 94 or b == 95 or b == 96 or b == 124 or b == 126
+
+fn is_digit(b: Int) -> Bool:
+    return b >= 48 and b <= 57
+
+# a control byte other than HTAB, which no field value or chunk extension may
+# hold. obs-text (0x80 and up) is allowed.
+fn is_ctl(b: Int) -> Bool:
+    return (b < 32 and b != 9) or b == 127
+
+# the bytes a Host value or an authority may hold: the reg-name, IP-literal
+# and port characters of rfc 3986. userinfo ("@") is refused, as rfc 9110
+# 4.2.4 asks, and so is anything that would end the authority.
+fn is_host_byte(b: Int) -> Bool:
+    if b >= 97 and b <= 122:
+        return true
+    if b >= 65 and b <= 90:
+        return true
+    if b >= 48 and b <= 57:
+        return true
+    return b == 33 or (b >= 36 and b <= 46) or b == 58 or b == 59 or b == 61 or b == 91 or b == 93 or b == 95 or b == 126
+
+fn valid_host(data: Bytes, start: Int, end: Int) -> Bool:
+    mut i := start
+    while i < end:
+        if not is_host_byte(data[i]):
+            return false
+        i = i + 1
+    return true
+
+# data[start..end] equals `text`, byte for byte.
+fn bytes_equal_text(data: Bytes, start: Int, end: Int, text: String) -> Bool:
+    if end - start != text.len():
+        return false
+    mut i := 0
+    while i < text.len():
+        if data[start + i] != ord(text[i]):
+            return false
+        i = i + 1
+    return true
+
+# the offset past the empty lines at `start`, each one LF or CRLF.
+fn skip_empty_lines(data: Bytes, start: Int) -> Int:
+    mut pos := start
+    while pos < data.len():
+        if data[pos] == 10:
+            pos = pos + 1
+        elif data[pos] == 13 and pos + 1 < data.len() and data[pos + 1] == 10:
+            pos = pos + 2
+        else:
+            return pos
+    return pos
+
+# true when `head` holds nothing but empty lines.
+fn only_empty_lines(head: Bytes) -> Bool:
+    return not head.is_empty() and skip_empty_lines(head, 0) == head.len()
+
+# "HTTP/" DIGIT "." DIGIT at `pos` (rfc 9112 2.3).
+fn is_http_version(data: Bytes, pos: Int) -> Bool:
+    if pos + 8 > data.len():
+        return false
+    return data[pos] == 72 and data[pos + 1] == 84 and data[pos + 2] == 84 and data[pos + 3] == 80 and data[pos + 4] == 47 and is_digit(data[pos + 5]) and data[pos + 6] == 46 and is_digit(data[pos + 7])
+
+# a Content-Length value: one or more digits and nothing else (rfc 9110 8.6).
+fn parse_content_length(data: Bytes, start: Int, end: Int) -> Int!:
+    if start >= end:
+        fail bad_request("empty Content-Length")
+    mut value := 0
+    mut pos := start
+    while pos < end:
+        b := data[pos]
+        if not is_digit(b):
+            fail bad_request("invalid Content-Length")
+        digit := b - 48
+        if value > DECIMAL_INT_MAX_DIV10 or (value == DECIMAL_INT_MAX_DIV10 and digit > DECIMAL_INT_MAX_LAST_DIGIT):
+            fail bad_request("Content-Length overflows")
+        value = value * 10 + digit
+        pos = pos + 1
+    return value
+
+# check a request head in one pass and record where its parts are, following
+# rfc 9112 2-7 and rfc 9110 for the field checks. `raw` runs through the empty
+# line that ends the head. `server` adds the Host checks an origin server
+# makes (rfc 9112 3.2): a reader that only parses requests skips them, as
+# go's http.ReadRequest does.
+#
+# a failure carries the status it should be answered with; see
+# request_error_status.
+fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
+    # rfc 9112 2.2: empty lines before the request line are ignored
+    skipped := skip_empty_lines(raw, 0)
+    mut head := raw
+    if skipped > 0:
+        head = raw.slice(skipped, raw.len())
+    n := head.len()
+
+    # request-line = method SP request-target SP HTTP-version (rfc 9112 3)
+    mut pos := 0
+    while pos < n and is_tchar(head[pos]):
+        pos = pos + 1
+    method_end := pos
+    if method_end == 0 or pos >= n or head[pos] != 32:
+        fail bad_request("malformed request line")
+    pos = pos + 1
+    target_start := pos
+    while pos < n and head[pos] > 32 and head[pos] != 127:
+        pos = pos + 1
+    target_end := pos
+    if target_end - target_start > MAX_REQUEST_TARGET_BYTES:
+        fail TARGET_LIMIT_MESSAGE
+    if target_end == target_start or pos >= n or head[pos] != 32:
+        fail bad_request("malformed request line")
+    pos = pos + 1
+    if not is_http_version(head, pos):
+        fail bad_request("malformed http version")
+    major := head[pos + 5] - 48
+    minor := head[pos + 7] - 48
+    pos = pos + 8
+    if pos < n and head[pos] == 13:
+        pos = pos + 1
+    if pos >= n or head[pos] != 10:
+        fail bad_request("malformed request line")
+    pos = pos + 1
+    if major != 1:
+        fail VERSION_MESSAGE
+
+    # request-target (rfc 9112 3.2)
+    is_connect := bytes_equal_text(head, 0, method_end, "CONNECT")
+    mut path_start := target_start
+    mut path_end := target_end
+    mut authority_start := 0 - 1
+    mut authority_end := 0 - 1
+    first := head[target_start]
+    if is_connect:
+        # authority-form, and only for CONNECT
+        if first == 47 or not valid_host(head, target_start, target_end):
+            fail bad_request("CONNECT needs an authority-form target")
+        authority_start = target_start
+        authority_end = target_end
+        path_start = target_start
+        path_end = target_start
+    elif first == 42 and target_end == target_start + 1:
+        # asterisk-form, and only for OPTIONS
+        if not bytes_equal_text(head, 0, method_end, "OPTIONS"):
+            fail bad_request("only OPTIONS may use the asterisk-form target")
+    elif first != 47:
+        # absolute-form: http or https, then the authority, which replaces Host
+        mut i := target_start
+        while i < target_end and head[i] != 58:
+            i = i + 1
+        scheme_matches := header_name_matches(head, target_start, i, "http") or header_name_matches(head, target_start, i, "https")
+        if not scheme_matches or i + 3 > target_end or head[i + 1] != 47 or head[i + 2] != 47:
+            fail bad_request("malformed request target")
+        authority_start = i + 3
+        mut j := authority_start
+        while j < target_end and head[j] != 47 and head[j] != 63:
+            j = j + 1
+        authority_end = j
+        if authority_end == authority_start or not valid_host(head, authority_start, authority_end):
+            fail bad_request("malformed request target authority")
+        path_start = authority_end
+    mut query_start := 0 - 1
+    if not is_connect:
+        mut q := path_start
+        while q < target_end and head[q] != 63:
+            q = q + 1
+        path_end = q
+        if q < target_end:
+            query_start = q + 1
+
+    # field lines (rfc 9112 5), up to the empty line
+    mut content_length := 0 - 1
+    mut host_count := 0
+    mut te_seen := false
+    mut te_last_chunked := false
+    mut te_chunked_count := 0
+    mut te_other := false
+    mut expect := EXPECT_NONE
+    mut has_close := false
+    mut has_keep_alive := false
+    while true:
+        if pos >= n:
+            fail INCOMPLETE_HEAD_MESSAGE
+        line_start := pos
+        b := head[pos]
+        if b == 10:
+            break
+        if b == 13:
+            if pos + 1 < n and head[pos + 1] == 10:
+                break
+            fail bad_request("bare CR in the request head")
+        if b == 32 or b == 9:
+            # obs-fold, or whitespace before the first field (rfc 9112 2.2, 5.2)
+            fail bad_request("folded or indented header field")
+        while pos < n and is_tchar(head[pos]):
+            pos = pos + 1
+        name_end := pos
+        if name_end == line_start or pos >= n or head[pos] != 58:
+            fail bad_request("malformed header field")
+        pos = pos + 1
+        while pos < n and (head[pos] == 32 or head[pos] == 9):
+            pos = pos + 1
+        value_start := pos
+        mut value_end := pos
+        while true:
+            if pos >= n:
+                fail INCOMPLETE_HEAD_MESSAGE
+            c := head[pos]
+            if c == 10:
+                break
+            if c == 13:
+                if pos + 1 < n and head[pos + 1] == 10:
+                    break
+                fail bad_request("bare CR in a header field")
+            if is_ctl(c):
+                fail bad_request("control character in a header field")
+            pos = pos + 1
+            if c != 32 and c != 9:
+                value_end = pos
+        if head[pos] == 13:
+            pos = pos + 1
+        pos = pos + 1
+
+        name_len := name_end - line_start
+        if name_len == 4 and header_name_matches(head, line_start, name_end, "host"):
+            host_count = host_count + 1
+            if server and not valid_host(head, value_start, value_end):
+                fail bad_request("malformed Host")
+        elif name_len == 14 and header_name_matches(head, line_start, name_end, "content-length"):
+            length := parse_content_length(head, value_start, value_end)!
+            if content_length >= 0 and length != content_length:
+                fail bad_request("conflicting Content-Length")
+            content_length = length
+        elif name_len == 17 and header_name_matches(head, line_start, name_end, "transfer-encoding"):
+            # a comma-separated list of codings (rfc 9112 6.1); empty elements
+            # are allowed and skipped (rfc 9110 5.6.1)
+            te_seen = true
+            mut item := value_start
+            while item <= value_end:
+                mut item_end := item
+                while item_end < value_end and head[item_end] != 44:
+                    item_end = item_end + 1
+                coding_start := trim_ascii_start(head, item, item_end)
+                coding_end := trim_ascii_end(head, coding_start, item_end)
+                if coding_end > coding_start:
+                    if header_name_matches(head, coding_start, coding_end, "chunked"):
+                        te_chunked_count = te_chunked_count + 1
+                        te_last_chunked = true
+                    else:
+                        te_other = true
+                        te_last_chunked = false
+                item = item_end + 1
+        elif name_len == 10 and header_name_matches(head, line_start, name_end, "connection"):
+            has_close = has_close or list_has_token(head, value_start, value_end, "close")
+            has_keep_alive = has_keep_alive or list_has_token(head, value_start, value_end, "keep-alive")
+        elif name_len == 6 and header_name_matches(head, line_start, name_end, "expect") and value_end > value_start:
+            if expect != EXPECT_OTHER and header_name_matches(head, value_start, value_end, "100-continue"):
+                expect = EXPECT_CONTINUE
+            else:
+                expect = EXPECT_OTHER
+
+    if server:
+        if host_count > 1:
+            fail bad_request("more than one Host")
+        if host_count == 0 and minor >= 1 and not is_connect:
+            fail bad_request("missing Host")
+    # framing (rfc 9112 6.1, 6.3). a request carrying both lengths is how a
+    # second request gets smuggled past a proxy that frames it the other way.
+    if te_seen:
+        if minor == 0:
+            fail bad_request("Transfer-Encoding on an http/1.0 request")
+        if content_length >= 0:
+            fail bad_request("both Transfer-Encoding and Content-Length")
+        if not te_last_chunked or te_chunked_count > 1:
+            fail bad_request("chunked must be the final transfer coding, applied once")
+        if te_other:
+            fail NOT_IMPLEMENTED_PREFIX + "unsupported transfer coding"
+    if content_length > MAX_REQUEST_BODY:
+        fail BODY_LIMIT_MESSAGE
+    if content_length < 0:
+        content_length = 0
+    return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, te_seen, expect, connection_closes(minor == 0, has_close, has_keep_alive))
+
+# decode part of a checked head as text. the request line holds no CTLs, but
+# it may hold bytes that are not utf-8, and that is a bad request.
+fn head_text(head: Bytes, start: Int, end: Int) -> String!:
+    if start >= end:
+        return ""
+    text := head.slice(start, end).to_string_utf8()
+    if text.is_err:
+        fail bad_request("request line is not utf-8")
+    return text.ok
+
+# the method as text, without allocating for the common ones.
+fn method_text_of(head: Bytes, end: Int) -> String!:
+    if bytes_equal_text(head, 0, end, "GET"):
+        return "GET"
+    if bytes_equal_text(head, 0, end, "POST"):
+        return "POST"
+    if bytes_equal_text(head, 0, end, "HEAD"):
+        return "HEAD"
+    if bytes_equal_text(head, 0, end, "PUT"):
+        return "PUT"
+    return head_text(head, 0, end)!
+
+# build the request a checked head and its body describe. only the request-line
+# parts are decoded here; header fields, query parameters and path segments are
+# read from the head when a handler asks for them.
+fn request_from_head(parsed: RequestHead, body: Bytes) -> HttpRequestBytes!:
+    head := parsed.head
+    method_text := method_text_of(head, parsed.method_end)!
+    mut path_text := head_text(head, parsed.path_start, parsed.path_end)!
+    # an absolute-form target with an empty path asks for "/" (rfc 9112 3.2.2)
+    if path_text == "" and parsed.authority_start >= 0 and parsed.path_start == parsed.authority_end:
+        path_text = "/"
+    mut query_text := ""
+    if parsed.query_start >= 0:
+        query_text = head_text(head, parsed.query_start, parsed.target_end)!
+    mut version_text := "HTTP/1.1"
+    if parsed.minor == 0:
+        version_text = "HTTP/1.0"
+    elif parsed.minor != 1:
+        version_text = "HTTP/1." + parsed.minor.to_string()
+    mut overrides: Map[String, String] := {}
+    if parsed.authority_start >= 0:
+        overrides.insert("Host", head_text(head, parsed.authority_start, parsed.authority_end)!)
+    return HttpRequestBytes(head, body, method_text, path_text, query_text, version_text, "", "", overrides, {}, [])
 
 fn pack_request(req: HttpRequestBytes) -> String!:
     sep := chr(31)
@@ -827,9 +1308,9 @@ impl HttpRequestBytes:
     fn method_bytes() -> Bytes:
         return request_line_field_bytes(self.head, 0)
     fn path_bytes() -> Bytes:
-        return request_target_path_bytes(self.head)
+        return bytes.from_string_utf8(self.path_text)
     fn query_bytes() -> Bytes:
-        return request_target_query_bytes(self.head)
+        return bytes.from_string_utf8(self.query_text)
     fn version_bytes() -> Bytes:
         return request_line_field_bytes(self.head, 2)
     fn headers_bytes() -> Bytes:
@@ -849,9 +1330,24 @@ impl HttpRequestBytes:
     fn wants_close() -> Bool:
         return request_prefers_close(self)
     fn headers() -> String!:
-        return self.headers_text
+        if self.headers_text != "" or self.head.is_empty():
+            return self.headers_text
+        return decode_utf8(headers_bytes(self.head))!
+    # header_map holds fields set when the request was built, such as the Host
+    # an absolute-form target names; they win over the head.
     fn header(name: String) -> String!:
-        return header_lookup(self.header_map, name)
+        if self.header_map.len() > 0:
+            value := header_lookup(self.header_map, name)
+            if value != "":
+                return value
+        return head_header_value(self.head, name)
+    # every header field as a map with lowercase names, repeated fields
+    # combined as header() combines them.
+    fn header_fields() -> Map[String, String]:
+        mut fields := head_header_fields(self.head)
+        for key in self.header_map:
+            fields.insert(key.to_lower(), self.header_map[key])
+        return fields
     fn header_or(name: String, fallback: String) -> String:
         value := self.header(name) catch ""
         if value == "":
@@ -895,6 +1391,9 @@ impl HttpRequestBytes:
     fn query_param(name: String) -> String!:
         if self.query_map.contains_key(name):
             return self.query_map[name]
+        params := query_params_map_from_string(self.query_text)
+        if params.contains_key(name):
+            return params[name]
         return ""
     fn query_param_or(name: String, fallback: String) -> String:
         value := self.query_param(name) catch ""
@@ -902,7 +1401,7 @@ impl HttpRequestBytes:
             return fallback
         return value
     fn has_query_param(name: String) -> Bool!:
-        return self.query_map.contains_key(name)
+        return self.query_map.contains_key(name) or query_params_map_from_string(self.query_text).contains_key(name)
     fn cookies() -> Map[String, String]!:
         return parse_cookie_map(self.header_or("Cookie", ""))
     fn cookie(name: String) -> String!:
@@ -938,7 +1437,9 @@ impl HttpRequestBytes:
     fn multipart_text_or(name: String, fallback: String) -> String:
         return self.multipart_text(name) catch fallback
     fn path_parts() -> List[String]!:
-        return copy_string_list(self.path_parts_cache)
+        if self.path_parts_cache.len() > 0:
+            return copy_string_list(self.path_parts_cache)
+        return path_segments(self.path_text)
     fn matches_path(pattern: String) -> Bool!:
         return route_match_path(self.path_text, pattern)
     fn path_param(pattern: String, name: String) -> String!:
@@ -995,9 +1496,6 @@ impl MultipartPart:
     fn is_file() -> Bool:
         return self.filename != ""
 
-DECIMAL_INT_MAX_DIV10 := 922337203685477580
-DECIMAL_INT_MAX_LAST_DIGIT := 7
-
 # http wire integers here are decimal and non-negative.
 fn parse_decimal_bytes(raw: Bytes) -> Int!:
     start := trim_ascii_start(raw, 0, raw.len())
@@ -1015,29 +1513,6 @@ fn parse_decimal_bytes(raw: Bytes) -> Int!:
         if value > DECIMAL_INT_MAX_DIV10 or (value == DECIMAL_INT_MAX_DIV10 and digit_value > DECIMAL_INT_MAX_LAST_DIGIT):
             fail "integer overflow"
         value = value * 10 + digit_value
-        pos = pos + 1
-    return value
-
-fn parse_hex_bytes(raw: Bytes) -> Int!:
-    start := trim_ascii_start(raw, 0, raw.len())
-    end := trim_ascii_end(raw, start, raw.len())
-    if start >= end:
-        fail "expected hex digits"
-
-    mut value := 0
-    mut pos := start
-    while pos < end:
-        digit := raw[pos]
-        mut digit_value := -1
-        if digit >= 48 and digit <= 57:
-            digit_value = digit - 48
-        elif digit >= 65 and digit <= 70:
-            digit_value = 10 + digit - 65
-        elif digit >= 97 and digit <= 102:
-            digit_value = 10 + digit - 97
-        else:
-            fail "expected hex digits"
-        value = value * 16 + digit_value
         pos = pos + 1
     return value
 
@@ -1061,70 +1536,162 @@ fn transfer_encoding_is_chunked(te_value: String) -> Bool:
             last = trimmed
     return last == "chunked"
 
-# decide how a REQUEST body is framed, rejecting the ambiguous shapes an
-# attacker uses to smuggle a second request past a front-end proxy that
-# frames it the other way (RFC 9112 6.1, 6.3):
-#   - Transfer-Encoding and Content-Length together — the proxy and this
-#     server can disagree on where the body ends, so refuse it outright.
-#   - a Transfer-Encoding this server cannot frame (anything whose final
-#     coding is not `chunked`) — refuse rather than fall back to a length.
-# returns true when the body is chunked, false when it is length-delimited.
-fn request_body_is_chunked(raw_head: Bytes) -> Bool!:
-    te := transfer_encoding_value(raw_head)
-    if te.len() == 0:
-        return false
-    if header_value_bytes(raw_head, "Content-Length").len() > 0:
-        fail "ambiguous request framing: both Transfer-Encoding and Content-Length"
-    if not transfer_encoding_is_chunked(te):
-        fail "unsupported Transfer-Encoding: " + te
-    return true
+# where a request or chunked body is read from: a buffered reader, or a tls
+# conn's own byte i/o. the plaintext and tls paths share one head reader, one
+# parser and one chunked decoder over it; only these few reads differ.
+struct ByteSource:
+    reader: BufferedBytesReader
+    conn: tls.Conn
+    use_tls: Bool
 
-fn chunk_size_line_bytes(raw: Bytes) -> Bytes:
-    mut end := raw.len()
-    if end > 0 and raw[end - 1] == 10:
-        end = end - 1
-    if end > 0 and raw[end - 1] == 13:
-        end = end - 1
-    mut line := raw.slice(0, end)
-    semi := find_byte(line, 0, 59)
-    if semi >= 0:
-        line = line.slice(0, semi)
-    return line
+fn buffered_source(reader: BufferedBytesReader) -> ByteSource:
+    return ByteSource(reader, tls.Conn(0), false)
 
-fn chunk_line_is_blank(raw: Bytes) -> Bool:
-    return chunk_size_line_bytes(raw).is_empty()
+fn tls_source(conn: tls.Conn) -> ByteSource:
+    return ByteSource(BufferedBytesReader(0), conn, true)
 
-fn consume_chunk_line_ending(reader: BufferedBytesReader):
-    ending := reader.read_exact_bytes(1) catch bytes.empty()
-    if ending.is_empty():
-        return
-    if ending[0] == 13:
-        reader.read_exact_bytes(1) catch bytes.empty()
-
-# decode a chunked body from a buffered reader. `limit` caps the decoded size
-# (0 means no cap): the request server passes MAX_REQUEST_BODY so a chunked upload
-# is bounded like a content-length one, while the client response path passes 0.
-fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
+# the next line through its LF, at most `cap` bytes before it. at end of stream
+# it is whatever arrived, which then has no LF.
+fn source_read_line(src: ByteSource, cap: Int) -> Bytes!:
     nl := bytes.from_string_utf8(chr(10))
+    if src.use_tls:
+        return read_until_including_from_tls(src.conn, nl, cap)
+    return src.reader.read_until_bytes_including_bounded(nl, cap)
+
+fn source_read_exact(src: ByteSource, count: Int) -> Bytes!:
+    if src.use_tls:
+        return read_exact_from_tls(src.conn, count)
+    return src.reader.read_exact_bytes(count)
+
+fn source_stream_exact(src: ByteSource, writer: BufferedBytesWriter, count: Int) -> Int!:
+    if src.use_tls:
+        return stream_exact_bytes_from_tls(src.conn, writer, count)
+    return stream_exact_bytes_from_reader(src.reader, writer, count)
+
+# a request head through the empty line that ends it, ending in LF or CRLF
+# (see io.head_end), or what arrived before end of stream.
+fn source_read_head(src: ByteSource, cap: Int) -> Bytes!:
+    if src.use_tls:
+        return read_until_including_from_tls(src.conn, bytes.empty(), cap)
+    return src.reader.read_head_bounded(cap)
+
+# the end of the content on a chunked-body line, before its LF or CRLF. a line
+# without an LF means the stream ended inside it.
+fn chunk_line_content_end(line: Bytes) -> Int!:
+    mut end := line.len()
+    if end == 0 or line[end - 1] != 10:
+        fail "http: chunked body ended early"
+    end = end - 1
+    if end > 0 and line[end - 1] == 13:
+        end = end - 1
+    return end
+
+# the largest value a chunk size may hold before one more hex digit overflows.
+CHUNK_SIZE_MAX_DIV16 := 576460752303423487
+
+fn hex_digit_value(b: Int) -> Int:
+    if b >= 48 and b <= 57:
+        return b - 48
+    if b >= 65 and b <= 70:
+        return b - 55
+    if b >= 97 and b <= 102:
+        return b - 87
+    return 0 - 1
+
+# the size on a chunk-size line (rfc 9112 7.1): hex digits, then optional
+# extensions after a ";", which are checked for control bytes and ignored.
+fn chunk_size_from_line(line: Bytes) -> Int!:
+    end := chunk_line_content_end(line)!
+    mut value := 0
+    mut pos := 0
+    while pos < end:
+        digit := hex_digit_value(line[pos])
+        if digit < 0:
+            break
+        if value > CHUNK_SIZE_MAX_DIV16:
+            fail bad_request("chunk size overflows")
+        value = value * 16 + digit
+        pos = pos + 1
+    if pos == 0:
+        fail bad_request("malformed chunk size")
+    while pos < end and (line[pos] == 32 or line[pos] == 9):
+        pos = pos + 1
+    if pos < end and line[pos] != 59:
+        fail bad_request("malformed chunk size")
+    while pos < end:
+        if is_ctl(line[pos]):
+            fail bad_request("control character in a chunk extension")
+        pos = pos + 1
+    return value
+
+# true at the empty line that ends a chunked body. a trailer field before it
+# must be a well-formed field line; its value is discarded.
+fn chunk_trailer_ends(line: Bytes) -> Bool!:
+    end := chunk_line_content_end(line)!
+    if end == 0:
+        return true
+    mut pos := 0
+    while pos < end and is_tchar(line[pos]):
+        pos = pos + 1
+    if pos == 0 or pos >= end or line[pos] != 58:
+        fail bad_request("malformed trailer field")
+    while pos < end:
+        if is_ctl(line[pos]):
+            fail bad_request("control character in a trailer field")
+        pos = pos + 1
+    return false
+
+# decode a chunked body (rfc 9112 7.1) from `src`, into `out`, or into `writer`
+# when `streaming` is set. `limit` caps the decoded size, 0 for no cap: the
+# request readers pass MAX_REQUEST_BODY so a chunked upload is bounded like a
+# content-length one, and the client response readers pass 0. returns the
+# decoded size.
+fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter, streaming: Bool, limit: Int) -> Int!:
+    mut total := 0
+    while true:
+        size := chunk_size_from_line(source_read_line(src, CHUNK_LINE_LIMIT)!)!
+        if size == 0:
+            mut done := false
+            while not done:
+                done = chunk_trailer_ends(source_read_line(src, CHUNK_LINE_LIMIT)!)!
+            if streaming:
+                writer.flush()!
+            return total
+        # check the declared size before reading it, so a bogus chunk-size line
+        # (e.g. 7fffffff) cannot force a huge allocation ahead of the cap
+        if limit > 0 and size > limit - total:
+            fail BODY_LIMIT_MESSAGE
+        if streaming:
+            total = total + source_stream_exact(src, writer, size)!
+        else:
+            out.write(source_read_exact(src, size)!)!
+            total = total + size
+        if chunk_line_content_end(source_read_line(src, CHUNK_LINE_LIMIT)!)! != 0:
+            fail bad_request("chunk data is not followed by a line ending")
+    return total
+
+fn read_chunked_from(src: ByteSource, limit: Int) -> Bytes!:
     out := bytes.buffer()
     errdefer out.free()
-    while true:
-        line := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
-        if line.is_empty():
-            fail "incomplete chunk size"
-        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
-        if chunk_size == 0:
-            while true:
-                trailer := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
-                if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    return out.take_bytes()
-        # check the declared chunk size against the limit BEFORE reading it, so a
-        # bogus chunk-size line (e.g. 7fffffff) cannot trigger a huge pre-allocation
-        # inside read_exact_bytes ahead of the cap check.
-        if limit > 0 and out.len() + chunk_size > limit:
-            fail BODY_LIMIT_MESSAGE
-        out.write(reader.read_exact_bytes(chunk_size)!)!
-        consume_chunk_line_ending(reader)
+    decode_chunked(src, out, BufferedBytesWriter(0), false, limit)!
+    return out.take_bytes()
+
+fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
+    return read_chunked_from(buffered_source(reader), limit)
+
+fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
+    return read_chunked_from(tls_source(conn), limit)
+
+fn stream_chunked_from(src: ByteSource, writer: BufferedBytesWriter) -> Int!:
+    out := bytes.buffer()
+    defer out.free()
+    return decode_chunked(src, out, writer, true, 0)
+
+fn stream_chunked_body_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
+    return stream_chunked_from(buffered_source(reader), writer)
+
+fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
+    return stream_chunked_from(tls_source(conn), writer)
 
 fn decode_chunked_body(raw: Bytes) -> Bytes!:
     # this runs once per chunked response, so the cursor and reader must give
@@ -1147,8 +1714,19 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
         out.write(chunk)!
     return out.take_bytes()
 
+# the end of the first `sep` at or after `start` in `data`, or -1. an empty `sep`
+# stands for the empty line that ends a head, found with io.head_end.
+fn sep_end_from(data: Bytes, start: Int, sep: Bytes) -> Int:
+    if sep.is_empty():
+        return io.head_end(data, start)
+    at := bytes.index_of(data.slice(start, data.len()), sep)
+    if at < 0:
+        return 0 - 1
+    return start + at + sep.len()
+
 # `cap` bounds the bytes read before the separator, so a tls peer that
 # never sends it cannot grow the buffer without bound; 0 or less means no limit.
+# an empty `sep` reads through the end of a head (see sep_end_from).
 #
 # the read is chunked rather than one byte at a time. a tls conn already holds
 # whatever it decrypted but was not asked for, and unread_bytes hands the tail
@@ -1157,21 +1735,21 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
 # entry and two buffer copies for every byte of every head, and the second copy
 # made the cost quadratic in the size of the record the head arrived in.
 fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!:
+    # how far back from the end of what arrived a separator can start
+    mut overlap := sep.len() - 1
     if sep.is_empty():
-        fail "empty separator"
+        overlap = 2
     mut seen := bytes.empty()
-    # bytes of `seen` already known to start no match: a separator that was not
-    # found before cannot begin more than sep.len() - 1 bytes from the end, so
-    # each chunk is scanned once rather than the whole buffer being rescanned.
+    # bytes of `seen` already known to start no match, so each chunk is scanned
+    # once rather than the whole buffer being rescanned.
     mut scanned := 0
     while true:
-        if seen.len() >= sep.len():
-            at := bytes.index_of(seen.slice(scanned, seen.len()), sep)
-            if at >= 0:
-                end := scanned + at + sep.len()
-                conn.unread_bytes(seen.slice(end, seen.len()))
-                return seen.slice(0, end)
-            scanned = seen.len() - sep.len() + 1
+        end := sep_end_from(seen, scanned, sep)
+        if end >= 0:
+            conn.unread_bytes(seen.slice(end, seen.len()))
+            return seen.slice(0, end)
+        if seen.len() > overlap:
+            scanned = seen.len() - overlap
         if cap > 0 and seen.len() > cap:
             fail "read_until exceeded {cap} bytes without the separator"
         chunk := conn.read_bytes(TLS_READ_CHUNK)!
@@ -1181,38 +1759,6 @@ fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!
             return seen
         seen = seen.concat(chunk)
     return seen
-
-fn consume_chunk_line_ending_tls(conn: tls.Conn):
-    ending := read_exact_from_tls(conn, 1) catch bytes.empty()
-    if ending.is_empty():
-        return
-    if ending[0] == 13:
-        read_exact_from_tls(conn, 1) catch bytes.empty()
-
-# decode a chunked body from a tls conn. `limit` caps the decoded size (0 means no
-# cap), mirroring read_chunked_body: the request fallback passes MAX_REQUEST_BODY,
-# the client response path passes 0.
-fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
-    nl := bytes.from_string_utf8(chr(10))
-    out := bytes.buffer()
-    errdefer out.free()
-    while true:
-        line := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
-        if line.is_empty():
-            fail "incomplete chunk size"
-        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
-        if chunk_size == 0:
-            while true:
-                trailer := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
-                if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    return out.take_bytes()
-        # check the declared chunk size against the limit BEFORE reading it, so a
-        # bogus chunk-size line cannot trigger a huge pre-allocation inside
-        # read_exact_from_tls ahead of the cap check (mirrors read_chunked_body).
-        if limit > 0 and out.len() + chunk_size > limit:
-            fail BODY_LIMIT_MESSAGE
-        out.write(read_exact_from_tls(conn, chunk_size)!)!
-        consume_chunk_line_ending_tls(conn)
 
 fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
     buf := bytes.buffer_with_capacity(1024)
@@ -1353,40 +1899,6 @@ fn stream_until_close_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> I
             return total
         total = total + writer.write_all_bytes(chunk)!
 
-fn stream_chunked_body_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    nl := bytes.from_string_utf8(chr(10))
-    mut total := 0
-    while true:
-        line := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
-        if line.is_empty():
-            fail "incomplete chunk size"
-        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
-        if chunk_size == 0:
-            while true:
-                trailer := reader.read_until_bytes_including_bounded(nl, CHUNK_LINE_LIMIT)!
-                if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    writer.flush()!
-                    return total
-        total = total + stream_exact_bytes_from_reader(reader, writer, chunk_size)!
-        consume_chunk_line_ending(reader)
-
-fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
-    nl := bytes.from_string_utf8(chr(10))
-    mut total := 0
-    while true:
-        line := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
-        if line.is_empty():
-            fail "incomplete chunk size"
-        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
-        if chunk_size == 0:
-            while true:
-                trailer := read_until_including_from_tls(conn, nl, CHUNK_LINE_LIMIT)!
-                if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    writer.flush()!
-                    return total
-        total = total + stream_exact_bytes_from_tls(conn, writer, chunk_size)!
-        consume_chunk_line_ending_tls(conn)
-
 fn stream_response_body_buffered(head: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
     plan := response_body_plan(head)!
     if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
@@ -1407,11 +1919,6 @@ fn stream_response_body_tls(head: Bytes, conn: tls.Conn, writer: BufferedBytesWr
         return stream_until_close_from_tls(conn, writer)
     return 0
 
-fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
-    length_text := header_value_bytes(raw_head, "Content-Length")
-    if length_text.is_empty():
-        return 0
-    return parse_decimal_bytes(length_text)
 # ===============================================================
 # Request Accessors
 # ===============================================================
@@ -1483,41 +1990,149 @@ pub fn get_query_param(req: String, name: String) -> String:
         return params[name]
     return ""
 # ===============================================================
-# Response Building — pre-built status lines avoid repeated formatting
+# Response Building
 # ===============================================================
-fn status_line(status: Int) -> String:
-    crlf := chr(13) + chr(10)
+
+# the reason phrase for a status code: the names rfc 9110 15 gives, plus 103
+# (rfc 8297), 428, 429, 431 and 511 (rfc 6585) and 451 (rfc 7725). a code
+# without one has an empty reason, which rfc 9112 4 allows.
+pub fn reason_phrase(status: Int) -> String:
     if status == 200:
-        return "HTTP/1.1 200 OK" + crlf
-    if status == 201:
-        return "HTTP/1.1 201 Created" + crlf
+        return "OK"
     if status == 204:
-        return "HTTP/1.1 204 No Content" + crlf
-    if status == 301:
-        return "HTTP/1.1 301 Moved Permanently" + crlf
-    if status == 400:
-        return "HTTP/1.1 400 Bad Request" + crlf
-    if status == 401:
-        return "HTTP/1.1 401 Unauthorized" + crlf
-    if status == 403:
-        return "HTTP/1.1 403 Forbidden" + crlf
+        return "No Content"
     if status == 404:
-        return "HTTP/1.1 404 Not Found" + crlf
-    if status == 405:
-        return "HTTP/1.1 405 Method Not Allowed" + crlf
-    if status == 411:
-        return "HTTP/1.1 411 Length Required" + crlf
-    if status == 413:
-        return "HTTP/1.1 413 Payload Too Large" + crlf
-    if status == 431:
-        return "HTTP/1.1 431 Request Header Fields Too Large" + crlf
+        return "Not Found"
+    if status == 304:
+        return "Not Modified"
+    if status == 201:
+        return "Created"
+    if status == 301:
+        return "Moved Permanently"
+    if status == 302:
+        return "Found"
+    if status == 400:
+        return "Bad Request"
+    if status == 401:
+        return "Unauthorized"
+    if status == 403:
+        return "Forbidden"
     if status == 500:
-        return "HTTP/1.1 500 Internal Server Error" + crlf
-    # uncommon status
-    mut sl := "HTTP/1.1 " + status.to_string()
-    sl = sl + " OK"
-    sl = sl + crlf
-    return sl
+        return "Internal Server Error"
+    if status == 100:
+        return "Continue"
+    if status == 101:
+        return "Switching Protocols"
+    if status == 103:
+        return "Early Hints"
+    if status == 202:
+        return "Accepted"
+    if status == 203:
+        return "Non-Authoritative Information"
+    if status == 205:
+        return "Reset Content"
+    if status == 206:
+        return "Partial Content"
+    if status == 300:
+        return "Multiple Choices"
+    if status == 303:
+        return "See Other"
+    if status == 305:
+        return "Use Proxy"
+    if status == 307:
+        return "Temporary Redirect"
+    if status == 308:
+        return "Permanent Redirect"
+    if status == 402:
+        return "Payment Required"
+    if status == 405:
+        return "Method Not Allowed"
+    if status == 406:
+        return "Not Acceptable"
+    if status == 407:
+        return "Proxy Authentication Required"
+    if status == 408:
+        return "Request Timeout"
+    if status == 409:
+        return "Conflict"
+    if status == 410:
+        return "Gone"
+    if status == 411:
+        return "Length Required"
+    if status == 412:
+        return "Precondition Failed"
+    if status == 413:
+        return "Content Too Large"
+    if status == 414:
+        return "URI Too Long"
+    if status == 415:
+        return "Unsupported Media Type"
+    if status == 416:
+        return "Range Not Satisfiable"
+    if status == 417:
+        return "Expectation Failed"
+    if status == 421:
+        return "Misdirected Request"
+    if status == 422:
+        return "Unprocessable Content"
+    if status == 426:
+        return "Upgrade Required"
+    if status == 428:
+        return "Precondition Required"
+    if status == 429:
+        return "Too Many Requests"
+    if status == 431:
+        return "Request Header Fields Too Large"
+    if status == 451:
+        return "Unavailable For Legal Reasons"
+    if status == 501:
+        return "Not Implemented"
+    if status == 502:
+        return "Bad Gateway"
+    if status == 503:
+        return "Service Unavailable"
+    if status == 504:
+        return "Gateway Timeout"
+    if status == 505:
+        return "HTTP Version Not Supported"
+    if status == 511:
+        return "Network Authentication Required"
+    return ""
+
+# the status line for a status code, through its CRLF.
+fn status_line(status: Int) -> String:
+    if status == 200:
+        return "HTTP/1.1 200 OK\r\n"
+    return "HTTP/1.1 " + status.to_string() + " " + reason_phrase(status) + "\r\n"
+
+fn two_digits(value: Int) -> String:
+    if value < 10:
+        return "0" + value.to_string()
+    return value.to_string()
+
+# a unix time in seconds as an IMF-fixdate (rfc 9110 5.6.7), the form a Date,
+# Last-Modified or Expires field takes: "Sun, 06 Nov 1994 08:49:37 GMT".
+pub fn http_date(unix_seconds: Int) -> String:
+    d := datetime.from_timestamp(unix_seconds * 1000)
+    clock := unix_seconds % 86400
+    mut out := datetime.weekday_name(d).substring(0, 3) + ", " + two_digits(datetime.day(d))
+    out = out + " " + datetime.month_short(datetime.month(d)) + " " + datetime.year(d).to_string()
+    out = out + " " + two_digits(clock / 3600) + ":" + two_digits(clock / 60 % 60) + ":" + two_digits(clock % 60) + " GMT"
+    return out
+
+# the Date field every server response carries (rfc 9110 6.6.1), through its
+# CRLF. it is formatted at most once a second per task, so a busy connection
+# reads the clock per request but formats the date once a second.
+threadlocal mut date_cache_second: Int := 0 - 1
+threadlocal mut date_cache_field: String := ""
+
+fn current_date_field() -> String:
+    now := time() / 1000
+    if now != date_cache_second:
+        date_cache_field = "Date: " + http_date(now) + "\r\n"
+        date_cache_second = now
+    return date_cache_field
+
 fn ct_header(ct: String) -> String:
     crlf := chr(13) + chr(10)
     if ct == "text/html":
@@ -1712,12 +2327,7 @@ impl HttpResponse:
     # loop keep a connection open (or close it) per request while the handler's
     # `HttpResponse` is serialized exactly once and never rebuilt.
     fn to_bytes_conn(connection: String) -> Bytes!:
-        header_bytes := response_head_bytes_conn(self, self.body.len(), false, connection)!
-        buf := bytes.buffer_with_capacity(header_bytes.len() + self.body.len())
-        errdefer buf.free()
-        buf.write(header_bytes)!
-        buf.write(self.body)!
-        return buf.take_bytes()
+        return response_bytes(self, standalone_connection(self, connection), "", false)
 
     fn to_string() -> String!:
         return self.to_bytes()!.to_string_utf8()
@@ -1750,29 +2360,95 @@ fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked:
 # per-request `HttpResponse` copy. an empty `connection` keeps the standalone
 # behavior: honor a Connection the handler set, else default to close.
 fn response_head_bytes_conn(response: HttpResponse, content_length: Int, use_chunked: Bool, connection: String) -> Bytes!:
-    crlf := chr(13) + chr(10)
+    return build_response_head(response, content_length, use_chunked, standalone_connection(response, connection), "", false)
+
+# the Connection value a response written outside a keep-alive serve loop
+# carries: the one asked for, else the handler's, else close.
+fn standalone_connection(response: HttpResponse, connection: String) -> String:
+    if connection != "":
+        return connection
+    existing := header_lookup(response.headers, "Connection")
+    if existing != "":
+        return existing
+    return "close"
+
+# true when `text` is one or more ascii digits.
+fn is_decimal_text(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    mut i := 0
+    while i < text.len():
+        b := ord(text[i])
+        if b < 48 or b > 57:
+            return false
+        i = i + 1
+    return true
+
+# the field that frames a response body (rfc 9112 6.3), through its CRLF, or
+# an empty string when the response carries none:
+#   * 1xx and 204 never carry Content-Length or Transfer-Encoding (rfc 9110
+#     15.2, 15.3.5).
+#   * 304 carries the Content-Length the handler set, if any (rfc 9110 15.4.5).
+#   * the answer to HEAD carries the length the body would have. a handler
+#     that answers HEAD without a body can set Content-Length to say it.
+#   * otherwise the body's real length is sent. a Content-Length the handler
+#     set that disagrees is replaced, so the framing always matches the bytes
+#     on the wire, and a Transfer-Encoding the handler set is dropped, so the
+#     two are never sent together.
+fn framing_field(status: Int, body_length: Int, use_chunked: Bool, explicit_length: String, head_request: Bool) -> String:
+    if status < 200 or status == 204:
+        return ""
+    if status == 304 or (head_request and body_length == 0 and not use_chunked):
+        if is_decimal_text(explicit_length):
+            return "Content-Length: " + explicit_length + "\r\n"
+        return ""
+    if use_chunked:
+        return "Transfer-Encoding: chunked\r\n"
+    return "Content-Length: " + body_length.to_string() + "\r\n"
+
+# serialize a response head. `body_length` is the length of the body that
+# follows, `connection` the Connection value to write, or empty for none, and
+# `date_field` the Date field to write through its CRLF, or empty for none; a
+# Date the handler set wins over it. `head_request` marks the answer to a HEAD
+# request. a Connection, Content-Length or Transfer-Encoding in the handler's
+# header map is never copied: `connection` and framing_field decide those.
+fn build_response_head(response: HttpResponse, body_length: Int, use_chunked: Bool, connection: String, date_field: String, head_request: Bool) -> Bytes!:
+    crlf := "\r\n"
     mut head := status_line(response.status)
     if response.content_type != "":
         head = head + ct_header(strip_header_controls(response.content_type))
+    mut explicit_length := ""
+    mut has_date := false
     for key in response.headers:
-        if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding"):
+        if header_key_matches(key, "Content-Length"):
+            explicit_length = response.headers[key].trim()
             continue
-        # when the caller supplies the Connection value, we write it once below;
-        # skip any Connection the response map carries so it is not duplicated.
-        if connection != "" and header_key_matches(key, "Connection"):
+        if header_key_matches(key, "Content-Type") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding") or header_key_matches(key, "Connection"):
             continue
+        if header_key_matches(key, "Date"):
+            has_date = true
         head = head + strip_header_controls(key) + ": " + strip_header_controls(response.headers[key]) + crlf
     for line in response.set_cookie_headers:
         head = head + "Set-Cookie: " + strip_header_controls(line) + crlf
-    if use_chunked:
-        head = head + "Transfer-Encoding: chunked" + crlf
-    else:
-        head = head + "Content-Length: " + content_length.to_string() + crlf
+    head = head + framing_field(response.status, body_length, use_chunked, explicit_length, head_request)
+    if not has_date:
+        head = head + date_field
     if connection != "":
         head = head + "Connection: " + strip_header_controls(connection) + crlf
-    elif header_lookup(response.headers, "Connection") == "":
-        head = head + "Connection: close" + crlf
     return bytes.from_string_utf8(head + crlf)
+
+# a whole response as the bytes to write: the head, then the body unless the
+# status (rfc 9110 15.2, 15.3.5, 15.4.5) or a HEAD request (rfc 9110 9.3.2)
+# rules one out. build_response_head has the other arguments.
+fn response_bytes(response: HttpResponse, connection: String, date_field: String, head_request: Bool) -> Bytes!:
+    head := build_response_head(response, response.body.len(), false, connection, date_field, head_request)!
+    if head_request or response_status_has_no_body(response.status) or response.body.is_empty():
+        return head
+    buf := bytes.buffer_with_capacity(head.len() + response.body.len())
+    errdefer buf.free()
+    buf.write(head)!
+    buf.write(response.body)!
+    return buf.take_bytes()
 
 impl StreamedHttpResponse:
     fn header_value(name: String) -> String:
@@ -1832,52 +2508,62 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
-# the response for an over-large request head: 431, connection closed.
-fn header_too_large_response() -> HttpResponse:
-    return text(431, "Request Header Fields Too Large").close_connection()
+# the response to a request the server refused while reading it (see
+# request_error_status): the status, its reason phrase as the body, and a
+# closed connection, so nothing left unread is taken for the next request.
+fn request_error_response(status: Int) -> HttpResponse:
+    return text(status, reason_phrase(status)).close_connection()
 
-# the response for an over-large request body: 413, connection closed.
-fn payload_too_large_response() -> HttpResponse:
-    return text(413, "Payload Too Large").close_connection()
+# write bytes to a server connection: the tls conn when `src` reads one, else
+# `writer`, which is flushed.
+fn source_write(src: ByteSource, writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    if src.use_tls:
+        return src.conn.write_all_bytes(data)
+    written := writer.write_all_bytes(data)!
+    writer.flush()!
+    return written
 
-fn request_connection_value(req: HttpRequestBytes) -> String:
-    return req.header_or("Connection", "").to_lower()
+# the bytes the server writes for one response: response_bytes with the cached
+# Date (rfc 9110 6.6.1) every server response carries.
+fn server_response_bytes(response: HttpResponse, connection: String, head_request: Bool) -> Bytes!:
+    return response_bytes(response, connection, current_date_field(), head_request)
+
+# answer a request-reading failure with its status, when it has one, and
+# return the bytes written.
+fn send_request_error(src: ByteSource, writer: BufferedBytesWriter, message: String) -> Int!:
+    status := request_error_status(message)
+    if status == 0:
+        return 0
+    return source_write(src, writer, server_response_bytes(request_error_response(status), "close", false)!)
 
 fn request_prefers_close(req: HttpRequestBytes) -> Bool:
-    connection := request_connection_value(req)
-    if req.version_text == "HTTP/1.0":
-        return connection != "keep-alive"
-    return connection == "close"
+    value := bytes.from_string_utf8(req.header_or("Connection", ""))
+    return connection_closes(req.version_text == "HTTP/1.0", list_has_token(value, 0, value.len(), "close"), list_has_token(value, 0, value.len(), "keep-alive"))
 
-fn response_connection_value(resp: HttpResponse) -> String:
-    return resp.header_value("Connection").to_lower()
-
-# decide the Connection header value for one keep-alive exchange, as a string the
-# serializer writes directly. this is the leak-free replacement for
-# `response_for_connection` + `response_closes_connection`: it makes the same
-# decision (the request's preference wins; then a Connection the handler set;
-# otherwise keep-alive) but returns a value instead of a rebuilt response, so the
-# serve loop never copies the handler's `HttpResponse` per request. the caller
-# closes the connection when this is "close" (case-insensitively).
-fn connection_value_for(req: HttpRequestBytes, resp: HttpResponse) -> String:
-    if request_prefers_close(req):
+# the Connection value a keep-alive serve loop writes for one exchange, as a
+# string the serializer writes directly, so the loop never copies the
+# handler's `HttpResponse`. "close" means the connection closes after this
+# response: the request asked for it (`wants_close`, see connection_closes) or
+# the handler's Connection names it. otherwise http/1.0 gets "keep-alive",
+# since it closes by default (rfc 9112 9.3). http/1.1 is persistent by
+# default, so it gets no Connection field, or the one the handler set if that
+# says more than keep-alive.
+fn connection_value(wants_close: Bool, http10: Bool, resp: HttpResponse) -> String:
+    if wants_close:
         return "close"
-    existing := resp.header_value("Connection")
+    existing := header_lookup(resp.headers, "Connection")
     if existing != "":
-        return existing
-    return "keep-alive"
+        value := bytes.from_string_utf8(existing)
+        if list_has_token(value, 0, value.len(), "close"):
+            return "close"
+    if http10:
+        return "keep-alive"
+    if existing == "" or header_key_matches(existing, "keep-alive"):
+        return ""
+    return existing
 
-fn response_for_connection(req: HttpRequestBytes, resp: HttpResponse) -> HttpResponse:
-    if request_prefers_close(req):
-        return resp.close_connection()
-    if response_connection_value(resp) != "":
-        return resp
-    return resp.keep_alive()
-
-fn response_closes_connection(req: HttpRequestBytes, resp: HttpResponse) -> Bool:
-    if request_prefers_close(req):
-        return true
-    return response_connection_value(resp) == "close"
+fn connection_value_for(req: HttpRequestBytes, resp: HttpResponse) -> String:
+    return connection_value(request_prefers_close(req), req.version_text == "HTTP/1.0", resp)
 
 fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
     mut i := start
@@ -1896,61 +2582,100 @@ fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
         i = i + 1
     return -1
 
-fn find_request_head_end(raw: Bytes) -> Int:
-    return find_request_head_end_from(raw, 0)
-
-fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
-    # the head ends at the first blank line. the buffered reader finds it
-    # inside its own cache and keeps whatever follows for the body, so the
-    # head arrives in one call. the loop this replaces asked the reader for
-    # one byte at a time, and each byte paid the reader's registry lookups,
-    # its lock, a fresh buffer and a slice: 56% of the server's instructions
-    # per request (docs/performance.md, 2026-09-10). the cap refuses a head
-    # that grows past the limit rather than buffering it forever (an endless
-    # head is a slowloris / memory-exhaustion vector).
-    head := reader.read_until_bytes_including_bounded(head_terminator(), MAX_HEADER_BYTES)
+# one read through the end of a request head, with the reader's cap failure
+# reported as the head limit. the cap bounds an endless head (slowloris, memory
+# exhaustion). a head whose end sits inside the chunk that crossed the cap is
+# refused too.
+fn read_head_once(src: ByteSource) -> Bytes!:
+    head := source_read_head(src, MAX_HEADER_BYTES)
     if head.is_err:
-        # the reader reports its cap in its own words; any other failure — a
-        # dropped socket, a deadline — passes through unchanged
+        # any other failure, a dropped socket or a deadline, passes through
         if io.is_read_until_limit_error(head.err):
             fail HEADER_LIMIT_MESSAGE
         fail head.err
-    # a head whose blank line sits inside the chunk that crossed the cap
-    # still has to respect the limit
     if head.ok.len() > MAX_HEADER_BYTES:
         fail HEADER_LIMIT_MESSAGE
     return head.ok
 
-# the blank line that ends a request head, as bytes.
-fn head_terminator() -> Bytes:
-    return bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
+# the next request head. empty lines before it are skipped (rfc 9112 2.2), up
+# to the head limit; a head is read in one call either way, since the readers
+# find its end in what they already hold and keep the rest for the body. an
+# empty result means the peer closed with nothing pending.
+fn read_request_head(src: ByteSource) -> Bytes!:
+    mut head := read_head_once(src)!
+    mut skipped := 0
+    while only_empty_lines(head):
+        skipped = skipped + head.len()
+        if skipped > MAX_HEADER_BYTES:
+            fail HEADER_LIMIT_MESSAGE
+        head = read_head_once(src)!
+    return head
 
-fn stream_request_body_buffered(head_bytes: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    if request_body_is_chunked(head_bytes)!:
-        return stream_chunked_body_from_reader(reader, writer)
-    content_length := content_length_from_head_bytes(head_bytes)!
-    return stream_exact_bytes_from_reader(reader, writer, content_length)
+# read one request: the head, checked by parse_request_head, then the body it
+# frames. the stream is left at the start of the next request, so a keep-alive
+# loop never desyncs; on a failure the caller closes the connection.
+fn read_request_from(src: ByteSource) -> HttpRequestBytes!:
+    raw := read_request_head(src)!
+    if raw.is_empty():
+        return empty_request()
+    parsed := parse_request_head(raw, false)!
+    return request_from_head(parsed, read_request_body(src, parsed)!)
 
-fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
-    head_bytes := read_request_head_buffered_bytes(reader)!
-    if head_bytes.is_empty():
-        return build_http_request(bytes.empty(), bytes.empty())
-    if request_body_is_chunked(head_bytes)!:
-        return build_http_request(head_bytes, read_chunked_body(reader, MAX_REQUEST_BODY)!)
-    content_length := content_length_from_head_bytes(head_bytes)!
-    # reject an over-large declared length before allocating for it, so a hostile
-    # "Content-Length: 10000000000" cannot force a giant up-front allocation.
-    if content_length > MAX_REQUEST_BODY:
+# the body a checked head frames.
+fn read_request_body(src: ByteSource, parsed: RequestHead) -> Bytes!:
+    if parsed.chunked:
+        return read_chunked_from(src, MAX_REQUEST_BODY)
+    # refuse an over-large declared length before allocating for it, so a
+    # hostile "Content-Length: 10000000000" cannot force a giant allocation
+    if parsed.content_length > MAX_REQUEST_BODY:
         fail BODY_LIMIT_MESSAGE
-    body_buf := bytes.buffer_with_capacity(content_length)
-    errdefer body_buf.free()
-    while body_buf.len() < content_length:
-        remaining := content_length - body_buf.len()
-        chunk := reader.read_bytes(remaining)!
-        if chunk.is_empty():
-            break
-        body_buf.write(chunk)!
-    return build_http_request(head_bytes, body_buf.take_bytes())
+    if parsed.content_length == 0:
+        return bytes.empty()
+    return source_read_exact(src, parsed.content_length)
+
+# a request the server read, and whether its Connection field asks to close
+# after it.
+struct ServerRequest:
+    req: HttpRequestBytes
+    wants_close: Bool
+
+CONTINUE_RESPONSE := "HTTP/1.1 100 Continue\r\n\r\n"
+
+# read one request as the server does: the head, checked with the Host rules,
+# then its body.
+#
+# an http/1.1 request that expects 100-continue (rfc 9110 10.1.1) is sent the
+# interim response just before its body is read. the body is read before the
+# handler runs, so that is as late as the server can send it; a handler that
+# never looks at the body still has it read. any other expectation fails with
+# 417 before the body is read, and the connection then closes, so the unread
+# body is never taken for the next request. an http/1.0 request's
+# expectations are ignored.
+fn read_server_request(src: ByteSource, writer: BufferedBytesWriter) -> ServerRequest!:
+    raw := read_request_head(src)!
+    if raw.is_empty():
+        return ServerRequest(empty_request(), true)
+    parsed := parse_request_head(raw, true)!
+    if parsed.minor >= 1 and parsed.expect != EXPECT_NONE:
+        if parsed.expect != EXPECT_CONTINUE:
+            fail EXPECTATION_MESSAGE
+        if parsed.chunked or parsed.content_length > 0:
+            source_write(src, writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
+    return ServerRequest(request_from_head(parsed, read_request_body(src, parsed)!)!, parsed.wants_close)
+
+# like read_request_from, but the body goes to `writer` as it arrives, with no
+# size cap, and the returned request has an empty body.
+fn read_request_into(src: ByteSource, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
+    raw := read_request_head(src)!
+    if raw.is_empty():
+        return StreamedHttpRequest(empty_request(), 0)
+    parsed := parse_request_head(raw, false)!
+    mut body_size := 0
+    if parsed.chunked:
+        body_size = stream_chunked_from(src, writer)!
+    else:
+        body_size = source_stream_exact(src, writer, parsed.content_length)!
+    return StreamedHttpRequest(request_from_head(parsed, bytes.empty())!, body_size)
 
 # reads one head line, refusing a line that alone exceeds `cap` bytes.
 #
@@ -1988,7 +2713,7 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
     crlf := chr(13) + chr(10)
     request_line := read_head_line_bounded(reader, MAX_HEADER_BYTES)!
     if request_line == "":
-        return build_http_request(bytes.empty(), bytes.empty())
+        return empty_request()
     raw := bytes.buffer_with_capacity(1024)
     defer raw.free()
     raw.write(bytes.from_string_utf8(request_line + crlf))!
@@ -2000,20 +2725,17 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
             fail HEADER_LIMIT_MESSAGE
         line = read_head_line_bounded(reader, MAX_HEADER_BYTES - raw.len())!
     raw.write(bytes.from_string_utf8(crlf))!
+    parsed := parse_request_head(raw.bytes(), false)!
     # this legacy path frames the body by Content-Length only. reject a
-    # Transfer-Encoding (and the ambiguous TE+CL smuggling shape) rather than
-    # silently ignoring it and mis-framing the body.
-    if request_body_is_chunked(raw.bytes())!:
+    # chunked body rather than silently mis-framing it.
+    if parsed.chunked:
         fail "chunked request bodies are not supported on the string reader; use read_request_bytes"
-    content_length := content_length_from_head_bytes(raw.bytes())!
-    if content_length > MAX_REQUEST_BODY:
+    if parsed.content_length > MAX_REQUEST_BODY:
         fail BODY_LIMIT_MESSAGE
-    if content_length > 0:
-        raw.write(bytes.from_string_utf8(reader.read(content_length)!))!
-    body_start := find_request_head_end(raw.bytes())
-    if body_start < 0:
-        return build_http_request(raw.bytes(), bytes.empty())
-    return build_http_request(raw.bytes().slice(0, body_start), raw.bytes().slice(body_start, raw.bytes().len()))
+    mut body := bytes.empty()
+    if parsed.content_length > 0:
+        body = bytes.from_string_utf8(reader.read(parsed.content_length)!)
+    return request_from_head(parsed, body)
 # reads one request from a buffered string reader and packs it into the legacy
 # string form. the head is bounded by MAX_HEADER_BYTES like every other request
 # reader here — a head that exceeds it fails, even as one endless CRLF-less line.
@@ -2022,17 +2744,14 @@ pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
 # reads one request from a file descriptor and packs it into the legacy string form.
 pub fn read_request(fd: Int) -> String!:
     return pack_request(read_request_bytes(fd)!)
-# reads one request from a buffered bytes reader.
+# reads one request from a buffered bytes reader. the request is checked like
+# the server checks it, except that a missing or repeated Host is allowed.
 pub fn read_request_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
-    return read_request_from_buffered_bytes(reader)
+    return read_request_from(buffered_source(reader))
 
 # reads one request and streams the body into a writer.
 pub fn read_request_buffered_bytes_into(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
-    head_bytes := read_request_head_buffered_bytes(reader)!
-    if head_bytes.is_empty():
-        return StreamedHttpRequest(build_http_request(bytes.empty(), bytes.empty())!, 0)
-    body_size := stream_request_body_buffered(head_bytes, reader, writer)!
-    return StreamedHttpRequest(build_http_request(head_bytes, bytes.empty())!, body_size)
+    return read_request_into(buffered_source(reader), writer)
 
 # reads one request from a file descriptor using the bytes-first path.
 pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
@@ -2040,7 +2759,7 @@ pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
     reader := stream.buffered_bytes_reader_chunked(512)
     # the request fully materializes its head and body, so the reader's
     # registry entries can be dropped before returning
-    req := read_request_from_buffered_bytes(reader)
+    req := read_request_from(buffered_source(reader))
     reader.free()
     return req
 
@@ -2048,7 +2767,7 @@ pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
 pub fn read_request_bytes_into(fd: Int, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
-    return read_request_buffered_bytes_into(reader, writer)
+    return read_request_into(buffered_source(reader), writer)
 
 # sends one structured response through a buffered writer.
 pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
@@ -2996,40 +3715,79 @@ fn run_handler(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBy
     defer json_mod.close_scope(scope)
     return handler(req)
 
-# serves one request using a bytes reader, writer, and handler.
-pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    req := read_request_buffered_bytes(reader)!
+# the outcome of serving one request: the bytes written, whether the
+# connection stays open for another, and the read failure that ended the
+# exchange, or an empty string.
+struct Exchange:
+    written: Int
+    keep_open: Bool
+    error: String
+
+# write the server's answer to `req` and return the bytes written. `connection`
+# is the Connection value to send, and HEAD gets the head alone.
+fn write_server_response(src: ByteSource, writer: BufferedBytesWriter, req: HttpRequestBytes, resp: HttpResponse, connection: String) -> Int!:
+    return source_write(src, writer, server_response_bytes(resp, connection, req.method_text == "HEAD")!)
+
+# serve one request from `src`, answering through `writer` or the tls conn. a
+# request the server refuses is answered with its status, and the connection
+# closes. `persistent` is false for the entry points that serve one request:
+# they send the Connection value the handler set, or close.
+fn serve_exchange(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, persistent: Bool) -> Exchange!:
+    got := read_server_request(src, writer)
+    if got.is_err:
+        # a refused request gets its status (see request_error_status); any
+        # other read failure, a dropped socket or eof inside a request, ends
+        # the connection without an answer. either way reading stops, so
+        # nothing desyncs.
+        return Exchange(send_request_error(src, writer, got.err)!, false, got.err)
+    req := got.ok.req
+    if req.head.is_empty() and req.method_text == "":
+        return Exchange(0, false, "")
     resp := run_handler(handler, req)
-    return send_buffered(writer, resp)
+    mut connection := ""
+    if persistent:
+        connection = connection_value(got.ok.wants_close, req.version_text == "HTTP/1.0", resp)
+    else:
+        connection = standalone_connection(resp, "")
+    written := write_server_response(src, writer, req, resp, connection)!
+    return Exchange(written, persistent and connection != "close", "")
+
+# serve requests from `src` until either side asks to close.
+fn serve_requests(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    mut total := 0
+    while true:
+        exchange := serve_exchange(src, writer, handler, true)!
+        total = total + exchange.written
+        if not exchange.keep_open:
+            return total
+    return total
+
+# serve a single request and fail with the read failure, if there was one.
+fn serve_single(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    exchange := serve_exchange(src, writer, handler, false)!
+    if exchange.error != "":
+        fail exchange.error
+    return exchange.written
+
+# serves one request using a bytes reader, writer, and handler. a request the
+# server refuses is answered with its status before the failure is returned.
+pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    return serve_single(buffered_source(reader), writer, handler)
 
 # serves requests on one connection until either side asks to close.
 pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    mut total := 0
-    while true:
-        req_result := read_request_buffered_bytes(reader)
-        if req_result.is_err:
-            # a size-limit violation gets the right status and then closes; any
-            # other read failure (a dropped socket, malformed framing) just ends
-            # the connection. either way we stop reading, so nothing desyncs.
-            message := req_result.err
-            if message == HEADER_LIMIT_MESSAGE:
-                total = total + send_buffered(writer, header_too_large_response())!
-            elif message == BODY_LIMIT_MESSAGE:
-                total = total + send_buffered(writer, payload_too_large_response())!
-            return total
-        req := req_result.ok
-        if req.head.is_empty() and req.method_text == "":
-            return total
-        resp := run_handler(handler, req)
-        connection := connection_value_for(req, resp)
-        total = total + send_buffered_conn(writer, resp, connection)!
-        if connection.to_lower() == "close":
-            return total
+    return serve_requests(buffered_source(reader), writer, handler)
 
 # serves one request from a client fd and closes the connection after writing the response.
 pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    req := read_request_bytes(fd)!
-    return send(fd, run_handler(handler, req))
+    stream := io.from_fd(fd)
+    reader := stream.buffered_bytes_reader_chunked(512)
+    writer := stream.buffered_bytes_writer()
+    # last-in-first-out: the registry entries go before the fd closes
+    defer tcp_close(fd)
+    defer writer.free()
+    defer reader.free()
+    return serve_single(buffered_source(reader), writer, handler)
 
 # serves requests from one client fd until the connection closes.
 pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -3043,76 +3801,13 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
     tcp_close(fd)
     return written
 
-# read one http/1.1 request head off a tls conn: one bounded read_until for the
-# blank line, the same shape read_request_head_buffered_bytes uses over a
-# buffered reader. the tls reader reads ahead and gives back what is past the
-# terminator, so the body (and any following request) is still never over-read.
-fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
-    head := read_until_including_from_tls(conn, head_terminator(), MAX_HEADER_BYTES)
-    if head.is_err:
-        if io.is_read_until_limit_error(head.err):
-            fail HEADER_LIMIT_MESSAGE
-        fail head.err
-    # the cap is checked before the chunk that crossed it is scanned, so a head
-    # whose terminator lands inside that chunk still has to be refused here.
-    if head.ok.len() > MAX_HEADER_BYTES:
-        fail HEADER_LIMIT_MESSAGE
-    return head.ok
-
-# read one http/1.1 request off a tls conn: the head, then the body. a chunked
-# body is decoded with the tls chunked reader (the same logic the plaintext path
-# uses), and a content-length body is read exactly; either way the stream is left
-# positioned at the next request, so the keep-alive loop in serve_connection_tls
-# does not desync. an empty head means the peer closed with nothing pending, which
-# ends that loop.
-fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
-    head_bytes := read_request_head_tls(conn)!
-    if head_bytes.is_empty():
-        return build_http_request(bytes.empty(), bytes.empty())
-    if request_body_is_chunked(head_bytes)!:
-        return build_http_request(head_bytes, read_chunked_body_tls(conn, MAX_REQUEST_BODY)!)
-    content_length := content_length_from_head_bytes(head_bytes)!
-    # reject an over-large declared length before allocating for it, matching the
-    # plaintext path.
-    if content_length > MAX_REQUEST_BODY:
-        fail BODY_LIMIT_MESSAGE
-    body_buf := bytes.buffer_with_capacity(content_length)
-    errdefer body_buf.free()
-    while body_buf.len() < content_length:
-        remaining := content_length - body_buf.len()
-        chunk := conn.read_bytes(remaining)!
-        if chunk.is_empty():
-            break
-        body_buf.write(chunk)!
-    return build_http_request(head_bytes, body_buf.take_bytes())
-
 # serve http/1.1 requests over an already-handshaken tls conn until either side
 # closes. this is the http/1.1 fallback for a tls listener that offers alpn "h2"
 # and "http/1.1": a peer that negotiated "http/1.1" (or sent no alpn) is served
-# here over the same tls session. it mirrors serve_connection, only reading and
-# writing through the tls conn's own byte i/o rather than a buffered socket
-# stream. the caller closes the conn.
+# here over the same tls session, by the same loop as serve_connection, reading
+# and writing through the tls conn's own byte i/o. the caller closes the conn.
 pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    mut total := 0
-    while true:
-        req_result := read_request_from_tls(conn)
-        if req_result.is_err:
-            # answer a size-limit violation with the right status, then close; any
-            # other read failure just ends the connection. mirrors serve_connection.
-            message := req_result.err
-            if message == HEADER_LIMIT_MESSAGE:
-                total = total + conn.write_all_bytes(header_too_large_response().to_bytes()!)!
-            elif message == BODY_LIMIT_MESSAGE:
-                total = total + conn.write_all_bytes(payload_too_large_response().to_bytes()!)!
-            return total
-        req := req_result.ok
-        if req.head.is_empty() and req.method_text == "":
-            return total
-        resp := run_handler(handler, req)
-        connection := connection_value_for(req, resp)
-        total = total + conn.write_all_bytes(resp.to_bytes_conn(connection)!)!
-        if connection.to_lower() == "close":
-            return total
+    return serve_requests(tls_source(conn), BufferedBytesWriter(0), handler)
 
 # accepts one client from a listener fd and serves exactly one request.
 pub fn serve_listener_once(listener_fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -3126,15 +3821,20 @@ pub fn serve_listener_connection(listener_fd: Int, handler: fn(HttpRequestBytes)
 pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, ctx: Context) -> Int!BlockingError:
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    req := read_request_buffered_bytes(reader)
-    if req.is_err:
-        fail blocking_failed(req.err)
+    src := buffered_source(reader)
+    got := read_server_request(src, writer)
+    if got.is_err:
+        send_request_error(src, writer, got.err) catch 0
+        fail blocking_failed(got.err)
+    req := got.ok.req
+    if req.head.is_empty() and req.method_text == "":
+        return 0
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    resp := run_handler(handler, req.ok)
+    resp := run_handler(handler, req)
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    sent := send_buffered(writer, resp)
+    sent := write_server_response(src, writer, req, resp, standalone_connection(resp, ""))
     if sent.is_err:
         fail blocking_failed(sent.err)
     return sent.ok
@@ -3234,13 +3934,20 @@ test "http frames the request body by the chunked transfer-encoding token, not a
     # a substring match on "chunked" would frame `xchunked` as a chunked body;
     # it must be treated as an unframable encoding and rejected, not read as CL.
     head := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Transfer-Encoding: xchunked" + crlf + crlf)
-    assert(request_body_is_chunked(head).is_err)
-    # a genuine `chunked` (the final token, with other codings before it) is chunked
-    good := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Transfer-Encoding: gzip, chunked" + crlf + crlf)
-    assert(request_body_is_chunked(good)! == true)
+    refused := parse_request_head(head, true)
+    assert(refused.is_err)
+    assert_eq(request_error_status(refused.err), 400)
+    # a genuine `chunked`, in any case, is chunked
+    good := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Transfer-Encoding: Chunked" + crlf + crlf)
+    assert(parse_request_head(good, true)!.chunked)
+    # chunked after a coding this server cannot decode is not implemented
+    gzip := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Transfer-Encoding: gzip, chunked" + crlf + crlf)
+    assert_eq(request_error_status(parse_request_head(gzip, true).err), 501)
     # a plain length-delimited request is not chunked and does not fail
-    plain := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Content-Length: 3" + crlf + crlf)
-    assert(request_body_is_chunked(plain)! == false)
+    plain := bytes.from_string_utf8("POST / HTTP/1.1" + crlf + "Host: x" + crlf + "Content-Length: 3" + crlf + crlf)
+    parsed := parse_request_head(plain, true)!
+    assert(not parsed.chunked)
+    assert_eq(parsed.content_length, 3)
 
 test "http accepts zero content length":
     crlf := chr(13) + chr(10)
@@ -3314,10 +4021,10 @@ test "http rejects an over-large content-length before allocating for it":
     assert_eq(result.err, BODY_LIMIT_MESSAGE)
 
 test "http maps size-limit failures to 431 and 413 responses that close the connection":
-    header_response := header_too_large_response()
+    header_response := request_error_response(431)
     assert_eq(header_response.status_code(), 431)
     assert_eq(header_response.header_value("Connection").to_lower(), "close")
-    body_response := payload_too_large_response()
+    body_response := request_error_response(413)
     assert_eq(body_response.status_code(), 413)
     assert_eq(body_response.header_value("Connection").to_lower(), "close")
 
@@ -3383,6 +4090,9 @@ test "http redirect helper rewrites requests safely":
     assert_eq(header_lookup(cross_origin.headers, "Authorization"), "")
     assert_eq(header_lookup(cross_origin.headers, "Cookie"), "")
 
+fn echo_path(req: HttpRequestBytes) -> HttpResponse:
+    return text(200, req.path_text)
+
 test "http serves keep-alive connections":
     first := get_request("example.test", 80, "/one").keep_alive().to_bytes()!
     second := get_request("example.test", 80, "/two").close_connection().to_bytes()!
@@ -3393,14 +4103,13 @@ test "http serves keep-alive connections":
     reader := io.bytes_reader(input.bytes()).buffered_chunked(5)
     writer := output.buffered_chunked(6)
 
-    req_one := read_request_buffered_bytes(reader)!
-    mut written := send_buffered(writer, response_for_connection(req_one, text(200, req_one.path_text)))!
-    req_two := read_request_buffered_bytes(reader)!
-    written = written + send_buffered(writer, response_for_connection(req_two, text(200, req_two.path_text)))!
+    written := serve_connection(reader, writer, echo_path)!
     payload := output.bytes().to_string_utf8()!
 
     assert_eq(written, output.bytes().len())
-    assert(payload.contains("Connection: keep-alive"))
+    # http/1.1 is persistent by default, so the first answer names nothing and
+    # the second, to a request that asked to close, says so.
+    assert(not payload.contains("Connection: keep-alive"))
     assert(payload.contains("Connection: close"))
     assert(payload.contains(chr(13) + chr(10) + chr(13) + chr(10) + "/one"))
     assert(payload.contains(chr(13) + chr(10) + chr(13) + chr(10) + "/two"))
@@ -3422,42 +4131,14 @@ test "http keep-alive serialization writes Connection without rebuilding the res
 test "http connection_value_for decides keep-alive per request":
     crlf := chr(13) + chr(10)
     plain := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.1" + crlf + "Host: x" + crlf + crlf)).buffered_chunked(8))!
-    assert_eq(connection_value_for(plain, text(200, "a")).to_lower(), "keep-alive")
-    asked_close := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.1" + crlf + "Connection: close" + crlf + crlf)).buffered_chunked(8))!
-    assert_eq(connection_value_for(asked_close, text(200, "a")).to_lower(), "close")
+    assert_eq(connection_value_for(plain, text(200, "a")), "")
+    asked_close := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.1" + crlf + "Connection: keep-alive, Close" + crlf + crlf)).buffered_chunked(8))!
+    assert_eq(connection_value_for(asked_close, text(200, "a")), "close")
+    old := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.0" + crlf + "Connection: Keep-Alive" + crlf + crlf)).buffered_chunked(8))!
+    assert_eq(connection_value_for(old, text(200, "a")), "keep-alive")
     # a handler that set its own Connection is respected over the default.
-    assert_eq(connection_value_for(plain, text(200, "a").close_connection()).to_lower(), "close")
-
-test "http keep-alive serve loop reuses one connection byte-for-byte":
-    crlf := chr(13) + chr(10)
-    first := get_request("example.test", 80, "/one").keep_alive().to_bytes()!
-    second := get_request("example.test", 80, "/two").close_connection().to_bytes()!
-    input := bytes.buffer()
-    input.write(first)!
-    input.write(second)!
-    output := bytes.buffer()
-    reader := io.bytes_reader(input.bytes()).buffered_chunked(5)
-    writer := output.buffered_chunked(6)
-
-    # mirror serve_connection's rewritten body: no per-request response rebuild.
-    req_one := read_request_buffered_bytes(reader)!
-    resp_one := text(200, req_one.path_text)
-    conn_one := connection_value_for(req_one, resp_one)
-    mut written := send_buffered_conn(writer, resp_one, conn_one)!
-    req_two := read_request_buffered_bytes(reader)!
-    resp_two := text(200, req_two.path_text)
-    conn_two := connection_value_for(req_two, resp_two)
-    written = written + send_buffered_conn(writer, resp_two, conn_two)!
-    payload := output.bytes().to_string_utf8()!
-
-    assert_eq(written, output.bytes().len())
-    # first request asked to keep alive, second asked to close.
-    assert_eq(conn_one.to_lower(), "keep-alive")
-    assert_eq(conn_two.to_lower(), "close")
-    assert(payload.contains("Connection: keep-alive"))
-    assert(payload.contains("Connection: close"))
-    assert(payload.contains(crlf + crlf + "/one"))
-    assert(payload.contains(crlf + crlf + "/two"))
+    assert_eq(connection_value_for(plain, text(200, "a").close_connection()), "close")
+    assert_eq(connection_value_for(plain, text(200, "a").keep_alive()), "")
 
 test "http reads sequential responses from one reader":
     first := text(200, "one").keep_alive().to_bytes()!

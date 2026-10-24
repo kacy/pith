@@ -1,0 +1,94 @@
+-- valid forms --
+origin form: 200 GET /a q=x=1 host=h xa=[] body=[] ; 200 after
+http/1.0 without host: 200 GET /old q= host= xa=[] body=[] close
+http/1.0 keep-alive: 200 GET /old q= host= xa=[] body=[] keep-alive ; 200 after
+absolute form: 200 GET /abs q=q=1 host=example.com:8080 xa=[] body=[] ; 200 after
+absolute form no path: 200 GET / q= host=example.com xa=[] body=[] ; 200 after
+options asterisk: 200 OPTIONS * q= host=h xa=[] body=[] ; 200 after
+connect authority: 200 CONNECT  q= host=example.com:443 xa=[] body=[] ; 200 after
+leading empty line: 200 GET /lead q= host=h xa=[] body=[] ; 200 after
+leading bare lf: 200 GET /lead q= host=h xa=[] body=[] ; 200 after
+bare lf head: 200 GET /lf q= host=h xa=[v] body=[] ; 200 after
+mixed line endings: 200 GET /mix q= host=h xa=[] body=[] ; 200 after
+ows trimmed: 200 GET / q= host=h xa=[spaced value] body=[] ; 200 after
+empty value: 200 GET / q= host=h xa=[] body=[] ; 200 after
+names case-insensitive: 200 GET / q= host=h xa=[v] body=[] ; 200 after
+duplicates combined: 200 GET / q= host=h xa=[1, 2] body=[] ; 200 after
+host with port: 200 GET / q= host=h.example:8080 xa=[] body=[] ; 200 after
+host ipv6: 200 GET / q= host=[::1]:8080 xa=[] body=[] ; 200 after
+empty host: 200 GET / q= host= xa=[] body=[] ; 200 after
+content-length body: 200 POST /p q= host=h xa=[] body=[abc] ; 200 after
+identical content-length: 200 POST /p q= host=h xa=[] body=[abc] ; 200 after
+chunked body: 200 POST /c q= host=h xa=[] body=[abcde] ; 200 after
+chunked case: 200 POST /c q= host=h xa=[] body=[z] ; 200 after
+chunk extension: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
+chunk trailers: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
+chunk upper hex: 200 POST /c q= host=h xa=[] body=[0123456789] ; 200 after
+chunked bare lf: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
+-- request line --
+garbage: 400 close
+bad version: 400 close
+lowercase version: 400 close
+version without minor: 400 close
+version two digits: 400 close
+version 2.0: 505 close
+version 0.9: 505 close
+missing version: 400 close
+double space: 400 close
+trailing space: 400 close
+tab separator: 400 close
+method not a token: 400 close
+empty method: 400 close
+target not origin form: 400 close
+asterisk not options: 400 close
+authority not connect: 400 close
+connect origin form: 400 close
+target with space: 400 close
+target with ctl: 400 close
+long target: 414 close
+bare cr in request line: 400 close
+-- header fields --
+no colon: 400 close
+space before colon: 400 close
+tab before colon: 400 close
+empty name: 400 close
+name not a token: 400 close
+obs-fold space: 400 close
+obs-fold tab: 400 close
+leading whitespace header: 400 close
+nul in value: 400 close
+ctl in value: 400 close
+del in value: 400 close
+bare cr in value: 400 close
+bare cr line end: 400 close
+-- host --
+missing host: 400 close
+two hosts: 400 close
+host with space: 400 close
+host with slash: 400 close
+host with userinfo: 400 close
+absolute form wins: 200 GET /x q= host=target.example xa=[] body=[] ; 200 after
+absolute form without host: 400 close
+-- framing --
+te and cl: 400 close
+cl and te: 400 close
+differing content-length: 400 close
+content-length list: 400 close
+content-length non-digit: 400 close
+content-length negative: 400 close
+content-length plus: 400 close
+content-length empty: 400 close
+content-length overflow: 400 close
+content-length too large: 413 close
+te final not chunked: 400 close
+te gzip only: 400 close
+te chunked twice: 400 close
+te unknown coding: 501 close
+te gzip then chunked: 501 close
+te on http/1.0: 400 close
+chunk size not hex: 400 close
+chunk size empty: 400 close
+chunk size overflow: 400 close
+chunk size too large: 413 close
+chunk data missing crlf: 400 close
+head too large: 431 close

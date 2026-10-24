@@ -1,0 +1,98 @@
+-- date --
+date on every response: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+handler date kept: HTTP/1.1 200 OK|Content-Type: text/plain|Date: Sun, 06 Nov 1994 08:49:37 GMT|Content-Length: 1|xHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+date on a refused request: HTTP/1.1 400 Bad Request|Content-Type: text/plain|Content-Length: 11|Date: <imf-fixdate>|Connection: close|Bad Request
+Sun, 06 Nov 1994 08:49:37 GMT
+Thu, 01 Jan 1970 00:00:00 GMT
+Tue, 29 Feb 2000 00:00:00 GMT
+Wed, 31 Dec 2025 23:59:59 GMT
+-- head --
+head: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+head explicit length: HTTP/1.1 200 OK|Content-Length: 1234|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+head not found: HTTP/1.1 404 Not Found|Content-Type: text/html|Content-Length: 22|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+get explicit length: HTTP/1.1 200 OK|Content-Length: 0|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- bodiless statuses --
+204: HTTP/1.1 204 No Content|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+304: HTTP/1.1 304 Not Modified|ETag: "v1"|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+304 explicit length: HTTP/1.1 304 Not Modified|Content-Length: 42|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+1xx: HTTP/1.1 103 Early Hints|Link: </s.css>|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- content-length --
+wrong explicit length: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+handler transfer-encoding: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- expect --
+100-continue: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue case: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue chunked: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue without body: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue on http/1.0: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|Connection: keep-alive|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+unknown expectation: HTTP/1.1 417 Expectation Failed|Content-Type: text/plain|Content-Length: 18|Date: <imf-fixdate>|Connection: close|Expectation Failed
+unknown expectation without body: HTTP/1.1 417 Expectation Failed|Content-Type: text/plain|Content-Length: 18|Date: <imf-fixdate>|Connection: close|Expectation Failed
+unknown expectation on http/1.0: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: keep-alive|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- connection --
+http/1.1 persistent: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+http/1.1 close: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: close|hello
+http/1.1 close case: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: close|hello
+http/1.1 close in a list: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: close|hello
+http/1.1 close in a later field: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: close|hello
+http/1.1 closed is not close: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+http/1.1 keep-alive: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+http/1.0 default: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: close|hello
+http/1.0 keep-alive: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: keep-alive|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+http/1.0 keep-alive case: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: keep-alive|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+http/1.0 keep-alive in a list: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: keep-alive|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+handler close: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 1|Date: <imf-fixdate>|Connection: close|x
+handler keep-alive: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 1|Date: <imf-fixdate>|xHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- options --
+options asterisk: HTTP/1.1 200 OK|Allow: GET, OPTIONS|Content-Length: 0|Date: <imf-fixdate>|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+-- status lines --
+HTTP/1.1 100 Continue|
+HTTP/1.1 101 Switching Protocols|
+HTTP/1.1 103 Early Hints|
+HTTP/1.1 200 OK|
+HTTP/1.1 201 Created|
+HTTP/1.1 202 Accepted|
+HTTP/1.1 203 Non-Authoritative Information|
+HTTP/1.1 204 No Content|
+HTTP/1.1 205 Reset Content|
+HTTP/1.1 206 Partial Content|
+HTTP/1.1 300 Multiple Choices|
+HTTP/1.1 301 Moved Permanently|
+HTTP/1.1 302 Found|
+HTTP/1.1 303 See Other|
+HTTP/1.1 304 Not Modified|
+HTTP/1.1 307 Temporary Redirect|
+HTTP/1.1 308 Permanent Redirect|
+HTTP/1.1 400 Bad Request|
+HTTP/1.1 401 Unauthorized|
+HTTP/1.1 402 Payment Required|
+HTTP/1.1 403 Forbidden|
+HTTP/1.1 404 Not Found|
+HTTP/1.1 405 Method Not Allowed|
+HTTP/1.1 406 Not Acceptable|
+HTTP/1.1 407 Proxy Authentication Required|
+HTTP/1.1 408 Request Timeout|
+HTTP/1.1 409 Conflict|
+HTTP/1.1 410 Gone|
+HTTP/1.1 411 Length Required|
+HTTP/1.1 412 Precondition Failed|
+HTTP/1.1 413 Content Too Large|
+HTTP/1.1 414 URI Too Long|
+HTTP/1.1 415 Unsupported Media Type|
+HTTP/1.1 416 Range Not Satisfiable|
+HTTP/1.1 417 Expectation Failed|
+HTTP/1.1 421 Misdirected Request|
+HTTP/1.1 422 Unprocessable Content|
+HTTP/1.1 426 Upgrade Required|
+HTTP/1.1 428 Precondition Required|
+HTTP/1.1 429 Too Many Requests|
+HTTP/1.1 431 Request Header Fields Too Large|
+HTTP/1.1 451 Unavailable For Legal Reasons|
+HTTP/1.1 500 Internal Server Error|
+HTTP/1.1 501 Not Implemented|
+HTTP/1.1 502 Bad Gateway|
+HTTP/1.1 503 Service Unavailable|
+HTTP/1.1 504 Gateway Timeout|
+HTTP/1.1 505 HTTP Version Not Supported|
+HTTP/1.1 511 Network Authentication Required|
+HTTP/1.1 299 |
+HTTP/1.1 599 |

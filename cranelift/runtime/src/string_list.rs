@@ -160,9 +160,9 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
         if part.is_empty() {
             return;
         }
+        // the fresh part's one count moves into the list
         let part_ptr = crate::pith_copy_bytes_to_cstring(part);
-        crate::collections::list::pith_list_push_value(list, part_ptr as i64);
-        crate::pith_cstring_release(part_ptr as *const i8);
+        crate::collections::list::pith_list_push_value_owned(list, part_ptr as i64);
     };
     // an empty delimiter never matches, so the whole string is one part.
     // each delimiter is found from the end of the previous one, so a

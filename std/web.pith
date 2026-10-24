@@ -512,12 +512,13 @@ fn chain_for(app: App, path: String) -> List[fn(fn(Request) -> http.HttpResponse
     return chain
 
 # the methods registered for a path, in registration order, as an `Allow`
-# header value. empty when no route matches the path at all.
-fn allowed_methods(app: App, req: http.HttpRequestBytes) -> String:
+# header value. empty when no route matches the path at all. `any_path` lists
+# the methods of every route, which is what `OPTIONS *` asks about.
+fn allowed_methods(app: App, req: http.HttpRequestBytes, any_path: Bool) -> String:
     mut out := ""
     mut seen: List[String] := []
     for route in app.routes:
-        matched := req.matches_path(route.pattern) catch false
+        matched := any_path or (req.matches_path(route.pattern) catch false)
         if not matched:
             continue
         mut already := false
@@ -554,6 +555,11 @@ struct Options:
 fn options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
     return fn(req: Request) => http.no_content().header("Allow", options.allow)
 
+# what `OPTIONS *` is answered with: 200, the methods the app serves, and an
+# empty body, so the answer carries Content-Length: 0.
+fn asterisk_options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
+    return fn(req: Request) => http.response(200).header("Allow", options.allow)
+
 # find the first route whose method and path match, wrap its handler in the
 # middleware onion, run it, and return the response. a request that matches
 # nothing gets a 404 and skips middleware entirely. this is the single place
@@ -572,8 +578,14 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     # deserves an Allow header, or the preflight a browser sends before a
     # cross-origin call — and a preflight that 404s before the middleware runs
     # can never be answered by cors middleware at all.
+    # `OPTIONS *` asks about the server as a whole (rfc 9110 9.3.7). no route
+    # pattern names "*", so it is answered here with every method the app
+    # serves, before a pattern like "/:name" could claim it as a path.
+    if method == "OPTIONS" and path == "*":
+        handler := wrap_middleware(chain_for(app, path), asterisk_options_handler(Options(allowed_methods(app, req, true))))
+        return handler(Request(req, empty_values, "*", empty_values))
     if method == "OPTIONS":
-        allow := allowed_methods(app, req)
+        allow := allowed_methods(app, req, false)
         if allow.len() > 0:
             pattern := pattern_for_path(app, req)
             handler := wrap_middleware(chain_for(app, path), options_handler(Options(allow)))
@@ -1157,6 +1169,16 @@ test "OPTIONS on a known path answers with the methods that path accepts":
 
     assert_eq(resp.status, 204)
     assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+
+test "OPTIONS * answers with every method the app serves":
+    app := bare().get("/users/:id", show_user).post("/users", create_user).get("/about", show_user)
+    resp := dispatch(app, request_for("OPTIONS", "*"))
+
+    assert_eq(resp.status, 200)
+    assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+    assert(resp.body.is_empty())
+    wire := resp.to_bytes()!.to_string_utf8()!
+    assert(wire.contains("Content-Length: 0"))
 
 test "OPTIONS on a path no route claims is still a 404":
     app := bare().get("/users/:id", show_user)

@@ -2242,19 +2242,14 @@ pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64
     if b.is_null() {
         return 1;
     }
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa as u8;
-        let cb = *pb as u8;
-        if ca != cb {
-            return if ca < cb { -1 } else { 1 };
-        }
-        if ca == 0 {
-            return 0;
-        }
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // compare the full bytes so a zero byte inside a string does not end
+    // the compare; a string that is a prefix of the other sorts first
+    let sa = std::slice::from_raw_parts(a as *const u8, crate::string::pith_cstring_len(a) as usize);
+    let sb = std::slice::from_raw_parts(b as *const u8, crate::string::pith_cstring_len(b) as usize);
+    match sa.cmp(sb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 

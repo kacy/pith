@@ -1282,10 +1282,10 @@ fn is_reserved_metadata_key(name: String) -> Bool:
 # the caller metadata carried in a request's headers.
 fn request_metadata(req: http.HttpRequestBytes) -> Map[String, String]:
     mut out: Map[String, String] := {}
-    for key in req.header_map:
-        name := key.to_lower()
+    fields := req.header_fields()
+    for name in fields:
         if not is_reserved_metadata_key(name):
-            out.insert(name, req.header_map[key])
+            out.insert(name, fields[name])
     return out
 
 # the request's grpc-timeout in milliseconds, or none when the header is

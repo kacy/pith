@@ -1,0 +1,55 @@
+# the validating request parser and the request fields it leaves to be read
+# later.
+#
+# a request read off the wire decodes only its request line; header fields,
+# query parameters, path segments and body text are built from the head when a
+# handler asks for them, and an absolute-form target puts its Host into the
+# request's header map. a round serves one in-memory keep-alive connection: a
+# GET whose handler reads every lazy field, a chunked POST with a trailer, an
+# absolute-form request, and a malformed request that is answered with 400 and
+# ends the connection. a per-round leak in any of those paths, or in the error
+# response, moves the peak between the two round counts.
+import leakprobe as probe
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn handle(req: http.HttpRequestBytes) -> http.HttpResponse:
+    mut n := req.header_or("X-A", "").len()
+    n = n + req.query_param_or("id", "").len()
+    # bound first: `(req.path_parts() catch []).len()` leaks the list on its
+    # own, whatever function returns it, which is not what this case measures
+    parts := req.path_parts() catch:
+        return http.text(500, "")
+    n = n + parts.len()
+    n = n + req.header_fields().len()
+    n = n + (req.body_text() catch "").len()
+    n = n + (req.headers() catch "").len()
+    return http.text(200, n.to_string())
+
+fn round(wire: Bytes) -> Int:
+    cursor := io.bytes_reader(wire)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(256)
+    defer reader.free()
+    sink := bytes.buffer()
+    defer sink.free()
+    writer := sink.buffered()
+    defer writer.free()
+    return http.serve_connection(reader, writer, handle) catch 0
+
+fn main():
+    mut wire := "GET /a/b?id=7&x=1 HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nx-a: 2\r\nCookie: a=1\r\n\r\n"
+    wire = wire + "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3;e=1\r\nabc\r\n0\r\nX-T: t\r\n\r\n"
+    wire = wire + "GET http://example.com/abs?q=1 HTTP/1.1\r\nHost: other\r\n\r\n"
+    wire = wire + "GET / HTTP/1.1\r\nHost: h\r\nBad Header: v\r\n\r\n"
+    stream := bytes.from_string_utf8(wire)
+    # a round is four requests, so half the round count keeps the case quick
+    n := probe.rounds() / 2
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(stream)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

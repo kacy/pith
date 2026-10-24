@@ -2378,17 +2378,25 @@ pub fn response(status: Int) -> HttpResponse:
     mut headers: Map[String, String] := {}
     return HttpResponse(status, "", headers, bytes.empty(), [], {})
 
+# a response with a content type and a text body and nothing else: what
+# response(status).with_body_text(body_text).header("Content-Type",
+# content_type) builds, without building and copying two responses on the
+# way.
+fn text_body_response(status: Int, content_type: String, body_text: String) -> HttpResponse:
+    mut headers: Map[String, String] := {}
+    return HttpResponse(status, content_type, headers, bytes.from_string_utf8(body_text), [], {})
+
 # builds a plain text response.
 pub fn text(status: Int, body_text: String) -> HttpResponse:
-    return response(status).with_body_text(body_text).header("Content-Type", MIME_TEXT)
+    return text_body_response(status, MIME_TEXT, body_text)
 
 # builds an html response.
 pub fn html(status: Int, body_text: String) -> HttpResponse:
-    return response(status).with_body_text(body_text).header("Content-Type", MIME_HTML)
+    return text_body_response(status, MIME_HTML, body_text)
 
 # builds a json response from raw json text.
 pub fn json(status: Int, body_text: String) -> HttpResponse:
-    return response(status).with_body_text(body_text).header("Content-Type", MIME_JSON)
+    return text_body_response(status, MIME_JSON, body_text)
 
 # builds a json response from a parsed json handle.
 pub fn json_value(status: Int, handle: Int) -> HttpResponse:

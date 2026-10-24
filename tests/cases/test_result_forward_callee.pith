@@ -1,0 +1,148 @@
+# a result local handed to a callee the caller's emitter does not walk: a
+# function in another module, a method in this module, and a method of a
+# type from another module (#1169). each callee forwards its parameter,
+# reads it, extracts from it or keeps it. under the two-register result abi
+# (PITH_RESULT_REG=1) a forwarded result comes back as a payload with a
+# count of its own, so the caller's local releases its own payload, and it
+# may only do that when the callee's module recorded the parameter as
+# borrowed. a callee that keeps the box (`keep`) must leave the local on
+# the plain shell release.
+#
+# each shape reads the forwarded value and its source while both are alive,
+# then reads them again with fresh allocations of the same sizes alive, so
+# a payload freed early prints another value instead of its own. every
+# shape runs with an ok and an error result. the expected output was
+# derived from the source and is the same with the flag on and off. runs
+# under valgrind with the freelist off (MEMCHECK_CASES).
+import result_forward_callee_helper as h
+
+struct Local:
+    n: Int
+
+impl Local:
+    fn fwd(x: String!) -> String!:
+        return x
+
+    fn fwd_alias(x: String!) -> String!:
+        y := x
+        return y
+
+    fn fwd_inner(x: String!) -> String!:
+        return self.fwd(x)
+
+    fn peek(x: String!) -> Int:
+        if x.is_err:
+            return self.n
+        return 1
+
+fn mk(i: Int) -> String!:
+    if i < 0:
+        fail "e{i}"
+    return "s{i}"
+
+fn mk_int(i: Int) -> Int!:
+    if i < 0:
+        fail "e{i}"
+    return i * 10
+
+fn mk_opt(i: Int) -> String?:
+    if i < 0:
+        return none
+    return "o{i}"
+
+fn show(label: String, r: String!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+fn show_int(label: String, r: Int!):
+    if r.is_ok:
+        print("{label} ok {r.ok}")
+    else:
+        print("{label} err {r.err}")
+
+fn junk() -> List[String!]:
+    return [mk(1), mk(2), mk(3), mk(0 - 1), mk(0 - 2), mk(0 - 3)]
+
+fn shape_imported(i: Int):
+    a := mk(i)
+    b := h.fwd(a)
+    show("imported.fwd", b)
+    show("imported.src", a)
+    c := h.fwd_alias(a)
+    d := h.fwd_match(a)
+    e := h.fwd_two(a)
+    j := junk()
+    show("imported.alias", c)
+    show("imported.match", d)
+    show("imported.two", e)
+    show("imported.src2", a)
+    print("imported.peek {h.peek(a)} junk {j.len()}")
+
+fn shape_imported_int(i: Int):
+    a := mk_int(i)
+    b := h.fwd_int(a)
+    j := junk()
+    show_int("imported_int.fwd", b)
+    show_int("imported_int.src", a)
+    print("junk {j.len()}")
+
+fn shape_imported_extract(i: Int):
+    a := mk(i)
+    n := h.len_or_fail(a)
+    j := junk()
+    show_int("imported_extract.len", n)
+    show("imported_extract.src", a)
+    print("junk {j.len()}")
+
+fn shape_imported_opt(i: Int):
+    o := mk_opt(i)
+    p := h.peek_opt(o)
+    j := junk()
+    print("imported_opt.peek {p} {o.unwrap_or("none")} junk {j.len()}")
+
+fn shape_imported_keep(i: Int):
+    a := mk(i)
+    k := h.keep(a)
+    j := junk()
+    show("imported_keep.kept", k.r)
+    show("imported_keep.src", a)
+    print("junk {j.len()}")
+
+fn shape_method(i: Int, l: Local):
+    a := mk(i)
+    b := l.fwd(a)
+    show("method.fwd", b)
+    show("method.src", a)
+    c := l.fwd_alias(a)
+    d := l.fwd_inner(a)
+    j := junk()
+    show("method.alias", c)
+    show("method.inner", d)
+    show("method.src2", a)
+    print("method.peek {l.peek(a)} junk {j.len()}")
+
+fn shape_imported_method(i: Int, r: h.Relay):
+    a := mk(i)
+    b := r.fwd(a)
+    j := junk()
+    show("imported_method.fwd", b)
+    show("imported_method.src", a)
+    print("imported_method.peek {r.peek(a)} junk {j.len()}")
+
+fn run(i: Int):
+    l := Local(7)
+    r := h.Relay(9)
+    shape_imported(i)
+    shape_imported_int(i)
+    shape_imported_extract(i)
+    shape_imported_opt(i)
+    shape_imported_keep(i)
+    shape_method(i, l)
+    shape_imported_method(i, r)
+
+fn main():
+    run(5)
+    run(0 - 5)
+    print("done")

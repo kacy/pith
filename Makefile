@@ -1260,6 +1260,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_empty_write_contract \
 	tests/cases/test_runtime_result_pairs \
 	tests/cases/test_result_forward_shapes \
+	tests/cases/test_result_forward_callee \
 	tests/cases/test_synthesized_error_messages \
 	tests/cases/test_json_fill_list_shapes \
 	tests/cases/test_json_fill_collection_shapes \

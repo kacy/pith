@@ -1,0 +1,37 @@
+# a preempted task must get its worker back while that worker stays busy.
+#
+# `hog` is pure compute, so the safe-point at its loop back-edge preempts it
+# once it overruns its quantum. `relay` keeps the worker busy until the hog
+# reports that it is done: each relay spawns the next one and returns, so
+# there is always a fresh task queued, and since a relay has no loop it is
+# never preempted itself. under PITH_GREEN with one worker the worker never
+# runs out of work. if a preempted task only resumed once its worker had
+# nothing else to do, the hog would never finish and the relay would never
+# stop: a regression shows up as this test hanging.
+#
+# that shape is what stalled an http server under load: a connection task
+# preempted in the middle of a request waited until its worker went idle,
+# which under a steady load took hundreds of milliseconds.
+#
+# the printed value does not depend on scheduling, so the output is identical
+# to the os-thread backend.
+
+fn hog(done: AtomicInt, rounds: Int) -> Int:
+    mut x := 0
+    mut i := 0
+    while i < rounds:
+        x = (x * 31 + i) % 1000003
+        i = i + 1
+    done.store(1)
+    return x
+
+fn relay(done: AtomicInt) -> Int:
+    if done.load() == 0:
+        spawn relay(done)
+    return 0
+
+fn main():
+    done := AtomicInt(0)
+    h := spawn hog(done, 200000000)
+    spawn relay(done)
+    print("hog:" + (await h).to_string())

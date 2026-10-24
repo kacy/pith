@@ -86,8 +86,10 @@
 //!   then injector, then steals from a random peer's *local* queue, and only if
 //!   all of that is empty does it resume a `deferred` (preempted) task — so a
 //!   compute hog that overran its quantum yields to every other ready task before
-//!   it runs again. plain `Mutex<VecDeque>` — readable first; lock-free deques are
-//!   a later perf phase.
+//!   it runs again. a worker that never runs dry still serves one deferred task
+//!   every `POLL_EVERY` tasks, so a preempted task waits a bounded number of
+//!   turns. plain `Mutex<VecDeque>` — readable first; lock-free deques are a
+//!   later perf phase.
 //! - **lock order.** when a block-site lock (a channel lock, or a task's join
 //!   lock) and the scheduler locks nest, the block-site lock is always taken
 //!   first: a channel send holds the channel lock and calls `wake`, which takes
@@ -1952,10 +1954,18 @@ fn debug_assert_stealable(_id: TaskId) {}
 
 /// find the next ready task for worker `index`: its pinned queue first (resume
 /// suspended work it owns), then its own local queue, then the injector, then a
-/// steal from a random peer's local queue. returns `None` if the whole pool is
-/// momentarily empty.
-fn find_work(index: usize) -> Option<TaskId> {
+/// steal from a random peer's local queue, and only then its deferred queue.
+/// with `deferred_first` the deferred queue goes first instead; the worker loop
+/// asks for that every `POLL_EVERY` tasks so a preempted task waits a bounded
+/// number of turns. returns `None` if the whole pool is momentarily empty.
+fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
     let sched = scheduler();
+
+    if deferred_first {
+        if let Some(id) = pop_deferred(index) {
+            return Some(id);
+        }
+    }
 
     // pinned first: these are woken tasks this worker must resume itself.
     if let Some(id) = sched.workers[index]
@@ -2005,15 +2015,16 @@ fn find_work(index: usize) -> Option<TaskId> {
     // nothing else — no owned woken work, no fresh work anywhere to run or steal.
     // this is what lets the other tasks on this worker make progress before the
     // hog runs again.
-    if let Some(id) = sched.workers[index]
+    pop_deferred(index)
+}
+
+/// take the oldest preempted task off worker `index`'s deferred queue.
+fn pop_deferred(index: usize) -> Option<TaskId> {
+    scheduler().workers[index]
         .deferred
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .pop_front()
-    {
-        return Some(id);
-    }
-    None
 }
 
 /// cheap per-thread rotating start index for steal victim selection. no strong
@@ -2084,8 +2095,9 @@ fn park(index: usize, timeout: Duration) -> bool {
 const PARK_SPIN: Duration = Duration::from_micros(10);
 
 /// how many tasks a busy worker runs between non-blocking polls of its
-/// sockets. go checks its global queue on the same kind of count (61); this
-/// only bounds how long a ready socket's task can wait behind queued work.
+/// sockets and serves its deferred queue first. go checks its global queue on
+/// the same kind of count (61); this only bounds how long a ready socket's
+/// task, or a preempted one, can wait behind queued work.
 const POLL_EVERY: u32 = 61;
 
 /// look for work for up to `PARK_SPIN` before parking. probes are spaced by a
@@ -2162,6 +2174,9 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
     let mut searching = false;
     let worker = &scheduler().workers[index];
     let mut since_poll: u32 = 0;
+    // set on the same count as the socket poll: the next `find_work` serves
+    // one preempted task ahead of everything else.
+    let mut deferred_turn = false;
     loop {
         if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
             if searching {
@@ -2170,7 +2185,7 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
             }
             searching = true;
         }
-        match find_work(index) {
+        match find_work(index, std::mem::take(&mut deferred_turn)) {
             Some(id) => {
                 idle_timeout = PARK_TIMEOUT_MIN;
                 if searching {
@@ -2185,10 +2200,14 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 // a worker that always has work never parks, so it never
                 // waits in its poller: look at its sockets every so often, or
                 // the tasks whose data has arrived would wait behind all of
-                // its queued work.
+                // its queued work. the same count gives the deferred queue a
+                // turn, or a preempted task would wait for the worker to run
+                // dry, which a server under steady load may not do for
+                // hundreds of milliseconds.
                 since_poll += 1;
                 if since_poll >= POLL_EVERY {
                     since_poll = 0;
+                    deferred_turn = true;
                     crate::netpoll::poll_ready(index);
                 }
             }

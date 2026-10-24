@@ -1936,47 +1936,121 @@ pub fn get_query_param(req: String, name: String) -> String:
         return params[name]
     return ""
 # ===============================================================
-# Response Building — pre-built status lines avoid repeated formatting
+# Response Building
 # ===============================================================
-fn status_line(status: Int) -> String:
-    crlf := chr(13) + chr(10)
+
+# the reason phrase for a status code: the names rfc 9110 15 gives, plus 103
+# (rfc 8297), 428, 429, 431 and 511 (rfc 6585) and 451 (rfc 7725). a code
+# without one has an empty reason, which rfc 9112 4 allows.
+pub fn reason_phrase(status: Int) -> String:
     if status == 200:
-        return "HTTP/1.1 200 OK" + crlf
-    if status == 201:
-        return "HTTP/1.1 201 Created" + crlf
+        return "OK"
     if status == 204:
-        return "HTTP/1.1 204 No Content" + crlf
-    if status == 301:
-        return "HTTP/1.1 301 Moved Permanently" + crlf
-    if status == 400:
-        return "HTTP/1.1 400 Bad Request" + crlf
-    if status == 401:
-        return "HTTP/1.1 401 Unauthorized" + crlf
-    if status == 403:
-        return "HTTP/1.1 403 Forbidden" + crlf
+        return "No Content"
     if status == 404:
-        return "HTTP/1.1 404 Not Found" + crlf
-    if status == 405:
-        return "HTTP/1.1 405 Method Not Allowed" + crlf
-    if status == 411:
-        return "HTTP/1.1 411 Length Required" + crlf
-    if status == 413:
-        return "HTTP/1.1 413 Payload Too Large" + crlf
-    if status == 414:
-        return "HTTP/1.1 414 URI Too Long" + crlf
-    if status == 431:
-        return "HTTP/1.1 431 Request Header Fields Too Large" + crlf
+        return "Not Found"
+    if status == 304:
+        return "Not Modified"
+    if status == 201:
+        return "Created"
+    if status == 301:
+        return "Moved Permanently"
+    if status == 302:
+        return "Found"
+    if status == 400:
+        return "Bad Request"
+    if status == 401:
+        return "Unauthorized"
+    if status == 403:
+        return "Forbidden"
     if status == 500:
-        return "HTTP/1.1 500 Internal Server Error" + crlf
+        return "Internal Server Error"
+    if status == 100:
+        return "Continue"
+    if status == 101:
+        return "Switching Protocols"
+    if status == 103:
+        return "Early Hints"
+    if status == 202:
+        return "Accepted"
+    if status == 203:
+        return "Non-Authoritative Information"
+    if status == 205:
+        return "Reset Content"
+    if status == 206:
+        return "Partial Content"
+    if status == 300:
+        return "Multiple Choices"
+    if status == 303:
+        return "See Other"
+    if status == 305:
+        return "Use Proxy"
+    if status == 307:
+        return "Temporary Redirect"
+    if status == 308:
+        return "Permanent Redirect"
+    if status == 402:
+        return "Payment Required"
+    if status == 405:
+        return "Method Not Allowed"
+    if status == 406:
+        return "Not Acceptable"
+    if status == 407:
+        return "Proxy Authentication Required"
+    if status == 408:
+        return "Request Timeout"
+    if status == 409:
+        return "Conflict"
+    if status == 410:
+        return "Gone"
+    if status == 411:
+        return "Length Required"
+    if status == 412:
+        return "Precondition Failed"
+    if status == 413:
+        return "Content Too Large"
+    if status == 414:
+        return "URI Too Long"
+    if status == 415:
+        return "Unsupported Media Type"
+    if status == 416:
+        return "Range Not Satisfiable"
+    if status == 417:
+        return "Expectation Failed"
+    if status == 421:
+        return "Misdirected Request"
+    if status == 422:
+        return "Unprocessable Content"
+    if status == 426:
+        return "Upgrade Required"
+    if status == 428:
+        return "Precondition Required"
+    if status == 429:
+        return "Too Many Requests"
+    if status == 431:
+        return "Request Header Fields Too Large"
+    if status == 451:
+        return "Unavailable For Legal Reasons"
     if status == 501:
-        return "HTTP/1.1 501 Not Implemented" + crlf
+        return "Not Implemented"
+    if status == 502:
+        return "Bad Gateway"
+    if status == 503:
+        return "Service Unavailable"
+    if status == 504:
+        return "Gateway Timeout"
     if status == 505:
-        return "HTTP/1.1 505 HTTP Version Not Supported" + crlf
-    # uncommon status
-    mut sl := "HTTP/1.1 " + status.to_string()
-    sl = sl + " OK"
-    sl = sl + crlf
-    return sl
+        return "HTTP Version Not Supported"
+    if status == 511:
+        return "Network Authentication Required"
+    return ""
+
+# the status line for a status code, through its CRLF.
+fn status_line(status: Int) -> String:
+    if status == 200:
+        return "HTTP/1.1 200 OK\r\n"
+    return "HTTP/1.1 " + status.to_string() + " " + reason_phrase(status) + "\r\n"
+
 fn ct_header(ct: String) -> String:
     crlf := chr(13) + chr(10)
     if ct == "text/html":
@@ -2295,9 +2369,7 @@ pub fn redirect(url: String) -> String:
 # request_error_status): the status, its reason phrase as the body, and a
 # closed connection, so nothing left unread is taken for the next request.
 fn request_error_response(status: Int) -> HttpResponse:
-    line := status_line(status)
-    # "HTTP/1.1 NNN " leads the line and CRLF ends it
-    return text(status, line.substring(13, line.len() - 2)).close_connection()
+    return text(status, reason_phrase(status)).close_connection()
 
 # answer a request-reading failure with its status, when it has one, and
 # return the bytes written.

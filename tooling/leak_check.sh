@@ -77,6 +77,11 @@ cases=(
   "tests/leaks/leak_result_forward SHAPE=7"
   "tests/leaks/leak_result_forward SHAPE=8"
   "tests/leaks/leak_result_forward SHAPE=9"
+  "tests/leaks/leak_result_forward_callee SHAPE=1"
+  "tests/leaks/leak_result_forward_callee SHAPE=2"
+  "tests/leaks/leak_result_forward_callee SHAPE=3"
+  "tests/leaks/leak_result_forward_callee SHAPE=4"
+  "tests/leaks/leak_result_forward_callee SHAPE=5"
   tests/leaks/leak_sort_engine
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let
@@ -200,6 +205,18 @@ cases=(
   "tests/leaks/leak_owned_receiver_getter SHAPE=4"
   "tests/leaks/leak_owned_receiver_getter SHAPE=5"
   "tests/leaks/leak_owned_receiver_getter SHAPE=6"
+  "tests/leaks/leak_temp_result_use SHAPE=1"
+  "tests/leaks/leak_temp_result_use SHAPE=2"
+  "tests/leaks/leak_temp_result_use SHAPE=3"
+  "tests/leaks/leak_temp_result_use SHAPE=4"
+  "tests/leaks/leak_temp_result_use SHAPE=5"
+  "tests/leaks/leak_temp_result_use SHAPE=6"
+  "tests/leaks/leak_temp_result_use SHAPE=7"
+  "tests/leaks/leak_temp_result_use SHAPE=8"
+  "tests/leaks/leak_temp_result_use SHAPE=9"
+  "tests/leaks/leak_temp_result_use SHAPE=10"
+  "tests/leaks/leak_temp_result_use SHAPE=11"
+  "tests/leaks/leak_temp_result_use SHAPE=12"
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
   "tests/leaks/leak_map_value_cycle PITH_CYCLE_GC=1"
 )

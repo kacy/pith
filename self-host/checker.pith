@@ -6461,7 +6461,14 @@ fn check_catch_expression(node: Node, scope_id: Int) -> Int:
     if result_info.kind != "result":
         report_error("E224", "catch requires a result type, got " + get_type_name(result_type))
         return TID_ERR
-    fallback_type := c_check_expr(node.children[1], scope_id)
+    mut fallback_type := c_check_expr(node.children[1], scope_id)
+    # an empty collection literal (`f() catch []`) has no element type of its
+    # own, so it takes the ok payload's type. without this the whole catch
+    # stayed untyped, and a method called on it (`(f() catch []).len()`)
+    # dispatched without a receiver kind and never released the value.
+    if is_error_type(fallback_type):
+        propagate_empty_collection_literal(node.children[1], result_info.inner)
+        fallback_type = c_get_expr_type(node.children[1])
     if is_error_type(fallback_type):
         return TID_ERR
     if types_compatible(fallback_type, result_info.inner) == false:

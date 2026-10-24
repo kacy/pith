@@ -1,0 +1,80 @@
+# a method or a field read on an owned temporary has to release the temporary
+# once the read has taken what it needs. these shapes each leaked their
+# temporary on every call:
+#   - a method on a catch whose fallback is an empty literal,
+#     `(f() catch []).len()`: the literal had no type, so the whole catch was
+#     untyped and the call never learned its receiver was a list to release
+#     (#1178, ~270 bytes a call).
+#   - a field read off a catch, a try, a parenthesized call, a field chain or
+#     a tuple element: the field path released only a bare call or struct
+#     construction.
+#   - a slot of a fresh result box, `f().ok.name` or `f().is_ok`: the box and
+#     whatever it held were stranded, including when the `.ok` value was
+#     bound to a `mut` local and then reassigned.
+import leakprobe as probe
+import std.env as env
+
+struct Rec:
+    pub name: String
+    pub n: Int
+
+struct Outer:
+    pub inner: Rec
+    pub tag: String
+
+fn parts_of(s: String) -> List[String]!:
+    return s.split("/")
+
+fn rec_of(i: Int) -> Rec!:
+    return Rec("rec-" + i.to_string(), i)
+
+fn outer_of(i: Int) -> Outer:
+    return Outer(Rec("in-" + i.to_string(), i), "tag-" + i.to_string())
+
+fn pair_of(i: Int) -> (Rec, String):
+    return (Rec("pr-" + i.to_string(), i), "ps-" + i.to_string())
+
+fn try_name_len(i: Int) -> Int!:
+    return rec_of(i)!.name.len()
+
+fn round(i: Int, shape: Int) -> Int:
+    if shape == 1:
+        return (parts_of("/a/b/c") catch []).len()
+    if shape == 2:
+        return (rec_of(i) catch Rec("fb", 0)).name.len()
+    if shape == 3:
+        return (rec_of(i) catch Rec("fb", 0)).n
+    if shape == 4:
+        return rec_of(i).ok.name.len()
+    if shape == 5:
+        return (rec_of(i).ok).n
+    if shape == 6:
+        if rec_of(i).is_ok:
+            return 1
+        return 0
+    if shape == 7:
+        mut x := rec_of(i).ok
+        x = rec_of(i + 1).ok
+        return x.n
+    if shape == 8:
+        return try_name_len(i) catch 0
+    if shape == 9:
+        return outer_of(i).inner.name.len()
+    if shape == 10:
+        return (outer_of(i)).tag.len()
+    if shape == 11:
+        return pair_of(i).0.name.len() + pair_of(i).1.len()
+    return (parts_of("/a/b") catch []).first().unwrap_or("").len()
+
+fn main():
+    n := probe.rounds()
+    shape := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i, shape)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

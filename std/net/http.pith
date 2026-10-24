@@ -35,6 +35,7 @@ pub MIME_TEXT := "text/plain"
 pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
 pub MIME_MULTIPART_FORM := "multipart/form-data"
+pub MIME_FORM := "application/x-www-form-urlencoded"
 pub MIME_CSS := "text/css"
 pub MIME_JS := "application/javascript"
 pub MIME_SVG := "image/svg+xml"
@@ -689,6 +690,78 @@ fn query_params_map_from_string(qs: String) -> Map[String, String]:
         if not result.contains_key(key):
             result.insert(key, url_mod.decode(pair.substring(eq + 1, pair.len())))
     return result
+
+# the values of an application/x-www-form-urlencoded text, a form body or a
+# query string, as net/http's url.ParseQuery reads them: keys and values are
+# percent-decoded, "+" is a space, and a repeated key keeps every value in the
+# order it came. a pair with no "=" is a key with an empty value. splitting
+# happens on the raw "&" and "=" before decoding, so an encoded "%26" stays
+# inside its value.
+pub fn parse_form(text: String) -> Map[String, List[String]]:
+    mut values: Map[String, List[String]] := {}
+    if text.len() == 0:
+        return values
+    for pair in text.split("&"):
+        if pair.len() == 0:
+            continue
+        eq := pair.index_of("=")
+        mut key := ""
+        mut value := ""
+        if eq < 0:
+            key = url_mod.decode(pair)
+        else:
+            key = url_mod.decode(pair.substring(0, eq))
+            value = url_mod.decode(pair.substring(eq + 1, pair.len()))
+        add_form_value(values, key, value)
+    return values
+
+fn add_form_value(values: Map[String, List[String]], key: String, value: String):
+    if values.contains_key(key):
+        values[key].push(value)
+    else:
+        values.insert(key, [value])
+
+# the media type of a Content-Type value, lowercased, without its parameters.
+fn media_type(content_type: String) -> String:
+    semi := content_type.index_of(";")
+    if semi >= 0:
+        return content_type.substring(0, semi).trim().to_lower()
+    return content_type.trim().to_lower()
+
+# the form values a request's body carries, as net/http's PostForm holds
+# them: only for POST, PUT and PATCH, from an application/x-www-form-urlencoded
+# body or from the fields of a multipart/form-data one. a multipart part that
+# carries a file is not a value; read it with multipart_part.
+fn body_form_values(req: HttpRequestBytes) -> Map[String, List[String]]:
+    mut values: Map[String, List[String]] := {}
+    method := req.method_text
+    if method != "POST" and method != "PUT" and method != "PATCH":
+        return values
+    kind := media_type(req.header_or("Content-Type", ""))
+    if kind == MIME_FORM:
+        return parse_form(req.body_text() catch "")
+    if kind == MIME_MULTIPART_FORM:
+        parsed := req.multipart_parts()
+        if parsed.is_err:
+            return values
+        for part in parsed.ok:
+            if not part.is_file():
+                add_form_value(values, part.name, part.text_or(""))
+    return values
+
+# a user and password from an `Authorization: Basic` header (rfc 7617).
+pub struct BasicAuth:
+    pub user: String
+    pub password: String
+
+# `value` as an http quoted-string, with any quote or backslash escaped.
+fn quoted_string(value: String) -> String:
+    return chr(34) + value.replace(chr(92), chr(92) + chr(92)).replace(chr(34), chr(92) + chr(34)) + chr(34)
+
+# a 401 that asks for basic credentials for `realm` (rfc 7617), the answer a
+# handler gives when basic_auth fails or the credentials are wrong.
+pub fn basic_auth_challenge(realm: String) -> HttpResponse:
+    return unauthorized_response().header("WWW-Authenticate", "Basic realm=" + quoted_string(realm) + ", charset=" + chr(34) + "UTF-8" + chr(34))
 
 fn parse_json_or_fail(text: String) -> Int!:
     handle := json_mod.parse(text)
@@ -1480,6 +1553,44 @@ impl HttpRequestBytes:
     # the token from an `Authorization: Bearer <token>` header. fails when the
     # header is missing or names another scheme, which is the shape an auth
     # guard wants: `token := req.bearer_token() catch: return unauthorized`.
+    # every form value of the request, as net/http's Form holds them: the
+    # body's values (see post_form) first, then the query string's.
+    fn form() -> Map[String, List[String]]:
+        values := body_form_values(self)
+        query_values := parse_form(self.query_text)
+        for key in query_values:
+            for value in query_values[key]:
+                add_form_value(values, key, value)
+        return values
+    # the form values of the request body only: an urlencoded or multipart
+    # body of a POST, PUT or PATCH. empty for anything else.
+    fn post_form() -> Map[String, List[String]]:
+        return body_form_values(self)
+    # the first value of the form field `name`, from the body and then the
+    # query string, or "" when neither has one.
+    fn form_value(name: String) -> String:
+        values := self.form()
+        if values.contains_key(name):
+            return values[name][0]
+        return ""
+    # the first value of the body form field `name`, or "".
+    fn post_form_value(name: String) -> String:
+        values := body_form_values(self)
+        if values.contains_key(name):
+            return values[name][0]
+        return ""
+    # the user and password from an `Authorization: Basic` header. fails when
+    # the header is missing, names another scheme, or is not base64 of
+    # "user:password". the scheme name is matched without case.
+    fn basic_auth() -> BasicAuth!:
+        header := self.header_or("Authorization", "")
+        if header.len() < 6 or not header_key_matches(header.substring(0, 6), "Basic "):
+            fail "no basic credentials in the Authorization header"
+        decoded := encoding.b64_decode(header.substring(6, header.len()).trim())!.to_string_utf8()!
+        colon := decoded.index_of(":")
+        if colon < 0:
+            fail "basic credentials have no colon"
+        return BasicAuth(decoded.substring(0, colon), decoded.substring(colon + 1, decoded.len()))
     fn bearer_token() -> String!:
         header := self.header_or("Authorization", "")
         if not header.starts_with("Bearer "):
@@ -4724,3 +4835,68 @@ test "clean_path follows net/http and never climbs above the root":
 test "path_is_clean agrees with clean_path":
     for p in ["/", "/a", "/a/", "/a/b.txt", "/..x", "//", "/a//b", "/./", "/a/..", "/%2e", "x", "", "/a%2Fb"]:
         assert_eq(path_is_clean(p), clean_path(p) == p)
+
+fn form_request(method: String, target: String, content_type: String, body: String) -> HttpRequestBytes!:
+    head := method + " " + target + " HTTP/1.1\r\nHost: h\r\nContent-Type: " + content_type + "\r\n\r\n"
+    return build_http_request(bytes.from_string_utf8(head), bytes.from_string_utf8(body))!
+
+test "parse_form decodes plus and escapes and keeps repeated keys":
+    values := parse_form("a=1&b=x+y%21&a=2&flag&=v&c=%26")
+    assert_eq(values["a"].len(), 2)
+    assert_eq(values["a"][0], "1")
+    assert_eq(values["a"][1], "2")
+    assert_eq(values["b"][0], "x y!")
+    assert_eq(values["flag"][0], "")
+    assert_eq(values[""][0], "v")
+    assert_eq(values["c"][0], "&")
+    assert_eq(parse_form("").len(), 0)
+
+test "form values merge the body before the query":
+    req := form_request("POST", "/f?a=query&q=1", "application/x-www-form-urlencoded; charset=utf-8", "a=body&b=2")!
+    assert_eq(req.form_value("a"), "body")
+    assert_eq(req.form_value("q"), "1")
+    assert_eq(req.form()["a"].len(), 2)
+    assert_eq(req.form()["a"][1], "query")
+    assert_eq(req.post_form_value("q"), "")
+    assert_eq(req.post_form_value("b"), "2")
+    assert_eq(req.form_value("missing"), "")
+
+test "a GET body and a non-form body are not form values":
+    get := form_request("GET", "/f?a=1", "application/x-www-form-urlencoded", "a=body")!
+    assert_eq(get.form_value("a"), "1")
+    assert_eq(get.post_form().len(), 0)
+    json_post := form_request("POST", "/f", "application/json", "a=body")!
+    assert_eq(json_post.form_value("a"), "")
+
+test "multipart text fields are form values and files are not":
+    parts := [multipart_field("title", "hello"), multipart_file_text("upload", "a.txt", "text/plain", "file body")]
+    body := encode_multipart(parts, "XyZ")!.to_string_utf8()!
+    req := form_request("POST", "/up", "multipart/form-data; boundary=XyZ", body)!
+    assert_eq(req.form_value("title"), "hello")
+    assert_eq(req.form_value("upload"), "")
+    assert_eq(req.multipart_part("upload")!.filename, "a.txt")
+    assert_eq(req.multipart_part("upload")!.text()!, "file body")
+
+fn auth_request(value: String) -> HttpRequestBytes!:
+    head := "GET / HTTP/1.1\r\nHost: h\r\nAuthorization: " + value + "\r\n\r\n"
+    return build_http_request(bytes.from_string_utf8(head), bytes.empty())!
+
+test "basic_auth reads the user and password":
+    creds := auth_request("Basic " + encoding.b64_encode_string("ada:pa:ss"))!.basic_auth()!
+    assert_eq(creds.user, "ada")
+    assert_eq(creds.password, "pa:ss")
+    lower := auth_request("basic " + encoding.b64_encode_string("u:"))!.basic_auth()!
+    assert_eq(lower.user, "u")
+    assert_eq(lower.password, "")
+    assert(auth_request("Bearer abc")!.basic_auth().is_err)
+    assert(auth_request("Basic !!!")!.basic_auth().is_err)
+    assert(auth_request("Basic " + encoding.b64_encode_string("nocolon"))!.basic_auth().is_err)
+    no_header := build_http_request(bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), bytes.empty())!
+    assert(no_header.basic_auth().is_err)
+
+test "basic_auth_challenge asks for credentials with a quoted realm":
+    q := chr(34)
+    bs := chr(92)
+    resp := basic_auth_challenge("ops " + q + "x" + q)
+    assert_eq(resp.status, 401)
+    assert_eq(resp.header_value("WWW-Authenticate"), "Basic realm=" + q + "ops " + bs + q + "x" + bs + q + q + ", charset=" + q + "UTF-8" + q)

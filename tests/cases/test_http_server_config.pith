@@ -64,12 +64,15 @@ fn start_server(start: Int, config: http.ServerConfig) -> Int!:
     spawn accept_loop(listener, config)
     return port
 
-# everything the server sends until it closes, or until GIVE_UP_MS.
+# everything the server sends until it closes, or until GIVE_UP_MS. a server
+# that closes with dripped bytes still unread resets the connection, which the
+# wait reports as an error rather than as readable, so only a plain timeout
+# waits again.
 fn read_until_close(fd: Int) -> String:
     mut out := bytes.empty()
     started := time_mod.mono_millis()
     while time_mod.mono_millis() - started < GIVE_UP_MS:
-        if tcp_wait_readable(fd, 100) != 1:
+        if tcp_wait_readable(fd, 100) == 0:
             continue
         chunk := tcp_read_bytes(fd, 65536) catch bytes.empty()
         if chunk.is_empty():
@@ -97,7 +100,7 @@ fn drip(port: Int, head: String) -> String!:
     tcp_write(fd, head)!
     mut sent := 0
     while time_mod.mono_millis() - started < GIVE_UP_MS:
-        if tcp_wait_readable(fd, 100) == 1:
+        if tcp_wait_readable(fd, 100) != 0:
             break
         if tcp_write(fd, "x").is_err:
             break
@@ -190,7 +193,7 @@ fn tls_case() -> Int!:
     conn.write_all_bytes(bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: h\r\nX-Slow: "))!
     mut sent := 0
     while time_mod.mono_millis() - started < GIVE_UP_MS:
-        if tcp_wait_readable(conn.socket(), 100) == 1:
+        if tcp_wait_readable(conn.socket(), 100) != 0:
             break
         if conn.write_all_bytes(bytes.from_string_utf8("x")).is_err:
             break

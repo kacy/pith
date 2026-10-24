@@ -1,0 +1,92 @@
+# a result local handed to a `-> T!` function that returns it, where the
+# callee is in another module or is a method (#1169), one shape per SHAPE
+# value. under the two-register result abi (PITH_RESULT_REG=1) the callee
+# returns the payload with a count of its own, so the caller's local has to
+# release the count its box holds. the caller does not walk these callees'
+# bodies, so that has to come from what the callee's emission recorded.
+# every round forwards an ok and an error result and reads both the
+# forwarded value and its source.
+import leakprobe as probe
+import result_forward_mod as fm
+import std.env as env
+
+struct Fwd:
+    n: Int
+
+impl Fwd:
+    fn fwd(x: String!) -> String!:
+        return x
+
+    fn fwd_alias(x: String!) -> String!:
+        y := x
+        return y
+
+    fn fwd_inner(x: String!) -> String!:
+        return self.fwd(x)
+
+    fn peek(x: String!) -> Int:
+        if x.is_err:
+            return self.n
+        return 1
+
+fn mk(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return "payload-{i}"
+
+fn len_of(r: String!) -> Int:
+    if r.is_ok:
+        return r.ok.len()
+    return r.err.len()
+
+# each shape is its own function, for the reason leak_result_forward gives.
+fn imported_round(i: Int) -> Int:
+    a := mk(i)
+    b := fm.fwd(a)
+    return len_of(b) + len_of(a)
+
+fn imported_alias_round(i: Int) -> Int:
+    a := mk(i)
+    b := fm.fwd_alias(a)
+    c := fm.fwd_match(a)
+    return len_of(b) + len_of(c) + len_of(a)
+
+fn imported_two_round(i: Int) -> Int:
+    a := mk(i)
+    b := fm.fwd_two(a)
+    return len_of(b) + len_of(a) + fm.peek(a)
+
+fn method_round(i: Int, f: Fwd) -> Int:
+    a := mk(i)
+    b := f.fwd(a)
+    return len_of(b) + len_of(a)
+
+fn method_alias_round(i: Int, f: Fwd) -> Int:
+    a := mk(i)
+    b := f.fwd_alias(a)
+    c := f.fwd_inner(a)
+    return len_of(b) + len_of(c) + len_of(a) + f.peek(a)
+
+fn shape(s: Int, i: Int, f: Fwd) -> Int:
+    if s == 1:
+        return imported_round(i)
+    if s == 2:
+        return imported_alias_round(i)
+    if s == 3:
+        return imported_two_round(i)
+    if s == 4:
+        return method_round(i, f)
+    return method_alias_round(i, f)
+
+fn main():
+    s := env.int_or("SHAPE", 1)
+    f := Fwd(0)
+    mut acc := 0
+    mut i := 0
+    while i < probe.rounds():
+        acc = acc + shape(s, i, f)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

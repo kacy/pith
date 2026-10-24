@@ -472,6 +472,8 @@ pub extern "C" fn pith_tcp_set_timeout(conn: i64, ms: i64) {
     }
     use std::os::unix::io::IntoRawFd;
     let _ = stream.into_raw_fd();
+    // the next wait reads the value back, as the kernel rounded it.
+    fd_handle::cache_timeout(&guard, false, None);
 }
 
 /// set or clear a connection's read or write deadline: `ms` milliseconds from

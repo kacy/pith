@@ -329,6 +329,22 @@ impl Channel {
     }
 }
 
+/// `channel.timeout_ms` for the fd `guard` holds, read from the kernel once
+/// per handle and cached after that. `pith_tcp_set_timeout` forgets the cached
+/// value, so the next wait reads the new one back.
+fn cached_timeout_ms(guard: &Guard, read: bool, channel: Channel) -> i64 {
+    if !channel.is_socket() {
+        return channel.timeout_ms(guard.fd() as i64, read);
+    }
+    let write = !read;
+    if let Some(ms) = crate::fd_handle::cached_timeout(guard, write) {
+        return ms;
+    }
+    let ms = channel.timeout_ms(guard.fd() as i64, read);
+    crate::fd_handle::cache_timeout(guard, write, Some(ms));
+    ms
+}
+
 /// the time one retry loop may spend waiting for its fd: asked for the first
 /// time the loop would block, then spent down across the retries after it.
 ///
@@ -336,7 +352,8 @@ impl Channel {
 ///
 /// the timeout is only ever asked for on the path that is about to park, so a
 /// read that finds its bytes already there pays nothing for it. the extra
-/// `getsockopt` lands exactly where the caller was going to sleep anyway.
+/// `getsockopt`, made once per handle (see `cached_timeout_ms`), lands exactly
+/// where the caller was going to sleep anyway.
 ///
 /// and a wake with nothing behind it cannot restart the clock. the caller asked
 /// for one bounded read, not an unbounded series of bounded waits, so a retry
@@ -360,7 +377,7 @@ impl WaitBudget {
     fn wait(&mut self, guard: &Guard, read: bool, channel: Channel) -> i64 {
         let resolved = match *self {
             WaitBudget::Unasked => {
-                let per_call = match channel.timeout_ms(guard.fd() as i64, read) {
+                let per_call = match cached_timeout_ms(guard, read, channel) {
                     ms if ms > 0 => Some(Instant::now() + Duration::from_millis(ms as u64)),
                     _ => None,
                 };
@@ -941,6 +958,34 @@ mod tests {
         close(b);
         close(read_end);
         close(write_end);
+    }
+
+    /// a handle caches its timeout on the first wait, and setting a new one
+    /// makes the next wait read it back rather than keep the old answer.
+    #[test]
+    fn a_timeout_set_after_a_wait_bounds_the_next_wait() {
+        let (a, b) = socket_pair();
+        set_nonblocking(a);
+        let handle = fd_handle::open(a, FdKind::Socket);
+        let guard = fd_handle::acquire(handle, FdKind::Socket).expect("live handle");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: one byte from a static buffer to a socket this test owns.
+            unsafe { libc::send(b, b"x".as_ptr() as *const libc::c_void, 1, libc::MSG_NOSIGNAL) };
+            b
+        });
+        // this wait finds no timeout and caches that.
+        assert_eq!(socket_read_yielding(&guard, 16).map(|bytes| bytes.len()), Some(1));
+        let b = writer.join().expect("writer panicked");
+        crate::network::pith_tcp_set_timeout(handle, 150);
+        let start = Instant::now();
+        assert!(socket_read_yielding(&guard, 16).is_none());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(120), "gave up after {waited:?}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        drop(guard);
+        close(a);
+        close(b);
     }
 
     /// an idle socket with a deadline gives up on it, and reports the giving up

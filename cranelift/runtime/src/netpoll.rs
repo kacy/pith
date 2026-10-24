@@ -84,8 +84,8 @@ use crate::concurrency::green;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// which readiness a task waits for on an fd. one fd can carry a read waiter and
@@ -201,6 +201,13 @@ impl Inner {
         }
     }
 
+    /// record in `busy` whether this registry has anything a poll could find.
+    /// called at the end of every locked change.
+    fn publish(&self, busy: &AtomicBool) {
+        let any = !self.fds.is_empty() || !self.deadlines.is_empty() || !self.timers.is_empty();
+        busy.store(any, AtomicOrdering::SeqCst);
+    }
+
     /// the event mask an fd should currently be armed for: the union of the
     /// interests that still have at least one waiter.
     fn desired_mask(&self, fd: RawFd) -> u32 {
@@ -223,11 +230,31 @@ impl Inner {
 struct Poller {
     epfd: RawFd,
     eventfd: RawFd,
-    /// an eventfd write is pending that the worker has not drained yet. lets a
-    /// burst of `notify` calls cost one syscall rather than one each.
+    /// a `notify` the worker has not consumed yet. it outlives a notify that
+    /// lands before the worker starts waiting, so none is lost, and a burst of
+    /// notifies for one parked worker costs one wake.
     notified: AtomicBool,
+    /// how the worker is waiting, so `notify` knows how to wake it: not at
+    /// all, on `park_cv`, or in `epoll_wait`.
+    mode: AtomicU8,
+    /// the futex park, for a worker with nothing registered with epoll. a
+    /// condvar wake is cheaper than an eventfd write and an epoll wakeup, and
+    /// the channel fan-out benchmark, which crosses workers on every message
+    /// and does no i/o, ran about a third slower with every park in epoll.
+    park: Mutex<()>,
+    park_cv: Condvar,
+    /// the registry holds an fd or a deadline, so a poll can find something.
+    /// set under the lock after every change (`Inner::publish`). an idle worker
+    /// checks it before polling, so a worker with no sockets and no sleepers
+    /// pays no syscall and no lock on its way to park.
+    busy: AtomicBool,
     inner: Mutex<Inner>,
 }
+
+/// `Poller::mode` values.
+const WAIT_NONE: u8 = 0;
+const WAIT_FUTEX: u8 = 1;
+const WAIT_EPOLL: u8 = 2;
 
 /// one poller per green worker, built with the worker pool, indexed like it.
 static POLLERS: OnceLock<Vec<Poller>> = OnceLock::new();
@@ -274,6 +301,10 @@ impl Poller {
             epfd,
             eventfd,
             notified: AtomicBool::new(false),
+            mode: AtomicU8::new(WAIT_NONE),
+            park: Mutex::new(()),
+            park_cv: Condvar::new(),
+            busy: AtomicBool::new(false),
             inner: Mutex::new(Inner::new()),
         }
     }
@@ -337,20 +368,35 @@ fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) {
 
 /// wake worker `index` out of `idle_wait`. a no-op when a notify is already
 /// pending, so a burst of wakes for one parked worker costs one syscall.
+///
+/// the flag is stored before the wait mode is read, and `idle_wait` stores the
+/// mode before it reads the flag, so either this sees the worker waiting and
+/// wakes it, or the worker sees the flag and does not wait.
 pub(crate) fn notify(index: usize) {
     let poller = poller(index);
     if poller.notified.swap(true, AtomicOrdering::SeqCst) {
         return;
     }
-    let one: u64 = 1;
-    // SAFETY: writing 8 bytes to our own eventfd; EAGAIN (counter saturated) is
-    // fine — the worker will still see a pending readiness and wake.
-    unsafe {
-        libc::write(
-            poller.eventfd,
-            &one as *const u64 as *const libc::c_void,
-            std::mem::size_of::<u64>(),
-        );
+    match poller.mode.load(AtomicOrdering::SeqCst) {
+        WAIT_FUTEX => {
+            // taking the lock orders this against the worker's check-then-wait.
+            let _g = poller.park.lock().unwrap_or_else(|p| p.into_inner());
+            poller.park_cv.notify_one();
+        }
+        WAIT_EPOLL => {
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to our own eventfd; EAGAIN (counter
+            // saturated) is fine — the worker will still see a pending
+            // readiness and wake.
+            unsafe {
+                libc::write(
+                    poller.eventfd,
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -418,6 +464,7 @@ pub(crate) fn wait_io(
             }));
         }
         reconcile_fd(poller, &mut inner, fd);
+        inner.publish(&poller.busy);
     }
     if !live() {
         // every waiter on this fd waits on the same dead handle — the number
@@ -498,6 +545,7 @@ fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<Atomi
         seq,
         target: DeadlineTarget::Timer,
     }));
+    inner.publish(&poller.busy);
 }
 
 /// run worker `index`'s poller once: wait up to `timeout` (zero polls without
@@ -540,9 +588,6 @@ fn poll(index: usize, timeout: Duration) -> bool {
             let token = ev.u64;
             let bits = ev.events;
             if token == EVENTFD_TOKEN {
-                // clear the flag before draining: a notify that lands after the
-                // drain then writes again rather than being swallowed.
-                poller.notified.store(false, AtomicOrdering::SeqCst);
                 drain_eventfd(poller.eventfd);
                 notified = true;
                 continue;
@@ -571,6 +616,7 @@ fn poll(index: usize, timeout: Duration) -> bool {
         if !inner.deadlines.is_empty() {
             collect_expired(poller, &mut inner, Instant::now(), &mut to_wake);
         }
+        inner.publish(&poller.busy);
     }
 
     let woke = !to_wake.is_empty();
@@ -582,16 +628,42 @@ fn poll(index: usize, timeout: Duration) -> bool {
 
 /// poll worker `index`'s sockets without blocking. a busy worker calls this
 /// between tasks so the tasks whose sockets became ready get queued even while
-/// it always has other work. returns whether any task was woken.
+/// it always has other work. returns whether any task was woken. free when the
+/// worker has nothing registered.
 pub(crate) fn poll_ready(index: usize) -> bool {
+    if !poller(index).busy.load(AtomicOrdering::SeqCst) {
+        return false;
+    }
     poll(index, Duration::ZERO)
 }
 
-/// park worker `index` in `epoll_wait` until one of its sockets is ready, a
-/// deadline expires, `notify` is called, or `timeout` runs out. returns true
-/// when the wait ran out with nothing to do.
+/// park worker `index` until one of its sockets is ready, a deadline expires,
+/// `notify` is called, or `timeout` runs out. returns true when the wait ran
+/// out with nothing to do.
+///
+/// a worker with sockets or deadlines registered waits in `epoll_wait`. one
+/// with nothing registered waits on its condvar instead, which is the cheaper
+/// wake; nothing can register while it waits, because only the worker itself
+/// registers on its poller.
 pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
-    !poll(index, timeout)
+    let poller = poller(index);
+    let woke = if poller.busy.load(AtomicOrdering::SeqCst) {
+        poller.mode.store(WAIT_EPOLL, AtomicOrdering::SeqCst);
+        !poller.notified.load(AtomicOrdering::SeqCst) && poll(index, timeout)
+    } else {
+        let guard = poller.park.lock().unwrap_or_else(|p| p.into_inner());
+        poller.mode.store(WAIT_FUTEX, AtomicOrdering::SeqCst);
+        let _ = poller
+            .park_cv
+            .wait_timeout_while(guard, timeout, |_| {
+                !poller.notified.load(AtomicOrdering::SeqCst)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        false
+    };
+    poller.mode.store(WAIT_NONE, AtomicOrdering::SeqCst);
+    let notified = poller.notified.swap(false, AtomicOrdering::SeqCst);
+    !(woke || notified)
 }
 
 /// the `epoll_wait` timeout for one poll: `cap`, or less if a deadline is due
@@ -764,6 +836,7 @@ pub(crate) fn on_close(fd: RawFd) {
             // fd was in the epoll set; remove it. errors (already gone) ignored.
             epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
         }
+        inner.publish(&poller.busy);
         // any deadline heap entries for this fd are now stale; they match no
         // waiter and are dropped when they surface (same as a fired waiter's).
     }

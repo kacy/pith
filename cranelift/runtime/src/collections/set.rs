@@ -3,7 +3,7 @@
 //! Hybrid approach: Uses hashbrown::HashSet internally for O(1) operations,
 //! but presents FFI-compatible interface matching the C runtime.
 
-use crate::handle_registry::{self, HandleKind};
+use crate::handle_registry;
 use hashbrown::hash_map::EntryRef;
 use hashbrown::{Equivalent, HashMap};
 use std::hash::{Hash, Hasher};
@@ -264,7 +264,6 @@ pub unsafe extern "C" fn pith_set_new(elem_type: i32, elem_size: i64) -> PithSet
     let set_impl = SetImpl::new(ElemType::from_code(elem_type), elem_size as usize);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
-    handle_registry::register(ptr as *const (), HandleKind::Set);
 
     PithSet { ptr }
 }
@@ -350,7 +349,6 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     // Free the set implementation. Scrub the magic first so any handle
     // that outlives the set fails the fast validity check.
     (*(set.ptr as *mut SetImpl)).magic = 0;
-    handle_registry::unregister(set.ptr as *const (), HandleKind::Set);
     let _ = Box::from_raw(set.ptr as *mut SetImpl);
 }
 
@@ -414,7 +412,6 @@ pub(crate) unsafe fn cycle_set_free_dead(handle: i64) {
         return;
     }
     (*(handle as *mut SetImpl)).magic = 0;
-    handle_registry::unregister(handle as *const (), HandleKind::Set);
     drop(Box::from_raw(handle as *mut SetImpl));
 }
 
@@ -555,7 +552,6 @@ pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
     let set_impl = SetImpl::new(ElemType::from_code(elem_type), 8);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed);
-    handle_registry::register(ptr as *const (), HandleKind::Set);
     ptr as i64
 }
 

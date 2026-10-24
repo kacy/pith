@@ -424,36 +424,65 @@ impl Span:
 # --- export buffer: ended spans wait here for the OTLP exporter to drain ---
 #
 # every span that ends writes here and the exporter drains from here, so unlike
-# the two settings above this really is contended state. all three accesses
-# (set_sink, record_finished_span, drain_finished_spans) take the lock, and the
-# drain hands the list over and installs a fresh one rather than exporting under
-# it, so the exporter's POST runs off the lock.
-mut sink_mu := Mutex()
-mut sink_spans: List[Span] := []
-mut sink_active := false
+# the two settings above this really is contended state. the drain hands each
+# list over and installs a fresh one rather than exporting under the lock, so
+# the exporter's POST runs off it.
+#
+# the buffer is split into SINK_SHARDS lists with a lock each, picked by the
+# span's trace id, so tasks ending spans of different traces do not queue on
+# one lock; 32 tasks ending spans spent a third of their samples on the single
+# lock. every span of a trace lands in the same shard, so a drain still returns
+# a trace's spans in the order they ended. set_sink and the drain take the
+# shard locks in index order.
+SINK_SHARDS := 8
+mut sink_mus: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
+mut sink_shards: List[List[Span]] := [[], [], [], [], [], [], [], []]
+mut sink_active := AtomicInt(0)
 FINISHED_SPANS_CAP := 2048
+
+fn sink_shard(trace_id: String) -> Int:
+    n := trace_id.len()
+    if n == 0:
+        return 0
+    # the last hex digit is random in a v7 id, and the low three bits of its
+    # ascii code spread both digits and letters across the shards.
+    return bits.band(ord(trace_id[n - 1]), SINK_SHARDS - 1)
 
 # enable collecting ended spans (the exporter turns this on). off => end() keeps
 # nothing, so a program tracing without an exporter does not accumulate spans.
 pub fn set_sink(on: Bool):
-    sink_mu.lock()
-    sink_active = on
-    if not on:
-        sink_spans = []
-    sink_mu.unlock()
+    if on:
+        sink_active.store(1)
+        return
+    sink_active.store(0)
+    mut i := 0
+    while i < SINK_SHARDS:
+        sink_mus[i].lock()
+        sink_shards[i] = []
+        sink_mus[i].unlock()
+        i = i + 1
 
 fn record_finished_span(span: Span):
-    sink_mu.lock()
-    if sink_active and sink_spans.len() < FINISHED_SPANS_CAP:
-        sink_spans.push(span)
-    sink_mu.unlock()
+    if sink_active.load() == 0:
+        return
+    s := sink_shard(span.trace_id)
+    sink_mus[s].lock()
+    if sink_shards[s].len() < FINISHED_SPANS_CAP / SINK_SHARDS:
+        sink_shards[s].push(span)
+    sink_mus[s].unlock()
 
 # take and clear the finished spans collected so far (the exporter calls this).
 pub fn drain_finished_spans() -> List[Span]:
-    sink_mu.lock()
-    out := sink_spans
-    sink_spans = []
-    sink_mu.unlock()
+    mut out: List[Span] := []
+    mut i := 0
+    while i < SINK_SHARDS:
+        sink_mus[i].lock()
+        taken := sink_shards[i]
+        sink_shards[i] = []
+        sink_mus[i].unlock()
+        for span in taken:
+            out.push(span)
+        i = i + 1
     return out
 
 # --- W3C trace-context propagation (the `traceparent` header) ---

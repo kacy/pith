@@ -363,22 +363,53 @@ fn observed_total(buckets: List[AtomicInt], overflow: AtomicInt) -> Int:
     return total
 
 # find or create a counter series and hand back an instrument bound to its cell.
+# each task keeps the series it has resolved, so a handler that looks its
+# series up on every write (`counter(name).labels(pairs).inc()`, the std.net.http
+# pattern) takes the shard lock once per series rather than once per write. a
+# hot series lives on one shard, so with every task writing it, the shard lock
+# was a single queue: 32 tasks writing one labeled counter spent most of their
+# samples waiting on it. the cached series hold the same atomic cells as the
+# registry, so a write through either is the same write. `reset` bumps
+# registry_epoch, and a task whose cache is from an older epoch drops it,
+# which keeps the documented rule that a reset needs fresh instruments.
+mut registry_epoch := AtomicInt(0)
+threadlocal mut cache_epoch: Int := 0 - 1
+threadlocal mut counter_cache: Map[String, Series] := {}
+threadlocal mut gauge_cache: Map[String, Series] := {}
+threadlocal mut histogram_cache: Map[String, HistSeries] := {}
+
+fn sync_cache():
+    epoch := registry_epoch.load()
+    if epoch != cache_epoch:
+        counter_cache.clear()
+        gauge_cache.clear()
+        histogram_cache.clear()
+        cache_epoch = epoch
+
 fn resolve_counter(key: String, bare: String, pairs: List[String]) -> Counter:
+    sync_cache()
+    if counter_cache.contains_key(key):
+        return counter_instrument(counter_cache[key])
     s := shard_of(key)
     shard_mu[s].lock()
     if not counter_series[s].contains_key(key):
         counter_series[s].insert(key, new_series(key, bare, pairs))
     found := counter_series[s][key]
     shard_mu[s].unlock()
+    counter_cache.insert(key, found)
     return counter_instrument(found)
 
 fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
+    sync_cache()
+    if gauge_cache.contains_key(key):
+        return gauge_instrument(gauge_cache[key])
     s := shard_of(key)
     shard_mu[s].lock()
     if not gauge_series[s].contains_key(key):
         gauge_series[s].insert(key, new_series(key, bare, pairs))
     found := gauge_series[s][key]
     shard_mu[s].unlock()
+    gauge_cache.insert(key, found)
     return gauge_instrument(found)
 
 # find or create a histogram series. a series that already exists is one lock
@@ -388,12 +419,16 @@ fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
 # whole-registry walk — and the common path does not pay for building a default
 # boundary list it is about to throw away.
 fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogram:
+    sync_cache()
+    if histogram_cache.contains_key(key):
+        return histogram_instrument(histogram_cache[key])
     s := shard_of(key)
     shard_mu[s].lock()
     known := histogram_series[s].contains_key(key)
     if known:
         found := histogram_series[s][key]
         shard_mu[s].unlock()
+        histogram_cache.insert(key, found)
         return histogram_instrument(found)
     shard_mu[s].unlock()
     bounds := buckets_for(bare)
@@ -402,6 +437,7 @@ fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogra
         histogram_series[s].insert(key, new_hist_series(key, bare, pairs, bounds))
     created := histogram_series[s][key]
     shard_mu[s].unlock()
+    histogram_cache.insert(key, created)
     return histogram_instrument(created)
 
 fn same_bounds(a: List[Float], b: List[Float]) -> Bool:
@@ -538,6 +574,7 @@ pub fn reset():
         metric_units[s].clear()
         histogram_bucket_defs[s].clear()
         s = s + 1
+    registry_epoch.store(registry_epoch.load() + 1)
     unlock_all_shards()
 
 # create or reopen a counter by name.

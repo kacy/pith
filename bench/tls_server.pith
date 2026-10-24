@@ -1,0 +1,45 @@
+# tls_server — the http_server benchmark's shape over tls: a task per accepted
+# connection, each serving keep-alive requests through serve_connection_tls.
+#
+#   pith build bench/tls_server.pith
+#   ./bench/tls_server <port>
+#   wrk -t 8 -c 256 -d 15s https://127.0.0.1:<port>/
+#
+# it uses the localhost certificate from the live-test fixtures, so a client
+# that verifies needs tests/live/fixtures/localhost-ca.crt; wrk does not verify.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+
+fn respond(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.response(200).with_body_bytes(bytes.from_string_utf8("ok")).content_type("text/plain")
+
+# handshake here, in the connection's own task, as std.web does: a handshake
+# in the accept loop would run every handshake one at a time.
+fn serve_one(listener: tls.Listener, fd: Int) -> Int:
+    handshaken := listener.handshake(fd)
+    if handshaken.is_err:
+        return 0
+    conn := handshaken.ok
+    http.serve_connection_tls(conn, respond) catch 0
+    conn.close()
+    return 0
+
+fn main() -> Int!:
+    mut port := 8443
+    argv := args()
+    if argv.len() > 1:
+        port = parse_int(argv[1]) catch 8443
+    # no alpn: wrk offers none, and a server that requires it refuses wrk.
+    config := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("0.0.0.0", port, config)!
+    print("listening on {port}")
+    while true:
+        accepted := listener.accept_socket()
+        if accepted.is_ok:
+            spawn serve_one(listener, accepted.ok)
+    return 0

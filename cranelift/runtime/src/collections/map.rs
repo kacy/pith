@@ -6,7 +6,7 @@
 use crate::collections::list::{
     element_tag_from_code, release_element, retain_element, ListTypeTag,
 };
-use crate::handle_registry::{self, HandleKind};
+use crate::handle_registry;
 use crate::runtime_core::optional_tuple;
 use hashbrown::hash_map::EntryRef;
 use hashbrown::{Equivalent, HashMap};
@@ -573,7 +573,6 @@ unsafe fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> Pit
     );
     let boxed = Box::new(map_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
-    handle_registry::register(ptr as *const (), HandleKind::Map);
     PithMap { ptr }
 }
 
@@ -721,7 +720,6 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     // Free the map implementation. Scrub the magic first so any handle
     // that outlives the map fails the fast validity check.
     (*(map.ptr as *mut MapImpl)).magic = 0;
-    handle_registry::unregister(map.ptr as *const (), HandleKind::Map);
     // a map that dies while the suspect buffer points at it keeps its shell:
     // the values are already released and the handle no longer validates
     // anywhere, so deferring the box drop to the graveyard leaks only the
@@ -830,7 +828,6 @@ pub(crate) unsafe fn cycle_map_free_dead(handle: i64) {
         & 1
         != 0;
     (*(handle as *mut MapImpl)).magic = 0;
-    handle_registry::unregister(handle as *const (), HandleKind::Map);
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_MAP);
         return;

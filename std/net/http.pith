@@ -513,7 +513,9 @@ fn form_encode_fields(fields: Map[String, String]) -> String:
 
 # Splits a request path into its non-empty segments, so "/a//b/" and "/a/b"
 # both yield ["a", "b"]. Route matching and group-scope checks share this, so
-# they agree on which routes a path reaches.
+# they agree on which routes a path reaches. the segments stay percent-encoded:
+# splitting happens on the raw "/" only, so an encoded slash ("%2F") stays
+# inside its segment, and segment_matches decodes a segment when it compares.
 pub fn path_segments(path: String) -> List[String]:
     mut parts: List[String] := []
     for part in normalize_path(path).split("/"):
@@ -521,36 +523,148 @@ pub fn path_segments(path: String) -> List[String]:
             parts.push(part)
     return parts
 
-fn route_match_path(path: String, pattern: String) -> Bool:
-    path_parts := path_segments(path)
-    pattern_parts := path_segments(pattern)
-    if path_parts.len() != pattern_parts.len():
+# true when the raw path segment `segment` names `literal` once
+# percent-decoded, so "caf%C3%A9" matches "café" and "%61pi" matches "api". a
+# segment with no escape is compared as it is, without decoding.
+pub fn segment_matches(segment: String, literal: String) -> Bool:
+    if segment.index_of("%") < 0:
+        return segment == literal
+    return url_mod.decode_path(segment) == literal
+
+# how many bytes of `path` from `at` spell one dot: 1 for ".", 3 for an
+# encoded "%2e" or "%2E", 0 for anything else.
+fn dot_width(path: String, at: Int, end: Int) -> Int:
+    if at >= end:
+        return 0
+    if path[at] == ".":
+        return 1
+    if at + 3 <= end and path[at] == "%" and path[at + 1] == "2" and (path[at + 2] == "e" or path[at + 2] == "E"):
+        return 3
+    return 0
+
+# how many dots the segment path[start:end] is made of, when it is a dot
+# segment ("." or "..", either dot possibly percent-encoded), or 0 when it is
+# not one. an encoded dot counts because a handler that decodes the segment
+# sees "..", and the router must not let that through as a name.
+fn dot_segment_dots(path: String, start: Int, end: Int) -> Int:
+    first := dot_width(path, start, end)
+    if first == 0:
+        return 0
+    if start + first == end:
+        return 1
+    second := dot_width(path, start + first, end)
+    if second > 0 and start + first + second == end:
+        return 2
+    return 0
+
+# true when clean_path would return `path` unchanged: it starts with "/", has
+# no empty segment but a trailing slash, and no "." or ".." segment, encoded
+# or not. it reads the path in place, so a clean path costs no allocation.
+pub fn path_is_clean(path: String) -> Bool:
+    n := path.len()
+    if n == 0 or path[0] != "/":
+        return false
+    mut start := 1
+    mut i := 1
+    while i <= n:
+        if i == n or path[i] == "/":
+            if i == start and i < n:
+                return false
+            if dot_segment_dots(path, start, i) > 0:
+                return false
+            start = i + 1
+        i = i + 1
+    return true
+
+# the canonical form of a request path, as net/http's ServeMux computes it: a
+# leading "/", repeated slashes collapsed, "." segments dropped and ".."
+# segments resolved against the segment before them. a ".." at the root stays
+# at the root, so the result never climbs above "/". a trailing slash is kept.
+# dot segments are recognized percent-encoded too ("%2e%2e"); every other
+# segment is kept as it arrived, escapes and all.
+pub fn clean_path(path: String) -> String:
+    if path_is_clean(path):
+        return path
+    # `kept` is a stack whose live part is its first `depth` entries, so a
+    # ".." pops by lowering depth and the next name overwrites the slot.
+    mut kept: List[String] := []
+    mut depth := 0
+    for part in path.split("/"):
+        if part == "":
+            continue
+        dots := dot_segment_dots(part, 0, part.len())
+        if dots == 1:
+            continue
+        if dots == 2:
+            if depth > 0:
+                depth = depth - 1
+            continue
+        if depth < kept.len():
+            kept[depth] = part
+        else:
+            kept.push(part)
+        depth = depth + 1
+    if depth == 0:
+        return "/"
+    mut out := ""
+    mut i := 0
+    while i < depth:
+        out = out + "/" + kept[i]
+        i = i + 1
+    if path.ends_with("/"):
+        out = out + "/"
+    return out
+
+# true when the segments of a request path match a route pattern's segments.
+# a ":name" pattern segment matches any one segment. a final "*name" segment
+# matches whatever is left, including nothing. every other pattern segment
+# must equal the path segment once that is percent-decoded.
+pub fn segments_match(path_parts: List[String], pattern_parts: List[String]) -> Bool:
+    mut fixed := pattern_parts.len()
+    if fixed > 0 and pattern_parts[fixed - 1].starts_with("*"):
+        fixed = fixed - 1
+        if path_parts.len() < fixed:
+            return false
+    elif path_parts.len() != fixed:
         return false
     mut i := 0
-    while i < path_parts.len():
+    while i < fixed:
         pat := pattern_parts[i]
-        if not pat.starts_with(":") and pat != path_parts[i]:
+        if not pat.starts_with(":") and not segment_matches(path_parts[i], pat):
             return false
         i = i + 1
     return true
 
+# the value of the parameter `name` in a path that segments_match accepted,
+# percent-decoded, or "" when the pattern has no such parameter. a "*name"
+# parameter is the rest of the path, each segment decoded and joined by "/",
+# so an encoded slash inside one segment reads as a "/" in the value.
+pub fn segment_param(path_parts: List[String], pattern_parts: List[String], name: String) -> String:
+    mut i := 0
+    while i < pattern_parts.len():
+        pat := pattern_parts[i]
+        if pat.len() == name.len() + 1 and pat.substring(1, pat.len()) == name:
+            if pat.starts_with(":") and i < path_parts.len():
+                return url_mod.decode_path(path_parts[i])
+            if pat.starts_with("*"):
+                mut rest: List[String] := []
+                mut j := i
+                while j < path_parts.len():
+                    rest.push(url_mod.decode_path(path_parts[j]))
+                    j = j + 1
+                return rest.join("/")
+        i = i + 1
+    return ""
+
+fn route_match_path(path: String, pattern: String) -> Bool:
+    return segments_match(path_segments(path), path_segments(pattern))
+
 fn route_param_from_path(path: String, pattern: String, name: String) -> String:
     path_parts := path_segments(path)
     pattern_parts := path_segments(pattern)
-    if path_parts.len() != pattern_parts.len():
+    if not segments_match(path_parts, pattern_parts):
         return ""
-    mut i := 0
-    while i < path_parts.len():
-        pat := pattern_parts[i]
-        if pat.starts_with(":"):
-            if pat.substring(1, pat.len()) == name:
-                # the value is one path segment; percent-decode it so a caller
-                # sees "a b", not the raw "a%20b" that arrived on the wire.
-                return url_mod.decode(path_parts[i])
-        elif pat != path_parts[i]:
-            return ""
-        i = i + 1
-    return ""
+    return segment_param(path_parts, pattern_parts, name)
 
 # splits a query string into decoded (key, value) pairs, first occurrence
 # winning, so every reader of a request's query agrees on one answer. keys and
@@ -4570,3 +4684,43 @@ test "an encoded separator in a query value is not split":
 test "a route parameter is percent-decoded":
     req := build_http_request(bytes.from_string_utf8("GET /users/a%20b HTTP/1.1\r\n\r\n"), bytes.empty())!
     assert_eq(req.path_param("/users/:id", "id")!, "a b")
+
+test "a route parameter keeps a plus and an encoded slash stays in its segment":
+    req := build_http_request(bytes.from_string_utf8("GET /files/a+b%2Fc HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.path_param("/files/:name", "name")!, "a+b/c")
+    assert(not req.matches_path("/files/:dir/:name")!)
+
+test "a literal route segment matches its percent-encoded spelling":
+    assert(route_match_path("/caf%C3%A9/%61pi", "/café/api"))
+    assert(not route_match_path("/caf%C3%A9", "/cafe"))
+
+test "a trailing wildcard matches the rest of the path":
+    pattern := path_segments("/static/*path")
+    assert(segments_match(path_segments("/static"), pattern))
+    assert(segments_match(path_segments("/static/a/b%20c.txt"), pattern))
+    assert(not segments_match(path_segments("/other/a"), pattern))
+    assert_eq(segment_param(path_segments("/static/a/b%20c.txt"), pattern, "path"), "a/b c.txt")
+    assert_eq(segment_param(path_segments("/static"), pattern, "path"), "")
+
+test "clean_path follows net/http and never climbs above the root":
+    assert_eq(clean_path("/a/b"), "/a/b")
+    assert_eq(clean_path("/a/b/"), "/a/b/")
+    assert_eq(clean_path("/"), "/")
+    assert_eq(clean_path(""), "/")
+    assert_eq(clean_path("a/b"), "/a/b")
+    assert_eq(clean_path("//a///b//"), "/a/b/")
+    assert_eq(clean_path("/a/./b/."), "/a/b")
+    assert_eq(clean_path("/a/b/../c"), "/a/c")
+    assert_eq(clean_path("/a/b/../"), "/a/")
+    assert_eq(clean_path("/.."), "/")
+    assert_eq(clean_path("/../../etc/passwd"), "/etc/passwd")
+    assert_eq(clean_path("/a/%2e%2E/%2e/b"), "/b")
+    assert_eq(clean_path("/a/.%2e/b"), "/b")
+    assert_eq(clean_path("//evil.example/x"), "/evil.example/x")
+    # a name that only starts with dots, or an escape that is not a dot, stays.
+    assert_eq(clean_path("/.well-known/..x/%2ex"), "/.well-known/..x/%2ex")
+    assert_eq(clean_path("/a%2F..%2Fb"), "/a%2F..%2Fb")
+
+test "path_is_clean agrees with clean_path":
+    for p in ["/", "/a", "/a/", "/a/b.txt", "/..x", "//", "/a//b", "/./", "/a/..", "/%2e", "x", "", "/a%2Fb"]:
+        assert_eq(path_is_clean(p), clean_path(p) == p)

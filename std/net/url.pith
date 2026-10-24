@@ -257,6 +257,16 @@ fn hex_digit(c: String) -> Int:
 # Percent-decodes a string, converting %XX sequences to characters.
 # Also converts "+" to space (application/x-www-form-urlencoded).
 pub fn decode(input: String) -> String:
+    return unescape(input, true)
+
+# Percent-decodes a path or one path segment. unlike decode, a "+" stays a
+# "+": only a query string or a form body spells a space that way.
+pub fn decode_path(input: String) -> String:
+    if input.index_of("%") < 0:
+        return input
+    return unescape(input, false)
+
+fn unescape(input: String, plus_is_space: Bool) -> String:
     # collect the pieces and join once at the end: appending to the result
     # string directly recopied everything accumulated so far on every append,
     # which made decoding quadratic in the input. a list survives a decoded
@@ -278,7 +288,7 @@ pub fn decode(input: String) -> String:
             else:
                 parts.push(input[position])
                 position = position + 1
-        elif input[position] == "+":
+        elif plus_is_space and input[position] == "+":
             parts.push(" ")
             position = position + 1
         else:
@@ -302,6 +312,12 @@ test "percent coding survives non-ascii and a trailing escape":
     assert_eq(decode("a%zz"), "a%zz")
     assert_eq(decode("a%4"), "a%4")
     assert_eq(decode("100%"), "100%")
+
+test "decode_path keeps a plus and decodes an escaped slash":
+    assert_eq(decode_path("a+b%20c"), "a+b c")
+    assert_eq(decode_path("a%2Fb"), "a/b")
+    assert_eq(decode_path("plain"), "plain")
+    assert_eq(decode_path("%2e%2E"), "..")
 
 test "url parse splits full urls":
     u := parse("https://example.com:8443/api/v1?q=pith#docs")

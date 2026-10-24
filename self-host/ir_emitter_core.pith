@@ -5748,6 +5748,9 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
         obj_r = ir_expr(recv_idx)
     r := ir_reg()
     if ir_emit_tuple_field_access(r, obj_r, recv_idx, fname):
+        # `make_pair().0` takes the element's own count before the fresh
+        # tuple goes, the same as a struct field read below
+        ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(ir_infer_type(idx)))
         return r
     lk := ir_field_lookup_key(recv_idx, fname)
     # when the name-keyed layout is missing (a struct emitted after this access,
@@ -5807,13 +5810,29 @@ fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
         return false
     return c_get_expr_type(recv.children[0]) < 0
 
+# the node kinds that can produce an owned struct for a field read to consume.
+# the rest of the test is ir_expr_is_borrowed's answer and the rc kind.
+fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
+    if kind == "call" or kind == "method_call" or kind == "struct_init":
+        return true
+    if kind == "catch_expr" or kind == "catch_block" or kind == "field_access":
+        return true
+    return kind == "try" or kind == "try_expr"
+
 # true when a field access's receiver is a fresh value nothing else names: a
 # call or method result, a struct construction, or an unwrap that built its
 # answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
 # kind.
+#
+# parens are transparent. a catch, a try (`f()!`) and a field read that is
+# itself off an owned temporary (`outer().inner`) all hand back a value with a
+# count of its own (see ir_expr_is_borrowed), so a field read off one of them
+# has to drop that count the same way.
 fn ir_field_receiver_is_owned_temp(recv_idx: Int) -> Bool:
     recv := get_node(recv_idx)
-    if recv.kind != "call" and recv.kind != "method_call" and recv.kind != "struct_init":
+    if recv.kind == "grouped" and recv.children.len() > 0:
+        return ir_field_receiver_is_owned_temp(recv.children[0])
+    if not ir_field_receiver_kind_can_own(recv.kind):
         return false
     if ir_value_extraction_is_uncounted(recv_idx):
         return false
@@ -6093,6 +6112,22 @@ fn ir_emit_result_field_access(idx: Int, obj_r: Int, fname: String) -> Int:
             if fname == "is_ok" or fname == "is_err":
                 return ir_emit_result_flag_field(obj_r, fname)
     return 0 - 1
+
+# a slot read off a result box nothing else names — `f().ok`, `f().is_ok` —
+# used to strand the box and whatever the other slot held. the slot value
+# takes its own count first, so it outlives the box, then the box goes the way
+# a discarded result does, payload and all. reading `.ok` off a fresh box is
+# already classified owned (ir_field_receiver_is_owned_temp), so the count
+# taken here is the one the consumer releases.
+fn ir_release_fresh_result_receiver(recv_idx: Int, obj_r: Int, value_r: Int, fname: String):
+    if not ir_expr_is_fresh_result_box(recv_idx):
+        return
+    recv_tid := c_get_expr_type(recv_idx)
+    if fname == "ok" or fname == "err":
+        value_kind := ir_rc_kind(ir_result_field_kind(recv_tid, fname))
+        if value_kind.len() > 0:
+            ir_rc_retain_reg(value_r, value_kind)
+    ir_emit_result_box_release(obj_r, recv_tid)
 
 fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
     actual_index := arg_index + 1
@@ -8251,6 +8286,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # not a struct field.
         result_r := ir_emit_result_field_access(idx, obj_r, fname)
         if result_r >= 0:
+            ir_release_fresh_result_receiver(node.children[0], obj_r, result_r, fname)
             return result_r
         # hand the already-evaluated receiver to the field read so it is not
         # emitted a second time (a stateful receiver would advance and misread).

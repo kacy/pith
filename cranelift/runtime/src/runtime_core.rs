@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     fn a_literal_header_gives_the_length_and_is_never_counted() {
         let mut words = [0u64; 4];
-        let text = b"literal ";
+        let text = b"literal\0";
         unsafe {
             let base = words.as_mut_ptr() as *mut u8;
             (base as *mut u32).write(CSTRING_STATIC_MAGIC);

@@ -191,19 +191,20 @@ mut ir_threadlocal_kinds: Map[String, String] := {}
 mut ir_next_tls_slot := 0
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
 
-# --- the two-register result ABI (PITH_RESULT_REG=1) ---
+# --- the two-register result ABI (on by default, PITH_RESULT_REG=0 for off) ---
 # functions in this registry return (is_ok, payload) in two registers via
 # ret2, and their call sites bind the pair with rcall, instead of passing a
 # heap-allocated three-slot result box. everything OUTSIDE these paths still
 # sees the declared retkind "tuple": a call site that is not consuming the
 # pair directly materializes a box from it on the spot, so the box world and
-# its ARC rules are untouched — with the flag off, not one instruction moves.
-# eligibility (ir_maybe_register_result_reg) is deliberately narrow for the
-# measured prototype: non-generic free functions whose ok payload is an Int
-# or Bool. the error payload is always a single register (a handle or zero).
-# the runtime builtins that return the same pair (ir_is_pair_builtin: the
-# parsers and the byte-count writes) take these call paths whatever the flag
-# says, since the runtime decides their return convention, not the emitter.
+# its ARC rules are untouched. with PITH_RESULT_REG=0 the registry stays
+# empty and every `-> T!` function returns the box. eligibility
+# (ir_maybe_register_result_reg) is non-generic free functions and plain-impl
+# methods whose ok payload fits one register. the error payload is always a
+# single register (a handle or zero). the runtime builtins that return the
+# same pair (ir_is_pair_builtin: the parsers and the byte-count writes) take
+# these call paths whatever the flag says, since the runtime decides their
+# return convention, not the emitter.
 mut ir_result_reg_flag := 0 - 1
 # the pair handshake: a consumer that can use (flag, payload) directly (the
 # `!` emitter) stores its operand node index here before emitting it; the
@@ -5840,26 +5841,28 @@ fn ir_emit_err_result_tuple(err_r: Int) -> Int:
     zero := ir_zero_reg()
     return ir_emit_result_tuple(zero, zero, err_r)
 
-# whether the two-register result ABI is on for this process. read once: the
-# emitter must make the same decision for a function's header and for every
-# one of its call sites, across every module of the program.
+# whether the two-register result ABI is on for this process: on unless
+# PITH_RESULT_REG is "0". read once: the emitter must make the same decision
+# for a function's header and for every one of its call sites, across every
+# module of the program.
 fn ir_result_reg_enabled() -> Bool:
     if ir_result_reg_flag < 0:
         value := env_opt("PITH_RESULT_REG").unwrap_or("")
-        if value == "1":
-            ir_result_reg_flag = 1
-        else:
+        if value == "0":
             ir_result_reg_flag = 0
+        else:
+            ir_result_reg_flag = 1
     return ir_result_reg_flag == 1
 
 # register `name` for the two-register result ABI when it qualifies. the gate
 # is per-FUNCTION and must be decided before any call site emits, which is why
 # it runs during return-clause registration. narrow on purpose: no generics
 # (specializations re-emit bodies under substitution), no `main` (the entry
-# glue expects one return), and only Int/Bool ok payloads so the extracted
-# value never needs reference counting. the error payload is whatever `fail`
-# produced — always a single register, released by the consumer exactly as
-# the box world's err slot is.
+# glue expects one return), and only ok payloads that fit one integer
+# register (ir_result_reg_ok_kind_fits: a Float! has no f64 pair yet, and an
+# optional or tuple payload is more than one word). the error payload is
+# whatever `fail` produced — always a single register, released by the
+# consumer exactly as the box world's err slot is.
 fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
     if not ir_result_reg_enabled():
         return

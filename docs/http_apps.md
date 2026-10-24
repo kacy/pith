@@ -37,6 +37,19 @@ use these helpers instead of reparsing strings by hand:
 - `req.path_param_or(...)`
 - `req.body_json()`
 - `req.body_json_or(...)`
+- `req.form()`, `req.post_form()`, `req.form_value(...)` and
+  `req.post_form_value(...)` (see [forms](#forms))
+- `req.basic_auth()`
+
+`matches_path` and `path_param` follow the same rules as `std.web`'s router.
+the path is split on its literal `/` characters and each segment is
+percent-decoded after that, so an encoded slash (`%2F`) never splits a
+segment, a literal pattern segment matches its encoded spelling, and a `+` in
+a path stays a `+`. a `:name` segment matches one segment and a final
+`*name` segment matches the rest of the path. `http.clean_path(path)` gives
+the canonical form net/http's `ServeMux` redirects to, and
+`http.path_is_clean(path)` checks for it without allocating (see
+[canonical paths](web.md#canonical-paths)).
 
 `body_json()` returns a handle into the `std.json` node pool, which lives in
 per-task storage and is not freed handle by handle. the `http.serve_*` entry
@@ -156,6 +169,44 @@ req := http.post_request("example.test", 80, "/upload").multipart_body(parts)!
 ```
 
 if you want a stable boundary for tests, use `multipart_body_with_boundary(...)`.
+
+## forms
+
+`http.parse_form(text)` reads an `application/x-www-form-urlencoded` body or a
+query string the way net/http's `url.ParseQuery` does. the result maps each key
+to all of its values, in order:
+
+```pith
+values := http.parse_form("tag=a&tag=b&q=x+y%21")
+values["tag"]       # ["a", "b"]
+values["q"][0]      # "x y!"
+```
+
+keys and values are percent-decoded and `+` is a space. the text is split on
+the raw `&` and `=` first, so an encoded `%26` stays inside its value, and a
+pair with no `=` is a key with an empty value.
+
+on a request:
+- `req.post_form()` holds the body's values. only a `POST`, `PUT` or `PATCH`
+  body counts, and only an urlencoded or a `multipart/form-data` one. a
+  multipart part that carries a file is not a value; read it with
+  `multipart_part`
+- `req.form()` holds the body's values first and then the query string's, as
+  net/http's `Request.Form` does
+- `req.form_value(name)` and `req.post_form_value(name)` return the first
+  value, or `""`
+
+## basic auth
+
+`req.basic_auth()` returns the user and password from an
+`Authorization: Basic` header (rfc 7617) as an `http.BasicAuth`. it fails when
+the header is missing, names another scheme, or does not decode to
+`user:password`. the scheme name is matched without case, and a password may
+hold a `:`.
+
+`http.basic_auth_challenge(realm)` is the `401` that asks for credentials,
+with `WWW-Authenticate: Basic realm="...", charset="UTF-8"`. compare the
+password with `std.crypto.subtle`, not `==`.
 
 ## middleware
 
@@ -446,6 +497,67 @@ print(out.bytes().len().to_string())
 the streamed body size. the body itself goes straight into the writer.
 
 `send_into(...)` follows redirects the same way `send()` does.
+
+## serving files and content
+
+`http.serve_file(req, path)` answers a request with a file, and
+`http.serve_content(req, name, modified, content)` with bytes already in
+memory. they are the counterparts of net/http's `ServeFile` and
+`ServeContent`, and they return an `HttpResponse`:
+
+```pith
+fn download(req: HttpRequestBytes) -> HttpResponse:
+    return http.serve_file(req, "build/report.pdf")
+```
+
+both send:
+- `Content-Type` from the name's extension. when the table above does not
+  know the extension, the type is sniffed from the first 512 bytes with
+  `http.detect_content_type`
+- `Last-Modified` and a strong `ETag` built from the modification time and
+  the size. `serve_content` takes the modification time in unix seconds, and
+  `0` sends neither
+- `Accept-Ranges: bytes`
+
+and they evaluate the conditional headers in the order rfc 9110 13.2.2 gives:
+1. `If-Match` that names no current tag, or failing that an
+   `If-Unmodified-Since` older than the modification time, gets `412`
+2. `If-None-Match` that names the tag gets `304` on `GET` and `HEAD` and
+   `412` otherwise. the comparison is weak, so `W/"..."` matches
+3. without `If-None-Match`, an `If-Modified-Since` no older than the
+   modification time gets `304`
+
+a `304` carries the `ETag` and no body.
+
+a `GET` with `Range` (rfc 9110 14) gets `206`. one range is sent as is with
+`Content-Range`, several as a `multipart/byteranges` body, and a range the
+content cannot satisfy gets `416` with `Content-Range: bytes */size`.
+`If-Range` with the current strong tag or the exact modification date allows
+the range. anything else sends the whole content. a `Range` header is
+ignored, and the whole content sent, when it is malformed, uses another unit,
+asks for more than 32 ranges, or adds up to more than the content. `HEAD`
+ignores `Range` and gets the headers of the full answer with no body.
+
+`serve_file` reads only the bytes it sends, so a `304`, a `HEAD` or a small
+range does not read the whole file. a path that is not a regular file gets
+`404`, and one with a NUL byte `400`.
+
+`http.serve_dir(req, root, name)` serves `name` relative to `root`, as
+net/http's `FileServer` does. `name` is already percent-decoded, such as a
+`*path` route parameter. a `..` segment gets `404`, so nothing outside `root`
+is read, and a directory gets its `index.html` or `404`. directories are never
+listed. `web.App.static` is built on it.
+
+`http.detect_content_type(bytes)` is the sniffer on its own, in the spirit of
+net/http's `DetectContentType`. it knows html, xml, json, pdf, png, jpeg, gif,
+webp, zip, gzip and wasm by their signatures, calls anything else with no
+binary bytes in its first 512 `text/plain; charset=utf-8`, and the rest
+`application/octet-stream`. it is never applied to a handler's response on
+its own: a pith handler always sets a `Content-Type`.
+
+`http.parse_http_date(text)` reads the three http date forms (rfc 9110
+5.6.7) into unix seconds, and `fs.modified(path)` gives a file's modification
+time in the same unit.
 
 ## client helpers
 

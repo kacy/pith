@@ -1,4 +1,4 @@
-.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-reg-only memcheck-result-reg memcheck-result-reg-only leak-check-result-reg-only check-bootstrap-seed smoke-bootstrap-seed test clean
+.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-reg-only memcheck-result-reg memcheck-result-reg-only leak-check-result-reg-only check-bootstrap-seed smoke-bootstrap-seed test clean
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1082,6 +1082,20 @@ green-echo: build
 # it exists for. it is pinned to one worker so the hang does not depend on how
 # many cores the runner has, and every arm has a timeout so a regression fails
 # the target instead of wedging the job.
+# many tasks parked on the blocking pool at once must all be woken. the lost
+# wake this guards against needs a lot of busy workers to show, so it runs at
+# 32 whatever the host's core count, three times, each under a timeout.
+green-pool-wake: build
+	@echo "--- green-thread blocking-pool wakes (32 workers, 32 tasks reading files) ---"
+	@for i in 1 2 3; do \
+		out=$$(timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=32 ./target/release/pith run tests/green/pool_wake.pith 2>/dev/null); \
+		if [ "$$out" != "reads: 320000" ]; then \
+			echo "FAIL run $$i: expected 'reads: 320000', got '$$out' (a hang shows as empty)"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "ok   all reads completed in 3 runs"
+
 green-starvation: build
 	@echo "--- green-thread cooperative preemption (byte-identical off vs on, 1 and default workers) ---"
 	@off=$$(timeout 60 env PITH_GREEN=0 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
@@ -1133,7 +1147,7 @@ green-pinned-fairness: build
 # byte-for-byte. green-echo is intentionally left out: it binds a
 # fixed loopback port and races a sleep to let the server start, which is too
 # flaky for a shared runner.
-green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness
+green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness green-pool-wake
 	@echo "all green-thread tests passed"
 
 # --- full corpus under each backend ---

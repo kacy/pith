@@ -1,0 +1,36 @@
+# pool_wake — many tasks waiting on the blocking pool at once must all resume.
+#
+# every task reads a file in a loop. a green task's file read runs on the
+# blocking pool, which wakes the task when the read is done. a wake that lands
+# while the task is already queued is dropped, and the task's own check of the
+# result had no full fence against the pool's store of it, so both sides could
+# read the other's old value: the wake was dropped and the task parked for
+# good. it needs many workers busy at once to show, which is why the target
+# runs it at 32.
+
+import std.fs as fs
+
+TASKS := 32
+READS := 10000
+
+fn reader(n: Int) -> Int:
+    mut read := 0
+    mut i := 0
+    while i < n:
+        text := fs.read("tests/green/pool_wake.pith") catch ""
+        if text.len() > 0:
+            read = read + 1
+        i = i + 1
+    return read
+
+fn main() -> Int:
+    mut tasks: List[Task[Int]] := []
+    mut t := 0
+    while t < TASKS:
+        tasks.push(spawn reader(READS))
+        t = t + 1
+    mut total := 0
+    for task in tasks:
+        total = total + await task
+    print("reads: {total}")
+    return 0

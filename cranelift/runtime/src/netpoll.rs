@@ -1,4 +1,4 @@
-//! epoll reactor (netpoller) for the green-thread backend.
+//! epoll netpoller for the green-thread backend.
 //!
 //! under `PITH_GREEN` a small pool of worker OS threads runs many pith tasks as
 //! stackful coroutines (see `concurrency::green`). every blocking coordination op
@@ -7,15 +7,23 @@
 //! last hard park: a green task that read from a socket with no data ready blocked
 //! its whole worker on `poll`, starving every other task pinned to that worker.
 //!
-//! this module closes that gap. one shared epoll instance plus one dedicated
-//! reactor OS thread watch every fd a green task is waiting on. when a socket
-//! would block, the task registers its (fd, interest) here and suspends its
-//! coroutine; the worker runs other tasks. when epoll reports the fd ready the
-//! reactor does NOT resume the coroutine — it only calls `green::wake(task)`,
-//! which re-enqueues the task onto its owner worker's pinned queue. that composes
-//! with green's pinning discipline for free: the coroutine is only ever resumed on
-//! the thread that first ran it, and the reactor never touches a coroutine's
-//! stack.
+//! this module closes that gap. every green worker owns a poller: its own epoll
+//! instance, eventfd and waiter registry. when a socket would block, the task
+//! registers its (fd, interest) with the poller of the worker it is running on
+//! and suspends its coroutine; the worker runs other tasks. the worker polls its
+//! own epoll when it runs out of work, and parks *in* `epoll_wait`, so readiness
+//! on one of its sockets wakes it directly. polling never resumes a coroutine —
+//! it only calls `green::wake(task)`, which re-enqueues the task onto its owner
+//! worker's pinned queue, so green's pinning discipline holds unchanged.
+//!
+//! this replaced one shared epoll instance, one registry lock and one dedicated
+//! reactor thread. every wait from every worker took that lock and made its
+//! `epoll_ctl` call under it, and every readiness crossed from the reactor
+//! thread to a worker. with 32 workers the reactor could barely get its own lock
+//! back to deliver events, and the workers spent most of their cpu in the
+//! kernel. a per-worker poller is the thread-per-core shape seastar and glommio
+//! use for i/o: the lock is only ever contended by a close from another thread,
+//! and a readiness costs no cross-thread hop.
 //!
 //! ## epoll mode: level-triggered + oneshot
 //!
@@ -29,12 +37,15 @@
 //!
 //! ## the waiter registry
 //!
-//! a single `Mutex<Inner>` guards everything the reactor and the workers share:
+//! each poller's `Mutex<Inner>` guards everything its worker and a closing thread
+//! share:
 //!
 //! - `waiters`: for each `(fd, interest)`, the list of tasks blocked on it.
 //!   multiple tasks may wait on one fd — e.g. several accept loops on a listener —
-//!   so on readiness the reactor wakes *all* waiters for that (fd, interest) and
+//!   so on readiness the poller wakes *all* waiters for that (fd, interest) and
 //!   clears the list; each retries its syscall, one wins, the losers re-block.
+//!   tasks on different workers that wait on one fd register it in each of their
+//!   pollers; epoll allows one fd in several instances.
 //! - `fds`: for each fd currently in the epoll set, the event mask presently
 //!   armed. arming is always recomputed from the waiter lists (`reconcile_fd`):
 //!   the first registrant on an fd does `EPOLL_CTL_ADD`, a change in the desired
@@ -43,28 +54,28 @@
 //!   function of the waiter lists is what makes the arm/disarm bookkeeping easy to
 //!   reason about.
 //! - `deadlines`: a min-heap of timestamped entries for waits that carry a
-//!   finite timeout. the reactor sets each `epoll_wait` timeout to the nearest
+//!   finite timeout. a parking worker caps its `epoll_wait` timeout at the nearest
 //!   deadline and, on expiry, wakes the task with a timeout result. an entry
 //!   targets either an fd wait or a pure timer.
 //! - `timers`: tasks sleeping with no fd at all (`sleep_task`, behind
 //!   `pith_sleep`). a sleep is a deadline wait minus the fd: same heap, same
 //!   sweep, nothing armed in epoll.
 //!
-//! ## the eventfd nudge
+//! ## the eventfd notify
 //!
-//! an eventfd is registered in epoll (level-triggered, no oneshot). readiness
-//! registrations need no nudge — a live `epoll_ctl` ADD is honored by an in-flight
-//! `epoll_wait`. only a *nearer deadline* needs one: if a worker registers a
-//! timeout sooner than the reactor's current sleep, it writes the eventfd so the
-//! reactor wakes and recomputes its timeout. (the eventfd doubles as a clean
-//! shutdown handle, though the pool currently lives for the whole process.)
+//! each poller's eventfd is registered in its epoll (level-triggered, no
+//! oneshot). it is how the scheduler wakes a parked worker for new work (see
+//! `notify`): the write makes the worker's `epoll_wait` return even if it lands
+//! before the wait starts. a deadline never needs one, because only the worker
+//! itself registers on its poller, and it is running a task when it does — its
+//! next park reads the new deadline.
 //!
 //! ## lock discipline
 //!
-//! there is exactly one lock here: `Inner`'s mutex. it is never held across
+//! the only lock here is each poller's `Inner` mutex. it is never held across
 //! `epoll_wait` (which blocks) and never across `green::wake` (which takes green's
-//! own slab/queue locks). a worker registering a waiter takes this lock, arms
-//! epoll under it, drops it, then parks. the reactor takes it only to drain fired
+//! own slab/queue locks). a worker registering a waiter takes its poller's lock,
+//! arms epoll under it, drops it, then parks. a poll takes it only to drain fired
 //! events and expired deadlines into a local list, drops it, then wakes. so this
 //! lock never nests inside green's locks nor they inside it — no cross-module lock
 //! cycle is possible.
@@ -73,8 +84,8 @@ use crate::concurrency::green;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// which readiness a task waits for on an fd. one fd can carry a read waiter and
@@ -95,8 +106,8 @@ impl Interest {
     }
 }
 
-// outcome of a wait, shared between the waiting task and the reactor via an
-// `AtomicI32`. it starts `PENDING`; whichever reactor path handles the waiter
+// outcome of a wait, shared between the waiting task and the poller via an
+// `AtomicI32`. it starts `PENDING`; whichever poller path handles the waiter
 // first flips it to a terminal value with a compare-exchange, so a readiness and
 // a timeout racing on the same waiter cannot both "win".
 const PENDING: i32 = 0;
@@ -118,7 +129,7 @@ struct Waiter {
     /// unique registration id, used to match a heap deadline entry back to the
     /// exact waiter (a stale heap entry whose waiter already fired finds nothing).
     seq: u64,
-    /// shared result cell; the reactor writes `READY` or `TIMED_OUT` here before
+    /// shared result cell; the poller writes `READY` or `TIMED_OUT` here before
     /// waking the task, which reads it back after `park_current` returns.
     outcome: Arc<AtomicI32>,
 }
@@ -167,7 +178,7 @@ struct FdReg {
     armed: u32,
 }
 
-/// everything the workers and the reactor thread share, behind one mutex.
+/// one poller's registry, behind its mutex.
 struct Inner {
     waiters: HashMap<(RawFd, Interest), Vec<Waiter>>,
     fds: HashMap<RawFd, FdReg>,
@@ -207,34 +218,47 @@ impl Inner {
     }
 }
 
-/// the whole reactor: the epoll fd, the nudge eventfd, and the shared registry.
-struct Reactor {
+/// one worker's poller: its epoll fd, the eventfd that wakes it, and its
+/// registry.
+struct Poller {
     epfd: RawFd,
     eventfd: RawFd,
+    /// an eventfd write is pending that the worker has not drained yet. lets a
+    /// burst of `notify` calls cost one syscall rather than one each.
+    notified: AtomicBool,
     inner: Mutex<Inner>,
 }
 
-/// built lazily on the first green socket wait so a program that never blocks on
-/// a socket under the green backend pays nothing (and starts no reactor thread).
-static REACTOR: OnceLock<Reactor> = OnceLock::new();
+/// one poller per green worker, built with the worker pool, indexed like it.
+static POLLERS: OnceLock<Vec<Poller>> = OnceLock::new();
 
-fn lock_inner(reactor: &Reactor) -> std::sync::MutexGuard<'_, Inner> {
-    reactor.inner.lock().unwrap_or_else(|p| p.into_inner())
+fn lock_inner(poller: &Poller) -> std::sync::MutexGuard<'_, Inner> {
+    poller.inner.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// build (once) the epoll instance and eventfd. does NOT start the reactor thread
-/// — that is a separate `Once` (`ensure_started`) so the constructor stays
-/// non-reentrant, mirroring `green::scheduler` / `ensure_workers_started`.
-fn reactor() -> &'static Reactor {
-    REACTOR.get_or_init(|| {
+fn pollers() -> &'static [Poller] {
+    POLLERS.get_or_init(|| (0..green::pool_size()).map(|_| Poller::new()).collect())
+}
+
+/// the poller of worker `index`.
+fn poller(index: usize) -> &'static Poller {
+    &pollers()[index]
+}
+
+impl Poller {
+    fn new() -> Self {
         // SAFETY: plain libc calls with valid flags; we check every return value.
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(epfd >= 0, "epoll_create1 failed");
+        if epfd < 0 {
+            runtime_fatal!("epoll_create1 failed: {}", std::io::Error::last_os_error())
+        }
         let eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        assert!(eventfd >= 0, "eventfd failed");
+        if eventfd < 0 {
+            runtime_fatal!("eventfd failed: {}", std::io::Error::last_os_error())
+        }
 
-        // register the eventfd level-triggered with no oneshot, so any nudge
-        // always wakes an in-flight epoll_wait until we drain it.
+        // register the eventfd level-triggered with no oneshot, so a notify
+        // wakes an `epoll_wait` until the worker drains it.
         let mut ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,
             u64: EVENTFD_TOKEN,
@@ -242,29 +266,17 @@ fn reactor() -> &'static Reactor {
         // SAFETY: epfd and eventfd are both valid fds we just created; `ev` is a
         // properly initialized epoll_event living on this stack for the call.
         let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, eventfd, &mut ev) };
-        assert!(rc == 0, "epoll_ctl ADD eventfd failed");
+        if rc != 0 {
+            runtime_fatal!("epoll_ctl ADD eventfd failed: {}", std::io::Error::last_os_error())
+        }
 
-        Reactor {
+        Poller {
             epfd,
             eventfd,
+            notified: AtomicBool::new(false),
             inner: Mutex::new(Inner::new()),
         }
-    })
-}
-
-/// start the reactor thread exactly once. called from the first `wait_io`, by
-/// which point `reactor()` is initialized.
-fn ensure_started() {
-    static STARTED: Once = Once::new();
-    STARTED.call_once(|| {
-        reactor();
-        if let Err(err) = std::thread::Builder::new()
-            .name("pith-netpoll".to_string())
-            .spawn(reactor_loop)
-        {
-            runtime_fatal!("could not start the netpoll reactor thread: {err}")
-        }
-    });
+    }
 }
 
 /// arm/re-arm/disarm epoll for `fd` so its armed mask matches the current waiter
@@ -278,21 +290,21 @@ fn ensure_started() {
 ///   oneshot fire dropped `armed` to 0) -> `EPOLL_CTL_MOD`.
 /// - waiters, fd in the set, mask unchanged -> nothing (a second waiter on an
 ///   already-armed interest just rode along on the existing arm).
-fn reconcile_fd(reactor: &Reactor, inner: &mut Inner, fd: RawFd) {
+fn reconcile_fd(poller: &Poller, inner: &mut Inner, fd: RawFd) {
     let desired = inner.desired_mask(fd);
     match inner.fds.get_mut(&fd) {
         None => {
             if desired != 0 {
-                epoll_apply(reactor.epfd, libc::EPOLL_CTL_ADD, fd, desired);
+                epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired);
                 inner.fds.insert(fd, FdReg { armed: desired });
             }
         }
         Some(reg) => {
             if desired == 0 {
-                epoll_apply(reactor.epfd, libc::EPOLL_CTL_DEL, fd, 0);
+                epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
                 inner.fds.remove(&fd);
             } else if reg.armed != desired {
-                epoll_apply(reactor.epfd, libc::EPOLL_CTL_MOD, fd, desired);
+                epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired);
                 reg.armed = desired;
             }
         }
@@ -315,7 +327,7 @@ fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) {
     } else {
         &mut ev as *mut libc::epoll_event
     };
-    // SAFETY: `epfd` is the reactor's epoll fd; `fd` is a socket fd owned by pith
+    // SAFETY: `epfd` is a poller's epoll fd; `fd` is a socket fd owned by pith
     // for the duration of the wait; `ev` (when used) is a valid event on this
     // stack. DEL passes a null event as the kernel allows.
     unsafe {
@@ -323,15 +335,19 @@ fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) {
     }
 }
 
-/// nudge the reactor awake so it recomputes its `epoll_wait` timeout — used only
-/// when a worker registers a deadline nearer than the reactor's current sleep.
-fn nudge(reactor: &Reactor) {
+/// wake worker `index` out of `idle_wait`. a no-op when a notify is already
+/// pending, so a burst of wakes for one parked worker costs one syscall.
+pub(crate) fn notify(index: usize) {
+    let poller = poller(index);
+    if poller.notified.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
     let one: u64 = 1;
     // SAFETY: writing 8 bytes to our own eventfd; EAGAIN (counter saturated) is
-    // fine — the reactor will still see a pending readiness and wake.
+    // fine — the worker will still see a pending readiness and wake.
     unsafe {
         libc::write(
-            reactor.eventfd,
+            poller.eventfd,
             &one as *const u64 as *const libc::c_void,
             std::mem::size_of::<u64>(),
         );
@@ -361,9 +377,13 @@ pub(crate) fn wait_io(
     task: usize,
     live: &dyn Fn() -> bool,
 ) -> i64 {
-    ensure_started();
-    let reactor = reactor();
     let interest = if read { Interest::Read } else { Interest::Write };
+    // a green task is always on a worker, so this is the poller of the worker
+    // the task is running on: the one that will poll for it.
+    let Some(index) = green::worker_index() else {
+        return -1;
+    };
+    let poller = poller(index);
     let outcome = Arc::new(AtomicI32::new(PENDING));
 
     let deadline = if timeout_ms < 0 {
@@ -373,17 +393,13 @@ pub(crate) fn wait_io(
     };
 
     // register under the lock: allocate a seq, push the waiter, record any
-    // deadline, and arm epoll. decide whether we need to nudge the reactor
-    // (only if our deadline is sooner than whatever it is currently sleeping on).
-    let should_nudge = {
-        let mut inner = lock_inner(reactor);
+    // deadline, and arm epoll. no notify is needed for the deadline: this
+    // worker is the one that polls this registry, and it reads the nearest
+    // deadline when it next parks.
+    {
+        let mut inner = lock_inner(poller);
         let seq = inner.next_seq;
         inner.next_seq += 1;
-
-        let nudge = match deadline {
-            Some(d) => inner.deadlines.peek().map_or(true, |top| d < top.0.at),
-            None => false,
-        };
 
         inner
             .waiters
@@ -401,11 +417,7 @@ pub(crate) fn wait_io(
                 target: DeadlineTarget::Io { fd, interest },
             }));
         }
-        reconcile_fd(reactor, &mut inner, fd);
-        nudge
-    };
-    if should_nudge {
-        nudge(reactor);
+        reconcile_fd(poller, &mut inner, fd);
     }
     if !live() {
         // every waiter on this fd waits on the same dead handle — the number
@@ -415,7 +427,7 @@ pub(crate) fn wait_io(
         on_close(fd);
     }
 
-    // suspend the coroutine back to the worker. `green::wake` (from the reactor)
+    // suspend the coroutine back to the worker. `green::wake` (from a poll)
     // re-enqueues us; even if that wake lands before we finish suspending,
     // green's `wake_pending` flag re-enqueues us from the park path, so it is
     // never lost. thus when `park_current` returns, `outcome` has been set.
@@ -436,8 +448,8 @@ pub(crate) fn wait_io(
 }
 
 /// park the current green task for `ms` milliseconds without holding its worker.
-/// this is `wait_io` minus the fd: register a deadline, nudge the reactor if it
-/// is now the nearest one, and suspend; the deadline sweep wakes us. must be
+/// this is `wait_io` minus the fd: register a deadline on this worker's poller
+/// and suspend; the deadline sweep wakes us. must be
 /// called only from inside a green task (the caller checks
 /// `green::current_task`); `task` is that task's slab id.
 ///
@@ -447,15 +459,13 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
     if ms <= 0 {
         return;
     }
-    ensure_started();
-    let reactor = reactor();
+    let Some(index) = green::worker_index() else {
+        std::thread::sleep(Duration::from_millis(ms as u64));
+        return;
+    };
     let outcome = Arc::new(AtomicI32::new(PENDING));
     let at = Instant::now() + Duration::from_millis(ms as u64);
-
-    let should_nudge = register_timer(reactor, at, task, &outcome);
-    if should_nudge {
-        nudge(reactor);
-    }
+    register_timer(poller(index), at, task, &outcome);
 
     // park until the sweep marks us done. unlike `wait_io` — where a spurious
     // wake is safe because the task re-runs its syscall — a sleep has no
@@ -469,14 +479,11 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
 
 /// the registration half of `sleep_task`, split out so it can be exercised
 /// without a live coroutine to suspend. pushes a timer deadline and its waiter
-/// under the lock; returns whether the reactor must be nudged (only when this
-/// deadline is nearer than whatever it is currently sleeping on).
-fn register_timer(reactor: &Reactor, at: Instant, task: usize, outcome: &Arc<AtomicI32>) -> bool {
-    let mut inner = lock_inner(reactor);
+/// under the lock.
+fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<AtomicI32>) {
+    let mut inner = lock_inner(poller);
     let seq = inner.next_seq;
     inner.next_seq += 1;
-
-    let nudge = inner.deadlines.peek().map_or(true, |top| at < top.0.at);
 
     inner.timers.insert(
         seq,
@@ -491,103 +498,116 @@ fn register_timer(reactor: &Reactor, at: Instant, task: usize, outcome: &Arc<Ato
         seq,
         target: DeadlineTarget::Timer,
     }));
-    nudge
 }
 
-/// the reactor thread: wait on epoll, wake the tasks whose fds are ready or whose
-/// deadlines expired, and re-arm what is left. never resumes a coroutine.
-fn reactor_loop() {
-    let reactor = reactor();
+/// run worker `index`'s poller once: wait up to `timeout` (zero polls without
+/// blocking), wake the tasks whose fds are ready or whose deadlines expired,
+/// and re-arm what is left. returns whether anything happened — a readiness,
+/// an expired deadline or a notify — as opposed to the wait running out.
+/// never resumes a coroutine.
+///
+/// the wait is capped at the poller's nearest deadline, so a parked worker
+/// wakes in time to expire it.
+fn poll(index: usize, timeout: Duration) -> bool {
+    let poller = poller(index);
     // a modest batch; more events than this in one wait just roll to the next.
     const MAX_EVENTS: usize = 64;
-    let mut events: Vec<libc::epoll_event> = (0..MAX_EVENTS)
-        .map(|_| libc::epoll_event { events: 0, u64: 0 })
-        .collect();
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
-    loop {
-        // choose the sleep bound: the nearest deadline, or block indefinitely.
-        let timeout_ms = next_timeout_ms(reactor);
+    let timeout_ms = next_timeout_ms(poller, timeout);
+    // SAFETY: `epfd` is valid for the life of the process; the events buffer
+    // is `MAX_EVENTS` long and lives on this stack across the call.
+    let n = unsafe {
+        libc::epoll_wait(
+            poller.epfd,
+            events.as_mut_ptr(),
+            MAX_EVENTS as libc::c_int,
+            timeout_ms,
+        )
+    };
+    // EINTR (or any transient error) reads as an empty wait.
+    let n = n.max(0) as usize;
 
-        // SAFETY: `epfd` is valid for the life of the process; the events buffer
-        // is `MAX_EVENTS` long and lives on this stack across the call.
-        let n = unsafe {
-            libc::epoll_wait(
-                reactor.epfd,
-                events.as_mut_ptr(),
-                MAX_EVENTS as libc::c_int,
-                timeout_ms,
-            )
-        };
-        if n < 0 {
-            // EINTR (or any transient error): just loop and wait again.
-            continue;
-        }
+    // collect every task to wake into a local list, then wake them AFTER
+    // dropping the registry lock — `green::wake` takes green's own locks, and
+    // keeping our lock out of that nest preserves the "netpoll lock never
+    // holds across a green wake" discipline.
+    let mut to_wake: Vec<usize> = Vec::new();
+    let mut notified = false;
+    {
+        let mut inner = lock_inner(poller);
+        for ev in events.iter().take(n) {
+            let token = ev.u64;
+            let bits = ev.events;
+            if token == EVENTFD_TOKEN {
+                // clear the flag before draining: a notify that lands after the
+                // drain then writes again rather than being swallowed.
+                poller.notified.store(false, AtomicOrdering::SeqCst);
+                drain_eventfd(poller.eventfd);
+                notified = true;
+                continue;
+            }
+            let fd = token as RawFd;
 
-        // collect every task to wake into a local list, then wake them AFTER
-        // dropping the registry lock — `green::wake` takes green's own locks, and
-        // keeping our lock out of that nest preserves the "netpoll lock never
-        // holds across a green wake" discipline.
-        let mut to_wake: Vec<usize> = Vec::new();
-        {
-            let mut inner = lock_inner(reactor);
-            for ev in events.iter().take(n as usize) {
-                let token = ev.u64;
-                let bits = ev.events;
-                if token == EVENTFD_TOKEN {
-                    drain_eventfd(reactor.eventfd);
-                    continue;
-                }
-                let fd = token as RawFd;
-
-                // the oneshot fire disarmed this fd in the kernel; record that so
-                // reconcile_fd re-arms any interest that still has waiters.
-                if let Some(reg) = inner.fds.get_mut(&fd) {
-                    reg.armed = 0;
-                }
-
-                // an error/hangup wakes both directions so the pending syscall can
-                // observe the real error. otherwise wake the direction that fired.
-                let err = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32);
-                if bits & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32) != 0 || err != 0 {
-                    take_ready(&mut inner, fd, Interest::Read, &mut to_wake);
-                }
-                if bits & (libc::EPOLLOUT as u32) != 0 || err != 0 {
-                    take_ready(&mut inner, fd, Interest::Write, &mut to_wake);
-                }
-                reconcile_fd(reactor, &mut inner, fd);
+            // the oneshot fire disarmed this fd in the kernel; record that so
+            // reconcile_fd re-arms any interest that still has waiters.
+            if let Some(reg) = inner.fds.get_mut(&fd) {
+                reg.armed = 0;
             }
 
-            // service expired deadlines in the same lock hold.
-            collect_expired(reactor, &mut inner, Instant::now(), &mut to_wake);
+            // an error/hangup wakes both directions so the pending syscall can
+            // observe the real error. otherwise wake the direction that fired.
+            let err = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32);
+            if bits & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32) != 0 || err != 0 {
+                take_ready(&mut inner, fd, Interest::Read, &mut to_wake);
+            }
+            if bits & (libc::EPOLLOUT as u32) != 0 || err != 0 {
+                take_ready(&mut inner, fd, Interest::Write, &mut to_wake);
+            }
+            reconcile_fd(poller, &mut inner, fd);
         }
 
-        for task in to_wake {
-            green::wake(task);
+        // service expired deadlines in the same lock hold.
+        if !inner.deadlines.is_empty() {
+            collect_expired(poller, &mut inner, Instant::now(), &mut to_wake);
         }
     }
+
+    let woke = !to_wake.is_empty();
+    for task in to_wake {
+        green::wake(task);
+    }
+    woke || notified
 }
 
-/// the `epoll_wait` timeout for the next loop: milliseconds until the nearest
-/// deadline (0 if already due), or `-1` to block until an fd event or a nudge.
-fn next_timeout_ms(reactor: &Reactor) -> libc::c_int {
-    let inner = lock_inner(reactor);
-    match inner.deadlines.peek() {
-        None => -1,
-        Some(top) => {
-            let now = Instant::now();
-            if top.0.at <= now {
-                0
-            } else {
-                let ms = (top.0.at - now).as_millis();
-                if ms > libc::c_int::MAX as u128 {
-                    libc::c_int::MAX
-                } else {
-                    // round up so we never wake a hair early and re-sleep.
-                    ms as libc::c_int + 1
-                }
-            }
-        }
+/// poll worker `index`'s sockets without blocking. a busy worker calls this
+/// between tasks so the tasks whose sockets became ready get queued even while
+/// it always has other work. returns whether any task was woken.
+pub(crate) fn poll_ready(index: usize) -> bool {
+    poll(index, Duration::ZERO)
+}
+
+/// park worker `index` in `epoll_wait` until one of its sockets is ready, a
+/// deadline expires, `notify` is called, or `timeout` runs out. returns true
+/// when the wait ran out with nothing to do.
+pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
+    !poll(index, timeout)
+}
+
+/// the `epoll_wait` timeout for one poll: `cap`, or less if a deadline is due
+/// sooner (0 if one is already due).
+fn next_timeout_ms(poller: &Poller, cap: Duration) -> libc::c_int {
+    let inner = lock_inner(poller);
+    let wait = match inner.deadlines.peek() {
+        None => cap,
+        Some(top) => cap.min(top.0.at.saturating_duration_since(Instant::now())),
+    };
+    if wait.is_zero() {
+        return 0;
     }
+    // round up so we never wake a hair early and re-sleep.
+    let ms = wait.as_millis() + 1;
+    ms.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
 /// take all waiters for `(fd, interest)`, mark each ready, and queue it to wake.
@@ -617,7 +637,7 @@ fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Ve
 /// timed out, remove it, and queue it to wake. a stale heap entry (its waiter
 /// already fired ready and was removed) simply matches nothing. a timer entry
 /// has no fd, so it wakes its sleeper directly and never touches epoll.
-fn collect_expired(reactor: &Reactor, inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
+fn collect_expired(poller: &Poller, inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
     // track which fds we touch so we can re-arm/disarm them once at the end.
     let mut touched: Vec<RawFd> = Vec::new();
     while let Some(top) = inner.deadlines.peek() {
@@ -675,7 +695,7 @@ fn collect_expired(reactor: &Reactor, inner: &mut Inner, now: Instant, to_wake: 
         }
     }
     for fd in touched {
-        reconcile_fd(reactor, inner, fd);
+        reconcile_fd(poller, inner, fd);
     }
 }
 
@@ -709,9 +729,10 @@ fn drain_eventfd(eventfd: RawFd) {
 /// that already claimed the waiter still wins — we only close out a truly-pending
 /// wait, never double-resolve one.
 pub(crate) fn on_close(fd: RawFd) {
-    // only touch the reactor if it was ever built; a process that never waited on
-    // a socket has no registry to clean.
-    let Some(reactor) = REACTOR.get() else {
+    // only touch the pollers if they were ever built; a process that never ran
+    // a green worker has no registry to clean. any worker's poller may hold a
+    // registration for this fd, so each is checked.
+    let Some(pollers) = POLLERS.get() else {
         return;
     };
 
@@ -719,8 +740,8 @@ pub(crate) fn on_close(fd: RawFd) {
     // `green::wake` takes green's own slab/queue locks, and this lock must never
     // nest inside them (the module's lock discipline).
     let mut to_wake: Vec<usize> = Vec::new();
-    {
-        let mut inner = lock_inner(reactor);
+    for poller in pollers {
+        let mut inner = lock_inner(poller);
         for interest in [Interest::Read, Interest::Write] {
             if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
                 for w in waiters {
@@ -741,7 +762,7 @@ pub(crate) fn on_close(fd: RawFd) {
         }
         if inner.fds.remove(&fd).is_some() {
             // fd was in the epoll set; remove it. errors (already gone) ignored.
-            epoll_apply(reactor.epfd, libc::EPOLL_CTL_DEL, fd, 0);
+            epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
         }
         // any deadline heap entries for this fd are now stale; they match no
         // waiter and are dropped when they surface (same as a fired waiter's).
@@ -815,11 +836,11 @@ mod tests {
     // value that no real socket test uses, so the epoll DEL just fails harmlessly.
     #[test]
     fn on_close_wakes_parked_waiter_with_closed_outcome() {
-        let reactor = reactor();
+        let poller = poller(0);
         let fd: RawFd = 424_242;
         let outcome = Arc::new(AtomicI32::new(PENDING));
         {
-            let mut inner = lock_inner(reactor);
+            let mut inner = lock_inner(poller);
             let seq = inner.next_seq;
             inner.next_seq += 1;
             inner
@@ -841,7 +862,7 @@ mod tests {
         // the waiter's outcome was flipped to CLOSED (wait_io maps that to -1), and
         // the registry no longer holds the waiter or the fd.
         assert_eq!(outcome.load(AtomicOrdering::Acquire), CLOSED);
-        let inner = lock_inner(reactor);
+        let inner = lock_inner(poller);
         assert!(inner.waiters.get(&(fd, Interest::Read)).is_none());
         assert!(inner.fds.get(&fd).is_none());
     }
@@ -857,10 +878,10 @@ mod tests {
     #[test]
     fn timer_registers_expires_and_wakes() {
         let _guard = TIMER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let reactor = reactor();
+        let poller = poller(0);
         let outcome = Arc::new(AtomicI32::new(PENDING));
         let at = Instant::now() + Duration::from_millis(5);
-        register_timer(reactor, at, usize::MAX, &outcome);
+        register_timer(poller, at, usize::MAX, &outcome);
 
         // identify our entry by its shared outcome cell, not by map emptiness:
         // the registry is global and other tests may hold entries of their own.
@@ -873,37 +894,20 @@ mod tests {
 
         let mut to_wake = Vec::new();
         {
-            let mut inner = lock_inner(reactor);
+            let mut inner = lock_inner(poller);
             assert!(ours(&inner));
 
             // not due yet: the sweep leaves it alone.
-            collect_expired(reactor, &mut inner, at - Duration::from_millis(1), &mut to_wake);
+            collect_expired(poller, &mut inner, at - Duration::from_millis(1), &mut to_wake);
             assert!(to_wake.is_empty());
             assert_eq!(outcome.load(AtomicOrdering::Acquire), PENDING);
 
             // due: it resolves to TIMED_OUT, queues the task, and cleans up.
-            collect_expired(reactor, &mut inner, at, &mut to_wake);
+            collect_expired(poller, &mut inner, at, &mut to_wake);
             assert!(!ours(&inner));
         }
         assert_eq!(to_wake, vec![usize::MAX]);
         assert_eq!(outcome.load(AtomicOrdering::Acquire), TIMED_OUT);
-    }
-
-    // the nudge decision: a timer nearer than the current top asks for one, a
-    // farther timer rides on the reactor's existing sleep. asserted relative to
-    // a timer of our own, since the global registry may hold other entries.
-    #[test]
-    fn timer_nudges_only_when_nearest() {
-        let _guard = TIMER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let reactor = reactor();
-        let far = Instant::now() + Duration::from_secs(600);
-        let outcome = Arc::new(AtomicI32::new(PENDING));
-        register_timer(reactor, far, usize::MAX, &outcome);
-        assert!(register_timer(reactor, far - Duration::from_secs(60), usize::MAX, &outcome));
-        assert!(!register_timer(reactor, far + Duration::from_secs(60), usize::MAX, &outcome));
-        // the far-future entries left behind are inert: nothing sweeps them
-        // until long after every test in this process has finished, and their
-        // task id (usize::MAX) makes any eventual wake a no-op.
     }
 
     // on_close must only close out a *pending* wait: a waiter a readiness or
@@ -911,11 +915,11 @@ mod tests {
     // fire never double-resolves the wait.
     #[test]
     fn on_close_leaves_already_resolved_waiter() {
-        let reactor = reactor();
+        let poller = poller(0);
         let fd: RawFd = 424_243;
         let outcome = Arc::new(AtomicI32::new(READY));
         {
-            let mut inner = lock_inner(reactor);
+            let mut inner = lock_inner(poller);
             let seq = inner.next_seq;
             inner.next_seq += 1;
             inner

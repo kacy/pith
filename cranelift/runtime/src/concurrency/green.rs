@@ -996,25 +996,17 @@ struct Worker {
     /// re-selected, right back into the loop that got it preempted. also pinned to
     /// the owner, so a suspended coroutine still never crosses a worker.
     deferred: Mutex<VecDeque<TaskId>>,
-    /// this worker's private park spot. an idle worker waits on its own condvar,
-    /// so a wake can target exactly the worker that is able to run the task —
-    /// crucially, a *pinned* wake nudges only the task's owner instead of a
-    /// pool-wide notify that also wakes idle peers which have nothing to run. on
-    /// a single-connection pipeline every task pins to one worker, so a shared
-    /// park spot made every wake needlessly wake (and CPU-spin, and lock-contend)
-    /// the other worker — that thundering herd is what made two workers slower
-    /// than one. the guarded unit plus the short wait-timeout in `park` bounds any
-    /// lost-wakeup window exactly as the old single spot did.
-    park_lock: Mutex<()>,
-    park_cv: Condvar,
-    /// whether this worker is currently inside `park`'s condvar wait. set under
-    /// `park_lock` before the wait and cleared after, so `wake_worker` can skip
-    /// the lock-and-notify entirely when the target is busy running tasks — the
-    /// common case on a hot pipeline, where the old unconditional lock acquire
-    /// per wake was measurable contention. the Dekker pairing is in `park`:
-    /// it publishes the flag before its final work re-check, and enqueuers
-    /// publish their work before reading the flag, so at least one side always
-    /// sees the other; the wait-timeout backstops anything subtler.
+    /// whether this worker is currently parked in its poller (`netpoll::
+    /// idle_wait`). each worker parks on its own spot, so a wake can target
+    /// exactly the worker that is able to run the task — crucially, a *pinned*
+    /// wake nudges only the task's owner instead of a pool-wide notify that also
+    /// wakes idle peers which have nothing to run. the flag lets `wake_worker`
+    /// skip the notify entirely when the target is busy running tasks, the
+    /// common case on a hot pipeline. the Dekker pairing is in `park`: it
+    /// publishes the flag before its final work re-check, and enqueuers publish
+    /// their work before reading the flag, so at least one side always sees the
+    /// other. a notify that lands before the wait starts is kept by the poller
+    /// (a pending eventfd, or the fallback's flag), so it is never lost.
     parked: AtomicBool,
     /// set by `wake_searcher` when it wakes this worker to look for fresh work.
     /// the waker has already counted the worker in `Scheduler::searching`, so
@@ -1148,6 +1140,19 @@ pub(crate) fn current_task() -> Option<TaskId> {
 #[inline]
 fn current_worker() -> Option<usize> {
     CURRENT_WORKER.with(|c| c.get())
+}
+
+/// the index of the worker this os thread is, for the netpoller, which keys
+/// its per-worker pollers by it. thread-owned, like `current_worker`.
+#[inline]
+pub(crate) fn worker_index() -> Option<usize> {
+    current_worker()
+}
+
+/// how many green workers the pool runs. builds the scheduler if needed, but
+/// does not start its threads.
+pub(crate) fn pool_size() -> usize {
+    scheduler().workers.len()
 }
 
 /// stamp (or clear) this os thread's worker index. worker startup and the
@@ -1491,8 +1496,6 @@ fn scheduler() -> &'static Scheduler {
                 local: StealQueue::default(),
                 pinned: Mutex::new(PinnedQueue::default()),
                 deferred: Mutex::new(VecDeque::new()),
-                park_lock: Mutex::new(()),
-                park_cv: Condvar::new(),
                 parked: AtomicBool::new(false),
                 search_token: AtomicBool::new(false),
                 running_task: AtomicUsize::new(0),
@@ -1758,21 +1761,17 @@ fn enqueue_preempted(owner: usize, id: TaskId) {
     wake_worker(owner);
 }
 
-/// nudge one worker's private park spot. acquiring the worker's park lock before
-/// notifying serializes against `park`'s check-then-wait, so a wake landing just
-/// as the worker decides to sleep is not lost (and the wait-timeout backstops any
-/// residual window). a `notify_one` on a worker that is not parked is a no-op.
+/// nudge one worker's park spot, its poller. a worker that is not parked needs
+/// nothing: it re-runs find_work on its own.
 fn wake_worker(index: usize) {
     let worker = &scheduler().workers[index];
-    // fast path: a worker that is running (or spinning) needs no futex — it
-    // re-runs find_work on its own. `parked` is published under `park_lock`
-    // before park's final work re-check, and our caller enqueued before this
-    // load, so a worker mid-park either sees the task or is visible here.
+    // `parked` is published before park's final work re-check, and our caller
+    // enqueued before this load, so a worker mid-park either sees the task or
+    // is visible here.
     if !worker.parked.load(AtomicOrdering::SeqCst) {
         return;
     }
-    let _g = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
-    worker.park_cv.notify_one();
+    crate::netpoll::notify(index);
 }
 
 /// nudge every worker. only the cycle collector's stop-the-world uses it, since
@@ -1910,10 +1909,10 @@ fn steal_start(n: usize) -> usize {
     })
 }
 
-/// park an idle worker until work likely exists. we re-check for work while
-/// holding `park_lock` to shrink the window where an enqueue+notify slips
-/// between our empty `find_work` and this wait; the timeout closes the
-/// window entirely, so a missed wakeup costs latency, never a hang.
+/// park an idle worker until work likely exists. it waits in its poller
+/// (`netpoll::idle_wait`), so a readiness on one of its sockets, a socket or
+/// sleep deadline, or a notify from `wake_worker` ends the wait. the timeout
+/// is a backstop, so a missed wakeup costs latency, never a hang.
 ///
 /// the timeout is the caller's: `worker_loop` starts at 1ms and doubles it
 /// on each consecutive timed-out park (capped), so a busy pool keeps the
@@ -1923,14 +1922,13 @@ fn steal_start(n: usize) -> usize {
 /// the wait timed out (true) or was cut short by a notify (false).
 fn park(index: usize, timeout: Duration) -> bool {
     let worker = &scheduler().workers[index];
-    let guard = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
     // publish the flag BEFORE the final work re-check. an enqueuer publishes
     // its work before reading the flag (wake_worker's fast path), so either it
     // sees us parked and pays the notify, or our re-check below sees its task
     // and we never sleep. flipping this order would let both sides miss each
     // other and cost a full park timeout per task.
     worker.parked.store(true, AtomicOrdering::SeqCst);
-    // one last check under the lock: if work appeared, don't sleep.
+    // one last check: if work appeared, don't sleep.
     if has_any_work(index) {
         worker.parked.store(false, AtomicOrdering::SeqCst);
         return false;
@@ -1943,16 +1941,12 @@ fn park(index: usize, timeout: Duration) -> bool {
     if stats_on() {
         C_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    let (guard, wait) = worker
-        .park_cv
-        .wait_timeout(guard, timeout)
-        .unwrap_or_else(|p| p.into_inner());
+    let timed_out = crate::netpoll::idle_wait(index, timeout);
     worker.parked.store(false, AtomicOrdering::SeqCst);
-    drop(guard);
     if stats_on() {
         PARKED_WORKERS.fetch_sub(1, AtomicOrdering::Relaxed);
     }
-    wait.timed_out()
+    timed_out
 }
 
 /// how long a worker keeps looking for work before it parks. this is the cost
@@ -1968,6 +1962,11 @@ fn park(index: usize, timeout: Duration) -> bool {
 /// this does not undo the idle-syscall work: a worker that is genuinely out of
 /// work parks as before.
 const PARK_SPIN: Duration = Duration::from_micros(10);
+
+/// how many tasks a busy worker runs between non-blocking polls of its
+/// sockets. go checks its global queue on the same kind of count (61); this
+/// only bounds how long a ready socket's task can wait behind queued work.
+const POLL_EVERY: u32 = 61;
 
 /// look for work for up to `PARK_SPIN` before parking. probes are spaced by a
 /// short pause burst rather than run back-to-back: `has_any_work` takes the
@@ -2042,6 +2041,7 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
     // woke it, and gives it up when it finds a task or parks.
     let mut searching = false;
     let worker = &scheduler().workers[index];
+    let mut since_poll: u32 = 0;
     loop {
         if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
             if searching {
@@ -2061,7 +2061,16 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 // coroutine is off-CPU and the next has not started, so a
                 // worker parked here holds no pith frame at all.
                 crate::cycle::mutator_gate();
-                run_task(id)
+                run_task(id);
+                // a worker that always has work never parks, so it never
+                // waits in its poller: look at its sockets every so often, or
+                // the tasks whose data has arrived would wait behind all of
+                // its queued work.
+                since_poll += 1;
+                if since_poll >= POLL_EVERY {
+                    since_poll = 0;
+                    crate::netpoll::poll_ready(index);
+                }
             }
             None => {
                 // the idle path passes this gate once per park timeout, so an
@@ -2070,6 +2079,12 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 // when it wants the world stopped, which cuts a long park
                 // short — the bound below is the fallback, not the mechanism.
                 crate::cycle::mutator_gate();
+                // out of queued work: pick up whatever this worker's sockets
+                // have ready before searching or parking.
+                since_poll = 0;
+                if crate::netpoll::poll_ready(index) {
+                    continue;
+                }
                 // an idle worker is about to look at the stealable queues
                 // until it parks, so it counts as a searcher: a spawn in that
                 // window need not wake anyone else.

@@ -1555,6 +1555,80 @@ the flag on (#1169), because the caller's walk cannot read that callee's
 body. #1167 (a result box held by a struct field or a list element) leaks
 with the flag off as well, and a little more with it on.
 
+### imported and method callees, and the default (#1169, 2026-10-24)
+
+the caller's cascade walk decides whether a result local releases its own
+payload. it read a same-module callee's body to see whether an argument was
+only borrowed, but it could not read an imported function's body or resolve
+a method call. a result local passed to either one kept the plain shell
+release. with the box abi that leaked whenever the callee only read the
+argument, and it balanced when the callee returned it, because the caller's
+binding of the returned box, which shares it, released the payload for
+both. with the register abi a returned result comes back as its payload
+with a count of its own, and the count the caller's box holds was never
+dropped: about 28 mb more peak resident set between 200k and 800k rounds,
+one payload per call.
+
+each module now records, before it emits any body, which result and
+optional parameters of its non-generic functions and plain methods pass
+the walk (`ir_record_borrow_params`). the walk runs in the declaring module,
+where the body's names resolve, and with that function's own return
+convention. a caller reads the record for an imported function, a
+module-qualified call and a method of a user struct or enum. modules are
+emitted after everything they import, so an imported callee's record is
+always there. a callee with no record (a builtin, a generic, a closure
+field, an interface default) answers "not safe", as before.
+
+`tests/leaks/leak_result_forward_callee` covers five shapes: an imported
+forwarder, an imported forwarder through an alias, a match binding and a
+second frame, a method, and methods through an alias and through `self`.
+peak growth between 200k and 800k rounds:
+
+| shape | before, register abi | after, register abi | after, box abi |
+|---|---:|---:|---:|
+| imported `fwd` | 28,044 kb | -24 kb | -8 kb |
+| imported alias and match | 28,048 kb | 28 kb | -76 kb |
+| imported two frames, plus a read-only callee | 28,044 kb | -20 kb | 84 kb |
+| method `fwd` | 28,256 kb | -24 kb | -48 kb |
+| method alias, `self.fwd`, read-only method | 28,132 kb | -16 kb | -40 kb |
+
+with either abi, a result local passed only to an imported or method
+callee that reads it used to leak its payload. it now releases it. `tests/cases/test_result_forward_callee`
+checks values for every callee kind, including a callee that keeps the
+box in a struct, which must stay on the shell release. it is in
+`MEMCHECK_CASES`.
+
+with that closed, the register abi is the default. `PITH_RESULT_REG=0`
+turns it off, and the `result-box` ci job runs the regression corpus, the
+leak gate and the memcheck set that way, so the box path keeps its
+coverage. the cases that still return the box are unchanged: `Float!`
+functions, generic functions and methods on generic types, interface
+impls, functions containing a lambda or a spawn, `main`, and optional or
+tuple ok payloads.
+
+wall time on cores 28-31 with one green worker, interleaved, the median of
+7 rounds for event_ledger and 11 for catalog_workload, with the range in
+brackets. main is 596e0fe5. "box" is this branch with `PITH_RESULT_REG=0`:
+
+| workload | metric | main | box | register (default) |
+|---|---|---:|---:|---:|
+| `event_ledger 200000` | gen_ms | 64 [63-66] | 65 [64-65] | 32 [32-33] |
+| | parse_ms | 37 [37-38] | 37 [36-38] | 36 [36-37] |
+| | total_ms | 112 [111-114] | 113 [111-113] | 80 [79-80] |
+| `catalog_workload 2000000` | batch_ms | 287 [284-292] | 287 [285-294] | 295 [292-309] |
+| | total_ms | 323 [321-328] | 323 [321-331] | 331 [327-345] |
+
+event_ledger drops 29% with an identical digest, all of it in the
+generation phase, where `ByteBuffer.write_string_utf8` stops building a box
+per call. catalog_workload's checksum is identical and its total is 2.5%
+slower. callgrind at 200000 iterations puts the two builds 0.35% apart
+(901,554,473 against 904,749,472 Ir). every pith and runtime function costs
+the same, allocation counts included; the whole difference is glibc's
+`memcmp` under `pith_cstring_eq`, 22.8 to 26.0 million Ir over the same
+number of calls. its hot path returns no pith result, so the likely cause
+is where the compared strings land in memory, which moves when other
+allocations change.
+
 ## july 2026 hardening, in numbers
 
 between 2026-07-26 and 2026-07-31 the green backend became the linux default,

@@ -1,0 +1,64 @@
+# helper module for test_result_forward_callee: callees in another module
+# that take a result or optional parameter and forward it, read it, extract
+# from it or keep it.
+
+## a struct that keeps a result it was handed.
+pub struct Keeper:
+    pub r: String!
+
+## a type with a forwarding method, called from another module.
+pub struct Relay:
+    pub n: Int
+
+impl Relay:
+    ## hand back the parameter.
+    pub fn fwd(x: String!) -> String!:
+        return x
+
+    ## read the flag in place.
+    pub fn peek(x: String!) -> Int:
+        if x.is_err:
+            return self.n
+        return 1
+
+## hand back the parameter.
+pub fn fwd(x: String!) -> String!:
+    return x
+
+## hand back an Int result parameter.
+pub fn fwd_int(x: Int!) -> Int!:
+    return x
+
+## hand back a local bound from the parameter.
+pub fn fwd_alias(x: String!) -> String!:
+    y := x
+    return y
+
+## hand back the parameter through a match binding.
+pub fn fwd_match(x: String!) -> String!:
+    match x:
+        v => v
+
+## hand back the parameter through another forwarder in this module.
+pub fn fwd_two(x: String!) -> String!:
+    return fwd(x)
+
+## read the flag in place.
+pub fn peek(x: String!) -> Int:
+    if x.is_err:
+        return 0
+    return 1
+
+## extract with `!` and hand back a new result.
+pub fn len_or_fail(x: String!) -> Int!:
+    return x!.len()
+
+## read an optional in place.
+pub fn peek_opt(o: String?) -> Int:
+    if o == none:
+        return 0
+    return 1
+
+## keep the parameter in a struct.
+pub fn keep(x: String!) -> Keeper:
+    return Keeper(x)

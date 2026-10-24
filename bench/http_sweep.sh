@@ -26,9 +26,13 @@
 #   DURATION     seconds per measured run (default: 10)
 #   WARMUP       seconds of unmeasured load before each run, 0 to skip (default: 1)
 #   THREADS      wrk threads (default: 8)
-#   SERVER_CPUS  taskset cpu list for the server (default: 0-23)
-#   WRK_CPUS     taskset cpu list for wrk (default: 24-31)
-#   WORKERS      PITH_GREEN_WORKERS for pith and GOMAXPROCS for the go arms (default: 24)
+#   SERVER_CPUS  taskset cpu list for the server (default: 0-7,16-23)
+#   WRK_CPUS     taskset cpu list for wrk (default: 8-15,24-31)
+#   WORKERS      PITH_GREEN_WORKERS for pith and GOMAXPROCS for the go arms (default: 16)
+#
+# the cpu defaults give the server one ccd of a 9950x and wrk the other, with
+# each ccd's smt siblings, so the two never share a core or an l3. check
+# /sys/devices/system/cpu/cpu*/topology/thread_siblings_list on another machine.
 #   PORT         first port; each run takes the next one (default: 18080)
 #   PITH_SERVER, NETHTTP_SERVER, MIN_SERVER, FASTHTTP_SERVER
 #                prebuilt server binaries; an arm without one is built here
@@ -47,9 +51,9 @@ trials=${TRIALS:-3}
 duration=${DURATION:-10}
 warmup=${WARMUP:-1}
 threads=${THREADS:-8}
-server_cpus=${SERVER_CPUS:-0-23}
-wrk_cpus=${WRK_CPUS:-24-31}
-workers=${WORKERS:-24}
+server_cpus=${SERVER_CPUS:-0-7,16-23}
+wrk_cpus=${WRK_CPUS:-8-15,24-31}
+workers=${WORKERS:-16}
 port=${PORT:-18080}
 path='/item?id=12345'
 

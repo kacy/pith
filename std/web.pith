@@ -319,18 +319,25 @@ pub fn parse[T](req: Request) -> T!json.JsonDecodeError:
     return json.decode_text[T](req.body())!
 
 # one registered route: a method, a path pattern, and the handler to run when
-# both match. the fn-type is written inline on purpose — a type-aliased handler
-# field is miscopied when the App builder clones itself.
+# both match. `segments` is the pattern split once at registration, so a
+# request is matched without splitting the pattern again. the fn-type is
+# written inline on purpose: a type-aliased handler field is miscopied when
+# the App builder clones itself.
 struct Route:
     method: String
     pattern: String
+    segments: List[String]
     handler: fn(Request) -> http.HttpResponse
+
+fn make_route(method: String, pattern: String, handler: fn(Request) -> http.HttpResponse) -> Route:
+    return Route(method, pattern, http.path_segments(pattern), handler)
 
 # a middleware bound to a path prefix by group(): it only wraps requests
 # whose path lives under that prefix. the fn-type is written out longhand
 # for the same builder-cloning reason as App.middleware.
 struct Scoped:
     prefix: String
+    segments: List[String]
     mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse
 
 # a web application: an ordered list of routes plus the middleware that wraps
@@ -363,7 +370,7 @@ pub fn new() -> App:
 # opinionated, observable default.
 pub fn bare() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
-    return App([Route("GET", "/healthz", healthz)], [], [], server_config())
+    return App([make_route("GET", "/healthz", healthz)], [], [], server_config())
 
 # return a copy of `routes` with `route` appended. building a new list keeps the
 # App builder pure: adding a route never mutates an App someone else is holding.
@@ -497,79 +504,80 @@ pub fn circuit(breaker: resilience.Breaker) -> fn(fn(Request) -> http.HttpRespon
             breaker.success()
         return resp
 
-# the path parameters named in `pattern` (its `:name` segments), pulled out of
-# the request's actual path so a handler can read them by name.
-fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String]:
+# the path parameters named in a route's pattern (its `:name` and `*name`
+# segments), pulled out of the request path's segments so a handler can read
+# them by name. each value is percent-decoded.
+fn params_for(route: Route, parts: List[String]) -> Map[String, String]:
     mut params: Map[String, String] := {}
-    for segment in pattern.split("/"):
-        if segment.starts_with(":"):
+    for segment in route.segments:
+        if segment.starts_with(":") or segment.starts_with("*"):
             name := segment.substring(1, segment.len())
-            params.insert(name, req.path_param(pattern, name) catch "")
+            params.insert(name, http.segment_param(parts, route.segments, name))
     return params
 
-# true when `path` lives under `prefix`: the prefix itself, or anything
-# below it. "/api" scopes "/api" and "/api/me" but not "/apiary".
+# true when a path, split into `parts`, lives under the prefix split into
+# `prefix_parts`: the prefix itself, or anything below it. "/api" scopes
+# "/api" and "/api/me" but not "/apiary".
 #
-# this compares on path segments, exactly as the router matches routes, so the
-# two never disagree. a raw `starts_with` would let "//api/me" — which the
-# router collapses to "/api/me" and happily matches a guarded route — slip the
-# group guard, because "//api/me" does not start with "/api/". segmenting both
-# sides closes that bypass.
-fn path_in_scope(path: String, prefix: String) -> Bool:
-    prefix_parts := http.path_segments(prefix)
-    path_parts := http.path_segments(path)
-    if path_parts.len() < prefix_parts.len():
+# this compares path segments with segment_matches, exactly as the router
+# matches routes, so the two never disagree. a raw `starts_with` would miss
+# "/%61pi/me", which reaches a route under "/api", and the guard would be
+# skipped. a path with empty segments, such as "//api/me", is redirected to
+# its clean form before it gets here.
+fn path_in_scope(parts: List[String], prefix_parts: List[String]) -> Bool:
+    if parts.len() < prefix_parts.len():
         return false
     mut i := 0
     while i < prefix_parts.len():
-        if path_parts[i] != prefix_parts[i]:
+        if not http.segment_matches(parts[i], prefix_parts[i]):
             return false
         i = i + 1
     return true
 
-# the middleware onion for `path`: app-wide first, then any group middleware
-# whose prefix covers it — so a group guard runs inside the logging and
-# metrics that wrap everything.
-fn chain_for(app: App, path: String) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
+# the middleware onion for a path split into `parts`: app-wide first, then any
+# group middleware whose prefix covers it, so a group guard runs inside the
+# logging and metrics that wrap everything.
+fn chain_for(app: App, parts: List[String]) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
     mut chain := app.middleware
     for scope in app.scoped:
-        if path_in_scope(path, scope.prefix):
+        if path_in_scope(parts, scope.segments):
             chain = with_mw(chain, scope.mw)
     return chain
 
+# append `method` to `seen` unless it is there already, and report whether
+# it was added.
+fn allow_method(seen: List[String], method: String) -> Bool:
+    for existing in seen:
+        if existing == method:
+            return false
+    seen.push(method)
+    return true
+
 # the methods registered for a path, in registration order, as an `Allow`
-# header value. empty when no route matches the path at all. `any_path` lists
-# the methods of every route, which is what `OPTIONS *` asks about.
-fn allowed_methods(app: App, req: http.HttpRequestBytes, any_path: Bool) -> String:
-    mut out := ""
+# header value. HEAD follows GET, since a GET route answers HEAD too, and
+# OPTIONS comes last, since the router answers it for any path a route
+# claims. empty when no route matches the path at all. `any_path` lists the
+# methods of every route, which is what `OPTIONS *` asks about.
+fn allowed_methods(app: App, parts: List[String], any_path: Bool) -> String:
     mut seen: List[String] := []
     for route in app.routes:
-        matched := any_path or (req.matches_path(route.pattern) catch false)
-        if not matched:
-            continue
-        mut already := false
-        for method in seen:
-            if method == route.method:
-                already = true
-        if already:
-            continue
-        seen.push(route.method)
-        if out.len() > 0:
-            out = out + ", "
-        out = out + route.method
-    if out.len() > 0:
-        return out + ", OPTIONS"
-    return out
+        if any_path or http.segments_match(parts, route.segments):
+            allow_method(seen, route.method)
+            if route.method == "GET":
+                allow_method(seen, "HEAD")
+    if seen.len() == 0:
+        return ""
+    allow_method(seen, "OPTIONS")
+    return seen.join(", ")
 
 # the pattern of the first route that matches this path under any method, so
 # a synthesized OPTIONS answer is labeled with the route it is about rather
 # than the raw path — the observability middleware uses it as a metric label.
-fn pattern_for_path(app: App, req: http.HttpRequestBytes) -> String:
+fn route_for_path(app: App, parts: List[String]) -> Route:
     for route in app.routes:
-        matched := req.matches_path(route.pattern) catch false
-        if matched:
-            return route.pattern
-    return ""
+        if http.segments_match(parts, route.segments):
+            return route
+    return app.routes[0]
 
 # what an OPTIONS request is answered with: 204 and the methods the path
 # accepts. it closes over a small struct rather than the bare string for the
@@ -586,37 +594,74 @@ fn options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
 fn asterisk_options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
     return fn(req: Request) => http.response(200).header("Allow", options.allow)
 
+# run `route`'s handler inside the middleware onion for the path.
+fn run_route(app: App, route: Route, req: http.HttpRequestBytes, parts: List[String]) -> http.HttpResponse:
+    empty_values: Map[String, String] := {}
+    handler := wrap_middleware(chain_for(app, parts), route.handler)
+    return handler(Request(req, params_for(route, parts), route.pattern, empty_values))
+
+# the 301 a path that is not in canonical form gets (see http.clean_path),
+# with the query kept. cleaning collapses repeated slashes, so the Location
+# never starts with "//", which a browser would read as another host.
+fn clean_path_redirect(req: http.HttpRequestBytes, path: String) -> http.HttpResponse:
+    mut location := http.clean_path(path)
+    query := req.query() catch ""
+    if query.len() > 0:
+        location = location + "?" + query
+    return http.redirect_response(location)
+
 # find the first route whose method and path match, wrap its handler in the
-# middleware onion, run it, and return the response. a request that matches
-# nothing gets a 404 and skips middleware entirely. this is the single place
+# middleware onion, run it, and return the response. this is the single place
 # every request funnels through, and where the middleware chain wraps in.
+#
+# in order:
+#   * `OPTIONS *` asks about the server as a whole (rfc 9110 9.3.7). no route
+#     pattern names "*", so it is answered here with every method the app
+#     serves, before a pattern like "/:name" could claim it as a path.
+#   * a path that is not in canonical form gets a 301 to the form that is,
+#     as net/http's ServeMux does, before any route sees it.
+#   * the first route matching both method and path runs. a HEAD request
+#     that no HEAD route claims runs the first GET route for the path, and the
+#     server drops the body it returns.
+#   * an OPTIONS request to a path that exists under some other method is not
+#     a miss. it is either a client asking what the route supports, which
+#     deserves an Allow header, or the preflight a browser sends before a
+#     cross-origin call, and a preflight that 404s before the middleware runs
+#     can never be answered by cors middleware at all. so it is answered
+#     through the middleware chain with the path's methods.
+#   * any other request to a path some route claims gets 405 with an Allow
+#     header, and a path no route claims gets 404. neither runs middleware.
 fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     method := req.method() catch "GET"
     path := req.path() catch "/"
-    empty_values: Map[String, String] := {}
-    for route in app.routes:
-        matched := req.matches_path(route.pattern) catch false
-        if route.method == method and matched:
-            handler := wrap_middleware(chain_for(app, path), route.handler)
-            return handler(Request(req, params_for(route.pattern, req), route.pattern, empty_values))
-    # an OPTIONS request to a path that exists under some other method is not
-    # a miss. it is either a client asking what the route supports, which
-    # deserves an Allow header, or the preflight a browser sends before a
-    # cross-origin call — and a preflight that 404s before the middleware runs
-    # can never be answered by cors middleware at all.
-    # `OPTIONS *` asks about the server as a whole (rfc 9110 9.3.7). no route
-    # pattern names "*", so it is answered here with every method the app
-    # serves, before a pattern like "/:name" could claim it as a path.
     if method == "OPTIONS" and path == "*":
-        handler := wrap_middleware(chain_for(app, path), asterisk_options_handler(Options(allowed_methods(app, req, true))))
+        empty_values: Map[String, String] := {}
+        no_parts: List[String] := []
+        handler := wrap_middleware(chain_for(app, no_parts), asterisk_options_handler(Options(allowed_methods(app, no_parts, true))))
         return handler(Request(req, empty_values, "*", empty_values))
+    if not http.path_is_clean(path):
+        return clean_path_redirect(req, path)
+    parts := http.path_segments(path)
+    is_head := method == "HEAD"
+    mut get_index := -1
+    mut i := 0
+    while i < app.routes.len():
+        route := app.routes[i]
+        if http.segments_match(parts, route.segments):
+            if route.method == method:
+                return run_route(app, route, req, parts)
+            if is_head and get_index < 0 and route.method == "GET":
+                get_index = i
+        i = i + 1
+    if get_index >= 0:
+        return run_route(app, app.routes[get_index], req, parts)
+    allow := allowed_methods(app, parts, false)
+    if allow.len() == 0:
+        return http.not_found_response()
     if method == "OPTIONS":
-        allow := allowed_methods(app, req, false)
-        if allow.len() > 0:
-            pattern := pattern_for_path(app, req)
-            handler := wrap_middleware(chain_for(app, path), options_handler(Options(allow)))
-            return handler(Request(req, params_for(pattern, req), pattern, empty_values))
-    return http.not_found_response()
+        options := make_route(method, route_for_path(app, parts).pattern, options_handler(Options(allow)))
+        return run_route(app, options, req, parts)
+    return http.method_not_allowed_response().header("Allow", allow)
 
 # serve one accepted connection to completion on its own task, then close it.
 # errors are swallowed so a broken client only ever affects its own connection.
@@ -713,22 +758,49 @@ fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
     spawn handle_tls_socket(app, listener_handle, fd)
 
 impl App:
-    # register a GET route. returns a new App, so calls chain:
+    # register a route for any method. returns a new App, so calls chain. get,
+    # post, put, patch, delete and head are this with the method filled in.
+    #
+    # a pattern is a "/"-separated list of segments. a segment that starts
+    # with ":" matches any one segment and hands it to the handler by name; a
+    # last segment that starts with "*" matches the rest of the path, even
+    # nothing; any other segment must match exactly once the request's
+    # segment is percent-decoded.
+    fn handle(method: String, pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
+        return App(with_route(self.routes, make_route(method, pattern, handler)), self.middleware, self.scoped, self.config)
+
+    # register a GET route. it answers HEAD too, unless a HEAD route for the
+    # same path comes first. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
     fn get(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware, self.scoped, self.config)
+        return self.handle("GET", pattern, handler)
 
     # register a POST route. returns a new App.
     fn post(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware, self.scoped, self.config)
+        return self.handle("POST", pattern, handler)
 
     # register a PUT route. returns a new App.
     fn put(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware, self.scoped, self.config)
+        return self.handle("PUT", pattern, handler)
+
+    # register a PATCH route. returns a new App.
+    fn patch(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
+        return self.handle("PATCH", pattern, handler)
 
     # register a DELETE route. returns a new App.
     fn delete(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware, self.scoped, self.config)
+        return self.handle("DELETE", pattern, handler)
+
+    # register a HEAD route, for a path whose HEAD answer should not come from
+    # running its GET handler. returns a new App.
+    fn head(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
+        return self.handle("HEAD", pattern, handler)
+
+    # answer one request as listen would, without a socket: routing, the
+    # middleware and the 301, 404 and 405 answers all apply. it is what an
+    # http.serve_* loop or a test hands requests to.
+    fn serve(req: http.HttpRequestBytes) -> http.HttpResponse:
+        return dispatch(self, req)
 
     # register a middleware. returns a new App, so calls chain alongside routes.
     # the first middleware registered runs outermost: it sees the request first
@@ -757,7 +829,7 @@ impl App:
         mut out: List[Scoped] := []
         for existing in self.scoped:
             out.push(existing)
-        out.push(Scoped(prefix, mw))
+        out.push(Scoped(prefix, http.path_segments(prefix), mw))
         return App(self.routes, self.middleware, out, self.config)
 
     # use `config` for the connections listen() and listen_tls() serve over
@@ -1204,14 +1276,14 @@ test "OPTIONS on a known path answers with the methods that path accepts":
     resp := dispatch(app, request_for("OPTIONS", "/users/42"))
 
     assert_eq(resp.status, 204)
-    assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+    assert_eq(resp.header_value("Allow"), "GET, HEAD, POST, OPTIONS")
 
 test "OPTIONS * answers with every method the app serves":
     app := bare().get("/users/:id", show_user).post("/users", create_user).get("/about", show_user)
     resp := dispatch(app, request_for("OPTIONS", "*"))
 
     assert_eq(resp.status, 200)
-    assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+    assert_eq(resp.header_value("Allow"), "GET, HEAD, POST, OPTIONS")
     assert(resp.body.is_empty())
     wire := resp.to_bytes()!.to_string_utf8()!
     assert(wire.contains("Content-Length: 0"))
@@ -1234,13 +1306,17 @@ fn deny_group(next: fn(Request) -> http.HttpResponse, req: Request) -> http.Http
     return http.text(401, "blocked")
 
 test "a group guard is not bypassed by a leading or doubled empty path segment":
-    # the router collapses empty segments, so "//api/items" and "/api//items"
-    # both reach the guarded handler; the scope check must collapse them too or
-    # the group guard is skipped.
+    # "//api/items" and "/api//items" are redirected to "/api/items" before
+    # any route runs, so neither reaches the guarded handler unguarded.
     app := bare().group("/api", deny_group).get("/api/items", show_user)
     assert_eq(dispatch(app, request_for("GET", "/api/items")).status, 401)
-    assert_eq(dispatch(app, request_for("GET", "//api/items")).status, 401)
-    assert_eq(dispatch(app, request_for("GET", "/api//items")).status, 401)
+    for doubled in ["//api/items", "/api//items"]:
+        resp := dispatch(app, request_for("GET", doubled))
+        assert_eq(resp.status, 301)
+        assert_eq(resp.header_value("Location"), "/api/items")
+    # a trailing slash is not redirected, and the scope check sees it as the
+    # same path the router does.
+    assert_eq(dispatch(app, request_for("GET", "/api/items/")).status, 401)
     # a path genuinely outside the group is still unguarded.
     open_app := bare().group("/api", deny_group).get("/items", show_user)
     assert_eq(dispatch(open_app, request_for("GET", "/items")).status, 200)

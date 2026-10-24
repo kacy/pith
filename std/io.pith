@@ -356,6 +356,12 @@ impl BufferedBytesWriter:
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_buffered_bytes_writer(self, data)
 
+    # write all of `data` and flush, returning the count written. the same
+    # bytes reach the target as write_all_bytes then flush send, but data
+    # written with nothing buffered ahead of it is not copied into the buffer.
+    fn write_all_and_flush(data: Bytes) -> Int!:
+        return buffered_bytes_writer_write_all_flush(self, data)
+
     fn flush() -> Int!:
         return buffered_bytes_writer_flush(self)
 
@@ -2066,19 +2072,34 @@ fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
         buffered_bytes_writer_cache.insert(writer.handle, cached)
         return 0
 
-    target_kind := buffered_bytes_writer_target_kinds[writer.handle]
-    target_handle := buffered_bytes_writer_target_handles[writer.handle]
-    mut wrote := 0
-    if target_kind == BUFFERED_BYTES_TARGET_BUFFER:
-        wrote = write_all_byte_buffer(ByteBuffer(target_handle), cached)!
-    elif target_kind == BUFFERED_BYTES_TARGET_TCP:
-        wrote = write_all_tcp_stream_bytes(TcpStream(target_handle), cached)!
-    elif target_kind == BUFFERED_BYTES_TARGET_FILE:
-        wrote = write_all_file_stream_bytes(FileStream(target_handle), cached)!
-    elif target_kind == BUFFERED_BYTES_TARGET_PROCESS_STDIN:
-        wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), cached)!
+    wrote := buffered_bytes_writer_send(writer.handle, cached)!
     buffered_bytes_writer_cache.insert(writer.handle, bytes.empty())
     return wrote
+
+# write all of `data` to the target of the writer behind `handle`, bypassing
+# its buffer.
+fn buffered_bytes_writer_send(handle: Int, data: Bytes) -> Int!:
+    target_kind := buffered_bytes_writer_target_kinds[handle]
+    target_handle := buffered_bytes_writer_target_handles[handle]
+    mut wrote := 0
+    if target_kind == BUFFERED_BYTES_TARGET_BUFFER:
+        wrote = write_all_byte_buffer(ByteBuffer(target_handle), data)!
+    elif target_kind == BUFFERED_BYTES_TARGET_TCP:
+        wrote = write_all_tcp_stream_bytes(TcpStream(target_handle), data)!
+    elif target_kind == BUFFERED_BYTES_TARGET_FILE:
+        wrote = write_all_file_stream_bytes(FileStream(target_handle), data)!
+    elif target_kind == BUFFERED_BYTES_TARGET_PROCESS_STDIN:
+        wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), data)!
+    return wrote
+
+# write_all_bytes followed by flush. with nothing buffered, the data goes
+# straight to the target instead of being copied into the buffer first.
+fn buffered_bytes_writer_write_all_flush(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    if buffered_bytes_writer_target_handles.contains_key(writer.handle) and not data.is_empty() and buffered_bytes_writer_cache_get(writer.handle).is_empty():
+        return buffered_bytes_writer_send(writer.handle, data)!
+    written := write_all_buffered_bytes_writer(writer, data)!
+    buffered_bytes_writer_flush_internal(writer)!
+    return written
 
 # ---------------------------------------------------------------------------
 # buffered text readers

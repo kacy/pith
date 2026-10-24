@@ -15,6 +15,16 @@ fn main() -> String!:
     print(writer.flush()!.to_string())
     print(sink.bytes().to_string_utf8()!)
 
+    # write_all_and_flush sends straight through with nothing buffered, and
+    # keeps the order with something buffered ahead of it.
+    through_sink := bytes.buffer()
+    through := through_sink.buffered_chunked(64)
+    print(through.write_all_and_flush(bytes.from_string_utf8("head"))!.to_string())
+    print(through.write_bytes(bytes.from_string_utf8("+"))!.to_string())
+    print(through.write_all_and_flush(bytes.from_string_utf8("tail"))!.to_string())
+    print(through.write_all_and_flush(bytes.empty())!.to_string())
+    print(through_sink.bytes().to_string_utf8()!)
+
     path := "/tmp/pith_io_bytes_buffered.txt"
     file_writer := fs.create(path)!
     buffered_file_writer := file_writer.buffered_bytes_writer_chunked(4)

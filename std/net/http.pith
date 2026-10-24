@@ -2878,9 +2878,7 @@ fn request_error_response(status: Int) -> HttpResponse:
 fn source_write(src: ByteSource, writer: BufferedBytesWriter, data: Bytes) -> Int!:
     if src.use_tls:
         return src.conn.write_all_bytes(data)
-    written := writer.write_all_bytes(data)!
-    writer.flush()!
-    return written
+    return writer.write_all_and_flush(data)
 
 # the bytes the server writes for one response: response_bytes with the cached
 # Date (rfc 9110 6.6.1) every server response carries.

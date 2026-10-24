@@ -191,12 +191,20 @@ pub static PITH_PREEMPT_REQUESTED: AtomicU8 = AtomicU8::new(0);
 /// relaxed load instead of a clock syscall.
 static PREEMPT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// how many monitor epochs a task may run before it is asked to yield. with the
-/// ~10 ms monitor pass, one epoch is roughly a 10-20 ms slice — the same ballpark
-/// as go's 10 ms preemption quantum. small enough to keep a compute task from
-/// starving its peers, large enough that ordinary cooperative code (which yields
-/// far more often) never trips it.
-const QUANTUM_EPOCHS: u64 = 1;
+/// how many monitor epochs a task may run before it is asked to yield. a task
+/// stamped with epoch `e` counts as overrun once the epoch reaches
+/// `e + QUANTUM_EPOCHS`, so with the ~10 ms monitor pass two epochs is a 10-20 ms
+/// slice — the same ballpark as go's 10 ms preemption quantum. small enough to
+/// keep a compute task from starving its peers, large enough that ordinary
+/// cooperative code (which yields far more often) never trips it.
+///
+/// one epoch would be a 0-10 ms slice: any task that happened to be running
+/// when the tick landed counted as overrun, however briefly it had run. on a
+/// busy pool some worker is always mid-task at a tick, so the request flag
+/// stayed up nearly all the time, every loop back-edge in every task took the
+/// slow path, and short tasks such as a server's per-request work were
+/// preempted for no reason.
+const QUANTUM_EPOCHS: u64 = 2;
 
 /// how often the monitor thread wakes to bump the epoch and scan the workers.
 const MONITOR_INTERVAL: Duration = Duration::from_millis(10);
@@ -2969,10 +2977,13 @@ mod tests {
 
     // the overrun predicate is the single definition of "this task has run too
     // long" shared by the monitor and the safe-point. check the boundary: a task
-    // stamped at the current epoch has not overrun; one epoch later it has.
+    // stamped at the current epoch has not overrun, nor one stamped one epoch
+    // ago, since a single tick says nothing about how long it ran; a full
+    // quantum later it has.
     #[test]
-    fn task_overrun_triggers_after_one_epoch() {
+    fn task_overrun_triggers_after_the_quantum() {
         assert!(!task_overrun(5, 5));
+        assert!(!task_overrun(5, 6));
         assert!(task_overrun(5, 5 + QUANTUM_EPOCHS));
         assert!(task_overrun(5, 100));
         // saturating: a stale `now` behind `running_since` never reports overrun.

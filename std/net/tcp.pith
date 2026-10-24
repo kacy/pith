@@ -170,6 +170,24 @@ pub fn write_all_bytes(fd: Int, data: Bytes) -> Int!:
 pub fn set_timeout(fd: Int, ms: Int):
     tcp_set_timeout(fd, ms)
 
+# sets a read deadline `ms` milliseconds from now, or clears it when `ms` is 0.
+#
+# unlike set_timeout this bounds every read until it is set again, not one
+# read at a time: a read that would still be waiting at the deadline fails,
+# however many reads came before it, so a peer that sends a byte just inside
+# the per-read timeout cannot keep a series of reads going forever. a read
+# that finds data already waiting returns it, even past the deadline. with
+# set_timeout as well, a read gives up at whichever comes first. it works the
+# same on both concurrency backends and through a tls conn's socket.
+pub fn set_read_deadline(fd: Int, ms: Int):
+    tcp_set_read_deadline(fd, ms)
+
+# sets a write deadline `ms` milliseconds from now, or clears it when `ms` is
+# 0: the set_read_deadline of writes. a write still waiting for buffer space
+# at the deadline fails.
+pub fn set_write_deadline(fd: Int, ms: Int):
+    tcp_set_write_deadline(fd, ms)
+
 # Closes a TCP connection.
 #
 # safe to call from any task, and safe to call twice: a second close is a no-op.
@@ -187,6 +205,8 @@ test "tcp wrappers report invalid descriptor errors":
     assert(write_all(-1, "hello").is_err)
     assert(write_all_bytes(-1, bytes.from_string_utf8("hello")).is_err)
     set_timeout(-1, 1)
+    set_read_deadline(-1, 1)
+    set_write_deadline(-1, 1)
     close(-1)
 
 test "write_all on an empty buffer writes nothing and does not fail":

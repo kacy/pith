@@ -27,7 +27,7 @@ from std.io import TcpStream
 # used to be negative literals that a module-const compiler bug silently zeroed,
 # which is why the first handle landed at 0; now the intended values are honored.)
 mut next_native_config_handle := 0
-mut next_native_conn_handle := 1000000
+mut next_native_conn_handle := AtomicInt(1000000)
 mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
 mut native_config_resumption_enabled: Map[Int, Bool] := {}
@@ -343,38 +343,55 @@ struct NativeConnState:
     mut key_updates_received: Int
     mut key_update_responded: Bool
 
-mut native_conn_mu := Mutex()
-mut native_conn_states: Map[Int, NativeConnState] := {}
+# the live connections, split into NATIVE_CONN_SHARDS maps by handle with a
+# lock each. every read and write of every tls connection looks its state up
+# here, so one lock over one map put every connection in one queue: a tls
+# server on 32 workers served a third of what it did on 4, with most of its
+# samples waiting on that lock. a handle always maps to the same shard, and no
+# path holds two shard locks.
+NATIVE_CONN_SHARDS := 16
+mut native_conn_mus: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
+mut native_conn_shards: List[Map[Int, NativeConnState]] := [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
 
-# register a new connection's state and return its handle. the counter bump and
-# the insert run under the lock so concurrent handshakes can't collide.
+# a garbage handle can be negative, and must still name a shard (where it is
+# then not found) rather than index off the list.
+fn native_conn_shard(handle: Int) -> Int:
+    return (handle % NATIVE_CONN_SHARDS + NATIVE_CONN_SHARDS) % NATIVE_CONN_SHARDS
+
+# register a new connection's state and return its handle. the handle comes
+# from an atomic counter, so concurrent handshakes can't collide.
 fn native_conn_register(state: NativeConnState) -> Int:
-    native_conn_mu.lock()
-    handle := next_native_conn_handle
-    next_native_conn_handle = next_native_conn_handle + 1
-    native_conn_states.insert(handle, state)
-    native_conn_mu.unlock()
+    mut handle := next_native_conn_handle.load()
+    while not next_native_conn_handle.compare_set(handle, handle + 1):
+        handle = next_native_conn_handle.load()
+    s := native_conn_shard(handle)
+    native_conn_mus[s].lock()
+    native_conn_shards[s].insert(handle, state)
+    native_conn_mus[s].unlock()
     return handle
 
 # fetch a connection's state struct. it is a reference, so mutating its read_seq
 # / write_seq / pending persists; the lock guards only the map lookup.
 fn native_conn_get(handle: Int) -> NativeConnState:
-    native_conn_mu.lock()
-    state := native_conn_states[handle]
-    native_conn_mu.unlock()
+    s := native_conn_shard(handle)
+    native_conn_mus[s].lock()
+    state := native_conn_shards[s][handle]
+    native_conn_mus[s].unlock()
     return state
 
 fn native_conn_has(handle: Int) -> Bool:
-    native_conn_mu.lock()
-    present := native_conn_states.contains_key(handle)
-    native_conn_mu.unlock()
+    s := native_conn_shard(handle)
+    native_conn_mus[s].lock()
+    present := native_conn_shards[s].contains_key(handle)
+    native_conn_mus[s].unlock()
     return present
 
 fn native_conn_drop(handle: Int):
-    native_conn_mu.lock()
-    if native_conn_states.contains_key(handle):
-        native_conn_states.remove(handle)
-    native_conn_mu.unlock()
+    s := native_conn_shard(handle)
+    native_conn_mus[s].lock()
+    if native_conn_shards[s].contains_key(handle):
+        native_conn_shards[s].remove(handle)
+    native_conn_mus[s].unlock()
 
 # parsed client hello data used for server-side config selection.
 pub struct ClientHelloInfo:

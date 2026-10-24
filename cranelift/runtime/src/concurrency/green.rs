@@ -112,7 +112,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 use std::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -586,50 +586,121 @@ struct Slot {
 /// spawned and never shrank — an unbounded leak on a long-running server that
 /// fans out one task per request. reusing a slot bumps its generation so a
 /// stale handle can never alias the task that takes its place.
+///
+/// the slab is split into `SLAB_SHARDS` independently locked shards. every
+/// spawn inserts a task and every finish and reclaim touches its slot, so one
+/// lock over the whole slab put every spawning worker in one queue: 32 tasks
+/// spawning and awaiting children ran 3x slower than one, with most of their
+/// samples waiting on it. a shard owns whole blocks of `SLAB_BLOCK` ids, which
+/// it claims from a global counter, so task ids stay dense for the sync arena
+/// and a lock-free table (`SLAB_BLOCKS`) maps any id back to its shard.
 struct Slab {
+    shard: usize,
     entries: Vec<Slot>,
+    /// the global block number behind each `SLAB_BLOCK` run of `entries`.
+    blocks: Vec<usize>,
     free: Vec<TaskId>,
 }
 
+const SLAB_SHARDS: usize = 32;
+/// ids a shard claims at a time; one arena chunk, so a claimed block fills a
+/// chunk rather than scattering a shard's ids across many.
+const SLAB_BLOCK: usize = ARENA_CHUNK;
+
+/// for each block of task ids: 0 until a shard claims it, then the shard in
+/// the top byte and the block's position in that shard's `entries`, plus one,
+/// below.
+static SLAB_BLOCKS: [AtomicU32; ARENA_SPINE] = [const { AtomicU32::new(0) }; ARENA_SPINE];
+static SLAB_NEXT_BLOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// the shard and local index of task id `id`, or `None` for an id no shard
+/// has claimed.
+fn slab_slot(id: TaskId) -> Option<(usize, usize)> {
+    let word = SLAB_BLOCKS.get(id / SLAB_BLOCK)?.load(AtomicOrdering::Acquire);
+    if word == 0 {
+        return None;
+    }
+    let shard = (word >> 24) as usize;
+    let block = (word & 0x00ff_ffff) as usize - 1;
+    Some((shard, block * SLAB_BLOCK + id % SLAB_BLOCK))
+}
+
 impl Slab {
-    fn new() -> Self {
+    fn new(shard: usize) -> Self {
         Slab {
+            shard,
             entries: Vec::new(),
+            blocks: Vec::new(),
             free: Vec::new(),
         }
     }
 
-    /// place `task` in a slot and return its `(index, generation)`. reuses a
-    /// reclaimed index when one is free, otherwise appends a fresh slot.
-    fn insert(&mut self, task: Task) -> (TaskId, u32) {
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.entries[index];
-            debug_assert!(slot.task.is_none(), "a free slot must be empty");
-            slot.task = Some(task);
-            (index, slot.generation)
-        } else {
-            let index = self.entries.len();
-            self.entries.push(Slot {
-                task: Some(task),
-                generation: 0,
-            });
-            (index, 0)
+    /// this shard's index for task id `id`, or `None` if another shard (or
+    /// none) owns it.
+    fn local(&self, id: TaskId) -> Option<usize> {
+        match slab_slot(id) {
+            Some((shard, local)) if shard == self.shard => Some(local),
+            _ => None,
         }
+    }
+
+    fn slot_mut(&mut self, id: TaskId) -> Option<&mut Slot> {
+        let local = self.local(id)?;
+        self.entries.get_mut(local)
+    }
+
+    /// claim the next block of ids for this shard and queue them all as free.
+    fn grow(&mut self) {
+        let block = SLAB_NEXT_BLOCK.fetch_add(1, AtomicOrdering::Relaxed);
+        if block >= ARENA_SPINE {
+            runtime_fatal!(
+                "green task count exceeds the slab bound of {}",
+                ARENA_SPINE * SLAB_BLOCK
+            )
+        }
+        let position = self.blocks.len();
+        self.blocks.push(block);
+        self.entries.extend((0..SLAB_BLOCK).map(|_| Slot {
+            task: None,
+            generation: 0,
+        }));
+        SLAB_BLOCKS[block].store(
+            ((self.shard as u32) << 24) | (position as u32 + 1),
+            AtomicOrdering::Release,
+        );
+        // reversed, so the lowest id is handed out first.
+        self.free
+            .extend((0..SLAB_BLOCK).rev().map(|offset| block * SLAB_BLOCK + offset));
+    }
+
+    /// place `task` in a slot and return its `(index, generation)`. reuses a
+    /// reclaimed index when one is free, otherwise claims a fresh block.
+    fn insert(&mut self, task: Task) -> (TaskId, u32) {
+        if self.free.is_empty() {
+            self.grow();
+        }
+        // panic-guard: `grow` above leaves `free` holding a whole block.
+        let id = self.free.pop().expect("a grown shard has free slots");
+        // panic-guard: every id on `free` was claimed by this shard.
+        let slot = self.slot_mut(id).expect("a free id belongs to its shard");
+        debug_assert!(slot.task.is_none(), "a free slot must be empty");
+        slot.task = Some(task);
+        (id, slot.generation)
     }
 
     #[cfg(test)]
     fn get(&self, id: TaskId) -> Option<&Task> {
-        self.entries.get(id).and_then(|slot| slot.task.as_ref())
+        self.entries.get(self.local(id)?).and_then(|slot| slot.task.as_ref())
     }
 
     fn get_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        self.entries.get_mut(id).and_then(|slot| slot.task.as_mut())
+        self.slot_mut(id).and_then(|slot| slot.task.as_mut())
     }
 
     /// resolve a handle-checked task: the slot must both exist and still carry
     /// `generation`, or this returns `None` (a stale handle to a reused slot).
     fn get_checked(&self, id: TaskId, generation: u32) -> Option<&Task> {
-        let slot = self.entries.get(id)?;
+        let slot = self.entries.get(self.local(id)?)?;
         if slot.generation != generation {
             return None;
         }
@@ -643,7 +714,7 @@ impl Slab {
     /// several awaiters race, exactly the first reclaims and the rest no-op.
     /// returns `true` when it reclaimed.
     fn reclaim(&mut self, id: TaskId, expected_gen: u32) -> bool {
-        let Some(slot) = self.entries.get_mut(id) else {
+        let Some(slot) = self.slot_mut(id) else {
             return false;
         };
         if slot.generation != expected_gen {
@@ -663,7 +734,7 @@ impl Slab {
     /// the handle that was registered so the caller can unregister it. a no-op
     /// (returns `None`) unless the task is `Done` and flagged `reclaim_on_done`.
     fn reclaim_if_detached(&mut self, id: TaskId) -> Option<i64> {
-        let slot = self.entries.get_mut(id)?;
+        let slot = self.slot_mut(id)?;
         let task = slot.task.as_ref()?;
         if !(task.reclaim_on_done && task.done) {
             return None;
@@ -680,7 +751,7 @@ impl Slab {
     /// that still carries `generation`. returns the handle to unregister when it
     /// reclaimed right now, else `None`.
     fn detach(&mut self, id: TaskId, generation: u32) -> Option<i64> {
-        let slot = self.entries.get_mut(id)?;
+        let slot = self.slot_mut(id)?;
         if slot.generation != generation {
             return None;
         }
@@ -719,8 +790,22 @@ const STACK_SIZE: usize = 1024 * 1024;
 const STACK_POOL_MAX: usize = 64;
 static STACK_POOL: Mutex<Vec<corosensei::stack::DefaultStack>> = Mutex::new(Vec::new());
 
-/// a pooled stack if one is free, otherwise a fresh allocation.
+/// how many stacks each worker keeps for itself before returning them to the
+/// shared `STACK_POOL`. a spawn takes a stack and a finish returns one, so with
+/// only the shared pool every spawn and finish on every worker took its lock:
+/// with the task slab sharded, 32 tasks spawning and awaiting children spent
+/// half their samples waiting on it.
+const WORKER_STACK_MAX: usize = 16;
+
+/// a pooled stack if one is free (this worker's own first, then the shared
+/// pool), otherwise a fresh allocation.
 fn take_stack() -> corosensei::stack::DefaultStack {
+    if let Some(w) = current_worker() {
+        let own = scheduler().workers[w].stacks.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        if let Some(stack) = own {
+            return stack;
+        }
+    }
     if let Some(stack) = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner()).pop() {
         return stack;
     }
@@ -741,6 +826,13 @@ fn recycle_stack(coro: SendCoroutine) {
         return;
     }
     let stack = coro.0.into_stack();
+    if let Some(w) = current_worker() {
+        let mut own = scheduler().workers[w].stacks.lock().unwrap_or_else(|p| p.into_inner());
+        if own.len() < WORKER_STACK_MAX {
+            own.push(stack);
+            return;
+        }
+    }
     let mut pool = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner());
     if pool.len() < STACK_POOL_MAX {
         pool.push(stack);
@@ -996,6 +1088,9 @@ struct Worker {
     /// re-selected, right back into the loop that got it preempted. also pinned to
     /// the owner, so a suspended coroutine still never crosses a worker.
     deferred: Mutex<VecDeque<TaskId>>,
+    /// this worker's cache of free coroutine stacks (see `take_stack`). only
+    /// the worker itself touches it, so its lock is uncontended.
+    stacks: Mutex<Vec<corosensei::stack::DefaultStack>>,
     /// whether this worker is currently parked in its poller (`netpoll::
     /// idle_wait`). each worker parks on its own spot, so a wake can target
     /// exactly the worker that is able to run the task — crucially, a *pinned*
@@ -1028,7 +1123,7 @@ struct Worker {
 /// the whole green runtime: the task slab, the per-worker queues + park spots,
 /// and the injector for off-worker spawns.
 struct Scheduler {
-    slab: Mutex<Slab>,
+    slab: Vec<SlabShard>,
     /// the lock-free per-task scheduling words, indexed by slab task id (see
     /// the scheduling-word section).
     sync: SyncArena,
@@ -1442,8 +1537,28 @@ pub static C_PINNED: AtomicU64 = AtomicU64::new(0);
 pub static C_CH_WAKE: AtomicU64 = AtomicU64::new(0);
 static C_PARKS: AtomicU64 = AtomicU64::new(0);
 
-fn lock_slab() -> MutexGuard<'static, Slab> {
-    let m = &scheduler().slab;
+/// one slab shard, padded to a cache line so neighbouring locks do not share one.
+#[repr(align(64))]
+struct SlabShard(Mutex<Slab>);
+
+/// lock the slab shard that owns task `id`. an id no shard owns locks shard 0,
+/// whose lookups then find nothing, the same answer the unsharded slab gave.
+fn lock_slab(id: TaskId) -> MutexGuard<'static, Slab> {
+    lock_slab_shard(slab_slot(id).map_or(0, |(shard, _)| shard))
+}
+
+/// lock the shard a new task should go in: the spawning worker's own, so
+/// spawns on different workers do not meet, or a rotating one off the pool.
+fn lock_spawn_slab() -> MutexGuard<'static, Slab> {
+    let shard = match current_worker() {
+        Some(w) => w,
+        None => steal_start(SLAB_SHARDS),
+    };
+    lock_slab_shard(shard % SLAB_SHARDS)
+}
+
+fn lock_slab_shard(shard: usize) -> MutexGuard<'static, Slab> {
+    let m = &scheduler().slab[shard].0;
     if let Ok(g) = m.try_lock() {
         return g;
     }
@@ -1496,6 +1611,7 @@ fn scheduler() -> &'static Scheduler {
                 local: StealQueue::default(),
                 pinned: Mutex::new(PinnedQueue::default()),
                 deferred: Mutex::new(VecDeque::new()),
+                stacks: Mutex::new(Vec::new()),
                 parked: AtomicBool::new(false),
                 search_token: AtomicBool::new(false),
                 running_task: AtomicUsize::new(0),
@@ -1503,7 +1619,7 @@ fn scheduler() -> &'static Scheduler {
             })
             .collect();
         Scheduler {
-            slab: Mutex::new(Slab::new()),
+            slab: (0..SLAB_SHARDS).map(|i| SlabShard(Mutex::new(Slab::new(i)))).collect(),
             sync: SyncArena::new(),
             workers,
             injector: StealQueue::default(),
@@ -2150,7 +2266,7 @@ fn finish_task(id: TaskId, result: i64) {
         block.word.store(S_DONE, AtomicOrdering::Release);
     }
     let (join, closure_handle) = {
-        let mut slab = lock_slab();
+        let mut slab = lock_slab(id);
         if let Some(task) = slab.get_mut(id) {
             task.done = true;
             task.result = result;
@@ -2194,7 +2310,7 @@ fn finish_task(id: TaskId, result: i64) {
     // returned, the task is in no run queue, and its awaiter list is drained, so
     // nothing else references this slot. an awaited task is left for `green_await`
     // to reclaim once it reads the result.
-    if let Some(handle) = lock_slab().reclaim_if_detached(id) {
+    if let Some(handle) = lock_slab(id).reclaim_if_detached(id) {
         handle_registry::unregister_id(handle, HandleKind::Task);
     }
 }
@@ -2450,7 +2566,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     );
 
     let (id, generation) = {
-        let mut slab = lock_slab();
+        let mut slab = lock_spawn_slab();
         let (id, generation) = slab.insert(Task {
             closure_handle,
             done: false,
@@ -2561,7 +2677,7 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
     // was already reclaimed — detached, or another awaiter of the same handle
     // beat us — this is a safe no-op and we skip the unregister.
     if let Some((index, generation)) = split_handle(task_handle) {
-        if lock_slab().reclaim(index, generation) {
+        if lock_slab(index).reclaim(index, generation) {
             handle_registry::unregister_id(task_handle, HandleKind::Task);
         }
     }
@@ -2596,7 +2712,7 @@ pub(crate) fn green_detach(task_handle: i64) {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return;
     }
-    if let Some(handle) = lock_slab().detach(index, generation) {
+    if let Some(handle) = lock_slab(index).detach(index, generation) {
         handle_registry::unregister_id(handle, HandleKind::Task);
     }
 }
@@ -2610,7 +2726,7 @@ fn join_for(task_handle: i64) -> Option<Arc<(Mutex<Join>, Condvar)>> {
         return None;
     }
     let (index, generation) = split_handle(task_handle)?;
-    let slab = lock_slab();
+    let slab = lock_slab(index);
     slab.get_checked(index, generation)
         .map(|task| task.join.clone())
 }
@@ -2690,7 +2806,7 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
         },
     );
     let (id, generation) = {
-        let mut slab = lock_slab();
+        let mut slab = lock_spawn_slab();
         let (id, generation) = slab.insert(Task {
             closure_handle: 0,
             done: false,
@@ -2749,7 +2865,7 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
             set_current_worker(Some(second));
             run_task(id);
             set_current_worker(None);
-            let mut slab = lock_slab();
+            let mut slab = lock_slab(id);
             match slab.get_mut(id) {
                 Some(task) if task.done => task.result,
                 _ => encode_probe(n, None, None, false),
@@ -2760,7 +2876,7 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
         Err(_) => encode_probe(n, None, None, false),
     };
     // the slot is done and nobody awaits it: give it back.
-    lock_slab().reclaim(id, generation);
+    lock_slab(id).reclaim(id, generation);
     result
 }
 
@@ -2911,7 +3027,7 @@ mod tests {
         // second resume: runs to completion, records the result.
         run_task(id);
         {
-            let slab = lock_slab();
+            let slab = lock_slab(id);
             let task = slab.get(id).unwrap();
             assert!(task.done);
             assert_eq!(task.result, 99);
@@ -2925,7 +3041,7 @@ mod tests {
     // and return its id. shared by the preempt and panic tests to cut the
     // slab-push boilerplate.
     fn push_ready_task(coro: TaskCoroutine, join: Arc<(Mutex<Join>, Condvar)>) -> TaskId {
-        let mut slab = lock_slab();
+        let mut slab = lock_spawn_slab();
         let (id, _generation) = slab.insert(Task {
             closure_handle: 0,
             done: false,
@@ -2986,7 +3102,7 @@ mod tests {
 
         // the task is recorded done and its coroutine dropped (never re-enqueued).
         {
-            let slab = lock_slab();
+            let slab = lock_slab(id);
             let task = slab.get(id).unwrap();
             assert!(task.done, "panicked task must be Done");
         }
@@ -3021,7 +3137,7 @@ mod tests {
         let id2 = push_ready_task(coro2, fresh_join());
         run_task(id2);
         {
-            let slab = lock_slab();
+            let slab = lock_slab(id2);
             let task = slab.get(id2).unwrap();
             assert!(task.done);
             assert_eq!(task.result, 7, "worker still runs tasks after a panic");
@@ -3066,13 +3182,21 @@ mod tests {
         assert_eq!(split_handle(hi), Some((3, GEN_MASK)));
     }
 
+    // a standalone shard for the slab tests. its blocks come from the same
+    // global counter as the scheduler's shards, under a shard number none of
+    // them uses, so it never resolves an id of theirs.
+    fn test_slab() -> Slab {
+        Slab::new(SLAB_SHARDS + 1)
+    }
+
     // reclaiming a done task frees its slot; the next insert reuses the index at
     // a bumped generation, so the old handle can never alias the new task.
     #[test]
     fn slab_reclaim_reuses_slot_with_bumped_generation() {
-        let mut slab = Slab::new();
+        let mut slab = test_slab();
         let (id, gen) = slab.insert(dummy_task(false));
-        assert_eq!((id, gen), (0, 0));
+        assert_eq!(gen, 0);
+        assert_eq!(id % SLAB_BLOCK, 0, "a fresh block hands out its first id first");
         assert!(slab.get_checked(id, gen).is_some());
 
         // a task that is not Done is never reclaimed.
@@ -3093,7 +3217,7 @@ mod tests {
     // reclaim only touches the slot that still carries the expected generation.
     #[test]
     fn slab_reclaim_wrong_generation_is_noop() {
-        let mut slab = Slab::new();
+        let mut slab = test_slab();
         let (id, gen) = slab.insert(dummy_task(true));
         assert!(!slab.reclaim(id, gen.wrapping_add(1)));
         assert!(slab.get_checked(id, gen).is_some(), "slot survives a mismatched reclaim");
@@ -3102,7 +3226,7 @@ mod tests {
     // detaching a still-running task flags it; reclamation happens on finish.
     #[test]
     fn slab_detach_running_task_reclaims_on_finish() {
-        let mut slab = Slab::new();
+        let mut slab = test_slab();
         let (id, gen) = slab.insert(dummy_task(false));
         assert_eq!(slab.detach(id, gen), None);
         assert!(slab.reclaim_if_detached(id).is_none(), "not done yet");
@@ -3116,7 +3240,7 @@ mod tests {
     // detaching an already-done task reclaims it immediately.
     #[test]
     fn slab_detach_done_task_reclaims_immediately() {
-        let mut slab = Slab::new();
+        let mut slab = test_slab();
         let (id, gen) = slab.insert(dummy_task(true));
         assert_eq!(slab.detach(id, gen), Some(make_handle(id, gen)));
         assert!(slab.get_checked(id, gen).is_none());
@@ -3128,7 +3252,7 @@ mod tests {
     // awaited case is reclaimed by `green_await`, not here.
     #[test]
     fn slab_undetached_done_task_survives_finish_reclaim() {
-        let mut slab = Slab::new();
+        let mut slab = test_slab();
         let (id, _gen) = slab.insert(dummy_task(true));
         assert!(slab.reclaim_if_detached(id).is_none());
     }
@@ -3262,7 +3386,7 @@ mod tests {
 
         run_task(id);
         {
-            let slab = lock_slab();
+            let slab = lock_slab(id);
             let task = slab.get(id).unwrap();
             assert!(task.done);
             assert_eq!(task.result, 21);

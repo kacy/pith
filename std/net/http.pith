@@ -1229,6 +1229,122 @@ fn parse_content_length(data: Bytes, start: Int, end: Int) -> Int!:
         pos = pos + 1
     return value
 
+# what the field lines of a head say about its framing and its connection,
+# gathered in one pass by scan_field_lines. content_length is -1 without a
+# Content-Length field. host_valid is false when a Host value holds a byte
+# no authority may hold.
+struct FieldScan:
+    content_length: Int
+    host_count: Int
+    host_valid: Bool
+    te_seen: Bool
+    te_last_chunked: Bool
+    te_chunked_count: Int
+    te_other: Bool
+    expect: Int
+    has_close: Bool
+    has_keep_alive: Bool
+
+# check the field lines of a head (rfc 9112 5) from `pos` through the empty
+# line that ends them, and gather the fields that frame the message. requests
+# and responses share it; each applies its own framing rules to the result.
+# a failure is a bad_request message, or INCOMPLETE_HEAD_MESSAGE when the head
+# stops before its empty line.
+fn scan_field_lines(head: Bytes, start: Int) -> FieldScan!:
+    n := head.len()
+    mut pos := start
+    mut content_length := 0 - 1
+    mut host_count := 0
+    mut host_valid := true
+    mut te_seen := false
+    mut te_last_chunked := false
+    mut te_chunked_count := 0
+    mut te_other := false
+    mut expect := EXPECT_NONE
+    mut has_close := false
+    mut has_keep_alive := false
+    while true:
+        if pos >= n:
+            fail INCOMPLETE_HEAD_MESSAGE
+        line_start := pos
+        b := head[pos]
+        if b == 10:
+            break
+        if b == 13:
+            if pos + 1 < n and head[pos + 1] == 10:
+                break
+            fail bad_request("bare CR in the head")
+        if b == 32 or b == 9:
+            # obs-fold, or whitespace before the first field (rfc 9112 2.2, 5.2)
+            fail bad_request("folded or indented header field")
+        while pos < n and is_tchar(head[pos]):
+            pos = pos + 1
+        name_end := pos
+        if name_end == line_start or pos >= n or head[pos] != 58:
+            fail bad_request("malformed header field")
+        pos = pos + 1
+        while pos < n and (head[pos] == 32 or head[pos] == 9):
+            pos = pos + 1
+        value_start := pos
+        mut value_end := pos
+        while true:
+            if pos >= n:
+                fail INCOMPLETE_HEAD_MESSAGE
+            c := head[pos]
+            if c == 10:
+                break
+            if c == 13:
+                if pos + 1 < n and head[pos + 1] == 10:
+                    break
+                fail bad_request("bare CR in a header field")
+            if is_ctl(c):
+                fail bad_request("control character in a header field")
+            pos = pos + 1
+            if c != 32 and c != 9:
+                value_end = pos
+        if head[pos] == 13:
+            pos = pos + 1
+        pos = pos + 1
+
+        name_len := name_end - line_start
+        if name_len == 4 and header_name_matches(head, line_start, name_end, "host"):
+            host_count = host_count + 1
+            if not valid_host(head, value_start, value_end):
+                host_valid = false
+        elif name_len == 14 and header_name_matches(head, line_start, name_end, "content-length"):
+            length := parse_content_length(head, value_start, value_end)!
+            if content_length >= 0 and length != content_length:
+                fail bad_request("conflicting Content-Length")
+            content_length = length
+        elif name_len == 17 and header_name_matches(head, line_start, name_end, "transfer-encoding"):
+            # a comma-separated list of codings (rfc 9112 6.1); empty elements
+            # are allowed and skipped (rfc 9110 5.6.1)
+            te_seen = true
+            mut item := value_start
+            while item <= value_end:
+                mut item_end := item
+                while item_end < value_end and head[item_end] != 44:
+                    item_end = item_end + 1
+                coding_start := trim_ascii_start(head, item, item_end)
+                coding_end := trim_ascii_end(head, coding_start, item_end)
+                if coding_end > coding_start:
+                    if header_name_matches(head, coding_start, coding_end, "chunked"):
+                        te_chunked_count = te_chunked_count + 1
+                        te_last_chunked = true
+                    else:
+                        te_other = true
+                        te_last_chunked = false
+                item = item_end + 1
+        elif name_len == 10 and header_name_matches(head, line_start, name_end, "connection"):
+            has_close = has_close or list_has_token(head, value_start, value_end, "close")
+            has_keep_alive = has_keep_alive or list_has_token(head, value_start, value_end, "keep-alive")
+        elif name_len == 6 and header_name_matches(head, line_start, name_end, "expect") and value_end > value_start:
+            if expect != EXPECT_OTHER and header_name_matches(head, value_start, value_end, "100-continue"):
+                expect = EXPECT_CONTINUE
+            else:
+                expect = EXPECT_OTHER
+    return FieldScan(content_length, host_count, host_valid, te_seen, te_last_chunked, te_chunked_count, te_other, expect, has_close, has_keep_alive)
+
 # check a request head in one pass and record where its parts are, following
 # rfc 9112 2-7 and rfc 9110 for the field checks. `raw` runs through the empty
 # line that ends the head. `server` adds the Host checks an origin server
@@ -1319,116 +1435,29 @@ fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
         if q < target_end:
             query_start = q + 1
 
-    # field lines (rfc 9112 5), up to the empty line
-    mut content_length := 0 - 1
-    mut host_count := 0
-    mut te_seen := false
-    mut te_last_chunked := false
-    mut te_chunked_count := 0
-    mut te_other := false
-    mut expect := EXPECT_NONE
-    mut has_close := false
-    mut has_keep_alive := false
-    while true:
-        if pos >= n:
-            fail INCOMPLETE_HEAD_MESSAGE
-        line_start := pos
-        b := head[pos]
-        if b == 10:
-            break
-        if b == 13:
-            if pos + 1 < n and head[pos + 1] == 10:
-                break
-            fail bad_request("bare CR in the request head")
-        if b == 32 or b == 9:
-            # obs-fold, or whitespace before the first field (rfc 9112 2.2, 5.2)
-            fail bad_request("folded or indented header field")
-        while pos < n and is_tchar(head[pos]):
-            pos = pos + 1
-        name_end := pos
-        if name_end == line_start or pos >= n or head[pos] != 58:
-            fail bad_request("malformed header field")
-        pos = pos + 1
-        while pos < n and (head[pos] == 32 or head[pos] == 9):
-            pos = pos + 1
-        value_start := pos
-        mut value_end := pos
-        while true:
-            if pos >= n:
-                fail INCOMPLETE_HEAD_MESSAGE
-            c := head[pos]
-            if c == 10:
-                break
-            if c == 13:
-                if pos + 1 < n and head[pos + 1] == 10:
-                    break
-                fail bad_request("bare CR in a header field")
-            if is_ctl(c):
-                fail bad_request("control character in a header field")
-            pos = pos + 1
-            if c != 32 and c != 9:
-                value_end = pos
-        if head[pos] == 13:
-            pos = pos + 1
-        pos = pos + 1
-
-        name_len := name_end - line_start
-        if name_len == 4 and header_name_matches(head, line_start, name_end, "host"):
-            host_count = host_count + 1
-            if server and not valid_host(head, value_start, value_end):
-                fail bad_request("malformed Host")
-        elif name_len == 14 and header_name_matches(head, line_start, name_end, "content-length"):
-            length := parse_content_length(head, value_start, value_end)!
-            if content_length >= 0 and length != content_length:
-                fail bad_request("conflicting Content-Length")
-            content_length = length
-        elif name_len == 17 and header_name_matches(head, line_start, name_end, "transfer-encoding"):
-            # a comma-separated list of codings (rfc 9112 6.1); empty elements
-            # are allowed and skipped (rfc 9110 5.6.1)
-            te_seen = true
-            mut item := value_start
-            while item <= value_end:
-                mut item_end := item
-                while item_end < value_end and head[item_end] != 44:
-                    item_end = item_end + 1
-                coding_start := trim_ascii_start(head, item, item_end)
-                coding_end := trim_ascii_end(head, coding_start, item_end)
-                if coding_end > coding_start:
-                    if header_name_matches(head, coding_start, coding_end, "chunked"):
-                        te_chunked_count = te_chunked_count + 1
-                        te_last_chunked = true
-                    else:
-                        te_other = true
-                        te_last_chunked = false
-                item = item_end + 1
-        elif name_len == 10 and header_name_matches(head, line_start, name_end, "connection"):
-            has_close = has_close or list_has_token(head, value_start, value_end, "close")
-            has_keep_alive = has_keep_alive or list_has_token(head, value_start, value_end, "keep-alive")
-        elif name_len == 6 and header_name_matches(head, line_start, name_end, "expect") and value_end > value_start:
-            if expect != EXPECT_OTHER and header_name_matches(head, value_start, value_end, "100-continue"):
-                expect = EXPECT_CONTINUE
-            else:
-                expect = EXPECT_OTHER
-
+    fields := scan_field_lines(head, pos)!
     if server:
-        if host_count > 1:
+        if not fields.host_valid:
+            fail bad_request("malformed Host")
+        if fields.host_count > 1:
             fail bad_request("more than one Host")
-        if host_count == 0 and minor >= 1 and not is_connect:
+        if fields.host_count == 0 and minor >= 1 and not is_connect:
             fail bad_request("missing Host")
     # framing (rfc 9112 6.1, 6.3). a request carrying both lengths is how a
     # second request gets smuggled past a proxy that frames it the other way.
-    if te_seen:
+    mut content_length := fields.content_length
+    if fields.te_seen:
         if minor == 0:
             fail bad_request("Transfer-Encoding on an http/1.0 request")
         if content_length >= 0:
             fail bad_request("both Transfer-Encoding and Content-Length")
-        if not te_last_chunked or te_chunked_count > 1:
+        if not fields.te_last_chunked or fields.te_chunked_count > 1:
             fail bad_request("chunked must be the final transfer coding, applied once")
-        if te_other:
+        if fields.te_other:
             fail NOT_IMPLEMENTED_PREFIX + "unsupported transfer coding"
     if content_length < 0:
         content_length = 0
-    return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, te_seen, expect, connection_closes(minor == 0, has_close, has_keep_alive))
+    return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, fields.te_seen, fields.expect, connection_closes(minor == 0, fields.has_close, fields.has_keep_alive))
 
 # decode part of a checked head as text. the request line holds no CTLs, but
 # it may hold bytes that are not utf-8, and that is a bad request.

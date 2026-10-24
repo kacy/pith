@@ -911,10 +911,73 @@ impl PinnedQueue {
     }
 }
 
+/// a queue of fresh, stealable tasks: a worker's `local` queue or the injector.
+/// the length is mirrored in an atomic so an idle worker can tell an empty queue
+/// from a full one without taking its lock. before the mirror, every idle probe
+/// locked every worker's queue in turn, so the cost of looking for work grew
+/// with the pool and a 32-worker pool spent most of its time in those locks.
+///
+/// the mirror is updated under the queue lock, so it is exact whenever the lock
+/// is free. a reader that sees zero may miss a push in flight; that push wakes a
+/// worker itself (see `wake_searcher`), so a stale zero costs nothing.
+#[derive(Default)]
+struct StealQueue {
+    queue: Mutex<VecDeque<TaskId>>,
+    len: AtomicUsize,
+}
+
+impl StealQueue {
+    fn lock(&self) -> MutexGuard<'_, VecDeque<TaskId>> {
+        self.queue.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len.load(AtomicOrdering::SeqCst) == 0
+    }
+
+    fn push(&self, id: TaskId) {
+        let mut q = self.lock();
+        q.push_back(id);
+        self.len.store(q.len(), AtomicOrdering::SeqCst);
+    }
+
+    fn pop(&self) -> Option<TaskId> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut q = self.lock();
+        let id = q.pop_front();
+        self.len.store(q.len(), AtomicOrdering::SeqCst);
+        id
+    }
+
+    /// take the front task to run and move half of the rest onto `into`, so a
+    /// thief that found a backlog does not have to come back for each task.
+    fn steal_half(&self, into: &StealQueue) -> Option<TaskId> {
+        if self.is_empty() {
+            return None;
+        }
+        let (id, batch) = {
+            let mut q = self.lock();
+            let id = q.pop_front()?;
+            let half = q.len() / 2;
+            let batch: Vec<TaskId> = q.drain(..half).collect();
+            self.len.store(q.len(), AtomicOrdering::SeqCst);
+            (id, batch)
+        };
+        if !batch.is_empty() {
+            let mut q = into.lock();
+            q.extend(batch);
+            into.len.store(q.len(), AtomicOrdering::SeqCst);
+        }
+        Some(id)
+    }
+}
+
 struct Worker {
     /// fresh, never-resumed tasks. stealable by peers because a fresh coroutine
     /// carries no live stack (see the pinning note).
-    local: Mutex<VecDeque<TaskId>>,
+    local: StealQueue,
     /// woken started tasks pinned to this worker. only this worker drains it, so
     /// a suspended coroutine only ever resumes on the thread that first ran it.
     /// `next` is the single task a same-worker wake asks to run first — the other
@@ -953,6 +1016,11 @@ struct Worker {
     /// publish their work before reading the flag, so at least one side always
     /// sees the other; the wait-timeout backstops anything subtler.
     parked: AtomicBool,
+    /// set by `wake_searcher` when it wakes this worker to look for fresh work.
+    /// the waker has already counted the worker in `Scheduler::searching`, so
+    /// the worker takes over that count when it sees the flag (see
+    /// `worker_loop`) instead of adding its own.
+    search_token: AtomicBool,
     /// the slab id (`id + 1`, 0 = none) of the task this worker is currently
     /// resuming. written right before `resume` and cleared right after, so the
     /// monitor thread can spot a task that has been on-CPU too long. the monitor
@@ -973,7 +1041,15 @@ struct Scheduler {
     /// the scheduling-word section).
     sync: SyncArena,
     workers: Vec<Worker>,
-    injector: Mutex<VecDeque<TaskId>>,
+    injector: StealQueue,
+    /// workers looking for fresh work in other workers' queues. a fresh spawn
+    /// wakes a parked worker only while this is zero, and the woken worker
+    /// starts out counted here, so a burst of spawns wakes one worker rather
+    /// than the pool. a searcher that finds work hands the search on to one
+    /// more worker if work is left (see `stop_searching`), which spreads a
+    /// fan-out across the pool one worker at a time. this is go's spinning-M
+    /// protocol.
+    searching: AtomicUsize,
     /// `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked on another
     /// worker takes it over (see `claim_parked`). read once, here, so the
     /// wake path pays one load to consult it.
@@ -1412,12 +1488,13 @@ fn scheduler() -> &'static Scheduler {
         let n = worker_count();
         let workers = (0..n)
             .map(|_| Worker {
-                local: Mutex::new(VecDeque::new()),
+                local: StealQueue::default(),
                 pinned: Mutex::new(PinnedQueue::default()),
                 deferred: Mutex::new(VecDeque::new()),
                 park_lock: Mutex::new(()),
                 park_cv: Condvar::new(),
                 parked: AtomicBool::new(false),
+                search_token: AtomicBool::new(false),
                 running_task: AtomicUsize::new(0),
                 running_since: AtomicU64::new(0),
             })
@@ -1426,7 +1503,8 @@ fn scheduler() -> &'static Scheduler {
             slab: Mutex::new(Slab::new()),
             sync: SyncArena::new(),
             workers,
-            injector: Mutex::new(VecDeque::new()),
+            injector: StealQueue::default(),
+            searching: AtomicUsize::new(0),
             migrate: migration_on(),
             wake_stats: stats_on() || crate::perf_stats_enabled(),
         }
@@ -1550,24 +1628,72 @@ fn monitor_loop() {
 fn enqueue_fresh(id: TaskId) {
     let sched = scheduler();
     match current_worker() {
-        Some(i) => sched.workers[i]
-            .local
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push_back(id),
-        None => sched
-            .injector
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push_back(id),
+        Some(i) => sched.workers[i].local.push(id),
+        None => sched.injector.push(id),
     }
-    // a fresh task is stealable by any worker, so nudge the whole pool: whoever
-    // is idle picks it up (or steals it), which is what keeps an independent
-    // fan-out spread across cores. fresh spawns are comparatively rare (task
-    // startup, not the per-message hot path), so the pool-wide nudge here is not
-    // the herd the pinned path had to shed.
     note_notify();
-    wake_pool();
+    wake_searcher();
+}
+
+/// make sure some worker is looking for the fresh work just queued. if a worker
+/// is already searching it will find the task, so nothing is woken; otherwise
+/// one parked worker is woken, already counted as a searcher.
+///
+/// this used to wake every worker on every spawn. one of them took the task and
+/// the rest re-scanned the pool and parked again, so on 32 workers a spawn cost
+/// about 28 park/wake round trips and a fan-out ran 100x slower than on one
+/// worker. claiming the single search slot with a CAS is what keeps a burst of
+/// spawns from waking the pool; `stop_searching` passes the slot on when the
+/// burst is bigger than one worker.
+///
+/// the pusher stores its task before it reads `searching` here, and a searcher
+/// that gives up decrements `searching` before its last look at the queues
+/// (`worker_loop`), so one side always sees the other.
+fn wake_searcher() {
+    let sched = scheduler();
+    if sched
+        .searching
+        .compare_exchange(0, 1, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let n = sched.workers.len();
+    let start = steal_start(n);
+    for k in 0..n {
+        let i = (start + k) % n;
+        let worker = &sched.workers[i];
+        if !worker.parked.load(AtomicOrdering::SeqCst) {
+            continue;
+        }
+        // a token left on a worker by an earlier wake that it has not consumed
+        // yet means that worker already holds a search slot; try another.
+        if worker.search_token.swap(true, AtomicOrdering::SeqCst) {
+            continue;
+        }
+        wake_worker(i);
+        return;
+    }
+    // nobody is parked: every worker is running a task or about to park, and
+    // each looks at the stealable queues before it parks. give the slot back.
+    sched.searching.fetch_sub(1, AtomicOrdering::SeqCst);
+}
+
+/// a searcher found a task. drop its search slot, and if it was the last
+/// searcher and fresh work is still queued, wake another worker to search for
+/// it. that hand-off is how a large fan-out spreads across the pool.
+fn stop_searching() {
+    let sched = scheduler();
+    if sched.searching.fetch_sub(1, AtomicOrdering::SeqCst) == 1 && any_stealable() {
+        wake_searcher();
+    }
+}
+
+/// is there fresh work in the injector or in any worker's local queue? reads
+/// only the queues' atomic lengths.
+fn any_stealable() -> bool {
+    let sched = scheduler();
+    !sched.injector.is_empty() || sched.workers.iter().any(|w| !w.local.is_empty())
 }
 
 /// re-enqueue a *woken started* task onto its owner worker's pinned queue and
@@ -1649,10 +1775,9 @@ fn wake_worker(index: usize) {
     worker.park_cv.notify_one();
 }
 
-/// nudge every worker. used for fresh, stealable work (injector or a worker's
-/// local queue), where any worker is a valid taker, so an idle peer wakes to run
-/// or steal it. this keeps independent fan-out spread across cores; it is not on
-/// the per-message hot path, so it is not a herd.
+/// nudge every worker. only the cycle collector's stop-the-world uses it, since
+/// that needs every parked worker to reach its gate. fresh work wakes a single
+/// searcher instead (`wake_searcher`).
 pub(crate) fn wake_pool() {
     let n = scheduler().workers.len();
     for i in 0..n {
@@ -1729,30 +1854,21 @@ fn find_work(index: usize) -> Option<TaskId> {
 
     // own local queue (stealable): pop into a local so the queue lock is released
     // before the debug invariant check locks the slab.
-    let from_local = sched.workers[index]
-        .local
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop_front();
-    if let Some(id) = from_local {
+    let own = &sched.workers[index].local;
+    if let Some(id) = own.pop() {
         debug_assert_stealable(id);
         return Some(id);
     }
 
-    let from_injector = sched
-        .injector
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop_front();
-    if let Some(id) = from_injector {
+    if let Some(id) = sched.injector.steal_half(own) {
         debug_assert_stealable(id);
         return Some(id);
     }
 
     // steal from a peer. start at a pseudo-random offset so workers do not all
-    // hammer worker 0. we take from the victim's *front*; a fancier scheduler
-    // steals from the back, but readable-first and it does not affect
-    // correctness with independent tasks.
+    // hammer worker 0. an empty victim is skipped on its atomic length, so the
+    // scan takes a lock only where there is something to take, and a hit
+    // takes half the victim's backlog along with it.
     let n = sched.workers.len();
     let start = steal_start(n);
     for k in 0..n {
@@ -1760,12 +1876,7 @@ fn find_work(index: usize) -> Option<TaskId> {
         if victim == index {
             continue;
         }
-        let stolen = sched.workers[victim]
-            .local
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop_front();
-        if let Some(id) = stolen {
+        if let Some(id) = sched.workers[victim].local.steal_half(own) {
             debug_assert_stealable(id);
             return Some(id);
         }
@@ -1898,20 +2009,9 @@ fn has_any_work(index: usize) -> bool {
     {
         return true;
     }
-    if !sched
-        .injector
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_empty()
-    {
-        return true;
-    }
-    // any worker's local queue is stealable (own or a peer's).
-    if sched
-        .workers
-        .iter()
-        .any(|w| !w.local.lock().unwrap_or_else(|p| p.into_inner()).is_empty())
-    {
+    // the injector and any worker's local queue are stealable (own or a
+    // peer's). their atomic lengths answer this without a lock.
+    if any_stealable() {
         return true;
     }
     // own deferred (preempted) work — reachable only by this worker, so like the
@@ -1937,10 +2037,26 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
     // futex traffic scaled linearly with worker count on an idle pool).
     // any work at all resets it, so a busy pool never sees the long tail.
     let mut idle_timeout = PARK_TIMEOUT_MIN;
+    // whether this worker holds one of the `searching` slots. it takes one
+    // when it runs out of work, or inherits one from the `wake_searcher` that
+    // woke it, and gives it up when it finds a task or parks.
+    let mut searching = false;
+    let worker = &scheduler().workers[index];
     loop {
+        if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
+            if searching {
+                // already counted: the slot the waker took is one too many.
+                scheduler().searching.fetch_sub(1, AtomicOrdering::SeqCst);
+            }
+            searching = true;
+        }
         match find_work(index) {
             Some(id) => {
                 idle_timeout = PARK_TIMEOUT_MIN;
+                if searching {
+                    searching = false;
+                    stop_searching();
+                }
                 // between tasks is the worker's stop point: the previous
                 // coroutine is off-CPU and the next has not started, so a
                 // worker parked here holds no pith frame at all.
@@ -1954,10 +2070,25 @@ fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>)
                 // when it wants the world stopped, which cuts a long park
                 // short — the bound below is the fallback, not the mechanism.
                 crate::cycle::mutator_gate();
+                // an idle worker is about to look at the stealable queues
+                // until it parks, so it counts as a searcher: a spawn in that
+                // window need not wake anyone else.
+                if !searching {
+                    searching = true;
+                    scheduler().searching.fetch_add(1, AtomicOrdering::SeqCst);
+                }
                 // a worker still at the floor timeout was running a moment ago,
                 // so a handoff aimed at it is plausibly already in flight —
                 // worth a bounded look before paying a park/futex round trip.
                 if idle_timeout == PARK_TIMEOUT_MIN && spin_for_work(index) {
+                    continue;
+                }
+                // give the slot up before the last look at the queues, so a
+                // spawn racing with this either sees no searcher and wakes a
+                // worker, or lands before the look below and is seen by it.
+                searching = false;
+                scheduler().searching.fetch_sub(1, AtomicOrdering::SeqCst);
+                if any_stealable() {
                     continue;
                 }
                 if park(index, idle_timeout) {

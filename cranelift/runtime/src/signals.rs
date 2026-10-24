@@ -16,9 +16,9 @@
 //!
 //! `signalfd` would also work on linux, but it reads signals pending for the
 //! *calling thread* plus the process, which only behaves under an inherited
-//! `pthread_sigmask` in every thread. the green worker pool and the netpoll
-//! reactor thread start lazily, so there is no single point at which we could
-//! set that mask for all of them. a `sigaction` handler is process-wide by
+//! `pthread_sigmask` in every thread. the green worker pool starts lazily, so
+//! there is no single point at which we could set that mask for all of its
+//! threads. a `sigaction` handler is process-wide by
 //! construction and has no such ordering requirement, and its read end is a
 //! plain pipe fd that works on every unix — so the fallback platforms get the
 //! same semantics rather than a second implementation.

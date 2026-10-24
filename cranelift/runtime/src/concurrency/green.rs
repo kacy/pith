@@ -1276,7 +1276,7 @@ pub(crate) fn wake(id: TaskId) {
 /// follows, the next wake — agrees on the new home. a pair of tasks that talk
 /// to each other converge onto one worker after the first exchange, and stay
 /// there: a wake from the same worker moves nothing. a waker that is not a
-/// worker (the reactor thread, `main`) has nowhere to take the task and
+/// worker (`main`, a blocking-pool thread) has nowhere to take the task and
 /// leaves the owner alone.
 ///
 /// this is only sound because nothing on the resumable path derives a value
@@ -1345,8 +1345,8 @@ fn note_wake(owner: Option<usize>, home: Option<usize>) {
     let (green, perf) = match (caller, owner) {
         (Some(w), Some(o)) if w == o => (&WAKE_SAME, &crate::PERF_GREEN_WAKES_SAME),
         (Some(_), Some(_)) => (&WAKE_CROSS, &crate::PERF_GREEN_WAKES_CROSS),
-        // waker is not a worker: the reactor thread or main. either way it
-        // must cross into a worker's queue.
+        // waker is not a worker: main or a blocking-pool thread. either way
+        // it must cross into a worker's queue.
         _ => (&WAKE_REACTOR, &crate::PERF_GREEN_WAKES_REACTOR),
     };
     // the green-stats counters are unconditional here (their own dump is
@@ -1859,7 +1859,11 @@ fn find_work(index: usize) -> Option<TaskId> {
         return Some(id);
     }
 
-    if let Some(id) = sched.injector.steal_half(own) {
+    // one at a time from the injector, unlike a peer steal below. the
+    // injector holds what `main` spawned, often a handful of tasks that talk
+    // to each other; taking half of them packed them onto one worker and made
+    // the channel fan-out benchmark about twice as slow.
+    if let Some(id) = sched.injector.pop() {
         debug_assert_stealable(id);
         return Some(id);
     }

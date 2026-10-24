@@ -3217,6 +3217,119 @@ pub fn send_static_path(writer: BufferedBytesWriter, response: HttpResponse, fil
 pub fn send_download_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String, download_name: String) -> Int!:
     return send_file_path(writer, download_file_response(response, file_path, download_name), file_path)
 
+# ===============================================================
+# Content sniffing
+# ===============================================================
+
+# how much of a body detect_content_type looks at, as net/http's does.
+SNIFF_LEN := 512
+
+# the html tags that mark a body as html when it starts with one, after any
+# leading whitespace, followed by a space or ">". compared ignoring ascii case.
+HTML_SNIFF_TAGS := ["<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT", "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR", "<P", "<!--"]
+
+# true when `data` holds the ascii text `text` at `at`, comparing ascii
+# letters without case when `fold` is set.
+fn bytes_have_text(data: Bytes, at: Int, text: String, fold: Bool) -> Bool:
+    if at + text.len() > data.len():
+        return false
+    mut i := 0
+    while i < text.len():
+        mut want := ord(text[i])
+        mut got := data[at + i]
+        if fold:
+            want = ascii_lower(want)
+            got = ascii_lower(got)
+        if want != got:
+            return false
+        i = i + 1
+    return true
+
+# true when `data` starts with the byte values in `signature`.
+fn bytes_have_prefix(data: Bytes, signature: List[Int]) -> Bool:
+    if signature.len() > data.len():
+        return false
+    mut i := 0
+    while i < signature.len():
+        if data[i] != signature[i]:
+            return false
+        i = i + 1
+    return true
+
+fn is_sniff_space(b: Int) -> Bool:
+    return b == 9 or b == 10 or b == 12 or b == 13 or b == 32
+
+# net/http's definition of a byte that cannot appear in text.
+fn is_binary_byte(b: Int) -> Bool:
+    return b <= 8 or b == 11 or (b >= 14 and b <= 26) or (b >= 28 and b <= 31)
+
+# true when the text from `at` opens like a json document: an object that
+# starts with a key or ends at once, or an array whose first element starts
+# like a json value. it is deliberately narrow, so prose that happens to
+# begin with "[" stays text/plain.
+fn looks_like_json(data: Bytes, at: Int, end: Int) -> Bool:
+    first := data[at]
+    if first != 123 and first != 91:
+        return false
+    mut i := at + 1
+    while i < end and is_sniff_space(data[i]):
+        i = i + 1
+    if i >= end:
+        return false
+    next := data[i]
+    if first == 123:
+        return next == 34 or next == 125
+    if bytes_have_text(data, i, "true", false) or bytes_have_text(data, i, "false", false) or bytes_have_text(data, i, "null", false):
+        return true
+    return next == 123 or next == 91 or next == 93 or next == 34 or next == 45 or (next >= 48 and next <= 57)
+
+# the media type of `data` from its first bytes, in the spirit of net/http's
+# DetectContentType: html, xml, json, pdf, png, jpeg, gif, webp, zip, gzip and
+# wasm by their signatures, then "text/plain; charset=utf-8" when none of the
+# first 512 bytes is binary, and "application/octet-stream" otherwise.
+pub fn detect_content_type(data: Bytes) -> String:
+    end := min(data.len(), SNIFF_LEN)
+    if bytes_have_prefix(data, [254, 255]):
+        return "text/plain; charset=utf-16be"
+    if bytes_have_prefix(data, [255, 254]):
+        return "text/plain; charset=utf-16le"
+    if bytes_have_prefix(data, [239, 187, 191]):
+        return "text/plain; charset=utf-8"
+    mut at := 0
+    while at < end and is_sniff_space(data[at]):
+        at = at + 1
+    for tag in HTML_SNIFF_TAGS:
+        if bytes_have_text(data, at, tag, true) and at + tag.len() < end:
+            after := data[at + tag.len()]
+            if after == 32 or after == 62:
+                return "text/html; charset=utf-8"
+    if bytes_have_text(data, at, "<?xml", false):
+        return "text/xml; charset=utf-8"
+    if bytes_have_text(data, 0, "%PDF-", false):
+        return "application/pdf"
+    if bytes_have_prefix(data, [137, 80, 78, 71, 13, 10, 26, 10]):
+        return MIME_PNG
+    if bytes_have_prefix(data, [255, 216, 255]):
+        return MIME_JPEG
+    if bytes_have_text(data, 0, "GIF87a", false) or bytes_have_text(data, 0, "GIF89a", false):
+        return MIME_GIF
+    if bytes_have_text(data, 0, "RIFF", false) and bytes_have_text(data, 8, "WEBPVP", false):
+        return MIME_WEBP
+    if bytes_have_prefix(data, [80, 75, 3, 4]):
+        return "application/zip"
+    if bytes_have_prefix(data, [31, 139, 8]):
+        return "application/x-gzip"
+    if bytes_have_prefix(data, [0, 97, 115, 109]):
+        return MIME_WASM
+    mut i := 0
+    while i < end:
+        if is_binary_byte(data[i]):
+            return MIME_BINARY
+        i = i + 1
+    if at < end and looks_like_json(data, at, end):
+        return MIME_JSON
+    return "text/plain; charset=utf-8"
+
 # sends a chunked response head so callers can stream chunks without buffering the whole body.
 pub fn send_chunked_response_head(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
     if not response.body.is_empty():
@@ -4900,3 +5013,31 @@ test "basic_auth_challenge asks for credentials with a quoted realm":
     resp := basic_auth_challenge("ops " + q + "x" + q)
     assert_eq(resp.status, 401)
     assert_eq(resp.header_value("WWW-Authenticate"), "Basic realm=" + q + "ops " + bs + q + "x" + bs + q + q + ", charset=" + q + "UTF-8" + q)
+
+fn bytes_of(values: List[Int]) -> Bytes:
+    buf := bytes.buffer()
+    for value in values:
+        buf.write_byte(value)
+    return buf.take_bytes()
+
+test "detect_content_type knows the common signatures":
+    q := chr(34)
+    assert_eq(detect_content_type(bytes.from_string_utf8("  <!doctype html><p>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<HTML>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<a href=x>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<?xml version=")), "text/xml; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("hello world")), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8(" " + chr(123) + q + "a" + q + ":1" + chr(125))), MIME_JSON)
+    assert_eq(detect_content_type(bytes.from_string_utf8(chr(123) + " note" + chr(125))), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("[1, 2]")), MIME_JSON)
+    assert_eq(detect_content_type(bytes.from_string_utf8("[note] not json")), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("%PDF-1.7")), "application/pdf")
+    assert_eq(detect_content_type(bytes_of([137, 80, 78, 71, 13, 10, 26, 10, 0])), MIME_PNG)
+    assert_eq(detect_content_type(bytes_of([255, 216, 255, 224])), MIME_JPEG)
+    assert_eq(detect_content_type(bytes.from_string_utf8("GIF89a....")), MIME_GIF)
+    assert_eq(detect_content_type(bytes.from_string_utf8("RIFF0000WEBPVP8 ")), MIME_WEBP)
+    assert_eq(detect_content_type(bytes_of([80, 75, 3, 4, 20])), "application/zip")
+    assert_eq(detect_content_type(bytes_of([31, 139, 8, 0])), "application/x-gzip")
+    assert_eq(detect_content_type(bytes_of([0, 97, 115, 109, 1, 0, 0, 0])), MIME_WASM)
+    assert_eq(detect_content_type(bytes_of([1, 2, 3])), MIME_BINARY)
+    assert_eq(detect_content_type(bytes.empty()), "text/plain; charset=utf-8")

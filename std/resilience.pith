@@ -99,73 +99,48 @@ pub fn attempt_if[T](policy: Retry, op: fn() -> T!, transient: fn(String) -> Boo
     fail "unreachable"
 
 # ---------------------------------------------------------------
-# shared state — one mutex over the limiter and breaker registries
-# ---------------------------------------------------------------
-
-# every limiter and breaker method holds this for one short section. the
-# registries are handle-keyed maps because the state is genuinely shared:
-# the whole point of a limiter is that every serving task drains one bucket.
-mut resilience_mu := Mutex()
-mut next_handle := 1
-
-mut limiter_rate: Map[Int, Int] := {}
-mut limiter_burst_m: Map[Int, Int] := {}
-mut limiter_tokens_m: Map[Int, Int] := {}
-mut limiter_stamp: Map[Int, Int] := {}
-
-mut breaker_threshold: Map[Int, Int] := {}
-mut breaker_reset_ms: Map[Int, Int] := {}
-mut breaker_failures: Map[Int, Int] := {}
-mut breaker_open: Map[Int, Bool] := {}
-mut breaker_opened_at: Map[Int, Int] := {}
-mut breaker_probing: Map[Int, Bool] := {}
-
-fn allocate_handle() -> Int:
-    handle := next_handle
-    next_handle = next_handle + 1
-    return handle
-
-# ---------------------------------------------------------------
 # rate limiter — token bucket
 # ---------------------------------------------------------------
 
 # a token bucket: `per_second` tokens flow in continuously, up to a standing
 # reserve of `burst`. each allowed call spends one token, so sustained load
 # is held to per_second while short spikes up to burst pass untouched.
+#
+# a limiter is shared by every task that holds it, so its state lives in
+# atomic cells behind its own mutex. limiters and breakers used to share one
+# module-wide mutex and handle-keyed maps, which made unrelated limiters and
+# breakers wait on each other: 32 tasks with a breaker each ran 24x slower
+# than one.
 pub struct Limiter:
-    handle: Int
+    mu: Mutex
+    rate: Int
+    burst_m: Int
+    tokens_m: AtomicInt
+    stamp: AtomicInt
 
 # build a limiter refilling `per_second` tokens with a reserve of `burst`.
 pub fn rate_limiter(per_second: Int, burst: Int) -> Limiter:
-    resilience_mu.lock()
-    handle := allocate_handle()
-    limiter_rate.insert(handle, per_second)
-    limiter_burst_m.insert(handle, burst * 1000)
-    limiter_tokens_m.insert(handle, burst * 1000)
-    limiter_stamp.insert(handle, time.mono_millis())
-    resilience_mu.unlock()
-    return Limiter(handle)
+    return Limiter(Mutex(), per_second, burst * 1000, AtomicInt(burst * 1000), AtomicInt(time.mono_millis()))
 
 impl Limiter:
     # spend one token if the bucket has one. never waits: a denied caller
     # decides what denial means — a 429, a drop, a fallback.
     fn allow() -> Bool:
-        resilience_mu.lock()
+        self.mu.lock()
         now := time.mono_millis()
-        elapsed := now - limiter_stamp[self.handle]
+        elapsed := now - self.stamp.load()
         # tokens are tracked in thousandths so integer math can meter
         # fractional refill: per_second tokens/s is per_second m-tokens/ms.
-        mut tokens := limiter_tokens_m[self.handle] + elapsed * limiter_rate[self.handle]
-        burst := limiter_burst_m[self.handle]
-        if tokens > burst:
-            tokens = burst
+        mut tokens := self.tokens_m.load() + elapsed * self.rate
+        if tokens > self.burst_m:
+            tokens = self.burst_m
         mut allowed := false
         if tokens >= 1000:
             tokens = tokens - 1000
             allowed = true
-        limiter_tokens_m.insert(self.handle, tokens)
-        limiter_stamp.insert(self.handle, now)
-        resilience_mu.unlock()
+        self.tokens_m.store(tokens)
+        self.stamp.store(now)
+        self.mu.unlock()
         return allowed
 
 # ---------------------------------------------------------------
@@ -176,77 +151,77 @@ impl Limiter:
 # consecutive failures, and half-open — exactly one probe allowed through —
 # once `reset_ms` has passed. the probe's outcome decides: success closes
 # the circuit, failure re-opens it for another reset_ms.
+#
+# like a limiter, a breaker keeps its state in atomic cells behind its own
+# mutex; `open` and `probing` hold 0 or 1.
 pub struct Breaker:
-    handle: Int
+    mu: Mutex
+    threshold: Int
+    reset_ms: Int
+    failures: AtomicInt
+    open: AtomicInt
+    opened_at: AtomicInt
+    probing: AtomicInt
 
 # build a breaker that trips after `failures` consecutive failures and
 # allows its half-open probe once `reset_ms` has passed.
 pub fn circuit_breaker(failures: Int, reset_ms: Int) -> Breaker:
-    resilience_mu.lock()
-    handle := allocate_handle()
-    breaker_threshold.insert(handle, failures)
-    breaker_reset_ms.insert(handle, reset_ms)
-    breaker_failures.insert(handle, 0)
-    breaker_open.insert(handle, false)
-    breaker_opened_at.insert(handle, 0)
-    breaker_probing.insert(handle, false)
-    resilience_mu.unlock()
-    return Breaker(handle)
+    return Breaker(Mutex(), failures, reset_ms, AtomicInt(0), AtomicInt(0), AtomicInt(0), AtomicInt(0))
 
 impl Breaker:
     # true when the call may proceed. while open, every caller is refused
     # until reset_ms has passed; then exactly one caller gets through as the
     # probe and must report back through success() or failure().
     fn allow() -> Bool:
-        resilience_mu.lock()
+        self.mu.lock()
         mut allowed := true
         # the open flag is explicit state rather than a timestamp sentinel:
         # the mono clock starts at zero with the process, so "opened at 0"
         # is a perfectly real moment.
-        if breaker_open[self.handle]:
+        if self.open.load() == 1:
             allowed = false
-            waited := time.mono_millis() - breaker_opened_at[self.handle]
-            if waited >= breaker_reset_ms[self.handle] and not breaker_probing[self.handle]:
-                breaker_probing.insert(self.handle, true)
+            waited := time.mono_millis() - self.opened_at.load()
+            if waited >= self.reset_ms and self.probing.load() == 0:
+                self.probing.store(1)
                 allowed = true
-        resilience_mu.unlock()
+        self.mu.unlock()
         return allowed
 
     # report a success: the circuit closes and the failure count resets.
     fn success():
-        resilience_mu.lock()
-        breaker_failures.insert(self.handle, 0)
-        breaker_open.insert(self.handle, false)
-        breaker_probing.insert(self.handle, false)
-        resilience_mu.unlock()
+        self.mu.lock()
+        self.failures.store(0)
+        self.open.store(0)
+        self.probing.store(0)
+        self.mu.unlock()
 
     # report a failure: closed, it counts toward the threshold and trips the
     # circuit when reached; half-open, the probe failed and the circuit
     # re-opens for another reset_ms.
     fn failure():
-        resilience_mu.lock()
-        if breaker_open[self.handle]:
-            breaker_opened_at.insert(self.handle, time.mono_millis())
-            breaker_probing.insert(self.handle, false)
+        self.mu.lock()
+        if self.open.load() == 1:
+            self.opened_at.store(time.mono_millis())
+            self.probing.store(0)
         else:
-            count := breaker_failures[self.handle] + 1
-            breaker_failures.insert(self.handle, count)
-            if count >= breaker_threshold[self.handle]:
-                breaker_open.insert(self.handle, true)
-                breaker_opened_at.insert(self.handle, time.mono_millis())
-                breaker_probing.insert(self.handle, false)
-        resilience_mu.unlock()
+            count := self.failures.load() + 1
+            self.failures.store(count)
+            if count >= self.threshold:
+                self.open.store(1)
+                self.opened_at.store(time.mono_millis())
+                self.probing.store(0)
+        self.mu.unlock()
 
     # "closed", "open", or "half_open" — for logs and dashboards; decisions
     # belong to allow().
     fn state() -> String:
-        resilience_mu.lock()
+        self.mu.lock()
         mut current := "closed"
-        if breaker_open[self.handle]:
+        if self.open.load() == 1:
             current = "open"
-            if breaker_probing[self.handle]:
+            if self.probing.load() == 1:
                 current = "half_open"
-        resilience_mu.unlock()
+        self.mu.unlock()
         return current
 
 # ---------------------------------------------------------------
